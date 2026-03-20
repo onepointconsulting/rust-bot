@@ -1,7 +1,8 @@
 use std::path::{Path, PathBuf};
+use super::base::Tool;
 
 #[derive(Debug)]
-enum ResolvePathError {
+pub(crate) enum ResolvePathError {
     HomeDirUnavailable,
     NotUnderAllowedDir { path: PathBuf, allowed: PathBuf },
     NotUnderAnyAllowedDir { path: PathBuf }
@@ -75,6 +76,187 @@ fn _resolve_path(
     Result::Ok(resolved)
 }
 
+
+
+// ---------------------------------------------------------------------------
+// FsToolConfig — shared config for filesystem tools.
+//
+// Rust doesn't have class inheritance, so the Python `_FsTool` base class is
+// expressed as a plain struct that each FS tool embeds by composition.
+// ---------------------------------------------------------------------------
+
+pub struct FsToolConfig {
+    workspace: Option<PathBuf>,
+    allowed_dir: Option<PathBuf>,
+    extra_allowed_dirs: Option<Vec<PathBuf>>,
+}
+
+impl FsToolConfig {
+    pub fn new(
+        workspace: Option<PathBuf>,
+        allowed_dir: Option<PathBuf>,
+        extra_allowed_dirs: Option<Vec<PathBuf>>,
+    ) -> Self {
+        Self { workspace, allowed_dir, extra_allowed_dirs }
+    }
+
+    /// Equivalent to `self._resolve(path)` in the Python base class.
+    pub fn resolve(&self, path: &str) -> Result<PathBuf, ResolvePathError> {
+        _resolve_path(
+            path,
+            self.workspace.clone(),
+            self.allowed_dir.clone(),
+            self.extra_allowed_dirs.clone(),
+        )
+    }
+}
+
+// ---------------------------------------------------------------------------
+// ReadFileTool
+// ---------------------------------------------------------------------------
+
+/// Read file contents with optional line-based pagination.
+pub struct ReadFileTool {
+    fs: FsToolConfig,
+}
+
+impl ReadFileTool {
+    const MAX_CHARS: usize = 128_000;
+    const DEFAULT_LIMIT: usize = 2_000;
+
+    pub fn new(
+        workspace: Option<PathBuf>,
+        allowed_dir: Option<PathBuf>,
+        extra_allowed_dirs: Option<Vec<PathBuf>>,
+    ) -> Self {
+        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+    }
+}
+
+impl Tool for ReadFileTool {
+    fn name(&self) -> String {
+        "read_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Read the contents of a file. Returns numbered lines. \
+         Use offset and limit to paginate through large files."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {
+                    "type": "string",
+                    "description": "The file path to read"
+                },
+                "offset": {
+                    "type": "integer",
+                    "description": "Line number to start reading from (1-indexed, default 1)",
+                    "minimum": 1
+                },
+                "limit": {
+                    "type": "integer",
+                    "description": "Maximum number of lines to read (default 2000)",
+                    "minimum": 1
+                }
+            },
+            "required": ["path"]
+        })
+    }
+
+    /// Input is a JSON object string: `{"path": "...", "offset": 1, "limit": 100}`.
+    fn execute(&self, input: String) -> String {
+        let args: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(v) => v,
+            Err(_) => return "Error: invalid JSON input".to_string(),
+        };
+
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return "Error: missing required parameter 'path'".to_string(),
+        };
+
+        let mut offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+
+        let fp = match self.fs.resolve(path) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {:?}", e),
+        };
+
+        if !fp.exists() {
+            return format!("Error: File not found: {}", path);
+        }
+        if !fp.is_file() {
+            return format!("Error: Not a file: {}", path);
+        }
+
+        let content = match std::fs::read_to_string(&fp) {
+            Ok(c) => c,
+            Err(e) => return format!("Error reading file: {}", e),
+        };
+
+        let all_lines: Vec<&str> = content.lines().collect();
+        let total = all_lines.len();
+
+        offset = offset.max(1);
+
+        if total == 0 {
+            return format!("(Empty file: {})", path);
+        }
+        if offset > total {
+            return format!(
+                "Error: offset {} is beyond end of file ({} lines)",
+                offset, total
+            );
+        }
+
+        let start = offset - 1;
+        let end = (start + limit.unwrap_or(Self::DEFAULT_LIMIT)).min(total);
+
+        let numbered: Vec<String> = all_lines[start..end]
+            .iter()
+            .enumerate()
+            .map(|(i, line)| format!("{}| {}", start + i + 1, line))
+            .collect();
+
+        let mut result = numbered.join("\n");
+
+        // Trim to MAX_CHARS if the result is too large.
+        if result.len() > Self::MAX_CHARS {
+            let mut trimmed: Vec<&str> = Vec::new();
+            let mut chars = 0usize;
+            for line in &numbered {
+                chars += line.len() + 1;
+                if chars > Self::MAX_CHARS {
+                    break;
+                }
+                trimmed.push(line);
+            }
+            let end_trimmed = start + trimmed.len();
+            result = trimmed.join("\n");
+            result += &format!(
+                "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
+                offset, end_trimmed, total, end_trimmed + 1
+            );
+            return result;
+        }
+
+        if end < total {
+            result += &format!(
+                "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
+                offset, end, total, end + 1
+            );
+        } else {
+            result += &format!("\n\n(End of file — {} lines total)", total);
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -146,6 +328,32 @@ mod tests {
         let resolved = _resolve_path(allowed_path.to_str().unwrap(), None, Some(allowed_dir.clone()), Some(vec![extra_allowed_dir.clone()])).unwrap();
         assert!(resolved.starts_with(allowed_dir));
         assert!(resolved.ends_with("notes.txt"));
+    }
+
+    #[test]
+    fn test_read_missing_file_tool() {
+        let tool = ReadFileTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ "path": "notes.txt" }).to_string());
+        assert!(result.contains("Error: File not found: notes.txt"));
+    }
+
+    #[test]
+    fn test_read_missing_path_tool() {
+        let tool = ReadFileTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("Error: missing required parameter 'path'"));
+    }
+
+    #[test]
+    fn test_read_content_tool() {
+        let tool = ReadFileTool::new(None, None, None);
+        // Find the notes.txt file in the docs directory
+        let notes_path = Path::new("docs").join("notes.txt");
+        assert!(notes_path.exists());
+        let result = tool.execute(serde_json::json!({ "path": notes_path.to_str().unwrap() }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("rust-bot is for educational, research, and technical exchange purposes only. It is unrelated to crypto and does not involve any official token or coin."));
     }
     
 }
