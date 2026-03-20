@@ -120,9 +120,24 @@ pub struct ReadFileTool {
     fs: FsToolConfig,
 }
 
+pub struct WriteFileTool {
+    fs: FsToolConfig,
+}
+
 impl ReadFileTool {
     const MAX_CHARS: usize = 128_000;
     const DEFAULT_LIMIT: usize = 2_000;
+
+    pub fn new(
+        workspace: Option<PathBuf>,
+        allowed_dir: Option<PathBuf>,
+        extra_allowed_dirs: Option<Vec<PathBuf>>,
+    ) -> Self {
+        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+    }
+}
+
+impl WriteFileTool {
 
     pub fn new(
         workspace: Option<PathBuf>,
@@ -257,6 +272,65 @@ impl Tool for ReadFileTool {
     }
 }
 
+impl Tool for WriteFileTool {
+
+    fn name(&self) -> String {
+        "write_file".to_string()
+    }
+    
+    fn description(&self) -> String {
+        "Write content to a file at the given path. Creates parent directories if needed."
+            .to_string()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The file path to write to"},
+                "content": {"type": "string", "description": "The content to write"},
+            },
+            "required": ["path", "content"],
+        })
+    }
+
+    fn execute(&self, input: String) -> String {
+        let args: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(v) => v,
+            Err(_) => return "Error: invalid JSON input".to_string(),
+        };
+
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return "Error: missing required parameter 'path'".to_string(),
+        };
+
+        let content = match args.get("content").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return "Error: missing required parameter 'content'".to_string(),
+        };
+
+        let fp = match self.fs.resolve(path) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {:?}", e),
+        };
+
+        if let Some(parent) = fp.parent() {
+            if let Err(e) = std::fs::create_dir_all(parent) {
+                return format!("Error writing file: {}", e);
+            }
+        }
+
+        match std::fs::write(&fp, content.as_bytes()) {
+            Ok(_) => format!("Successfully wrote {} bytes to {}", content.len(), fp.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                format!("Error: {}", e)
+            }
+            Err(e) => format!("Error writing file: {}", e),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -333,8 +407,8 @@ mod tests {
     #[test]
     fn test_read_missing_file_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "notes.txt" }).to_string());
-        assert!(result.contains("Error: File not found: notes.txt"));
+        let result = tool.execute(serde_json::json!({ "path": "missing.txt" }).to_string());
+        assert!(result.contains("Error: File not found: missing.txt"));
     }
 
     #[test]
@@ -347,14 +421,43 @@ mod tests {
 
     #[test]
     fn test_read_content_tool() {
-        let tool = ReadFileTool::new(None, None, None);
+        let docs_path = Path::new("docs");
+        let tool = ReadFileTool::new(None, Some(docs_path.to_path_buf()), None);
         // Find the notes.txt file in the docs directory
-        let notes_path = Path::new("docs").join("notes.txt");
+        let notes_path = docs_path.join("notes.txt");
         assert!(notes_path.exists());
         let result = tool.execute(serde_json::json!({ "path": notes_path.to_str().unwrap() }).to_string());
         println!("result: {}", result);
         assert!(result.contains("rust-bot is for educational, research, and technical exchange purposes only. It is unrelated to crypto and does not involve any official token or coin."));
     }
+
+    #[test]
+    fn test_write_missing_path_tool() {
+        let tool = WriteFileTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ "content": "Hello, world!" }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("Error: missing required parameter 'path'"));
+    }
+
+    #[test]
+    fn test_write_missing_content() {
+        let tool = WriteFileTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ "path": "notes.txt" }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("Error: missing required parameter 'content'"));
+    }
+
+    #[test]
+    fn test_write_tool_success() {
+        let tool = WriteFileTool::new(None, None, None);
+        let notes_text = "notes.txt";
+        let result = tool.execute(serde_json::json!({ "path": notes_text, "content": "Hello, world!" }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains(format!("Successfully wrote").as_str()));
+        assert!(Path::new(notes_text).exists());
+    }
+    
+    
     
 }
 
