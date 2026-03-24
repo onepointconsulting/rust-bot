@@ -629,7 +629,7 @@ impl Tool for ListDirTool {
                 .collect();
             paths.sort();
 
-            for item in paths {
+            for item in paths.iter().take(cap) {
                 let rel = match item.strip_prefix(&dp) {
                     Ok(r) => r.to_path_buf(),
                     Err(_) => continue,
@@ -645,18 +645,18 @@ impl Tool for ListDirTool {
                     continue;
                 }
                 total += 1;
-                if items.len() < cap {
-                    let posix_rel = rel.components()
-                        .map(|c| c.as_os_str().to_string_lossy())
-                        .collect::<Vec<_>>()
-                        .join("/");
+                
+                let posix_rel = rel.components()
+                    .map(|c| c.as_os_str().to_string_lossy())
+                    .collect::<Vec<_>>()
+                    .join("/");
 
-                    if item.is_dir() {
-                        items.push(format!("{}/", posix_rel));
-                    } else {
-                        items.push(format!("{}", posix_rel));
-                    }
+                if item.is_dir() {
+                    items.push(format!("{}/", posix_rel));
+                } else {
+                    items.push(format!("{}", posix_rel));
                 }
+                
             }
         } else {
             let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&dp) {
@@ -668,13 +668,11 @@ impl Tool for ListDirTool {
             };
             entries.sort_by_key(|e| e.path());
 
-            for entry in entries {
+            for entry in entries.iter().take(cap) {
                 total += 1;
-                if items.len() < cap {
-                    let entry_path = entry.path();
-                    let rel = entry_path.strip_prefix(&dp).unwrap_or(entry_path.as_path());
-                    items.push(format!("{}", rel.display()));
-                }
+                let entry_path = entry.path();
+                let rel = entry_path.strip_prefix(&dp).unwrap_or(entry_path.as_path());
+                items.push(format!("{}", rel.display()));
             }
         }
 
@@ -919,10 +917,12 @@ mod tests {
     #[test]
     fn test_list_dir_tool_expression() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "src", "recursive": true }).to_string());
+        let result = tool.execute(serde_json::json!({ "path": "src", "recursive": true, "max_entries": 10 }).to_string());
+        println!("result count: {}", result.split("\n").count());
         println!("result: {}", result);
         assert!(result.contains("agent/mod.rs"));
         assert!(result.contains("agent/tools/mod.rs"));
+        assert!(result.split("\n").count() == 10);
     }
     
 }
