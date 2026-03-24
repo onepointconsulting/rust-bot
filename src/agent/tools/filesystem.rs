@@ -1,4 +1,5 @@
 use std::path::{Path, PathBuf};
+use similar::TextDiff;
 use super::base::Tool;
 
 #[derive(Debug)]
@@ -187,6 +188,48 @@ impl EditFileTool {
         extra_allowed_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
         Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+    }
+
+    fn _not_found_msg(&self, old_text: &str, content: &str, path: &str) -> String {
+        let lines: Vec<&str> = content.lines().collect();
+        let old_lines: Vec<&str> = old_text.lines().collect();
+        let window = old_lines.len();
+
+        let mut best_ratio = 0.0_f32;
+        let mut best_start = 0_usize;
+
+        let iterations = (lines.len() + 1).saturating_sub(window).max(1);
+        for i in 0..iterations {
+            let candidate = lines[i..(i + window).min(lines.len())].join("\n");
+            let ratio = TextDiff::from_lines(old_text, &candidate).ratio();
+            if ratio > best_ratio {
+                best_ratio = ratio;
+                best_start = i;
+            }
+        }
+
+        if best_ratio > 0.5 {
+            let actual_window = lines[best_start..(best_start + window).min(lines.len())].join("\n");
+            let diff = TextDiff::from_lines(old_text, &actual_window);
+            let unified = diff
+                .unified_diff()
+                .header(
+                    "old_text (provided)",
+                    &format!("{} (actual, line {})", path, best_start + 1),
+                )
+                .to_string();
+            return format!(
+                "Error: old_text not found in {}.\nBest match ({:.0}% similar) at line {}:\n{}",
+                path,
+                best_ratio * 100.0,
+                best_start + 1,
+                unified,
+            );
+        }
+        format!(
+            "Error: old_text not found in {}. No similar text found. Verify the file content.",
+            path
+        )
     }
 }
 
@@ -399,8 +442,97 @@ impl Tool for EditFileTool {
     }
 
     fn execute(&self, input: String) -> String {
-        panic!("Not implemented");
+        let args: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(v) => v,
+            Err(_) => return "Error: invalid JSON input".to_string(),
+        };
+
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) if !p.is_empty() => p,
+            _ => return "Error: missing required parameter 'path'".to_string(),
+        };
+
+        let old_text = match args.get("old_text").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return "Error: missing required parameter 'old_text'".to_string(),
+        };
+
+        let new_text = match args.get("new_text").and_then(|v| v.as_str()) {
+            Some(t) => t,
+            None => return "Error: missing required parameter 'new_text'".to_string(),
+        };
+
+        let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+
+        let fp = match self.fs.resolve(path) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {:?}", e),
+        };
+
+        if !fp.exists() {
+            return format!("Error: File not found: {}", path);
+        }
+
+        let raw = match std::fs::read(&fp) {
+            Ok(b) => b,
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                return format!("Error: {}", e);
+            }
+            Err(e) => return format!("Error editing file: {}", e),
+        };
+
+        let uses_crlf = raw.windows(2).any(|w| w == b"\r\n");
+
+        let content = match String::from_utf8(raw) {
+            Ok(s) => s,
+            Err(e) => return format!("Error editing file: {}", e),
+        };
+        let content = content.replace("\r\n", "\n");
+
+        let norm_old = old_text.replace("\r\n", "\n");
+        let (matched, count) = _find_match(&content, &norm_old);
+
+        let matched = match matched {
+            Some(m) => m,
+            None => return self._not_found_msg(old_text, &content, path),
+        };
+
+        if count > 1 && !replace_all {
+            return format!(
+                "Warning: old_text appears {} times. \
+                 Provide more context to make it unique, or set replace_all=true.",
+                count
+            );
+        }
+
+        let norm_new = new_text.replace("\r\n", "\n");
+        let mut new_content = if replace_all {
+            content.replace(&matched, &norm_new)
+        } else {
+            match content.find(&matched) {
+                Some(pos) => {
+                    let mut s = content[..pos].to_string();
+                    s.push_str(&norm_new);
+                    s.push_str(&content[pos + matched.len()..]);
+                    s
+                }
+                None => content,
+            }
+        };
+
+        if uses_crlf {
+            new_content = new_content.replace('\n', "\r\n");
+        }
+
+        match std::fs::write(&fp, new_content.as_bytes()) {
+            Ok(_) => format!("Successfully edited {}", fp.display()),
+            Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                format!("Error: {}", e)
+            }
+            Err(e) => format!("Error editing file: {}", e),
+        }
     }
+
 }
 
 #[cfg(test)]
@@ -414,6 +546,18 @@ mod tests {
             .unwrap()
             .as_nanos();
         std::env::temp_dir().join(format!("rust-bot-test-{}", nanos))
+    }
+
+    fn sample_file() -> PathBuf {
+        let dir = unique_temp_dir();
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("sample.txt");
+        let content: String = (1..=20)
+            .map(|i| format!("{}| line {}", i, i))
+            .collect::<Vec<_>>()
+            .join("\n");
+        fs::write(&path, content.as_bytes()).unwrap();
+        path
     }
 
     #[test]
@@ -539,12 +683,60 @@ mod tests {
     }
 
     #[test]
+    fn test_find_match_count_1() {
+        let sample_file = sample_file();
+        let content = std::fs::read_to_string(&sample_file).unwrap();
+        assert!(content.contains("1| line 1"));
+        let (matched_fragment, count) = _find_match(content.as_str(), "1| line 1");
+        assert!(matched_fragment.is_some());
+        assert!(count == 2); // "1| line 1" and "11| line 11" both contain the expression "1| line 1"
+    }
+
+    #[test]
     fn test_find_match_indented() {
         let content = "Hello, world!     \n     Hello, rust!     \n         Hello, world!";
         let old_text = "Hello, world!\nHello, rust!";
         let (matched_fragment, count) = _find_match(content, old_text);
         assert!(matched_fragment.is_some());
         assert!(count == 1);
+    }
+
+    #[test]
+    fn test_edit_simple_match() {
+        let tool: EditFileTool = EditFileTool::new(None, None, None);
+        let sample_file = sample_file();
+        let content = std::fs::read_to_string(&sample_file).unwrap();
+        assert!(content.contains("1| line 1"));
+        let result = tool.execute(serde_json::json!(
+            { 
+                "path": sample_file.to_str().unwrap(),
+                "old_text": "1| line 1",
+                "new_text": "---1| line 1---",
+                "replace_all": true
+            }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains(format!("Successfully edited").as_str()));
+        assert!(sample_file.exists());
+
+        let content = std::fs::read_to_string(&sample_file).unwrap();
+        assert!(content.contains("---1| line 1---"));
+    }
+
+    #[test]
+    fn test_edit_replace_all_false() {
+        let tool: EditFileTool = EditFileTool::new(None, None, None);
+        let sample_file = sample_file();
+        let content = std::fs::read_to_string(&sample_file).unwrap();
+        assert!(content.contains("1| line 1"));
+        let result = tool.execute(serde_json::json!(
+            { 
+                "path": sample_file.to_str().unwrap(),
+                "old_text": "1| line 1",
+                "new_text": "---1| line 1---, but only the first occurrence",
+                "replace_all": false
+            }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
     }
     
 }
