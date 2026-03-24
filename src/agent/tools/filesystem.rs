@@ -1,6 +1,7 @@
 use std::path::{Path, PathBuf};
 use similar::TextDiff;
 use super::base::Tool;
+use globwalk::GlobWalkerBuilder;
 
 #[derive(Debug)]
 pub(crate) enum ResolvePathError {
@@ -156,6 +157,10 @@ pub struct EditFileTool {
     fs: FsToolConfig,
 }
 
+pub struct ListDirTool {
+    fs: FsToolConfig,
+}
+
 impl ReadFileTool {
     const MAX_CHARS: usize = 128_000;
     const DEFAULT_LIMIT: usize = 2_000;
@@ -170,6 +175,21 @@ impl ReadFileTool {
 }
 
 impl WriteFileTool {
+
+    pub fn new(
+        workspace: Option<PathBuf>,
+        allowed_dir: Option<PathBuf>,
+        extra_allowed_dirs: Option<Vec<PathBuf>>,
+    ) -> Self {
+        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+    }
+}
+
+impl ListDirTool {
+    const DEFAULT_MAX: usize = 200;
+    const IGNORE_DIRS: &'static [&'static str] = &[
+        ".git", "node_modules", "__pycache__", ".venv", "target",
+    ];
 
     pub fn new(
         workspace: Option<PathBuf>,
@@ -535,6 +555,144 @@ impl Tool for EditFileTool {
 
 }
 
+impl Tool for ListDirTool {
+
+    fn name(&self) -> String {
+        "list_dir".to_string()
+    }
+
+    fn description(&self) -> String {
+        "List the contents of a directory".to_string()
+    }
+    
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The directory path to list"},
+                "recursive": {
+                    "type": "boolean",
+                    "description": "Recursively list all files (default false)",
+                },
+                "max_entries": {
+                    "type": "integer",
+                    "description": "Maximum entries to return (default 200)",
+                    "minimum": 1,
+                },
+            },
+            "required": ["path"],
+        })
+    }
+
+    fn execute(&self, input: String) -> String {
+        let args: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(v) => v,
+            Err(_) => return "Error: invalid JSON input".to_string(),
+        };
+
+        let path = match args.get("path").and_then(|v| v.as_str()) {
+            Some(p) => p,
+            None => return "Error: missing required parameter 'path'".to_string(),
+        };
+
+        let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cap = args
+            .get("max_entries")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize)
+            .unwrap_or(Self::DEFAULT_MAX);
+
+        let dp = match self.fs.resolve(path) {
+            Ok(p) => p,
+            Err(e) => return format!("Error: {:?}", e),
+        };
+
+        if !dp.exists() {
+            return format!("Error: Directory not found: {}", path);
+        }
+        if !dp.is_dir() {
+            return format!("Error: Not a directory: {}", path);
+        }
+
+        let mut items: Vec<String> = Vec::new();
+        let mut total = 0_usize;
+
+        if recursive {
+            let walker = match GlobWalkerBuilder::from_patterns(&dp, &["**/*"]).build() {
+                Ok(w) => w,
+                Err(e) => return format!("Error listing directory: {}", e),
+            };
+
+            let mut paths: Vec<PathBuf> = walker
+                .filter_map(|e| e.ok())
+                .map(|e| e.path().to_path_buf())
+                .collect();
+            paths.sort();
+
+            for item in paths {
+                let rel = match item.strip_prefix(&dp) {
+                    Ok(r) => r.to_path_buf(),
+                    Err(_) => continue,
+                };
+                let ignored = rel.components().any(|c| {
+                    if let std::path::Component::Normal(s) = c {
+                        Self::IGNORE_DIRS.contains(&s.to_str().unwrap_or(""))
+                    } else {
+                        false
+                    }
+                });
+                if ignored {
+                    continue;
+                }
+                total += 1;
+                if items.len() < cap {
+                    let posix_rel = rel.components()
+                        .map(|c| c.as_os_str().to_string_lossy())
+                        .collect::<Vec<_>>()
+                        .join("/");
+
+                    if item.is_dir() {
+                        items.push(format!("{}/", posix_rel));
+                    } else {
+                        items.push(format!("{}", posix_rel));
+                    }
+                }
+            }
+        } else {
+            let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&dp) {
+                Ok(rd) => rd.filter_map(|e| e.ok()).collect(),
+                Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
+                    return format!("Error: {}", e);
+                }
+                Err(e) => return format!("Error listing directory: {}", e),
+            };
+            entries.sort_by_key(|e| e.path());
+
+            for entry in entries {
+                total += 1;
+                if items.len() < cap {
+                    let entry_path = entry.path();
+                    let rel = entry_path.strip_prefix(&dp).unwrap_or(entry_path.as_path());
+                    items.push(format!("{}", rel.display()));
+                }
+            }
+        }
+
+        if items.is_empty() && total == 0 {
+            return format!("Directory {} is empty", path);
+        }
+
+        let mut result = items.join("\n");
+        if total > cap {
+            result += &format!(
+                "\n\n(truncated, showing first {} of {} entries)",
+                cap, total
+            );
+        }
+        result
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -737,6 +895,34 @@ mod tests {
             }).to_string());
         println!("result: {}", result);
         assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
+    }
+
+    #[test]
+    fn test_list_dir_tool() {
+        let tool = ListDirTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ "path": "docs", "recursive": false }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("notes.txt"));
+        assert!(result.contains("credits"));
+    }
+
+    #[test]
+    fn test_list_dir_tool_recursive() {
+        let tool = ListDirTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ "path": "docs", "recursive": true }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("notes.txt"));
+        assert!(result.contains("credits/"));
+        assert!(result.contains("credits/nanobot.txt"));
+    }
+
+    #[test]
+    fn test_list_dir_tool_expression() {
+        let tool = ListDirTool::new(None, None, None);
+        let result = tool.execute(serde_json::json!({ "path": "src", "recursive": true }).to_string());
+        println!("result: {}", result);
+        assert!(result.contains("agent/mod.rs"));
+        assert!(result.contains("agent/tools/mod.rs"));
     }
     
 }
