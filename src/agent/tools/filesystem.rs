@@ -76,7 +76,34 @@ fn _resolve_path(
     Result::Ok(resolved)
 }
 
+fn _find_match(content: &str, old_text: &str) -> (Option<String>, usize) {
+    if content.contains(old_text) {
+        let count = content.matches(old_text).count();
+        return (Some(old_text.to_string()), count);
+    }
 
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    if old_lines.is_empty() {
+        return (None, 0);
+    }
+    let stripped_old: Vec<&str> = old_lines.iter().map(|l| l.trim()).collect();
+    let content_lines: Vec<&str> = content.lines().collect();
+
+    let mut candidates: Vec<String> = Vec::new();
+    if content_lines.len() >= old_lines.len() {
+        for i in 0..=(content_lines.len() - old_lines.len()) {
+            let window = &content_lines[i..i + old_lines.len()];
+            if window.iter().map(|l| l.trim()).collect::<Vec<_>>() == stripped_old {
+                candidates.push(window.join("\n"));
+            }
+        }
+    }
+
+    if !candidates.is_empty() {
+        return (Some(candidates[0].clone()), candidates.len());
+    }
+    (None, 0)
+}
 
 // ---------------------------------------------------------------------------
 // FsToolConfig — shared config for filesystem tools.
@@ -124,6 +151,10 @@ pub struct WriteFileTool {
     fs: FsToolConfig,
 }
 
+pub struct EditFileTool {
+    fs: FsToolConfig,
+}
+
 impl ReadFileTool {
     const MAX_CHARS: usize = 128_000;
     const DEFAULT_LIMIT: usize = 2_000;
@@ -138,6 +169,17 @@ impl ReadFileTool {
 }
 
 impl WriteFileTool {
+
+    pub fn new(
+        workspace: Option<PathBuf>,
+        allowed_dir: Option<PathBuf>,
+        extra_allowed_dirs: Option<Vec<PathBuf>>,
+    ) -> Self {
+        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+    }
+}
+
+impl EditFileTool {
 
     pub fn new(
         workspace: Option<PathBuf>,
@@ -331,6 +373,36 @@ impl Tool for WriteFileTool {
     }
 }
 
+impl Tool for EditFileTool {
+    fn name(&self) -> String {
+        "edit_file".to_string()
+    }
+
+    fn description(&self) -> String {
+        "Edit the contents of a file".to_string()
+    }
+    
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "The file path to edit"},
+                "old_text": {"type": "string", "description": "The text to find and replace"},
+                "new_text": {"type": "string", "description": "The text to replace with"},
+                "replace_all": {
+                    "type": "boolean",
+                    "description": "Replace all occurrences (default false)",
+                },
+            },
+            "required": ["path", "old_text", "new_text"],
+        })
+    }
+
+    fn execute(&self, input: String) -> String {
+        panic!("Not implemented");
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -457,7 +529,23 @@ mod tests {
         assert!(Path::new(notes_text).exists());
     }
     
-    
+    #[test]
+    fn test_find_match() {
+        let content = "Hello, world!\nHello, rust!\nHello, world!";
+        let old_text = "Hello, world!";
+        let (matched_fragment, count) = _find_match(content, old_text);
+        assert!(matched_fragment.is_some());
+        assert!(count == 2);
+    }
+
+    #[test]
+    fn test_find_match_indented() {
+        let content = "Hello, world!     \n     Hello, rust!     \n         Hello, world!";
+        let old_text = "Hello, world!\nHello, rust!";
+        let (matched_fragment, count) = _find_match(content, old_text);
+        assert!(matched_fragment.is_some());
+        assert!(count == 1);
+    }
     
 }
 
