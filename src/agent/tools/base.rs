@@ -407,9 +407,7 @@ pub trait Tool {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::agent::tools::base::Tool;
-    use serde_json::json;
 
     struct SampleTool;
 

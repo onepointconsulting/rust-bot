@@ -1,4 +1,4 @@
-use super::base::Tool;
+use crate::agent::tools::base::Tool;
 use std::collections::HashMap;
 
 pub struct RegistryTool {
@@ -84,3 +84,57 @@ impl RegistryTool {
         self.tools.contains_key(name)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::agent::tools::base::Tool;
+
+    struct SampleTool;
+
+    impl Tool for SampleTool {
+        fn name(&self) -> String {
+            "sample".to_string()
+        }
+
+        fn description(&self) -> String {
+            "sample tool".to_string()
+        }
+
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "minLength": 2 },
+                },
+                "required": ["query"],
+            })
+        }
+        
+        fn execute(&self, _params: &serde_json::Value) -> String {
+            "ok".to_string()
+        }
+    }
+
+    #[test]
+    fn test_registry_returns_validation_ok() {
+        let tool = SampleTool;
+        let mut registry = RegistryTool::new();
+        registry.register(Box::new(tool));
+        let result = registry.execute("sample", "{\"query\": \"hello\"}".to_string());
+        println!("result: {}", result);
+        assert_eq!(result, "ok");
+    }
+
+    #[test]
+    fn test_registry_returns_validation_error() {
+        let tool = SampleTool;
+        let mut registry = RegistryTool::new();
+        registry.register(Box::new(tool));
+        let result = registry.execute("sample", "{\"name\": \"john\"}".to_string());
+        println!("result: {}", result);
+        assert!(result.trim().contains("Error: invalid parameters for tool sample: [\"missing required query\"]"));
+    }
+}
+
+    
