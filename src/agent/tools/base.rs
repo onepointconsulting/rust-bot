@@ -62,7 +62,7 @@ pub trait Tool {
 
             String result of the tool execution.
     */
-    fn execute(&self, input: String) -> String;
+    fn execute(&self, params: &serde_json::Value) -> String;
 
     fn cast_params(&self, params: &serde_json::Value) -> serde_json::Value {
         let schema = self.parameters().clone();
@@ -445,7 +445,7 @@ mod tests {
             })
         }
 
-        fn execute(&self, _input: String) -> String {
+        fn execute(&self, _params: &serde_json::Value) -> String {
             "ok".to_string()
         }
     }

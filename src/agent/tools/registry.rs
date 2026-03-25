@@ -45,4 +45,42 @@ impl RegistryTool {
             })
             .collect()
     }
+
+    pub fn execute(&self, name: &str, input: String) -> String {
+        let tool_res = self.tools.get(name);
+        if tool_res.is_none() {
+            return format!("Tool {} not found. Available tools: {:?}", name, self.tools.keys());
+        }
+        let tool = tool_res.unwrap();
+        let args: serde_json::Value = match serde_json::from_str(&input) {
+            Ok(v) => v,
+            Err(_) => return format!("Error: invalid JSON input: {}", input),
+        };
+        tool.cast_params(&args);
+        let errors = tool.validate_params(&args);
+        let l_hint = "\n\n[Analyze the error above and try a different approach.]";
+        if !errors.is_empty() {
+            return format!("Error: invalid parameters for tool {}: {:?}{l_hint}", name, errors);
+        }
+        let result = tool.execute(&args);
+        if result.starts_with("Error:") {
+            return format!("{result}{l_hint}");
+        }
+        return result;
+    }
+
+    /// Get list of registered tool names.
+    pub fn tool_names(&self) -> Vec<String> {
+        self.tools.keys().cloned().collect()
+    }
+
+    /// Returns the number of registered tools.
+    pub fn len(&self) -> usize {
+        self.tools.len()
+    }
+
+    /// Checks if a tool with the given name is registered.
+    pub fn contains(&self, name: &str) -> bool {
+        self.tools.contains_key(name)
+    }
 }

@@ -288,19 +288,15 @@ impl Tool for ReadFileTool {
     }
 
     /// Input is a JSON object string: `{"path": "...", "offset": 1, "limit": 100}`.
-    fn execute(&self, input: String) -> String {
-        let args: serde_json::Value = match serde_json::from_str(&input) {
-            Ok(v) => v,
-            Err(_) => return "Error: invalid JSON input".to_string(),
-        };
+    fn execute(&self, params: &serde_json::Value) -> String {
 
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+        let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: missing required parameter 'path'".to_string(),
         };
 
-        let mut offset = args.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let limit = args.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let mut offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
+        let limit = params.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
@@ -399,18 +395,13 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn execute(&self, input: String) -> String {
-        let args: serde_json::Value = match serde_json::from_str(&input) {
-            Ok(v) => v,
-            Err(_) => return "Error: invalid JSON input".to_string(),
-        };
-
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+    fn execute(&self, params: &serde_json::Value) -> String {
+        let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: missing required parameter 'path'".to_string(),
         };
 
-        let content = match args.get("content").and_then(|v| v.as_str()) {
+        let content = match params.get("content").and_then(|v| v.as_str()) {
             Some(c) => c,
             None => return "Error: missing required parameter 'content'".to_string(),
         };
@@ -461,28 +452,23 @@ impl Tool for EditFileTool {
         })
     }
 
-    fn execute(&self, input: String) -> String {
-        let args: serde_json::Value = match serde_json::from_str(&input) {
-            Ok(v) => v,
-            Err(_) => return "Error: invalid JSON input".to_string(),
-        };
-
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+    fn execute(&self, params: &serde_json::Value) -> String {
+        let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return "Error: missing required parameter 'path'".to_string(),
         };
 
-        let old_text = match args.get("old_text").and_then(|v| v.as_str()) {
+        let old_text = match params.get("old_text").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => return "Error: missing required parameter 'old_text'".to_string(),
         };
 
-        let new_text = match args.get("new_text").and_then(|v| v.as_str()) {
+        let new_text = match params.get("new_text").and_then(|v| v.as_str()) {
             Some(t) => t,
             None => return "Error: missing required parameter 'new_text'".to_string(),
         };
 
-        let replace_all = args.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let replace_all = params.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
@@ -584,19 +570,15 @@ impl Tool for ListDirTool {
         })
     }
 
-    fn execute(&self, input: String) -> String {
-        let args: serde_json::Value = match serde_json::from_str(&input) {
-            Ok(v) => v,
-            Err(_) => return "Error: invalid JSON input".to_string(),
-        };
+    fn execute(&self, params: &serde_json::Value) -> String {
 
-        let path = match args.get("path").and_then(|v| v.as_str()) {
+        let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: missing required parameter 'path'".to_string(),
         };
 
-        let recursive = args.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
-        let cap = args
+        let recursive = params.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+        let cap = params
             .get("max_entries")
             .and_then(|v| v.as_u64())
             .map(|v| v as usize)
@@ -779,14 +761,14 @@ mod tests {
     #[test]
     fn test_read_missing_file_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "missing.txt" }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": "missing.txt" }));
         assert!(result.contains("Error: File not found: missing.txt"));
     }
 
     #[test]
     fn test_read_missing_path_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ }).to_string());
+        let result = tool.execute(&serde_json::json!({ }));
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'path'"));
     }
@@ -798,7 +780,7 @@ mod tests {
         // Find the notes.txt file in the docs directory
         let notes_path = docs_path.join("notes.txt");
         assert!(notes_path.exists());
-        let result = tool.execute(serde_json::json!({ "path": notes_path.to_str().unwrap() }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": notes_path.to_str().unwrap() }));
         println!("result: {}", result);
         assert!(result.contains("rust-bot is for educational, research, and technical exchange purposes only. It is unrelated to crypto and does not involve any official token or coin."));
     }
@@ -806,7 +788,7 @@ mod tests {
     #[test]
     fn test_write_missing_path_tool() {
         let tool = WriteFileTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "content": "Hello, world!" }).to_string());
+        let result = tool.execute(&serde_json::json!({ "content": "Hello, world!" }));
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'path'"));
     }
@@ -814,7 +796,7 @@ mod tests {
     #[test]
     fn test_write_missing_content() {
         let tool = WriteFileTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "notes.txt" }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": "notes.txt" }));
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'content'"));
     }
@@ -823,7 +805,7 @@ mod tests {
     fn test_write_tool_success() {
         let tool = WriteFileTool::new(None, None, None);
         let notes_text = "notes.txt";
-        let result = tool.execute(serde_json::json!({ "path": notes_text, "content": "Hello, world!" }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" }));
         println!("result: {}", result);
         assert!(result.contains(format!("Successfully wrote").as_str()));
         assert!(Path::new(notes_text).exists());
@@ -863,13 +845,13 @@ mod tests {
         let sample_file = sample_file();
         let content = std::fs::read_to_string(&sample_file).unwrap();
         assert!(content.contains("1| line 1"));
-        let result = tool.execute(serde_json::json!(
+        let result = tool.execute(&serde_json::json!(
             { 
                 "path": sample_file.to_str().unwrap(),
                 "old_text": "1| line 1",
                 "new_text": "---1| line 1---",
                 "replace_all": true
-            }).to_string());
+            }));
         println!("result: {}", result);
         assert!(result.contains(format!("Successfully edited").as_str()));
         assert!(sample_file.exists());
@@ -884,13 +866,13 @@ mod tests {
         let sample_file = sample_file();
         let content = std::fs::read_to_string(&sample_file).unwrap();
         assert!(content.contains("1| line 1"));
-        let result = tool.execute(serde_json::json!(
+        let result = tool.execute(&serde_json::json!(
             { 
                 "path": sample_file.to_str().unwrap(),
                 "old_text": "1| line 1",
                 "new_text": "---1| line 1---, but only the first occurrence",
                 "replace_all": false
-            }).to_string());
+            }));
         println!("result: {}", result);
         assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
     }
@@ -898,7 +880,7 @@ mod tests {
     #[test]
     fn test_list_dir_tool() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "docs", "recursive": false }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false }));
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits"));
@@ -907,7 +889,7 @@ mod tests {
     #[test]
     fn test_list_dir_tool_recursive() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "docs", "recursive": true }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": true }));
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits/"));
@@ -917,7 +899,7 @@ mod tests {
     #[test]
     fn test_list_dir_tool_expression() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(serde_json::json!({ "path": "src", "recursive": true, "max_entries": 10 }).to_string());
+        let result = tool.execute(&serde_json::json!({ "path": "src", "recursive": true, "max_entries": 10 }));
         println!("result count: {}", result.split("\n").count());
         println!("result: {}", result);
         assert!(result.contains("agent/mod.rs"));
