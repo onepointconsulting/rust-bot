@@ -52,4 +52,17 @@ impl OpenAICompatProvider {
             })
             .collect()
     }
+
+    /// Get a value from a serde_json::Value::Object or struct field, returning None if absent.
+    /// 
+    /// If `obj` is an Object, tries to get the key as in Python's dict access.
+    /// For anything else (including structs), it attempts to get a field via serde_json pointer, but returns None if not found.
+    pub fn get_value(obj: &serde_json::Value, key: &str) -> Option<serde_json::Value> {
+        if let Some(map) = obj.as_object() {
+            map.get(key).cloned()
+        } else {
+            // Fallback for struct-like objects, match Python getattr(obj, key, None)
+            obj.get(key).cloned()
+        }
+    }
 }
