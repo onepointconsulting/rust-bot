@@ -1,4 +1,6 @@
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
+use futures::FutureExt;
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallRequest {
@@ -95,8 +97,8 @@ impl LLMResponse {
 }
 
 struct GenerationSettings {
-    temperature: f64,
-    max_tokens: u32,
+    temperature: f32,
+    max_tokens: usize,
     reasoning_effort: Option<String>,
 }
 
@@ -252,14 +254,21 @@ pub trait LLMProvider {
     /// Keeps only provider-safe message keys and normalizes assistant content.
     ///
     fn sanitize_request_messages(
-        messages: &Vec<serde_json::Map<String, serde_json::Value>>,
+        messages: &[serde_json::Value],
         allowed_keys: &std::collections::HashSet<String>,
-    ) -> Vec<serde_json::Map<String, serde_json::Value>> {
+    ) -> Vec<serde_json::Value> {
         let mut sanitized = Vec::with_capacity(messages.len());
 
         for msg in messages {
+            let obj = match msg.as_object() {
+                Some(o) => o,
+                None => {
+                    sanitized.push(msg.clone());
+                    continue;
+                }
+            };
             let mut clean = serde_json::Map::new();
-            for (k, v) in msg.iter() {
+            for (k, v) in obj.iter() {
                 if allowed_keys.contains(k) {
                     clean.insert(k.clone(), v.clone());
                 }
@@ -274,7 +283,7 @@ pub trait LLMProvider {
             if is_assistant && !has_content {
                 clean.insert("content".to_string(), serde_json::Value::Null);
             }
-            sanitized.push(clean);
+            sanitized.push(serde_json::Value::Object(clean));
         }
         sanitized
     }
@@ -298,14 +307,336 @@ pub trait LLMProvider {
     #[allow(unused_variables)]
     async fn chat(
         &self,
-        messages: Vec<std::collections::HashMap<String, serde_json::Value>>,
-        tools: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse;
+
+
+    fn get_default_model(&self) -> String;
+    
+
+    fn is_transient_error(content: Option<&str>) -> bool {
+        let err = content.unwrap_or("").to_lowercase();
+        Self::TRANSIENT_ERROR_MARKERS
+            .iter()
+            .any(|marker| err.contains(marker))
+    }
+
+    /// Replace image_url blocks with text placeholder. Returns None if no images found.
+    /// Rough equivalent of the Python static method _strip_image_content.
+    fn strip_image_content(
+        messages: &[serde_json::Value],
+    ) -> Option<Vec<serde_json::Value>> {
+        let mut found = false;
+        let mut result = Vec::with_capacity(messages.len());
+
+        for msg in messages.iter() {
+            let content = msg.get("content");
+            if let Some(serde_json::Value::Array(blocks)) = content {
+                let mut new_content = Vec::with_capacity(blocks.len());
+                for b in blocks {
+                    if let serde_json::Value::Object(obj) = b {
+                        if obj
+                            .get("type")
+                            .and_then(|t| t.as_str())
+                            .map(|t| t == "image_url")
+                            .unwrap_or(false)
+                        {
+                            let path = obj
+                                .get("_meta")
+                                .and_then(|meta| {
+                                    if let serde_json::Value::Object(meta_obj) = meta {
+                                        meta_obj.get("path").and_then(|p| p.as_str())
+                                    } else {
+                                        None
+                                    }
+                                })
+                                .unwrap_or("");
+                            let placeholder = if path.is_empty() {
+                                "[image omitted]".to_string()
+                            } else {
+                                format!("[image: {}]", path)
+                            };
+                            new_content.push(serde_json::json!({
+                                "type": "text",
+                                "text": placeholder,
+                            }));
+                            found = true;
+                        } else {
+                            new_content.push(b.clone());
+                        }
+                    } else {
+                        new_content.push(b.clone());
+                    }
+                }
+                let mut new_msg = msg.clone();
+                new_msg["content"] = serde_json::Value::Array(new_content);
+                result.push(new_msg);
+            } else {
+                result.push(msg.clone());
+            }
+        }
+        if found { Some(result) } else { None }
+    }
+
+    async fn safe_chat(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse
+    {
+
+        match AssertUnwindSafe(
+            self.chat(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
+        )
+        .catch_unwind()
+        .await
+        {
+            Ok(resp) => resp,
+            Err(panic_info) => {
+                let err_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                LLMResponse {
+                    content: Some(format!("Error calling LLM: {err_msg}")),
+                    finish_reason: "error".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                }
+            }
+        }
+    }
+
+    /// Stream a chat completion, calling `on_content_delta` for each text chunk.
+    ///
+    /// The default implementation falls back to a non-streaming call and delivers the
+    /// full content as a single delta. Providers that support native streaming should override this method.
+    ///
+    /// # Arguments
+    /// * `messages` - List of message maps with "role" and "content".
+    /// * `tools` - Optional vector of tool definition maps.
+    /// * `model` - Optional model identifier (provider-specific).
+    /// * `max_tokens` - Maximum tokens in response.
+    /// * `temperature` - Sampling temperature.
+    /// * `reasoning_effort` - Optional reasoning effort string.
+    /// * `tool_choice` - Tool selection strategy ("auto", "required", or specific tool map/string).
+    /// * `on_content_delta` - Optional async function taking a string that will be called with content delta text.
+    ///
+    /// # Returns
+    /// An LLMResponse containing the result.
+    ///
+    /// # Notes
+    /// This dummy implementation can be overridden by providers supporting real streaming.
+    #[allow(unused_variables)]
+    async fn chat_stream<F, Fut>(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: Option<F>,
+    ) -> LLMResponse
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let response = self.chat(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        ).await;
+
+        if let Some(on_delta) = on_content_delta {
+            if let Some(ref content) = response.content {
+                on_delta(content.clone()).await;
+            }
+        }
+
+        response
+    }
+
+    #[allow(unused_variables)]
+    async fn safe_chat_stream<F, Fut>(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: Option<F>,
+    ) -> LLMResponse
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        match AssertUnwindSafe(
+            self.chat_stream(messages, tools, model, max_tokens, temperature,
+                reasoning_effort, tool_choice, on_content_delta)
+        )
+        .catch_unwind()
+        .await
+        {
+            Ok(resp) => resp,
+            Err(panic_info) => {
+                let err_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                    s.to_string()
+                } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                    s.clone()
+                } else {
+                    "unknown panic".to_string()
+                };
+                LLMResponse {
+                    content: Some(format!("Error calling LLM: {err_msg}")),
+                    finish_reason: "error".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                }
+            }
+        }
+
+    }
+
+    /// Calls chat() with retry logic on transient provider failures.
+    ///
+    /// Parameters default to self.generation when not explicitly passed,
+    /// so callers do not need to thread temperature / max_tokens / reasoning_effort through every layer.
+    async fn chat_with_retry(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse {
+        // Fallback to default values from generation_settings if not specified.
+        let gs = self.generation_settings();
+        let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
+        let temperature = temperature.unwrap_or(gs.temperature);
+        let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
+
+        // Helper closure for calling self.chat and handling .await
+        async fn call_safe_chat<T: LLMProvider + ?Sized>(
+            provider: &T,
+            messages: Vec<serde_json::Value>,
+            tools: Option<Vec<serde_json::Value>>,
+            model: Option<String>,
+            max_tokens: usize,
+            temperature: f32,
+            reasoning_effort: Option<String>,
+            tool_choice: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            provider.safe_chat(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                reasoning_effort,
+                tool_choice,
+            )
+            .await
+        }
+
+        // The retry loop.
+        let mut last_response = None;
+        for (attempt, delay) in Self::CHAT_RETRY_DELAYS.iter().enumerate() {
+            let response = call_safe_chat(
+                self,
+                messages.clone(),
+                tools.clone(),
+                model.clone(),
+                max_tokens,
+                temperature,
+                reasoning_effort.clone(),
+                tool_choice.clone(),
+            )
+            .await;
+
+            // If finish_reason is not "error", return response.
+            if response.finish_reason != "error" {
+                return response;
+            }
+
+            // If the error is NOT transient, attempt to strip image content, else return.
+            if !Self::is_transient_error(response.content.as_deref()) {
+                // Attempt to strip image content and retry just once if possible.
+                if let Some(stripped) = Self::strip_image_content(&messages) {
+                    log::warn!(
+                        "Non-transient LLM error with image content, retrying without images"
+                    );
+                    // Retry immediately with stripped messages.
+                    return call_safe_chat(
+                        self,
+                        stripped,
+                        tools.clone(),
+                        model.clone(),
+                        max_tokens,
+                        temperature,
+                        reasoning_effort.clone(),
+                        tool_choice.clone(),
+                    )
+                    .await;
+                }
+                // All else failed, return last response.
+                return response;
+            }
+            // Otherwise, transient error; log and sleep before retrying.
+            log::warn!(
+                "LLM transient error (attempt {}/{}) retrying in {}s: {}",
+                attempt + 1,
+                Self::CHAT_RETRY_DELAYS.len(),
+                delay,
+                response.content.as_deref().unwrap_or("").get(..120).unwrap_or(""),
+            );
+
+            // Sleep the retry delay.
+            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+
+            last_response = Some(response);
+        }
+        // Last attempt after retries exhausted
+        call_safe_chat(
+            self,
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        )
+        .await
+    }
+    
 }
 
 #[cfg(test)]
@@ -346,15 +677,56 @@ mod tests {
 
         async fn chat(
             &self,
-            messages: Vec<std::collections::HashMap<String, serde_json::Value>>,
-            tools: Option<Vec<std::collections::HashMap<String, serde_json::Value>>>,
+            messages: Vec<serde_json::Value>,
+            tools: Option<Vec<serde_json::Value>>,
             model: Option<String>,
             max_tokens: usize,
             temperature: f32,
             reasoning_effort: Option<String>,
             tool_choice: Option<serde_json::Value>,
         ) -> LLMResponse {
-            LLMResponse::new()
+            LLMResponse {
+                content: Some("Hello, world!".to_string()),
+                finish_reason: "stop".to_string(),
+                tool_calls: Vec::new(),
+                usage: std::collections::HashMap::new(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            }
+        }
+
+        fn get_default_model(&self) -> String {
+            return "test".to_string();
+        }
+
+        async fn chat_stream<F, Fut>(
+            &self,
+            messages: Vec<serde_json::Value>,
+            tools: Option<Vec<serde_json::Value>>,
+            model: Option<String>,
+            max_tokens: usize,
+            temperature: f32,
+            reasoning_effort: Option<String>,
+            tool_choice: Option<serde_json::Value>,
+            on_content_delta: Option<F>,
+        ) -> LLMResponse
+        where
+            F: Fn(String) -> Fut + Send + Sync,
+            Fut: std::future::Future<Output = ()> + Send,
+        {
+            if let Some(on_delta) = on_content_delta {
+                on_delta("Hello, ".to_string()).await;
+                on_delta("world!".to_string()).await;
+            }
+            let response = LLMResponse {
+                content: Some("Hello, world!".to_string()),
+                finish_reason: "stop".to_string(),
+                tool_calls: Vec::new(),
+                usage: std::collections::HashMap::new(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            };
+            response
         }
     }
 
@@ -503,7 +875,7 @@ mod tests {
                 .map(|s| s.to_string())
                 .collect::<HashSet<String>>(),
         );
-        let messages_values = vec![
+        let messages = vec![
             serde_json::json!({
                 "role": "user",
                 "content": "Hello",
@@ -515,10 +887,200 @@ mod tests {
                 "secret": "should be stripped"
             }),
         ];
-        let messages = messages_values.iter()
-            .map(|v| v.as_object().unwrap().clone())
-            .collect();
         let res = TestLLMProvider::sanitize_request_messages(&messages, &allowed_keys);
         assert_eq!(res.len(), 2);
+    }
+
+    #[test]
+    fn test_is_transient_error() {
+        assert!(TestLLMProvider::is_transient_error(Some(
+            "429: Too Many Requests"
+        )));
+        assert!(TestLLMProvider::is_transient_error(Some(
+            "rate limit exceeded"
+        )));
+        assert!(TestLLMProvider::is_transient_error(Some(
+            "500: Internal Server Error"
+        )));
+        assert!(TestLLMProvider::is_transient_error(Some(
+            "502: Bad Gateway"
+        )));
+        assert!(TestLLMProvider::is_transient_error(Some(
+            "503: Service Unavailable"
+        )));
+        assert!(TestLLMProvider::is_transient_error(Some(
+            "504: Gateway Timeout"
+        )));
+    }
+
+    #[test]
+    fn test_is_transient_error_false() {
+        assert!(!TestLLMProvider::is_transient_error(None));
+        assert!(!TestLLMProvider::is_transient_error(Some("banana error")));
+    }
+
+    #[test]
+    fn test_strip_image_content() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "image_url", "_meta": {
+                    "path": "https://test.com/image.png"
+                }}]
+            }
+        )];
+        let result = TestLLMProvider::strip_image_content(&messages);
+        println!("result: {}", serde_json::to_string_pretty(&result.clone().unwrap()).unwrap());
+        assert!(result.is_some());
+        assert_eq!(result.unwrap().len(), 1);
+    }
+
+    
+    #[test]
+    fn test_strip_image_content_no_images() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Hello, world!"}]
+            }
+        )];
+        let result = TestLLMProvider::strip_image_content(&messages);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn test_safe_chat() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Hello, world!"}]
+            }
+        )];
+        let tools = vec![serde_json::json!(
+            {
+                "name": "test_tool",
+                "description": "Test tool",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "test_param": {
+                            "type": "string",
+                            "description": "Test parameter"
+                        }
+                    }
+                }
+            }
+        )];
+        let llm_provider = create_test_llm_provider();
+        let result = llm_provider.safe_chat(
+            messages,
+            Some(tools),
+            None,
+            4096,
+            0.0,
+            None,
+            None,
+        ).await;
+        println!("result: {}", result.content.unwrap());
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Hello, world!"}]
+            }
+        )];
+        let llm_provider = create_test_llm_provider();
+        let result = llm_provider.chat_stream(
+            messages,
+            None,
+            None,
+            4096,
+            0.0,
+            None,
+            None,
+            None::<fn(String) -> std::future::Ready<()>>,
+        ).await;
+        assert_eq!(result.content, Some("Hello, world!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_chat_stream_with_on_content_delta() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "assistant",
+                "type": "message",
+                "content": [{"type": "text", "text": "Hello, world!"}]
+            }
+        )];
+        let llm_provider = create_test_llm_provider();
+        let result = llm_provider.chat_stream(
+            messages,
+            None,
+            None,
+            4096,
+            0.0,
+            None,
+            None,
+            Some(|content| async move {
+                println!("content: {}", content);
+            }),
+        ).await;
+        assert_eq!(result.content, Some("Hello, world!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_safe_chat_stream() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "user",
+                "type": "message",
+                "content": [{"type": "text", "text": "Hello, world!"}]
+            }
+        )];
+    
+        let llm_provider = create_test_llm_provider();
+        let result = llm_provider.safe_chat_stream(
+            messages,
+            None,
+            None,
+            4096,
+            0.0,
+            None,
+            None,
+            None::<fn(String) -> std::future::Ready<()>>,
+        ).await;
+        assert_eq!(result.content, Some("Hello, world!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_safe_chat_stream_with_on_content_delta() {
+        let messages = vec![serde_json::json!(
+            {
+                "role": "user",
+                "type": "message",
+                "content": [{"type": "text", "text": "Hello, world!"}]
+            }
+        )];
+        let llm_provider = create_test_llm_provider();
+        let result = llm_provider.safe_chat_stream(
+            messages,
+            None,
+            None,
+            4096,
+            0.0,
+            None,
+            None,
+            Some(|content| async move {
+                println!("content: {}", content);
+            }),
+        ).await;
+        assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
 }

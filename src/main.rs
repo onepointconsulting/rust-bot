@@ -1,7 +1,9 @@
 mod bus;
 mod agent;
 mod providers;
+mod config;
 
 fn main() {
-    println!("Hello, world!");
+    config::log::init_logger();
+    log::info!("Starting the bot");
 }
