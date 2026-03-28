@@ -126,4 +126,19 @@ mod tests {
         let value = OpenAICompatProvider::get_value(&obj, "key");
         assert_eq!(value, Some(serde_json::json!("value")));
     }
+
+    #[test]
+    fn test_coerce_null() {
+        let value = serde_json::json!(null);
+        let result = OpenAICompatProvider::coerce_map(&value);
+        assert_eq!(result, None);
+    }
+
+    #[test]
+    fn test_coerce_object() {
+        let value = serde_json::json!({ "key": "value" });
+        let result = OpenAICompatProvider::coerce_map(&value);
+        let check = serde_json::json!({ "key": "value" }).as_object().unwrap().clone();
+        assert_eq!(result, Some(check));
+    }
 }
