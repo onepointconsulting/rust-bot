@@ -642,7 +642,7 @@ pub trait LLMProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet, fs};
+    use std::{collections::HashSet};
 
     struct TestLLMProvider {
         api_key: Option<String>,
