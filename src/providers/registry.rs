@@ -20,7 +20,7 @@ pub struct ProviderSpec {
     pub is_local: bool,                      // local deployment (vLLM, Ollama)
     pub detect_by_key_prefix: String,        // match api_key prefix, e.g. "sk-or-"
     pub detect_by_base_keyword: String,      // match substring in api_base URL
-    pub default_api_base: String,            // OpenAI-compatible base URL for this provider
+    pub default_api_base: Option<String>,            // OpenAI-compatible base URL for this provider
 
     // gateway behavior
     pub strip_model_prefix: bool,            // strip "provider/" before sending to gateway
@@ -66,7 +66,7 @@ impl Default for ProviderSpec {
             is_local: false,
             detect_by_key_prefix: String::new(),
             detect_by_base_keyword: String::new(),
-            default_api_base: String::new(),
+            default_api_base: None,
             strip_model_prefix: false,
             model_overrides: Vec::new(),
             is_oauth: false,
