@@ -1,3 +1,4 @@
+use async_openai::{Client, config::OpenAIConfig};
 use crate::providers::{base::{LLMProvider, GenerationSettings}, registry::ProviderSpec};
 use std::collections::HashMap;
 
@@ -8,9 +9,13 @@ pub struct OpenAICompatProvider {
     extra_headers: HashMap<String, String>,
     spec: Option<ProviderSpec>,
     generation: GenerationSettings,
+    client: Client<OpenAIConfig>,
 }
 
 impl OpenAICompatProvider {
+
+    const DEFAULT_MODEL: &str = "gpt-5-mini";
+
     // Allowed message keys for OpenAI-compatible messages
     const ALLOWED_MSG_KEYS: &[&str] = &[
         "role",
@@ -247,14 +252,20 @@ impl OpenAICompatProvider {
 }
 
 impl LLMProvider for OpenAICompatProvider {
-    fn new(api_key: Option<String>, api_base: Option<String>) -> Self {
+    fn new(
+        api_key: Option<String>,
+        api_base: Option<String>,
+        default_model: Option<String>,
+        extra_headers: Option<HashMap<String, String>>,
+        spec: Option<ProviderSpec>
+    ) -> Self {
         // Defaults based on Python signature.
         // In the Rust implementation, additional fields like default_model, extra_headers, spec,
         // client, etc., must be handled in the struct definition, but are omitted/handled elsewhere for clarity.
-        let default_model = "gpt-5-mini".to_string();
+        let default_model = default_model.unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string());
         let extra_headers: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        let spec: Option<ProviderSpec> = None;
+            extra_headers.unwrap_or_else(|| std::collections::HashMap::new());
+        let spec: Option<ProviderSpec> = spec.clone();
 
         // Compute effective_base.
         let effective_base = api_base
@@ -283,20 +294,35 @@ impl LLMProvider for OpenAICompatProvider {
             default_headers.insert(k.clone(), v.clone());
         }
 
-        // Build the async client; placeholder, actual details depend on struct layout.
-        // let _client = AsyncOpenAI::new(
-        //     api_key.clone().unwrap_or_else(|| "no-key".to_string()),
-        //     effective_base.clone(),
-        //     default_headers.clone()
-        // );
+        // Build OpenAIConfig with api_key, optional base URL, and all merged headers.
+        let mut config = OpenAIConfig::new();
+        if let Some(ref key) = api_key {
+            config = config.with_api_key(key);
+        }
+        if let Some(ref base) = effective_base {
+            config = config.with_api_base(base);
+        }
+        for (k, v) in &default_headers {
+            use reqwest::header::HeaderName;
+            let header_name = HeaderName::from_bytes(k.as_bytes()).unwrap_or_else(|e| {
+                log::error!("Invalid HTTP header name '{}': {}", k, e);
+                panic!("Invalid HTTP header name '{}': {}", k, e);
+            });
+            config = config.with_header(header_name, v.as_str()).unwrap_or_else(|e| {
+                log::error!("Invalid HTTP header value for '{}': {}", k, e);
+                panic!("Invalid HTTP header value for '{}': {}", k, e);
+            });
+        }
+        let client = Client::with_config(config);
 
         let provider = Self {
             api_key,
             api_base: effective_base,
             default_model: Some(default_model),
             extra_headers,
-            spec: spec.clone(),
+            spec: spec,
             generation: GenerationSettings::new(),
+            client,
         };
 
         // Setup environment if appropriate.
@@ -321,10 +347,18 @@ impl LLMProvider for OpenAICompatProvider {
         &mut self.generation
     }
 
+    fn extra_headers(&self) -> Option<HashMap<String, String>> {
+        Some(self.extra_headers.clone())
+    }
+
+    fn spec(&self) -> Option<&ProviderSpec> {
+        self.spec.as_ref()
+    }
+
     fn get_default_model(&self) -> String {
         self.default_model
             .clone()
-            .unwrap_or_else(|| "gpt-4o-mini".to_string())
+            .unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string())
     }
 
     async fn chat(

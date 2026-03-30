@@ -2,6 +2,8 @@ use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use futures::FutureExt;
 
+use crate::providers::registry::ProviderSpec;
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct ToolCallRequest {
     /// A tool call request from the LLM.
@@ -138,7 +140,13 @@ pub trait LLMProvider {
     ///         self.api_key = api_key
     ///         self.api_base = api_base
     ///         self.generation: GenerationSettings = GenerationSettings()
-    fn new(api_key: Option<String>, api_base: Option<String>) -> Self
+    fn new(
+        api_key: Option<String>,
+        api_base: Option<String>,
+        default_model: Option<String>,
+        extra_headers: Option<HashMap<String, String>>,
+        spec: Option<ProviderSpec>
+    ) -> Self
     where
         Self: Sized;
 
@@ -148,11 +156,16 @@ pub trait LLMProvider {
     /// Returns a reference to the provider's API base, if set.
     fn api_base(&self) -> Option<String>;
 
+    fn extra_headers(&self) -> Option<HashMap<String, String>>;
+
     /// Returns a reference to the provider's GenerationSettings.
     fn generation_settings(&self) -> &GenerationSettings;
 
     /// Returns a mutable reference to the provider's GenerationSettings.
     fn generation_settings_mut(&mut self) -> &mut GenerationSettings;
+
+    /// Returns a reference to the provider's ProviderSpec, if set.
+    fn spec(&self) -> Option<&ProviderSpec>;
 
     /// Sanitize message content: fix empty blocks, strip internal _meta fields.
     /// Equivalent to the python static method `_sanitize_empty_content`.
@@ -651,7 +664,13 @@ mod tests {
     }
 
     impl LLMProvider for TestLLMProvider {
-        fn new(api_key: Option<String>, api_base: Option<String>) -> Self {
+        fn new(
+            api_key: Option<String>,
+            api_base: Option<String>,
+            _default_model: Option<String>,
+            _extra_headers: Option<HashMap<String, String>>,
+            _spec: Option<ProviderSpec>
+        ) -> Self {
             Self {
                 api_key,
                 api_base,
@@ -673,6 +692,14 @@ mod tests {
 
         fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
             return &mut self.generation;
+        }
+
+        fn extra_headers(&self) -> Option<HashMap<String, String>> {
+            return None;
+        }
+
+        fn spec(&self) -> Option<&ProviderSpec> {
+            return None;
         }
 
         async fn chat(
@@ -763,6 +790,9 @@ mod tests {
         TestLLMProvider::new(
             Some("test".to_string()),
             Some("https://test.com".to_string()),
+            Some("test".to_string()),
+            None,
+            None
         )
     }
 
