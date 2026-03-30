@@ -1,5 +1,8 @@
+use crate::providers::{
+    base::{GenerationSettings, LLMProvider},
+    registry::ProviderSpec,
+};
 use async_openai::{Client, config::OpenAIConfig};
-use crate::providers::{base::{LLMProvider, GenerationSettings}, registry::ProviderSpec};
 use std::collections::HashMap;
 
 pub struct OpenAICompatProvider {
@@ -13,7 +16,6 @@ pub struct OpenAICompatProvider {
 }
 
 impl OpenAICompatProvider {
-
     const DEFAULT_MODEL: &str = "gpt-5-mini";
 
     // Allowed message keys for OpenAI-compatible messages
@@ -228,9 +230,13 @@ impl OpenAICompatProvider {
             });
             // SAFETY: single-threaded at provider init time; no other threads read this env var concurrently.
             if spec.is_gateway {
-                unsafe { std::env::set_var(&spec.env_key, &api_key); }
+                unsafe {
+                    std::env::set_var(&spec.env_key, &api_key);
+                }
             } else if std::env::var_os(&spec.env_key).is_none() {
-                unsafe { std::env::set_var(&spec.env_key, &api_key); }
+                unsafe {
+                    std::env::set_var(&spec.env_key, &api_key);
+                }
             }
 
             let effective_base_str = api_base
@@ -244,7 +250,9 @@ impl OpenAICompatProvider {
                     .replace("{api_key}", api_key.as_str())
                     .replace("{api_base}", effective_base_str);
                 if std::env::var_os(env_name).is_none() {
-                    unsafe { std::env::set_var(env_name, resolved); }
+                    unsafe {
+                        std::env::set_var(env_name, resolved);
+                    }
                 }
             }
         }
@@ -257,12 +265,13 @@ impl LLMProvider for OpenAICompatProvider {
         api_base: Option<String>,
         default_model: Option<String>,
         extra_headers: Option<HashMap<String, String>>,
-        spec: Option<ProviderSpec>
+        spec: Option<ProviderSpec>,
     ) -> Self {
         // Defaults based on Python signature.
         // In the Rust implementation, additional fields like default_model, extra_headers, spec,
         // client, etc., must be handled in the struct definition, but are omitted/handled elsewhere for clarity.
-        let default_model = default_model.unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string());
+        let default_model =
+            default_model.unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string());
         let extra_headers: std::collections::HashMap<String, String> =
             extra_headers.unwrap_or_else(|| std::collections::HashMap::new());
         let spec: Option<ProviderSpec> = spec.clone();
@@ -308,10 +317,12 @@ impl LLMProvider for OpenAICompatProvider {
                 log::error!("Invalid HTTP header name '{}': {}", k, e);
                 panic!("Invalid HTTP header name '{}': {}", k, e);
             });
-            config = config.with_header(header_name, v.as_str()).unwrap_or_else(|e| {
-                log::error!("Invalid HTTP header value for '{}': {}", k, e);
-                panic!("Invalid HTTP header value for '{}': {}", k, e);
-            });
+            config = config
+                .with_header(header_name, v.as_str())
+                .unwrap_or_else(|e| {
+                    log::error!("Invalid HTTP header value for '{}': {}", k, e);
+                    panic!("Invalid HTTP header value for '{}': {}", k, e);
+                });
         }
         let client = Client::with_config(config);
 
