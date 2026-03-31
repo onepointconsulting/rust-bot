@@ -1,8 +1,15 @@
 use crate::providers::{
-    base::{GenerationSettings, LLMProvider},
-    registry::ProviderSpec,
+    base::{GenerationSettings, LLMProvider}, cache_control::apply_cache_control, registry::ProviderSpec
 };
-use async_openai::{Client, config::OpenAIConfig};
+use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
+    FunctionCall,
+};
 use std::collections::HashMap;
 
 pub struct OpenAICompatProvider {
@@ -257,6 +264,211 @@ impl OpenAICompatProvider {
             }
         }
     }
+
+    fn sanitize_messages(messages: &[serde_json::Value]) -> Vec<serde_json::Value> {
+        // Strip non-standard keys, normalize tool_call IDs.
+
+        // Prepare allowed_keys as a HashSet<String>.
+        let allowed_keys: std::collections::HashSet<String> =
+            OpenAICompatProvider::ALLOWED_MSG_KEYS
+                .iter()
+                .map(|s| s.to_string())
+                .collect();
+
+        // Sanitize: strip nonstandard keys.
+        let mut sanitized =
+            <Self as LLMProvider>::sanitize_request_messages(messages, &allowed_keys);
+
+        // id_map: maps original id string -> normalized id string
+        let mut id_map: HashMap<String, String> = HashMap::new();
+
+        // Use normalize_tool_call_id from sanitizer.rs
+        fn map_id(
+            id_map: &mut HashMap<String, String>,
+            value: &serde_json::Value,
+        ) -> serde_json::Value {
+            // If not a string, return as is
+            if let Some(s) = value.as_str() {
+                // Use crate::providers::sanitizer::normalize_tool_call_id for normalization
+                // Don't import at this scope, just call fully qualified
+                let v = id_map.entry(s.to_string()).or_insert_with(|| {
+                    let normalized = crate::providers::sanitizer::normalize_tool_call_id(
+                        &serde_json::Value::String(s.to_string()),
+                    );
+                    normalized.as_str().unwrap_or(s).to_string()
+                });
+                serde_json::Value::String(v.clone())
+            } else {
+                value.clone()
+            }
+        }
+
+        for clean in sanitized.iter_mut() {
+            // tool_calls normalization
+            if let Some(tool_calls) = clean.get_mut("tool_calls") {
+                if let Some(tc_arr) = tool_calls.as_array_mut() {
+                    let mut normalized = Vec::with_capacity(tc_arr.len());
+                    for tc in tc_arr.drain(..) {
+                        if let Some(mut tc_obj) = tc.as_object().cloned() {
+                            // Normalize id
+                            let id_val =
+                                tc_obj.get("id").cloned().unwrap_or(serde_json::Value::Null);
+                            tc_obj.insert("id".to_string(), map_id(&mut id_map, &id_val));
+                            normalized.push(serde_json::Value::Object(tc_obj));
+                        } else {
+                            // Not an object, leave as-is
+                            normalized.push(tc);
+                        }
+                    }
+                    *tool_calls = serde_json::Value::Array(normalized);
+                }
+            }
+            // tool_call_id normalization
+            if let Some(val) = clean.get_mut("tool_call_id") {
+                if !val.is_null() {
+                    *val = map_id(&mut id_map, val);
+                }
+            }
+        }
+
+        sanitized
+    }
+
+    fn build_request(
+        &self, 
+        messages: &[serde_json::Value], 
+        tools: Option<Vec<serde_json::Value>>, 
+        model: Option<String>, 
+        max_tokens: usize, 
+        temperature: f32, 
+        reasoning_effort: Option<String>, 
+        tool_choice: Option<serde_json::Value>) -> CreateChatCompletionRequestArgs {
+            let mut model_name = model.unwrap_or_else(|| self.get_default_model());
+            let spec_option = self.spec.as_ref();
+            let mut messages = messages;
+            let (cached_messages, cached_tools) = if let Some(spec) = spec_option {
+                if spec.supports_prompt_caching {
+                    let (new_messages, new_tools) =
+                        apply_cache_control(&messages, tools.as_ref().map(|t| t.as_slice()));
+                        (Some(new_messages), new_tools)
+                } else {
+                    (None, None)
+                }
+            } else {
+                (None, None)
+            };
+            if let Some(ref cached) = cached_messages {
+                messages = cached.as_slice();
+            }
+            if let Some(spec) = spec_option {
+                if spec.strip_model_prefix {
+                    model_name = model_name.rsplitn(2, '/').next().unwrap_or(&model_name).to_string();
+                }
+            }
+            let sanitized_messages = Self::sanitize_messages(
+                OpenAICompatProvider::sanitize_empty_content(messages).as_slice()
+            );
+            let chat_messages: Vec<ChatCompletionRequestMessage> = sanitized_messages
+                .iter()
+                .filter_map(|msg| {
+                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                    let content_str = msg
+                        .get("content")
+                        .and_then(|c| c.as_str())
+                        .unwrap_or("")
+                        .to_string();
+                    match role {
+                        "system" => ChatCompletionRequestSystemMessageArgs::default()
+                            .content(content_str)
+                            .build()
+                            .ok()
+                            .map(Into::into),
+                        "assistant" => {
+                            let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
+                            if !content_str.is_empty() {
+                                builder.content(content_str);
+                            }
+                            if let Some(tcs_val) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                                let tcs: Vec<ChatCompletionMessageToolCalls> = tcs_val
+                                    .iter()
+                                    .filter_map(|tc| {
+                                        let id = tc.get("id")?.as_str()?.to_string();
+                                        let func = tc.get("function")?;
+                                        let name = func.get("name")?.as_str()?.to_string();
+                                        let arguments = func
+                                            .get("arguments")
+                                            .map(|a| {
+                                                a.as_str()
+                                                    .map(str::to_string)
+                                                    .unwrap_or_else(|| a.to_string())
+                                            })
+                                            .unwrap_or_default();
+                                        Some(ChatCompletionMessageToolCalls::Function(
+                                            ChatCompletionMessageToolCall {
+                                                id,
+                                                function: FunctionCall { name, arguments },
+                                            },
+                                        ))
+                                    })
+                                    .collect();
+                                if !tcs.is_empty() {
+                                    builder.tool_calls(tcs);
+                                }
+                            }
+                            builder.build().ok().map(Into::into)
+                        }
+                        "tool" => {
+                            let tool_call_id = msg
+                                .get("tool_call_id")
+                                .and_then(|v| v.as_str())
+                                .unwrap_or("")
+                                .to_string();
+                            Some(ChatCompletionRequestMessage::Tool(
+                                ChatCompletionRequestToolMessage {
+                                    content: ChatCompletionRequestToolMessageContent::Text(content_str),
+                                    tool_call_id,
+                                },
+                            ))
+                        }
+                        _ => ChatCompletionRequestUserMessageArgs::default()
+                            .content(content_str)
+                            .build()
+                            .ok()
+                            .map(Into::into),
+                    }
+                })
+                .collect();
+            let mut request = CreateChatCompletionRequestArgs::default();
+            request.model(model_name);
+            request.messages(chat_messages);
+            request.max_tokens(max_tokens as u32);
+            request.temperature(temperature);
+
+            // Prefer cache-annotated tools over the originals; deserialize from JSON.
+            let effective_tools = cached_tools.or(tools);
+            if let Some(tool_list) = effective_tools {
+                let typed_tools: Vec<ChatCompletionTools> = tool_list
+                    .into_iter()
+                    .filter_map(|t| serde_json::from_value(t).ok())
+                    .collect();
+                if !typed_tools.is_empty() {
+                    request.tools(typed_tools);
+                }
+            }
+
+            if let Some(effort) = reasoning_effort {
+                if let Ok(typed_effort) = serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(effort)) {
+                    request.reasoning_effort(typed_effort);
+                }
+            }
+            if let Some(tc) = tool_choice {
+                if let Ok(typed_tc) = serde_json::from_value::<ChatCompletionToolChoiceOption>(tc) {
+                    request.tool_choice(typed_tc);
+                }
+            }
+
+            request
+    }
 }
 
 impl LLMProvider for OpenAICompatProvider {
@@ -474,5 +686,31 @@ mod tests {
             Some(&spec),
             None
         ));
+    }
+
+    #[test]
+    fn test_sanitize_messages() {
+        let messages = vec![
+            serde_json::json!({ 
+                "role": "system", 
+                "content": "You are a helpful assistant.", 
+                "foo": "bar" 
+            }),
+            serde_json::json!({ 
+                "role": "user", 
+                "content": "Hello, how are you?", 
+                "foo": "bar" 
+            })
+        ];
+        let sanitized = OpenAICompatProvider::sanitize_messages(&messages);
+        assert_eq!(sanitized.len(), 2);
+        assert_eq!(
+            sanitized[0],
+            serde_json::json!({ "role": "system", "content": "You are a helpful assistant." })
+        );
+        assert_eq!(
+            sanitized[1],
+            serde_json::json!({ "role": "user", "content": "Hello, how are you?" })
+        );
     }
 }
