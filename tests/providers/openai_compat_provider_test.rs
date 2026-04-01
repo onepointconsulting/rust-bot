@@ -16,24 +16,30 @@ fn read_env() -> (String, String, String) {
 fn create_openrouter_provider() -> OpenAICompatProvider {
     let (openai_api_key, openai_api_base, openai_api_model) = read_env();
     let mut extra_headers = HashMap::new();
-    extra_headers.insert("x-session-affinity".to_string(), Uuid::new_v4().simple().to_string());
+    extra_headers.insert(
+        "x-session-affinity".to_string(),
+        Uuid::new_v4().simple().to_string(),
+    );
     <OpenAICompatProvider as LLMProvider>::new(
-        Some(openai_api_key), 
+        Some(openai_api_key),
         Some(openai_api_base),
-        Some(openai_api_model), 
+        Some(openai_api_model),
         Some(extra_headers),
-        None
+        None,
     )
 }
 
 fn create_openrouter_provider_with_spec() -> OpenAICompatProvider {
     let (openai_api_key, openai_api_base, openai_api_model) = read_env();
     let mut extra_headers = HashMap::new();
-    extra_headers.insert("x-session-affinity".to_string(), Uuid::new_v4().simple().to_string());
+    extra_headers.insert(
+        "x-session-affinity".to_string(),
+        Uuid::new_v4().simple().to_string(),
+    );
     <OpenAICompatProvider as LLMProvider>::new(
-        Some(openai_api_key), 
+        Some(openai_api_key),
         None,
-        Some(openai_api_model), 
+        Some(openai_api_model),
         None,
         Some(ProviderSpec {
             name: "openrouter".to_string(),
@@ -52,7 +58,7 @@ fn create_openrouter_provider_with_spec() -> OpenAICompatProvider {
             is_oauth: false,
             is_direct: false,
             supports_prompt_caching: false,
-        })
+        }),
     )
 }
 
@@ -93,33 +99,60 @@ async fn simple_test_chat_system(system_message: &str, user_message: &str) -> LL
         serde_json::json!({
             "role": "user",
             "content": user_message
-        })
+        }),
     ];
-    let response = provider.chat(messages, None, None, 100, 0.5, None, None).await;
+    let response = provider
+        .chat(messages, None, None, 100, 0.5, None, None)
+        .await;
     response
 }
 
 async fn simple_test_chat(message: &str) -> LLMResponse {
     let provider = create_openrouter_provider();
-    let messages = vec![
-        serde_json::json!({
-            "role": "user",
-            "content": message
-        })
-    ];
-    let response = provider.chat(messages, None, None, 100, 0.5, None, None).await;
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": message
+    })];
+    let response = provider
+        .chat(messages, None, None, 100, 0.5, None, None)
+        .await;
     response
+}
+
+fn simple_weather_tool() -> serde_json::Value {
+    serde_json::json!({
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get the current weather for a given location",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "location": {
+              "type": "string",
+              "description": "The city and country, e.g. 'London, UK'"
+            },
+            "unit": {
+              "type": "string",
+              "enum": ["celsius", "fahrenheit"],
+              "description": "The temperature unit to use"
+            }
+          },
+          "required": ["location"]
+        }
+      }
+    })
 }
 
 async fn simple_test_safe_chat(message: &str) -> LLMResponse {
     let provider = create_openrouter_provider();
-    let messages = vec![
-        serde_json::json!({
-            "role": "user",
-            "content": message
-        })
-    ];
-    let response = provider.safe_chat(messages, None, None, 100, 0.5, None, None).await;
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": message
+    })];
+    let response = provider
+        .safe_chat(messages, Some(vec![simple_weather_tool()]), None, 100, 0.5, None, None)
+        .await;
     response
 }
 
@@ -142,7 +175,8 @@ async fn test_who_are_you() {
 
 #[tokio::test]
 async fn test_who_are_you_safe() {
-    let response = simple_test_safe_chat("Who are you? And what is your knowledge cut-off date?").await;
+    let response =
+        simple_test_safe_chat("Who are you? And what is your knowledge cut-off date?").await;
     assert!(response.content.is_some());
     println!("response: {}", response.content.unwrap());
     assert!(response.finish_reason == "stop");
@@ -152,9 +186,22 @@ async fn test_who_are_you_safe() {
 async fn test_who_are_you_system() {
     let response = simple_test_chat_system(
         "You are a helpful assistant who loves jokes. You always respond with a joke.",
-        "Who are you? And what is your knowledge cut-off date?"
-    ).await;
+        "Who are you? And what is your knowledge cut-off date?",
+    )
+    .await;
     assert!(response.content.is_some());
     println!("response: {}", response.content.unwrap());
     println!("finish reason: {}", response.finish_reason);
+    assert!(response.tool_calls.is_empty());
+}
+
+#[tokio::test]
+async fn test_who_are_you_system_safe() {
+    let response = simple_test_safe_chat(
+        "How is the weather in London?",
+    )
+    .await;
+    assert!(response.content.is_none());
+    println!("finish reason: {}", response.finish_reason);
+    assert!(!response.tool_calls.is_empty());
 }
