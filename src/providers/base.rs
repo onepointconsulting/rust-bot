@@ -649,6 +649,17 @@ pub trait LLMProvider {
         )
         .await
     }
+
+    fn handle_error(e: Box<dyn std::error::Error>) -> crate::providers::base::LLMResponse {
+        return crate::providers::base::LLMResponse {
+            content: Some(e.to_string()),
+            finish_reason: "error".to_string(),
+            tool_calls: Vec::new(),
+            usage: HashMap::new(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        };
+    }
     
 }
 

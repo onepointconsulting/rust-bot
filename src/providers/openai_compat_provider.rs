@@ -1,15 +1,12 @@
 use crate::providers::{
-    base::{GenerationSettings, LLMProvider}, cache_control::apply_cache_control, registry::ProviderSpec
+    base::{GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest},
+    cache_control::apply_cache_control,
+    registry::ProviderSpec,
+};
+use async_openai::types::chat::{
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall
 };
 use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
-use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
-    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs,
-    FunctionCall,
-};
 use std::collections::HashMap;
 
 pub struct OpenAICompatProvider {
@@ -335,139 +332,223 @@ impl OpenAICompatProvider {
     }
 
     fn build_request(
-        &self, 
-        messages: &[serde_json::Value], 
-        tools: Option<Vec<serde_json::Value>>, 
-        model: Option<String>, 
-        max_tokens: usize, 
-        temperature: f32, 
-        reasoning_effort: Option<String>, 
-        tool_choice: Option<serde_json::Value>) -> CreateChatCompletionRequestArgs {
-            let mut model_name = model.unwrap_or_else(|| self.get_default_model());
-            let spec_option = self.spec.as_ref();
-            let mut messages = messages;
-            let (cached_messages, cached_tools) = if let Some(spec) = spec_option {
-                if spec.supports_prompt_caching {
-                    let (new_messages, new_tools) =
-                        apply_cache_control(&messages, tools.as_ref().map(|t| t.as_slice()));
-                        (Some(new_messages), new_tools)
-                } else {
-                    (None, None)
-                }
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> CreateChatCompletionRequestArgs {
+        let mut model_name = model.unwrap_or_else(|| self.get_default_model());
+        let spec_option = self.spec.as_ref();
+        let mut messages = messages;
+        let (cached_messages, cached_tools) = if let Some(spec) = spec_option {
+            if spec.supports_prompt_caching {
+                let (new_messages, new_tools) =
+                    apply_cache_control(&messages, tools.as_ref().map(|t| t.as_slice()));
+                (Some(new_messages), new_tools)
             } else {
                 (None, None)
-            };
-            if let Some(ref cached) = cached_messages {
-                messages = cached.as_slice();
             }
-            if let Some(spec) = spec_option {
-                if spec.strip_model_prefix {
-                    model_name = model_name.rsplitn(2, '/').next().unwrap_or(&model_name).to_string();
-                }
+        } else {
+            (None, None)
+        };
+        if let Some(ref cached) = cached_messages {
+            messages = cached.as_slice();
+        }
+        if let Some(spec) = spec_option {
+            if spec.strip_model_prefix {
+                model_name = model_name
+                    .rsplitn(2, '/')
+                    .next()
+                    .unwrap_or(&model_name)
+                    .to_string();
             }
-            let sanitized_messages = Self::sanitize_messages(
-                OpenAICompatProvider::sanitize_empty_content(messages).as_slice()
-            );
-            let chat_messages: Vec<ChatCompletionRequestMessage> = sanitized_messages
-                .iter()
-                .filter_map(|msg| {
-                    let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
-                    let content_str = msg
-                        .get("content")
-                        .and_then(|c| c.as_str())
-                        .unwrap_or("")
-                        .to_string();
-                    match role {
-                        "system" => ChatCompletionRequestSystemMessageArgs::default()
-                            .content(content_str)
-                            .build()
-                            .ok()
-                            .map(Into::into),
-                        "assistant" => {
-                            let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
-                            if !content_str.is_empty() {
-                                builder.content(content_str);
-                            }
-                            if let Some(tcs_val) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                                let tcs: Vec<ChatCompletionMessageToolCalls> = tcs_val
-                                    .iter()
-                                    .filter_map(|tc| {
-                                        let id = tc.get("id")?.as_str()?.to_string();
-                                        let func = tc.get("function")?;
-                                        let name = func.get("name")?.as_str()?.to_string();
-                                        let arguments = func
-                                            .get("arguments")
-                                            .map(|a| {
-                                                a.as_str()
-                                                    .map(str::to_string)
-                                                    .unwrap_or_else(|| a.to_string())
-                                            })
-                                            .unwrap_or_default();
-                                        Some(ChatCompletionMessageToolCalls::Function(
-                                            ChatCompletionMessageToolCall {
-                                                id,
-                                                function: FunctionCall { name, arguments },
-                                            },
-                                        ))
-                                    })
-                                    .collect();
-                                if !tcs.is_empty() {
-                                    builder.tool_calls(tcs);
-                                }
-                            }
-                            builder.build().ok().map(Into::into)
+        }
+        let sanitized_messages = Self::sanitize_messages(
+            OpenAICompatProvider::sanitize_empty_content(messages).as_slice(),
+        );
+        let chat_messages: Vec<ChatCompletionRequestMessage> = sanitized_messages
+            .iter()
+            .filter_map(|msg| {
+                let role = msg.get("role").and_then(|r| r.as_str()).unwrap_or("user");
+                let content_str = msg
+                    .get("content")
+                    .and_then(|c| c.as_str())
+                    .unwrap_or("")
+                    .to_string();
+                match role {
+                    "system" => ChatCompletionRequestSystemMessageArgs::default()
+                        .content(content_str)
+                        .build()
+                        .ok()
+                        .map(Into::into),
+                    "assistant" => {
+                        let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
+                        if !content_str.is_empty() {
+                            builder.content(content_str);
                         }
-                        "tool" => {
-                            let tool_call_id = msg
-                                .get("tool_call_id")
-                                .and_then(|v| v.as_str())
-                                .unwrap_or("")
-                                .to_string();
-                            Some(ChatCompletionRequestMessage::Tool(
-                                ChatCompletionRequestToolMessage {
-                                    content: ChatCompletionRequestToolMessageContent::Text(content_str),
-                                    tool_call_id,
-                                },
-                            ))
+                        if let Some(tcs_val) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+                            let tcs: Vec<ChatCompletionMessageToolCalls> = tcs_val
+                                .iter()
+                                .filter_map(|tc| {
+                                    let id = tc.get("id")?.as_str()?.to_string();
+                                    let func = tc.get("function")?;
+                                    let name = func.get("name")?.as_str()?.to_string();
+                                    let arguments = func
+                                        .get("arguments")
+                                        .map(|a| {
+                                            a.as_str()
+                                                .map(str::to_string)
+                                                .unwrap_or_else(|| a.to_string())
+                                        })
+                                        .unwrap_or_default();
+                                    Some(ChatCompletionMessageToolCalls::Function(
+                                        ChatCompletionMessageToolCall {
+                                            id,
+                                            function: FunctionCall { name, arguments },
+                                        },
+                                    ))
+                                })
+                                .collect();
+                            if !tcs.is_empty() {
+                                builder.tool_calls(tcs);
+                            }
                         }
-                        _ => ChatCompletionRequestUserMessageArgs::default()
-                            .content(content_str)
-                            .build()
-                            .ok()
-                            .map(Into::into),
+                        builder.build().ok().map(Into::into)
                     }
-                })
+                    "tool" => {
+                        let tool_call_id = msg
+                            .get("tool_call_id")
+                            .and_then(|v| v.as_str())
+                            .unwrap_or("")
+                            .to_string();
+                        Some(ChatCompletionRequestMessage::Tool(
+                            ChatCompletionRequestToolMessage {
+                                content: ChatCompletionRequestToolMessageContent::Text(content_str),
+                                tool_call_id,
+                            },
+                        ))
+                    }
+                    _ => ChatCompletionRequestUserMessageArgs::default()
+                        .content(content_str)
+                        .build()
+                        .ok()
+                        .map(Into::into),
+                }
+            })
+            .collect();
+        let mut request = CreateChatCompletionRequestArgs::default();
+        request.model(model_name);
+        request.messages(chat_messages);
+        request.max_tokens(max_tokens as u32);
+        request.temperature(temperature);
+
+        // Prefer cache-annotated tools over the originals; deserialize from JSON.
+        let effective_tools = cached_tools.or(tools);
+        if let Some(tool_list) = effective_tools {
+            let typed_tools: Vec<ChatCompletionTools> = tool_list
+                .into_iter()
+                .filter_map(|t| serde_json::from_value(t).ok())
                 .collect();
-            let mut request = CreateChatCompletionRequestArgs::default();
-            request.model(model_name);
-            request.messages(chat_messages);
-            request.max_tokens(max_tokens as u32);
-            request.temperature(temperature);
+            if !typed_tools.is_empty() {
+                request.tools(typed_tools);
+            }
+        }
 
-            // Prefer cache-annotated tools over the originals; deserialize from JSON.
-            let effective_tools = cached_tools.or(tools);
-            if let Some(tool_list) = effective_tools {
-                let typed_tools: Vec<ChatCompletionTools> = tool_list
-                    .into_iter()
-                    .filter_map(|t| serde_json::from_value(t).ok())
-                    .collect();
-                if !typed_tools.is_empty() {
-                    request.tools(typed_tools);
+        if let Some(effort) = reasoning_effort {
+            if let Ok(typed_effort) =
+                serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(effort))
+            {
+                request.reasoning_effort(typed_effort);
+            }
+        }
+        if let Some(tc) = tool_choice {
+            if let Ok(typed_tc) = serde_json::from_value::<ChatCompletionToolChoiceOption>(tc) {
+                request.tool_choice(typed_tc);
+            }
+        }
+
+        request
+    }
+
+    fn parse_response(response: CreateChatCompletionResponse) -> LLMResponse {
+        if response.choices.is_empty() {
+            return LLMResponse {
+                content: Some("Error: API returned empty choices.".to_string()),
+                finish_reason: "error".to_string(),
+                tool_calls: vec![],
+                usage: HashMap::new(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            };
+        }
+  
+        let choice0 = &response.choices[0];
+        let mut content = choice0.message.content.clone();
+        let mut finish_reason = choice0.finish_reason
+            .map(|r| serde_json::to_value(r).ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_else(|| "stop".to_string()))
+            .unwrap_or_else(|| "stop".to_string());
+  
+        // Collect tool calls across all choices (mirrors the Python loop)
+        let mut raw_tool_calls = vec![];
+        for ch in &response.choices {
+            if let Some(tcs) = &ch.message.tool_calls {
+                if !tcs.is_empty() {
+                    raw_tool_calls.extend(tcs.iter());
+                    if matches!(ch.finish_reason, Some(FinishReason::ToolCalls) | Some(FinishReason::Stop)) {
+                        finish_reason = serde_json::to_value(ch.finish_reason)
+                            .ok().and_then(|v| v.as_str().map(str::to_string))
+                            .unwrap_or(finish_reason);
+                    }
                 }
             }
-
-            if let Some(effort) = reasoning_effort {
-                if let Ok(typed_effort) = serde_json::from_value::<ReasoningEffort>(serde_json::Value::String(effort)) {
-                    request.reasoning_effort(typed_effort);
-                }
+            if content.is_none() {
+                content = ch.message.content.clone();
             }
-            if let Some(tc) = tool_choice {
-                if let Ok(typed_tc) = serde_json::from_value::<ChatCompletionToolChoiceOption>(tc) {
-                    request.tool_choice(typed_tc);
-                }
+        }
+  
+        // Parse tool calls
+        let tool_calls = raw_tool_calls.into_iter().filter_map(|tc| {
+            let ChatCompletionMessageToolCalls::Function(tc) = tc else { return None; };
+            let args: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            Some(ToolCallRequest {
+                id: Self::short_tool_id(),
+                name: tc.function.name.clone(),
+                arguments: args,
+                extra_content: None,
+                provider_specific_fields: None,
+                function_provider_specific_fields: None,
+            })
+        }).collect();
+        
+        let mut usage_map = HashMap::new();
+        match response.usage {
+            Some(usage) => {
+                usage_map.insert("prompt_tokens".to_string(), usage.prompt_tokens as i64);
+                usage_map.insert("completion_tokens".to_string(), usage.completion_tokens as i64);
+                usage_map.insert("total_tokens".to_string(), usage.total_tokens as i64);
             }
-
-            request
+            None => {
+                usage_map.insert("prompt_tokens".to_string(), 0);
+                usage_map.insert("completion_tokens".to_string(), 0);
+                usage_map.insert("total_tokens".to_string(), 0);
+            }
+        }
+  
+        LLMResponse {
+            content,
+            tool_calls,
+            finish_reason,
+            usage: usage_map.clone(), // fill from response.usage if needed
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
     }
 }
 
@@ -583,18 +664,41 @@ impl LLMProvider for OpenAICompatProvider {
             .clone()
             .unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string())
     }
-
+    
     async fn chat(
         &self,
-        _messages: Vec<serde_json::Value>,
-        _tools: Option<Vec<serde_json::Value>>,
-        _model: Option<String>,
-        _max_tokens: usize,
-        _temperature: f32,
-        _reasoning_effort: Option<String>,
-        _tool_choice: Option<serde_json::Value>,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
     ) -> crate::providers::base::LLMResponse {
-        unimplemented!("OpenAICompatProvider::chat is not yet implemented")
+        let request_args = self.build_request(
+            &messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        );
+        match request_args.build() {
+            Ok(request) => {
+                match self.client.chat().create(request).await {
+                    Ok(response) => {
+                        return OpenAICompatProvider::parse_response(response);
+                    }
+                    Err(e) => {
+                        return OpenAICompatProvider::handle_error(Box::new(e));
+                    }
+                }
+            }
+            Err(e) => {
+                return OpenAICompatProvider::handle_error(Box::new(e));
+            }
+        }
     }
 }
 
@@ -691,16 +795,16 @@ mod tests {
     #[test]
     fn test_sanitize_messages() {
         let messages = vec![
-            serde_json::json!({ 
-                "role": "system", 
-                "content": "You are a helpful assistant.", 
-                "foo": "bar" 
+            serde_json::json!({
+                "role": "system",
+                "content": "You are a helpful assistant.",
+                "foo": "bar"
             }),
-            serde_json::json!({ 
-                "role": "user", 
-                "content": "Hello, how are you?", 
-                "foo": "bar" 
-            })
+            serde_json::json!({
+                "role": "user",
+                "content": "Hello, how are you?",
+                "foo": "bar"
+            }),
         ];
         let sanitized = OpenAICompatProvider::sanitize_messages(&messages);
         assert_eq!(sanitized.len(), 2);

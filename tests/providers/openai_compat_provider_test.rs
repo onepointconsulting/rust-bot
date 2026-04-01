@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rust_bot::providers::base::LLMProvider;
+use rust_bot::providers::base::{LLMProvider, LLMResponse};
 use rust_bot::providers::openai_compat_provider::OpenAICompatProvider;
 use rust_bot::providers::registry::ProviderSpec;
 use uuid::Uuid;
@@ -81,4 +81,53 @@ fn test_create_openrouter_provider_with_spec() {
     assert_eq!(provider.get_default_model(), openai_api_model);
     assert!(provider.spec().is_some());
     assert_eq!(provider.spec().unwrap().name, "openrouter");
+}
+
+async fn simple_test_chat(message: &str) -> LLMResponse {
+    let provider = create_openrouter_provider();
+    let messages = vec![
+        serde_json::json!({
+            "role": "user",
+            "content": message
+        })
+    ];
+    let response = provider.chat(messages, None, None, 100, 0.5, None, None).await;
+    response
+}
+
+async fn simple_test_safe_chat(message: &str) -> LLMResponse {
+    let provider = create_openrouter_provider();
+    let messages = vec![
+        serde_json::json!({
+            "role": "user",
+            "content": message
+        })
+    ];
+    let response = provider.safe_chat(messages, None, None, 100, 0.5, None, None).await;
+    response
+}
+
+#[tokio::test]
+async fn test_chat_success() {
+    let response = simple_test_chat("Hello, how are you?").await;
+    assert!(response.content.is_some());
+    println!("response: {}", response.content.unwrap());
+    assert!(response.finish_reason == "stop");
+    assert!(response.tool_calls.is_empty());
+}
+
+#[tokio::test]
+async fn test_who_are_you() {
+    let response = simple_test_chat("Who are you?").await;
+    assert!(response.content.is_some());
+    println!("response: {}", response.content.unwrap());
+    assert!(response.finish_reason == "stop");
+}
+
+#[tokio::test]
+async fn test_who_are_you_safe() {
+    let response = simple_test_safe_chat("Who are you? And what is your knownledge cut-off date?").await;
+    assert!(response.content.is_some());
+    println!("response: {}", response.content.unwrap());
+    assert!(response.finish_reason == "stop");
 }
