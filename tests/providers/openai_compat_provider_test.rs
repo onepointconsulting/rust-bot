@@ -206,13 +206,18 @@ async fn test_who_are_you_system_safe() {
     assert!(!response.tool_calls.is_empty());
 }
 
-#[tokio::test]
-async fn test_chat_stream_success() {
+fn create_openrouter_provider_with_long_message() -> (OpenAICompatProvider, Vec<serde_json::Value>) {
     let provider = create_openrouter_provider();
     let messages = vec![serde_json::json!({
         "role": "user",
-        "content": "Can you tell me a really longjoke?"
+        "content": "Can you tell me a really long joke?"
     })];
+    return (provider, messages);
+}
+
+#[tokio::test]
+async fn test_chat_stream_success() {
+    let (provider, messages) = create_openrouter_provider_with_long_message();
     let response = provider.chat_stream(
         messages, 
         None, 
@@ -226,5 +231,26 @@ async fn test_chat_stream_success() {
         }),
     ).await;
     assert!(response.content.is_some());
+    assert!(response.content.unwrap().len() > 0);
+    // println!("response: {}", response.content.unwrap());
+}
+
+#[tokio::test]
+async fn test_safe_chat_stream_success() {
+    let (provider, messages) = create_openrouter_provider_with_long_message();
+    let response = provider.safe_chat_stream(
+        messages, 
+        None, 
+        None,
+        1000,
+        0.5,
+        None,
+        None,
+        Some(|content| async move {
+            println!("==>: {}", content);
+        }),
+    ).await;
+    assert!(response.content.is_some());
+    assert!(response.content.unwrap().len() > 0);
     // println!("response: {}", response.content.unwrap());
 }
