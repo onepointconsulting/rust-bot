@@ -7,6 +7,7 @@ use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall
 };
 use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
+use futures::StreamExt;
 use std::collections::HashMap;
 
 pub struct OpenAICompatProvider {
@@ -545,7 +546,36 @@ impl OpenAICompatProvider {
             content,
             tool_calls,
             finish_reason,
-            usage: usage_map.clone(), // fill from response.usage if needed
+            usage: usage_map.clone(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
+    }
+
+    fn parse_stream_response(
+        content: String,
+        finish_reason: String,
+        raw_tool_calls: Vec<ChatCompletionMessageToolCalls>,
+    ) -> LLMResponse {
+        let tool_calls = raw_tool_calls.into_iter().filter_map(|tc| {
+            let ChatCompletionMessageToolCalls::Function(tc) = tc else { return None; };
+            let args: HashMap<String, serde_json::Value> =
+                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            Some(ToolCallRequest {
+                id: Self::short_tool_id(),
+                name: tc.function.name.clone(),
+                arguments: args,
+                extra_content: None,
+                provider_specific_fields: None,
+                function_provider_specific_fields: None,
+            })
+        }).collect();
+
+        LLMResponse {
+            content: if content.is_empty() { None } else { Some(content) },
+            finish_reason,
+            tool_calls,
+            usage: HashMap::new(),
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -689,6 +719,86 @@ impl LLMProvider for OpenAICompatProvider {
                 match self.client.chat().create(request).await {
                     Ok(response) => {
                         return OpenAICompatProvider::parse_response(response);
+                    }
+                    Err(e) => {
+                        return OpenAICompatProvider::handle_error(Box::new(e));
+                    }
+                }
+            }
+            Err(e) => {
+                return OpenAICompatProvider::handle_error(Box::new(e));
+            }
+        }
+    }
+
+    #[allow(unused_variables)]
+    async fn chat_stream<F, Fut>(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: Option<F>,
+    ) -> LLMResponse
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let request_args = self.build_request(
+            &messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        );
+        match request_args.build() {
+            Ok(request) => {
+                match self.client.chat().create_stream(request).await {
+                    Ok(mut stream) => {
+                        let mut content_buf = String::new();
+                        let mut finish_reason = "stop".to_string();
+                        let mut raw_tool_calls: Vec<ChatCompletionMessageToolCalls> = vec![];
+                        let cb = on_content_delta.as_ref();
+                        while let Some(chunk) = stream.next().await {
+                            if let Ok(chunk) = chunk {
+                                for choice in &chunk.choices {
+                                    if let Some(delta_content) = &choice.delta.content {
+                                        content_buf.push_str(delta_content);
+                                        if let Some(cb) = cb {
+                                            cb(delta_content.clone()).await;
+                                        }
+                                    }
+                                    if let Some(ref tcs) = choice.delta.tool_calls {
+                                        for tc in tcs {
+                                            if let Some(ref func) = tc.function {
+                                                let name = func.name.clone().unwrap_or_default();
+                                                let arguments = func.arguments.clone().unwrap_or_default();
+                                                raw_tool_calls.push(
+                                                    ChatCompletionMessageToolCalls::Function(
+                                                        ChatCompletionMessageToolCall {
+                                                            id: tc.id.clone().unwrap_or_else(Self::short_tool_id),
+                                                            function: FunctionCall { name, arguments },
+                                                        },
+                                                    ),
+                                                );
+                                            }
+                                        }
+                                    }
+                                    if let Some(reason) = choice.finish_reason {
+                                        finish_reason = serde_json::to_value(reason)
+                                            .ok()
+                                            .and_then(|v| v.as_str().map(str::to_string))
+                                            .unwrap_or(finish_reason.clone());
+                                    }
+                                }
+                            }
+                        }
+                        return Self::parse_stream_response(content_buf, finish_reason, raw_tool_calls);
                     }
                     Err(e) => {
                         return OpenAICompatProvider::handle_error(Box::new(e));

@@ -205,3 +205,26 @@ async fn test_who_are_you_system_safe() {
     println!("finish reason: {}", response.finish_reason);
     assert!(!response.tool_calls.is_empty());
 }
+
+#[tokio::test]
+async fn test_chat_stream_success() {
+    let provider = create_openrouter_provider();
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you tell me a really longjoke?"
+    })];
+    let response = provider.chat_stream(
+        messages, 
+        None, 
+        None,
+        1000,
+        0.5,
+        None,
+        None,
+        Some(|content| async move {
+            println!("==>: {}", content);
+        }),
+    ).await;
+    assert!(response.content.is_some());
+    // println!("response: {}", response.content.unwrap());
+}
