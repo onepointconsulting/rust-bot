@@ -741,7 +741,7 @@ impl LLMProvider for OpenAICompatProvider {
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-        on_content_delta: Option<F>,
+        on_content_delta: &Option<F>,
     ) -> LLMResponse
     where
         F: Fn(String) -> Fut + Send + Sync,

@@ -226,7 +226,7 @@ async fn test_chat_stream_success() {
         0.5,
         None,
         None,
-        Some(|content| async move {
+        &Some(|content| async move {
             println!("==>: {}", content);
         }),
     ).await;
@@ -246,7 +246,27 @@ async fn test_safe_chat_stream_success() {
         0.5,
         None,
         None,
-        Some(|content| async move {
+        &Some(|content| async move {
+            println!("==>: {}", content);
+        }),
+    ).await;
+    assert!(response.content.is_some());
+    assert!(response.content.unwrap().len() > 0);
+    // println!("response: {}", response.content.unwrap());
+}
+
+#[tokio::test]
+async fn test_safe_chat_stream_with_retry_success() {
+    let (provider, messages) = create_openrouter_provider_with_long_message();
+    let response = provider.safe_chat_stream_with_retry(
+        messages, 
+        None, 
+        None,
+        Some(3000),
+        Some(0.5f32),
+        None,
+        None,
+        &Some(|content| async move {
             println!("==>: {}", content);
         }),
     ).await;

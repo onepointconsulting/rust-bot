@@ -63,6 +63,12 @@ impl ToolCallRequest {
     }
 }
 
+// Not used right now
+pub enum RetryMode {
+    Standard,
+    Persistent
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LLMResponse {
     /// Response content from the LLM provider.
@@ -397,6 +403,7 @@ pub trait LLMProvider {
         if found { Some(result) } else { None }
     }
 
+    #[allow(async_fn_in_trait)]
     async fn safe_chat(
         &self,
         messages: Vec<serde_json::Value>,
@@ -457,6 +464,7 @@ pub trait LLMProvider {
     /// # Notes
     /// This dummy implementation can be overridden by providers supporting real streaming.
     #[allow(unused_variables)]
+    #[allow(async_fn_in_trait)]
     async fn chat_stream<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
@@ -466,7 +474,7 @@ pub trait LLMProvider {
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-        on_content_delta: Option<F>,
+        on_content_delta: &Option<F>,
     ) -> LLMResponse
     where
         F: Fn(String) -> Fut + Send + Sync,
@@ -492,6 +500,7 @@ pub trait LLMProvider {
     }
 
     #[allow(unused_variables)]
+    #[allow(async_fn_in_trait)]
     async fn safe_chat_stream<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
@@ -501,7 +510,7 @@ pub trait LLMProvider {
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-        on_content_delta: Option<F>,
+        on_content_delta: &Option<F>,
     ) -> LLMResponse
     where
         F: Fn(String) -> Fut + Send + Sync,
@@ -540,6 +549,7 @@ pub trait LLMProvider {
     ///
     /// Parameters default to self.generation when not explicitly passed,
     /// so callers do not need to thread temperature / max_tokens / reasoning_effort through every layer.
+    #[allow(async_fn_in_trait)]
     async fn chat_with_retry(
         &self,
         messages: Vec<serde_json::Value>,
@@ -580,7 +590,6 @@ pub trait LLMProvider {
         }
 
         // The retry loop.
-        let mut last_response = None;
         for (attempt, delay) in Self::CHAT_RETRY_DELAYS.iter().enumerate() {
             let response = call_safe_chat(
                 self,
@@ -633,8 +642,6 @@ pub trait LLMProvider {
 
             // Sleep the retry delay.
             tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
-
-            last_response = Some(response);
         }
         // Last attempt after retries exhausted
         call_safe_chat(
@@ -646,6 +653,90 @@ pub trait LLMProvider {
             temperature,
             reasoning_effort,
             tool_choice,
+        )
+        .await
+    }
+
+    #[allow(async_fn_in_trait)]
+    async fn safe_chat_stream_with_retry<F, Fut>(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: &Option<F>,
+    ) -> LLMResponse
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ()> + Send
+    {
+        let gs = self.generation_settings();
+        let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
+        let temperature = temperature.unwrap_or(gs.temperature);
+        let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
+
+        for (attempt, delay) in Self::CHAT_RETRY_DELAYS.iter().enumerate() {
+            let response = self.safe_chat_stream(
+                messages.clone(),
+                tools.clone(),
+                model.clone(),
+                max_tokens,
+                temperature,
+                reasoning_effort.clone(),
+                tool_choice.clone(),
+                on_content_delta,
+            )
+            .await;
+            if !Self::is_transient_error(response.content.as_deref()) {
+                // Attempt to strip image content and retry just once if possible.
+                if let Some(stripped) = Self::strip_image_content(&messages) {
+                    log::warn!(
+                        "Non-transient LLM error with image content, retrying without images"
+                    );
+                    // Retry immediately with stripped messages.
+                    return self.safe_chat_stream(
+                        stripped,
+                        tools.clone(),
+                        model.clone(),
+                        max_tokens,
+                        temperature,
+                        reasoning_effort.clone(),
+                        tool_choice.clone(),
+                        on_content_delta,
+                    )
+                    .await;
+                }
+                // All else failed, return last response.
+                return response;
+            }
+            // If finish_reason is not "error", return response.
+            if response.finish_reason != "error" {
+                return response;
+            }
+            // Otherwise, transient error; log and sleep before retrying.
+            log::warn!(
+                "LLM transient error (attempt {}/{}) retrying in {}s: {}",
+                attempt + 1,
+                Self::CHAT_RETRY_DELAYS.len(),
+                delay,
+                response.content.as_deref().unwrap_or("").get(..120).unwrap_or(""),
+            );
+
+            // Sleep the retry delay.
+            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+        }
+        self.safe_chat_stream(
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+            on_content_delta,
         )
         .await
     }
@@ -746,7 +837,7 @@ mod tests {
             temperature: f32,
             reasoning_effort: Option<String>,
             tool_choice: Option<serde_json::Value>,
-            on_content_delta: Option<F>,
+            on_content_delta: &Option<F>,
         ) -> LLMResponse
         where
             F: Fn(String) -> Fut + Send + Sync,
@@ -1046,7 +1137,7 @@ mod tests {
             0.0,
             None,
             None,
-            None::<fn(String) -> std::future::Ready<()>>,
+            &None::<fn(String) -> std::future::Ready<()>>,
         ).await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
@@ -1069,7 +1160,7 @@ mod tests {
             0.0,
             None,
             None,
-            Some(|content| async move {
+            &Some(|content| async move {
                 println!("content: {}", content);
             }),
         ).await;
@@ -1095,7 +1186,7 @@ mod tests {
             0.0,
             None,
             None,
-            None::<fn(String) -> std::future::Ready<()>>,
+            &None::<fn(String) -> std::future::Ready<()>>,
         ).await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
@@ -1118,7 +1209,7 @@ mod tests {
             0.0,
             None,
             None,
-            Some(|content| async move {
+            &Some(|content| async move {
                 println!("content: {}", content);
             }),
         ).await;
