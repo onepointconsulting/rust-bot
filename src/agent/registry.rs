@@ -1,11 +1,11 @@
 use crate::agent::tools::base::Tool;
 use std::collections::HashMap;
 
-pub struct RegistryTool {
+pub struct ToolRegistry {
     tools: HashMap<String, Box<dyn Tool>>,
 }
 
-impl RegistryTool {
+impl ToolRegistry {
     pub fn new() -> Self {
         Self { tools: HashMap::new() }
     }
@@ -119,7 +119,7 @@ mod tests {
     #[test]
     fn test_registry_returns_validation_ok() {
         let tool = SampleTool;
-        let mut registry = RegistryTool::new();
+        let mut registry = ToolRegistry::new();
         registry.register(Box::new(tool));
         let result = registry.execute("sample", "{\"query\": \"hello\"}".to_string());
         println!("result: {}", result);
@@ -129,7 +129,7 @@ mod tests {
     #[test]
     fn test_registry_returns_validation_error() {
         let tool = SampleTool;
-        let mut registry = RegistryTool::new();
+        let mut registry = ToolRegistry::new();
         registry.register(Box::new(tool));
         let result = registry.execute("sample", "{\"name\": \"john\"}".to_string());
         println!("result: {}", result);
