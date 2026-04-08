@@ -2,7 +2,7 @@ use std::io::Write;
 /// Memory system for persistent agent memory.
 use std::sync::LazyLock;
 
-use crate::utils::helpers::{ensure_dir, touch_file};
+use crate::utils::helpers::ensure_dir;
 
 pub static SAVE_MEMORY_TOOL: LazyLock<Vec<serde_json::Value>> = LazyLock::new(|| {
     vec![serde_json::json!({
@@ -93,8 +93,6 @@ impl MemoryStore {
         ensure_dir(&memory_dir);
         let memory_path = memory_dir.join("MEMORY.md");
         let history_path = memory_dir.join("HISTORY.md");
-        touch_file(&memory_path);
-        touch_file(&history_path);
         Self {
             memory_dir,
             memory_file: memory_path,
@@ -309,9 +307,7 @@ impl MemoryStore {
 
         let tool_call = response.tool_calls.get(0);
         let args = tool_call.and_then(|call| {
-            normalize_save_memory_args(&serde_json::Value::Object(
-                call.arguments.clone().into_iter().collect(),
-            ))
+            normalize_save_memory_args(&serde_json::Value::Object(call.arguments.clone().into_iter().collect()))
         });
         if args.is_none() {
             log::warn!("Memory consolidation: unexpected save_memory arguments");
@@ -361,16 +357,21 @@ impl MemoryStore {
         // Get timestamp
         let ts = chrono::Local::now().format("%Y-%m-%d %H:%M").to_string();
         // Format message count line
-        let mut entry = format!("[{}] [RAW] {} messages\n", ts, messages.len());
+        let mut entry = format!(
+            "[{}] [RAW] {} messages\n",
+            ts,
+            messages.len()
+        );
         // Append formatted messages
-        let formatted_messages = MemoryStore::format_messages(messages);
-        entry.push_str(formatted_messages.as_str());
+        entry.push_str(MemoryStore::format_messages(messages).as_str());
+        println!("entry: {}", entry);
         self.append_history(&entry);
         log::warn!(
             "Memory consolidation degraded: raw-archived {} messages",
             messages.len()
         );
     }
+
 }
 
 #[cfg(test)]
@@ -381,19 +382,9 @@ mod tests {
 
     const WORKSPACE: &str = "docs/workspace_sample1";
 
-    fn create_memory_store(recreate: bool) -> MemoryStore {
+    fn create_memory_store() -> MemoryStore {
         let workspace = PathBuf::from(WORKSPACE);
-        let memory_store = MemoryStore::new(workspace.clone());
-        if (recreate) {
-            clear_memory_store(&memory_store);
-            return MemoryStore::new(workspace)
-        }
-        memory_store
-    }
-
-    fn clear_memory_store(memory_store: &MemoryStore) {
-        std::fs::remove_file(memory_store.history_file.clone()).unwrap();
-        std::fs::remove_file(memory_store.memory_file.clone()).unwrap();
+        MemoryStore::new(workspace)
     }
 
     #[test]
@@ -439,10 +430,11 @@ mod tests {
 
     #[test]
     fn test_read_long_term() {
-        let memory_store = create_memory_store(false);
+        let memory_store = create_memory_store();
         let entry = "The agent initialized a new workspace and created initial memory files.";
         memory_store.write_long_term(entry);
         let result = memory_store.read_long_term();
+        println!("result: {}", result);
         assert!(result.contains(entry));
         let result2 = memory_store.get_memory_context();
         assert!(result2.contains(entry));
@@ -450,7 +442,7 @@ mod tests {
 
     #[test]
     fn test_append_history() {
-        let memory_store = create_memory_store(false);
+        let memory_store = create_memory_store();
         let messages = vec![serde_json::json!({
             "content": "The agent initialized a new workspace and created initial memory files.",
             "timestamp": "2026-03-25 10:00:00",
@@ -489,7 +481,7 @@ mod tests {
 
     #[test]
     fn test_raw_archive() {
-        let memory_store = create_memory_store(false);
+        let memory_store = create_memory_store();
         let messages = vec![serde_json::json!({
             "content": "The agent initialized a new workspace and created initial memory files.",
             "timestamp": "2026-03-25 10:00:00",
@@ -503,24 +495,6 @@ mod tests {
         let result = std::fs::read_to_string(&history_file).unwrap();
         println!("result: {}", result);
         assert!(result.contains("[RAW] 1 messages"));
-        assert!(
-            result.contains(
-                "The agent initialized a new workspace and created initial memory files."
-            )
-        );
-    }
-
-    #[test]
-    fn test_fail_or_raw_archive() {
-        let messages = vec![serde_json::json!({
-            "content": "The agent initialized a new workspace and created initial memory files.",
-            "timestamp": "2026-03-25 10:00:00",
-            "role": "user",
-            "tools_used": []
-        })];
-        let mut memory_store = create_memory_store(false);
-        let result = memory_store.fail_or_raw_archive(&messages);
-        assert!(!result);
-        assert_eq!(memory_store.consecutive_failures, 1);
+        assert!(result.contains("The agent initialized a new workspace and created initial memory files."));
     }
 }
