@@ -590,7 +590,7 @@ impl Tool for ListDirTool {
         };
 
         if !dp.exists() {
-            return format!("Error: Directory not found: {}", path);
+            return format!("Error: Directory not found: {}. Path: {}", dp.display(), path);
         }
         if !dp.is_dir() {
             return format!("Error: Not a directory: {}", path);
@@ -880,6 +880,22 @@ mod tests {
     #[test]
     fn test_list_dir_tool() {
         let tool = ListDirTool::new(None, None, None);
+        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false }));
+        println!("result: {}", result);
+        assert!(result.contains("notes.txt"));
+        assert!(result.contains("credits"));
+    }
+
+    #[test]
+    fn test_list_dir_tool_workspace() {
+        let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
+        println!("workspace: {}", workspace.display());
+        println!("workspace absolute: {}", workspace.is_absolute());
+        let docs = Path::new("docs");
+        let tool = ListDirTool::new(
+            Some(workspace.to_path_buf()), 
+            Some(docs.to_path_buf()), 
+            None);
         let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false }));
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));

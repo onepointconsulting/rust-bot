@@ -120,26 +120,149 @@ impl GenerationSettings {
     }
 }
 
+/// Default retry delays (in seconds) for chat requests.
+const CHAT_RETRY_DELAYS: &[u64] = &[1, 2, 4];
+
+/// Markers that signal a transient error and should trigger a retry.
+const TRANSIENT_ERROR_MARKERS: &[&str] = &[
+    "429",
+    "rate limit",
+    "500",
+    "502",
+    "503",
+    "504",
+    "overloaded",
+    "timeout",
+    "timed out",
+    "connection",
+    "server error",
+    "temporarily unavailable",
+];
+
+
+
+
+
+/// A dyn-compatible subset of [`LLMProvider`].
+///
+/// `LLMProvider` cannot be used as `dyn LLMProvider` because it contains:
+/// - Associated constants (`CHAT_RETRY_DELAYS`, `TRANSIENT_ERROR_MARKERS`)
+/// - Static methods with no `&self` receiver (`sanitize_empty_content`, etc.)
+/// - Generic async methods (`chat_stream<F, Fut>`, etc.)
+///
+/// `LLMProviderDyn` exposes only the methods needed for runtime dispatch:
+/// the core `&self` accessors and the three non-generic async call methods.
+/// A blanket impl covers any `T: LLMProvider + Send + Sync` automatically,
+/// so callers store `Arc<dyn LLMProviderDyn>` and construct it from any concrete provider.
+#[async_trait::async_trait(?Send)]
+pub trait LLMProviderDyn: Send + Sync {
+    fn api_key(&self) -> Option<String>;
+    fn api_base(&self) -> Option<String>;
+    fn extra_headers(&self) -> Option<HashMap<String, String>>;
+    fn generation_settings(&self) -> &GenerationSettings;
+    fn generation_settings_mut(&mut self) -> &mut GenerationSettings;
+    fn spec(&self) -> Option<&ProviderSpec>;
+    fn get_default_model(&self) -> String;
+
+    async fn chat(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse;
+
+    async fn safe_chat(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse;
+
+    async fn chat_with_retry(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse;
+}
+
+#[async_trait::async_trait(?Send)]
+impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
+    fn api_key(&self) -> Option<String> {
+        LLMProvider::api_key(self)
+    }
+    fn api_base(&self) -> Option<String> {
+        LLMProvider::api_base(self)
+    }
+    fn extra_headers(&self) -> Option<HashMap<String, String>> {
+        LLMProvider::extra_headers(self)
+    }
+    fn generation_settings(&self) -> &GenerationSettings {
+        LLMProvider::generation_settings(self)
+    }
+    fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+        LLMProvider::generation_settings_mut(self)
+    }
+    fn spec(&self) -> Option<&ProviderSpec> {
+        LLMProvider::spec(self)
+    }
+    fn get_default_model(&self) -> String {
+        LLMProvider::get_default_model(self)
+    }
+
+    async fn chat(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse {
+        LLMProvider::chat(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+    }
+
+    async fn safe_chat(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse {
+        LLMProvider::safe_chat(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+    }
+
+    async fn chat_with_retry(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse {
+        LLMProvider::chat_with_retry(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+    }
+}
+
 pub trait LLMProvider {
-    /// Default retry delays (in seconds) for chat requests.
-    const CHAT_RETRY_DELAYS: &'static [u64] = &[1, 2, 4];
-
-    /// Markers that signal a transient error and should trigger a retry.
-    const TRANSIENT_ERROR_MARKERS: &'static [&'static str] = &[
-        "429",
-        "rate limit",
-        "500",
-        "502",
-        "503",
-        "504",
-        "overloaded",
-        "timeout",
-        "timed out",
-        "connection",
-        "server error",
-        "temporarily unavailable",
-    ];
-
     /// Required method to initialize an LLMProvider.
     /// Equivalent Python signature:
     ///     def __init__(self, api_key: str | None = None, api_base: str | None = None):
@@ -341,7 +464,7 @@ pub trait LLMProvider {
 
     fn is_transient_error(content: Option<&str>) -> bool {
         let err = content.unwrap_or("").to_lowercase();
-        Self::TRANSIENT_ERROR_MARKERS
+        TRANSIENT_ERROR_MARKERS
             .iter()
             .any(|marker| err.contains(marker))
     }
@@ -590,7 +713,7 @@ pub trait LLMProvider {
         }
 
         // The retry loop.
-        for (attempt, delay) in Self::CHAT_RETRY_DELAYS.iter().enumerate() {
+        for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
             let response = call_safe_chat(
                 self,
                 messages.clone(),
@@ -635,7 +758,7 @@ pub trait LLMProvider {
             log::warn!(
                 "LLM transient error (attempt {}/{}) retrying in {}s: {}",
                 attempt + 1,
-                Self::CHAT_RETRY_DELAYS.len(),
+                CHAT_RETRY_DELAYS.len(),
                 delay,
                 response.content.as_deref().unwrap_or("").get(..120).unwrap_or(""),
             );
@@ -678,7 +801,7 @@ pub trait LLMProvider {
         let temperature = temperature.unwrap_or(gs.temperature);
         let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
 
-        for (attempt, delay) in Self::CHAT_RETRY_DELAYS.iter().enumerate() {
+        for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
             let response = self.safe_chat_stream(
                 messages.clone(),
                 tools.clone(),
@@ -720,7 +843,7 @@ pub trait LLMProvider {
             log::warn!(
                 "LLM transient error (attempt {}/{}) retrying in {}s: {}",
                 attempt + 1,
-                Self::CHAT_RETRY_DELAYS.len(),
+                CHAT_RETRY_DELAYS.len(),
                 delay,
                 response.content.as_deref().unwrap_or("").get(..120).unwrap_or(""),
             );
@@ -928,16 +1051,15 @@ mod tests {
     #[test]
     fn test_create_test_llm_provider() {
         let llm_provider = create_test_llm_provider();
-        assert_eq!(llm_provider.api_key(), Some("test".to_string()));
+        assert_eq!(LLMProvider::api_key(&llm_provider), Some("test".to_string()));
         assert_eq!(
-            llm_provider.api_base(),
+            LLMProvider::api_base(&llm_provider),
             Some("https://test.com".to_string())
         );
-        assert_eq!(llm_provider.generation_settings().temperature, 0.7);
-        assert_eq!(llm_provider.generation_settings().max_tokens, 4096);
+        assert_eq!(LLMProvider::generation_settings(&llm_provider).temperature, 0.7);
+        assert_eq!(LLMProvider::generation_settings(&llm_provider).max_tokens, 4096);
         assert!(
-            llm_provider
-                .generation_settings()
+            LLMProvider::generation_settings(&llm_provider)
                 .reasoning_effort
                 .is_none()
         );
@@ -1107,7 +1229,8 @@ mod tests {
             }
         )];
         let llm_provider = create_test_llm_provider();
-        let result = llm_provider.safe_chat(
+        let result = LLMProvider::safe_chat(
+            &llm_provider,
             messages,
             Some(tools),
             None,

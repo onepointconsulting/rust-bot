@@ -274,7 +274,7 @@ pub fn build_assistant_message(
 // ── tool result persistence ───────────────────────────────────────────────────
 
 const TOOL_RESULT_PREVIEW_CHARS: usize = 1200;
-const TOOL_RESULTS_DIR: &str = ".nanobot/tool-results";
+const TOOL_RESULTS_DIR: &str = ".rust-bot/tool-results";
 const TOOL_RESULT_RETENTION_SECS: u64 = 7 * 24 * 60 * 60;
 const TOOL_RESULT_MAX_BUCKETS: usize = 32;
 
@@ -779,7 +779,7 @@ mod tests {
         let s = current_time_str(None);
         println!("s: {}", s);
         assert!(s.contains("UTC"), "expected UTC offset: {}", s);
-        assert_eq!(s.rfind("(").unwrap(), 29, "expected at least one ( in the string: {}", s);
+        assert_eq!(s.find("(").unwrap(), 17, "expected at least one ( in the string: {}", s);
     }
 
     #[test]
