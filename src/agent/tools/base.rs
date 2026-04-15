@@ -64,6 +64,15 @@ pub trait Tool {
     */
     fn execute(&self, params: &serde_json::Value) -> String;
 
+    /// Return `true` if this tool is safe to run concurrently with other
+    /// concurrency-safe tools in the same LLM turn.
+    ///
+    /// Defaults to `false` so that existing tools are always executed
+    /// sequentially unless they explicitly opt in.
+    fn concurrency_safe(&self) -> bool {
+        false
+    }
+
     fn cast_params(&self, params: &serde_json::Value) -> serde_json::Value {
         let schema = self.parameters().clone();
         if schema

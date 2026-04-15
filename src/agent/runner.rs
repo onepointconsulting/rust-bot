@@ -1,28 +1,21 @@
-use std::collections::HashMap;
-use std::path::PathBuf;
-use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use std::collections::HashMap;
+use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use crate::agent::hook::{AgentHook, AgentHookContext};
-use crate::utils::prompt_templates::render_template;
 use crate::agent::registry::ToolRegistry;
-use crate::providers::base::LLMProviderDyn;
+use crate::providers::base::{BoxedStreamCallback, LLMProviderDyn, LLMResponse, ToolCallRequest};
 use crate::utils::helpers::{
-    build_assistant_message,
-    estimate_message_tokens,
-    estimate_prompt_tokens_chain,
-    find_legal_message_start,
-    maybe_persist_tool_result,
-    truncate_text
+    build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
+    estimate_prompt_tokens_chain, find_legal_message_start, maybe_persist_tool_result,
+    truncate_text,
 };
+use crate::utils::prompt_templates::render_template;
 use crate::utils::runtime::{
-    EMPTY_FINAL_RESPONSE_MESSAGE,
-    build_finalization_retry_message,
-    build_length_recovery_message,
-    ensure_nonempty_tool_result,
-    is_blank_text,
-    repeated_external_lookup_error,
+    EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
+    ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
@@ -31,7 +24,15 @@ const MAX_LENGTH_RECOVERIES: usize = 3;
 const SNIP_SAFETY_BUFFER: usize = 1024;
 const MICROCOMPACT_KEEP_RECENT: usize = 10;
 const MICROCOMPACT_MIN_CHARS: usize = 500;
-const COMPACTABLE_TOOLS: &[&str] = &["read_file", "exec", "grep", "glob", "web_search", "web_fetch", "list_dir"];
+const COMPACTABLE_TOOLS: &[&str] = &[
+    "read_file",
+    "exec",
+    "grep",
+    "glob",
+    "web_search",
+    "web_fetch",
+    "list_dir",
+];
 const BACKFILL_CONTENT: &str = "[Tool result unavailable — call was interrupted or lost]";
 
 /// Configuration for a single agent execution.
@@ -276,7 +277,8 @@ impl AgentRunner {
                 .to_string();
             let content = message.get("content").cloned().unwrap_or(Value::Null);
 
-            let normalized = self.normalize_tool_result(spec, &tool_call_id, &tool_name, content.clone());
+            let normalized =
+                self.normalize_tool_result(spec, &tool_call_id, &tool_name, content.clone());
 
             if normalized != content {
                 let updated = updated.get_or_insert_with(|| messages.to_vec());
@@ -285,6 +287,416 @@ impl AgentRunner {
         }
 
         updated.unwrap_or_else(|| messages.to_vec())
+    }
+
+    /// Trim the oldest non-system messages so the prompt fits within the context-window budget.
+    ///
+    /// The algorithm works as follows:
+    ///   1. Do nothing if no messages are provided or no context window limit is configured.
+    ///   2. Compute a token budget: prefer `context_block_limit` when set; otherwise derive it
+    ///      as `context_window_tokens - max_output - SNIP_SAFETY_BUFFER`, where `max_output` is
+    ///      `spec.max_tokens` (or 4096 as a fallback).
+    ///   3. Estimate the current prompt size; return unchanged if it already fits.
+    ///   4. Separate system messages (which are always kept) from the rest.
+    ///   5. Walk non-system messages from newest to oldest, accumulating until the per-turn
+    ///      budget (`total budget - system tokens`, minimum 128) would be exceeded.
+    ///   6. Trim the kept slice so it starts on a user turn and has no orphaned tool results
+    ///      (via `find_legal_message_start`).
+    ///   7. If nothing survives the trim, fall back to the last four non-system messages and
+    ///      apply the same legality check.
+    ///   8. Return system messages followed by the trimmed history.
+    fn snip_history(&self, spec: &AgentRunSpec, messages: Vec<Value>) -> Vec<Value> {
+        let Some(context_window_tokens) = spec.context_window_tokens else {
+            return messages;
+        };
+        if messages.is_empty() {
+            return messages;
+        }
+
+        let max_output = spec.max_tokens.unwrap_or(4096);
+        let budget = spec.context_block_limit.unwrap_or_else(|| {
+            context_window_tokens
+                .saturating_sub(max_output)
+                .saturating_sub(SNIP_SAFETY_BUFFER)
+        });
+        if budget == 0 {
+            return messages;
+        }
+
+        let tool_defs = spec.tools.get_definitions();
+        let tools_slice: Option<&[Value]> = if tool_defs.is_empty() {
+            None
+        } else {
+            Some(&tool_defs)
+        };
+        let estimate = estimate_prompt_tokens(&messages, tools_slice);
+        log::debug!("estimate: {}, budget: {}", estimate, budget);
+        if estimate <= budget {
+            return messages;
+        }
+
+        let system_messages: Vec<Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) == Some("system"))
+            .cloned()
+            .collect();
+        let non_system: Vec<Value> = messages
+            .iter()
+            .filter(|m| m.get("role").and_then(Value::as_str) != Some("system"))
+            .cloned()
+            .collect();
+        if non_system.is_empty() {
+            return messages;
+        }
+
+        let system_tokens: usize = system_messages.iter().map(estimate_message_tokens).sum();
+        let remaining_budget = budget.saturating_sub(system_tokens).max(128);
+
+        let mut kept: Vec<Value> = Vec::new();
+        let mut kept_tokens = 0usize;
+        for message in non_system.iter().rev() {
+            let msg_tokens = estimate_message_tokens(message);
+            if !kept.is_empty() && kept_tokens + msg_tokens > remaining_budget {
+                break;
+            }
+            kept.push(message.clone());
+            kept_tokens += msg_tokens;
+        }
+        kept.reverse();
+
+        if !kept.is_empty() {
+            if let Some(first_user) = kept
+                .iter()
+                .position(|m| m.get("role").and_then(Value::as_str) == Some("user"))
+            {
+                kept = kept[first_user..].to_vec();
+            }
+            let start = find_legal_message_start(&kept);
+            if start > 0 {
+                kept = kept[start..].to_vec();
+            }
+        }
+
+        if kept.is_empty() {
+            let tail = non_system.len().min(4);
+            kept = non_system[non_system.len() - tail..].to_vec();
+            let start = find_legal_message_start(&kept);
+            if start > 0 {
+                kept = kept[start..].to_vec();
+            }
+        }
+
+        let mut result = system_messages;
+        result.extend(kept);
+        result
+    }
+
+    /// Send one LLM request and return the response.
+    ///
+    /// Mirrors Python's `_request_model`:
+    ///   - Builds the request parameters from `spec`.
+    ///   - If the hook requests streaming, the response content is forwarded
+    ///     to `hook.on_stream` as a single delta once the full response arrives.
+    pub async fn request_model(
+        &self,
+        spec: &AgentRunSpec,
+        messages: Vec<Value>,
+        hook: &dyn AgentHook,
+        context: &mut AgentHookContext,
+    ) -> LLMResponse {
+        let tools = spec.tools.get_definitions();
+        let tools_opt = if tools.is_empty() { None } else { Some(tools) };
+
+        if hook.wants_streaming() {
+            // `BoxedStreamCallback` must be `Send + Sync`, so we cannot capture
+            // `&mut AgentHookContext` directly inside it.  Instead we collect
+            // each delta into a shared buffer and replay them to the hook once
+            // the request completes — preserving the correct ordering while
+            // staying free of unsafe code.
+            let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let deltas_cb = Arc::clone(&deltas);
+            let callback: BoxedStreamCallback = Box::new(move |delta: String| {
+                let deltas = Arc::clone(&deltas_cb);
+                Box::pin(async move {
+                    deltas.lock().unwrap().push(delta);
+                })
+            });
+
+            let response = self
+                .provider
+                .chat_stream_with_retry_boxed(
+                    messages,
+                    tools_opt,
+                    Some(spec.model.clone()),
+                    spec.max_tokens,
+                    spec.temperature.map(|t| t as f32),
+                    spec.reasoning_effort.clone(),
+                    None,
+                    Some(callback),
+                )
+                .await;
+
+            for delta in deltas.lock().unwrap().drain(..) {
+                hook.on_stream(context, &delta).await;
+            }
+
+            return response;
+        }
+
+        self.provider
+            .chat_with_retry(
+                messages,
+                tools_opt,
+                Some(spec.model.clone()),
+                spec.max_tokens,
+                spec.temperature.map(|t| t as f32),
+                spec.reasoning_effort.clone(),
+                None,
+            )
+            .await
+    }
+
+    fn usage_dict(usage: Option<HashMap<String, i64>>) -> HashMap<String, i64> {
+        usage.unwrap_or_default()
+    }
+
+    fn accumulate_usage(target: &mut HashMap<String, u64>, addition: &HashMap<String, u64>) {
+        for (key, value) in addition {
+            *target.entry(key.clone()).or_insert(0) += value;
+        }
+    }
+
+    fn emit_checkpoint(spec: &AgentRunSpec, payload: Value) {
+        if let Some(ref callback) = spec.checkpoint_callback {
+            callback(payload);
+        }
+    }
+
+    /// Execute all tool calls and return their results, telemetry events, and
+    /// the first fatal error (if any).
+    ///
+    /// Mirrors Python's `_execute_tools`:
+    ///   - Partitions the calls into sequential / concurrent batches via
+    ///     `partition_tool_batches`.
+    ///   - For multi-tool concurrent batches the Python uses `asyncio.gather`.
+    ///     This implementation awaits each call sequentially within a batch;
+    ///     true parallelism would additionally require `external_lookup_counts`
+    ///     to be `Arc<Mutex<HashMap<String, usize>>>` so it can be shared across
+    ///     concurrent tasks.
+    ///   - Collects every `(result, event, error)` triple into three parallel
+    ///     vecs and captures the **first** fatal error encountered.
+    ///
+    /// Returns `(results, events, fatal_error)`.
+    async fn execute_tools(
+        spec: &AgentRunSpec,
+        tool_calls: &[ToolCallRequest],
+        external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+    ) -> (Vec<String>, Vec<HashMap<String, String>>, Option<String>) {
+        let batches = Self::partition_tool_batches(spec, tool_calls);
+        let mut tool_results: Vec<(String, HashMap<String, String>, Option<String>)> =
+            Vec::with_capacity(tool_calls.len());
+
+        for batch in batches {
+            if spec.concurrent_tools && batch.len() > 1 {
+                let results = futures::future::join_all(batch.iter().map(|tool_call| Self::run_tool(spec, tool_call, Arc::clone(&external_lookup_counts)))).await;
+                tool_results.extend(results);
+            } else {
+                for tool_call in batch {
+                    tool_results.push(
+                        Self::run_tool(spec, tool_call, Arc::clone(&external_lookup_counts)).await,
+                    );
+                }
+            }
+        }
+
+        let mut results: Vec<String> = Vec::with_capacity(tool_results.len());
+        let mut events: Vec<HashMap<String, String>> = Vec::with_capacity(tool_results.len());
+        let mut fatal_error: Option<String> = None;
+
+        for (result, event, error) in tool_results {
+            results.push(result);
+            events.push(event);
+            if error.is_some() && fatal_error.is_none() {
+                fatal_error = error;
+            }
+        }
+
+        (results, events, fatal_error)
+    }
+
+    /// Group tool calls into batches for (optionally concurrent) execution.
+    ///
+    /// When `spec.concurrent_tools` is `false` every call gets its own
+    /// singleton batch, preserving strict sequential ordering.
+    ///
+    /// When concurrent execution is enabled, consecutive tool calls whose
+    /// tool reports `concurrency_safe() == true` are merged into one batch
+    /// (to be run in parallel).  A non-safe tool — or one not found in the
+    /// registry — flushes the accumulated batch and becomes its own singleton,
+    /// acting as a serialisation barrier.  This mirrors the Python behaviour
+    /// where `tool.concurrency_safe` is checked via attribute access.
+    fn partition_tool_batches<'a>(
+        spec: &AgentRunSpec,
+        tool_calls: &'a [ToolCallRequest],
+    ) -> Vec<Vec<&'a ToolCallRequest>> {
+        if !spec.concurrent_tools {
+            return tool_calls.iter().map(|tc| vec![tc]).collect();
+        }
+
+        let mut batches: Vec<Vec<&ToolCallRequest>> = Vec::new();
+        let mut current: Vec<&ToolCallRequest> = Vec::new();
+
+        for tool_call in tool_calls {
+            let can_batch = spec
+                .tools
+                .get(&tool_call.name)
+                .map(|t| t.concurrency_safe())
+                .unwrap_or(false);
+
+            if can_batch {
+                current.push(tool_call);
+            } else {
+                if !current.is_empty() {
+                    batches.push(std::mem::take(&mut current));
+                }
+                batches.push(vec![tool_call]);
+            }
+        }
+
+        if !current.is_empty() {
+            batches.push(current);
+        }
+
+        batches
+    }
+
+    /// Resolve, validate, and execute one tool call.
+    ///
+    /// Mirrors Python's `_request_model` / `_run_tool`:
+    ///   - Blocks repeated identical external lookups.
+    ///   - Delegates to `ToolRegistry::prepare_call` for parameter resolution
+    ///     and validation, then calls `Tool::execute` directly on the resolved
+    ///     tool.
+    ///   - Classifies every failure path (lookup block, prep error, error result)
+    ///     into a uniform `(result, event, fatal_error)` triple.
+    ///
+    /// Returns `(result, event, fatal_error)`:
+    ///   - `result`      — string fed back to the LLM as the tool result.
+    ///   - `event`       — telemetry map (`"name"`, `"status"`, `"detail"`).
+    ///   - `fatal_error` — `Some(msg)` when `spec.fail_on_tool_error` is set
+    ///                     and an error occurred; the agent loop should abort.
+    async fn run_tool(
+        spec: &AgentRunSpec,
+        tool_call: &ToolCallRequest,
+        external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+    ) -> (String, HashMap<String, String>, Option<String>) {
+        const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
+
+        // ── 1. Block repeated identical external lookups ──────────────────────
+        if let Some(lookup_error) = repeated_external_lookup_error(
+            &tool_call.name,
+            &tool_call.arguments,
+            &mut external_lookup_counts.lock().unwrap(),
+        ) {
+            let event = HashMap::from([
+                ("name".to_string(), tool_call.name.clone()),
+                ("status".to_string(), "error".to_string()),
+                (
+                    "detail".to_string(),
+                    "repeated external lookup blocked".to_string(),
+                ),
+            ]);
+            let error = if spec.fail_on_tool_error {
+                Some(lookup_error.clone())
+            } else {
+                None
+            };
+            return (format!("{lookup_error}{HINT}"), event, error);
+        }
+
+        // ── 2. Resolve and validate parameters ───────────────────────────────
+        // Convert HashMap<String, Value> → Value::Object so prepare_call can
+        // cast and validate the parameters against the tool's JSON schema.
+        let params_value = Value::Object(
+            tool_call
+                .arguments
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+        );
+        let (tool, cast_params, prep_error) =
+            spec.tools.prepare_call(&tool_call.name, &params_value);
+
+        if let Some(err) = prep_error {
+            // Strip the leading "Error: " / "Error: Tool '…':" prefix for the
+            // short telemetry detail (mirrors Python's `split(": ", 1)[-1]`).
+            let detail: String = err
+                .splitn(2, ": ")
+                .nth(1)
+                .unwrap_or(&err)
+                .chars()
+                .take(120)
+                .collect();
+            let event = HashMap::from([
+                ("name".to_string(), tool_call.name.clone()),
+                ("status".to_string(), "error".to_string()),
+                ("detail".to_string(), detail),
+            ]);
+            let error = if spec.fail_on_tool_error {
+                Some(err.clone())
+            } else {
+                None
+            };
+            return (format!("{err}{HINT}"), event, error);
+        }
+
+        // ── 3. Execute ────────────────────────────────────────────────────────
+        // `prepare_call` guarantees `tool = Some(_)` when `prep_error = None`.
+        // Python's `await tool.execute(**params)` maps to the sync call below.
+        // Unlike Python, Rust tools do not raise exceptions; a tool that wants
+        // to signal failure returns a string starting with "Error".
+        let result = tool
+            .expect("prepare_call returned no tool and no error")
+            .execute(&cast_params);
+
+        // ── 4. Treat "Error…" result strings as soft errors ──────────────────
+        if result.starts_with("Error") {
+            let detail: String = result.replace('\n', " ").trim().chars().take(120).collect();
+            let event = HashMap::from([
+                ("name".to_string(), tool_call.name.clone()),
+                ("status".to_string(), "error".to_string()),
+                ("detail".to_string(), detail),
+            ]);
+            let error = if spec.fail_on_tool_error {
+                Some(result.clone())
+            } else {
+                None
+            };
+            return (format!("{result}{HINT}"), event, error);
+        }
+
+        // ── 5. Success ────────────────────────────────────────────────────────
+        let replaced = result.replace('\n', " ");
+        let trimmed = replaced.trim();
+        let detail = if trimmed.is_empty() {
+            "(empty)".to_string()
+        } else if trimmed.chars().count() > 120 {
+            let cutoff = trimmed
+                .char_indices()
+                .nth(120)
+                .map(|(i, _)| i)
+                .unwrap_or(trimmed.len());
+            format!("{}...", &trimmed[..cutoff])
+        } else {
+            trimmed.to_string()
+        };
+
+        let event = HashMap::from([
+            ("name".to_string(), tool_call.name.clone()),
+            ("status".to_string(), "ok".to_string()),
+            ("detail".to_string(), detail),
+        ]);
+        (result, event, None)
     }
 }
 
@@ -295,6 +707,13 @@ mod tests {
     use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
     use crate::providers::registry::ProviderSpec;
 
+    fn create_dummy_spec() -> AgentRunSpec {
+        AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        }
+    }
+
     /// Minimal provider that satisfies `LLMProviderDyn` for tests that don't
     /// exercise the provider (e.g. `normalize_tool_result`).
     struct StubProvider {
@@ -303,26 +722,82 @@ mod tests {
 
     impl StubProvider {
         fn new() -> Arc<dyn LLMProviderDyn> {
-            Arc::new(Self { settings: GenerationSettings::new() })
+            Arc::new(Self {
+                settings: GenerationSettings::new(),
+            })
         }
     }
 
     #[async_trait::async_trait(?Send)]
     impl LLMProviderDyn for StubProvider {
-        fn api_key(&self) -> Option<String> { None }
-        fn api_base(&self) -> Option<String> { None }
-        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> { None }
-        fn generation_settings(&self) -> &GenerationSettings { &self.settings }
-        fn generation_settings_mut(&mut self) -> &mut GenerationSettings { &mut self.settings }
-        fn spec(&self) -> Option<&ProviderSpec> { None }
-        fn get_default_model(&self) -> String { String::new() }
-        async fn chat(&self, _: Vec<Value>, _: Option<Vec<Value>>, _: Option<String>, _: usize, _: f32, _: Option<String>, _: Option<Value>) -> LLMResponse {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            String::new()
+        }
+        async fn chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
             unimplemented!()
         }
-        async fn safe_chat(&self, _: Vec<Value>, _: Option<Vec<Value>>, _: Option<String>, _: usize, _: f32, _: Option<String>, _: Option<Value>) -> LLMResponse {
+        async fn safe_chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
             unimplemented!()
         }
-        async fn chat_with_retry(&self, _: Vec<Value>, _: Option<Vec<Value>>, _: Option<String>, _: Option<usize>, _: Option<f32>, _: Option<String>, _: Option<Value>) -> LLMResponse {
+        async fn chat_with_retry(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            unimplemented!()
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+            _: Option<BoxedStreamCallback>,
+        ) -> LLMResponse {
             unimplemented!()
         }
     }
@@ -442,7 +917,10 @@ mod tests {
         ];
         let result = AgentRunner::backfill_missing_tool_results(&mixed);
         assert_eq!(result.len(), 3);
-        let backfilled = result.iter().find(|m| m["tool_call_id"] == "absent").unwrap();
+        let backfilled = result
+            .iter()
+            .find(|m| m["tool_call_id"] == "absent")
+            .unwrap();
         assert_eq!(backfilled["name"], "exec");
         assert_eq!(backfilled["content"], BACKFILL_CONTENT);
     }
@@ -475,7 +953,10 @@ mod tests {
 
         // First 2 are stale and large — must be collapsed.
         for i in 0..2 {
-            assert_eq!(result[i]["content"], "[read_file result omitted from context]");
+            assert_eq!(
+                result[i]["content"],
+                "[read_file result omitted from context]"
+            );
         }
         // Remaining MICROCOMPACT_KEEP_RECENT are untouched.
         for i in 2..total {
@@ -515,7 +996,10 @@ mod tests {
     fn test_normalize_null_result_replaced() {
         // Null input is replaced by ensure_nonempty_tool_result with a non-empty message.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 1000, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        };
         let out = runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::Null);
         match out {
             Value::String(s) => assert!(!s.is_empty()),
@@ -527,8 +1011,12 @@ mod tests {
     fn test_normalize_blank_string_result_replaced() {
         // A whitespace-only string is also considered empty and gets replaced.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 1000, ..Default::default() };
-        let out = runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::String("   ".into()));
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        };
+        let out =
+            runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::String("   ".into()));
         match out {
             Value::String(s) => assert!(!s.trim().is_empty()),
             other => panic!("expected non-blank String, got {other:?}"),
@@ -539,9 +1027,17 @@ mod tests {
     fn test_normalize_content_within_limit_unchanged() {
         // A short result within max_tool_result_chars is returned as-is.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 1000, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        };
         let content = "hello world".to_string();
-        let out = runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::String(content.clone()));
+        let out = runner.normalize_tool_result(
+            &spec,
+            "call_1",
+            "my_tool",
+            Value::String(content.clone()),
+        );
         assert_eq!(out, Value::String(content));
     }
 
@@ -550,9 +1046,13 @@ mod tests {
         // A string longer than max_tool_result_chars is truncated (no workspace, so no persist).
         let runner = make_runner();
         let limit = 20;
-        let spec = AgentRunSpec { max_tool_result_chars: limit, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: limit,
+            ..Default::default()
+        };
         let long_content = "a".repeat(limit + 50);
-        let out = runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::String(long_content));
+        let out =
+            runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::String(long_content));
         match out {
             Value::String(s) => assert!(s.len() <= limit + "\n... (truncated)".len()),
             other => panic!("expected truncated String, got {other:?}"),
@@ -563,9 +1063,17 @@ mod tests {
     fn test_normalize_zero_limit_disables_truncation() {
         // max_tool_result_chars = 0 means unlimited: even very long content is not truncated.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 0, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 0,
+            ..Default::default()
+        };
         let long_content = "z".repeat(10_000);
-        let out = runner.normalize_tool_result(&spec, "call_1", "my_tool", Value::String(long_content.clone()));
+        let out = runner.normalize_tool_result(
+            &spec,
+            "call_1",
+            "my_tool",
+            Value::String(long_content.clone()),
+        );
         assert_eq!(out, Value::String(long_content));
     }
 
@@ -583,7 +1091,12 @@ mod tests {
             ..Default::default()
         };
         let large_content = "x".repeat(limit + 200);
-        let out = runner.normalize_tool_result(&spec, "call_persist", "read_file", Value::String(large_content));
+        let out = runner.normalize_tool_result(
+            &spec,
+            "call_persist",
+            "read_file",
+            Value::String(large_content),
+        );
         // The persisted reference is a short string pointing to the file on disk,
         // not the original large payload.
         match out {
@@ -598,7 +1111,10 @@ mod tests {
     fn test_apply_budget_no_tool_messages_unchanged() {
         // No tool messages — returned unchanged, no allocation.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 10, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 10,
+            ..Default::default()
+        };
         let messages = vec![
             serde_json::json!({"role": "user", "content": "hello"}),
             serde_json::json!({"role": "assistant", "content": "hi"}),
@@ -611,7 +1127,10 @@ mod tests {
     fn test_apply_budget_short_content_unchanged() {
         // Tool message content within the limit is not modified.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 1000, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        };
         let messages = vec![
             serde_json::json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": "ok"}),
         ];
@@ -624,7 +1143,10 @@ mod tests {
         // Tool message content exceeding the limit is truncated.
         let runner = make_runner();
         let limit = 20;
-        let spec = AgentRunSpec { max_tool_result_chars: limit, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: limit,
+            ..Default::default()
+        };
         let long = "x".repeat(limit + 100);
         let messages = vec![
             serde_json::json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": long}),
@@ -638,7 +1160,10 @@ mod tests {
     fn test_apply_budget_null_content_replaced() {
         // A null content field is replaced with a non-empty placeholder.
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 1000, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        };
         let messages = vec![
             serde_json::json!({"role": "tool", "tool_call_id": "c1", "name": "exec", "content": null}),
         ];
@@ -651,10 +1176,11 @@ mod tests {
     fn test_apply_budget_missing_tool_call_id_uses_fallback() {
         // When tool_call_id is absent the method falls back to "tool_{idx}".
         let runner = make_runner();
-        let spec = AgentRunSpec { max_tool_result_chars: 1000, ..Default::default() };
-        let messages = vec![
-            serde_json::json!({"role": "tool", "name": "exec", "content": "done"}),
-        ];
+        let spec = AgentRunSpec {
+            max_tool_result_chars: 1000,
+            ..Default::default()
+        };
+        let messages = vec![serde_json::json!({"role": "tool", "name": "exec", "content": "done"})];
         // No panic — fallback id is generated internally.
         let result = runner.apply_tool_result_budget(&spec, &messages);
         assert_eq!(result[0]["content"].as_str().unwrap(), "done");
@@ -665,7 +1191,10 @@ mod tests {
         // Non-tool messages adjacent to a truncated tool message are untouched.
         let runner = make_runner();
         let limit = 10;
-        let spec = AgentRunSpec { max_tool_result_chars: limit, ..Default::default() };
+        let spec = AgentRunSpec {
+            max_tool_result_chars: limit,
+            ..Default::default()
+        };
         let long = "y".repeat(limit + 50);
         let messages = vec![
             serde_json::json!({"role": "user", "content": "go"}),
@@ -677,5 +1206,296 @@ mod tests {
         assert_eq!(result[2], messages[2]);
         let tool_out = result[1]["content"].as_str().unwrap();
         assert!(tool_out.len() <= limit + "\n... (truncated)".len());
+    }
+
+    #[test]
+    fn test_snip_history_no_change_when_within_budget() {
+        // Two tiny messages — well within any reasonable budget, returned unchanged.
+        let messages = vec![
+            serde_json::json!({"role": "user", "content": "go"}),
+            serde_json::json!({"role": "assistant", "content": "done"}),
+        ];
+        let spec = AgentRunSpec {
+            context_window_tokens: Some(8_000),
+            context_block_limit: Some(4_000),
+            ..Default::default()
+        };
+        let runner = make_runner();
+        let result = runner.snip_history(&spec, messages.clone());
+        assert_eq!(result, messages);
+    }
+
+    #[test]
+    fn test_snip_history_trims_old_messages() {
+        // Build a history where old turns are very large and a recent turn is tiny.
+        // The budget (200 tokens) fits only the recent user+assistant pair; the two
+        // old pairs must be dropped.
+        //
+        // Token estimates (char / 4 + 4 per message):
+        //   old message  : 2 000 chars → ~504 tokens each
+        //   recent message:   20 chars →   ~9 tokens each
+        //   recent pair total           ≈   18 tokens  ≪  200 budget  ✓
+        //   adding any old message      ≈  522 tokens  ≫  200 budget  ✓  (triggers break)
+        let old_content = "x".repeat(2_000);
+        let recent_user = serde_json::json!({"role": "user",     "content": "what is 2+2?"});
+        let recent_asst = serde_json::json!({"role": "assistant", "content": "the answer is 4"});
+
+        let messages = vec![
+            serde_json::json!({"role": "user",     "content": old_content.clone()}),
+            serde_json::json!({"role": "assistant", "content": old_content.clone()}),
+            serde_json::json!({"role": "user",     "content": old_content.clone()}),
+            serde_json::json!({"role": "assistant", "content": old_content.clone()}),
+            recent_user.clone(),
+            recent_asst.clone(),
+        ];
+
+        let spec = AgentRunSpec {
+            context_window_tokens: Some(8_000),
+            context_block_limit: Some(200),
+            ..Default::default()
+        };
+        let runner = make_runner();
+        let result = runner.snip_history(&spec, messages);
+
+        // Only the recent pair should survive.
+        assert_eq!(result.len(), 2, "expected only the recent pair to be kept");
+        assert_eq!(result[0], recent_user);
+        assert_eq!(result[1], recent_asst);
+    }
+
+    // ── run_tool ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn test_run_tool_repeated_external_lookup_blocked() {
+        // A repeated external lookup is blocked and returns an error.
+        let spec = AgentRunSpec {
+            fail_on_tool_error: true,
+            ..Default::default()
+        };
+        let tool_call = crate::providers::base::ToolCallRequest {
+            id: "1".to_string(),
+            name: "dummy_tool".to_string(),
+            arguments: HashMap::new(),
+            extra_content: None,
+            provider_specific_fields: None,
+            function_provider_specific_fields: None,
+        };
+        let external_lookup_counts = HashMap::<String, usize>::new();
+        let (result, event, fatal_error) =
+            AgentRunner::run_tool(&spec, &tool_call, Arc::new(Mutex::new(external_lookup_counts))).await;
+        assert_eq!(
+            result,
+            "Error: Tool 'dummy_tool' not found. Available: \n\n[Analyze the error above and try a different approach.]"
+        );
+        assert_eq!(event.get("name").unwrap(), &"dummy_tool".to_string());
+        assert_eq!(event.get("status").unwrap(), &"error".to_string());
+        assert_eq!(
+            event.get("detail").unwrap(),
+            &"Tool 'dummy_tool' not found. Available: ".to_string()
+        );
+        assert_eq!(
+            fatal_error,
+            Some("Error: Tool 'dummy_tool' not found. Available: ".to_string())
+        );
+    }
+
+    // ── partition_tool_batches ────────────────────────────────────────────────
+
+    /// Build a minimal `ToolCallRequest` with the given name and no arguments.
+    fn tc(name: &str) -> ToolCallRequest {
+        ToolCallRequest {
+            id: name.to_string(),
+            name: name.to_string(),
+            arguments: HashMap::new(),
+            extra_content: None,
+            provider_specific_fields: None,
+            function_provider_specific_fields: None,
+        }
+    }
+
+    /// Flatten batch references into names for easy assertions.
+    fn batch_names<'a>(batches: &[Vec<&'a ToolCallRequest>]) -> Vec<Vec<&'a str>> {
+        batches
+            .iter()
+            .map(|b| b.iter().map(|tc| tc.name.as_str()).collect())
+            .collect()
+    }
+
+    /// A tool that explicitly opts in to concurrent execution.
+    struct ConcurrentSafeTool(String);
+    impl crate::agent::tools::base::Tool for ConcurrentSafeTool {
+        fn name(&self) -> String {
+            self.0.clone()
+        }
+        fn description(&self) -> String {
+            "safe".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn execute(&self, _: &serde_json::Value) -> String {
+            "ok".into()
+        }
+        fn concurrency_safe(&self) -> bool {
+            true
+        }
+    }
+
+    /// A tool that relies on the default (non-concurrent-safe).
+    struct SerialTool(String);
+    impl crate::agent::tools::base::Tool for SerialTool {
+        fn name(&self) -> String {
+            self.0.clone()
+        }
+        fn description(&self) -> String {
+            "serial".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{}})
+        }
+        fn execute(&self, _: &serde_json::Value) -> String {
+            "ok".into()
+        }
+        // concurrency_safe() defaults to false
+    }
+
+    fn registry_with(tools: Vec<Box<dyn crate::agent::tools::base::Tool>>) -> ToolRegistry {
+        let mut reg = ToolRegistry::new();
+        for t in tools {
+            reg.register(t);
+        }
+        reg
+    }
+
+    fn spec_concurrent(tools: ToolRegistry) -> AgentRunSpec {
+        AgentRunSpec {
+            concurrent_tools: true,
+            tools,
+            ..Default::default()
+        }
+    }
+
+    fn spec_sequential(tools: ToolRegistry) -> AgentRunSpec {
+        AgentRunSpec {
+            concurrent_tools: false,
+            tools,
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn test_partition_empty_input() {
+        // No tool calls → no batches.
+        let spec = spec_concurrent(ToolRegistry::new());
+        let result = AgentRunner::partition_tool_batches(&spec, &[]);
+        assert!(result.is_empty());
+    }
+
+    #[test]
+    fn test_partition_non_concurrent_mode_always_singletons() {
+        // Even concurrency-safe tools must be serialised when the flag is off.
+        let reg = registry_with(vec![
+            Box::new(ConcurrentSafeTool("a".into())),
+            Box::new(ConcurrentSafeTool("b".into())),
+        ]);
+        let calls = vec![tc("a"), tc("b")];
+        let spec = spec_sequential(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["a"], vec!["b"]]
+        );
+    }
+
+    #[test]
+    fn test_partition_all_safe_merged_into_one_batch() {
+        // All safe tools with concurrency enabled → single batch.
+        let reg = registry_with(vec![
+            Box::new(ConcurrentSafeTool("x".into())),
+            Box::new(ConcurrentSafeTool("y".into())),
+            Box::new(ConcurrentSafeTool("z".into())),
+        ]);
+        let calls = vec![tc("x"), tc("y"), tc("z")];
+        let spec = spec_concurrent(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["x", "y", "z"]]
+        );
+    }
+
+    #[test]
+    fn test_partition_all_serial_each_is_singleton() {
+        // Non-safe tools are serialisation barriers — each gets its own batch.
+        let reg = registry_with(vec![
+            Box::new(SerialTool("p".into())),
+            Box::new(SerialTool("q".into())),
+        ]);
+        let calls = vec![tc("p"), tc("q")];
+        let spec = spec_concurrent(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["p"], vec!["q"]]
+        );
+    }
+
+    #[test]
+    fn test_partition_safe_batch_flushed_by_serial_tool() {
+        // safe, safe, serial → [safe, safe] then [serial].
+        let reg = registry_with(vec![
+            Box::new(ConcurrentSafeTool("a".into())),
+            Box::new(ConcurrentSafeTool("b".into())),
+            Box::new(SerialTool("c".into())),
+        ]);
+        let calls = vec![tc("a"), tc("b"), tc("c")];
+        let spec = spec_concurrent(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["a", "b"], vec!["c"]]
+        );
+    }
+
+    #[test]
+    fn test_partition_serial_tool_followed_by_safe_batch() {
+        // serial, safe, safe → [serial] then [safe, safe].
+        let reg = registry_with(vec![
+            Box::new(SerialTool("a".into())),
+            Box::new(ConcurrentSafeTool("b".into())),
+            Box::new(ConcurrentSafeTool("c".into())),
+        ]);
+        let calls = vec![tc("a"), tc("b"), tc("c")];
+        let spec = spec_concurrent(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["a"], vec!["b", "c"]]
+        );
+    }
+
+    #[test]
+    fn test_partition_serial_tool_splits_safe_batches() {
+        // safe, safe, serial, safe, safe → two safe batches separated by serial.
+        let reg = registry_with(vec![
+            Box::new(ConcurrentSafeTool("a".into())),
+            Box::new(ConcurrentSafeTool("b".into())),
+            Box::new(SerialTool("barrier".into())),
+            Box::new(ConcurrentSafeTool("c".into())),
+            Box::new(ConcurrentSafeTool("d".into())),
+        ]);
+        let calls = vec![tc("a"), tc("b"), tc("barrier"), tc("c"), tc("d")];
+        let spec = spec_concurrent(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["a", "b"], vec!["barrier"], vec!["c", "d"]]
+        );
+    }
+
+    #[test]
+    fn test_partition_unknown_tool_treated_as_non_safe() {
+        // A tool not in the registry is treated as a serialisation barrier.
+        let reg = registry_with(vec![Box::new(ConcurrentSafeTool("known".into()))]);
+        let calls = vec![tc("known"), tc("ghost"), tc("known")];
+        let spec = spec_concurrent(reg);
+        assert_eq!(
+            batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
+            vec![vec!["known"], vec!["ghost"], vec!["known"]]
+        );
     }
 }

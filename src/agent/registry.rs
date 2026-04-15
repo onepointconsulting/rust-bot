@@ -83,6 +83,24 @@ impl ToolRegistry {
     pub fn contains(&self, name: &str) -> bool {
         self.tools.contains_key(name)
     }
+
+    /// Resolve, cast, and validate one tool call
+    pub fn prepare_call(
+        &self,
+        name: &str,
+        params: &serde_json::Value,
+    ) -> (Option<&dyn Tool>, serde_json::Value, Option<String>) {
+        
+        if let Some(tool) = self.tools.get(name) {
+            let cast_params = tool.cast_params(params);
+            let errors = tool.validate_params(&cast_params);
+            if !errors.is_empty() {
+                return (Some(tool.as_ref()), cast_params, Option::Some(format!("Error: Invalid parameters for tool '{}': {}", name, errors.join("; "))));
+            }
+            return (Some(tool.as_ref()), cast_params, Option::None);
+        }
+        return (Option::None, params.clone(), Option::Some(format!("Error: Tool '{}' not found. Available: {}", name, self.tool_names().join(", "))));
+    }
 }
 
 #[cfg(test)]

@@ -1,5 +1,7 @@
 use std::collections::HashMap;
+use std::future::Future;
 use std::panic::AssertUnwindSafe;
+use std::pin::Pin;
 use futures::FutureExt;
 
 use crate::providers::registry::ProviderSpec;
@@ -143,6 +145,14 @@ const TRANSIENT_ERROR_MARKERS: &[&str] = &[
 
 
 
+/// A dyn-safe streaming callback: receives one content delta per token and
+/// returns a boxed `Send` future.
+///
+/// The `Send + Sync` bounds are required so the closure can be stored behind an
+/// `Arc` and called from async provider code that may span threads.
+pub type BoxedStreamCallback =
+    Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// A dyn-compatible subset of [`LLMProvider`].
 ///
 /// `LLMProvider` cannot be used as `dyn LLMProvider` because it contains:
@@ -195,6 +205,29 @@ pub trait LLMProviderDyn: Send + Sync {
         temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
+    ) -> LLMResponse;
+
+    /// Streaming counterpart of [`chat_with_retry`] that is safe to call
+    /// through `Arc<dyn LLMProviderDyn>`.
+    ///
+    /// `on_content_delta` is invoked once per text token as it arrives from the
+    /// provider.  Providers that do not implement real streaming (i.e. those
+    /// relying on the default `chat_stream` base implementation) will invoke the
+    /// callback exactly once with the full response content.
+    ///
+    /// The callback's `Send + Sync` bounds and the `Send` bound on the returned
+    /// future are required so the closure can be held across `.await` points in
+    /// provider code that may run on a multi-threaded executor.
+    async fn chat_stream_with_retry_boxed(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: Option<BoxedStreamCallback>,
     ) -> LLMResponse;
 }
 
@@ -259,6 +292,36 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
         LLMProvider::chat_with_retry(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+    }
+
+    async fn chat_stream_with_retry_boxed(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: Option<usize>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: Option<BoxedStreamCallback>,
+    ) -> LLMResponse {
+        // `BoxedStreamCallback` satisfies the bounds of `safe_chat_stream_with_retry`:
+        //   F  = Box<dyn Fn(String) -> Pin<Box<dyn Future<Output=()> + Send>> + Send + Sync>
+        //      → implements Fn(String) -> Fut + Send + Sync  ✓
+        //   Fut = Pin<Box<dyn Future<Output=()> + Send>>
+        //      → implements Future<Output=()> + Send          ✓
+        LLMProvider::safe_chat_stream_with_retry(
+            self,
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+            &on_content_delta,
+        )
+        .await
     }
 }
 
