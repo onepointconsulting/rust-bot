@@ -42,7 +42,7 @@ pub struct AgentRunSpec {
     pub model: String,
     pub max_iterations: usize,
     pub max_tool_result_chars: usize,
-    pub temperature: Option<f64>,
+    pub temperature: Option<f32>,
     pub max_tokens: Option<usize>,
     pub reasoning_effort: Option<String>,
     pub hook: Option<Arc<dyn AgentHook>>,
@@ -698,6 +698,44 @@ impl AgentRunner {
         ]);
         (result, event, None)
     }
+
+    fn append_final_message(messages: &mut Vec<Value>, content: Option<&str>) {
+        if content.is_none() {
+            return;
+        }
+        if !messages.is_empty() 
+            && messages.last().and_then(|m| m.get("role").and_then(Value::as_str)) == Some("assistant") 
+            && messages.last().and_then(|m| m.get("tool_calls").and_then(Value::as_array)).is_none() {
+            if messages.last().and_then(|m| m.get("content").and_then(Value::as_str)) == content {
+                return;
+            }
+            let last_idx = messages.len() - 1;
+            messages[last_idx] = build_assistant_message(content, Option::None, Option::None, Option::None);
+            return;
+        }
+        messages.push(build_assistant_message(content, Option::None, Option::None, Option::None));
+    }
+
+    async fn request_finalization_retry(&self, spec: &AgentRunSpec, messages: &mut Vec<Value>) -> LLMResponse {
+        let mut retry_messages = messages.clone();
+        retry_messages.push(build_finalization_retry_message());
+        self.provider.chat_with_retry(
+            retry_messages, 
+            Option::None, 
+            Some(spec.model.clone()), 
+            spec.max_tokens.clone(), 
+            spec.temperature.clone(), 
+            spec.reasoning_effort.clone(), 
+            Option::None).await
+    }
+
+    fn merge_usage(left: &HashMap<String, u64>, right: &HashMap<String, u64>) -> HashMap<String, u64> {
+        let mut merged = left.clone();
+        for (key, value) in right.iter() {
+            merged.insert(key.clone(), merged.get(key).unwrap_or(&0u64) + value);
+        }
+        merged
+    }
 }
 
 #[cfg(test)]
@@ -785,7 +823,14 @@ mod tests {
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
-            unimplemented!()
+            LLMResponse {
+                content: Some("Hello, world!".to_string()),
+                finish_reason: "stop".to_string(),
+                tool_calls: Vec::new(),
+                usage: std::collections::HashMap::new(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            }
         }
         async fn chat_stream_with_retry_boxed(
             &self,
@@ -1497,5 +1542,53 @@ mod tests {
             batch_names(&AgentRunner::partition_tool_batches(&spec, &calls)),
             vec![vec!["known"], vec!["ghost"], vec!["known"]]
         );
+    }
+
+    #[test]
+    fn test_append_final_message_empty_messages() {
+        let mut messages = Vec::new();
+        AgentRunner::append_final_message(&mut messages, Some("Hello, world!"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages, vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)]);
+    }
+
+    
+    #[test]
+    fn test_assistant_message_unchanged() {
+        let mut messages = vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)];
+        AgentRunner::append_final_message(&mut messages, Some("Hello, world!"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages, vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)]);
+    }
+
+    #[test]
+    fn test_assistant_message_changed() {
+        let mut messages = vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)];
+        AgentRunner::append_final_message(&mut messages, Some("Hello, universe!"));
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages, vec![build_assistant_message(Some("Hello, universe!"), Option::None, Option::None, Option::None)]);
+    }
+
+    #[tokio::test]
+    async fn request_finalization_retry_empty_messages() {
+        let runner = make_runner();
+        let spec = AgentRunSpec {
+            model: "gpt-4o".to_string(),
+            max_tokens: Some(1000),
+            temperature: Some(0.5),
+            reasoning_effort: Some("medium".to_string()),
+            ..Default::default()
+        };
+        let mut messages = Vec::new();
+        let result = runner.request_finalization_retry(&spec, &mut messages).await;
+        assert_eq!(result.content, Some("Hello, world!".to_string()));
+    }
+
+    #[test]
+    fn test_merge_usage() {
+        let left = HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)]);
+        let right = HashMap::from([("a".to_string(), 3), ("c".to_string(), 4)]);
+        let result = AgentRunner::merge_usage(&left, &right);
+        assert_eq!(result, HashMap::from([("a".to_string(), 4), ("b".to_string(), 2), ("c".to_string(), 4)]));
     }
 }
