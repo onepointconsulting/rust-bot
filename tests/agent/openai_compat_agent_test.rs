@@ -28,5 +28,6 @@ async fn test_simple_run_no_tools() {
     assert!(result.final_content.is_some());
     let final_message = result.final_content.unwrap();
     assert!(final_message.len() > 0);
+    assert!(result.stop_reason == "completed");
     println!("final_message: {:?}", final_message);
 }
