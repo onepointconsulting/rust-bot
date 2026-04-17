@@ -716,8 +716,8 @@ impl AgentRunner {
         messages.push(build_assistant_message(content, Option::None, Option::None, Option::None));
     }
 
-    async fn request_finalization_retry(&self, spec: &AgentRunSpec, messages: &mut Vec<Value>) -> LLMResponse {
-        let mut retry_messages = messages.clone();
+    async fn request_finalization_retry(&self, spec: &AgentRunSpec, messages: &[Value]) -> LLMResponse {
+        let mut retry_messages = messages.to_vec();
         retry_messages.push(build_finalization_retry_message());
         self.provider.chat_with_retry(
             retry_messages, 
@@ -729,6 +729,256 @@ impl AgentRunner {
             Option::None).await
     }
 
+    /// Main agent iteration loop.
+    ///
+    /// Calls the LLM repeatedly, executing any tool calls it requests, until the
+    /// model produces a final text response, an error occurs, or `max_iterations`
+    /// is exhausted.  Returns a fully-populated [`AgentRunResult`].
+    pub async fn run(&self, spec: AgentRunSpec) -> AgentRunResult {
+        // ── Initialise per-run state ──────────────────────────────────────────
+        let hook: Arc<dyn AgentHook> = spec
+            .hook
+            .clone()
+            .unwrap_or_else(|| Arc::new(NoopHook));
+
+        let mut messages = spec.initial_messages.clone();
+        let mut usage: HashMap<String, u64> = HashMap::new();
+        let mut all_tool_events: Vec<HashMap<String, String>> = Vec::new();
+        let mut tools_used: Vec<String> = Vec::new();
+        let mut stop_reason = "completed".to_string();
+        let mut final_result_content: Option<String> = None;
+        let mut final_error: Option<String> = None;
+
+        let external_lookup_counts: Arc<Mutex<HashMap<String, usize>>> =
+            Arc::new(Mutex::new(HashMap::new()));
+
+        let mut empty_retries = 0usize;
+        let mut length_recoveries = 0usize;
+        // Tracks whether the loop ran to completion without breaking — Rust's
+        // equivalent of Python's `for … else` idiom.
+        let mut exhausted = true;
+
+        'outer: for iteration in 0..spec.max_iterations {
+            // ── Context governance ────────────────────────────────────────────
+            let backfilled = Self::backfill_missing_tool_results(&messages);
+            let compacted = Self::microcompact(&backfilled);
+            let budgeted = self.apply_tool_result_budget(&spec, &compacted);
+            let messages_for_model = self.snip_history(&spec, budgeted);
+
+            let mut ctx = AgentHookContext::new(iteration, messages.clone());
+            hook.before_iteration(&mut ctx).await;
+
+            // ── LLM call ──────────────────────────────────────────────────────
+            let response = self
+                .request_model(&spec, messages_for_model.clone(), hook.as_ref(), &mut ctx)
+                .await;
+
+            Self::accumulate_usage(&mut usage, &response.usage);
+            ctx.usage = response
+                .usage
+                .iter()
+                .map(|(k, &v)| (k.clone(), v as i64))
+                .collect();
+            ctx.response = Some(response.clone());
+
+            // ── Tool calls branch ─────────────────────────────────────────────
+            if !response.tool_calls.is_empty() {
+                hook.on_stream_end(&mut ctx, true).await;
+
+                let tool_calls_json: Vec<Value> = response
+                    .tool_calls
+                    .iter()
+                    .map(|tc| tc.to_openai_tool_call())
+                    .collect();
+                let thinking = Self::thinking_blocks_as_values(response.thinking_blocks.as_ref());
+                let assistant_msg = build_assistant_message(
+                    response.content.as_deref(),
+                    Some(tool_calls_json),
+                    response.reasoning_content.as_deref(),
+                    thinking,
+                );
+                messages.push(assistant_msg);
+                Self::emit_checkpoint(&spec, serde_json::json!({"type": "awaiting_tools"}));
+
+                ctx.tool_calls = response.tool_calls.clone();
+                hook.before_execute_tools(&mut ctx).await;
+
+                let (results, events, fatal_error) = Self::execute_tools(
+                    &spec,
+                    &response.tool_calls,
+                    Arc::clone(&external_lookup_counts),
+                )
+                .await;
+
+                for tc in &response.tool_calls {
+                    if !tools_used.contains(&tc.name) {
+                        tools_used.push(tc.name.clone());
+                    }
+                }
+                all_tool_events.extend(events.clone());
+                ctx.tool_events = events;
+
+                if let Some(err) = fatal_error {
+                    let error_msg = spec
+                        .error_message
+                        .as_deref()
+                        .unwrap_or(DEFAULT_ERROR_MESSAGE);
+                    stop_reason = "tool_error".to_string();
+                    Self::append_final_message(&mut messages, Some(error_msg));
+                    ctx.stop_reason = Some("tool_error".to_string());
+                    ctx.error = Some(err.clone());
+                    hook.after_iteration(&mut ctx).await;
+                    final_result_content = Some(error_msg.to_string());
+                    final_error = Some(err);
+                    exhausted = false;
+                    break 'outer;
+                }
+
+                // Append normalised tool result messages.
+                for (tc, result) in response.tool_calls.iter().zip(results.into_iter()) {
+                    let normalized = self.normalize_tool_result(
+                        &spec,
+                        &tc.id,
+                        &tc.name,
+                        Value::String(result),
+                    );
+                    let tool_msg = serde_json::json!({
+                        "role": "tool",
+                        "tool_call_id": tc.id,
+                        "name": tc.name,
+                        "content": normalized,
+                    });
+                    ctx.tool_results.push(tool_msg.clone());
+                    messages.push(tool_msg);
+                }
+
+                Self::emit_checkpoint(&spec, serde_json::json!({"type": "tools_completed"}));
+                empty_retries = 0;
+                length_recoveries = 0;
+                hook.after_iteration(&mut ctx).await;
+                continue;
+            }
+
+            // ── Text response branch ──────────────────────────────────────────
+            let content = hook.finalize_content(&ctx, response.content.clone());
+
+            // Blank with retries remaining — keep going.
+            if is_blank_text(content.as_deref()) && empty_retries < MAX_EMPTY_RETRIES {
+                hook.on_stream_end(&mut ctx, false).await;
+                ctx.final_content = content;
+                hook.after_iteration(&mut ctx).await;
+                empty_retries += 1;
+                continue;
+            }
+
+            // Blank with retries exhausted — one last finalization attempt.
+            let (final_content, finish_reason) = if is_blank_text(content.as_deref()) {
+                let retry_resp = self
+                    .request_finalization_retry(&spec, &messages_for_model)
+                    .await;
+                Self::accumulate_usage(&mut usage, &retry_resp.usage);
+                let retry_content = hook.finalize_content(&ctx, retry_resp.content.clone());
+                (retry_content, retry_resp.finish_reason)
+            } else {
+                (content, response.finish_reason.clone())
+            };
+
+            // Length-truncated response — append partial + recovery prompt.
+            if finish_reason == "length" && length_recoveries < MAX_LENGTH_RECOVERIES {
+                hook.on_stream_end(&mut ctx, true).await;
+                let partial_thinking =
+                    Self::thinking_blocks_as_values(response.thinking_blocks.as_ref());
+                let partial_msg = build_assistant_message(
+                    final_content.as_deref(),
+                    None,
+                    response.reasoning_content.as_deref(),
+                    partial_thinking,
+                );
+                messages.push(partial_msg);
+                messages.push(build_length_recovery_message());
+                ctx.final_content = final_content;
+                hook.after_iteration(&mut ctx).await;
+                length_recoveries += 1;
+                continue;
+            }
+
+            hook.on_stream_end(&mut ctx, false).await;
+
+            // Provider-signalled error.
+            if finish_reason == "error" {
+                let error_msg = spec
+                    .error_message
+                    .as_deref()
+                    .unwrap_or(DEFAULT_ERROR_MESSAGE);
+                stop_reason = "error".to_string();
+                Self::append_final_message(&mut messages, Some(error_msg));
+                ctx.stop_reason = Some("error".to_string());
+                hook.after_iteration(&mut ctx).await;
+                final_result_content = Some(error_msg.to_string());
+                exhausted = false;
+                break 'outer;
+            }
+
+            // Still blank after all retry paths.
+            if is_blank_text(final_content.as_deref()) {
+                stop_reason = "empty_final_response".to_string();
+                Self::append_final_message(&mut messages, Some(EMPTY_FINAL_RESPONSE_MESSAGE));
+                ctx.stop_reason = Some("empty_final_response".to_string());
+                hook.after_iteration(&mut ctx).await;
+                final_result_content = Some(EMPTY_FINAL_RESPONSE_MESSAGE.to_string());
+                exhausted = false;
+                break 'outer;
+            }
+
+            // Normal completion.
+            let normal_thinking =
+                Self::thinking_blocks_as_values(response.thinking_blocks.as_ref());
+            let assistant_msg = build_assistant_message(
+                final_content.as_deref(),
+                None,
+                response.reasoning_content.as_deref(),
+                normal_thinking,
+            );
+            messages.push(assistant_msg);
+            Self::emit_checkpoint(&spec, serde_json::json!({"type": "final_response"}));
+            ctx.final_content = final_content.clone();
+            hook.after_iteration(&mut ctx).await;
+            final_result_content = final_content;
+            exhausted = false;
+            break 'outer;
+        }
+
+        // ── Post-loop: max_iterations exhausted ───────────────────────────────
+        if exhausted {
+            stop_reason = "max_iterations".to_string();
+            let max_iter_msg = spec.max_iterations_message.as_deref();
+            Self::append_final_message(&mut messages, max_iter_msg);
+            final_result_content = max_iter_msg.map(str::to_string);
+        }
+
+        AgentRunResult {
+            final_content: final_result_content,
+            messages,
+            tools_used,
+            usage,
+            stop_reason,
+            error: final_error,
+            tool_events: all_tool_events,
+        }
+    }
+
+    /// Convert `LLMResponse::thinking_blocks` into the `Vec<Value>` form that
+    /// `build_assistant_message` expects.
+    fn thinking_blocks_as_values(
+        blocks: Option<&Vec<HashMap<String, serde_json::Value>>>,
+    ) -> Option<Vec<Value>> {
+        blocks.map(|tb| {
+            tb.iter()
+                .map(|m| Value::Object(m.clone().into_iter().collect()))
+                .collect()
+        })
+    }
+
     fn merge_usage(left: &HashMap<String, u64>, right: &HashMap<String, u64>) -> HashMap<String, u64> {
         let mut merged = left.clone();
         for (key, value) in right.iter() {
@@ -737,6 +987,12 @@ impl AgentRunner {
         merged
     }
 }
+
+/// No-op fallback hook used when `AgentRunSpec::hook` is `None`.
+struct NoopHook;
+
+#[async_trait::async_trait]
+impl AgentHook for NoopHook {}
 
 #[cfg(test)]
 mod tests {

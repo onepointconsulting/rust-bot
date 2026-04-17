@@ -80,7 +80,7 @@ pub struct LLMResponse {
     /// Finish reason, such as "stop" or "tool_calls".
     pub finish_reason: String,
     /// Usage metrics, e.g., token counts.
-    pub usage: HashMap<String, i64>,
+    pub usage: HashMap<String, u64>,
     /// Providers' extra reasoning content, e.g., for Kimi or DeepSeek-R1.
     pub reasoning_content: Option<String>,
     /// Extended blocks, e.g., for Anthropic's "thinking".

@@ -531,9 +531,9 @@ impl OpenAICompatProvider {
         let mut usage_map = HashMap::new();
         match response.usage {
             Some(usage) => {
-                usage_map.insert("prompt_tokens".to_string(), usage.prompt_tokens as i64);
-                usage_map.insert("completion_tokens".to_string(), usage.completion_tokens as i64);
-                usage_map.insert("total_tokens".to_string(), usage.total_tokens as i64);
+                usage_map.insert("prompt_tokens".to_string(), usage.prompt_tokens as u64);
+                usage_map.insert("completion_tokens".to_string(), usage.completion_tokens as u64);
+                usage_map.insert("total_tokens".to_string(), usage.total_tokens as u64);
             }
             None => {
                 usage_map.insert("prompt_tokens".to_string(), 0);
