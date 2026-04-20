@@ -31,19 +31,36 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
-    /// Get all tool definitions in OpenAI format.
+    /// Get all tool definitions in OpenAI format with stable ordering for
+    /// cache-friendly prompts.
+    ///
+    /// Built-in tools (no `mcp_` prefix) are sorted and placed first; MCP
+    /// tools are sorted and appended — mirroring the Python implementation.
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
-        self.tools
-            .values()
-            .map(|tool| {
-                // Compose the OpenAI-format tool definition.
-                serde_json::json!({
-                    "name": tool.name(),
-                    "description": tool.description(),
-                    "parameters": tool.parameters(),
-                })
-            })
-            .collect()
+        let schema_name = |s: &serde_json::Value| -> String {
+            s.get("function")
+                .and_then(|f| f.get("name"))
+                .and_then(|n| n.as_str())
+                .unwrap_or("")
+                .to_string()
+        };
+
+        let mut builtins: Vec<serde_json::Value> = Vec::new();
+        let mut mcp_tools: Vec<serde_json::Value> = Vec::new();
+
+        for tool in self.tools.values() {
+            let schema = tool.to_schema();
+            if schema_name(&schema).starts_with("mcp_") {
+                mcp_tools.push(schema);
+            } else {
+                builtins.push(schema);
+            }
+        }
+
+        builtins.sort_by(|a, b| schema_name(a).cmp(&schema_name(b)));
+        mcp_tools.sort_by(|a, b| schema_name(a).cmp(&schema_name(b)));
+        builtins.extend(mcp_tools);
+        builtins
     }
 
     pub fn execute(&self, name: &str, input: String) -> String {
