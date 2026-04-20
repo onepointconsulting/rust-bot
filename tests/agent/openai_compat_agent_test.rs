@@ -1,6 +1,6 @@
 use std::{path::{Path, PathBuf}, sync::Arc};
 use serde_json::Value;
-use rust_bot::agent::{registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{ListDirTool, WriteFileTool}}};
+use rust_bot::agent::{registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}}};
 
 use crate::config::helpers::{read_env, create_openrouter_provider};
 
@@ -103,6 +103,54 @@ async fn test_simple_run_with_write_tool() {
     completion_message_check(&result);
 }
 
+fn create_agent_run_spec_with_read_and_write_tool(messages: Vec<Value>) -> AgentRunSpec {
+    let workspace_path = prepare_workspace();
+    let write_tool = Box::new(WriteFileTool::new(Some(workspace_path.clone()), None, None));
+    let read_tool = Box::new(ReadFileTool::new(Some(workspace_path), None, None));
+    create_agent_run_spec_with_tools(messages, vec![write_tool, read_tool])
+}
+
+/// Two-turn conversation:
+///   Turn 1 — ask the agent to write a poem to `llm_poem.txt`.
+///   Turn 2 — append a follow-up user message to the existing history and ask
+///             the agent to summarize the poem it just wrote; the agent reads
+///             the file and produces a summary.
+#[tokio::test]
+async fn test_write_poem_then_summarize() {
+    let workspace_path = prepare_workspace();
+    let poem_file = workspace_path.join("llm_poem.txt");
+    // Start clean so the assertion below is unambiguous.
+    let _ = std::fs::remove_file(&poem_file);
+
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+
+    // ── Turn 1: write the poem ────────────────────────────────────────────────
+    let initial_messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Please write a short poem (4–8 lines) to a file called llm_poem.txt in the workspace directory."
+    })];
+    let spec1 = create_agent_run_spec_with_read_and_write_tool(initial_messages);
+    let result1 = runner.run(spec1).await;
+    completion_message_check(&result1);
+    assert!(poem_file.exists(), "llm_poem.txt should have been created");
+
+    // ── Turn 2: summarize the poem ────────────────────────────────────────────
+    // Build conversation history: everything from turn 1 plus a new user message.
+    let mut turn2_messages = result1.messages.clone();
+    turn2_messages.push(serde_json::json!({
+        "role": "user",
+        "content": "Now please read llm_poem.txt from the workspace directory and give me a one-sentence summary of the poem you wrote."
+    }));
+    let spec2 = create_agent_run_spec_with_read_and_write_tool(turn2_messages);
+    let result2 = runner.run(spec2).await;
+    completion_message_check(&result2);
+    // The summary must reference the file name or its content in some way.
+    let summary = result2.final_content.unwrap();
+    assert!(!summary.is_empty(), "summary should not be empty");
+    println!("Poem summary: {}", summary);
+}
+
 #[tokio::test]
 async fn test_simple_run_with_write_and_list_dir_tool() {
     let provider = create_openrouter_provider();
@@ -115,4 +163,57 @@ async fn test_simple_run_with_write_and_list_dir_tool() {
     let result = runner.run(spec).await;
     completion_message_check(&result);
     assert!(result.final_content.unwrap().contains("joke1.txt"));
+}
+
+fn create_agent_run_spec_with_read_write_edit_tool(messages: Vec<Value>) -> AgentRunSpec {
+    let workspace_path = prepare_workspace();
+    let write_tool = Box::new(WriteFileTool::new(Some(workspace_path.clone()), None, None));
+    let read_tool = Box::new(ReadFileTool::new(Some(workspace_path.clone()), None, None));
+    let edit_tool = Box::new(EditFileTool::new(Some(workspace_path), None, None));
+    create_agent_run_spec_with_tools(messages, vec![write_tool, read_tool, edit_tool])
+}
+
+/// Two-turn conversation:
+///   Turn 1 — ask the agent to write a first verse of a poem to `llm_poem2.txt`.
+///   Turn 2 — ask the agent to append a second verse to the same file using the
+///             edit tool, then verify both verses are present on disk.
+#[tokio::test]
+async fn test_write_and_append_poem_verse() {
+    let workspace_path = prepare_workspace();
+    let poem_file = workspace_path.join("llm_poem2.txt");
+    // Start clean so assertions below are unambiguous.
+    let _ = std::fs::remove_file(&poem_file);
+
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+
+    // ── Turn 1: write the first verse ────────────────────────────────────────
+    let initial_messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Please write exactly one verse (4 lines) of an original poem to a file called llm_poem2.txt in the workspace directory. Only write the verse itself, no title or extra commentary."
+    })];
+    let spec1 = create_agent_run_spec_with_read_write_edit_tool(initial_messages);
+    let result1 = runner.run(spec1).await;
+    completion_message_check(&result1);
+    assert!(poem_file.exists(), "llm_poem2.txt should have been created after turn 1");
+    let content_after_turn1 = std::fs::read_to_string(&poem_file).unwrap();
+    assert!(!content_after_turn1.trim().is_empty(), "File should contain the first verse");
+
+    // ── Turn 2: append a second verse ────────────────────────────────────────
+    let mut turn2_messages = result1.messages.clone();
+    turn2_messages.push(serde_json::json!({
+        "role": "user",
+        "content": "Great! Now please append a second verse (4 lines) to llm_poem2.txt in the workspace directory using the edit tool. The new verse should be separated from the first by a blank line."
+    }));
+    let spec2 = create_agent_run_spec_with_read_write_edit_tool(turn2_messages);
+    let result2 = runner.run(spec2).await;
+    completion_message_check(&result2);
+
+    let content_after_turn2 = std::fs::read_to_string(&poem_file).unwrap();
+    // The file should be longer than after turn 1 (second verse was appended).
+    assert!(
+        content_after_turn2.len() > content_after_turn1.len(),
+        "File should be longer after the second verse was appended"
+    );
+    println!("Final poem:\n{}", content_after_turn2);
 }
