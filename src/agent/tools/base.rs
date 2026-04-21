@@ -64,13 +64,25 @@ pub trait Tool {
     */
     fn execute(&self, params: &serde_json::Value) -> String;
 
+    /// Whether this tool is side-effect free and safe to parallelize.
+    /// Defaults to `false` so that existing tools are always executed
+    /// sequentially unless they explicitly opt in.
+    fn exclusive(&self) -> bool {
+        false
+    }
+
+    /// Whether this tool is read-only and safe to parallelize.
+    fn read_only(&self) -> bool {
+        false
+    }
+
     /// Return `true` if this tool is safe to run concurrently with other
     /// concurrency-safe tools in the same LLM turn.
     ///
     /// Defaults to `false` so that existing tools are always executed
     /// sequentially unless they explicitly opt in.
     fn concurrency_safe(&self) -> bool {
-        false
+        self.read_only() && !self.exclusive()
     }
 
     fn cast_params(&self, params: &serde_json::Value) -> serde_json::Value {

@@ -384,6 +384,10 @@ impl Tool for WriteFileTool {
             .to_string()
     }
 
+    fn read_only(&self) -> bool {
+        false
+    }
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -434,6 +438,10 @@ impl Tool for EditFileTool {
 
     fn description(&self) -> String {
         "Edit the contents of a file".to_string()
+    }
+
+    fn read_only(&self) -> bool {
+        false
     }
     
     fn parameters(&self) -> serde_json::Value {
