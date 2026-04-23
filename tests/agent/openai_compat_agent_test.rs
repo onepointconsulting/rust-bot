@@ -1,6 +1,6 @@
 use std::{path::{Path, PathBuf}, sync::Arc};
 use serde_json::Value;
-use rust_bot::agent::{registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}}};
+use rust_bot::agent::{registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, shell::ShellTool}};
 
 use crate::config::helpers::{read_env, create_openrouter_provider};
 
@@ -64,6 +64,18 @@ fn create_agent_run_spec_with_tools(messages: Vec<Value>, tools: Vec<Box<dyn Too
         tools: tool_registry,
         ..AgentRunSpec::default()   // everything else gets its default
     }
+}
+
+fn create_agent_run_spec_with_shell_tool(messages: Vec<Value>) -> AgentRunSpec {
+    let workspace_path = prepare_workspace();
+    let shell_tool = Box::new(ShellTool::new(
+        10, Some(workspace_path.clone()), None, None, false, None, None));
+    let write_tool = Box::new(WriteFileTool::new(
+        Some(workspace_path), 
+        None, 
+        None
+    ));
+    create_agent_run_spec_with_tools(messages, vec![shell_tool, write_tool])
 }
 
 #[tokio::test]
@@ -216,4 +228,18 @@ async fn test_write_and_append_poem_verse() {
         "File should be longer after the second verse was appended"
     );
     println!("Final poem:\n{}", content_after_turn2);
+}
+
+#[tokio::test]
+async fn test_shell_tool() {
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please recursively list the contents of the workspace directory and write the result to a file called shell_tool_result.txt?"
+    })];
+    let spec = create_agent_run_spec_with_shell_tool(messages);
+    let result = runner.run(spec).await;
+    println!("result: {:?}", result);
+    completion_message_check(&result);
 }
