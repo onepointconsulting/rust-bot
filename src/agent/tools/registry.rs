@@ -1,4 +1,5 @@
 /// Tool registry for dynamic tool management.
+use async_trait::async_trait;
 use std::collections::HashMap;
 
 use crate::agent::tools::base::Tool;
@@ -105,14 +106,14 @@ impl ToolRegistry {
     ///
     /// Any error (unknown tool, invalid params, or a result beginning with
     /// `"Error"`) has `HINT` appended to nudge the LLM to self-correct.
-    pub fn execute(&self, name: &str, params: &serde_json::Value) -> String {
+    pub async fn execute(&self, name: &str, params: &serde_json::Value) -> String {
         let (tool, cast_params, error) = self.prepare_call(name, params);
         if let Some(err) = error {
             return err + HINT;
         }
 
         // prepare_call guarantees tool is Some when error is None
-        let result = tool.unwrap().execute(&cast_params);
+        let result = tool.unwrap().execute(&cast_params).await;
         if result.starts_with("Error") {
             result + HINT
         } else {
@@ -172,6 +173,7 @@ mod tests {
 
     struct EchoTool;
 
+    #[async_trait]
     impl Tool for EchoTool {
         fn name(&self) -> String { "echo".to_string() }
         fn description(&self) -> String { "Echoes the input message.".to_string() }
@@ -184,13 +186,14 @@ mod tests {
                 "required": ["message"]
             })
         }
-        fn execute(&self, params: &serde_json::Value) -> String {
+        async fn execute(&self, params: &serde_json::Value) -> String {
             params["message"].as_str().unwrap_or("").to_string()
         }
     }
 
     struct AddTool;
 
+    #[async_trait]
     impl Tool for AddTool {
         fn name(&self) -> String { "add".to_string() }
         fn description(&self) -> String { "Adds two integers.".to_string() }
@@ -204,7 +207,7 @@ mod tests {
                 "required": ["a", "b"]
             })
         }
-        fn execute(&self, params: &serde_json::Value) -> String {
+        async fn execute(&self, params: &serde_json::Value) -> String {
             let a = params["a"].as_i64().unwrap_or(0);
             let b = params["b"].as_i64().unwrap_or(0);
             (a + b).to_string()
@@ -214,25 +217,27 @@ mod tests {
     /// A tool whose name starts with `mcp_` to test schema ordering.
     struct McpSearchTool;
 
+    #[async_trait]
     impl Tool for McpSearchTool {
         fn name(&self) -> String { "mcp_search".to_string() }
         fn description(&self) -> String { "MCP search tool.".to_string() }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({ "type": "object", "properties": {}, "required": [] })
         }
-        fn execute(&self, _params: &serde_json::Value) -> String { "results".to_string() }
+        async fn execute(&self, _params: &serde_json::Value) -> String { "results".to_string() }
     }
 
     /// A tool that always returns an error string.
     struct FailTool;
 
+    #[async_trait]
     impl Tool for FailTool {
         fn name(&self) -> String { "fail".to_string() }
         fn description(&self) -> String { "Always errors.".to_string() }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({ "type": "object", "properties": {}, "required": [] })
         }
-        fn execute(&self, _params: &serde_json::Value) -> String {
+        async fn execute(&self, _params: &serde_json::Value) -> String {
             "Error: something went wrong".to_string()
         }
     }
@@ -365,41 +370,41 @@ mod tests {
 
     // ── execute tests ─────────────────────────────────────────────────────────
 
-    #[test]
-    fn test_execute_unknown_tool_appends_hint() {
+    #[tokio::test]
+    async fn test_execute_unknown_tool_appends_hint() {
         let reg = registry_with_defaults();
-        let result = reg.execute("ghost", &serde_json::json!({}));
+        let result = reg.execute("ghost", &serde_json::json!({})).await;
         assert!(result.contains("Tool 'ghost' not found"));
         assert!(result.contains("[Analyze the error above"));
     }
 
-    #[test]
-    fn test_execute_invalid_params_appends_hint() {
+    #[tokio::test]
+    async fn test_execute_invalid_params_appends_hint() {
         let reg = registry_with_defaults();
-        let result = reg.execute("echo", &serde_json::json!({}));
+        let result = reg.execute("echo", &serde_json::json!({})).await;
         assert!(result.contains("Invalid parameters"));
         assert!(result.contains("[Analyze the error above"));
     }
 
-    #[test]
-    fn test_execute_success() {
+    #[tokio::test]
+    async fn test_execute_success() {
         let reg = registry_with_defaults();
-        let result = reg.execute("echo", &serde_json::json!({ "message": "hi" }));
+        let result = reg.execute("echo", &serde_json::json!({ "message": "hi" })).await;
         assert_eq!(result, "hi");
     }
 
-    #[test]
-    fn test_execute_add_tool() {
+    #[tokio::test]
+    async fn test_execute_add_tool() {
         let reg = registry_with_defaults();
-        let result = reg.execute("add", &serde_json::json!({ "a": 3, "b": 7 }));
+        let result = reg.execute("add", &serde_json::json!({ "a": 3, "b": 7 })).await;
         assert_eq!(result, "10");
     }
 
-    #[test]
-    fn test_execute_tool_error_result_appends_hint() {
+    #[tokio::test]
+    async fn test_execute_tool_error_result_appends_hint() {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(FailTool));
-        let result = reg.execute("fail", &serde_json::json!({}));
+        let result = reg.execute("fail", &serde_json::json!({})).await;
         assert!(result.starts_with("Error: something went wrong"));
         assert!(result.contains("[Analyze the error above"));
     }

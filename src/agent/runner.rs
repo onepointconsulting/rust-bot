@@ -657,7 +657,8 @@ impl AgentRunner {
         // to signal failure returns a string starting with "Error".
         let result = tool
             .expect("prepare_call returned no tool and no error")
-            .execute(&cast_params);
+            .execute(&cast_params)
+            .await;
 
         // ── 4. Treat "Error…" result strings as soft errors ──────────────────
         if result.starts_with("Error") {
@@ -1625,6 +1626,7 @@ mod tests {
 
     /// A tool that explicitly opts in to concurrent execution.
     struct ConcurrentSafeTool(String);
+    #[async_trait::async_trait]
     impl crate::agent::tools::base::Tool for ConcurrentSafeTool {
         fn name(&self) -> String {
             self.0.clone()
@@ -1635,7 +1637,7 @@ mod tests {
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({"type":"object","properties":{}})
         }
-        fn execute(&self, _: &serde_json::Value) -> String {
+        async fn execute(&self, _: &serde_json::Value) -> String {
             "ok".into()
         }
         fn concurrency_safe(&self) -> bool {
@@ -1645,6 +1647,7 @@ mod tests {
 
     /// A tool that relies on the default (non-concurrent-safe).
     struct SerialTool(String);
+    #[async_trait::async_trait]
     impl crate::agent::tools::base::Tool for SerialTool {
         fn name(&self) -> String {
             self.0.clone()
@@ -1655,7 +1658,7 @@ mod tests {
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({"type":"object","properties":{}})
         }
-        fn execute(&self, _: &serde_json::Value) -> String {
+        async fn execute(&self, _: &serde_json::Value) -> String {
             "ok".into()
         }
         // concurrency_safe() defaults to false

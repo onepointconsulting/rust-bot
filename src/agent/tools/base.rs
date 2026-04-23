@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::collections::HashMap;
 
 /// Mapping from JSON Schema primitive types to idiomatic Rust types.
@@ -44,7 +45,8 @@ pub fn json_type_map() -> HashMap<&'static str, &'static [&'static str]> {
     map
 }
 
-pub trait Tool {
+#[async_trait]
+pub trait Tool: Send + Sync {
     /// Tool name used in function calls.
     fn name(&self) -> String;
     /// Description of what the tool does.
@@ -62,7 +64,7 @@ pub trait Tool {
 
             String result of the tool execution.
     */
-    fn execute(&self, params: &serde_json::Value) -> String;
+    async fn execute(&self, params: &serde_json::Value) -> String;
 
     /// Whether this tool is side-effect free and safe to parallelize.
     /// Defaults to `false` so that existing tools are always executed
@@ -432,6 +434,7 @@ mod tests {
 
     struct SampleTool;
 
+    #[async_trait::async_trait]
     impl Tool for SampleTool {
         fn name(&self) -> String {
             "sample".to_string()
@@ -464,7 +467,7 @@ mod tests {
             })
         }
 
-        fn execute(&self, _params: &serde_json::Value) -> String {
+        async fn execute(&self, _params: &serde_json::Value) -> String {
             "ok".to_string()
         }
     }

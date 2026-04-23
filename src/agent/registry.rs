@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use crate::agent::tools::base::Tool;
 use std::collections::HashMap;
 
@@ -63,7 +64,7 @@ impl ToolRegistry {
         builtins
     }
 
-    pub fn execute(&self, name: &str, input: String) -> String {
+    pub async fn execute(&self, name: &str, input: String) -> String {
         let tool_res = self.tools.get(name);
         if tool_res.is_none() {
             return format!("Tool {} not found. Available tools: {:?}", name, self.tools.keys());
@@ -79,7 +80,7 @@ impl ToolRegistry {
         if !errors.is_empty() {
             return format!("Error: invalid parameters for tool {}: {:?}{l_hint}", name, errors);
         }
-        let result = tool.execute(&args);
+        let result = tool.execute(&args).await;
         if result.starts_with("Error:") {
             return format!("{result}{l_hint}");
         }
@@ -127,6 +128,7 @@ mod tests {
 
     struct SampleTool;
 
+    #[async_trait]
     impl Tool for SampleTool {
         fn name(&self) -> String {
             "sample".to_string()
@@ -146,27 +148,27 @@ mod tests {
             })
         }
         
-        fn execute(&self, _params: &serde_json::Value) -> String {
+        async fn execute(&self, _params: &serde_json::Value) -> String {
             "ok".to_string()
         }
     }
 
-    #[test]
-    fn test_registry_returns_validation_ok() {
+    #[tokio::test]
+    async fn test_registry_returns_validation_ok() {
         let tool = SampleTool;
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(tool));
-        let result = registry.execute("sample", "{\"query\": \"hello\"}".to_string());
+        let result = registry.execute("sample", "{\"query\": \"hello\"}".to_string()).await;
         println!("result: {}", result);
         assert_eq!(result, "ok");
     }
 
-    #[test]
-    fn test_registry_returns_validation_error() {
+    #[tokio::test]
+    async fn test_registry_returns_validation_error() {
         let tool = SampleTool;
         let mut registry = ToolRegistry::new();
         registry.register(Box::new(tool));
-        let result = registry.execute("sample", "{\"name\": \"john\"}".to_string());
+        let result = registry.execute("sample", "{\"name\": \"john\"}".to_string()).await;
         println!("result: {}", result);
         assert!(result.trim().contains("Error: invalid parameters for tool sample: [\"missing required query\"]"));
     }

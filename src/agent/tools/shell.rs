@@ -1,11 +1,12 @@
+use async_trait::async_trait;
+use crate::agent::tools::base::Tool;
+use crate::agent::tools::sandbox::wrap_command;
+use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
-use crate::agent::tools::base::Tool;
-use regex::Regex;
 
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
-
 
 pub struct ShellTool {
     timeout: u64,
@@ -18,6 +19,9 @@ pub struct ShellTool {
 }
 
 impl ShellTool {
+    const MAX_TIMEOUT: u64 = 600;
+    const MAX_OUTPUT: usize = 10_000;
+
     pub fn new(
         timeout: u64,
         working_dir: Option<PathBuf>,
@@ -30,23 +34,147 @@ impl ShellTool {
         Self {
             timeout,
             working_dir,
-            deny_patterns: Some(deny_patterns.unwrap_or(
-                vec![
-                    r"\brm\s+-[rf]{1,2}\b".to_string(),          // rm -r, rm -rf, rm -fr
-                    r"\bdel\s+/[fq]\b".to_string(),              // del /f, del /q
-                    r"\brmdir\s+/s\b".to_string(),               // rmdir /s
-                    r"(?:^|[;&|]\s*)format\b".to_string(),       // format (as standalone command only)
-                    r"\b(mkfs|diskpart)\b".to_string(),          // disk operations
-                    r"\bdd\s+if=".to_string(),                   // dd
-                    r">\s*/dev/sd".to_string(),                  // write to disk
-                    r"\b(shutdown|reboot|poweroff)\b".to_string(),  // system power
-                    r":\(\)\s*\{.*\};\s*:".to_string(),
-                ]
-            )),
+            deny_patterns: Some(deny_patterns.unwrap_or(vec![
+                r"\brm\s+-[rf]{1,2}\b".to_string(),    // rm -r, rm -rf, rm -fr
+                r"\bdel\s+/[fq]\b".to_string(),        // del /f, del /q
+                r"\brmdir\s+/s\b".to_string(),         // rmdir /s
+                r"(?:^|[;&|]\s*)format\b".to_string(), // format (as standalone command only)
+                r"\b(mkfs|diskpart)\b".to_string(),    // disk operations
+                r"\bdd\s+if=".to_string(),             // dd
+                r">\s*/dev/sd".to_string(),            // write to disk
+                r"\b(shutdown|reboot|poweroff)\b".to_string(), // system power
+                r":\(\)\s*\{.*\};\s*:".to_string(),
+            ])),
             allow_patterns: Some(allow_patterns.unwrap_or(vec![])),
             restrict_to_workspace,
             sandbox,
-            path_append 
+            path_append,
+        }
+    }
+
+    async fn execute_command(
+        &self,
+        command: &str,
+        working_dir: Option<PathBuf>,
+        timeout: Option<u64>,
+    ) -> String {
+        let mut cwd = working_dir
+            .or(self.working_dir.clone())
+            .unwrap_or_else(|| std::env::current_dir().unwrap());
+        let guard_error = self.guard_command(command, cwd.to_str().unwrap());
+        if let Some(error) = guard_error {
+            return error;
+        }
+
+        let mut effective_command = command.to_string();
+
+        if let Some(sandbox) = &self.sandbox {
+            if IS_WINDOWS {
+                log::warn!(
+                    "Sandbox '{}' is not supported on Windows; running unsandboxed",
+                    sandbox.to_string()
+                )
+            } else {
+                let workspace = self
+                    .working_dir
+                    .clone()
+                    .unwrap_or_else(|| std::env::current_dir().unwrap());
+                let command_result = wrap_command(
+                    sandbox,
+                    command,
+                    workspace.to_str().unwrap(),
+                    cwd.to_str().unwrap(),
+                    None,
+                );
+                if let Ok(command) = command_result {
+                    effective_command = command;
+                } else {
+                    return command_result.unwrap_err();
+                }
+                cwd = workspace;
+            }
+        }
+        let effective_timeout = std::cmp::min(timeout.unwrap_or(self.timeout), Self::MAX_TIMEOUT);
+        let mut env = Self::build_env();
+
+        if let Some(path_append) = &self.path_append {
+            if IS_WINDOWS {
+                let current = env.get("PATH").cloned().unwrap_or_default();
+                env.insert("PATH".to_string(), format!("{current};{path_append}"));
+            } else {
+                effective_command =
+                    format!("export PATH=\"$PATH:{path_append}\"; {effective_command}");
+            }
+        }
+
+        // ── Spawn ─────────────────────────────────────────────────────────────
+        let child = match Self::spawn(&effective_command, cwd.to_str().unwrap_or("."), &env) {
+            Ok(c) => c,
+            Err(e) => return format!("Error executing command: {e}"),
+        };
+
+        // ── Collect output with timeout ───────────────────────────────────────
+        // `Child::wait_with_output` is blocking; run it on the thread-pool so
+        // the async executor is not stalled.
+        let timeout_dur = std::time::Duration::from_secs(effective_timeout);
+
+        let output_result = tokio::time::timeout(
+            timeout_dur,
+            tokio::task::spawn_blocking(move || child.wait_with_output()),
+        )
+        .await;
+
+        let output = match output_result {
+            // Timed out — the Child was moved into the closure so we can no
+            // longer call kill_process here; the OS will reap it when the
+            // thread unblocks.  Return the timeout message immediately.
+            Err(_elapsed) => {
+                return format!("Error: Command timed out after {effective_timeout} seconds");
+            }
+            // Thread panicked or was cancelled.
+            Ok(Err(join_err)) => {
+                return format!("Error executing command: {join_err}");
+            }
+            Ok(Ok(Err(io_err))) => {
+                return format!("Error executing command: {io_err}");
+            }
+            Ok(Ok(Ok(out))) => out,
+        };
+
+        // ── Build result string ───────────────────────────────────────────────
+        let mut parts: Vec<String> = Vec::new();
+
+        let stdout_text = String::from_utf8_lossy(&output.stdout);
+        if !stdout_text.is_empty() {
+            parts.push(stdout_text.into_owned());
+        }
+
+        let stderr_text = String::from_utf8_lossy(&output.stderr);
+        if !stderr_text.trim().is_empty() {
+            parts.push(format!("STDERR:\n{stderr_text}"));
+        }
+
+        let exit_code = output.status.code().unwrap_or(-1);
+        parts.push(format!("\nExit code: {exit_code}"));
+
+        let result = if parts.is_empty() {
+            "(no output)".to_string()
+        } else {
+            parts.join("\n")
+        };
+
+        // ── Truncate if over MAX_OUTPUT ───────────────────────────────────────
+        if result.len() > Self::MAX_OUTPUT {
+            let half = Self::MAX_OUTPUT / 2;
+            let truncated = result.len() - Self::MAX_OUTPUT;
+            format!(
+                "{}\n\n... ({} chars truncated) ...\n\n{}",
+                &result[..half],
+                truncated,
+                &result[result.len() - half..],
+            )
+        } else {
+            result
         }
     }
 
@@ -69,29 +197,54 @@ impl ShellTool {
             let sr = std::env::var("SYSTEMROOT").unwrap_or_else(|_| r"C:\Windows".to_string());
             HashMap::from([
                 ("SYSTEMROOT".to_string(), sr.clone()),
-                ("COMSPEC".to_string(),    std::env::var("COMSPEC")
-                    .unwrap_or_else(|_| format!(r"{sr}\system32\cmd.exe"))),
-                ("USERPROFILE".to_string(), std::env::var("USERPROFILE").unwrap_or_default()),
-                ("HOMEDRIVE".to_string(),   std::env::var("HOMEDRIVE").unwrap_or_else(|_| "C:".to_string())),
-                ("HOMEPATH".to_string(),    std::env::var("HOMEPATH").unwrap_or_else(|_| r"\".to_string())),
-                ("TEMP".to_string(),        std::env::var("TEMP").unwrap_or_else(|_| format!(r"{sr}\Temp"))),
-                ("TMP".to_string(),         std::env::var("TMP").unwrap_or_else(|_| format!(r"{sr}\Temp"))),
-                ("PATHEXT".to_string(),     std::env::var("PATHEXT")
-                    .unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string())),
-                ("PATH".to_string(),        std::env::var("PATH")
-                    .unwrap_or_else(|_| format!(r"{sr}\system32;{sr}"))),
+                (
+                    "COMSPEC".to_string(),
+                    std::env::var("COMSPEC").unwrap_or_else(|_| format!(r"{sr}\system32\cmd.exe")),
+                ),
+                (
+                    "USERPROFILE".to_string(),
+                    std::env::var("USERPROFILE").unwrap_or_default(),
+                ),
+                (
+                    "HOMEDRIVE".to_string(),
+                    std::env::var("HOMEDRIVE").unwrap_or_else(|_| "C:".to_string()),
+                ),
+                (
+                    "HOMEPATH".to_string(),
+                    std::env::var("HOMEPATH").unwrap_or_else(|_| r"\".to_string()),
+                ),
+                (
+                    "TEMP".to_string(),
+                    std::env::var("TEMP").unwrap_or_else(|_| format!(r"{sr}\Temp")),
+                ),
+                (
+                    "TMP".to_string(),
+                    std::env::var("TMP").unwrap_or_else(|_| format!(r"{sr}\Temp")),
+                ),
+                (
+                    "PATHEXT".to_string(),
+                    std::env::var("PATHEXT").unwrap_or_else(|_| ".COM;.EXE;.BAT;.CMD".to_string()),
+                ),
+                (
+                    "PATH".to_string(),
+                    std::env::var("PATH").unwrap_or_else(|_| format!(r"{sr}\system32;{sr}")),
+                ),
             ])
         } else {
             let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
             HashMap::from([
                 ("HOME".to_string(), home),
-                ("LANG".to_string(), std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".to_string())),
-                ("TERM".to_string(), std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string())),
+                (
+                    "LANG".to_string(),
+                    std::env::var("LANG").unwrap_or_else(|_| "C.UTF-8".to_string()),
+                ),
+                (
+                    "TERM".to_string(),
+                    std::env::var("TERM").unwrap_or_else(|_| "dumb".to_string()),
+                ),
             ])
         }
     }
-
-    
 
     /// Best-effort safety guard for potentially destructive commands.
     ///
@@ -128,9 +281,9 @@ impl ShellTool {
         // ── 2. Allow patterns ─────────────────────────────────────────────────
         if let Some(allow) = &self.allow_patterns {
             if !allow.is_empty() {
-                let permitted = allow.iter().any(|p| {
-                    Regex::new(p).map(|re| re.is_match(&lower)).unwrap_or(false)
-                });
+                let permitted = allow
+                    .iter()
+                    .any(|p| Regex::new(p).map(|re| re.is_match(&lower)).unwrap_or(false));
                 if !permitted {
                     return Some(
                         "Error: Command blocked by safety guard (not in allowlist)".to_string(),
@@ -147,7 +300,9 @@ impl ShellTool {
                 );
             }
 
-            let cwd_path = Path::new(cwd).canonicalize().unwrap_or_else(|_| PathBuf::from(cwd));
+            let cwd_path = Path::new(cwd)
+                .canonicalize()
+                .unwrap_or_else(|_| PathBuf::from(cwd));
 
             for raw in Self::extract_absolute_paths(cmd) {
                 // Expand environment variables (best-effort: %VAR% on Windows, $VAR on POSIX).
@@ -161,10 +316,9 @@ impl ShellTool {
                     Err(_) => PathBuf::from(&expanded),
                 };
 
-                if p.is_absolute()
-                    && !p.starts_with(&cwd_path)
-                    && p != cwd_path
-                {
+                // TODO: Media directory should also be allowed here
+
+                if p.is_absolute() && !p.starts_with(&cwd_path) && p != cwd_path {
                     return Some(
                         "Error: Command blocked by safety guard (path outside working dir)"
                             .to_string(),
@@ -231,8 +385,6 @@ impl ShellTool {
 
         paths
     }
-
-    
 
     /// Launch `command` in a platform-appropriate shell.
     ///
@@ -344,14 +496,16 @@ impl ShellTool {
         {
             match child.try_wait() {
                 Ok(_) => {}
-                Err(e) => log::debug!("kill_process: final try_wait (WNOHANG equivalent) failed: {e}"),
+                Err(e) => {
+                    log::debug!("kill_process: final try_wait (WNOHANG equivalent) failed: {e}")
+                }
             }
         }
     }
 }
 
+#[async_trait]
 impl Tool for ShellTool {
-
     fn name(&self) -> String {
         "shell".to_string()
     }
@@ -360,7 +514,10 @@ impl Tool for ShellTool {
         return r#"Execute a shell command and return its output.
 Prefer read_file/write_file/edit_file over cat/echo/sed, and grep/glob over shell find/grep. 
 Use -y or --yes flags to avoid interactive prompts.
-Output is truncated at 10 000 chars; timeout defaults to 60s."#.to_string().trim().to_string();
+Output is truncated at 10 000 chars; timeout defaults to 60s."#
+            .to_string()
+            .trim()
+            .to_string();
     }
 
     fn exclusive(&self) -> bool {
@@ -379,10 +536,23 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#.to_string().trim
         })
     }
 
-    fn execute(&self, params: &serde_json::Value) -> String {
-        panic!("Not implemented");
+    async fn execute(&self, params: &serde_json::Value) -> String {
+        let command = match params.get("command").and_then(|v| v.as_str()) {
+            Some(c) => c,
+            None => return "Error: missing required parameter 'command'".to_string(),
+        };
+    
+        let working_dir = params
+            .get("working_dir")
+            .and_then(|v| v.as_str())
+            .map(PathBuf::from);
+    
+        let timeout = params
+            .get("timeout")
+            .and_then(|v| v.as_u64());
+    
+        self.execute_command(command, working_dir, timeout).await
     }
-
 }
 
 mod tests {
@@ -442,8 +612,8 @@ mod tests {
             .to_string_lossy()
             .into_owned();
 
-        let mut child = ShellTool::spawn("notepad.exe", &cwd, &env)
-            .expect("failed to spawn notepad.exe");
+        let mut child =
+            ShellTool::spawn("notepad.exe", &cwd, &env).expect("failed to spawn notepad.exe");
 
         // Give it a moment to start up, then kill it.
         tokio::time::sleep(std::time::Duration::from_millis(2000)).await;
@@ -458,20 +628,57 @@ mod tests {
         );
     }
 
+    /// Run a simple `echo` command through the full ShellTool execution path
+    /// and verify the output is captured correctly.
+    #[tokio::test]
+    async fn test_execute_echo() {
+        let tool = ShellTool::new(10, None, None, None, false, None, None);
+
+        // Use a platform-appropriate echo command.
+        let command = if IS_WINDOWS {
+            "echo hello"
+        } else {
+            "echo hello"
+        };
+        let result = tool.execute_command(command, None, None).await;
+        println!("result: {result}");
+
+        assert!(
+            result.contains("hello"),
+            "expected 'hello' in output, got: {result}"
+        );
+        assert!(
+            result.contains("Exit code: 0"),
+            "expected exit code 0, got: {result}"
+        );
+    }
+
     #[test]
     fn test_guard_command_dangerous_pattern() {
-        let tool = ShellTool::new(
-            60,
-             None,
-              None,
-               None,
-                false,
-                 None, None);
+        let tool = ShellTool::new(60, None, None, None, false, None, None);
         let command = "echo Hello, world! > ~/notes.txt && rm -rf ~/notes.txt";
         let result = tool.guard_command(command, ".");
         assert!(result.is_some());
-        assert!(result.unwrap().contains("Error: Command blocked by safety guard (dangerous pattern detected)"));
+        assert!(
+            result
+                .unwrap()
+                .contains("Error: Command blocked by safety guard (dangerous pattern detected)")
+        );
     }
 
+    #[tokio::test]
+    async fn test_execute_command() {
+        let tool = ShellTool::new(10, None, None, None, false, None, None);
+        let result = tool.execute_command("echo hello", None, None).await;
+        println!("result: {result}");
+        assert!(result.contains("hello"));
+    }
 
+    #[tokio::test]
+    async fn test_execute_volume_info() {
+        let tool = ShellTool::new(10, None, None, None, false, None, None);
+        let result = tool.execute_command(if (IS_WINDOWS) {"vol"} else {"lsblk -f"}, None, None).await;
+        println!("result: {result}");
+        assert!(result.len() > 0, "result should not be empty");
+    }
 }

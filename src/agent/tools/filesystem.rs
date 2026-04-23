@@ -1,3 +1,4 @@
+use async_trait::async_trait;
 use std::path::{Path, PathBuf};
 use similar::TextDiff;
 use super::base::Tool;
@@ -253,6 +254,7 @@ impl EditFileTool {
     }
 }
 
+#[async_trait]
 impl Tool for ReadFileTool {
     fn name(&self) -> String {
         "read_file".to_string()
@@ -288,7 +290,7 @@ impl Tool for ReadFileTool {
     }
 
     /// Input is a JSON object string: `{"path": "...", "offset": 1, "limit": 100}`.
-    fn execute(&self, params: &serde_json::Value) -> String {
+    async fn execute(&self, params: &serde_json::Value) -> String {
 
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -373,6 +375,7 @@ impl Tool for ReadFileTool {
     }
 }
 
+#[async_trait]
 impl Tool for WriteFileTool {
 
     fn name(&self) -> String {
@@ -399,7 +402,7 @@ impl Tool for WriteFileTool {
         })
     }
 
-    fn execute(&self, params: &serde_json::Value) -> String {
+    async fn execute(&self, params: &serde_json::Value) -> String {
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: missing required parameter 'path'".to_string(),
@@ -431,6 +434,7 @@ impl Tool for WriteFileTool {
     }
 }
 
+#[async_trait]
 impl Tool for EditFileTool {
     fn name(&self) -> String {
         "edit_file".to_string()
@@ -460,7 +464,7 @@ impl Tool for EditFileTool {
         })
     }
 
-    fn execute(&self, params: &serde_json::Value) -> String {
+    async fn execute(&self, params: &serde_json::Value) -> String {
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) if !p.is_empty() => p,
             _ => return "Error: missing required parameter 'path'".to_string(),
@@ -549,6 +553,7 @@ impl Tool for EditFileTool {
 
 }
 
+#[async_trait]
 impl Tool for ListDirTool {
 
     fn name(&self) -> String {
@@ -578,7 +583,7 @@ impl Tool for ListDirTool {
         })
     }
 
-    fn execute(&self, params: &serde_json::Value) -> String {
+    async fn execute(&self, params: &serde_json::Value) -> String {
 
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
@@ -766,54 +771,54 @@ mod tests {
         assert!(resolved.ends_with("notes.txt"));
     }
 
-    #[test]
-    fn test_read_missing_file_tool() {
+    #[tokio::test]
+    async fn test_read_missing_file_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "missing.txt" }));
+        let result = tool.execute(&serde_json::json!({ "path": "missing.txt" })).await;
         assert!(result.contains("Error: File not found: missing.txt"));
     }
 
-    #[test]
-    fn test_read_missing_path_tool() {
+    #[tokio::test]
+    async fn test_read_missing_path_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ }));
+        let result = tool.execute(&serde_json::json!({ })).await;
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'path'"));
     }
 
-    #[test]
-    fn test_read_content_tool() {
+    #[tokio::test]
+    async fn test_read_content_tool() {
         let docs_path = Path::new("docs");
         let tool = ReadFileTool::new(None, Some(docs_path.to_path_buf()), None);
         // Find the notes.txt file in the docs directory
         let notes_path = docs_path.join("notes.txt");
         assert!(notes_path.exists());
-        let result = tool.execute(&serde_json::json!({ "path": notes_path.to_str().unwrap() }));
+        let result = tool.execute(&serde_json::json!({ "path": notes_path.to_str().unwrap() })).await;
         println!("result: {}", result);
         assert!(result.contains("rust-bot is for educational, research, and technical exchange purposes only. It is unrelated to crypto and does not involve any official token or coin."));
     }
 
-    #[test]
-    fn test_write_missing_path_tool() {
+    #[tokio::test]
+    async fn test_write_missing_path_tool() {
         let tool = WriteFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "content": "Hello, world!" }));
+        let result = tool.execute(&serde_json::json!({ "content": "Hello, world!" })).await;
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'path'"));
     }
 
-    #[test]
-    fn test_write_missing_content() {
+    #[tokio::test]
+    async fn test_write_missing_content() {
         let tool = WriteFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "notes.txt" }));
+        let result = tool.execute(&serde_json::json!({ "path": "notes.txt" })).await;
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'content'"));
     }
 
-    #[test]
-    fn test_write_tool_success() {
+    #[tokio::test]
+    async fn test_write_tool_success() {
         let tool = WriteFileTool::new(None, None, None);
         let notes_text = "notes.txt";
-        let result = tool.execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" }));
+        let result = tool.execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" })).await;
         println!("result: {}", result);
         assert!(result.contains(format!("Successfully wrote").as_str()));
         assert!(Path::new(notes_text).exists());
@@ -847,8 +852,8 @@ mod tests {
         assert!(count == 1);
     }
 
-    #[test]
-    fn test_edit_simple_match() {
+    #[tokio::test]
+    async fn test_edit_simple_match() {
         let tool: EditFileTool = EditFileTool::new(None, None, None);
         let sample_file = sample_file();
         let content = std::fs::read_to_string(&sample_file).unwrap();
@@ -859,7 +864,7 @@ mod tests {
                 "old_text": "1| line 1",
                 "new_text": "---1| line 1---",
                 "replace_all": true
-            }));
+            })).await;
         println!("result: {}", result);
         assert!(result.contains(format!("Successfully edited").as_str()));
         assert!(sample_file.exists());
@@ -868,8 +873,8 @@ mod tests {
         assert!(content.contains("---1| line 1---"));
     }
 
-    #[test]
-    fn test_edit_replace_all_false() {
+    #[tokio::test]
+    async fn test_edit_replace_all_false() {
         let tool: EditFileTool = EditFileTool::new(None, None, None);
         let sample_file = sample_file();
         let content = std::fs::read_to_string(&sample_file).unwrap();
@@ -880,22 +885,22 @@ mod tests {
                 "old_text": "1| line 1",
                 "new_text": "---1| line 1---, but only the first occurrence",
                 "replace_all": false
-            }));
+            })).await;
         println!("result: {}", result);
         assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
     }
 
-    #[test]
-    fn test_list_dir_tool() {
+    #[tokio::test]
+    async fn test_list_dir_tool() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false }));
+        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false })).await;
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits"));
     }
 
-    #[test]
-    fn test_list_dir_tool_workspace() {
+    #[tokio::test]
+    async fn test_list_dir_tool_workspace() {
         let workspace = Path::new(env!("CARGO_MANIFEST_DIR"));
         println!("workspace: {}", workspace.display());
         println!("workspace absolute: {}", workspace.is_absolute());
@@ -904,27 +909,27 @@ mod tests {
             Some(workspace.to_path_buf()), 
             Some(docs.to_path_buf()), 
             None);
-        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false }));
+        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false })).await;
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits"));
     }
 
-    #[test]
-    fn test_list_dir_tool_recursive() {
+    #[tokio::test]
+    async fn test_list_dir_tool_recursive() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": true }));
+        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": true })).await;
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits/"));
         assert!(result.contains("credits/nanobot.txt"));
     }
 
-    #[test]
-    fn test_list_dir_tool_expression() {
+    #[tokio::test]
+    async fn test_list_dir_tool_expression() {
         let tool = ListDirTool::new(None, None, None);
         let limit = 10000;
-        let result = tool.execute(&serde_json::json!({ "path": "src", "recursive": true, "max_entries": limit }));
+        let result = tool.execute(&serde_json::json!({ "path": "src", "recursive": true, "max_entries": limit })).await;
         println!("result count: {}", result.split("\n").count());
         println!("result: {}", result);
         assert!(result.contains("agent/mod.rs"));
