@@ -243,3 +243,59 @@ async fn test_shell_tool() {
     println!("result: {:?}", result);
     completion_message_check(&result);
 }
+
+#[tokio::test]
+async fn test_shell_tool_with_volume() {
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please check the volume information of the disk using the vol command and write the result to a file called shell_tool_vol_result.txt?"
+    })];
+    let spec = create_agent_run_spec_with_shell_tool(messages);
+    let result = runner.run(spec).await;
+    println!("result: {:?}", result);
+    completion_message_check(&result);
+}
+
+#[tokio::test]
+async fn test_shell_tool_with_system_info() {
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please check the system info and write the result to a file called system_info_vol_result.txt?"
+    })];
+    let spec = create_agent_run_spec_with_shell_tool(messages);
+    let result = runner.run(spec).await;
+    println!("result: {:?}", result);
+    completion_message_check(&result);
+}
+
+#[tokio::test]
+async fn test_shell_tool_with_system_info_2() {
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please check the system info and write the result to a file called system_info_vol_result.txt?"
+    })];
+    let spec = create_agent_run_spec_with_shell_tool(messages);
+    let result = runner.run(spec).await;
+    println!("result: {:?}", result);
+    completion_message_check(&result);
+}
+
+#[tokio::test]
+async fn test_shell_tool_associations_with_read_write_tool() {
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please list the associations of file types to applications on this system and write it to a file called assoc_result.txt?"
+    })];
+    let spec = create_agent_run_spec_with_shell_tool(messages);
+    let result = runner.run(spec).await;
+    println!("result: {:?}", result);
+    completion_message_check(&result);
+}
