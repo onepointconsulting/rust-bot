@@ -676,6 +676,21 @@ pub fn sync_workspace_templates(workspace: &Path, silent: bool) -> Vec<String> {
     added
 }
 
+pub fn expand_tilde_path(path: &str) -> std::borrow::Cow<'_, str> {
+    let expanded = if let Some(stripped) = path.strip_prefix("~/") {
+        home::home_dir().map(|h| h.join(stripped))
+    } else if path == "~" {
+        home::home_dir()
+    } else {
+        None
+    };
+
+    match expanded {
+        Some(p) => p.to_string_lossy().into_owned().into(),
+        None => path.into(),
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -1082,5 +1097,13 @@ mod tests {
         let second = sync_workspace_templates(tmp.path(), true);
         assert!(!first.is_empty());
         assert!(second.is_empty(), "second sync should add nothing: {:?}", second);
+    }
+
+    #[test]
+    fn test_expand_tilde_path() {
+        let res1 = expand_tilde_path("~/test");
+        assert!(res1.contains("test"));
+        assert!(!res1.contains("~"));
+        assert_eq!(expand_tilde_path("test"), "test");
     }
 }

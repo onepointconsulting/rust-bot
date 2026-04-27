@@ -895,6 +895,7 @@ mod tests {
             is_oauth: false,
             is_direct: false,
             supports_prompt_caching: false,
+            supports_max_completion_tokens: false,
         };
         assert!(OpenAICompatProvider::uses_openrouter_attribution(
             Some(&spec),

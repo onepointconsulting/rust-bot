@@ -56,6 +56,7 @@ pub fn create_openrouter_provider_with_spec() -> OpenAICompatProvider {
             is_oauth: false,
             is_direct: false,
             supports_prompt_caching: false,
+            supports_max_completion_tokens: false,
         }),
     )
 }
