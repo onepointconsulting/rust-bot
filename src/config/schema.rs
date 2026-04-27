@@ -831,7 +831,36 @@ impl Config {
 
     pub fn get_provider_name(&self, model: Option<&str>) -> Option<String> {
         let (_, name) = self.match_provider(model);
-        return name
+        name
+    }
+
+    pub fn get_api_key(&self, model: Option<&str>) -> Option<String> {
+        self.get_provider(model).map(|p| p.api_key.clone())
+    }
+
+    /// Get the API base URL for the given model.
+    ///
+    /// Returns the explicitly configured `api_base` first. For gateway and local
+    /// providers that have no explicit base URL, falls back to the registry default.
+    /// Standard providers resolve their base URL inside the provider constructor.
+    pub fn get_api_base(&self, model: Option<&str>) -> Option<String> {
+        let (p, name) = self.match_provider(model);
+
+        if let Some(p) = p {
+            if p.api_base.is_some() {
+                return p.api_base.clone();
+            }
+        }
+
+        if let Some(name) = name {
+            if let Some(spec) = crate::providers::registry::find_by_name(&name) {
+                if (spec.is_gateway || spec.is_local) && spec.default_api_base.is_some() {
+                    return spec.default_api_base;
+                }
+            }
+        }
+
+        None
     }
 }
 
@@ -1690,10 +1719,32 @@ mod tests {
 
     #[test]
     fn test_config_match_openai_compat_provider() {
-        let json = r#"{"providers": {"openai": {"api_key": "test"}}}"#;
+        let json = r#"
+{
+"providers": {"openai": {"api_key": "test", "model": "gpt-5-mini"}},
+"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"}
+}
+        "#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let p = cfg.get_provider(Some("gpt-5-mini"));
         let name = cfg.get_provider_name(Some("gpt-5-mini"));
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().api_key, "test");
+        assert!(name.is_some());
+        println!("provider: {:?}", name.unwrap());
+    }
+
+    #[test]
+    fn test_config_match_openai_codex_provider() {
+        let json = r#"
+{
+"providers": {"openai": {"api_key": "test", "model": "gpt-5.2-codex"}},
+"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"}
+}
+        "#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let p = cfg.get_provider(Some("gpt-5.2-codex"));
+        let name = cfg.get_provider_name(Some("gpt-5.2-codex"));
         assert!(p.is_some());
         assert_eq!(p.unwrap().api_key, "test");
         assert!(name.is_some());
