@@ -2,6 +2,10 @@
 
 This is a simple bot implementation based on Nanobot in Rust.
 
+## Pre-requisites
+
+Install Rust
+
 ## Testing
 
 Some of the tests require an .env file with some parameters specified in .env_local.
@@ -9,6 +13,8 @@ Some of the tests require an .env file with some parameters specified in .env_lo
 ```
 cargo test
 ```
+
+#### Integration tests
 
 ```
 cargo test --tests
