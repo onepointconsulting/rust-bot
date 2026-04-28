@@ -1,0 +1,6 @@
+{
+    "agents": {
+        "model": "gpt-4o",
+        "maxTokens": 4096
+    }
+}
