@@ -1,7 +1,9 @@
 use rust_bot::providers::base::{LLMProvider, LLMResponse};
 use rust_bot::providers::openai_compat_provider::OpenAICompatProvider;
 
-use crate::config::helpers::{read_env, create_openrouter_provider, create_openrouter_provider_with_spec};
+use crate::config::helpers::{
+    create_openrouter_provider, create_openrouter_provider_with_spec, read_env,
+};
 
 #[test]
 fn creates_provider_via_trait_constructor() {
@@ -92,7 +94,15 @@ async fn simple_test_safe_chat(message: &str) -> LLMResponse {
         "content": message
     })];
     let response = provider
-        .safe_chat(messages, Some(vec![simple_weather_tool()]), None, 100, 0.5, None, None)
+        .safe_chat(
+            messages,
+            Some(vec![simple_weather_tool()]),
+            None,
+            100,
+            0.5,
+            None,
+            None,
+        )
         .await;
     response
 }
@@ -138,16 +148,14 @@ async fn test_who_are_you_system() {
 
 #[tokio::test]
 async fn test_who_are_you_system_safe() {
-    let response = simple_test_safe_chat(
-        "How is the weather in London?",
-    )
-    .await;
+    let response = simple_test_safe_chat("How is the weather in London?").await;
     assert!(response.content.is_none());
     println!("finish reason: {}", response.finish_reason);
     assert!(!response.tool_calls.is_empty());
 }
 
-fn create_openrouter_provider_with_long_message() -> (OpenAICompatProvider, Vec<serde_json::Value>) {
+fn create_openrouter_provider_with_long_message() -> (OpenAICompatProvider, Vec<serde_json::Value>)
+{
     let provider = create_openrouter_provider();
     let messages = vec![serde_json::json!({
         "role": "user",
@@ -156,21 +164,34 @@ fn create_openrouter_provider_with_long_message() -> (OpenAICompatProvider, Vec<
     return (provider, messages);
 }
 
+fn create_openrouter_provider_with_long_message_2(
+    message: &str,
+) -> (OpenAICompatProvider, Vec<serde_json::Value>) {
+    let provider = create_openrouter_provider();
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": message
+    })];
+    return (provider, messages);
+}
+
 #[tokio::test]
 async fn test_chat_stream_success() {
     let (provider, messages) = create_openrouter_provider_with_long_message();
-    let response = provider.chat_stream(
-        messages, 
-        None, 
-        None,
-        1000,
-        0.5,
-        None,
-        None,
-        &Some(|content| async move {
-            println!("==>: {}", content);
-        }),
-    ).await;
+    let response = provider
+        .chat_stream(
+            messages,
+            None,
+            None,
+            1000,
+            0.5,
+            None,
+            None,
+            &Some(|content| async move {
+                println!("==>: {}", content);
+            }),
+        )
+        .await;
     assert!(response.content.is_some());
     assert!(response.content.unwrap().len() > 0);
     // println!("response: {}", response.content.unwrap());
@@ -179,18 +200,20 @@ async fn test_chat_stream_success() {
 #[tokio::test]
 async fn test_safe_chat_stream_success() {
     let (provider, messages) = create_openrouter_provider_with_long_message();
-    let response = provider.safe_chat_stream(
-        messages, 
-        None, 
-        None,
-        1000,
-        0.5,
-        None,
-        None,
-        &Some(|content| async move {
-            println!("==>: {}", content);
-        }),
-    ).await;
+    let response = provider
+        .safe_chat_stream(
+            messages,
+            None,
+            None,
+            1000,
+            0.5,
+            None,
+            None,
+            &Some(|content| async move {
+                println!("==>: {}", content);
+            }),
+        )
+        .await;
     assert!(response.content.is_some());
     assert!(response.content.unwrap().len() > 0);
     // println!("response: {}", response.content.unwrap());
@@ -199,18 +222,43 @@ async fn test_safe_chat_stream_success() {
 #[tokio::test]
 async fn test_safe_chat_stream_with_retry_success() {
     let (provider, messages) = create_openrouter_provider_with_long_message();
-    let response = provider.safe_chat_stream_with_retry(
-        messages, 
-        None, 
-        None,
-        Some(3000),
-        Some(0.5f32),
-        None,
-        None,
-        &Some(|content| async move {
-            println!("==>: {}", content);
-        }),
-    ).await;
+    let response = provider
+        .safe_chat_stream_with_retry(
+            messages,
+            None,
+            None,
+            Some(3000),
+            Some(0.5f32),
+            None,
+            None,
+            &Some(|content| async move {
+                println!("==>: {}", content);
+            }),
+        )
+        .await;
+    assert!(response.content.is_some());
+    assert!(response.content.unwrap().len() > 0);
+    // println!("response: {}", response.content.unwrap());
+}
+
+#[tokio::test]
+async fn test_safe_chat_stream_with_retry_success_2() {
+    let (provider, messages) =
+        create_openrouter_provider_with_long_message_2("Can you please tell me  a bed time story?");
+    let response = provider
+        .safe_chat_stream_with_retry(
+            messages,
+            None,
+            None,
+            Some(3000),
+            Some(0.5f32),
+            None,
+            None,
+            &Some(|content| async move {
+                println!("==>: {}", content);
+            }),
+        )
+        .await;
     assert!(response.content.is_some());
     assert!(response.content.unwrap().len() > 0);
     // println!("response: {}", response.content.unwrap());
