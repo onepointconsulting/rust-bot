@@ -2017,6 +2017,7 @@ dependencies = [
  "globwalk",
  "hex",
  "home",
+ "ipnet",
  "log",
  "rand 0.10.0",
  "regex",

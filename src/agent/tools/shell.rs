@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use crate::agent::tools::base::Tool;
 use crate::agent::tools::sandbox::wrap_command;
+use crate::config::paths::get_media_dir;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -317,8 +318,9 @@ impl ShellTool {
                 };
 
                 // TODO: Media directory should also be allowed here
-
-                if p.is_absolute() && !p.starts_with(&cwd_path) && p != cwd_path {
+                let media_path = get_media_dir(None);
+                if p.is_absolute() && !p.starts_with(&cwd_path) && p != cwd_path 
+                    && !p.starts_with(&media_path) && p != media_path {
                     return Some(
                         "Error: Command blocked by safety guard (path outside working dir)"
                             .to_string(),
