@@ -2030,6 +2030,7 @@ dependencies = [
  "tera",
  "tiktoken-rs",
  "tokio",
+ "url",
  "uuid",
 ]
 
