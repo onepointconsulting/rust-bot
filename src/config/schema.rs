@@ -8,7 +8,7 @@ use crate::{providers::registry::{find_by_name, providers}, utils::helpers::expa
 // ── ProviderConfig ────────────────────────────────────────────────────────────
 
 /// LLM provider configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderConfig {
     /// API key for the provider. Defaults to an empty string so it can be
@@ -49,7 +49,7 @@ fn default_transcription_provider() -> String { "groq".to_string() }
 /// Built-in and plugin channel configs are stored in `extra`. Each channel
 /// parses its own config independently. Per-channel `"streaming": true`
 /// enables streaming output (requires a `send_delta` implementation).
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelsConfig {
     /// Stream agent's text progress to the channel.
@@ -107,7 +107,7 @@ fn default_dream_max_batch_size() -> u32 { 20 }
 fn default_dream_max_iterations() -> u32 { 10 }
 
 /// Dream memory consolidation configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DreamConfig {
     /// Consolidation interval in whole hours. Must be ≥ 1. Default: 2.
@@ -198,7 +198,7 @@ fn default_agent_reasoning_effort() -> Option<String> { None }
 fn default_agent_timezone() -> String { "UTC".to_string() }
 fn default_agent_dream_config() -> DreamConfig { DreamConfig::default() }
 
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentsConfig {
 
@@ -285,7 +285,7 @@ impl Default for AgentsConfig {
 /// Each field holds the credentials and endpoint settings for one provider.
 /// All fields default to an empty `ProviderConfig` so missing sections in the
 /// config file are silently filled in with safe no-op values.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProvidersConfig {
     /// Any OpenAI-compatible endpoint (custom deployments, local models, etc.).
@@ -356,7 +356,7 @@ fn default_heartbeat_interval_s() -> u32 { 30 * 60 }
 fn default_heartbeat_keep_recent_messages() -> u32 { 8 }
 
 /// Heartbeat service configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HeartbeatConfig {
     /// Whether the heartbeat service is active.
@@ -392,7 +392,7 @@ fn default_api_port() -> u16 { 8900 }
 fn default_api_timeout() -> f64 { 120.0 }
 
 /// OpenAI-compatible API server configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ApiConfig {
     /// Bind address for the API server. Defaults to local-only `127.0.0.1`.
@@ -427,7 +427,7 @@ fn default_gateway_host() -> String { "0.0.0.0".to_string() }
 fn default_gateway_port() -> u16 { 18790 }
 
 /// Gateway/server configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GatewayConfig {
     /// Bind address for the gateway. Defaults to `0.0.0.0` (all interfaces).
@@ -463,7 +463,7 @@ fn default_web_search_max_results() -> u32 { 5 }
 fn default_web_search_timeout() -> u32 { 30 }
 
 /// Web search tool configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebSearchConfig {
     /// Search backend: `"brave"`, `"tavily"`, `"duckduckgo"`, `"searxng"`, or `"jina"`.
@@ -509,7 +509,7 @@ impl Default for WebSearchConfig {
 fn default_web_tools_enable() -> bool { true }
 
 /// Web tools configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebToolsConfig {
     /// Enable or disable the web tools entirely. Default: `true`.
@@ -545,7 +545,7 @@ fn default_exec_tool_enable() -> bool { true }
 fn default_exec_tool_timeout() -> u32 { 60 }
 
 /// Shell exec tool configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExecToolConfig {
     /// Enable or disable the shell exec tool. Default: `true`.
@@ -595,7 +595,7 @@ pub enum McpTransportType {
 }
 
 /// MCP server connection configuration (stdio or HTTP).
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpServerConfig {
     /// Transport type. Auto-detected from `command`/`url` when `None`.
@@ -658,7 +658,7 @@ impl Default for McpServerConfig {
 // ── ToolsConfig ───────────────────────────────────────────────────────────────
 
 /// Tools configuration.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ToolsConfig {
     /// Web tool configuration (search, proxy, etc.).
@@ -702,7 +702,7 @@ impl Default for ToolsConfig {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Root configuration for the bot.
-#[derive(Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
     /// Agent behaviour and model configuration.
@@ -1739,15 +1739,18 @@ mod tests {
         let json = r#"
 {
 "providers": {"openai": {"api_key": "test", "model": "gpt-5.2-codex"}},
-"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"}
+"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"},
+"tools": {"ssrfWhitelist": ["100.64.0.0/10", "192.168.0.0/16"]}
 }
         "#;
         let cfg: Config = serde_json::from_str(json).unwrap();
         let p = cfg.get_provider(Some("gpt-5.2-codex"));
         let name = cfg.get_provider_name(Some("gpt-5.2-codex"));
+        let ssrf_whitelist = cfg.tools.ssrf_whitelist.clone();
         assert!(p.is_some());
         assert_eq!(p.unwrap().api_key, "test");
         assert!(name.is_some());
+        assert_eq!(ssrf_whitelist, vec!["100.64.0.0/10", "192.168.0.0/16"]);
         println!("provider: {:?}", name.unwrap());
     }
 }

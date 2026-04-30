@@ -1,7 +1,10 @@
+use std::env;
 use std::fs::{self, File};
 use std::io::{BufReader, Write};
 use std::path::PathBuf;
-use std::sync::OnceLock;
+use std::sync::{LazyLock, OnceLock};
+
+use regex::Regex;
 
 
 use crate::config::schema::Config;
@@ -82,12 +85,64 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) {
     });
 }
 
+static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
+    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap()
+});
+
+/// Return a copy of `config` with every `${VAR}` placeholder in string values
+/// replaced by the corresponding environment variable.
+///
+/// Only `String` values are affected; numbers, booleans, and nulls pass through
+/// unchanged. Returns `Err` if any referenced variable is not set.
+pub fn resolve_config_env_vars(config: &Config) -> Result<Config, String> {
+    let data = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    let resolved = resolve_env_vars_in_value(data)?;
+    serde_json::from_value(resolved).map_err(|e| e.to_string())
+}
+
+/// Recursively resolve `${VAR}` patterns in all string leaves of a JSON value.
+fn resolve_env_vars_in_value(value: serde_json::Value) -> Result<serde_json::Value, String> {
+    match value {
+        serde_json::Value::String(s) => {
+            let mut error: Option<String> = None;
+            let result = ENV_VAR_RE.replace_all(&s, |caps: &regex::Captures| {
+                let var_name = &caps[1];
+                match env::var(var_name) {
+                    Ok(val) => val,
+                    Err(_) => {
+                        error = Some(format!("Environment variable '{var_name}' is not set"));
+                        String::new()
+                    }
+                }
+            });
+            if let Some(err) = error {
+                return Err(err);
+            }
+            Ok(serde_json::Value::String(result.into_owned()))
+        }
+        serde_json::Value::Object(map) => {
+            let mut new_map = serde_json::Map::new();
+            for (k, v) in map {
+                new_map.insert(k, resolve_env_vars_in_value(v)?);
+            }
+            Ok(serde_json::Value::Object(new_map))
+        }
+        serde_json::Value::Array(arr) => {
+            let resolved: Result<Vec<_>, _> = arr.into_iter().map(resolve_env_vars_in_value).collect();
+            Ok(serde_json::Value::Array(resolved?))
+        }
+        other => Ok(other),
+    }
+}
+
 fn apply_ssrf_whitelist(config: &Config) {
     let ssrf_whitelist = config.tools.ssrf_whitelist.clone();
     if !ssrf_whitelist.is_empty() {
         configure_ssrf_whitelist(ssrf_whitelist);
     }
 }
+
+
 
 #[cfg(test)]
 mod tests {
@@ -159,5 +214,68 @@ mod tests {
 
         let loaded = load_config(Some(path));
         assert_eq!(loaded.agents.model, "model-v2");
+    }
+
+    #[test]
+    fn test_apply_ssrf_whitelist() {
+        let mut config = Config::default();
+        config.tools.ssrf_whitelist = vec!["100.64.0.0/10".to_string(), "192.168.0.0/16".to_string()];
+        assert!(!config.tools.ssrf_whitelist.is_empty());
+        assert!(config.tools.ssrf_whitelist.len() == 2);
+        assert!(config.tools.ssrf_whitelist.get(0).unwrap() == "100.64.0.0/10");
+        assert!(config.tools.ssrf_whitelist.get(1).unwrap() == "192.168.0.0/16");
+        println!("Config: {}", serde_json::to_string_pretty(&config).unwrap());
+    }
+
+    // ── resolve_config_env_vars ───────────────────────────────────────────────
+
+    #[test]
+    fn test_resolve_env_vars_no_placeholders() {
+        let config = Config::default();
+        let resolved = resolve_config_env_vars(&config).unwrap();
+        assert_eq!(resolved.agents.model, config.agents.model);
+    }
+
+    #[test]
+    fn test_resolve_env_vars_replaces_placeholder() {
+        unsafe { env::set_var("TEST_MODEL_NAME", "my-test-model") };
+        let mut config = Config::default();
+        config.agents.model = "${TEST_MODEL_NAME}".to_string();
+
+        let resolved = resolve_config_env_vars(&config).unwrap();
+        assert_eq!(resolved.agents.model, "my-test-model");
+    }
+
+    #[test]
+    fn test_resolve_env_vars_partial_replacement() {
+        unsafe { env::set_var("TEST_PROVIDER_NAME", "openrouter") };
+        let mut config = Config::default();
+        config.agents.model = "prefix-${TEST_PROVIDER_NAME}/some-model".to_string();
+
+        let resolved = resolve_config_env_vars(&config).unwrap();
+        assert_eq!(resolved.agents.model, "prefix-openrouter/some-model");
+    }
+
+    #[test]
+    fn test_resolve_env_vars_missing_var_returns_error() {
+        let mut config = Config::default();
+        config.agents.model = "${THIS_VAR_DEFINITELY_DOES_NOT_EXIST_12345}".to_string();
+
+        let result = resolve_config_env_vars(&config);
+        assert!(result.is_err());
+        let msg = result.unwrap_err();
+        assert!(msg.contains("THIS_VAR_DEFINITELY_DOES_NOT_EXIST_12345"), "got: {msg}");
+    }
+
+    #[test]
+    fn test_resolve_env_vars_non_string_unchanged() {
+        unsafe { env::set_var("TEST_MAX_TOKENS", "999") };
+        // max_tokens is a u32, not a string — env var pattern in a string field
+        // should not affect numeric fields at all.
+        let config = Config::default();
+        let original_max_tokens = config.agents.max_tokens;
+
+        let resolved = resolve_config_env_vars(&config).unwrap();
+        assert_eq!(resolved.agents.max_tokens, original_max_tokens);
     }
 }

@@ -7,7 +7,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use regex::Regex;
-use serde_json::Value;
+use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
 use crate::providers::base::LLMProvider;
@@ -77,12 +77,12 @@ pub fn build_image_content_blocks(
 ) -> Vec<Value> {
     let b64 = BASE64.encode(raw);
     vec![
-        serde_json::json!({
+        json!({
             "type": "image_url",
             "image_url": { "url": format!("data:{};base64,{}", mime, b64) },
             "_meta": { "path": path },
         }),
-        serde_json::json!({ "type": "text", "text": label }),
+        json!({ "type": "text", "text": label }),
     ]
 }
 
@@ -256,7 +256,7 @@ pub fn build_assistant_message(
     reasoning_content: Option<&str>,
     thinking_blocks: Option<Vec<Value>>,
 ) -> Value {
-    let mut msg = serde_json::json!({ "role": "assistant", "content": content });
+    let mut msg = json!({ "role": "assistant", "content": content });
     if let Some(tc) = tool_calls {
         msg["tool_calls"] = Value::Array(tc);
     }
@@ -399,7 +399,7 @@ pub fn maybe_persist_tool_result(
 
     if !path.exists() {
         let body = if is_json {
-            serde_json::to_string_pretty(&content).unwrap_or_else(|_| text_payload.clone())
+            to_string_pretty(&content).unwrap_or_else(|_| text_payload.clone())
         } else {
             text_payload.clone()
         };
@@ -872,8 +872,8 @@ mod tests {
     #[test]
     fn test_find_legal_start_all_valid() {
         let messages = vec![
-            serde_json::json!({ "role": "assistant", "tool_calls": [{"id": "c1"}] }),
-            serde_json::json!({ "role": "tool", "tool_call_id": "c1" }),
+            json!({ "role": "assistant", "tool_calls": [{"id": "c1"}] }),
+            json!({ "role": "tool", "tool_call_id": "c1" }),
         ];
         assert_eq!(find_legal_message_start(&messages), 0);
     }
@@ -881,8 +881,8 @@ mod tests {
     #[test]
     fn test_find_legal_start_orphaned_tool_result() {
         let messages = vec![
-            serde_json::json!({ "role": "tool", "tool_call_id": "orphan" }),
-            serde_json::json!({ "role": "user", "content": "hi" }),
+            json!({ "role": "tool", "tool_call_id": "orphan" }),
+            json!({ "role": "user", "content": "hi" }),
         ];
         // orphan has no prior assistant call → start moves past it
         assert_eq!(find_legal_message_start(&messages), 1);
@@ -898,8 +898,8 @@ mod tests {
     #[test]
     fn test_stringify_text_blocks_ok() {
         let blocks = vec![
-            serde_json::json!({ "type": "text", "text": "hello" }),
-            serde_json::json!({ "type": "text", "text": "world" }),
+            json!({ "type": "text", "text": "hello" }),
+            json!({ "type": "text", "text": "world" }),
         ];
         assert_eq!(stringify_text_blocks(&blocks), Some("hello\nworld".to_string()));
     }
@@ -907,7 +907,7 @@ mod tests {
     #[test]
     fn test_stringify_text_blocks_non_text_returns_none() {
         let blocks = vec![
-            serde_json::json!({ "type": "image_url", "url": "..." }),
+            json!({ "type": "image_url", "url": "..." }),
         ];
         assert_eq!(stringify_text_blocks(&blocks), None);
     }
@@ -964,7 +964,7 @@ mod tests {
 
     #[test]
     fn test_build_assistant_message_with_tool_calls() {
-        let tc = vec![serde_json::json!({"id": "c1", "function": {"name": "f"}})];
+        let tc = vec![json!({"id": "c1", "function": {"name": "f"}})];
         let msg = build_assistant_message(None, Some(tc), None, None);
         assert!(msg["tool_calls"].is_array());
     }
@@ -979,14 +979,14 @@ mod tests {
 
     #[test]
     fn test_estimate_message_tokens_string_content() {
-        let msg = serde_json::json!({ "role": "user", "content": "hello world" });
+        let msg = json!({ "role": "user", "content": "hello world" });
         let tokens = estimate_message_tokens(&msg);
         assert!(tokens >= 4, "expected at least 4: {}", tokens);
     }
 
     #[test]
     fn test_estimate_message_tokens_empty_returns_4() {
-        let msg = serde_json::json!({ "role": "user" });
+        let msg = json!({ "role": "user" });
         assert_eq!(estimate_message_tokens(&msg), 4);
     }
 
@@ -994,16 +994,16 @@ mod tests {
 
     #[test]
     fn test_estimate_prompt_tokens_grows_with_content() {
-        let short = vec![serde_json::json!({ "role": "user", "content": "hi" })];
-        let long = vec![serde_json::json!({ "role": "user", "content": "a".repeat(400) })];
+        let short = vec![json!({ "role": "user", "content": "hi" })];
+        let long = vec![json!({ "role": "user", "content": "a".repeat(400) })];
         println!("long: {}", estimate_prompt_tokens(&long, None));
         assert!(estimate_prompt_tokens(&long, None) > estimate_prompt_tokens(&short, None));
     }
 
     #[test]
     fn test_estimate_prompt_tokens_tools_add_cost() {
-        let msgs = vec![serde_json::json!({ "role": "user", "content": "hi" })];
-        let tools = vec![serde_json::json!({"type": "function", "function": {"name": "f"}})];
+        let msgs = vec![json!({ "role": "user", "content": "hi" })];
+        let tools = vec![json!({"type": "function", "function": {"name": "f"}})];
         assert!(estimate_prompt_tokens(&msgs, Some(&tools)) > estimate_prompt_tokens(&msgs, None));
     }
 
