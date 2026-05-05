@@ -31,6 +31,9 @@ tiktoken-rs = "0.10.0"
 garde = { version = "0.22.1", features = ["full"] }
 url = "2"
 ipnet = "2.12.0"
+rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "transport-io"] }
 
 [dev-dependencies]
 tempfile = "3"
+# Extra rmcp features needed only for integration tests (server, macros, schemars)
+rmcp = { version = "1.6.0", features = ["server", "macros", "schemars"] }

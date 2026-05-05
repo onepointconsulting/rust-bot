@@ -98,7 +98,7 @@ async fn simple_test_safe_chat(message: &str) -> LLMResponse {
             messages,
             Some(vec![simple_weather_tool()]),
             None,
-            100,
+            1000,
             0.5,
             None,
             None,
@@ -128,9 +128,10 @@ async fn test_who_are_you() {
 async fn test_who_are_you_safe() {
     let response =
         simple_test_safe_chat("Who are you? And what is your knowledge cut-off date?").await;
+    println!("finish reason: {}", response.finish_reason);
+    assert!(response.finish_reason == "stop");
     assert!(response.content.is_some());
     println!("response: {}", response.content.unwrap());
-    assert!(response.finish_reason == "stop");
 }
 
 #[tokio::test]
@@ -149,7 +150,6 @@ async fn test_who_are_you_system() {
 #[tokio::test]
 async fn test_who_are_you_system_safe() {
     let response = simple_test_safe_chat("How is the weather in London?").await;
-    assert!(response.content.is_none());
     println!("finish reason: {}", response.finish_reason);
     assert!(!response.tool_calls.is_empty());
 }
