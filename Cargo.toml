@@ -31,7 +31,8 @@ tiktoken-rs = "0.10.0"
 garde = { version = "0.22.1", features = ["full"] }
 url = "2"
 ipnet = "2.12.0"
-rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "transport-io"] }
+rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
+http = "1"
 
 [dev-dependencies]
 tempfile = "3"

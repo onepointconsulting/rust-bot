@@ -2,10 +2,15 @@ use async_trait::async_trait;
 use serde_json::{json, Value};
 
 use std::time::Duration;
-use rmcp::{Peer, RoleClient};
+use http::HeaderName;
+use rmcp::{Peer, RoleClient, ServiceExt};
 use rmcp::model::{CallToolRequestParams, RawContent, Tool as McpToolDef};
+use rmcp::transport::TokioChildProcess;
+use rmcp::transport::streamable_http_client::{
+    StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
+};
 use crate::agent::tools::base::Tool;
-use crate::agent::tools::registry::ToolRegistry;
+use crate::config::schema::{McpServerConfig, McpTransportType};
 
 
 /// Return the single non-null branch for nullable unions.
@@ -122,6 +127,109 @@ fn normalize_schema_for_openai(schema: &Value) -> Value {
 }
 
 
+
+// ── MCP client connection ─────────────────────────────────────────────────────
+
+/// Error returned by [`connect_mcp_server`].
+#[derive(Debug)]
+pub enum ConnectMcpError {
+    /// No transport type could be determined from the config.
+    UnknownTransport,
+    /// Spawning the stdio subprocess failed.
+    Io(std::io::Error),
+    /// The MCP handshake with the server failed.
+    Handshake(rmcp::service::ClientInitializeError),
+    /// A header name in the config is invalid.
+    InvalidHeader(String),
+}
+
+impl std::fmt::Display for ConnectMcpError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownTransport => write!(f, "could not determine MCP transport type"),
+            Self::Io(e) => write!(f, "stdio spawn error: {e}"),
+            Self::Handshake(e) => write!(f, "MCP handshake failed: {e}"),
+            Self::InvalidHeader(h) => write!(f, "invalid header name: {h}"),
+        }
+    }
+}
+
+impl std::error::Error for ConnectMcpError {}
+
+/// A live MCP client session.
+///
+/// Holds both the [`Peer`] used to call tools and the underlying
+/// [`rmcp::service::RunningService`] that drives the connection.
+/// Dropping this value closes the connection.
+pub struct McpClient {
+    pub peer: Peer<RoleClient>,
+    _service: rmcp::service::RunningService<RoleClient, ()>,
+}
+
+/// Connect to an MCP server described by `config`.
+///
+/// Selects the transport based on `config.transport_type`, auto-detecting when
+/// `None`:
+/// - command non-empty → [`McpTransportType::Stdio`]
+/// - url non-empty     → [`McpTransportType::StreamableHttp`]
+///
+/// Returns a [`McpClient`] whose `peer` field can be passed directly to
+/// [`MCPToolWrapper::new`].
+pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpClient, ConnectMcpError> {
+    let transport_type = config.transport_type.as_ref().cloned().or_else(|| {
+        if !config.command.is_empty() {
+            Some(McpTransportType::Stdio)
+        } else if !config.url.is_empty() {
+            Some(McpTransportType::StreamableHttp)
+        } else {
+            None
+        }
+    }).ok_or(ConnectMcpError::UnknownTransport)?;
+
+    match transport_type {
+        McpTransportType::Stdio => connect_stdio(config).await,
+        McpTransportType::Sse => connect_http(config, true).await,
+        McpTransportType::StreamableHttp => connect_http(config, false).await,
+    }
+}
+
+async fn connect_stdio(config: &McpServerConfig) -> Result<McpClient, ConnectMcpError> {
+    let mut cmd = tokio::process::Command::new(&config.command);
+    cmd.args(&config.args);
+    for (k, v) in &config.env {
+        cmd.env(k, v);
+    }
+
+    let transport = TokioChildProcess::new(cmd).map_err(ConnectMcpError::Io)?;
+    let service = ().serve(transport).await.map_err(ConnectMcpError::Handshake)?;
+    Ok(McpClient { peer: service.peer().clone(), _service: service })
+}
+
+async fn connect_http(config: &McpServerConfig, allow_stateless: bool) -> Result<McpClient, ConnectMcpError> {
+    let mut transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str())
+        .reinit_on_expired_session(true);
+
+    // Map config headers → http::HeaderName / HeaderValue
+    if !config.headers.is_empty() {
+        let mut headers = std::collections::HashMap::new();
+        for (name, value) in &config.headers {
+            let header_name = HeaderName::from_bytes(name.as_bytes())
+                .map_err(|_| ConnectMcpError::InvalidHeader(name.clone()))?;
+            let header_value = http::HeaderValue::from_str(value)
+                .map_err(|_| ConnectMcpError::InvalidHeader(name.clone()))?;
+            headers.insert(header_name, header_value);
+        }
+        transport_config = transport_config.custom_headers(headers);
+    }
+
+    transport_config.allow_stateless = allow_stateless;
+
+    let transport = StreamableHttpClientTransport::from_config(transport_config);
+    let service = ().serve(transport).await.map_err(ConnectMcpError::Handshake)?;
+    Ok(McpClient { peer: service.peer().clone(), _service: service })
+}
+
+
 pub struct MCPToolWrapper {
     session: Peer<RoleClient>,
     original_name: String,
@@ -150,6 +258,8 @@ impl MCPToolWrapper {
         Self { session, original_name, name, description, parameters: parameters.clone(), tool_timeout }
     }
 }
+
+
 
 #[async_trait]
 impl Tool for MCPToolWrapper {

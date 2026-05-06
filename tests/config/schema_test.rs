@@ -1,0 +1,31 @@
+use rust_bot::config::{loader::save_config, schema::{Config, McpServerConfig, McpTransportType, ToolsConfig}};
+use std::{collections::HashMap, path::PathBuf};
+
+use crate::config::helpers::read_mcp_env;
+
+#[test]
+fn test_create_mcp_server_config() {
+    
+    let mut headers = HashMap::new();
+    let (mcp_server_url, mcp_headers_jwt) = read_mcp_env();
+    headers.insert("Authorization".to_string(), mcp_headers_jwt.to_string());
+    let mcp_server_config = McpServerConfig {
+        transport_type: Some(McpTransportType::Sse),
+        command: "".to_string(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        url: mcp_server_url.to_string(),
+        headers,
+        tool_timeout: 30,
+        enabled_tools: Vec::new(),
+    };
+    let cfg = Config {
+        tools: ToolsConfig {
+            mcp_servers: HashMap::from([("ems".to_string(), mcp_server_config)]),
+            ..ToolsConfig::default()
+        },
+        ..Config::default()
+    };
+    assert_eq!(cfg.tools.mcp_servers.len(), 1);
+    save_config(&cfg, Some(PathBuf::from("configs/simple1/mcp_config.json")));
+}

@@ -11,6 +11,13 @@ pub fn read_env() -> (String, String, String) {
     (openai_api_key, openai_api_base, openai_api_model)
 }
 
+pub fn read_mcp_env() -> (String, String) {
+    dotenv().expect("Failed to read .env file");
+    let mcp_server_url = env::var("MCP_SERVER_URL").expect("MCP_SERVER_URL is not set");
+    let mcp_headers_jwt = env::var("MCP_HEADERS_JWT").expect("MCP_HEADERS_JWT is not set");
+    (mcp_server_url, mcp_headers_jwt)
+}
+
 pub fn create_openrouter_provider() -> OpenAICompatProvider {
     let (openai_api_key, openai_api_base, openai_api_model) = read_env();
     let mut extra_headers = HashMap::new();
