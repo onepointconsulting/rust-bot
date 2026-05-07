@@ -16,7 +16,7 @@ log = "0.4.29"
 env_logger = "0.11.10"
 rand = "0.10.0"
 async-openai = { version = "0.34.0", features = ["chat-completion"] }
-reqwest = { version = "0.12", default-features = false }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
 uuid = { version = "1.23.0", features = ["v4"] }
 dotenv = "0.15.0"
 sha1 = "0.11.0"
@@ -31,7 +31,7 @@ tiktoken-rs = "0.10.0"
 garde = { version = "0.22.1", features = ["full"] }
 url = "2"
 ipnet = "2.12.0"
-rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest"] }
+rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
 http = "1"
 
 [dev-dependencies]

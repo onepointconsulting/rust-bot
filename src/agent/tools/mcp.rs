@@ -4,6 +4,7 @@ use serde_json::{json, Value};
 use std::time::Duration;
 use http::HeaderName;
 use rmcp::{Peer, RoleClient, ServiceExt};
+use rmcp::service::ServiceError;
 use rmcp::model::{CallToolRequestParams, RawContent, Tool as McpToolDef};
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
@@ -209,17 +210,23 @@ async fn connect_http(config: &McpServerConfig, allow_stateless: bool) -> Result
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str())
         .reinit_on_expired_session(true);
 
-    // Map config headers → http::HeaderName / HeaderValue
-    if !config.headers.is_empty() {
-        let mut headers = std::collections::HashMap::new();
-        for (name, value) in &config.headers {
+    // `Authorization` must go through the dedicated `auth_header` field so that
+    // rmcp includes it on every request (including the initial handshake).
+    // All other headers are forwarded as `custom_headers`.
+    let mut custom_headers = std::collections::HashMap::new();
+    for (name, value) in &config.headers {
+        if name.eq_ignore_ascii_case("authorization") {
+            transport_config = transport_config.auth_header(value.clone());
+        } else {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| ConnectMcpError::InvalidHeader(name.clone()))?;
             let header_value = http::HeaderValue::from_str(value)
                 .map_err(|_| ConnectMcpError::InvalidHeader(name.clone()))?;
-            headers.insert(header_name, header_value);
+            custom_headers.insert(header_name, header_value);
         }
-        transport_config = transport_config.custom_headers(headers);
+    }
+    if !custom_headers.is_empty() {
+        transport_config = transport_config.custom_headers(custom_headers);
     }
 
     transport_config.allow_stateless = allow_stateless;
@@ -227,6 +234,72 @@ async fn connect_http(config: &McpServerConfig, allow_stateless: bool) -> Result
     let transport = StreamableHttpClientTransport::from_config(transport_config);
     let service = ().serve(transport).await.map_err(ConnectMcpError::Handshake)?;
     Ok(McpClient { peer: service.peer().clone(), _service: service })
+}
+
+
+/// Keeps the MCP session alive while [`MCPToolWrapper`] values are in use.
+///
+/// Dropping [`LoadedMcpTools`] closes the connection — keep it in scope until
+/// the runner (or any holder of the tool boxes) is finished.
+pub struct LoadedMcpTools {
+    pub client: McpClient,
+    pub tools: Vec<Box<dyn Tool>>,
+}
+
+/// Failure to connect or list tools when building [`LoadedMcpTools`].
+#[derive(Debug)]
+pub enum LoadMcpToolsError {
+    Connect(ConnectMcpError),
+    ListTools(ServiceError),
+}
+
+impl std::fmt::Display for LoadMcpToolsError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Connect(e) => write!(f, "{e}"),
+            Self::ListTools(e) => write!(f, "{e}"),
+        }
+    }
+}
+
+impl std::error::Error for LoadMcpToolsError {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        match self {
+            Self::Connect(e) => Some(e),
+            Self::ListTools(e) => Some(e),
+        }
+    }
+}
+
+/// Connect using `config`, list tools from the server, and wrap each in [`MCPToolWrapper`].
+///
+/// `server_name` is the prefix passed to [`MCPToolWrapper::new`] (`mcp_{server_name}_{tool}`).
+/// Per-tool timeouts use [`McpServerConfig::tool_timeout`] (seconds).
+pub async fn load_mcp_tools_from_config(
+    config: &McpServerConfig,
+    server_name: &str,
+) -> Result<LoadedMcpTools, LoadMcpToolsError> {
+    let client = connect_mcp_server(config).await.map_err(LoadMcpToolsError::Connect)?;
+    let tools_result = client
+        .peer
+        .list_tools(None)
+        .await
+        .map_err(LoadMcpToolsError::ListTools)?;
+    let timeout = Duration::from_secs(u64::from(config.tool_timeout));
+    let peer = client.peer.clone();
+    let tools: Vec<Box<dyn Tool>> = tools_result
+        .tools
+        .iter()
+        .map(|tool_def| {
+            Box::new(MCPToolWrapper::new(
+                peer.clone(),
+                server_name,
+                tool_def,
+                timeout,
+            )) as Box<dyn Tool>
+        })
+        .collect();
+    Ok(LoadedMcpTools { client, tools })
 }
 
 
@@ -517,5 +590,16 @@ mod tests {
         });
         let result = normalize_schema_for_openai(&schema);
         assert_eq!(result["properties"]["raw"], true);
+    }
+
+    use crate::config::schema::McpServerConfig;
+
+    #[tokio::test]
+    async fn load_mcp_tools_fails_unknown_transport() {
+        let cfg = McpServerConfig::default();
+        assert!(matches!(
+            load_mcp_tools_from_config(&cfg, "test").await,
+            Err(LoadMcpToolsError::Connect(ConnectMcpError::UnknownTransport)),
+        ));
     }
 }

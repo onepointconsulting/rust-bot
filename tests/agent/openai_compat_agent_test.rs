@@ -1,9 +1,9 @@
-use std::{path::{Path, PathBuf}, sync::Arc, time::Duration};
+use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use rmcp::ServiceExt;
 use serde_json::Value;
-use rust_bot::agent::{registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::MCPToolWrapper, shell::ShellTool}};
+use rust_bot::{agent::{registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{MCPToolWrapper, LoadedMcpTools, load_mcp_tools_from_config}, shell::ShellTool}}, config::schema::{McpServerConfig, McpTransportType}};
 
-use crate::agent::mcp_dummy_client::DummyMcpClient;
+use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::read_mcp_env};
 use crate::agent::mcp_dummy_server::HelloServer;
 use crate::config::helpers::{read_env, create_openrouter_provider};
 
@@ -353,4 +353,46 @@ async fn test_mcp_tool() {
     let result = runner.run(spec).await;
     println!("result: {:?}", result);
     completion_message_check(&result);
+}
+
+#[tokio::test]
+async fn test_mcp_tool_with_mcp_config() {
+    let provider = create_openrouter_provider();
+    let runner = AgentRunner::new(Arc::new(provider));
+    let mut headers = HashMap::new();
+    let (mcp_server_url, mcp_headers_jwt, mcp_test_prompt) = read_mcp_env();
+    println!("mcp_server_url: {}", mcp_server_url);
+    println!("mcp_headers_jwt: {}", mcp_headers_jwt);
+    headers.insert("Authorization".to_string(), mcp_headers_jwt.to_string());
+    let mcp_server_config = McpServerConfig {
+        transport_type: Some(McpTransportType::Sse),
+        command: "".to_string(),
+        args: Vec::new(),
+        env: HashMap::new(),
+        url: mcp_server_url.to_string(),
+        headers,
+        tool_timeout: 30,
+        enabled_tools: Vec::new(),
+    };
+    let LoadedMcpTools {
+        client: _mcp_client_keepalive,
+        tools: mcp_tools,
+    } = load_mcp_tools_from_config(&mcp_server_config, "ems")
+        .await
+        .expect("Failed to connect to MCP server and list tools");
+    assert!(!mcp_tools.is_empty(), "EMS must expose at least one tool");
+    log::info!("mcp_tools length: {}", mcp_tools.len());
+    for tool in mcp_tools.iter() {
+        log::info!("tool: {:?}", tool.name());
+    }
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": mcp_test_prompt
+    })];
+    let spec = create_agent_run_spec_with_tools(messages, mcp_tools);
+    let result = runner.run(spec).await;
+    assert!(result.final_content.is_some(), "result should have final content");
+    println!("result: {:?}", result.final_content.clone().unwrap());
+    completion_message_check(&result);
+
 }

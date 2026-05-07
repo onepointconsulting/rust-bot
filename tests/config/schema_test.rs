@@ -7,7 +7,7 @@ use crate::config::helpers::read_mcp_env;
 fn test_create_mcp_server_config() {
     
     let mut headers = HashMap::new();
-    let (mcp_server_url, mcp_headers_jwt) = read_mcp_env();
+    let (mcp_server_url, mcp_headers_jwt, _mcp_test_prompt) = read_mcp_env();
     headers.insert("Authorization".to_string(), mcp_headers_jwt.to_string());
     let mcp_server_config = McpServerConfig {
         transport_type: Some(McpTransportType::Sse),
