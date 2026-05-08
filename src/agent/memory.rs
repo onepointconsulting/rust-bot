@@ -1,10 +1,11 @@
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::path::PathBuf;
-use std::sync::LazyLock;
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
 use crate::agent::context::{SOUL_FILE, USER_FILE};
+use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
     ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think,
@@ -47,6 +48,14 @@ pub struct MemoryStore {
 }
 
 impl MemoryStore {
+    /// Migration helper: history is considered upgraded when `history.jsonl` exists and is non-empty.
+    fn history_file_already_migrated(path: &Path) -> bool {
+        match std::fs::metadata(path) {
+            Ok(meta) => meta.len() > 0,
+            Err(_) => false,
+        }
+    }
+
     pub fn new(workspace: PathBuf, max_history_entries: Option<usize>) -> Self {
         let cloned_workspace = workspace.clone();
         let memory_dir = workspace.join("memory");
@@ -91,7 +100,7 @@ impl MemoryStore {
         if !self.legacy_history_file.exists() {
             return;
         }
-        if history_file_already_migrated(&self.history_file) {
+        if Self::history_file_already_migrated(self.history_file.as_path()) {
             return;
         }
 
@@ -641,11 +650,11 @@ impl MemoryStore {
     }
 }
 
-fn history_file_already_migrated(path: &PathBuf) -> bool {
-    match std::fs::metadata(path) {
-        Ok(meta) => meta.len() > 0,
-        Err(_) => false,
-    }
+struct Consolidator {
+    store: MemoryStore,
+    provider: Arc<dyn LLMProviderDyn>,
+    model: String,
+    
 }
 
 #[cfg(test)]
