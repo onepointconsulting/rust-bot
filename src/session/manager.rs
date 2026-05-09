@@ -1,9 +1,17 @@
-use std::collections::HashMap;
+use std::{
+    collections::HashMap,
+    fs::{self, File},
+    io::{BufRead, BufReader},
+    path::{Path, PathBuf},
+};
 
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
 use serde_json::{Map, Value, json};
 
-use crate::utils::helpers::find_legal_message_start;
+use crate::{
+    config::paths::get_legacy_sessions_dir,
+    utils::helpers::{ensure_dir, find_legal_message_start, safe_filename},
+};
 
 /// In-memory conversation session record.
 pub struct Session {
@@ -16,7 +24,6 @@ pub struct Session {
 }
 
 impl Session {
-
     pub fn new(key: String) -> Self {
         Self {
             key,
@@ -107,7 +114,10 @@ impl Session {
 
         // If the cutoff lands mid-turn, extend backward to the nearest user turn.
         while start_idx > 0
-            && self.messages[start_idx].get("role").and_then(|v| v.as_str()) != Some("user")
+            && self.messages[start_idx]
+                .get("role")
+                .and_then(|v| v.as_str())
+                != Some("user")
         {
             start_idx -= 1;
         }
@@ -124,7 +134,184 @@ impl Session {
         self.last_consolidated = last_consolidated;
         self.updated_at = Utc::now();
     }
+}
 
+/// Rename `src` to `dst`, or copy + remove `src` if rename fails (e.g. cross-volume).
+fn migrate_session_file(src: &Path, dst: &Path) -> std::io::Result<()> {
+    match fs::rename(src, dst) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            fs::copy(src, dst)?;
+            fs::remove_file(src)?;
+            Ok(())
+        }
+    }
+}
+
+fn json_value_as_last_consolidated(v: &Value) -> usize {
+    v.as_u64()
+        .map(|u| u as usize)
+        .or_else(|| v.as_i64().map(|i| i.max(0) as usize))
+        .unwrap_or(0)
+}
+
+pub struct SessionManager {
+    pub workspace: PathBuf,
+    pub sessions_dir: PathBuf,
+    pub legacy_sessions_dir: PathBuf,
+    cache: HashMap<String, Session>,
+}
+
+impl SessionManager {
+    pub fn new(workspace: PathBuf) -> Self {
+        Self {
+            workspace: workspace.clone(),
+            sessions_dir: ensure_dir(workspace.join("sessions")),
+            legacy_sessions_dir: get_legacy_sessions_dir(),
+            cache: HashMap::new(),
+        }
+    }
+
+    /// Get the file path for a session.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key of the session.
+    ///
+    /// # Returns
+    ///
+    /// The file path for the session.
+    fn get_session_path(&self, key: &str) -> PathBuf {
+        let safe_key = safe_filename(key);
+        return self.sessions_dir.join(format!("{}.jsonl", safe_key));
+    }
+
+    fn get_legacy_session_path(&self, key: &str) -> PathBuf {
+        let safe_key = safe_filename(key);
+        return self.legacy_sessions_dir.join(format!("{}.jsonl", safe_key));
+    }
+
+    /// Get an existing session or create a new one.
+    ///
+    /// # Arguments
+    ///
+    /// * `key` - The key of the session.
+    ///
+    /// # Returns
+    ///
+    /// The session.
+    fn get_or_create_session(&mut self, key: &str) -> &mut Session {
+        if self.cache.contains_key(key) {
+            return self.cache.get_mut(key).unwrap();
+        }
+        let mut session_opt = self.load(key);
+        if let None = &mut session_opt {
+            session_opt = Some(Session::new(key.to_string()));
+        }
+        let session = session_opt.unwrap();
+        self.cache.insert(key.to_string(), session);
+        return self.cache.get_mut(key).expect("just inserted");
+    }
+
+    fn load(&self, key: &str) -> Option<Session> {
+        let path = self.get_session_path(key);
+        if !path.exists() {
+            let legacy_path = self.get_legacy_session_path(key);
+            if legacy_path.exists() {
+                if let Some(parent) = path.parent() {
+                    let _ = fs::create_dir_all(parent);
+                }
+                match migrate_session_file(&legacy_path, &path) {
+                    Ok(()) => log::info!("Migrated session {} from legacy path", key),
+                    Err(e) => log::error!("Failed to migrate session {}: {:?}", key, e),
+                }
+            }
+        }
+        if !path.exists() {
+            return None;
+        }
+
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Failed to open session file {}: {}", path.display(), e);
+                return None;
+            }
+        };
+
+        let mut messages: Vec<Value> = Vec::new();
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        let mut created_at = Utc::now();
+        let mut last_consolidated: usize = 0;
+
+        let reader = BufReader::new(file);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    log::warn!("Failed reading session {} line: {}", key, e);
+                    continue;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let data: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("Skipping invalid JSON in session {}: {}", key, e);
+                    continue;
+                }
+            };
+            if let Some(data_type) = data.get("_type")
+                && let Some(data_type_str) = data_type.as_str()
+                && data_type_str == "metadata"
+            {
+                let metadata_data = data.get("metadata").cloned().unwrap_or(Value::Null);
+                if let Some(meta_obj) = metadata_data.as_object() {
+                    for (meta_key, value) in meta_obj.iter() {
+                        metadata.insert(meta_key.clone(), value.clone());
+                    }
+                } else if !metadata_data.is_null() {
+                    log::warn!(
+                        "Session {} metadata line has non-object metadata field; skipping merge",
+                        key
+                    );
+                }
+                if let Some(created_at_val) = data.get("created_at") {
+                    if let Some(created_at_str) = created_at_val.as_str() {
+                        let parsed = NaiveDateTime::parse_from_str(
+                            created_at_str,
+                            "%Y-%m-%dT%H:%M:%S%.f",
+                        )
+                        .or_else(|_| {
+                            NaiveDateTime::parse_from_str(created_at_str, "%Y-%m-%dT%H:%M:%S")
+                        });
+                        if let Ok(naive_dt) = parsed {
+                            created_at = Utc.from_utc_datetime(&naive_dt);
+                        } else if let Ok(dt) = DateTime::parse_from_rfc3339(created_at_str) {
+                            created_at = dt.with_timezone(&Utc);
+                        }
+                    }
+                }
+                if let Some(v) = data.get("last_consolidated") {
+                    last_consolidated = json_value_as_last_consolidated(v);
+                }
+            } else {
+                messages.push(data);
+            }
+        }
+
+        Some(Session {
+            key: key.to_string(),
+            messages,
+            created_at,
+            updated_at: Utc::now(),
+            metadata,
+            last_consolidated,
+        })
+    }
 }
 
 #[cfg(test)]
@@ -149,15 +336,11 @@ mod tests {
     #[test]
     fn get_history_skips_suffix_before_last_consolidated() {
         let mut session = Session::new("s1".into());
-        session
-            .messages
-            .push(fixture_message("user", "before"));
+        session.messages.push(fixture_message("user", "before"));
         session
             .messages
             .push(fixture_message("assistant", "middle"));
-        session
-            .messages
-            .push(fixture_message("user", "after"));
+        session.messages.push(fixture_message("user", "after"));
         session.last_consolidated = 1;
         // Window is [assistant, user]; alignment keeps from first user only.
         let h = session.get_history(None);
@@ -185,15 +368,9 @@ mod tests {
     #[test]
     fn get_history_alignment_drops_prefix_until_first_user() {
         let mut session = Session::new("s1".into());
-        session
-            .messages
-            .push(fixture_message("assistant", "lead"));
-        session
-            .messages
-            .push(fixture_message("user", "prompt"));
-        session
-            .messages
-            .push(fixture_message("assistant", "reply"));
+        session.messages.push(fixture_message("assistant", "lead"));
+        session.messages.push(fixture_message("user", "prompt"));
+        session.messages.push(fixture_message("assistant", "reply"));
         let h = session.get_history(Some(50));
         assert_eq!(h.len(), 2);
         assert_eq!(h[0]["role"], json!("user"));
@@ -326,8 +503,12 @@ mod tests {
         orphan.insert("tool_call_id".into(), json!("unknown-id"));
 
         let mut session = Session::new("k".into());
-        session.messages.push(fixture_message("assistant", "lead-a"));
-        session.messages.push(fixture_message("assistant", "lead-b"));
+        session
+            .messages
+            .push(fixture_message("assistant", "lead-a"));
+        session
+            .messages
+            .push(fixture_message("assistant", "lead-b"));
         session.messages.push(Value::Object(orphan));
         session.messages.push(fixture_message("user", "hi"));
         session.last_consolidated = 0;
@@ -336,5 +517,61 @@ mod tests {
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].get("content"), Some(&json!("hi")));
         assert_eq!(session.last_consolidated, 0);
+    }
+
+    #[test]
+    fn load_reads_jsonl_metadata_and_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("s1")));
+        let body = concat!(
+            r#"{"_type":"metadata","metadata":{"t":"v"},"created_at":"2026-01-10T08:00:00","last_consolidated":2}"#,
+            "\n",
+            r#"{"role":"user","content":"hi"}"#,
+            "\n",
+        );
+        fs::write(&path, body).unwrap();
+        let s = mgr.load("s1").expect("load");
+        assert_eq!(s.metadata.get("t"), Some(&json!("v")));
+        assert_eq!(s.last_consolidated, 2);
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0]["content"], json!("hi"));
+    }
+
+    #[test]
+    fn load_non_object_metadata_does_not_panic_and_keeps_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("s2")));
+        fs::write(
+            &path,
+            "{\"_type\":\"metadata\",\"metadata\":[]}\n{\"role\":\"user\",\"content\":\"ok\"}\n",
+        )
+        .unwrap();
+        let s = mgr.load("s2").expect("load");
+        assert!(s.metadata.is_empty());
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0]["content"], json!("ok"));
+    }
+
+    #[test]
+    fn load_skips_invalid_json_line_and_keeps_following_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("s3")));
+        fs::write(
+            &path,
+            "not json\n{\"role\":\"user\",\"content\":\"x\"}\n",
+        )
+        .unwrap();
+        let s = mgr.load("s3").expect("load");
+        assert_eq!(s.messages.len(), 1);
+        assert_eq!(s.messages[0]["content"], json!("x"));
     }
 }
