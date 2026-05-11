@@ -6,6 +6,7 @@ use std::time::SystemTime;
 
 use crate::agent::context::{SOUL_FILE, USER_FILE};
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
+use crate::session::manager::SessionManager;
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
     ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think,
@@ -654,7 +655,9 @@ struct Consolidator {
     store: MemoryStore,
     provider: Arc<dyn LLMProviderDyn>,
     model: String,
-    
+    sessions: SessionManager,
+    context_window_tokens: usize,
+    max_completion_tokens: usize,
 }
 
 #[cfg(test)]

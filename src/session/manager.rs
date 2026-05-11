@@ -1,7 +1,7 @@
 use std::{
     collections::HashMap,
     fs::{self, File},
-    io::{BufRead, BufReader},
+    io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
 };
 
@@ -281,13 +281,14 @@ impl SessionManager {
                 }
                 if let Some(created_at_val) = data.get("created_at") {
                     if let Some(created_at_str) = created_at_val.as_str() {
-                        let parsed = NaiveDateTime::parse_from_str(
-                            created_at_str,
-                            "%Y-%m-%dT%H:%M:%S%.f",
-                        )
-                        .or_else(|_| {
-                            NaiveDateTime::parse_from_str(created_at_str, "%Y-%m-%dT%H:%M:%S")
-                        });
+                        let parsed =
+                            NaiveDateTime::parse_from_str(created_at_str, "%Y-%m-%dT%H:%M:%S%.f")
+                                .or_else(|_| {
+                                    NaiveDateTime::parse_from_str(
+                                        created_at_str,
+                                        "%Y-%m-%dT%H:%M:%S",
+                                    )
+                                });
                         if let Ok(naive_dt) = parsed {
                             created_at = Utc.from_utc_datetime(&naive_dt);
                         } else if let Ok(dt) = DateTime::parse_from_rfc3339(created_at_str) {
@@ -311,6 +312,81 @@ impl SessionManager {
             metadata,
             last_consolidated,
         })
+    }
+
+    /// Save a session to disk and update the cache.
+    ///
+    /// Writes a single metadata line followed by one line per message (JSONL).
+    /// Returns an error if the file cannot be created or written.
+    pub fn save(&mut self, session: Session) -> std::io::Result<()> {
+        let path = self.get_session_path(&session.key);
+
+        let mut file = File::create(&path)?;
+
+        let metadata_line = json!({
+            "_type": "metadata",
+            "key": session.key,
+            "created_at": session.created_at.to_rfc3339(),
+            "updated_at": session.updated_at.to_rfc3339(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated,
+        });
+        writeln!(file, "{}", serde_json::to_string(&metadata_line)?)?;
+
+        for msg in &session.messages {
+            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+        }
+
+        self.cache.insert(session.key.clone(), session);
+        Ok(())
+    }
+
+    pub fn invalidate(&mut self, key: &str) -> Option<Session> {
+        self.cache.remove(key)
+    }
+
+    pub fn list_sessions(&self) -> Vec<Value> {
+        let mut sessions = Vec::new();
+        let entries = match std::fs::read_dir(&self.sessions_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("Failed to list sessions dir: {}", e);
+                return sessions;
+            }
+        };
+        for path in entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        {
+            // Read just the metadata line
+            if let Ok(file) = File::open(&path) {
+                let reader = BufReader::new(file);
+                // Read single line from reader
+                if let Some(line_result) = reader.lines().next() {
+                    if let Ok(line) = line_result {
+                        if let Ok(metadata) = serde_json::from_str::<Value>(&line) {
+                            if let Some(metadata_type) = metadata.get("_type") && let Some(metadata_type_str) = metadata_type.as_str() && metadata_type_str == "metadata" {
+                                if let Some(key) = metadata.get("key").and_then(|v| v.as_str()).filter(|k| !k.is_empty()) {
+                                    sessions.push(json!({
+                                        "key": key,
+                                        "created_at": metadata.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "updated_at": metadata.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
+                                        "path": path.display().to_string(),
+                                    }));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        sessions.sort_by(|a, b| {
+            let a_ts = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            let b_ts = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            b_ts.cmp(a_ts)
+        });
+        sessions
     }
 }
 
@@ -565,13 +641,270 @@ mod tests {
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("s3")));
-        fs::write(
-            &path,
-            "not json\n{\"role\":\"user\",\"content\":\"x\"}\n",
-        )
-        .unwrap();
+        fs::write(&path, "not json\n{\"role\":\"user\",\"content\":\"x\"}\n").unwrap();
         let s = mgr.load("s3").expect("load");
         assert_eq!(s.messages.len(), 1);
         assert_eq!(s.messages[0]["content"], json!("x"));
+    }
+
+    #[test]
+    fn save_writes_metadata_line_and_messages_as_jsonl() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut session = Session::new("k1".into());
+        session.add_message("user", "hello", Map::new());
+        session.add_message("assistant", "world", Map::new());
+        session.metadata.insert("x".into(), json!(42));
+        session.last_consolidated = 1;
+
+        mgr.save(session).expect("save");
+
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("k1")));
+        let content = fs::read_to_string(&path).unwrap();
+        let lines: Vec<&str> = content.lines().collect();
+
+        // First line is the metadata record.
+        assert_eq!(lines.len(), 3);
+        let meta: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(meta["_type"], json!("metadata"));
+        assert_eq!(meta["key"], json!("k1"));
+        assert_eq!(meta["metadata"]["x"], json!(42));
+        assert_eq!(meta["last_consolidated"], json!(1));
+        assert!(meta["created_at"].as_str().is_some());
+        assert!(meta["updated_at"].as_str().is_some());
+
+        // Subsequent lines are the messages.
+        let msg0: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(msg0["role"], json!("user"));
+        assert_eq!(msg0["content"], json!("hello"));
+
+        let msg1: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(msg1["role"], json!("assistant"));
+        assert_eq!(msg1["content"], json!("world"));
+    }
+
+    #[test]
+    fn save_updates_cache_so_next_load_is_not_needed() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut session = Session::new("k2".into());
+        session.add_message("user", "ping", Map::new());
+
+        mgr.save(session).expect("save");
+
+        assert!(
+            mgr.cache.contains_key("k2"),
+            "cache should hold the session after save"
+        );
+    }
+
+    #[test]
+    fn save_then_load_round_trips_fields() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut session = Session::new("k3".into());
+        session.add_message("user", "a", Map::new());
+        session.add_message("assistant", "b", Map::new());
+        session.metadata.insert("env".into(), json!("test"));
+        session.last_consolidated = 1;
+        let saved_created_at = session.created_at;
+
+        mgr.save(session).expect("save");
+
+        // Remove from cache to force a real disk read.
+        mgr.cache.remove("k3");
+        let loaded = mgr.load("k3").expect("load");
+
+        assert_eq!(loaded.key, "k3");
+        assert_eq!(loaded.messages.len(), 2);
+        assert_eq!(loaded.messages[0]["role"], json!("user"));
+        assert_eq!(loaded.messages[1]["role"], json!("assistant"));
+        assert_eq!(loaded.metadata.get("env"), Some(&json!("test")));
+        assert_eq!(loaded.last_consolidated, 1);
+        // created_at survives the round-trip (compare at second granularity).
+        let diff = (loaded.created_at - saved_created_at).num_seconds().abs();
+        assert!(diff < 2, "created_at should survive the round-trip");
+    }
+
+    #[test]
+    fn save_overwrites_existing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("k4")));
+
+        // Write some stale content first.
+        fs::write(&path, "stale content\n").unwrap();
+
+        let session = Session::new("k4".into());
+        mgr.save(session).expect("save");
+
+        let content = fs::read_to_string(&path).unwrap();
+        // Stale content must be gone; first line must be valid metadata JSON.
+        let first_line = content.lines().next().unwrap();
+        let meta: Value = serde_json::from_str(first_line).unwrap();
+        assert_eq!(meta["_type"], json!("metadata"));
+    }
+
+    // ── list_sessions ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn list_sessions_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_sorted_by_updated_at_descending() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+
+        let mut older = Session::new("older".into());
+        older.updated_at = Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap();
+        mgr.save(older).unwrap();
+
+        let mut newer = Session::new("newer".into());
+        newer.updated_at = Utc.with_ymd_and_hms(2026, 5, 11, 18, 0, 0).unwrap();
+        mgr.save(newer).unwrap();
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["key"], json!("newer"));
+        assert_eq!(listed[1]["key"], json!("older"));
+    }
+
+    #[test]
+    fn list_sessions_ignores_non_jsonl_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        fs::write(mgr.sessions_dir.join("readme.txt"), "x").unwrap();
+        let s = Session::new("only".into());
+        mgr.save(s).unwrap();
+        mgr.cache.clear();
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["key"], json!("only"));
+    }
+
+    #[test]
+    fn list_sessions_skips_invalid_json_first_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("bad")));
+        fs::write(&path, "not-json\n").unwrap();
+
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_skips_first_line_not_metadata_type() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr.sessions_dir.join("other.jsonl");
+        fs::write(
+            &path,
+            r#"{"_type":"other","key":"x","updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_skips_metadata_without_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr.sessions_dir.join("nokey.jsonl");
+        fs::write(
+            &path,
+            r#"{"_type":"metadata","created_at":"2026-01-01T00:00:00Z","updated_at":"2026-01-02T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_skips_empty_string_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr.sessions_dir.join("emptykey.jsonl");
+        fs::write(
+            &path,
+            r#"{"_type":"metadata","key":"","updated_at":"2026-01-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn list_sessions_returns_created_at_path_and_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("meta-t")));
+        fs::write(
+            &path,
+            r#"{"_type":"metadata","key":"meta-t","created_at":"2026-04-01T12:00:00+00:00","updated_at":"2026-04-02T15:30:00+00:00"}"#,
+        )
+        .unwrap();
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 1);
+        let e = &listed[0];
+        assert_eq!(e["key"], json!("meta-t"));
+        assert_eq!(e["created_at"], json!("2026-04-01T12:00:00+00:00"));
+        assert_eq!(e["updated_at"], json!("2026-04-02T15:30:00+00:00"));
+        assert_eq!(e["path"], json!(path.display().to_string()));
+    }
+
+    #[test]
+    fn list_sessions_missing_datetime_fields_use_empty_strings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+        let path = mgr.sessions_dir.join("partial.jsonl");
+        fs::write(
+            &path,
+            r#"{"_type":"metadata","key":"partial"}"#,
+        )
+        .unwrap();
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["created_at"], json!(""));
+        assert_eq!(listed[0]["updated_at"], json!(""));
+    }
+
+    #[test]
+    fn list_sessions_empty_updated_at_sorts_after_rfc3339() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"));
+
+        let path_a = mgr.sessions_dir.join("a.jsonl");
+        fs::write(
+            &path_a,
+            r#"{"_type":"metadata","key":"has_ts","updated_at":"2026-06-01T00:00:00Z"}"#,
+        )
+        .unwrap();
+        let path_b = mgr.sessions_dir.join("b.jsonl");
+        fs::write(
+            &path_b,
+            r#"{"_type":"metadata","key":"no_ts"}"#,
+        )
+        .unwrap();
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 2);
+        assert_eq!(listed[0]["key"], json!("has_ts"));
+        assert_eq!(listed[1]["key"], json!("no_ts"));
     }
 }

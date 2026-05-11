@@ -4,10 +4,8 @@
 /// Shared snippets live under `agent/_snippets/` and are pulled in via
 /// `{% include 'agent/_snippets/....md' %}` — identical to the Python/Jinja2 setup.
 ///
-/// The templates root is resolved at runtime relative to the binary's location,
-/// with a fallback to `CARGO_MANIFEST_DIR` (i.e. the project root) when running
-/// under `cargo test` or `cargo run`.
-use std::path::PathBuf;
+/// The templates root is resolved at runtime (see [`resolve_templates_root`]).
+use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use tera::{Context, Tera};
@@ -17,26 +15,35 @@ use tera::{Context, Tera};
 /// Resolve the `templates/` directory.
 ///
 /// Strategy (first match wins):
-/// 1. `RUST_BOT_TEMPLATES_DIR` env var — lets callers point at any directory.
-/// 2. Sibling of the running executable — works in installed / release builds.
-/// 3. `CARGO_MANIFEST_DIR/templates` — works under `cargo test` / `cargo run`.
-fn resolve_templates_root() -> PathBuf {
+/// 1. `RUST_BOT_TEMPLATES_DIR` env var — explicit override for any layout.
+/// 2. Walk up from the executable's directory (at most 8 ancestors), use the first
+///    `{ancestor}/templates` that exists — finds the repo's `templates/` when the binary
+///    lives under `target/debug` or `target/release`, and supports install layouts like
+///    `prefix/bin/app` → `prefix/templates` if distributors nest that way.
+/// 3. `{current_working_directory}/templates` — last resort when launched from the project
+///    root or another directory that contains a `templates/` folder.
+pub fn resolve_templates_root() -> PathBuf {
     if let Ok(dir) = std::env::var("RUST_BOT_TEMPLATES_DIR") {
         return PathBuf::from(dir);
     }
 
     if let Ok(exe) = std::env::current_exe() {
-        let candidate = exe
-            .parent()
-            .unwrap_or(std::path::Path::new("."))
-            .join("templates");
-        if candidate.is_dir() {
-            return candidate;
+        let mut dir: Option<PathBuf> = exe.parent().map(Path::to_path_buf);
+        for _ in 0..8 {
+            let Some(ref d) = dir else {
+                break;
+            };
+            let candidate = d.join("templates");
+            if candidate.is_dir() {
+                return candidate;
+            }
+            dir = d.parent().map(Path::to_path_buf);
         }
     }
 
-    // Fallback: project root known at compile time.
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates")
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("templates")
 }
 
 // ── cached Tera environment ───────────────────────────────────────────────────

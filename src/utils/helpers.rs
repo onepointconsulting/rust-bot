@@ -11,6 +11,7 @@ use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
 use crate::providers::base::LLMProvider;
+use crate::utils::prompt_templates::resolve_templates_root;
 
 // ── directory helpers (pre-existing) ─────────────────────────────────────────
 
@@ -611,7 +612,7 @@ pub fn build_status_content(
 ///
 /// Returns the list of relative paths that were created.
 pub fn sync_workspace_templates(workspace: &Path, silent: bool) -> Vec<String> {
-    let templates_root = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("templates");
+    let templates_root = resolve_templates_root();
     if !templates_root.is_dir() {
         return vec![];
     }

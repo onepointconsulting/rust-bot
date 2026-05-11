@@ -1,5 +1,7 @@
 use std::{path::PathBuf, sync::LazyLock};
 
+use crate::agent::memory::MemoryStore;
+
 pub const AGENTS_FILE: &'static str = "AGENTS.md";
 pub const SOUL_FILE: &'static str = "SOUL.md";
 pub const USER_FILE: &'static str = "USER.md";
@@ -14,13 +16,16 @@ const MAX_RECENT_HISTORY: usize = 50;
 pub struct ContextBuilder {
     workspace: PathBuf,
     timezone: Option<String>,
+    memory: MemoryStore,
 }
 
 impl ContextBuilder {
     pub fn new(workspace: PathBuf, timezone: Option<String>) -> Self {
+        let memory = MemoryStore::new(workspace.clone(), None);
         Self {
             workspace,
             timezone,
+            memory,
         }
     }
 }

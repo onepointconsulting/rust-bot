@@ -34,6 +34,7 @@ ipnet = "2.12.0"
 rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "transport-io", "transport-streamable-http-client-reqwest", "reqwest-native-tls"] }
 http = "1"
 ctor = "1.0.2"
+which = "6"
 
 [dev-dependencies]
 tempfile = "3"
