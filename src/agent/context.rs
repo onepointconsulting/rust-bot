@@ -1,6 +1,6 @@
 use std::{path::PathBuf, sync::LazyLock};
 
-use crate::agent::memory::MemoryStore;
+use crate::agent::{memory::MemoryStore, skills::SkillsLoader};
 
 pub const AGENTS_FILE: &'static str = "AGENTS.md";
 pub const SOUL_FILE: &'static str = "SOUL.md";
@@ -17,14 +17,17 @@ pub struct ContextBuilder {
     workspace: PathBuf,
     timezone: Option<String>,
     memory: MemoryStore,
+    skills: SkillsLoader,
 }
 
 impl ContextBuilder {
     pub fn new(workspace: PathBuf, timezone: Option<String>) -> Self {
+        let skills = SkillsLoader::new(&workspace, None);
         let memory = MemoryStore::new(workspace.clone(), None);
         Self {
             workspace,
             timezone,
+            skills,
             memory,
         }
     }
