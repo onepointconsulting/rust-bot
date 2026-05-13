@@ -9,8 +9,7 @@ use crate::agent::registry::ToolRegistry;
 use crate::providers::base::{BoxedStreamCallback, LLMProviderDyn, LLMResponse, ToolCallRequest};
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
-    estimate_prompt_tokens_chain, find_legal_message_start, maybe_persist_tool_result,
-    truncate_text,
+    find_legal_message_start, maybe_persist_tool_result, truncate_text,
 };
 use crate::utils::prompt_templates::render_template;
 use crate::utils::runtime::{
@@ -914,6 +913,7 @@ impl AgentRunner {
                     .unwrap_or(DEFAULT_ERROR_MESSAGE);
                 stop_reason = "error".to_string();
                 Self::append_final_message(&mut messages, Some(error_msg));
+                log::error!("Provider-signalled error: {}", error_msg);
                 ctx.stop_reason = Some("error".to_string());
                 hook.after_iteration(&mut ctx).await;
                 final_result_content = Some(error_msg.to_string());

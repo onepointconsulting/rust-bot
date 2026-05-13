@@ -15,12 +15,12 @@ use crate::{
 
 /// In-memory conversation session record.
 pub struct Session {
-    key: String,
-    messages: Vec<Value>,
+    pub key: String,
+    pub messages: Vec<Value>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
     metadata: HashMap<String, Value>,
-    last_consolidated: usize,
+    pub last_consolidated: usize,
 }
 
 impl Session {

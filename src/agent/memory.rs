@@ -1,12 +1,13 @@
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex, Weak};
 use std::time::SystemTime;
 
 use crate::agent::context::{SOUL_FILE, USER_FILE};
-use crate::providers::base::{LLMProvider, LLMProviderDyn};
-use crate::session::manager::SessionManager;
+use crate::providers::base::LLMProviderDyn;
+use crate::session::manager::{Session, SessionManager};
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
     ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think,
@@ -174,22 +175,6 @@ impl MemoryStore {
         entries
     }
 
-    /// Return the mtime of `legacy_history_file` formatted as `"YYYY-MM-DD HH:MM"`.
-    ///
-    /// Falls back to the current local time when the file metadata is
-    /// unavailable (mirrors Python's `except OSError` branch).
-    fn legacy_fallback_timestamp(&self) -> String {
-        let mtime: SystemTime = self
-            .legacy_history_file
-            .metadata()
-            .and_then(|m| m.modified())
-            .unwrap_or_else(|_| SystemTime::now());
-
-        DateTime::<Local>::from(mtime)
-            .format("%Y-%m-%d %H:%M")
-            .to_string()
-    }
-
     fn split_legacy_history_chunks(&self, text: &str) -> Vec<String> {
         let mut chunks: Vec<String> = Vec::new();
         let mut current: Vec<&str> = Vec::new();
@@ -256,6 +241,22 @@ impl MemoryStore {
         false
     }
 
+    /// Return the mtime of `legacy_history_file` formatted as `"YYYY-MM-DD HH:MM"`.
+    ///
+    /// Falls back to the current local time when the file metadata is
+    /// unavailable (mirrors Python's `except OSError` branch).
+    fn legacy_fallback_timestamp(&self) -> String {
+        let mtime: SystemTime = self
+            .legacy_history_file
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or_else(|_| SystemTime::now());
+
+        DateTime::<Local>::from(mtime)
+            .format("%Y-%m-%d %H:%M")
+            .to_string()
+    }
+
     /// Return a backup path under [`Self::memory_dir`] that does not exist yet.
     ///
     /// Tries `HISTORY.md.bak`, then `HISTORY.md.bak.2`, `HISTORY.md.bak.3`, … mirroring Python's
@@ -270,67 +271,6 @@ impl MemoryStore {
             suffix += 1;
         }
         candidate
-    }
-
-    /// Inner step shared by `maybe_migrate_legacy_history` so a single `?` ladder can short-circuit
-    /// any I/O failure without falling through to the success log line.
-    fn run_legacy_migration(&self, entries: Vec<serde_json::Value>) -> io::Result<()> {
-        if !entries.is_empty() {
-            let last_cursor = entries
-                .last()
-                .and_then(|e| e.get("cursor"))
-                .cloned()
-                .unwrap_or_else(|| json!(entries.len()));
-            let cursor_str = match &last_cursor {
-                serde_json::Value::Number(n) => n.to_string(),
-                serde_json::Value::String(s) => s.clone(),
-                other => other.to_string(),
-            };
-
-            self.write_entries(entries)?;
-            std::fs::write(&self.cursor_file, cursor_str.as_bytes())?;
-            std::fs::write(&self.dream_cursor_file, cursor_str.as_bytes())?;
-        }
-
-        let backup_path = self.next_legacy_backup_path();
-        std::fs::rename(&self.legacy_history_file, &backup_path)?;
-        Ok(())
-    }
-
-    /* End of migration related methods */
-
-    fn read_safe(path: &PathBuf) -> Option<String> {
-        if !path.exists() {
-            log::debug!("File does not exist: {}", path.display());
-            return None;
-        }
-        match std::fs::read_to_string(path) {
-            Ok(content) => Some(content),
-            Err(_) => {
-                log::error!("Failed to read file: {}", path.display());
-                None
-            }
-        }
-    }
-
-    fn write_safe(content: &str, path: &PathBuf) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-        {
-            let result = file.write_all(content.as_bytes());
-            if result.is_err() {
-                log::error!(
-                    "Failed to write file: {} due to {}",
-                    path.display(),
-                    result.err().unwrap()
-                );
-            }
-        } else {
-            log::error!("Failed to write file: {}", path.display());
-        }
     }
 
     /* MEMORY.md (long-term facts) */
@@ -459,24 +399,10 @@ impl MemoryStore {
             .collect()
     }
 
-    /// Parse a JSON `cursor` field (supports JSON number or string of digits).
-    fn parse_entry_cursor(cursor: &serde_json::Value) -> Option<u64> {
-        match cursor {
-            serde_json::Value::Number(n) => {
-                if let Some(u) = n.as_u64() {
-                    return Some(u);
-                }
-                n.as_f64().map(|f| f as u64)
-            }
-            serde_json::Value::String(s) => s.trim().parse().ok(),
-            _ => None,
-        }
-    }
-
     /// Drop oldest entries if the file exceeds *max_history_entries*.
     pub fn compact_history(&self) {
         if self.max_history_entries == 0 {
-            return
+            return;
         }
         let entries = self.read_entries();
         if entries.len() <= self.max_history_entries {
@@ -487,8 +413,6 @@ impl MemoryStore {
             log::error!("Failed to write history file: {}", e);
         }
     }
-
-    // jsonl helpers
 
     /// Read all entries from self.history_file as JSONL lines line by line skipping blank lines.
     fn read_entries(&self) -> Vec<serde_json::Value> {
@@ -506,12 +430,14 @@ impl MemoryStore {
                 }
             }
         } else {
-            log::error!("Failed to open history file: {}", self.history_file.display());
+            log::error!(
+                "Failed to open history file: {}",
+                self.history_file.display()
+            );
         }
         entries
     }
 
-    
     /// Read the last entry from [`Self::history_file`] efficiently (tail scan, up to 4 KiB).
     ///
     /// Mirrors Python `_read_last_entry`: opens in binary mode, seeks to end, reads a trailing
@@ -565,7 +491,10 @@ impl MemoryStore {
                     }
                 }
                 Err(_) => {
-                    log::error!("Failed to read dream cursor file: {}", self.dream_cursor_file.display());
+                    log::error!(
+                        "Failed to read dream cursor file: {}",
+                        self.dream_cursor_file.display()
+                    );
                 }
             }
         }
@@ -624,9 +553,7 @@ impl MemoryStore {
                 .map(str::to_uppercase)
                 .unwrap_or_else(|| "UNKNOWN".into());
 
-            lines.push(format!(
-                "[{timestamp}] {role}{tools_suffix}: {content}",
-            ));
+            lines.push(format!("[{timestamp}] {role}{tools_suffix}: {content}",));
         }
 
         lines.join("\n")
@@ -649,6 +576,98 @@ impl MemoryStore {
             );
         }
     }
+
+    /// Inner step shared by `maybe_migrate_legacy_history` so a single `?` ladder can short-circuit
+    /// any I/O failure without falling through to the success log line.
+    fn run_legacy_migration(&self, entries: Vec<serde_json::Value>) -> io::Result<()> {
+        if !entries.is_empty() {
+            let last_cursor = entries
+                .last()
+                .and_then(|e| e.get("cursor"))
+                .cloned()
+                .unwrap_or_else(|| json!(entries.len()));
+            let cursor_str = match &last_cursor {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            };
+
+            self.write_entries(entries)?;
+            std::fs::write(&self.cursor_file, cursor_str.as_bytes())?;
+            std::fs::write(&self.dream_cursor_file, cursor_str.as_bytes())?;
+        }
+
+        let backup_path = self.next_legacy_backup_path();
+        std::fs::rename(&self.legacy_history_file, &backup_path)?;
+        Ok(())
+    }
+
+    /* End of migration related methods */
+
+    fn read_safe(path: &PathBuf) -> Option<String> {
+        if !path.exists() {
+            log::debug!("File does not exist: {}", path.display());
+            return None;
+        }
+        match std::fs::read_to_string(path) {
+            Ok(content) => Some(content),
+            Err(_) => {
+                log::error!("Failed to read file: {}", path.display());
+                None
+            }
+        }
+    }
+
+    fn write_safe(content: &str, path: &PathBuf) {
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(path)
+        {
+            let result = file.write_all(content.as_bytes());
+            if result.is_err() {
+                log::error!(
+                    "Failed to write file: {} due to {}",
+                    path.display(),
+                    result.err().unwrap()
+                );
+            }
+        } else {
+            log::error!("Failed to write file: {}", path.display());
+        }
+    }
+
+    /// Parse a JSON `cursor` field (supports JSON number or string of digits).
+    fn parse_entry_cursor(cursor: &serde_json::Value) -> Option<u64> {
+        match cursor {
+            serde_json::Value::Number(n) => {
+                if let Some(u) = n.as_u64() {
+                    return Some(u);
+                }
+                n.as_f64().map(|f| f as u64)
+            }
+            serde_json::Value::String(s) => s.trim().parse().ok(),
+            _ => None,
+        }
+    }
+}
+
+pub trait MessageBuilder {
+    /// Build the complete message list for an LLM call
+    fn build_messages(
+        &self,
+        history: Vec<serde_json::Value>,
+        current_message: &str,
+        skill_names: Option<Vec<String>>,
+        media: Option<Vec<String>>,
+        channel: Option<String>,
+        chat_id: Option<String>,
+        current_role: &str,
+    ) -> Vec<serde_json::Value>;
+
+    /// Get tool definitions with stable ordering for cache-friendly prompts.
+    fn get_definitions(&self) -> Vec<serde_json::Value>;
 }
 
 struct Consolidator {
@@ -657,7 +676,79 @@ struct Consolidator {
     model: String,
     sessions: SessionManager,
     context_window_tokens: usize,
+    message_builder: Box<dyn MessageBuilder>,
     max_completion_tokens: usize,
+    locks: HashMap<String, Weak<Mutex<()>>>,
+}
+
+impl Consolidator {
+    pub fn new(
+        store: MemoryStore,
+        provider: Arc<dyn LLMProviderDyn>,
+        model: String,
+        sessions: SessionManager,
+        context_window_tokens: usize,
+        message_builder: Box<dyn MessageBuilder>,
+        max_completion_tokens: usize,
+    ) -> Self {
+        // Initialize the dictionary (typically inside a struct's constructor/init)
+        let locks: HashMap<String, Weak<Mutex<()>>> = HashMap::new();
+        Self {
+            store,
+            provider,
+            model,
+            sessions,
+            context_window_tokens,
+            message_builder,
+            max_completion_tokens,
+            locks,
+        }
+    }
+
+    /// Pick a user-turn boundary that removes enough old prompt tokens.
+    pub fn pick_consolidation_boundary(
+        session: &Session,
+        tokens_to_remove: usize,
+    ) -> Option<(usize, usize)> {
+        let start = session.last_consolidated;
+        if start >= session.messages.len() || tokens_to_remove == 0 {
+            return None;
+        }
+
+        let mut removed_tokens = 0;
+        let mut last_boundary = None::<(usize, usize)>;
+        for idx in start..session.messages.len() {
+            let message = &session.messages[idx];
+            if idx > start && message.get("role").and_then(|v| v.as_str()) == Some("user") {
+                last_boundary = Some((idx, removed_tokens));
+                if removed_tokens >= tokens_to_remove {
+                    return last_boundary;
+                }
+            }
+            removed_tokens += estimate_message_tokens(message);
+        }
+        last_boundary
+    }
+
+    /// Estimate current prompt size for the normal session history view.
+    pub fn estimate_session_prompt_tokens(&self, session: &Session) -> (usize, String) {
+        let history = session.get_history(Some(0));
+        // Translate: channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
+        let (channel, chat_id) = if let Some(idx) = session.key.find(':') {
+            let (ch, id) = session.key.split_at(idx);
+            // split_at keeps the ':' at the start of `id`, so trim it
+            (Some(ch.to_string()), Some(id[1..].to_string()))
+        } else {
+            (None, None)
+        };
+        let probe_messages =
+            self.message_builder
+                .build_messages(history, "[token-probe]", None, None, channel, chat_id, "user");
+        return estimate_prompt_tokens_chain(
+            probe_messages.as_slice(),
+            Some(self.message_builder.get_definitions().as_slice()),
+        );
+    }
 }
 
 #[cfg(test)]
@@ -668,6 +759,113 @@ mod tests {
 
     fn make_store(tmp: &TempDir) -> MemoryStore {
         MemoryStore::new(tmp.path().to_path_buf(), None)
+    }
+
+    fn session_with_messages(
+        messages: Vec<serde_json::Value>,
+        last_consolidated: usize,
+    ) -> Session {
+        let mut s = Session::new("test-session".into());
+        s.messages = messages;
+        s.last_consolidated = last_consolidated;
+        s
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_returns_none_when_tokens_to_remove_zero() {
+        let s = session_with_messages(
+            vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": "yo"}),
+            ],
+            0,
+        );
+        assert_eq!(Consolidator::pick_consolidation_boundary(&s, 0), None);
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_returns_none_when_start_at_or_past_messages_len() {
+        let s = session_with_messages(vec![json!({"role": "user", "content": ""})], 1);
+        assert_eq!(Consolidator::pick_consolidation_boundary(&s, 100), None);
+
+        let s2 = session_with_messages(vec![json!({"role": "user", "content": ""})], 2);
+        assert_eq!(Consolidator::pick_consolidation_boundary(&s2, 100), None);
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_no_user_turn_after_start_returns_none() {
+        // Single message at `start`: condition is `idx > start && role == user`, so never triggers.
+        let s = session_with_messages(vec![json!({"role": "user", "content": ""})], 0);
+        assert_eq!(Consolidator::pick_consolidation_boundary(&s, 1), None);
+
+        // First user in range is exactly at `start` (not after).
+        let s2 = session_with_messages(
+            vec![
+                json!({"role": "system", "content": "x"}),
+                json!({"role": "user", "content": ""}),
+            ],
+            1,
+        );
+        assert_eq!(Consolidator::pick_consolidation_boundary(&s2, 1000), None);
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_finds_second_user_with_expected_removed_counts() {
+        // Empty `content` → `estimate_message_tokens` is 4 per message.
+        let s = session_with_messages(
+            vec![
+                json!({"role": "user", "content": ""}),
+                json!({"role": "assistant", "content": ""}),
+                json!({"role": "user", "content": ""}),
+            ],
+            0,
+        );
+        let cum_before_third =
+            estimate_message_tokens(&s.messages[0]) + estimate_message_tokens(&s.messages[1]);
+        assert_eq!(cum_before_third, 8);
+
+        assert_eq!(
+            Consolidator::pick_consolidation_boundary(&s, 8),
+            Some((2, 8)),
+            "exact threshold should return at first qualifying user boundary"
+        );
+        assert_eq!(
+            Consolidator::pick_consolidation_boundary(&s, 7),
+            Some((2, 8)),
+            "removed count already met before checking should still return that boundary"
+        );
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_returns_last_user_boundary_when_threshold_not_met() {
+        let s = session_with_messages(
+            vec![
+                json!({"role": "user", "content": ""}),
+                json!({"role": "assistant", "content": ""}),
+                json!({"role": "user", "content": ""}),
+            ],
+            0,
+        );
+        assert_eq!(
+            Consolidator::pick_consolidation_boundary(&s, 100),
+            Some((2, 8)),
+            "should return last user-turn boundary even when removed_tokens never reaches threshold"
+        );
+    }
+
+    #[test]
+    fn pick_consolidation_boundary_respects_last_consolidated_range() {
+        let s = session_with_messages(
+            vec![
+                json!({"role": "user", "content": "a"}),
+                json!({"role": "assistant", "content": "b"}),
+                json!({"role": "user", "content": "c"}),
+                json!({"role": "assistant", "content": "d"}),
+            ],
+            2,
+        );
+        // Only indices 2.. are scanned; first candidate user is at idx 2 but `idx > start` fails.
+        assert_eq!(Consolidator::pick_consolidation_boundary(&s, 1), None);
     }
 
     #[test]
@@ -1284,11 +1482,7 @@ mod tests {
         let store = make_store(&tmp);
         let row = json!({"cursor": 42});
         let serialized = serde_json::to_string(&row).unwrap();
-        fs::write(
-            &store.history_file,
-            format!("   {serialized}   \n"),
-        )
-        .unwrap();
+        fs::write(&store.history_file, format!("   {serialized}   \n")).unwrap();
 
         assert_eq!(store.read_entries(), vec![row]);
     }
@@ -1333,7 +1527,10 @@ mod tests {
 
         assert!(store.read_unprocessed_history(3).is_empty());
         assert_eq!(store.read_unprocessed_history(2), vec![e3.clone()]);
-        assert_eq!(store.read_unprocessed_history(1), vec![e2.clone(), e3.clone()]);
+        assert_eq!(
+            store.read_unprocessed_history(1),
+            vec![e2.clone(), e3.clone()]
+        );
         assert_eq!(store.read_unprocessed_history(0), vec![e1, e2, e3]);
     }
 
@@ -1360,7 +1557,9 @@ mod tests {
     fn read_unprocessed_history_parses_string_cursor_like_numeric() {
         let tmp = TempDir::new().unwrap();
         let store = make_store(&tmp);
-        let legacy = serde_json::from_str::<serde_json::Value>(r#"{"cursor": "14", "note": "legacy"}"#).unwrap();
+        let legacy =
+            serde_json::from_str::<serde_json::Value>(r#"{"cursor": "14", "note": "legacy"}"#)
+                .unwrap();
         fs::write(
             &store.history_file,
             format!("{}\n", serde_json::to_string(&legacy).unwrap()),
@@ -1508,10 +1707,7 @@ mod tests {
             json!({"role": "assistant", "content": "ok", "timestamp": "2026-01-01 10:02"}),
         ];
         let out = MemoryStore::format_messages(&messages);
-        assert_eq!(
-            out,
-            "[2026-01-01 10:02] ASSISTANT: ok"
-        );
+        assert_eq!(out, "[2026-01-01 10:02] ASSISTANT: ok");
     }
 
     #[test]
@@ -1551,10 +1747,7 @@ mod tests {
             json!({"content": "no role", "timestamp": "short"}),
         ];
         let out = MemoryStore::format_messages(&messages);
-        assert_eq!(
-            out,
-            "[1234567890123456] TOOL: x\n[short] UNKNOWN: no role"
-        );
+        assert_eq!(out, "[1234567890123456] TOOL: x\n[short] UNKNOWN: no role");
     }
 
     // ── append_history ────────────────────────────────────────────────────────────

@@ -819,7 +819,8 @@ pub trait LLMProvider {
             }
             // Otherwise, transient error; log and sleep before retrying.
             log::warn!(
-                "LLM transient error (attempt {}/{}) retrying in {}s: {}",
+                "LLM transient error with {} (attempt {}/{}) retrying in {}s: {}",
+                model.clone().unwrap_or("unknown model".to_string()),
                 attempt + 1,
                 CHAT_RETRY_DELAYS.len(),
                 delay,

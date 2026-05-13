@@ -4,7 +4,7 @@ use crate::providers::{
     registry::ProviderSpec,
 };
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall
 };
 use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
 use futures::StreamExt;
@@ -18,6 +18,11 @@ pub struct OpenAICompatProvider {
     spec: Option<ProviderSpec>,
     generation: GenerationSettings,
     client: Client<OpenAIConfig>,
+    /// Raw reqwest client used to bypass async-openai's strict typed
+    /// deserializer when the API returns unknown enum variants (e.g.
+    /// `service_tier: "standard"` from Anthropic's OpenAI-compat endpoint).
+    http_client: reqwest::Client,
+    chat_completions_url: String,
 }
 
 impl OpenAICompatProvider {
@@ -475,6 +480,40 @@ impl OpenAICompatProvider {
         request
     }
 
+    /// POST the request as raw JSON and deserialize with unknown `service_tier`
+    /// variants stripped out.  This works around async-openai's strict `ServiceTier`
+    /// enum that rejects values like `"standard"` returned by Anthropic's
+    /// OpenAI-compatible endpoint.
+    async fn chat_raw(
+        &self,
+        request: &CreateChatCompletionRequest,
+    ) -> Result<CreateChatCompletionResponse, String> {
+        let body = serde_json::to_value(request).map_err(|e| e.to_string())?;
+        let resp = self
+            .http_client
+            .post(&self.chat_completions_url)
+            .header("Content-Type", "application/json")
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| e.to_string())?;
+
+        let status = resp.status();
+        let mut json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+
+        if !status.is_success() {
+            return Err(format!("HTTP {status}: {json}"));
+        }
+
+        // Strip fields that async-openai's typed structs cannot deserialize
+        // (e.g. `service_tier: "standard"` from Anthropic).
+        if let Some(obj) = json.as_object_mut() {
+            obj.remove("service_tier");
+        }
+
+        serde_json::from_value(json).map_err(|e| format!("failed to deserialize api response: {e}"))
+    }
+
     fn parse_response(response: CreateChatCompletionResponse) -> LLMResponse {
         if response.choices.is_empty() {
             return LLMResponse {
@@ -649,6 +688,37 @@ impl LLMProvider for OpenAICompatProvider {
         }
         let client = Client::with_config(config);
 
+        // Build a raw reqwest client with the same headers for the fallback
+        // JSON path that strips unknown fields before typed deserialization.
+        let mut header_map = reqwest::header::HeaderMap::new();
+        if let Some(ref key) = api_key {
+            use reqwest::header::{AUTHORIZATION, HeaderValue};
+            if let Ok(val) = HeaderValue::from_str(&format!("Bearer {key}")) {
+                header_map.insert(AUTHORIZATION, val);
+            }
+        }
+        for (k, v) in &default_headers {
+            use reqwest::header::{HeaderName, HeaderValue};
+            if let (Ok(name), Ok(val)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) {
+                header_map.insert(name, val);
+            }
+        }
+        let http_client = reqwest::Client::builder()
+            .default_headers(header_map)
+            .build()
+            .unwrap_or_default();
+
+        let chat_completions_url = format!(
+            "{}/chat/completions",
+            effective_base
+                .as_deref()
+                .unwrap_or("https://api.openai.com/v1")
+                .trim_end_matches('/')
+        );
+
         let provider = Self {
             api_key,
             api_base: effective_base,
@@ -657,6 +727,8 @@ impl LLMProvider for OpenAICompatProvider {
             spec: spec,
             generation: GenerationSettings::new(),
             client,
+            http_client,
+            chat_completions_url,
         };
 
         // Setup environment if appropriate.
@@ -715,19 +787,18 @@ impl LLMProvider for OpenAICompatProvider {
             tool_choice,
         );
         match request_args.build() {
-            Ok(request) => {
-                match self.client.chat().create(request).await {
-                    Ok(response) => {
-                        return OpenAICompatProvider::parse_response(response);
-                    }
-                    Err(e) => {
-                        return OpenAICompatProvider::handle_error(Box::new(e));
-                    }
-                }
-            }
-            Err(e) => {
-                return OpenAICompatProvider::handle_error(Box::new(e));
-            }
+            Ok(request) => match self.chat_raw(&request).await {
+                Ok(response) => OpenAICompatProvider::parse_response(response),
+                Err(e) => LLMResponse {
+                    content: Some(e),
+                    finish_reason: "error".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                },
+            },
+            Err(e) => OpenAICompatProvider::handle_error(Box::new(e)),
         }
     }
 

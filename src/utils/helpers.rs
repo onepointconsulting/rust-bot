@@ -10,7 +10,6 @@ use regex::Regex;
 use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
-use crate::providers::base::LLMProvider;
 use crate::utils::prompt_templates::resolve_templates_root;
 
 // ── directory helpers (pre-existing) ─────────────────────────────────────────
@@ -470,13 +469,7 @@ pub fn estimate_message_tokens(message: &Value) -> usize {
     (payload.len() / 4 + 4).max(4)
 }
 
-pub fn estimate_prompt_tokens_chain(
-    provider: &impl LLMProvider,
-    model: &str,
-    messages: &[Value],
-    tools: Option<&[Value]>,
-) -> (usize, String) {
-    
+pub fn estimate_prompt_tokens_chain(messages: &[Value], tools: Option<&[Value]>) -> (usize, String) {
     let estimated = estimate_prompt_tokens(messages, tools);
     if estimated > 0 {
         return (estimated, "tiktoken".to_string());
