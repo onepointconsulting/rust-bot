@@ -427,7 +427,6 @@ pub trait Tool: Send + Sync {
     }
 }
 
-
 #[cfg(test)]
 mod tests {
     use crate::agent::tools::base::Tool;

@@ -1,15 +1,16 @@
 /// Tool registry for dynamic tool management.
 use async_trait::async_trait;
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::agent::tools::base::Tool;
 
 const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
 
 // ── ToolRegistry ──────────────────────────────────────────────────────────────
-
+#[derive(Clone)]
 pub struct ToolRegistry {
-    tools: HashMap<String, Box<dyn Tool>>,
+    tools: HashMap<String, Arc<dyn Tool>>,
 }
 
 impl ToolRegistry {
@@ -20,15 +21,16 @@ impl ToolRegistry {
     // ── lifecycle ─────────────────────────────────────────────────────────────
 
     pub fn register(&mut self, tool: Box<dyn Tool>) {
-        self.tools.insert(tool.name(), tool);
+        let name = tool.name();
+        self.tools.insert(name, Arc::from(tool));
     }
 
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
     }
 
-    pub fn get(&self, name: &str) -> Option<&dyn Tool> {
-        self.tools.get(name).map(|t| t.as_ref())
+    pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
+        self.tools.get(name).cloned()
     }
 
     pub fn has(&self, name: &str) -> bool {
@@ -65,13 +67,13 @@ impl ToolRegistry {
     ///
     /// Returns `(tool, cast_params, error)`. When `error` is `Some` the call
     /// should not proceed; when it is `None` the tool is ready to execute.
-    pub fn prepare_call<'a>(
-        &'a self,
+    pub fn prepare_call(
+        &self,
         name: &str,
         params: &serde_json::Value,
-    ) -> (Option<&'a dyn Tool>, serde_json::Value, Option<String>) {
+    ) -> (Option<Arc<dyn Tool>>, serde_json::Value, Option<String>) {
         let tool = match self.tools.get(name) {
-            Some(t) => t.as_ref(),
+            Some(t) => t.clone(),
             None => {
                 let available = self.tool_names().join(", ");
                 return (
@@ -113,7 +115,7 @@ impl ToolRegistry {
         }
 
         // prepare_call guarantees tool is Some when error is None
-        let result = tool.unwrap().execute(&cast_params).await;
+        let result = tool.unwrap().as_ref().execute(&cast_params).await;
         if result.starts_with("Error") {
             result + HINT
         } else {

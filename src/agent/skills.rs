@@ -6,6 +6,8 @@ use std::{
     path::PathBuf,
 };
 
+use crate::utils::helpers::strip_surrounding_quotes;
+
 // Default builtin skills directory (relative to this file)
 pub static BUILTIN_SKILLS_DIR: LazyLock<PathBuf> = LazyLock::new(|| {
     std::env::current_dir()
@@ -413,11 +415,7 @@ impl SkillsLoader {
                             let (key, value) = line.split_once(':').unwrap();
                             metadata.insert(
                                 key.trim().to_string(),
-                                value
-                                    .trim()
-                                    .trim_matches('\"')
-                                    .trim_matches('\'')
-                                    .to_string(),
+                                strip_surrounding_quotes(value),
                             );
                         }
                     }

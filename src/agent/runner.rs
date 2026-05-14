@@ -5,13 +5,13 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::agent::hook::{AgentHook, AgentHookContext};
-use crate::agent::registry::ToolRegistry;
+use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{BoxedStreamCallback, LLMProviderDyn, LLMResponse, ToolCallRequest};
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
     find_legal_message_start, maybe_persist_tool_result, truncate_text,
 };
-use crate::utils::prompt_templates::render_template;
+
 use crate::utils::runtime::{
     EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
     ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,

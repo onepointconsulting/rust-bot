@@ -7,11 +7,14 @@ use std::time::SystemTime;
 
 use tera::Context;
 use crate::agent::context::{SOUL_FILE, USER_FILE};
+use crate::agent::runner::{AgentRunSpec, AgentRunner};
+use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
+use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
-    ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_think,
+    empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_surrounding_quotes, strip_think
 };
 use crate::utils::prompt_templates::render_template;
 use chrono::{DateTime, Local};
@@ -891,6 +894,139 @@ impl Consolidator {
             .clone()
     }
 
+}
+
+/// Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
+/// Phase 1 produces an analysis summary (plain LLM call).
+/// Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
+/// LLM can make targeted, incremental edits instead of replacing entire files.
+pub struct Dream {
+    pub store: MemoryStore,
+    pub provider: Arc<dyn LLMProviderDyn>,
+    pub model: String,
+    pub sessions: SessionManager,
+    pub max_batch_size: usize,
+    pub max_iterations: usize,
+    pub max_tool_result_chars: usize,
+    pub runner: AgentRunner,
+    tools: ToolRegistry,
+}
+
+impl Dream {
+    pub fn new(
+        store: MemoryStore,
+        provider: Arc<dyn LLMProviderDyn>,
+        model: &str,
+        sessions: SessionManager,
+        max_batch_size: usize,
+        max_iterations: usize,
+        max_tool_result_chars: usize,
+    ) -> Dream {
+        let mut tools = ToolRegistry::new();
+        let workspace = store.workspace.clone();
+        tools.register(Box::new(ReadFileTool::new(Some(workspace.clone()), None, None)));
+        tools.register(Box::new(EditFileTool::new(Some(workspace), None, None)));
+        Dream {
+            store,
+            provider: provider.clone(),
+            model: model.to_string(),
+            sessions,
+            max_batch_size,
+            max_iterations,
+            max_tool_result_chars,
+            runner: AgentRunner::new(provider),
+            tools: tools,
+        }
+    }
+
+    /// Process unprocessed history entries. Returns True if work was done.    
+    pub async fn run(&self) -> bool {
+        let last_cursor = self.store.get_last_dream_cursor();
+        let entries = self.store.read_unprocessed_history(last_cursor);
+        if entries.is_empty() {
+            return false;
+        }
+
+        let batch = entries[..entries.len().min(self.max_batch_size)].to_vec();
+        log::info!(
+            "Dream: processing {} entries (cursor {}→{}), batch={}",
+            entries.len(), last_cursor, batch[batch.len() - 1]["cursor"], batch.len(),
+        );
+
+        // Build history text for LLM
+        let history_text = batch.iter()
+            .map(|e| 
+                format!("[{}] {}", e["timestamp"].as_str().unwrap_or(""), e["content"].as_str().unwrap_or(""))).collect::<Vec<String>>().join("\n");
+
+        // Current file contents
+        let current_date = Local::now().format("%Y-%m-%d").to_string();
+        let current_memory = empty_or_default(self.store.read_memory());
+        let current_soul = empty_or_default(self.store.read_soul());
+        let current_user = empty_or_default(self.store.read_user());
+        let file_context = format!(
+            "## Current Date\n{}\n\n\
+             ## Current MEMORY.md ({} chars)\n{}\n\n\
+             ## Current SOUL.md ({} chars)\n{}\n\n\
+             ## Current USER.md ({} chars)\n{}",
+            current_date,
+            current_memory.chars().count(),
+            current_memory,
+            current_soul.chars().count(),
+            current_soul,
+            current_user.chars().count(),
+            current_user,
+        );
+
+        // Phase 1: Analyze
+        let phase1_prompt = format!(
+            "## Conversation History\n{history_text}\n\n{file_context}"
+        );
+
+        let phase1_response = self.provider.chat_with_retry(
+                vec![serde_json::json!({
+                    "role": "system",
+                    "content": render_template("agent/dream_phase1.md", &Context::new(), true).unwrap(),
+                }), serde_json::json!({
+                    "role": "user",
+                    "content": phase1_prompt,
+                })],
+                None,
+            Some(self.model.clone()),
+            None,
+            None,
+            None,
+            None,
+        ).await;
+        if phase1_response.finish_reason != "stop" {
+            log::error!("Dream Phase 1 failed: {}", phase1_response.finish_reason);
+            return false;
+        }
+        let analysis = empty_or_default(phase1_response.content);
+        log::info!("Dream Phase 1 analysis ({} chars): {}", analysis.len(), analysis.chars().take(500).collect::<String>());
+
+        // Phase 2: Delegate to AgentRunner with read_file / edit_file
+        let phase2_prompt = format!("## Analysis Result\n{analysis}\n\n{file_context}");
+        let messages = vec![
+            serde_json::json!({
+                "role": "system",
+                "content": render_template("agent/dream_phase2.md", &Context::new(), true).unwrap(),
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": phase2_prompt,
+            }),
+        ];
+        let phase2_response = self.runner.run(AgentRunSpec {
+            initial_messages: messages,
+            tools: self.tools.clone(),
+            model: self.model.clone(),
+            max_iterations: self.max_iterations,
+            max_tool_result_chars: self.max_tool_result_chars,
+            fail_on_tool_error: false,
+            ..Default::default()
+        }).await;
+        true
+    }
 }
 
 #[cfg(test)]

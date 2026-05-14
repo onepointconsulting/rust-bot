@@ -52,6 +52,14 @@ pub fn strip_think(text: &str) -> String {
     text.trim().to_string()
 }
 
+/// Trim surrounding whitespace, then strip leading/trailing `"` and `'` (YAML-style quoted scalars).
+///
+/// Used for skill frontmatter `key: "value"` / `key: 'value'` lines so stored metadata matches
+/// unquoted Python-style values.
+pub fn strip_surrounding_quotes(s: &str) -> String {
+    s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
 // ── image utilities ───────────────────────────────────────────────────────────
 
 /// Detect image MIME type from magic bytes, ignoring file extension.
@@ -691,6 +699,17 @@ pub fn expand_tilde_path(path: &str) -> std::borrow::Cow<'_, str> {
     }
 }
 
+pub fn empty_or_default(text: Option<String>) -> String {
+    if let Some(text) = text {
+        if text.is_empty() {
+            return "(empty)".to_string();
+        }
+        text
+    } else {
+        "(empty)".to_string()
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -728,6 +747,23 @@ mod tests {
     fn test_strip_think_both() {
         let input = "<think>closed</think> middle <think>unclosed";
         assert_eq!(strip_think(input), "middle");
+    }
+
+    // ── strip_surrounding_quotes ───────────────────────────────────────────────
+
+    #[test]
+    fn strip_surrounding_quotes_double_quoted_yaml_scalar() {
+        assert_eq!(strip_surrounding_quotes("  \"Quoted Title\"  "), "Quoted Title");
+    }
+
+    #[test]
+    fn strip_surrounding_quotes_single_quoted_yaml_scalar() {
+        assert_eq!(strip_surrounding_quotes("'Alice'"), "Alice");
+    }
+
+    #[test]
+    fn strip_surrounding_quotes_unquoted_unchanged() {
+        assert_eq!(strip_surrounding_quotes("  plain  "), "plain");
     }
 
     // ── detect_image_mime ─────────────────────────────────────────────────────
@@ -1106,4 +1142,12 @@ mod tests {
         assert!(!res1.contains("~"));
         assert_eq!(expand_tilde_path("test"), "test");
     }
+
+    #[test]
+    fn test_strip_surrounding_quotes() {
+        assert_eq!(strip_surrounding_quotes("  \"Quoted Title\"  "), "Quoted Title");
+        assert_eq!(strip_surrounding_quotes("'Alice'"), "Alice");
+        assert_eq!(strip_surrounding_quotes("  plain  "), "plain");
+    }
 }
+
