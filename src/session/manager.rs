@@ -14,6 +14,7 @@ use crate::{
 };
 
 /// In-memory conversation session record.
+#[derive(Clone)]
 pub struct Session {
     pub key: String,
     pub messages: Vec<Value>,
@@ -55,8 +56,18 @@ impl Session {
         self.updated_at = Utc::now();
     }
 
+    /// Recent messages for prompting, from `last_consolidated` onward (trimmed and normalized).
+    ///
+    /// * `max_messages` — keep at most this many messages from the **end** of that window before
+    ///   user-turn alignment. `None` means 500. **`Some(0)` is treated like `None`** (also 500): a
+    ///   literal `0` here used to keep zero rows and surprise callers that expected “default” or
+    ///   “unlimited”.
     pub fn get_history(&self, max_messages: Option<usize>) -> Vec<Value> {
-        let max_messages = max_messages.unwrap_or(500);
+        const DEFAULT_CAP: usize = 500;
+        let max_messages = match max_messages {
+            None | Some(0) => DEFAULT_CAP,
+            Some(n) => n,
+        };
         let unconsolidated =
             self.messages[(self.last_consolidated).min(self.messages.len())..].to_vec();
         let mut sliced = if unconsolidated.len() > max_messages {
@@ -439,6 +450,19 @@ mod tests {
         assert_eq!(h[0]["content"], json!("m3"));
         assert_eq!(h[1]["role"], json!("assistant"));
         assert_eq!(h[1]["content"], json!("m4"));
+    }
+
+    #[test]
+    fn get_history_some_zero_matches_none_default_cap() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", "m1"));
+        let with_none = session.get_history(None);
+        let with_zero = session.get_history(Some(0));
+        assert_eq!(with_none, with_zero);
+        assert!(
+            !with_none.is_empty(),
+            "Some(0) is normalized to the same default cap as None"
+        );
     }
 
     #[test]

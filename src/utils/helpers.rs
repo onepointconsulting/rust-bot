@@ -11,6 +11,9 @@ use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
 use crate::utils::prompt_templates::resolve_templates_root;
+use tiktoken_rs::{CoreBPE, cl100k_base};
+
+static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
 
 // ── directory helpers (pre-existing) ─────────────────────────────────────────
 
@@ -419,11 +422,11 @@ pub fn maybe_persist_tool_result(
 
 // ── token estimation ──────────────────────────────────────────────────────────
 
-/// Estimate tokens contributed by a single message (character ÷ 4 + overhead).
+/// Estimate tokens contributed by a single message.
 ///
 /// Counts content, tool_calls, reasoning_content, name, and tool_call_id —
 /// same fields as the Python tiktoken implementation. The `+4` per-message
-/// overhead matches the OpenAI framing cost.
+/// overhead matches the OpenAI framing cost (role token + separators).
 pub fn estimate_message_tokens(message: &Value) -> usize {
     let mut parts: Vec<String> = Vec::new();
 
@@ -466,7 +469,14 @@ pub fn estimate_message_tokens(message: &Value) -> usize {
     if payload.is_empty() {
         return 4;
     }
-    (payload.len() / 4 + 4).max(4)
+
+    const FRAMING: usize = 4;
+    let bpe = BPE.get_or_init(|| cl100k_base().ok());
+    match bpe {
+        Some(bpe) => bpe.encode_with_special_tokens(&payload).len() + FRAMING,
+        // Fallback: byte-length / 4 heuristic if BPE failed to initialise
+        None => (payload.len() / 4 + FRAMING).max(FRAMING),
+    }
 }
 
 pub fn estimate_prompt_tokens_chain(messages: &[Value], tools: Option<&[Value]>) -> (usize, String) {
@@ -485,10 +495,6 @@ pub fn estimate_prompt_tokens(
     messages: &[Value],
     tools: Option<&[Value]>,
 ) -> usize {
-    use std::sync::OnceLock;
-    use tiktoken_rs::{CoreBPE, cl100k_base};
-
-    static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
 
     let mut parts: Vec<String> = Vec::new();
 
