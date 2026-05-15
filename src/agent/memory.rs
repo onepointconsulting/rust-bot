@@ -5,21 +5,22 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock};
 use std::time::SystemTime;
 
-use tera::Context;
 use crate::agent::context::{SOUL_FILE, USER_FILE};
 use crate::agent::runner::{AgentRunSpec, AgentRunner};
 use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
 use crate::agent::tools::registry::ToolRegistry;
-use crate::providers::base::LLMProviderDyn;
+use crate::providers::base::{LLMProviderDyn, LLMResponse};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
-    empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain, strip_surrounding_quotes, strip_think
+    empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain,
+    strip_surrounding_quotes, strip_think,
 };
 use crate::utils::prompt_templates::render_template;
 use chrono::{DateTime, Local};
 use regex::Regex;
 use serde_json::json;
+use tera::Context;
 
 const DEFAULT_MAX_HISTORY: usize = 1000;
 
@@ -686,7 +687,6 @@ struct Consolidator {
 }
 
 impl Consolidator {
-
     const SAFETY_BUFFER: usize = 1024;
     const MAX_CONSOLIDATION_ROUNDS: usize = 5;
 
@@ -751,9 +751,15 @@ impl Consolidator {
         } else {
             (None, None)
         };
-        let probe_messages =
-            self.message_builder
-                .build_messages(history, "[token-probe]", None, None, channel, chat_id, "user");
+        let probe_messages = self.message_builder.build_messages(
+            history,
+            "[token-probe]",
+            None,
+            None,
+            channel,
+            chat_id,
+            "user",
+        );
         return estimate_prompt_tokens_chain(
             probe_messages.as_slice(),
             Some(self.message_builder.get_definitions().as_slice()),
@@ -775,24 +781,27 @@ impl Consolidator {
                 }
             };
         let formatted = MemoryStore::format_messages(messages);
-        let response = self.provider.chat_with_retry(
-            vec![
-                serde_json::json!({
-                    "role": "system",
-                    "content": system_prompt
-                }),
-                serde_json::json!({
-                    "role": "user",
-                    "content": formatted
-                }),
-            ],
-             None,
-             Some(self.model.clone()),
-             None,
-             None,
-             None,
-             None,
-        ).await;
+        let response = self
+            .provider
+            .chat_with_retry(
+                vec![
+                    serde_json::json!({
+                        "role": "system",
+                        "content": system_prompt
+                    }),
+                    serde_json::json!({
+                        "role": "user",
+                        "content": formatted
+                    }),
+                ],
+                None,
+                Some(self.model.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         // Match `append_history`: treat blank / whitespace-only summaries like missing output.
         let summary_entry = response.content.as_ref().and_then(|entry| {
             let mut c = strip_think(entry.trim_end());
@@ -814,7 +823,7 @@ impl Consolidator {
                 self.store.raw_archive(messages)
             }
         }
-        return true
+        return true;
     }
 
     /// Loop: archive old messages until prompt fits within safe budget.
@@ -827,7 +836,8 @@ impl Consolidator {
 
         let lock = self.get_lock(&session.key);
         let _guard = lock.lock().await;
-        let budget = self.context_window_tokens - self.max_completion_tokens - Consolidator::SAFETY_BUFFER;
+        let budget =
+            self.context_window_tokens - self.max_completion_tokens - Consolidator::SAFETY_BUFFER;
         let target = budget / 2;
         let (mut estimated, source) = self.estimate_session_prompt_tokens(session);
         if estimated == 0 {
@@ -836,7 +846,10 @@ impl Consolidator {
         if estimated < budget {
             log::debug!(
                 "Token consolidation idle {}: {}/{} via {}",
-                session.key, estimated, self.context_window_tokens, source
+                session.key,
+                estimated,
+                self.context_window_tokens,
+                source
             );
             return;
         }
@@ -886,14 +899,12 @@ impl Consolidator {
         }
     }
 
-
     fn get_lock(&mut self, session_key: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
             .entry(session_key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
-
 }
 
 /// Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
@@ -924,7 +935,11 @@ impl Dream {
     ) -> Dream {
         let mut tools = ToolRegistry::new();
         let workspace = store.workspace.clone();
-        tools.register(Box::new(ReadFileTool::new(Some(workspace.clone()), None, None)));
+        tools.register(Box::new(ReadFileTool::new(
+            Some(workspace.clone()),
+            None,
+            None,
+        )));
         tools.register(Box::new(EditFileTool::new(Some(workspace), None, None)));
         Dream {
             store,
@@ -939,6 +954,10 @@ impl Dream {
         }
     }
 
+    fn finish_reason_fail(phase1_response: &LLMResponse) -> bool {
+        phase1_response.finish_reason == "error" || phase1_response.content.is_none()
+    }
+
     /// Process unprocessed history entries. Returns True if work was done.    
     pub async fn run(&self) -> bool {
         let last_cursor = self.store.get_last_dream_cursor();
@@ -950,13 +969,24 @@ impl Dream {
         let batch = entries[..entries.len().min(self.max_batch_size)].to_vec();
         log::info!(
             "Dream: processing {} entries (cursor {}→{}), batch={}",
-            entries.len(), last_cursor, batch[batch.len() - 1]["cursor"], batch.len(),
+            entries.len(),
+            last_cursor,
+            batch[batch.len() - 1]["cursor"],
+            batch.len(),
         );
 
         // Build history text for LLM
-        let history_text = batch.iter()
-            .map(|e| 
-                format!("[{}] {}", e["timestamp"].as_str().unwrap_or(""), e["content"].as_str().unwrap_or(""))).collect::<Vec<String>>().join("\n");
+        let history_text = batch
+            .iter()
+            .map(|e| {
+                format!(
+                    "[{}] {}",
+                    e["timestamp"].as_str().unwrap_or(""),
+                    e["content"].as_str().unwrap_or("")
+                )
+            })
+            .collect::<Vec<String>>()
+            .join("\n");
 
         // Current file contents
         let current_date = Local::now().format("%Y-%m-%d").to_string();
@@ -978,14 +1008,19 @@ impl Dream {
         );
 
         // Phase 1: Analyze
-        let phase1_prompt = format!(
-            "## Conversation History\n{history_text}\n\n{file_context}"
-        );
+        let phase1_prompt = format!("## Conversation History\n{history_text}\n\n{file_context}");
 
+        let phase1_system = match render_template("agent/dream_phase1.md", &Context::new(), true) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Dream Phase 1: failed to render template: {}", e);
+                return false;
+            }
+        };
         let phase1_response = self.provider.chat_with_retry(
                 vec![serde_json::json!({
                     "role": "system",
-                    "content": render_template("agent/dream_phase1.md", &Context::new(), true).unwrap(),
+                    "content": phase1_system,
                 }), serde_json::json!({
                     "role": "user",
                     "content": phase1_prompt,
@@ -997,34 +1032,111 @@ impl Dream {
             None,
             None,
         ).await;
-        if phase1_response.finish_reason != "stop" {
-            log::error!("Dream Phase 1 failed: {}", phase1_response.finish_reason);
+        if Self::finish_reason_fail(&phase1_response) {
+            log::error!(
+                "Dream Phase 1 failed: finish_reason={}, has_content={}",
+                phase1_response.finish_reason,
+                phase1_response.content.is_some(),
+            );
             return false;
         }
         let analysis = empty_or_default(phase1_response.content);
-        log::info!("Dream Phase 1 analysis ({} chars): {}", analysis.len(), analysis.chars().take(500).collect::<String>());
+        log::info!(
+            "Dream Phase 1 analysis ({} chars): {}",
+            analysis.chars().count(),
+            analysis.chars().take(500).collect::<String>()
+        );
 
         // Phase 2: Delegate to AgentRunner with read_file / edit_file
         let phase2_prompt = format!("## Analysis Result\n{analysis}\n\n{file_context}");
+        let phase2_system = match render_template("agent/dream_phase2.md", &Context::new(), true) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Dream Phase 2: failed to render template: {}", e);
+                return false;
+            }
+        };
         let messages = vec![
             serde_json::json!({
                 "role": "system",
-                "content": render_template("agent/dream_phase2.md", &Context::new(), true).unwrap(),
+                "content": phase2_system,
             }),
             serde_json::json!({
                 "role": "user",
                 "content": phase2_prompt,
             }),
         ];
-        let phase2_response = self.runner.run(AgentRunSpec {
-            initial_messages: messages,
-            tools: self.tools.clone(),
-            model: self.model.clone(),
-            max_iterations: self.max_iterations,
-            max_tool_result_chars: self.max_tool_result_chars,
-            fail_on_tool_error: false,
-            ..Default::default()
-        }).await;
+        let phase2_response = self
+            .runner
+            .run(AgentRunSpec {
+                initial_messages: messages,
+                tools: self.tools.clone(),
+                model: self.model.clone(),
+                max_iterations: self.max_iterations,
+                max_tool_result_chars: self.max_tool_result_chars,
+                fail_on_tool_error: false,
+                ..Default::default()
+            })
+            .await;
+        log::debug!(
+            "Dream Phase 2 complete: stop_reason={}, tool_events={}",
+            phase2_response.stop_reason,
+            phase2_response.tool_events.len(),
+        );
+        let default_value = "".to_string();
+        let mut changelog: Vec<String> = Vec::new();
+        for event in &phase2_response.tool_events {
+            let msg = format!(
+                "Dream tool_event: name={}, status={}, detail={}",
+                event.get("name").unwrap_or(&default_value),
+                event.get("status").unwrap_or(&default_value),
+                event.get("detail").unwrap_or(&default_value),
+            );
+            log::info!("{}", msg.chars().take(200).collect::<String>());
+            if event.get("status").unwrap_or(&default_value) == "ok" {
+                changelog.push(format!(
+                    "{}: {}",
+                    event.get("name").unwrap_or(&default_value),
+                    event.get("detail").unwrap_or(&default_value),
+                ));
+            }
+        }
+
+        // Advance cursor — always, to avoid re-processing Phase 1
+        let new_cursor = batch[batch.len() - 1]["cursor"].as_u64().unwrap_or(0);
+        self.store.set_last_dream_cursor(new_cursor);
+        self.store.compact_history();
+
+        if phase2_response.stop_reason == "completed" {
+            log::info!(
+                "Dream done: {} change(s), cursor advanced to {}",
+                changelog.len(),
+                new_cursor,
+            );
+        } else {
+            log::warn!(
+                "Dream Phase 2 failed: stop_reason={}, has_content={}; cursor advanced to {}",
+                phase2_response.stop_reason,
+                phase2_response.final_content.is_some(),
+                new_cursor
+            );
+            return false;
+        }
+
+        // Git auto-commit (only when there are actual changes)
+        if !changelog.is_empty() && self.store.git.is_initialized() {
+            let ts_raw = &batch[batch.len() - 1]["timestamp"];
+            let ts = ts_raw.as_str().unwrap_or("");
+            let commit_ts = if ts.is_empty() { Local::now().format("%Y-%m-%d %H:%M").to_string() } else { ts.to_string() };
+            if let Some(sha) = self.store.git.auto_commit(&format!(
+                "dream: {}, {} change(s)",
+                commit_ts,
+                changelog.len()
+            )) {
+                log::info!("Dream git commit: {}", sha);
+            }
+        }
+
         true
     }
 }
@@ -1037,7 +1149,9 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
-    use crate::providers::base::{BoxedStreamCallback, GenerationSettings, LLMProviderDyn, LLMResponse};
+    use crate::providers::base::{
+        BoxedStreamCallback, GenerationSettings, LLMProviderDyn, LLMResponse,
+    };
     use crate::providers::registry::ProviderSpec;
 
     fn make_store(tmp: &TempDir) -> MemoryStore {
@@ -1203,8 +1317,11 @@ mod tests {
         let mut c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
         let mut session = Session::new("s".into());
         c.maybe_consolidate_by_tokens(&mut session).await;
-        assert!(!c.store.history_file.exists() || fs::metadata(&c.store.history_file).unwrap().len() == 0,
-            "no history written for empty session");
+        assert!(
+            !c.store.history_file.exists()
+                || fs::metadata(&c.store.history_file).unwrap().len() == 0,
+            "no history written for empty session"
+        );
     }
 
     #[tokio::test]
@@ -1214,12 +1331,18 @@ mod tests {
         resp.content = Some("summary".into());
         let mut c = test_consolidator_with_ctx(&tmp, ArchiveTestProvider::arc(resp), 0, 0);
         let mut session = session_with_messages(
-            vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "yo"})],
+            vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": "yo"}),
+            ],
             0,
         );
         c.maybe_consolidate_by_tokens(&mut session).await;
-        assert!(!c.store.history_file.exists() || fs::metadata(&c.store.history_file).unwrap().len() == 0,
-            "no history written when context_window_tokens is zero");
+        assert!(
+            !c.store.history_file.exists()
+                || fs::metadata(&c.store.history_file).unwrap().len() == 0,
+            "no history written when context_window_tokens is zero"
+        );
     }
 
     #[tokio::test]
@@ -1231,12 +1354,18 @@ mod tests {
         resp.content = Some("summary".into());
         let mut c = test_consolidator_with_ctx(&tmp, ArchiveTestProvider::arc(resp), 65_536, 8192);
         let mut session = session_with_messages(
-            vec![json!({"role": "user", "content": "hi"}), json!({"role": "assistant", "content": "yo"})],
+            vec![
+                json!({"role": "user", "content": "hi"}),
+                json!({"role": "assistant", "content": "yo"}),
+            ],
             0,
         );
         c.maybe_consolidate_by_tokens(&mut session).await;
-        assert!(!c.store.history_file.exists() || fs::metadata(&c.store.history_file).unwrap().len() == 0,
-            "no history written when estimated is zero (below budget)");
+        assert!(
+            !c.store.history_file.exists()
+                || fs::metadata(&c.store.history_file).unwrap().len() == 0,
+            "no history written when estimated is zero (below budget)"
+        );
     }
 
     #[tokio::test]
@@ -1264,10 +1393,12 @@ mod tests {
 
         // Build a session with several alternating messages starting already past last_consolidated=0.
         // last_consolidated stays 0; after any consolidation round it should advance.
-        let msgs: Vec<serde_json::Value> = (0..6).map(|i| {
-            let role = if i % 2 == 0 { "user" } else { "assistant" };
-            json!({"role": role, "content": format!("msg {i}")})
-        }).collect();
+        let msgs: Vec<serde_json::Value> = (0..6)
+            .map(|i| {
+                let role = if i % 2 == 0 { "user" } else { "assistant" };
+                json!({"role": role, "content": format!("msg {i}")})
+            })
+            .collect();
         let mut session = session_with_messages(msgs, 0);
         let lc_before = session.last_consolidated;
 
@@ -1275,9 +1406,14 @@ mod tests {
 
         // With StubArchiveMessageBuilder (returns 0 estimated), consolidation exits early.
         // Verify no history was spuriously written and last_consolidated unchanged.
-        assert_eq!(session.last_consolidated, lc_before,
-            "last_consolidated must not change when estimated == 0");
-        assert!(!c.store.history_file.exists() || fs::metadata(&c.store.history_file).unwrap().len() == 0);
+        assert_eq!(
+            session.last_consolidated, lc_before,
+            "last_consolidated must not change when estimated == 0"
+        );
+        assert!(
+            !c.store.history_file.exists()
+                || fs::metadata(&c.store.history_file).unwrap().len() == 0
+        );
     }
 
     #[tokio::test]
@@ -1289,7 +1425,10 @@ mod tests {
         resp.content = Some("s".into());
         let mut c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
         let mut session = session_with_messages(
-            vec![json!({"role": "user", "content": "a"}), json!({"role": "assistant", "content": "b"})],
+            vec![
+                json!({"role": "user", "content": "a"}),
+                json!({"role": "assistant", "content": "b"}),
+            ],
             0,
         );
         c.maybe_consolidate_by_tokens(&mut session).await;
@@ -1304,7 +1443,10 @@ mod tests {
         resp.content = Some("should-not-be-used".into());
         let c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
         assert!(!c.archive(&vec![]).await);
-        assert!(!c.store.history_file.exists() || fs::metadata(&c.store.history_file).unwrap().len() == 0);
+        assert!(
+            !c.store.history_file.exists()
+                || fs::metadata(&c.store.history_file).unwrap().len() == 0
+        );
     }
 
     #[tokio::test]
@@ -1348,7 +1490,10 @@ mod tests {
             content.contains(RAW_MARKER),
             "expected raw marker in archived content, got: {content:?}"
         );
-        assert!(content.contains("USER:"), "formatted user line should appear: {content:?}");
+        assert!(
+            content.contains("USER:"),
+            "formatted user line should appear: {content:?}"
+        );
     }
 
     #[test]

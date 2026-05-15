@@ -742,7 +742,6 @@ impl AgentRunner {
             .unwrap_or_else(|| Arc::new(NoopHook));
 
         let mut messages = spec.initial_messages.clone();
-        println!("messages: {:?}", messages);
         let mut usage: HashMap<String, u64> = HashMap::new();
         let mut all_tool_events: Vec<HashMap<String, String>> = Vec::new();
         let mut tools_used: Vec<String> = Vec::new();
