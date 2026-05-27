@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use rmcp::ServiceExt;
 use serde_json::Value;
-use rust_bot::{agent::{tools::registry::ToolRegistry, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{MCPToolWrapper, LoadedMcpTools, load_mcp_tools_from_config}, shell::ShellTool}}, config::schema::{McpServerConfig, McpTransportType}};
+use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool}}, config::schema::{McpServerConfig, McpTransportType}};
 use ctor::ctor;
 
 use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::read_mcp_env};
@@ -33,6 +33,11 @@ fn prepare_workspace() -> PathBuf {
         std::fs::create_dir_all(&workspace_path).unwrap();
     }
     workspace_path
+}
+
+fn create_agent_runner() -> AgentRunner {
+    let provider = create_openrouter_provider();
+    AgentRunner::new(Arc::new(provider))
 }
 
 fn create_agent_run_spec_with_write_tool(messages: Vec<Value>) -> AgentRunSpec {
@@ -90,8 +95,7 @@ fn create_agent_run_spec_with_shell_tool(messages: Vec<Value>) -> AgentRunSpec {
 
 #[tokio::test]
 async fn test_simple_run_no_tools() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Hello, how are you?"
@@ -114,8 +118,7 @@ fn completion_message_check(result: &AgentRunResult) {
 
 #[tokio::test]
 async fn test_simple_run_with_write_tool() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please write a joke to a file called joke.txt in the workspace directory?"
@@ -144,8 +147,7 @@ async fn test_write_poem_then_summarize() {
     // Start clean so the assertion below is unambiguous.
     let _ = std::fs::remove_file(&poem_file);
 
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
 
     // ── Turn 1: write the poem ────────────────────────────────────────────────
     let initial_messages = vec![serde_json::json!({
@@ -175,8 +177,7 @@ async fn test_write_poem_then_summarize() {
 
 #[tokio::test]
 async fn test_simple_run_with_write_and_list_dir_tool() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please write a joke to a file called joke1.txt and then list the contents of the workspace directory?"
@@ -206,8 +207,7 @@ async fn test_write_and_append_poem_verse() {
     // Start clean so assertions below are unambiguous.
     let _ = std::fs::remove_file(&poem_file);
 
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
 
     // ── Turn 1: write the first verse ────────────────────────────────────────
     let initial_messages = vec![serde_json::json!({
@@ -242,8 +242,7 @@ async fn test_write_and_append_poem_verse() {
 
 #[tokio::test]
 async fn test_shell_tool() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please recursively list the contents of the workspace directory and write the result to a file called shell_tool_result.txt?"
@@ -256,8 +255,7 @@ async fn test_shell_tool() {
 
 #[tokio::test]
 async fn test_shell_tool_with_volume() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please check the volume information of the disk using the vol command and write the result to a file called shell_tool_vol_result.txt?"
@@ -270,8 +268,7 @@ async fn test_shell_tool_with_volume() {
 
 #[tokio::test]
 async fn test_shell_tool_with_system_info() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please check the system info and write the result to a file called system_info_vol_result.txt?"
@@ -284,8 +281,7 @@ async fn test_shell_tool_with_system_info() {
 
 #[tokio::test]
 async fn test_shell_tool_with_system_info_2() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please check the system info and write the result to a file called system_info_vol_result.txt?"
@@ -298,8 +294,7 @@ async fn test_shell_tool_with_system_info_2() {
 
 #[tokio::test]
 async fn test_shell_tool_associations_with_read_write_tool() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
         "content": "Can you please list the associations of file types to applications on this system and write it to a file called assoc_result.txt?"
@@ -311,9 +306,56 @@ async fn test_shell_tool_associations_with_read_write_tool() {
 }
 
 #[tokio::test]
+async fn test_glob_tool() {
+    let runner = create_agent_runner();
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please list all files with the txt extension in the workspace directory?"
+    })];
+    let workspace_path = prepare_workspace();
+    let tool = Box::new(GlobTool::new(Some(workspace_path.clone()), None, None));
+    let mut tool_registry = ToolRegistry::new();
+    tool_registry.register(tool);
+    let (_openai_api_key, _openai_api_base, openai_api_model) = read_env();
+    let spec = AgentRunSpec {
+        model: openai_api_model,
+        max_iterations: 30,
+        initial_messages: messages,
+        tools: tool_registry,
+        ..AgentRunSpec::default()   // everything else gets its default
+    };
+    let result = runner.run(spec).await;
+    completion_message_check(&result);
+    println!("result: {}", result.final_content.unwrap().as_str());
+}
+
+#[tokio::test]
+async fn test_grep_tool() {
+    let runner = create_agent_runner();
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "I am looking for content about food in the workspace directory."
+    })];
+    let workspace_path = prepare_workspace();
+    let tool = Box::new(GrepTool::new(Some(workspace_path.clone()), None, None));
+    let mut tool_registry = ToolRegistry::new();
+    tool_registry.register(tool);
+    let (_openai_api_key, _openai_api_base, openai_api_model) = read_env();
+    let spec = AgentRunSpec {
+        model: openai_api_model,
+        max_iterations: 30,
+        initial_messages: messages,
+        tools: tool_registry,
+        ..AgentRunSpec::default()   // everything else gets its default
+    };
+    let result = runner.run(spec).await;
+    completion_message_check(&result);
+    println!("result: {}", result.final_content.unwrap().as_str());
+}
+
+#[tokio::test]
 async fn test_mcp_tool() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
 
     // Spin up a HelloServer over an in-process duplex byte pipe
     let (server_transport, client_transport) = tokio::io::duplex(4096);
@@ -364,8 +406,7 @@ async fn test_mcp_tool() {
 
 #[tokio::test]
 async fn test_mcp_tool_with_mcp_config() {
-    let provider = create_openrouter_provider();
-    let runner = AgentRunner::new(Arc::new(provider));
+    let runner = create_agent_runner();
     let mut headers = HashMap::new();
     let (mcp_server_url, mcp_headers_jwt, mcp_test_prompt) = read_mcp_env();
     log::info!("mcp_server_url: {}", mcp_server_url);

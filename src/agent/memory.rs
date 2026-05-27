@@ -14,7 +14,7 @@ use crate::session::manager::{Session, SessionManager};
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
     empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain,
-    strip_surrounding_quotes, strip_think,
+    strip_think,
 };
 use crate::utils::prompt_templates::render_template;
 use chrono::{DateTime, Local};

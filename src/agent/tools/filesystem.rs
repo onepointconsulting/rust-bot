@@ -116,9 +116,9 @@ fn _find_match(content: &str, old_text: &str) -> (Option<String>, usize) {
 // ---------------------------------------------------------------------------
 
 pub struct FsToolConfig {
-    workspace: Option<PathBuf>,
-    allowed_dir: Option<PathBuf>,
-    extra_allowed_dirs: Option<Vec<PathBuf>>,
+    pub(crate) workspace: Option<PathBuf>,
+    pub(crate) allowed_dir: Option<PathBuf>,
+    pub(crate) extra_allowed_dirs: Option<Vec<PathBuf>>,
 }
 
 impl FsToolConfig {
@@ -188,7 +188,7 @@ impl WriteFileTool {
 
 impl ListDirTool {
     const DEFAULT_MAX: usize = 200;
-    const IGNORE_DIRS: &'static [&'static str] = &[
+    pub(crate) const IGNORE_DIRS: &'static [&'static str] = &[
         ".git", "node_modules", "__pycache__", ".venv", "target",
     ];
 

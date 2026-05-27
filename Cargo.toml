@@ -35,6 +35,7 @@ rmcp = { version = "1.6.0", features = ["client", "transport-child-process", "tr
 http = "1"
 ctor = "1.0.2"
 which = "6"
+glob = "0.3.3"
 
 [dev-dependencies]
 tempfile = "3"
