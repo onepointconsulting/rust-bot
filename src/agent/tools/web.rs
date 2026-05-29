@@ -1,14 +1,17 @@
 use async_trait::async_trait;
 use std::sync::LazyLock;
 
+use dom_smoothie::{Config, Readability, TextMode};
 use html_escape::decode_html_entities;
 use regex::Regex;
 use serde_json::Value;
 use url::Url;
 
 use crate::{
-    agent::tools::base::Tool, config::schema::WebSearchConfig,
-    security::network::validate_url_target,
+    agent::tools::base::Tool,
+    config::schema::WebSearchConfig,
+    security::network::{validate_resolved_url, validate_url_target},
+    utils::helpers::{build_image_content_blocks, detect_image_mime},
 };
 
 const USER_AGENT: &str = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/148.0.0.0 Safari/537.36";
@@ -37,6 +40,70 @@ fn strip_tags(text: &str) -> String {
 fn normalize(text: &str) -> String {
     let text = WHITESPACE_RE.replace_all(text, " ");
     return NEWLINE_RE.replace_all(&text, "\n\n").into_owned();
+}
+
+fn looks_like_html(text: &str) -> bool {
+    let sample = text.get(..256.min(text.len())).unwrap_or(text);
+    let lower = sample.to_ascii_lowercase();
+    lower.starts_with("<!doctype") || lower.starts_with("<html")
+}
+
+fn fetch_error_json(url: &str, message: &str) -> String {
+    serde_json::json!({ "error": message, "url": url }).to_string()
+}
+
+/// Extract article text via dom_smoothie (Mozilla Readability port).
+fn extract_with_readability(html: &str, url: &str, extract_mode: &str) -> Result<String, String> {
+    let cfg = if extract_mode == "markdown" {
+        Config {
+            text_mode: TextMode::Markdown,
+            ..Default::default()
+        }
+    } else {
+        Config {
+            text_mode: TextMode::Raw,
+            ..Default::default()
+        }
+    };
+    let mut readability = Readability::new(html, Some(url), Some(cfg)).map_err(|e| e.to_string())?;
+    let article = readability.parse().map_err(|e| e.to_string())?;
+    let content = if extract_mode == "markdown" {
+        article.text_content.to_string()
+    } else {
+        normalize(&strip_tags(&article.content.to_string()))
+    };
+    Ok(if article.title.is_empty() {
+        content
+    } else {
+        format!("# {}\n\n{content}", article.title)
+    })
+}
+
+fn format_fetch_payload(
+    url: &str,
+    final_url: &str,
+    status: u16,
+    extractor: &str,
+    mut text: String,
+    max_chars: usize,
+) -> String {
+    let truncated = text.len() > max_chars;
+    if truncated {
+        text = text.chars().take(max_chars).collect();
+    }
+    text = format!("{UNTRUSTED_BANNER}\n\n{text}");
+    let length = text.len();
+    serde_json::json!({
+        "url": url,
+        "finalUrl": final_url,
+        "status": status,
+        "extractor": extractor,
+        "truncated": truncated,
+        "length": length,
+        "untrusted": true,
+        "text": text,
+    })
+    .to_string()
 }
 
 /// Validate URL with SSRF protection: scheme, domain, and resolved IP check.
@@ -160,12 +227,40 @@ fn brave_result_to_value(result: &Value) -> Value {
     })
 }
 
+/// Build an HTTP client for web tools, optionally routing through a proxy.
+///
+/// Supports HTTP and SOCKS5 proxy URLs such as `http://127.0.0.1:7890` or
+/// `socks5://127.0.0.1:1080`. Invalid proxy URLs are logged and ignored.
+fn build_http_client(proxy: Option<&str>) -> reqwest::Client {
+    let mut builder = reqwest::Client::builder()
+        .user_agent(USER_AGENT)
+        .redirect(reqwest::redirect::Policy::limited(MAX_REDIRECTS));
+
+    if let Some(proxy_url) = proxy.map(str::trim).filter(|url| !url.is_empty()) {
+        match reqwest::Proxy::all(proxy_url) {
+            Ok(proxy) => {
+                builder = builder.proxy(proxy);
+            }
+            Err(err) => {
+                log::warn!("Invalid web proxy URL '{proxy_url}': {err}");
+            }
+        }
+    }
+
+    builder
+        .build()
+        .unwrap_or_else(|err| {
+            log::warn!("Failed to build web HTTP client: {err}");
+            reqwest::Client::new()
+        })
+}
+
 /// Search the web using configured provider.
 pub struct WebSearchTool {
     name: String,
     description: String,
     config: WebSearchConfig,
-    proxy: Option<String>,
+    client: reqwest::Client,
 }
 
 impl WebSearchTool {
@@ -176,7 +271,7 @@ impl WebSearchTool {
 Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
                 .to_string(),
             config: config.unwrap_or(WebSearchConfig::default()),
-            proxy: proxy.clone(),
+            client: build_http_client(proxy.as_deref()),
         }
     }
 
@@ -186,7 +281,7 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
             &[("q", query), ("format", "json"), ("no_html", "1")],
         )
         .expect("duckduckgo base url failed");
-        if let Ok(response) = reqwest::get(url).await {
+        if let Ok(response) = self.client.get(url).send().await {
             if let Ok(body) = response.text().await {
                 let json = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
                 let related_topics = json
@@ -224,7 +319,8 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
             ],
         )
         .expect("brave base url failed");
-        let response = reqwest::Client::new()
+        let response = self
+            .client
             .get(url)
             .header("Accept", "application/json")
             .header("Accept-Encoding", "gzip")
@@ -314,6 +410,200 @@ impl Tool for WebSearchTool {
     }
 }
 
+const MAX_CHARS: usize = 50_000;
+
+pub struct WebFetchTool {
+    name: String,
+    description: String,
+    max_chars: usize,
+    client: reqwest::Client,
+}
+
+impl WebFetchTool {
+    pub fn new(max_chars: Option<usize>, proxy: Option<String>) -> Self {
+        Self {
+            name: "web_fetch".to_string(),
+            description: format!("Fetch a URL and extract readable content (HTML → markdown/text).
+            Output is capped at maxChars (default {MAX_CHARS}).
+            Works for most web pages and docs; may fail on login-walled or JS-heavy sites.
+            "),
+            max_chars: max_chars.unwrap_or(MAX_CHARS),
+            client: build_http_client(proxy.as_deref()),
+        }
+    }
+
+    async fn image_fetch_result(
+        response: reqwest::Response,
+        url: &str,
+        content_type: &str,
+    ) -> String {
+        let raw = match response.bytes().await {
+            Ok(bytes) => bytes,
+            Err(e) => return format!("Error: failed to read image from {url}: {e}"),
+        };
+        let mime = content_type
+            .split(';')
+            .next()
+            .unwrap_or("")
+            .trim();
+        let mime = if mime.starts_with("image/") {
+            mime
+        } else {
+            detect_image_mime(&raw).unwrap_or("application/octet-stream")
+        };
+        let blocks = build_image_content_blocks(
+            &raw,
+            mime,
+            url,
+            &format!("(Image fetched from: {url})"),
+        );
+        serde_json::to_string(&blocks)
+            .unwrap_or_else(|e| format!("Error: failed to encode image content: {e}"))
+    }
+
+    async fn html_fetch_result(
+        response: reqwest::Response,
+        url: &str,
+        content_type: Option<&str>,
+        extract_mode: &str,
+        max_chars: usize,
+    ) -> String {
+        let status = response.status().as_u16();
+        let final_url = response.url().to_string();
+
+        let (redirect_ok, redirect_err) = validate_resolved_url(&final_url).await;
+        if !redirect_ok {
+            return fetch_error_json(url, &format!("Redirect blocked: {redirect_err}"));
+        }
+
+        let body = match response.text().await {
+            Ok(body) => body,
+            Err(e) => return fetch_error_json(url, &format!("Failed to read response body: {e}")),
+        };
+
+        let ctype = content_type.unwrap_or("");
+        let (text, extractor) = if ctype.contains("application/json") {
+            match serde_json::from_str::<Value>(&body) {
+                Ok(value) => (
+                    serde_json::to_string_pretty(&value).unwrap_or(body),
+                    "json",
+                ),
+                Err(_) => (body, "raw"),
+            }
+        } else if ctype.contains("text/html") || looks_like_html(&body) {
+            match extract_with_readability(&body, url, extract_mode) {
+                Ok(text) => (text, "readability"),
+                Err(e) => return fetch_error_json(url, &e),
+            }
+        } else {
+            (body, "raw")
+        };
+
+        format_fetch_payload(url, &final_url, status, extractor, text, max_chars)
+    }
+}
+
+#[async_trait]
+impl Tool for WebFetchTool {
+
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "url": {
+                    "type": "string",
+                    "description": "The URL to fetch",
+                },
+                "extract_mode": {
+                    "type": "string",
+                    "description": "The mode to extract the content (default 'markdown')",
+                    "enum": ["markdown", "text"],
+                    "default": "markdown",
+                },
+                "max_chars": {
+                    "type": "integer",
+                    "description": "The maximum number of characters to extract (default {MAX_CHARS})",
+                    "minimum": 1,
+                    "maximum": MAX_CHARS,
+                    "default": MAX_CHARS,
+                },
+            },
+            "required": ["url"],
+        })
+    }
+
+    fn read_only(&self) -> bool {
+        true
+    }
+
+    async fn execute(&self, params: &serde_json::Value) -> String {
+        let url = params.get("url").and_then(Value::as_str).unwrap_or("");
+        if url.is_empty() {
+            return "Error: missing required parameter 'url'".to_string();
+        }
+        let extract_mode =
+            params.get("extract_mode").and_then(Value::as_str).unwrap_or("markdown");
+        let max_chars = std::cmp::min(
+            params
+                .get("max_chars")
+                .and_then(Value::as_u64)
+                .unwrap_or(self.max_chars as u64) as usize,
+            MAX_CHARS,
+        );
+        let (ok, msg) = validate_url_safe(url).await;
+        if !ok {
+            return format!("Error: URL validation failed for {url}: {msg}");
+        }
+
+        let parsed_url = match Url::parse(url) {
+            Ok(parsed) => parsed,
+            Err(e) => return format!("Error: failed to parse url {url}: {e}"),
+        };
+
+        let response = match self.client.get(parsed_url).send().await {
+            Ok(response) => response,
+            Err(e) => return format!("Error: failed to fetch {url}: {e}"),
+        };
+
+        if !response.status().is_success() {
+            return format!(
+                "Error: HTTP {} fetching {url}",
+                response.status().as_u16()
+            );
+        }
+
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|v| v.to_str().ok())
+            .map(str::to_string);
+
+        if content_type
+            .as_deref()
+            .is_some_and(|ctype| ctype.contains("image/"))
+        {
+            return Self::image_fetch_result(response, url, content_type.as_deref().unwrap()).await;
+        }
+
+        Self::html_fetch_result(
+            response,
+            url,
+            content_type.as_deref(),
+            extract_mode,
+            max_chars,
+        )
+        .await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -362,6 +652,26 @@ mod tests {
             out.starts_with("Results for:"),
             "expected formatted brave results, got: {out}"
         );
+    }
+
+    #[test]
+    fn build_http_client_without_proxy_succeeds() {
+        let _client = build_http_client(None);
+    }
+
+    #[test]
+    fn build_http_client_accepts_http_proxy_url() {
+        let _client = build_http_client(Some("http://127.0.0.1:7890"));
+    }
+
+    #[test]
+    fn build_http_client_accepts_socks5_proxy_url() {
+        let _client = build_http_client(Some("socks5://127.0.0.1:1080"));
+    }
+
+    #[test]
+    fn build_http_client_invalid_proxy_falls_back() {
+        let _client = build_http_client(Some("not-a-valid-proxy"));
     }
 
     #[test]
@@ -570,5 +880,59 @@ mod tests {
         assert_eq!(flat[0]["FirstURL"], "https://first.test");
         assert_eq!(flat[1]["FirstURL"], "https://second.test");
         assert_eq!(flat[2]["FirstURL"], "https://third.test");
+    }
+
+    // ── web_fetch helpers ─────────────────────────────────────────────────────
+
+    #[test]
+    fn looks_like_html_detects_doctype_and_html_prefix() {
+        assert!(looks_like_html("<!DOCTYPE html><html><body>x</body></html>"));
+        assert!(looks_like_html("<HTML><head></head></html>"));
+        assert!(!looks_like_html("plain text"));
+        assert!(!looks_like_html("{\"key\": \"value\"}"));
+    }
+
+    #[test]
+    fn format_fetch_payload_truncates_and_adds_banner() {
+        let out = format_fetch_payload(
+            "https://example.com",
+            "https://example.com/final",
+            200,
+            "readability",
+            "x".repeat(20),
+            10,
+        );
+        let json: Value = serde_json::from_str(&out).expect("valid json");
+        assert_eq!(json["url"], "https://example.com");
+        assert_eq!(json["finalUrl"], "https://example.com/final");
+        assert_eq!(json["status"], 200);
+        assert_eq!(json["extractor"], "readability");
+        assert_eq!(json["truncated"], true);
+        assert_eq!(json["untrusted"], true);
+        let text = json["text"].as_str().unwrap();
+        assert!(text.starts_with(UNTRUSTED_BANNER));
+        assert!(text.len() > UNTRUSTED_BANNER.len() + 2);
+    }
+
+    #[test]
+    fn extract_with_readability_returns_title_and_body() {
+        let html = r#"<!DOCTYPE html>
+<html><head><title>Test Page</title></head>
+<body><article><p>Hello world from readability.</p></article></body></html>"#;
+        let text = extract_with_readability(html, "https://example.com", "text")
+            .expect("readability extraction");
+        assert!(text.contains("Test Page"), "text: {text}");
+        assert!(text.contains("Hello world"), "text: {text}");
+    }
+
+    #[test]
+    fn extract_with_readability_markdown_mode() {
+        let html = r#"<!DOCTYPE html>
+<html><head><title>MD Page</title></head>
+<body><article><h2>Section</h2><p>Body text.</p></article></body></html>"#;
+        let text = extract_with_readability(html, "https://example.com", "markdown")
+            .expect("markdown extraction");
+        assert!(text.contains("MD Page"), "text: {text}");
+        assert!(text.contains("Body text"), "text: {text}");
     }
 }

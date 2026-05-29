@@ -58,6 +58,21 @@ pub fn ensure_nonempty_tool_result(tool_name: &str, content: Value) -> Value {
     }
 }
 
+/// Parse a tool's string return value into message content.
+///
+/// Image tools such as `web_fetch` serialize content blocks as JSON arrays;
+/// plain-text tools return regular strings.
+pub fn coerce_tool_execute_result(result: String) -> Value {
+    let trimmed = result.trim_start();
+    if trimmed.starts_with('[')
+        && let Ok(value) = serde_json::from_str::<Value>(&result)
+        && value.is_array()
+    {
+        return value;
+    }
+    Value::String(result)
+}
+
 // ── blank text check ──────────────────────────────────────────────────────────
 
 /// Returns `true` when `content` is `None` or contains only whitespace.
@@ -235,6 +250,30 @@ mod tests {
         let content = serde_json::json!(42);
         let result = ensure_nonempty_tool_result("tool", content.clone());
         assert_eq!(result, content);
+    }
+
+    // ── coerce_tool_execute_result ────────────────────────────────────────────
+
+    #[test]
+    fn test_coerce_tool_execute_result_plain_string() {
+        let result = coerce_tool_execute_result("hello".into());
+        assert_eq!(result, Value::String("hello".into()));
+    }
+
+    #[test]
+    fn test_coerce_tool_execute_result_json_array() {
+        let blocks = serde_json::json!([
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,abc" } },
+            { "type": "text", "text": "(Image fetched from: http://x)" }
+        ]);
+        let result = coerce_tool_execute_result(blocks.to_string());
+        assert_eq!(result, blocks);
+    }
+
+    #[test]
+    fn test_coerce_tool_execute_result_invalid_json_array_stays_string() {
+        let result = coerce_tool_execute_result("[not json".into());
+        assert_eq!(result, Value::String("[not json".into()));
     }
 
     // ── is_blank_text ─────────────────────────────────────────────────────────

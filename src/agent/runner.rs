@@ -14,7 +14,8 @@ use crate::utils::helpers::{
 
 use crate::utils::runtime::{
     EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
-    ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,
+    coerce_tool_execute_result, ensure_nonempty_tool_result, is_blank_text,
+    repeated_external_lookup_error,
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
@@ -840,7 +841,7 @@ impl AgentRunner {
                         &spec,
                         &tc.id,
                         &tc.name,
-                        Value::String(result),
+                        coerce_tool_execute_result(result),
                     );
                     let tool_msg = serde_json::json!({
                         "role": "tool",
