@@ -1,7 +1,7 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use rmcp::ServiceExt;
 use serde_json::Value;
-use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool}}, config::schema::{McpServerConfig, McpTransportType}};
+use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool, web::WebSearchTool}}, config::schema::{McpServerConfig, McpTransportType, WebSearchConfig}};
 use ctor::ctor;
 
 use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::read_mcp_env};
@@ -443,4 +443,22 @@ async fn test_mcp_tool_with_mcp_config() {
     println!("result: {:?}", result.final_content.clone().unwrap());
     completion_message_check(&result);
 
+}
+
+#[tokio::test]
+async fn test_web_search_tool() {
+    let runner = create_agent_runner();
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please search the web for information about the weather in London?"
+    })];
+    let config = WebSearchConfig {
+        provider: "brave".to_string(),
+        api_key: std::env::var("BRAVE_API_KEY").unwrap_or_default(),
+        ..WebSearchConfig::default()
+    };
+    let web_search_tool = WebSearchTool::new(Some(config), None);
+    let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(web_search_tool)]);
+    let result = runner.run(spec).await;
+    completion_message_check(&result);
 }

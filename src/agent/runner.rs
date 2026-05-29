@@ -880,6 +880,7 @@ impl AgentRunner {
                 let retry_content = hook.finalize_content(&ctx, retry_resp.content.clone());
                 (retry_content, retry_resp.finish_reason)
             } else {
+                log::info!("final_content: {:?}", content);
                 (content, response.finish_reason.clone())
             };
 

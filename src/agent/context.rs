@@ -161,14 +161,14 @@ impl ContextBuilder {
     ///
     /// Call this per-request and prepend the result as a system message before the
     /// user turn so the model always has current time and routing context.
-    pub fn build_runtime_context(
-        &self,
+    pub(crate) fn build_runtime_context(
         channel_option: Option<&str>,
         chat_id_option: Option<&str>,
+        timezone: Option<&str>,
     ) -> String {
         let mut lines = vec![format!(
             "Current Time: {}",
-            current_time_str(self.timezone.as_deref())
+            current_time_str(timezone)
         )];
         if let Some(channel) = channel_option
             && let Some(chat_id) = chat_id_option
@@ -263,7 +263,8 @@ impl ContextBuilder {
         chat_id: Option<&str>,
         current_role: &str,
     ) -> Vec<serde_json::Value> {
-        let runtime_ctx = self.build_runtime_context(channel, chat_id);
+        let runtime_ctx =
+            ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
         let user_content = self.build_user_content(current_message, media);
 
         // Merge runtime context block and user content into a single value so
@@ -519,9 +520,7 @@ mod tests {
 
     #[test]
     fn build_runtime_context_contains_current_time_and_tag() {
-        let tmp = TempDir::new().unwrap();
-        let b = make_builder(&tmp);
-        let result = b.build_runtime_context(None, None);
+        let result = ContextBuilder::build_runtime_context(None, None, None);
         assert!(
             result.contains("Current Time:"),
             "should contain Current Time"
@@ -535,9 +534,7 @@ mod tests {
     #[test]
     fn build_runtime_context_channel_only_omits_channel_info() {
         // Requires both channel AND chat_id to emit either; channel-only is silently omitted.
-        let tmp = TempDir::new().unwrap();
-        let b = make_builder(&tmp);
-        let result = b.build_runtime_context(Some("telegram"), None);
+        let result = ContextBuilder::build_runtime_context(Some("telegram"), None, None);
         assert!(
             !result.contains("Channel:"),
             "channel should be absent when chat_id is missing"
@@ -546,9 +543,8 @@ mod tests {
 
     #[test]
     fn build_runtime_context_both_channel_and_chat_id_appear() {
-        let tmp = TempDir::new().unwrap();
-        let b = make_builder(&tmp);
-        let result = b.build_runtime_context(Some("telegram"), Some("12345"));
+        let result =
+            ContextBuilder::build_runtime_context(Some("telegram"), Some("12345"), None);
         assert!(
             result.contains("Channel: telegram"),
             "channel should appear"
@@ -558,9 +554,7 @@ mod tests {
 
     #[test]
     fn build_runtime_context_empty_strings_suppressed() {
-        let tmp = TempDir::new().unwrap();
-        let b = make_builder(&tmp);
-        let result = b.build_runtime_context(Some(""), Some("12345"));
+        let result = ContextBuilder::build_runtime_context(Some(""), Some("12345"), None);
         assert!(
             !result.contains("Channel:"),
             "empty channel should be suppressed"
@@ -572,13 +566,12 @@ mod tests {
     }
 
     #[test]
-    fn build_runtime_context_uses_stored_timezone() {
-        let tmp = TempDir::new().unwrap();
-        let b = ContextBuilder::new(tmp.path().to_path_buf(), Some("Europe/London".to_string()));
-        let result = b.build_runtime_context(None, None);
+    fn build_runtime_context_uses_timezone_parameter() {
+        let result =
+            ContextBuilder::build_runtime_context(None, None, Some("Europe/London"));
         assert!(
             result.contains("Europe/London"),
-            "stored timezone should appear in time string"
+            "timezone parameter should appear in time string"
         );
     }
 

@@ -5,4 +5,4 @@ pub mod shell;
 pub mod sandbox;
 pub mod mcp;
 pub mod search;
-
+pub mod web;

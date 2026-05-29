@@ -16,7 +16,7 @@ log = "0.4.29"
 env_logger = "0.11.10"
 rand = "0.10.0"
 async-openai = { version = "0.34.0", features = ["chat-completion"] }
-reqwest = { version = "0.12", default-features = false, features = ["native-tls"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "gzip"] }
 uuid = { version = "1.23.0", features = ["v4"] }
 dotenv = "0.15.0"
 sha1 = "0.11.0"
@@ -36,6 +36,7 @@ http = "1"
 ctor = "1.0.2"
 which = "6"
 glob = "0.3.3"
+html-escape = "0.2.13"
 
 [dev-dependencies]
 tempfile = "3"

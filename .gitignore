@@ -1,3 +1,18 @@
 /target
 notes.txt
 .env
+
+# Auto-generated cache directories (e.g. Python install manager)
+**/_cache/
+
+# Local Python installation and other machine-specific workspace output
+workspace/Python/
+
+# Ephemeral agent/shell test artifacts (keep workspace/dummy.txt)
+workspace/*_result.txt
+workspace/*_tmp.txt
+workspace/joke*.txt
+workspace/llm_poem*.txt
+workspace/assoc_result.txt
+workspace/workspace/
+shell_tool_result.txt
