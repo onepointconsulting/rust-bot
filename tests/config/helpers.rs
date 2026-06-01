@@ -1,5 +1,6 @@
-use std::{collections::HashMap, env};
+use std::{collections::HashMap, env, path::PathBuf};
 use dotenv::dotenv;
+use garde::Path;
 use rust_bot::providers::{base::LLMProvider, openai_compat_provider::OpenAICompatProvider, registry::ProviderSpec};
 use uuid::Uuid;
 
@@ -67,4 +68,15 @@ pub fn create_openrouter_provider_with_spec() -> OpenAICompatProvider {
             supports_max_completion_tokens: false,
         }),
     )
+}
+
+const WORKSPACE: &str = "workspace";
+
+pub fn prepare_workspace() -> PathBuf {
+    let workspace = std::path::Path::new(WORKSPACE);
+    let workspace_path = workspace.to_path_buf();
+    if !workspace_path.exists() {
+        std::fs::create_dir_all(&workspace_path).unwrap();
+    }
+    workspace_path
 }

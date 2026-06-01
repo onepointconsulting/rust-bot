@@ -4,11 +4,9 @@ use serde_json::Value;
 use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool, web::{WebFetchTool, WebSearchTool}}}, config::schema::{McpServerConfig, McpTransportType, WebSearchConfig}};
 use ctor::ctor;
 
-use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::read_mcp_env};
+use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::{prepare_workspace, read_mcp_env}};
 use crate::agent::mcp_dummy_server::HelloServer;
 use crate::config::helpers::{read_env, create_openrouter_provider};
-
-const WORKSPACE: &str = "workspace";
 
 #[ctor(unsafe)]
 pub fn init_logger() {
@@ -24,15 +22,6 @@ fn create_agent_run_spec(messages: Vec<Value>) -> AgentRunSpec {
         initial_messages: messages,
         ..AgentRunSpec::default()   // everything else gets its default
     }
-}
-
-fn prepare_workspace() -> PathBuf {
-    let workspace = Path::new(WORKSPACE);
-    let workspace_path = workspace.to_path_buf();
-    if !workspace_path.exists() {
-        std::fs::create_dir_all(&workspace_path).unwrap();
-    }
-    workspace_path
 }
 
 fn create_agent_runner() -> AgentRunner {

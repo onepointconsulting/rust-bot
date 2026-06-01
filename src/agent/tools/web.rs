@@ -398,6 +398,7 @@ impl Tool for WebSearchTool {
             10,
         ) as usize;
 
+        log::info!("Searching web with provider: {provider}");
         if provider == "duckduckgo" {
             let results = self.search_duckduckgo(query, count).await;
             return format_results(query, &results, count);
@@ -573,10 +574,19 @@ impl Tool for WebFetchTool {
             Err(e) => return format!("Error: failed to fetch {url}: {e}"),
         };
 
-        if !response.status().is_success() {
+        if response.status() == reqwest::StatusCode::TOO_MANY_REQUESTS {
+            log::warn!("Rate limit (429) while fetching {url}");
             return format!(
-                "Error: HTTP {} fetching {url}",
-                response.status().as_u16()
+                "Soft Error: HTTP 429 rate limited for {url}. \
+                 Do not retry this URL immediately; use web_search or try a different source."
+            );
+        }
+
+        if response.status() == reqwest::StatusCode::SERVICE_UNAVAILABLE {
+            log::warn!("Rate limit (503) while fetching {url}");
+            return format!(
+                "Soft Error: HTTP 503 rate limited for {url}. \
+                 Do not retry this URL immediately; use web_search or try a different source."
             );
         }
 

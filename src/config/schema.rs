@@ -458,12 +458,12 @@ impl Default for GatewayConfig {
 
 // ── WebSearchConfig ───────────────────────────────────────────────────────────
 
-fn default_web_search_provider() -> String { "duckduckgo".to_string() }
+fn default_web_search_provider() -> String { "brave".to_string() }
 fn default_web_search_max_results() -> u32 { 5 }
 fn default_web_search_timeout() -> u32 { 30 }
 
 /// Web search tool configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebSearchConfig {
     /// Search backend: `"brave"`, `"tavily"`, `"duckduckgo"`, `"searxng"`, or `"jina"`.

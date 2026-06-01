@@ -436,7 +436,8 @@ impl AgentRunner {
                 )
                 .await;
 
-            for delta in deltas.lock().unwrap().drain(..) {
+            let drained: Vec<String> = deltas.lock().unwrap().drain(..).collect();
+            for delta in drained {
                 hook.on_stream(context, &delta).await;
             }
 
@@ -820,6 +821,7 @@ impl AgentRunner {
                 ctx.tool_events = events;
 
                 if let Some(err) = fatal_error {
+                    log::error!("Fatal tool error: {}", err);
                     let error_msg = spec
                         .error_message
                         .as_deref()
