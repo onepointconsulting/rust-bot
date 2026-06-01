@@ -15,4 +15,5 @@ workspace/joke*.txt
 workspace/llm_poem*.txt
 workspace/assoc_result.txt
 workspace/workspace/
+workspace/weather_in_london.txt
 shell_tool_result.txt
