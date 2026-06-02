@@ -87,6 +87,11 @@ pub trait Tool: Send + Sync {
         self.read_only() && !self.exclusive()
     }
 
+    /// Update routing context for tools that send messages or spawn subagents.
+    fn set_tool_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
+        let _ = (channel, chat_id, message_id);
+    }
+
     fn cast_params(&self, params: &serde_json::Value) -> serde_json::Value {
         let schema = self.parameters().clone();
         if schema

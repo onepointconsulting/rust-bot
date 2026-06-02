@@ -6,3 +6,4 @@ pub mod sandbox;
 pub mod mcp;
 pub mod search;
 pub mod web;
+pub mod spawn;

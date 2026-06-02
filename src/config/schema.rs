@@ -1332,7 +1332,7 @@ mod tests {
     #[test]
     fn test_web_search_defaults() {
         let cfg = WebSearchConfig::default();
-        assert_eq!(cfg.provider, "duckduckgo");
+        assert_eq!(cfg.provider, "brave");
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.base_url, "");
         assert_eq!(cfg.max_results, 5);
@@ -1395,7 +1395,7 @@ mod tests {
         assert!(cfg.enable);
         assert_eq!(cfg.proxy, None);
         // nested search should carry WebSearchConfig defaults
-        assert_eq!(cfg.search.provider, "duckduckgo");
+        assert_eq!(cfg.search.provider, "brave");
         assert_eq!(cfg.search.max_results, 5);
         assert_eq!(cfg.search.timeout, 30);
         assert!(cfg.validate().is_ok());
@@ -1407,7 +1407,7 @@ mod tests {
         let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.enable);
         assert_eq!(cfg.proxy, None);
-        assert_eq!(cfg.search.provider, "duckduckgo");
+        assert_eq!(cfg.search.provider, "brave");
         assert!(cfg.validate().is_ok());
     }
 

@@ -5,3 +5,4 @@ pub mod hook;
 pub mod runner;
 pub mod skills;
 pub mod subagent;
+pub mod agent_loop;

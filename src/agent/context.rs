@@ -129,10 +129,10 @@ impl ContextBuilder {
         let workspace_path = {
             let raw = self
                 .workspace
-                .canonicalize()
-                .unwrap_or_else(|_| self.workspace.clone())
-                .to_string_lossy()
-                .into_owned();
+            .canonicalize()
+            .unwrap_or_else(|_| self.workspace.clone())
+            .to_string_lossy()
+            .into_owned();
             // Strip Windows extended-length prefix ("\\?\") and normalise
             // backslashes to forward slashes so paths read naturally.
             let stripped = raw.strip_prefix(r"\\?\").unwrap_or(&raw);

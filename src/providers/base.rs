@@ -7,7 +7,7 @@ use futures::FutureExt;
 use crate::providers::registry::ProviderSpec;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct ToolCallRequest {
+pub struct  ToolCallRequest {
     /// A tool call request from the LLM.
     pub id: String,
     pub name: String,
