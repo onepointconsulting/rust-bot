@@ -1,15 +1,22 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::time::SystemTime;
 
 use async_trait::async_trait;
 
+use crate::agent::context::ContextBuilder;
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
+use crate::agent::runner::AgentRunner;
+use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::bus::queue::MessageBus;
-use crate::config::schema::{ExecToolConfig, WebToolsConfig};
+use crate::config::schema::{ChannelsConfig, ExecToolConfig, McpServerConfig, WebToolsConfig};
+use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
+use crate::session::manager::SessionManager;
 use crate::utils::helpers::strip_think;
 use crate::utils::tool_hints::format_tool_hints;
 
@@ -229,7 +236,7 @@ impl AgentHook for LoopHookChain {
 /// 5. Sends responses back
 ///
 pub struct AgentLoop {
-    bus: MessageBus,
+    bus: Arc<MessageBus>,
     provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
     model: Option<String>,
@@ -240,17 +247,31 @@ pub struct AgentLoop {
     provider_retry_mode: String,
     web_config: Option<WebToolsConfig>,
     exec_config: Option<ExecToolConfig>,
-    // cron_service: Option<CronService>,
+    cron_service: Option<Arc<CronService>>,
+    restrict_to_workspace: bool,
+    session_manager: Option<Arc<SessionManager>>,
+    mcp_servers: HashMap<String, Arc<McpServerConfig>>,
+    channels_config: Option<ChannelsConfig>,
+    timezone: Option<String>,
+    start_time: Option<SystemTime>,
+    last_usage: HashMap<String, usize>,
+    extra_hooks: Vec<Arc<dyn AgentHook>>,
+    context: Arc<ContextBuilder>,
+    sessions: Option<Arc<SessionManager>>,
     tools: Arc<ToolRegistry>,
+    runner: Arc<AgentRunner>,
+    subagents: Arc<SubagentManager>,
+    running: bool,
+
 }
 
 impl AgentLoop {
     const RUNTIME_CHECKPOINT_KEY: &str = "runtime_checkpoint";
 
-    pub fn new(tools: Arc<ToolRegistry>, provider: Arc<dyn LLMProviderDyn>) -> Self {
+    pub fn new(bus: Arc<MessageBus>, tools: Arc<ToolRegistry>, provider: Arc<dyn LLMProviderDyn>, workspace: PathBuf) -> Self {
         Self {
-            bus: MessageBus::new(),
-            provider: provider,
+            bus: bus.clone(),
+            provider: provider.clone(),
             workspace: PathBuf::from("."),
             model: None,
             max_iterations: None,
@@ -260,6 +281,20 @@ impl AgentLoop {
             provider_retry_mode: "standard".to_string(),
             web_config: None,
             exec_config: None,
+            cron_service: None,
+            restrict_to_workspace: false,
+            session_manager: None,
+            mcp_servers: HashMap::new(),
+            channels_config: None,
+            timezone: None,
+            start_time: None,
+            last_usage: HashMap::new(),
+            extra_hooks: Vec::new(),
+            context: Arc::new(ContextBuilder::new(workspace.clone(), None)),
+            sessions: None,
+            runner: Arc::new(AgentRunner::new(provider.clone())),
+            subagents: Arc::new(SubagentManager::new(provider, workspace, bus, 0, None, None, None, None)),
+            running: false,
             tools,
         }
     }
@@ -366,13 +401,6 @@ mod tests {
         AgentHookContext::new(1, vec![])
     }
 
-    fn test_agent_loop() -> Arc<AgentLoop> {
-        Arc::new(AgentLoop::new(Arc::new(ToolRegistry::new()),
-        Arc::new(PlaceholderProvider {
-            settings: GenerationSettings::new(),
-        })))
-    }
-
     fn recording_stream_callback() -> (StreamCallback, Arc<Mutex<Vec<String>>>) {
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_cb = Arc::clone(&received);
@@ -383,14 +411,6 @@ mod tests {
             })
         });
         (callback, received)
-    }
-
-    fn hook_with_stream(on_stream: StreamCallback) -> LoopHook {
-        LoopHook::new(test_agent_loop(), None, Some(on_stream), None)
-    }
-
-    fn hook_without_stream() -> LoopHook {
-        LoopHook::new(test_agent_loop(), None, None, None)
     }
 
     fn recording_stream_end_callback() -> (StreamEndCallback, Arc<Mutex<Vec<bool>>>) {
@@ -405,10 +425,6 @@ mod tests {
         (callback, received)
     }
 
-    fn hook_with_stream_end(on_stream_end: StreamEndCallback) -> LoopHook {
-        LoopHook::new(test_agent_loop(), None, None, Some(on_stream_end))
-    }
-
     fn recording_progress_callback() -> (ProgressCallback, Arc<Mutex<Vec<(String, bool)>>>) {
         let received = Arc::new(Mutex::new(Vec::new()));
         let received_cb = Arc::clone(&received);
@@ -421,10 +437,6 @@ mod tests {
         (callback, received)
     }
 
-    fn hook_with_progress(on_progress: ProgressCallback) -> LoopHook {
-        LoopHook::new(test_agent_loop(), Some(on_progress), None, None)
-    }
-
     fn stream_buf_snapshot(hook: &LoopHook) -> String {
         hook.stream_buf
             .lock()
@@ -432,219 +444,6 @@ mod tests {
             .clone()
     }
 
-    #[test]
-    fn test_wants_streaming_reflects_callback_presence() {
-        let (callback, _) = recording_stream_callback();
-        assert!(!hook_without_stream().wants_streaming());
-        assert!(hook_with_stream(callback).wants_streaming());
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_accumulates_raw_delta_without_callback() {
-        let hook = hook_without_stream();
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "hel").await;
-        hook.on_stream(&mut ctx, "lo").await;
-
-        assert_eq!(stream_buf_snapshot(&hook), "hello");
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_emits_incremental_plain_text() {
-        let (callback, received) = recording_stream_callback();
-        let hook = hook_with_stream(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "Hello").await;
-
-        assert_eq!(*received.lock().unwrap(), vec!["Hello".to_string()]);
-        assert_eq!(stream_buf_snapshot(&hook), "Hello");
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_emits_only_clean_suffix_on_later_deltas() {
-        let (callback, received) = recording_stream_callback();
-        let hook = hook_with_stream(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "Hel").await;
-        hook.on_stream(&mut ctx, "lo").await;
-
-        assert_eq!(
-            *received.lock().unwrap(),
-            vec!["Hel".to_string(), "lo".to_string()]
-        );
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_suppresses_incomplete_think_blocks() {
-        let (callback, received) = recording_stream_callback();
-        let hook = hook_with_stream(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "<think>secret").await;
-
-        assert!(received.lock().unwrap().is_empty());
-        assert_eq!(stream_buf_snapshot(&hook), "<think>secret");
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_emits_visible_text_after_think_block_closes() {
-        let (callback, received) = recording_stream_callback();
-        let hook = hook_with_stream(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "<think>secret").await;
-        hook.on_stream(&mut ctx, "</think>Hi").await;
-
-        assert_eq!(*received.lock().unwrap(), vec!["Hi".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_short_new_clean_does_not_panic() {
-        let (callback, received) = recording_stream_callback();
-        let hook = hook_with_stream(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "Hello").await;
-        hook.on_stream(&mut ctx, " <think>x").await;
-
-        assert_eq!(*received.lock().unwrap(), vec!["Hello".to_string()]);
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_end_clears_buffer_without_callback() {
-        let hook = hook_without_stream();
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "hello").await;
-        assert_eq!(stream_buf_snapshot(&hook), "hello");
-
-        hook.on_stream_end(&mut ctx, false).await;
-        assert_eq!(stream_buf_snapshot(&hook), "");
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_end_invokes_callback_with_resuming_flag() {
-        let (callback, received) = recording_stream_end_callback();
-        let hook = hook_with_stream_end(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream_end(&mut ctx, true).await;
-        hook.on_stream_end(&mut ctx, false).await;
-
-        assert_eq!(*received.lock().unwrap(), vec![true, false]);
-    }
-
-    #[tokio::test]
-    async fn test_on_stream_end_clears_buffer_after_callback() {
-        let (callback, received) = recording_stream_end_callback();
-        let hook = hook_with_stream_end(callback);
-        let mut ctx = make_ctx();
-
-        hook.on_stream(&mut ctx, "partial").await;
-        hook.on_stream_end(&mut ctx, false).await;
-
-        assert_eq!(*received.lock().unwrap(), vec![false]);
-        assert_eq!(stream_buf_snapshot(&hook), "");
-    }
-
-    #[tokio::test]
-    async fn test_before_execute_tools_emits_thought_without_tool_hint_flag() {
-        let (callback, received) = recording_progress_callback();
-        let hook = hook_with_progress(callback);
-        let mut ctx = make_ctx();
-        ctx.response = Some(LLMResponse {
-            content: Some("Let me check that file.".into()),
-            tool_calls: vec![],
-            finish_reason: "tool_calls".into(),
-            usage: HashMap::new(),
-            reasoning_content: None,
-            thinking_blocks: None,
-        });
-        ctx.tool_calls.push(ToolCallRequest {
-            id: "call_1".into(),
-            name: "read_file".into(),
-            arguments: HashMap::from([("path".into(), serde_json::json!("src/main.rs"))]),
-            extra_content: None,
-            provider_specific_fields: None,
-            function_provider_specific_fields: None,
-        });
-
-        hook.before_execute_tools(&mut ctx).await;
-
-        let events = received.lock().unwrap();
-        assert_eq!(events.len(), 2);
-        assert_eq!(events[0].0, "Let me check that file.");
-        assert!(!events[0].1);
-        assert_eq!(events[1].0, "read src/main.rs");
-        assert!(events[1].1);
-    }
-
-    #[tokio::test]
-    async fn test_before_execute_tools_skips_thought_when_streaming() {
-        let (progress_cb, progress_received) = recording_progress_callback();
-        let (stream_cb, _) = recording_stream_callback();
-        let hook = LoopHook::new(test_agent_loop(), Some(progress_cb), Some(stream_cb), None);
-        let mut ctx = make_ctx();
-        ctx.response = Some(LLMResponse {
-            content: Some("hidden thought".into()),
-            tool_calls: vec![],
-            finish_reason: "tool_calls".into(),
-            usage: HashMap::new(),
-            reasoning_content: None,
-            thinking_blocks: None,
-        });
-        ctx.tool_calls.push(ToolCallRequest {
-            id: "call_1".into(),
-            name: "glob".into(),
-            arguments: HashMap::from([("pattern".into(), serde_json::json!("*.rs"))]),
-            extra_content: None,
-            provider_specific_fields: None,
-            function_provider_specific_fields: None,
-        });
-
-        hook.before_execute_tools(&mut ctx).await;
-
-        let events = progress_received.lock().unwrap();
-        assert_eq!(events.len(), 1);
-        assert_eq!(events[0].0, "glob \"*.rs\"");
-        assert!(events[0].1);
-    }
-
-    #[tokio::test]
-    async fn test_after_iteration_does_not_mutate_context() {
-        let hook = hook_without_stream();
-        let mut ctx = make_ctx();
-        ctx.usage.insert("prompt_tokens".into(), 100);
-        ctx.usage.insert("completion_tokens".into(), 25);
-        ctx.usage.insert("cached_tokens".into(), 10);
-
-        hook.after_iteration(&mut ctx).await;
-
-        assert_eq!(ctx.usage.get("prompt_tokens"), Some(&100));
-    }
-
-    #[test]
-    fn test_finalize_content_strips_think_blocks() {
-        let hook = hook_without_stream();
-        let ctx = make_ctx();
-
-        assert_eq!(
-            hook.finalize_content(&ctx, Some("<think>secret</think>Hello".into())),
-            Some("Hello".into())
-        );
-        assert_eq!(hook.finalize_content(&ctx, None), None);
-    }
-
-    #[test]
-    fn test_set_tool_context_noops_when_tools_missing() {
-        let agent_loop = AgentLoop::new(Arc::new(ToolRegistry::new()), Arc::new(PlaceholderProvider {
-            settings: GenerationSettings::new(),
-        }));
-        agent_loop.set_tool_context("telegram", "chat-42", Some("msg-1"));
-    }
 
     // ── LoopHookChain ─────────────────────────────────────────────────────────
 

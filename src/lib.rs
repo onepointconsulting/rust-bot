@@ -6,3 +6,4 @@ pub mod utils;
 pub mod security;
 pub mod session;
 pub mod cron;
+pub mod command;
