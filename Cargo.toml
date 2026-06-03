@@ -26,6 +26,7 @@ tera = "1"
 regex = "1"
 base64 = "0.22"
 chrono-tz = "0.9"
+croner = "2"
 async-trait = "0.1"
 tiktoken-rs = "0.10.0"
 garde = { version = "0.22.1", features = ["full"] }

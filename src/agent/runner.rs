@@ -664,6 +664,7 @@ impl AgentRunner {
         // ── 4. Treat "Error…" result strings as soft errors ──────────────────
         if result.starts_with("Error") {
             let detail: String = result.replace('\n', " ").trim().chars().take(120).collect();
+            log::error!("Tool error: {}", result);
             let event = HashMap::from([
                 ("name".to_string(), tool_call.name.clone()),
                 ("status".to_string(), "error".to_string()),

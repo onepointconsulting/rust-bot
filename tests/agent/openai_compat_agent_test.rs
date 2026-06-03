@@ -1,10 +1,10 @@
 use std::{collections::HashMap, path::{Path, PathBuf}, sync::Arc, time::Duration};
 use rmcp::ServiceExt;
 use serde_json::Value;
-use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool, web::{WebFetchTool, WebSearchTool}}}, config::schema::{McpServerConfig, McpTransportType, WebSearchConfig}};
+use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, cron::CronTool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool, web::{WebFetchTool, WebSearchTool}}}, config::schema::{McpServerConfig, McpTransportType, WebSearchConfig}, cron::CronService};
 use ctor::ctor;
 
-use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::{prepare_workspace, read_mcp_env}};
+use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::{prepare_cron_workspace, prepare_workspace, read_mcp_env}};
 use crate::agent::mcp_dummy_server::HelloServer;
 use crate::config::helpers::{read_env, create_openrouter_provider};
 
@@ -475,6 +475,23 @@ async fn test_web_search_fetch_tool() {
         Box::new(write_tool)
     ];
     let spec = create_agent_run_spec_with_tools(messages, tools);
+    let result = runner.run(spec).await;
+    completion_message_check(&result);
+}
+
+#[tokio::test]
+async fn test_cron_tool() {
+    let runner = create_agent_runner();
+    let messages = vec![serde_json::json!({
+        "role": "user",
+        "content": "Can you please add a job to the cron service to say hello every day at 10:00 AM?"
+    })];
+    let store_workspace = prepare_cron_workspace();
+    let store_path = store_workspace.join("jobs.json");
+    let cron_service = CronService::new(store_path, None);
+    let cron_tool = CronTool::new(cron_service, "UTC");
+    cron_tool.set_context("cli", "test_cron_tool");
+    let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(cron_tool)]);
     let result = runner.run(spec).await;
     completion_message_check(&result);
 }

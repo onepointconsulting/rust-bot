@@ -9,16 +9,15 @@ use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::bus::queue::MessageBus;
 use crate::config::schema::{ExecToolConfig, WebToolsConfig};
-use crate::providers::base::{LLMProviderDyn};
+use crate::providers::base::LLMProviderDyn;
 use crate::utils::helpers::strip_think;
 use crate::utils::tool_hints::format_tool_hints;
 
 const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron"];
 
 // Match Python's optional async callbacks (`tool_hint=True` keyword in Python).
-pub type ProgressCallback = Arc<
-    dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type ProgressCallback =
+    Arc<dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub type StreamCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -134,7 +133,8 @@ impl AgentHook for LoopHook {
                     on_progress(thought, false).await;
                 }
             }
-            let tool_hint = safe_strip_think(Some(format_tool_hints(context.tool_calls.clone()).as_str()));
+            let tool_hint =
+                safe_strip_think(Some(format_tool_hints(context.tool_calls.clone()).as_str()));
             if let Some(tool_hint) = tool_hint {
                 on_progress(tool_hint, true).await;
             }
@@ -148,31 +148,18 @@ impl AgentHook for LoopHook {
                 args_str.get(..200).unwrap_or(&args_str)
             );
         }
-        self.agent_loop.set_tool_context(
-            &self.channel,
-            &self.chat_id,
-            self.message_id.as_deref(),
-        );
+        self.agent_loop
+            .set_tool_context(&self.channel, &self.chat_id, self.message_id.as_deref());
     }
 
     async fn after_iteration(&self, context: &mut AgentHookContext) {
         let prompt = context.usage.get("prompt_tokens").copied().unwrap_or(0);
-        let completion = context
-            .usage
-            .get("completion_tokens")
-            .copied()
-            .unwrap_or(0);
+        let completion = context.usage.get("completion_tokens").copied().unwrap_or(0);
         let cached = context.usage.get("cached_tokens").copied().unwrap_or(0);
-        log::debug!(
-            "LLM usage: prompt={prompt} completion={completion} cached={cached}"
-        );
+        log::debug!("LLM usage: prompt={prompt} completion={completion} cached={cached}");
     }
 
-    fn finalize_content(
-        &self,
-        _ctx: &AgentHookContext,
-        content: Option<String>,
-    ) -> Option<String> {
+    fn finalize_content(&self, _ctx: &AgentHookContext, content: Option<String>) -> Option<String> {
         safe_strip_think(content.as_deref())
     }
 }
@@ -258,29 +245,32 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-
     const RUNTIME_CHECKPOINT_KEY: &str = "runtime_checkpoint";
-    
-    pub fn new(tools: Arc<ToolRegistry>) -> Self {
-        Self { tools: ToolRegistry::new() }
+
+    pub fn new(tools: Arc<ToolRegistry>, provider: Arc<dyn LLMProviderDyn>) -> Self {
+        Self {
+            bus: MessageBus::new(),
+            provider: provider,
+            workspace: PathBuf::from("."),
+            model: None,
+            max_iterations: None,
+            context_window_tokens: None,
+            context_block_limit: None,
+            max_tool_result_chars: None,
+            provider_retry_mode: "standard".to_string(),
+            web_config: None,
+            exec_config: None,
+            tools,
+        }
     }
 
     /// Update context for all tools that need routing info.
-    pub fn set_tool_context(
-        &self,
-        channel: &str,
-        chat_id: &str,
-        message_id: Option<&str>,
-    ) {
+    pub fn set_tool_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
         for name in CONTEXT_AWARE_TOOLS {
             let Some(tool) = self.tools.get(name) else {
                 continue;
             };
-            let message_id = if *name == "message" {
-                message_id
-            } else {
-                None
-            };
+            let message_id = if *name == "message" { message_id } else { None };
             tool.set_tool_context(channel, chat_id, message_id);
         }
     }
@@ -291,12 +281,96 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
+    use crate::providers::base::{GenerationSettings, LLMResponse, ToolCallRequest};
+
+    /// Minimal provider placeholder until `AgentLoop` is fully wired.
+    struct PlaceholderProvider {
+        settings: GenerationSettings,
+    }
+
+    #[async_trait(?Send)]
+    impl LLMProviderDyn for PlaceholderProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            String::new()
+        }
+        async fn chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            LLMResponse::new()
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            LLMResponse::new()
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            LLMResponse::new()
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<crate::providers::base::BoxedStreamCallback>,
+        ) -> LLMResponse {
+            LLMResponse::new()
+        }
+    }
+
     fn make_ctx() -> AgentHookContext {
         AgentHookContext::new(1, vec![])
     }
 
     fn test_agent_loop() -> Arc<AgentLoop> {
-        Arc::new(AgentLoop::new(Arc::new(ToolRegistry::new())))
+        Arc::new(AgentLoop::new(Arc::new(ToolRegistry::new()),
+        Arc::new(PlaceholderProvider {
+            settings: GenerationSettings::new(),
+        })))
     }
 
     fn recording_stream_callback() -> (StreamCallback, Arc<Mutex<Vec<String>>>) {
@@ -478,8 +552,6 @@ mod tests {
 
     #[tokio::test]
     async fn test_before_execute_tools_emits_thought_without_tool_hint_flag() {
-        use crate::providers::base::{LLMResponse, ToolCallRequest};
-
         let (callback, received) = recording_progress_callback();
         let hook = hook_with_progress(callback);
         let mut ctx = make_ctx();
@@ -512,18 +584,11 @@ mod tests {
 
     #[tokio::test]
     async fn test_before_execute_tools_skips_thought_when_streaming() {
-        use crate::providers::base::ToolCallRequest;
-
         let (progress_cb, progress_received) = recording_progress_callback();
         let (stream_cb, _) = recording_stream_callback();
-        let hook = LoopHook::new(
-            test_agent_loop(),
-            Some(progress_cb),
-            Some(stream_cb),
-            None,
-        );
+        let hook = LoopHook::new(test_agent_loop(), Some(progress_cb), Some(stream_cb), None);
         let mut ctx = make_ctx();
-        ctx.response = Some(crate::providers::base::LLMResponse {
+        ctx.response = Some(LLMResponse {
             content: Some("hidden thought".into()),
             tool_calls: vec![],
             finish_reason: "tool_calls".into(),
@@ -567,10 +632,7 @@ mod tests {
         let ctx = make_ctx();
 
         assert_eq!(
-            hook.finalize_content(
-                &ctx,
-                Some("<think>secret</think>Hello".into())
-            ),
+            hook.finalize_content(&ctx, Some("<think>secret</think>Hello".into())),
             Some("Hello".into())
         );
         assert_eq!(hook.finalize_content(&ctx, None), None);
@@ -578,7 +640,9 @@ mod tests {
 
     #[test]
     fn test_set_tool_context_noops_when_tools_missing() {
-        let agent_loop = AgentLoop::new(Arc::new(ToolRegistry::new()));
+        let agent_loop = AgentLoop::new(Arc::new(ToolRegistry::new()), Arc::new(PlaceholderProvider {
+            settings: GenerationSettings::new(),
+        }));
         agent_loop.set_tool_context("telegram", "chat-42", Some("msg-1"));
     }
 
@@ -593,7 +657,10 @@ mod tests {
     #[async_trait]
     impl AgentHook for OrderRecordingHook {
         async fn on_stream_end(&self, _ctx: &mut AgentHookContext, _resuming: bool) {
-            self.calls.lock().unwrap().push(format!("{}:on_stream_end", self.label));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:on_stream_end", self.label));
         }
 
         async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {

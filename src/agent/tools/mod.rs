@@ -7,3 +7,4 @@ pub mod mcp;
 pub mod search;
 pub mod web;
 pub mod spawn;
+pub mod cron;

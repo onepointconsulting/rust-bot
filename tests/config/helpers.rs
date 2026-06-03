@@ -80,3 +80,12 @@ pub fn prepare_workspace() -> PathBuf {
     }
     workspace_path
 }
+
+pub fn prepare_cron_workspace() -> PathBuf {
+    let path_buf = prepare_workspace();
+    let cron_path = path_buf.join("cron");
+    if !cron_path.exists() {
+        std::fs::create_dir_all(&cron_path).unwrap();
+    }
+    cron_path
+}
