@@ -107,7 +107,7 @@ fn default_dream_max_batch_size() -> u32 { 20 }
 fn default_dream_max_iterations() -> u32 { 10 }
 
 /// Dream memory consolidation configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DreamConfig {
     /// Consolidation interval in whole hours. Must be ≥ 1. Default: 2.
@@ -177,12 +177,27 @@ impl DreamConfig {
 
 // ── AgentsConfig ──────────────────────────────────────────────────────────────
 
-#[derive(Deserialize, Serialize, Default, Debug, Clone, PartialEq)]
+#[derive(Deserialize, Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum ProviderRetryMode {
     #[default]
     Standard,
     Persistent,
+}
+
+impl std::fmt::Display for ProviderRetryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ProviderRetryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Persistent => "persistent",
+        }
+    }
 }
 
 fn default_agent_workspace() -> String { "~/.rust-bot/workspace".to_string() }
@@ -509,7 +524,7 @@ impl Default for WebSearchConfig {
 fn default_web_tools_enable() -> bool { true }
 
 /// Web tools configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebToolsConfig {
     /// Enable or disable the web tools entirely. Default: `true`.
@@ -545,7 +560,7 @@ fn default_exec_tool_enable() -> bool { true }
 fn default_exec_tool_timeout() -> u32 { 60 }
 
 /// Shell exec tool configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ExecToolConfig {
     /// Enable or disable the shell exec tool. Default: `true`.
@@ -873,6 +888,44 @@ impl Default for Config {
             api: ApiConfig::default(),
             gateway: GatewayConfig::default(),
             tools: ToolsConfig::default(),
+        }
+    }
+}
+
+/// Default agent configuration.
+#[derive(Debug, Clone)]
+pub struct AgentDefaults {
+    pub workspace: String,
+    pub model: String,
+    pub provider: String,
+    pub max_tokens: u32,
+    pub context_window_tokens: u32,
+    pub context_block_limit: Option<u32>,
+    pub temperature: f32,
+    pub max_tool_iterations: u32,
+    pub max_tool_result_chars: u32,
+    pub provider_retry_mode: ProviderRetryMode,
+    pub reasoning_effort: Option<String>,
+    pub timezone: String,
+    pub dream: DreamConfig,
+}
+
+impl AgentDefaults {
+    pub fn default() -> Self {
+        Self {
+            workspace: default_agent_workspace(),
+            model: default_agent_model(),
+            provider: default_agent_provider(),
+            max_tokens: default_agent_max_tokens(),
+            context_window_tokens: default_agent_context_window_tokens(),
+            context_block_limit: None,
+            temperature: default_agent_temperature(),
+            max_tool_iterations: default_agent_max_tool_iterations(),
+            max_tool_result_chars: default_agent_max_tool_result_chars(),
+            provider_retry_mode: default_agent_provider_retry_mode(),
+            reasoning_effort: default_agent_reasoning_effort(),
+            timezone: default_agent_timezone(),
+            dream: default_agent_dream_config(),
         }
     }
 }

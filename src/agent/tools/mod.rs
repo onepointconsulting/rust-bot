@@ -8,3 +8,4 @@ pub mod search;
 pub mod web;
 pub mod spawn;
 pub mod cron;
+pub mod message;

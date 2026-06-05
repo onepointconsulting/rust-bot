@@ -2,7 +2,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use crate::agent::context::{SOUL_FILE, USER_FILE};
@@ -658,16 +658,16 @@ impl MemoryStore {
     }
 }
 
-pub trait MessageBuilder {
+pub trait MessageBuilder: Send + Sync {
     /// Build the complete message list for an LLM call
     fn build_messages(
         &self,
-        history: Vec<serde_json::Value>,
+        history: &[serde_json::Value],
         current_message: &str,
-        skill_names: Option<Vec<String>>,
-        media: Option<Vec<String>>,
-        channel: Option<String>,
-        chat_id: Option<String>,
+        skill_names: Option<&[String]>,
+        media: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
         current_role: &str,
     ) -> Vec<serde_json::Value>;
 
@@ -675,12 +675,12 @@ pub trait MessageBuilder {
     fn get_definitions(&self) -> Vec<serde_json::Value>;
 }
 
-struct Consolidator {
-    store: MemoryStore,
+pub struct Consolidator {
+    store: Arc<MemoryStore>,
     provider: Arc<dyn LLMProviderDyn>,
     model: String,
-    sessions: SessionManager,
-    context_window_tokens: usize,
+    sessions: Arc<Mutex<SessionManager>>,
+    context_window_tokens: u32,
     message_builder: Box<dyn MessageBuilder>,
     max_completion_tokens: usize,
     locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
@@ -691,18 +691,18 @@ impl Consolidator {
     const MAX_CONSOLIDATION_ROUNDS: usize = 5;
 
     pub fn new(
-        store: MemoryStore,
+        store: Arc<MemoryStore>,
         provider: Arc<dyn LLMProviderDyn>,
         model: String,
-        sessions: SessionManager,
-        context_window_tokens: usize,
+        sessions: Arc<Mutex<SessionManager>>,
+        context_window_tokens: u32,
         message_builder: Box<dyn MessageBuilder>,
         max_completion_tokens: usize,
     ) -> Self {
         // Initialize the dictionary (typically inside a struct's constructor/init)
         let locks: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
         Self {
-            store,
+            store: store,
             provider,
             model,
             sessions,
@@ -743,16 +743,13 @@ impl Consolidator {
     pub fn estimate_session_prompt_tokens(&self, session: &Session) -> (usize, String) {
         // Same default window as `session.get_history(None)` (500); `Some(0)` is also normalized to that cap.
         let history = session.get_history(None);
-        // Translate: channel, chat_id = (session.key.split(":", 1) if ":" in session.key else (None, None))
-        let (channel, chat_id) = if let Some(idx) = session.key.find(':') {
-            let (ch, id) = session.key.split_at(idx);
-            // split_at keeps the ':' at the start of `id`, so trim it
-            (Some(ch.to_string()), Some(id[1..].to_string()))
-        } else {
-            (None, None)
-        };
+        let (channel, chat_id) = session
+            .key
+            .split_once(':')
+            .map(|(ch, id)| (Some(ch), Some(id)))
+            .unwrap_or((None, None));
         let probe_messages = self.message_builder.build_messages(
-            history,
+            history.as_slice(),
             "[token-probe]",
             None,
             None,
@@ -836,8 +833,10 @@ impl Consolidator {
 
         let lock = self.get_lock(&session.key);
         let _guard = lock.lock().await;
-        let budget =
-            self.context_window_tokens - self.max_completion_tokens - Consolidator::SAFETY_BUFFER;
+        let window = self.context_window_tokens as usize;
+        let budget = window
+            .saturating_sub(self.max_completion_tokens)
+            .saturating_sub(Consolidator::SAFETY_BUFFER);
         let target = budget / 2;
         let (mut estimated, source) = self.estimate_session_prompt_tokens(session);
         if estimated == 0 {
@@ -877,7 +876,12 @@ impl Consolidator {
                         return;
                     }
                     session.last_consolidated = end_idx;
-                    if let Err(e) = self.sessions.save(session.clone()) {
+                    if let Err(e) = self
+                        .sessions
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .save(session.clone())
+                    {
                         log::error!("Failed to save session after consolidation: {}", e);
                         return;
                     }
@@ -912,7 +916,7 @@ impl Consolidator {
 /// Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
 /// LLM can make targeted, incremental edits instead of replacing entire files.
 pub struct Dream {
-    pub store: MemoryStore,
+    pub store: Arc<MemoryStore>,
     pub provider: Arc<dyn LLMProviderDyn>,
     pub model: String,
     pub sessions: SessionManager,
@@ -925,7 +929,7 @@ pub struct Dream {
 
 impl Dream {
     pub fn new(
-        store: MemoryStore,
+        store: Arc<MemoryStore>,
         provider: Arc<dyn LLMProviderDyn>,
         model: &str,
         sessions: SessionManager,
@@ -1173,12 +1177,12 @@ mod tests {
     impl MessageBuilder for StubArchiveMessageBuilder {
         fn build_messages(
             &self,
-            _history: Vec<serde_json::Value>,
+            _history: &[serde_json::Value],
             _current_message: &str,
-            _skill_names: Option<Vec<String>>,
-            _media: Option<Vec<String>>,
-            _channel: Option<String>,
-            _chat_id: Option<String>,
+            _skill_names: Option<&[String]>,
+            _media: Option<&[String]>,
+            _channel: Option<&str>,
+            _chat_id: Option<&str>,
             _current_role: &str,
         ) -> Vec<serde_json::Value> {
             vec![]
@@ -1280,10 +1284,10 @@ mod tests {
 
     fn test_consolidator(tmp: &TempDir, provider: Arc<dyn LLMProviderDyn>) -> Consolidator {
         Consolidator::new(
-            make_store(tmp),
+            Arc::new(make_store(tmp)),
             provider,
             "test-model".into(),
-            SessionManager::new(tmp.path().to_path_buf()),
+            Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf()))),
             65_536,
             Box::new(StubArchiveMessageBuilder),
             8192,
@@ -1293,14 +1297,14 @@ mod tests {
     fn test_consolidator_with_ctx(
         tmp: &TempDir,
         provider: Arc<dyn LLMProviderDyn>,
-        context_window_tokens: usize,
+        context_window_tokens: u32,
         max_completion_tokens: usize,
     ) -> Consolidator {
         Consolidator::new(
-            make_store(tmp),
+            Arc::new(make_store(tmp)),
             provider,
             "test-model".into(),
-            SessionManager::new(tmp.path().to_path_buf()),
+            Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf()))),
             context_window_tokens,
             Box::new(StubArchiveMessageBuilder),
             max_completion_tokens,

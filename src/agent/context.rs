@@ -1,10 +1,11 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use tera::Context;
 
 use crate::{
-    agent::{memory::MemoryStore, skills::SkillsLoader},
+    agent::{memory::{MemoryStore, MessageBuilder}, skills::SkillsLoader, tools::registry::ToolRegistry},
     utils::{
         helpers::{build_assistant_message, current_time_str, detect_image_mime},
         prompt_templates::render_template,
@@ -23,19 +24,21 @@ const MAX_RECENT_HISTORY: usize = 50;
 pub struct ContextBuilder {
     workspace: PathBuf,
     timezone: Option<String>,
-    memory: MemoryStore,
+    pub memory: Arc<MemoryStore>,
     skills: SkillsLoader,
+    tools: Arc<ToolRegistry>,
 }
 
 impl ContextBuilder {
-    pub fn new(workspace: PathBuf, timezone: Option<String>) -> Self {
+    pub fn new(workspace: PathBuf, timezone: Option<String>, tools: Arc<ToolRegistry>) -> Self {
         let skills = SkillsLoader::new(&workspace, None);
-        let memory = MemoryStore::new(workspace.clone(), None);
+        let memory = Arc::new(MemoryStore::new(workspace.clone(), None));
         Self {
             workspace,
             timezone,
             skills,
             memory,
+            tools,
         }
     }
 
@@ -248,62 +251,6 @@ impl ContextBuilder {
         serde_json::Value::Array(images)
     }
 
-    /// Build the complete message list for an LLM call.
-    ///
-    /// The runtime context (current time, channel routing) is merged into the
-    /// current user turn rather than added as a separate message, avoiding
-    /// consecutive same-role messages that some providers reject.
-    pub fn build_messages(
-        &self,
-        history: &[serde_json::Value],
-        current_message: &str,
-        skill_names: Option<&[String]>,
-        media: Option<&[String]>,
-        channel: Option<&str>,
-        chat_id: Option<&str>,
-        current_role: &str,
-    ) -> Vec<serde_json::Value> {
-        let runtime_ctx =
-            ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
-        let user_content = self.build_user_content(current_message, media);
-
-        // Merge runtime context block and user content into a single value so
-        // we never produce two consecutive messages with the same role.
-        let merged: serde_json::Value = if let Some(text) = user_content.as_str() {
-            serde_json::Value::String(format!("{runtime_ctx}\n\n{text}"))
-        } else {
-            // user_content is already an array of blocks; prepend the runtime tag block
-            let mut blocks = vec![serde_json::json!({"type": "text", "text": runtime_ctx})];
-            if let Some(arr) = user_content.as_array() {
-                blocks.extend(arr.iter().cloned());
-            }
-            serde_json::Value::Array(blocks)
-        };
-
-        let system_content = self.build_system_prompt(skill_names, channel);
-        let mut messages: Vec<serde_json::Value> = std::iter::once(
-            serde_json::json!({"role": "system", "content": system_content}),
-        )
-        .chain(history.iter().cloned())
-        .collect();
-
-        // If the last message already has the same role, merge rather than append.
-        if messages
-            .last()
-            .and_then(|m| m["role"].as_str())
-            == Some(current_role)
-        {
-            if let Some(last) = messages.last_mut() {
-                let existing_content = last["content"].take();
-                last["content"] = Self::merge_message_content(existing_content, merged);
-            }
-        } else {
-            messages.push(serde_json::json!({"role": current_role, "content": merged}));
-        }
-
-        messages
-    }
-
     fn merge_message_content(
         left: serde_json::Value,
         right: serde_json::Value,
@@ -387,9 +334,97 @@ impl ContextBuilder {
         ));
         messages
     }
+    
+}
 
-    
-    
+impl MessageBuilder for ContextBuilder {
+
+    /// Build the complete message list for an LLM call.
+    ///
+    /// The runtime context (current time, channel routing) is merged into the
+    /// current user turn rather than added as a separate message, avoiding
+    /// consecutive same-role messages that some providers reject.
+    fn build_messages(
+        &self,
+        history: &[serde_json::Value],
+        current_message: &str,
+        skill_names: Option<&[String]>,
+        media: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        current_role: &str,
+    ) -> Vec<serde_json::Value> {
+        let runtime_ctx =
+            ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
+        let user_content = self.build_user_content(current_message, media);
+
+        // Merge runtime context block and user content into a single value so
+        // we never produce two consecutive messages with the same role.
+        let merged: serde_json::Value = if let Some(text) = user_content.as_str() {
+            serde_json::Value::String(format!("{runtime_ctx}\n\n{text}"))
+        } else {
+            // user_content is already an array of blocks; prepend the runtime tag block
+            let mut blocks = vec![serde_json::json!({"type": "text", "text": runtime_ctx})];
+            if let Some(arr) = user_content.as_array() {
+                blocks.extend(arr.iter().cloned());
+            }
+            serde_json::Value::Array(blocks)
+        };
+
+        let system_content = self.build_system_prompt(skill_names, channel);
+        let mut messages: Vec<serde_json::Value> = std::iter::once(
+            serde_json::json!({"role": "system", "content": system_content}),
+        )
+        .chain(history.iter().cloned())
+        .collect();
+
+        // If the last message already has the same role, merge rather than append.
+        if messages
+            .last()
+            .and_then(|m| m["role"].as_str())
+            == Some(current_role)
+        {
+            if let Some(last) = messages.last_mut() {
+                let existing_content = last["content"].take();
+                last["content"] = Self::merge_message_content(existing_content, merged);
+            }
+        } else {
+            messages.push(serde_json::json!({"role": current_role, "content": merged}));
+        }
+
+        messages
+    }
+
+    fn get_definitions(&self) -> Vec<serde_json::Value> {
+        self.tools.get_definitions()
+    }
+}
+
+impl MessageBuilder for Arc<ContextBuilder> {
+    fn build_messages(
+        &self,
+        history: &[serde_json::Value],
+        current_message: &str,
+        skill_names: Option<&[String]>,
+        media: Option<&[String]>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        current_role: &str,
+    ) -> Vec<serde_json::Value> {
+        self.as_ref().build_messages(
+            history,
+            current_message,
+            skill_names,
+            media,
+            channel,
+            chat_id,
+            current_role,
+        )
+    }
+
+    fn get_definitions(&self) -> Vec<serde_json::Value> {
+        self.as_ref().get_definitions()
+    }
 }
 
 #[cfg(test)]
@@ -398,7 +433,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_builder(tmp: &TempDir) -> ContextBuilder {
-        ContextBuilder::new(tmp.path().to_path_buf(), None)
+        ContextBuilder::new(tmp.path().to_path_buf(), None, Arc::new(ToolRegistry::new()))
     }
 
     // ── os_display_name ───────────────────────────────────────────────────────

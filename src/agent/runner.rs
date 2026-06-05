@@ -52,7 +52,7 @@ pub struct AgentRunSpec {
     pub fail_on_tool_error: bool,
     pub workspace: Option<PathBuf>,
     pub session_key: Option<String>,
-    pub context_window_tokens: Option<usize>,
+    pub context_window_tokens: Option<u32>,
     pub context_block_limit: Option<usize>,
     pub provider_retry_mode: String,
     pub progress_callback: Option<Arc<dyn Fn(Value) + Send + Sync>>,
@@ -315,7 +315,7 @@ impl AgentRunner {
 
         let max_output = spec.max_tokens.unwrap_or(4096);
         let budget = spec.context_block_limit.unwrap_or_else(|| {
-            context_window_tokens
+            (context_window_tokens as usize)
                 .saturating_sub(max_output)
                 .saturating_sub(SNIP_SAFETY_BUFFER)
         });

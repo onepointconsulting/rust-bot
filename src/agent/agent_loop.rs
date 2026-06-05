@@ -6,14 +6,21 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use async_trait::async_trait;
+use tokio::sync::Mutex as AsyncMutex;
+use tokio::sync::Semaphore;
+use tokio::task::JoinHandle;
 
 use crate::agent::context::ContextBuilder;
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
+use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::runner::AgentRunner;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::bus::queue::MessageBus;
-use crate::config::schema::{ChannelsConfig, ExecToolConfig, McpServerConfig, WebToolsConfig};
+use crate::config::schema::{
+    AgentDefaults, ChannelsConfig, ExecToolConfig, McpServerConfig, ProviderRetryMode,
+    WebToolsConfig,
+};
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::SessionManager;
@@ -236,66 +243,149 @@ impl AgentHook for LoopHookChain {
 /// 5. Sends responses back
 ///
 pub struct AgentLoop {
+    defaults: AgentDefaults,
     bus: Arc<MessageBus>,
     provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
-    model: Option<String>,
-    max_iterations: Option<usize>,
-    context_window_tokens: Option<usize>,
-    context_block_limit: Option<usize>,
-    max_tool_result_chars: Option<usize>,
+    model: String,
+    max_iterations: u32,
+    context_window_tokens: u32,
+    context_block_limit: Option<u32>,
+    max_tool_result_chars: u32,
     provider_retry_mode: String,
-    web_config: Option<WebToolsConfig>,
-    exec_config: Option<ExecToolConfig>,
+    web_config: WebToolsConfig,
+    exec_config: ExecToolConfig,
     cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
-    session_manager: Option<Arc<SessionManager>>,
+    session_manager: Arc<Mutex<SessionManager>>,
     mcp_servers: HashMap<String, Arc<McpServerConfig>>,
+    mcp_connected: bool,
+    mcp_connecting: bool,
     channels_config: Option<ChannelsConfig>,
     timezone: Option<String>,
-    start_time: Option<SystemTime>,
+    start_time: SystemTime,
     last_usage: HashMap<String, usize>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
-    sessions: Option<Arc<SessionManager>>,
     tools: Arc<ToolRegistry>,
     runner: Arc<AgentRunner>,
     subagents: Arc<SubagentManager>,
+    active_tasks: Arc<AsyncMutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+    background_tasks: Arc<AsyncMutex<Vec<JoinHandle<()>>>>,
+    session_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    max: usize,
     running: bool,
-
+    concurrency_gate: Option<Arc<Semaphore>>,
+    consolidator: Arc<Consolidator>,
+    dream: Arc<Dream>,
 }
 
 impl AgentLoop {
     const RUNTIME_CHECKPOINT_KEY: &str = "runtime_checkpoint";
 
-    pub fn new(bus: Arc<MessageBus>, tools: Arc<ToolRegistry>, provider: Arc<dyn LLMProviderDyn>, workspace: PathBuf) -> Self {
+    pub fn new(
+        bus: Arc<MessageBus>,
+        channels_config: Option<ChannelsConfig>,
+        workspace: PathBuf,
+        model: Option<String>,
+        max_iterations: Option<u32>,
+        context_window_tokens: Option<u32>,
+        context_block_limit: Option<u32>,
+        max_tool_result_chars: Option<u32>,
+        provider_retry_mode: Option<ProviderRetryMode>,
+        web_config: Option<WebToolsConfig>,
+        exec_config: Option<ExecToolConfig>,
+        cron_service: Option<Arc<CronService>>,
+        restrict_to_workspace: Option<bool>,
+        session_manager: Option<Arc<Mutex<SessionManager>>>,
+        provider: Arc<dyn LLMProviderDyn>,
+        mcp_servers: Option<HashMap<String, Arc<McpServerConfig>>>,
+    ) -> Self {
+        let defaults = AgentDefaults::default();
+        let model = model.unwrap_or(provider.clone().get_default_model());
+        let web_config = web_config.unwrap_or(WebToolsConfig::default());
+        let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
+        let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
+            .unwrap_or_else(|_| "3".to_string())
+            .parse()
+            .unwrap_or(3);
+
+        let concurrency_gate = if max > 0 {
+            Some(Arc::new(Semaphore::new(max)))
+        } else {
+            None
+        };
+        let tools = Arc::new(ToolRegistry::new());
+        let context = Arc::new(ContextBuilder::new(workspace.clone(), None, tools.clone()));
+        let session_manager = session_manager
+            .unwrap_or_else(|| Arc::new(Mutex::new(SessionManager::new(workspace.clone()))));
+        let context_window_tokens =
+            context_window_tokens.unwrap_or(defaults.clone().context_window_tokens);
+        let max_tool_result_chars =
+            max_tool_result_chars.unwrap_or(defaults.clone().max_tool_result_chars);
         Self {
+            defaults: defaults.clone(),
             bus: bus.clone(),
+            channels_config,
             provider: provider.clone(),
-            workspace: PathBuf::from("."),
-            model: None,
-            max_iterations: None,
-            context_window_tokens: None,
-            context_block_limit: None,
-            max_tool_result_chars: None,
-            provider_retry_mode: "standard".to_string(),
-            web_config: None,
-            exec_config: None,
-            cron_service: None,
-            restrict_to_workspace: false,
-            session_manager: None,
-            mcp_servers: HashMap::new(),
-            channels_config: None,
+            workspace: workspace.clone(),
+            model: model.clone(),
+            max_iterations: max_iterations.unwrap_or(defaults.clone().max_tool_iterations),
+            context_window_tokens,
+            context_block_limit: context_block_limit,
+            max_tool_result_chars,
+            provider_retry_mode: provider_retry_mode
+                .unwrap_or(defaults.clone().provider_retry_mode)
+                .to_string(),
+            web_config: web_config.clone(),
+            exec_config: exec_config.clone().unwrap_or(ExecToolConfig::default()),
+            cron_service: cron_service,
+            restrict_to_workspace: restrict_to_workspace,
             timezone: None,
-            start_time: None,
+            start_time: SystemTime::now(),
             last_usage: HashMap::new(),
             extra_hooks: Vec::new(),
-            context: Arc::new(ContextBuilder::new(workspace.clone(), None)),
-            sessions: None,
+            context: context.clone(),
+            session_manager: session_manager.clone(),
+            tools: tools.clone(),
             runner: Arc::new(AgentRunner::new(provider.clone())),
-            subagents: Arc::new(SubagentManager::new(provider, workspace, bus, 0, None, None, None, None)),
+            subagents: Arc::new(SubagentManager::new(
+                provider.clone(),
+                workspace.clone(),
+                bus,
+                0,
+                Some(model.clone()),
+                Some(web_config),
+                Some(exec_config.unwrap_or(ExecToolConfig::default())),
+                Some(restrict_to_workspace),
+            )),
             running: false,
-            tools,
+            mcp_servers: mcp_servers.unwrap_or(HashMap::new()),
+            mcp_connected: false,
+            mcp_connecting: false,
+            active_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+            background_tasks: Arc::new(AsyncMutex::new(Vec::new())),
+            session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            max: max,
+            concurrency_gate: concurrency_gate,
+            consolidator: Arc::new(Consolidator::new(
+                Arc::clone(&context.memory),
+                provider.clone(),
+                model.clone(),
+                session_manager.clone(),
+                context_window_tokens,
+                Box::new(Arc::clone(&context)),
+                max_tool_result_chars as usize,
+            )),
+            dream: Arc::new(Dream::new(
+                Arc::clone(&context.memory),
+                provider,
+                &model,
+                SessionManager::new(workspace),
+                defaults.dream.max_batch_size as usize,
+                defaults.dream.max_iterations as usize,
+                max_tool_result_chars as usize,
+            )),
         }
     }
 
@@ -443,7 +533,6 @@ mod tests {
             .unwrap_or_else(|e| e.into_inner())
             .clone()
     }
-
 
     // ── LoopHookChain ─────────────────────────────────────────────────────────
 
