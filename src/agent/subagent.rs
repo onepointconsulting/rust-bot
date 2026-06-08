@@ -445,6 +445,49 @@ impl SubagentManager {
             log::error!("Failed to render subagent announce content for task {task_id}");
         }
     }
+
+    /// Cancel all subagents for the given session. Returns count cancelled.
+    pub async fn cancel_by_session(&self, session_key: &str) -> u32 {
+        let task_ids: Vec<String> = self
+            .session_tasks
+            .lock()
+            .unwrap()
+            .get(session_key)
+            .map(|ids| ids.iter().cloned().collect())
+            .unwrap_or_default();
+
+        let mut handles = Vec::new();
+        {
+            let mut running = self.running_tasks.lock().unwrap();
+            for tid in task_ids {
+                let Some(handle) = running.get(&tid) else {
+                    continue;
+                };
+                if handle.is_finished() {
+                    continue;
+                }
+                if let Some(handle) = running.remove(&tid) {
+                    handles.push(handle);
+                }
+            }
+        }
+
+        let count = handles.len() as u32;
+        if handles.is_empty() {
+            return count;
+        }
+
+        // std::thread::JoinHandle has no cancel(); wait for each thread to finish.
+        tokio::task::spawn_blocking(move || {
+            for handle in handles {
+                let _ = handle.join();
+            }
+        })
+        .await
+        .ok();
+
+        count
+    }
 }
 
 #[cfg(test)]

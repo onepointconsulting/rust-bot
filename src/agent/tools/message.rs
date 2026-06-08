@@ -8,6 +8,7 @@ use serde_json::Value;
 
 use crate::agent::tools::base::Tool;
 use crate::bus::events::OutboundMessage;
+use crate::bus::queue::MessageBus;
 use crate::utils::helpers::strip_think;
 
 pub type SendCallback = Arc<
@@ -55,6 +56,15 @@ impl MessageTool {
     /// Reset per-turn send tracking.
     pub fn start_turn(&self) {
         *self.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) = false;
+    }
+
+    pub fn create_send_callback(bus: Arc<MessageBus>) -> SendCallback {
+        Arc::new(move |msg| {
+            let bus = Arc::clone(&bus);
+            Box::pin(async move {
+                let _ = bus.publish_outbound(msg);
+            })
+        })
     }
 }
 

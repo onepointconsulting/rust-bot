@@ -14,9 +14,19 @@ use crate::agent::context::ContextBuilder;
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::runner::AgentRunner;
+use crate::agent::skills::BUILTIN_SKILLS_DIR;
 use crate::agent::subagent::SubagentManager;
+use crate::agent::tools::cron::CronTool;
+use crate::agent::tools::filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
+use crate::agent::tools::base::Tool;
+use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
+use crate::agent::tools::search::{GlobTool, GrepTool};
+use crate::agent::tools::shell::ShellTool;
+use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::tools::web::{WebFetchTool, WebSearchTool};
 use crate::bus::queue::MessageBus;
+use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
     AgentDefaults, ChannelsConfig, ExecToolConfig, McpServerConfig, ProviderRetryMode,
     WebToolsConfig,
@@ -269,8 +279,8 @@ pub struct AgentLoop {
     context: Arc<ContextBuilder>,
     tools: Arc<ToolRegistry>,
     runner: Arc<AgentRunner>,
-    subagents: Arc<SubagentManager>,
-    active_tasks: Arc<AsyncMutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+    pub subagents: Arc<SubagentManager>,
+    pub active_tasks: Arc<AsyncMutex<HashMap<String, Vec<JoinHandle<()>>>>>,
     background_tasks: Arc<AsyncMutex<Vec<JoinHandle<()>>>>,
     session_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     max: usize,
@@ -278,6 +288,7 @@ pub struct AgentLoop {
     concurrency_gate: Option<Arc<Semaphore>>,
     consolidator: Arc<Consolidator>,
     dream: Arc<Dream>,
+    commands: CommandRouter,
 }
 
 impl AgentLoop {
@@ -285,7 +296,7 @@ impl AgentLoop {
 
     pub fn new(
         bus: Arc<MessageBus>,
-        channels_config: Option<ChannelsConfig>,
+        provider: Arc<dyn LLMProviderDyn>,
         workspace: PathBuf,
         model: Option<String>,
         max_iterations: Option<u32>,
@@ -298,12 +309,15 @@ impl AgentLoop {
         cron_service: Option<Arc<CronService>>,
         restrict_to_workspace: Option<bool>,
         session_manager: Option<Arc<Mutex<SessionManager>>>,
-        provider: Arc<dyn LLMProviderDyn>,
         mcp_servers: Option<HashMap<String, Arc<McpServerConfig>>>,
+        channels_config: Option<ChannelsConfig>,
+        timezone: Option<String>,
+        hooks: Option<Vec<Arc<dyn AgentHook>>>,
     ) -> Self {
         let defaults = AgentDefaults::default();
         let model = model.unwrap_or(provider.clone().get_default_model());
         let web_config = web_config.unwrap_or(WebToolsConfig::default());
+        let exec_config = exec_config.clone().unwrap_or(ExecToolConfig::default());
         let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
             .unwrap_or_else(|_| "3".to_string())
@@ -315,15 +329,41 @@ impl AgentLoop {
         } else {
             None
         };
-        let tools = Arc::new(ToolRegistry::new());
-        let context = Arc::new(ContextBuilder::new(workspace.clone(), None, tools.clone()));
         let session_manager = session_manager
             .unwrap_or_else(|| Arc::new(Mutex::new(SessionManager::new(workspace.clone()))));
         let context_window_tokens =
             context_window_tokens.unwrap_or(defaults.clone().context_window_tokens);
         let max_tool_result_chars =
             max_tool_result_chars.unwrap_or(defaults.clone().max_tool_result_chars);
-        Self {
+        let subagents = Arc::new(SubagentManager::new(
+            provider.clone(),
+            workspace.clone(),
+            bus.clone(),
+            max_tool_result_chars as usize,
+            Some(model.clone()),
+            Some(web_config.clone()),
+            Some(exec_config.clone()),
+            Some(restrict_to_workspace),
+        ));
+        let mut tools = ToolRegistry::new();
+        AgentLoop::register_default_tools(
+            &mut tools,
+            restrict_to_workspace,
+            &exec_config,
+            &web_config,
+            bus.clone(),
+            &cron_service,
+            &timezone,
+            &workspace,
+        );
+        tools.register(Box::new(SpawnTool::new(subagents.clone())));
+        let tools = Arc::new(tools);
+        let context = Arc::new(ContextBuilder::new(
+            workspace.clone(),
+            timezone.clone(),
+            tools.clone(),
+        ));
+        let agent_loop = Self {
             defaults: defaults.clone(),
             bus: bus.clone(),
             channels_config,
@@ -338,27 +378,18 @@ impl AgentLoop {
                 .unwrap_or(defaults.clone().provider_retry_mode)
                 .to_string(),
             web_config: web_config.clone(),
-            exec_config: exec_config.clone().unwrap_or(ExecToolConfig::default()),
+            exec_config: exec_config.clone(),
             cron_service: cron_service,
             restrict_to_workspace: restrict_to_workspace,
-            timezone: None,
+            timezone: timezone,
             start_time: SystemTime::now(),
             last_usage: HashMap::new(),
-            extra_hooks: Vec::new(),
+            extra_hooks: hooks.unwrap_or(Vec::new()),
             context: context.clone(),
             session_manager: session_manager.clone(),
-            tools: tools.clone(),
+            tools: tools,
             runner: Arc::new(AgentRunner::new(provider.clone())),
-            subagents: Arc::new(SubagentManager::new(
-                provider.clone(),
-                workspace.clone(),
-                bus,
-                0,
-                Some(model.clone()),
-                Some(web_config),
-                Some(exec_config.unwrap_or(ExecToolConfig::default())),
-                Some(restrict_to_workspace),
-            )),
+            subagents,
             running: false,
             mcp_servers: mcp_servers.unwrap_or(HashMap::new()),
             mcp_connected: false,
@@ -386,7 +417,109 @@ impl AgentLoop {
                 defaults.dream.max_iterations as usize,
                 max_tool_result_chars as usize,
             )),
+            commands: {
+                let mut router = CommandRouter::new();
+                register_builtin_commands(&mut router);
+                router
+            },
+        };
+        agent_loop
+    }
+
+    /// Register the default set of tools.
+    fn register_default_tools(
+        tools: &mut ToolRegistry,
+        restrict_to_workspace: bool,
+        exec_config: &ExecToolConfig,
+        web_config: &WebToolsConfig,
+        bus: Arc<MessageBus>,
+        cron_service: &Option<Arc<CronService>>,
+        timezone: &Option<String>,
+        workspace: &PathBuf,
+    ) {
+        let allowed_dir = if restrict_to_workspace || !exec_config.sandbox.is_empty() {
+            Some(workspace.clone())
+        } else {
+            None
+        };
+        let extra_read = if allowed_dir.is_some() {
+            vec![BUILTIN_SKILLS_DIR.clone()]
+        } else {
+            vec![]
+        };
+        let workspace = Some(workspace.clone());
+        tools.register(Box::new(ReadFileTool::new(
+            workspace.clone(),
+            allowed_dir.clone(),
+            Some(extra_read),
+        )));
+        for tool in [
+            Box::new(WriteFileTool::new(
+                workspace.clone(),
+                allowed_dir.clone(),
+                None,
+            )) as Box<dyn Tool>,
+            Box::new(EditFileTool::new(
+                workspace.clone(),
+                allowed_dir.clone(),
+                None,
+            )),
+            Box::new(ListDirTool::new(
+                workspace.clone(),
+                allowed_dir.clone(),
+                None,
+            )),
+            Box::new(GlobTool::new(
+                workspace.clone(),
+                allowed_dir.clone(),
+                None,
+            )),
+            Box::new(GrepTool::new(
+                workspace.clone(),
+                allowed_dir.clone(),
+                None,
+            )),
+        ] {
+            tools.register(tool);
         }
+        if exec_config.enable {
+            tools.register(Box::new(ShellTool::new(
+                exec_config.timeout as u64,
+                workspace.clone(),
+                None,
+                None,
+                restrict_to_workspace,
+                None,
+                Some(exec_config.path_append.clone()),
+            )));
+        }
+        if web_config.enable {
+            tools.register(Box::new(WebSearchTool::new(
+                Some(web_config.search.clone()),
+                web_config.proxy.clone(),
+            )));
+            tools.register(Box::new(WebFetchTool::new(
+                None,
+                web_config.proxy.clone(),
+            )));
+        }
+        tools.register(Box::new(MessageTool::new(
+            Some(MessageTool::create_send_callback(bus)),
+            "",
+            "",
+            None,
+        )));
+        if let Some(cron_service) = cron_service {
+            tools.register(Box::new(CronTool::new(
+                cron_service.clone(),
+                timezone.clone().unwrap_or("UTC".to_string()),
+            )));
+        }
+    }
+
+    /// Shared message bus handle for publishing outbound messages.
+    pub fn bus(&self) -> Arc<MessageBus> {
+        Arc::clone(&self.bus)
     }
 
     /// Update context for all tools that need routing info.
