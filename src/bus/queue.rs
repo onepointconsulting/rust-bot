@@ -1,6 +1,7 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+use tokio::sync::Mutex;
 use tokio::sync::mpsc;
 
 use super::events::{InboundMessage, OutboundMessage};
@@ -23,11 +24,6 @@ impl<T> TrackedReceiver<T> {
             self.count.fetch_sub(1, Ordering::Relaxed);
         }
         msg
-    }
-
-    /// Number of pending messages in the queue.
-    fn len(&self) -> usize {
-        self.count.load(Ordering::Relaxed)
     }
 }
 
@@ -59,14 +55,24 @@ impl<T> TrackedSender<T> {
 }
 
 /// Async queue, similar to Python's `asyncio.Queue`. Supports send, recv, and len.
+///
+/// The receiver is held behind a `Mutex` so the queue can be consumed through a
+/// shared `&self` (e.g. from an `Arc<MessageBus>`). Sending stays lock-free, so
+/// producers are never blocked while a consumer is parked in `recv`.
 pub struct AsyncQueue<T> {
     tx: TrackedSender<T>,
-    rx: TrackedReceiver<T>,
+    rx: Mutex<TrackedReceiver<T>>,
+    count: Arc<AtomicUsize>,
 }
 
 impl<T> AsyncQueue<T> {
     fn new(tx: TrackedSender<T>, rx: TrackedReceiver<T>) -> Self {
-        Self { tx, rx }
+        let count = Arc::clone(&tx.count);
+        Self {
+            tx,
+            rx: Mutex::new(rx),
+            count,
+        }
     }
 
     /// Send a message into the queue (like `queue.put_nowait` / `queue.put`).
@@ -75,13 +81,13 @@ impl<T> AsyncQueue<T> {
     }
 
     /// Receive the next message (like `queue.get()`). Returns `None` when the channel is closed.
-    pub async fn recv(&mut self) -> Option<T> {
-        self.rx.recv().await
+    pub async fn recv(&self) -> Option<T> {
+        self.rx.lock().await.recv().await
     }
 
     /// Number of pending messages (like `queue.qsize()`).
     pub fn len(&self) -> usize {
-        self.rx.len()
+        self.count.load(Ordering::Relaxed)
     }
 
     /// Returns a sender handle that can be cloned and shared to push messages from elsewhere.
@@ -132,7 +138,7 @@ impl MessageBus {
     }
 
     /// Consume the next inbound message (blocks until available).
-    pub async fn consume_inbound(&mut self) -> Option<InboundMessage> {
+    pub async fn consume_inbound(&self) -> Option<InboundMessage> {
         self.inbound.recv().await
     }
 
@@ -142,7 +148,7 @@ impl MessageBus {
     }
 
     /// Consume the next outbound message (blocks until available).
-    pub async fn consume_outbound(&mut self) -> Option<OutboundMessage> {
+    pub async fn consume_outbound(&self) -> Option<OutboundMessage> {
         self.outbound.recv().await
     }
 }
@@ -158,7 +164,7 @@ mod tests {
     fn publish_inbound_then_consume_then_publish_outbound_then_consume() {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
-            let mut bus = MessageBus::new();
+            let bus = MessageBus::new();
 
             // Publish "hello, world" to the inbound queue
             let inbound = InboundMessage {

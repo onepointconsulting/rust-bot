@@ -2,10 +2,13 @@ use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use async_trait::async_trait;
+use chrono::Utc;
+use tera::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
@@ -13,19 +16,22 @@ use tokio::task::JoinHandle;
 use crate::agent::context::ContextBuilder;
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::{Consolidator, Dream};
-use crate::agent::runner::AgentRunner;
+use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::skills::BUILTIN_SKILLS_DIR;
 use crate::agent::subagent::SubagentManager;
+use crate::agent::tools::base::Tool;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
-use crate::agent::tools::base::Tool;
+use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_from_config};
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::search::{GlobTool, GrepTool};
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
 use crate::agent::tools::web::{WebFetchTool, WebSearchTool};
+use crate::bus::events::InboundMessage;
 use crate::bus::queue::MessageBus;
+use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
     AgentDefaults, ChannelsConfig, ExecToolConfig, McpServerConfig, ProviderRetryMode,
@@ -33,7 +39,7 @@ use crate::config::schema::{
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
-use crate::session::manager::SessionManager;
+use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::strip_think;
 use crate::utils::tool_hints::format_tool_hints;
 
@@ -195,7 +201,7 @@ struct LoopHookChain {
 }
 
 impl LoopHookChain {
-    pub fn new(primary: Arc<dyn AgentHook>, extras: Vec<Box<dyn AgentHook>>) -> Self {
+    pub fn new(primary: Arc<dyn AgentHook>, extras: Vec<Arc<dyn AgentHook>>) -> Self {
         Self {
             primary,
             extras: CompositeHook::new(extras),
@@ -267,24 +273,31 @@ pub struct AgentLoop {
     exec_config: ExecToolConfig,
     cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
-    session_manager: Arc<Mutex<SessionManager>>,
+    pub session_manager: Arc<Mutex<SessionManager>>,
     mcp_servers: HashMap<String, Arc<McpServerConfig>>,
-    mcp_connected: bool,
-    mcp_connecting: bool,
+    mcp_connected: AtomicBool,
+    mcp_connecting: AtomicBool,
+    /// Live MCP sessions. Holding these keeps the connections open; dropping
+    /// them closes the connections (RAII equivalent of Python's AsyncExitStack).
+    mcp_sessions: Mutex<Vec<LoadedMcpTools>>,
     channels_config: Option<ChannelsConfig>,
     timezone: Option<String>,
     start_time: SystemTime,
-    last_usage: HashMap<String, usize>,
+    last_usage: Mutex<HashMap<String, u64>>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
     tools: Arc<ToolRegistry>,
     runner: Arc<AgentRunner>,
     pub subagents: Arc<SubagentManager>,
-    pub active_tasks: Arc<AsyncMutex<HashMap<String, Vec<JoinHandle<()>>>>>,
+    /// In-flight per-session tasks, keyed by session then by a unique task id so
+    /// each task can remove itself on completion (the `add_done_callback` analog).
+    pub active_tasks: Arc<AsyncMutex<HashMap<String, HashMap<u64, JoinHandle<()>>>>>,
+    /// Monotonic source of task ids for `active_tasks`.
+    next_task_id: AtomicU64,
     background_tasks: Arc<AsyncMutex<Vec<JoinHandle<()>>>>,
     session_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     max: usize,
-    running: bool,
+    running: AtomicBool,
     concurrency_gate: Option<Arc<Semaphore>>,
     consolidator: Arc<Consolidator>,
     dream: Arc<Dream>,
@@ -383,18 +396,20 @@ impl AgentLoop {
             restrict_to_workspace: restrict_to_workspace,
             timezone: timezone,
             start_time: SystemTime::now(),
-            last_usage: HashMap::new(),
+            last_usage: Mutex::new(HashMap::new()),
             extra_hooks: hooks.unwrap_or(Vec::new()),
             context: context.clone(),
             session_manager: session_manager.clone(),
             tools: tools,
             runner: Arc::new(AgentRunner::new(provider.clone())),
             subagents,
-            running: false,
+            running: AtomicBool::new(false),
             mcp_servers: mcp_servers.unwrap_or(HashMap::new()),
-            mcp_connected: false,
-            mcp_connecting: false,
+            mcp_connected: AtomicBool::new(false),
+            mcp_connecting: AtomicBool::new(false),
+            mcp_sessions: Mutex::new(Vec::new()),
             active_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+            next_task_id: AtomicU64::new(0),
             background_tasks: Arc::new(AsyncMutex::new(Vec::new())),
             session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             max: max,
@@ -469,16 +484,8 @@ impl AgentLoop {
                 allowed_dir.clone(),
                 None,
             )),
-            Box::new(GlobTool::new(
-                workspace.clone(),
-                allowed_dir.clone(),
-                None,
-            )),
-            Box::new(GrepTool::new(
-                workspace.clone(),
-                allowed_dir.clone(),
-                None,
-            )),
+            Box::new(GlobTool::new(workspace.clone(), allowed_dir.clone(), None)),
+            Box::new(GrepTool::new(workspace.clone(), allowed_dir.clone(), None)),
         ] {
             tools.register(tool);
         }
@@ -498,10 +505,7 @@ impl AgentLoop {
                 Some(web_config.search.clone()),
                 web_config.proxy.clone(),
             )));
-            tools.register(Box::new(WebFetchTool::new(
-                None,
-                web_config.proxy.clone(),
-            )));
+            tools.register(Box::new(WebFetchTool::new(None, web_config.proxy.clone())));
         }
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
@@ -515,6 +519,57 @@ impl AgentLoop {
                 timezone.clone().unwrap_or("UTC".to_string()),
             )));
         }
+    }
+
+    /// Connect to configured MCP servers (one-time, lazy).
+    ///
+    /// Takes `&self` (state is held in atomics / a mutex) so it can be called
+    /// from a shared `Arc<Self>` in the run loop.
+    async fn connect_mcp(&self) {
+        if self.mcp_connected.load(Ordering::Relaxed)
+            || self.mcp_connecting.load(Ordering::Relaxed)
+            || self.mcp_servers.is_empty()
+        {
+            return;
+        }
+        self.mcp_connecting.store(true, Ordering::Relaxed);
+
+        // Rust uses RAII instead of an AsyncExitStack: each established session
+        // closes its connection when dropped. On success we keep the sessions
+        // alive by storing them on `self`; on failure they are dropped here,
+        // which is the equivalent of `await stack.aclose()`.
+        match Self::connect_mcp_servers(&self.mcp_servers).await {
+            Ok(sessions) => {
+                *self.mcp_sessions.lock().unwrap_or_else(|e| e.into_inner()) = sessions;
+                self.mcp_connected.store(true, Ordering::Relaxed);
+            }
+            Err(e) => {
+                log::error!("Failed to connect MCP servers (will retry next message): {e}");
+                // Drop any partially-established sessions (closes them).
+                self.mcp_sessions
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clear();
+            }
+        }
+
+        // `finally`: always release the connecting flag.
+        self.mcp_connecting.store(false, Ordering::Relaxed);
+    }
+
+    /// Connect to every configured MCP server and load its tools.
+    ///
+    /// Returns the live sessions (each owns its connection plus the loaded tool
+    /// wrappers). Fails fast on the first server that cannot be reached; the
+    /// sessions established so far are dropped as the error unwinds.
+    async fn connect_mcp_servers(
+        servers: &HashMap<String, Arc<McpServerConfig>>,
+    ) -> Result<Vec<LoadedMcpTools>, LoadMcpToolsError> {
+        let mut sessions = Vec::with_capacity(servers.len());
+        for (name, config) in servers {
+            sessions.push(load_mcp_tools_from_config(config, name).await?);
+        }
+        Ok(sessions)
     }
 
     /// Shared message bus handle for publishing outbound messages.
@@ -531,6 +586,327 @@ impl AgentLoop {
             let message_id = if *name == "message" { message_id } else { None };
             tool.set_tool_context(channel, chat_id, message_id);
         }
+    }
+
+    /// Run the agent iteration loop.
+    ///
+    /// `on_stream` is called with each content delta during streaming.
+    /// `on_stream_end(resuming)` is called when a streaming session finishes:
+    /// `resuming = true` means tool calls follow (spinner should restart),
+    /// `resuming = false` means this is the final response.
+    async fn run_agent_loop(
+        self: &Arc<Self>,
+        initial_messages: Vec<Value>,
+        on_progress: Option<ProgressCallback>,
+        on_stream: Option<StreamCallback>,
+        on_stream_end: Option<StreamEndCallback>,
+        session: Option<Session>,
+        channel: &str,
+        chat_id: &str,
+        message_id: Option<String>,
+    ) -> AgentRunResult {
+        let loop_hook = LoopHook::with_context(
+            Arc::clone(self),
+            on_progress,
+            on_stream,
+            on_stream_end,
+            channel,
+            chat_id,
+            message_id,
+        );
+        let hook: Arc<dyn AgentHook> = if self.extra_hooks.is_empty() {
+            Arc::new(loop_hook)
+        } else {
+            Arc::new(LoopHookChain::new(
+                Arc::new(loop_hook),
+                self.extra_hooks.clone(),
+            ))
+        };
+
+        let session_key = session.as_ref().map(|s| s.key.clone());
+        let checkpoint_callback: Option<Arc<dyn Fn(Value) + Send + Sync>> =
+            session_key.clone().map(|key| {
+                let this = Arc::clone(self);
+                Arc::new(move |payload: Value| {
+                    this.set_runtime_checkpoint(&key, payload);
+                }) as Arc<dyn Fn(Value) + Send + Sync>
+            });
+
+        let result = self
+            .runner
+            .run(AgentRunSpec {
+                initial_messages,
+                tools: (*self.tools).clone(),
+                model: self.model.clone(),
+                max_iterations: self.max_iterations as usize,
+                max_tool_result_chars: self.max_tool_result_chars as usize,
+                hook: Some(hook),
+                error_message: Some(
+                    "Sorry, I encountered an error calling the AI model.".to_string(),
+                ),
+                concurrent_tools: true,
+                workspace: Some(self.workspace.clone()),
+                session_key,
+                context_window_tokens: Some(self.context_window_tokens),
+                context_block_limit: self.context_block_limit,
+                provider_retry_mode: self.provider_retry_mode.clone(),
+                progress_callback: None,
+                checkpoint_callback,
+                fail_on_tool_error: false,
+                temperature: None,
+                max_iterations_message: None,
+                max_tokens: None,
+                reasoning_effort: None,
+            })
+            .await;
+        *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage.clone();
+        if result.stop_reason == "max_iterations" {
+            log::warn!("Max iterations ({}) reached", self.max_iterations);
+        } else if result.stop_reason == "error" {
+            let message = result
+                .final_content
+                .as_deref()
+                .unwrap_or("")
+                .chars()
+                .take(200)
+                .collect::<String>();
+            log::error!("LLM returned error: {message}");
+        }
+        result
+    }
+
+    /// Persist the latest in-flight turn state into session metadata.
+    ///
+    /// Resolves the canonical session from the manager by key (rather than
+    /// mutating a stale snapshot captured before the run started), so saving the
+    /// checkpoint never clobbers the live message history.
+    fn set_runtime_checkpoint(&self, session_key: &str, payload: Value) {
+        let mut manager = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session(session_key);
+        session
+            .metadata
+            .insert(AgentLoop::RUNTIME_CHECKPOINT_KEY.to_string(), payload);
+        let snapshot = session.clone();
+        if let Err(e) = manager.save(snapshot) {
+            log::error!("Failed to save runtime checkpoint: {e}");
+        }
+    }
+
+    /// Run the agent loop, dispatching messages as tasks to stay responsive to /stop.
+    async fn run(self: &Arc<Self>) {
+        self.running.store(true, Ordering::Relaxed);
+        self.connect_mcp().await;
+        log::info!("Agent loop started");
+        while self.running.load(Ordering::Relaxed) {
+            // `consume_inbound` takes `&self` (the receiver is locked internally),
+            // so producers can keep publishing while we wait here.
+            let msg = match tokio::time::timeout(Duration::from_secs(1), self.bus.consume_inbound())
+                .await
+            {
+                Ok(Some(msg)) => msg,      // got a message
+                Ok(None) => break,         // channel closed (all senders dropped)
+                Err(_elapsed) => continue, // timed out → poll again
+            };
+            let raw = msg.content.trim();
+            if self.commands.is_priority(raw) {
+                // Priority commands (/stop, /restart) run inline so they can't be
+                // queued behind the very work they're meant to interrupt.
+                let ctx = CommandContext::new(msg.clone(), None, msg.session_key(), raw);
+                if let Some(result) = self.commands.dispatch_priority(&ctx).await {
+                    if let Err(error) = self.bus.publish_outbound(result) {
+                        log::error!("Failed to publish outbound message: {error}");
+                    }
+                }
+            } else {
+                // Everything else is dispatched as its own task so the loop stays
+                // responsive (and the task is cancellable via /stop).
+                let this = Arc::clone(self);
+                let key = msg.session_key();
+                let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
+                let active_tasks = Arc::clone(&self.active_tasks);
+                let cleanup_key = key.clone();
+
+                // Hold the registry lock across spawn + insert so the task's tail
+                // cleanup can't run (and no-op) before the handle is registered.
+                let mut map = self.active_tasks.lock().await;
+                let handle = tokio::spawn(async move {
+                    this.dispatch(msg).await;
+                    // `add_done_callback` analog: drop our own entry when finished.
+                    let mut map = active_tasks.lock().await;
+                    if let Some(slot) = map.get_mut(&cleanup_key) {
+                        slot.remove(&task_id);
+                        if slot.is_empty() {
+                            map.remove(&cleanup_key);
+                        }
+                    }
+                });
+                map.entry(key).or_default().insert(task_id, handle);
+            }
+        }
+    }
+
+    /// Process a message: per-session serial, cross-session concurrent.
+    async fn dispatch(self: Arc<Self>, msg: InboundMessage) {
+        // setdefault: get-or-create the per-session lock, then release the map.
+        let lock = {
+            let mut locks = self.session_locks.lock().await;
+            locks
+                .entry(msg.session_key())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        // `async with lock:` — now serialize only this session.
+        let _guard = lock.lock().await;
+    }
+
+    /// Process a single inbound message and return the response.
+    async fn process_message(
+        self: Arc<Self>,
+        msg: InboundMessage,
+        session_key: &str,
+        on_progress: Option<ProgressCallback>,
+        on_stream: Option<StreamCallback>,
+        on_stream_end: Option<StreamEndCallback>,
+    ) {
+        if msg.channel.to_lowercase() == "system" {
+            let (channel, chat_id) = if msg.chat_id.contains(':') {
+                let mut splits = msg.chat_id.split(':');
+                let channel = splits.next().unwrap();
+                let chat_id = splits.next().unwrap();
+                (channel, chat_id)
+            } else {
+                ("cli", msg.chat_id.as_str())
+            };
+            log::info!("Processing system message from {}", msg.sender_id);
+            let key = format!("{channel}:{chat_id}");
+            let mut manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session = manager.get_or_create_session(&key);
+            if self.restore_runtime_checkpoint(session) {
+                let snapshot = session.clone();
+                if let Err(e) = manager.save(snapshot) {
+                    log::error!("Failed to save restored session: {e}");
+                }
+            }
+        }
+    }
+
+    /// Stable identity tuple for a message, used to detect overlap between the
+    /// restored checkpoint messages and what's already in session history.
+    fn checkpoint_message_key(message: &Value) -> [Option<&Value>; 7] {
+        [
+            message.get("role"),
+            message.get("content"),
+            message.get("tool_call_id"),
+            message.get("name"),
+            message.get("tool_calls"),
+            message.get("reasoning_content"),
+            message.get("thinking_blocks"),
+        ]
+    }
+
+    /// Materialize an unfinished turn into session history before a new request.
+    ///
+    /// Reconstructs the assistant message, any completed tool results, and a
+    /// synthetic "interrupted" result for every pending tool call, then appends
+    /// only the portion not already present (suffix/prefix overlap detection
+    /// keeps re-materialization idempotent). Returns whether anything was
+    /// restored.
+    fn restore_runtime_checkpoint(&self, session: &mut Session) -> bool {
+        let Some(checkpoint) = session
+            .metadata
+            .get(AgentLoop::RUNTIME_CHECKPOINT_KEY)
+            .and_then(Value::as_object)
+        else {
+            return false;
+        };
+
+        let mut restored_messages: Vec<Value> = Vec::new();
+
+        if let Some(assistant) = checkpoint
+            .get("assistant_message")
+            .and_then(Value::as_object)
+        {
+            let mut restored = assistant.clone();
+            restored
+                .entry("timestamp")
+                .or_insert_with(|| Value::String(Utc::now().to_rfc3339()));
+            restored_messages.push(Value::Object(restored));
+        }
+
+        if let Some(results) = checkpoint
+            .get("completed_tool_results")
+            .and_then(Value::as_array)
+        {
+            for message in results {
+                if let Some(obj) = message.as_object() {
+                    let mut restored = obj.clone();
+                    restored
+                        .entry("timestamp")
+                        .or_insert_with(|| Value::String(Utc::now().to_rfc3339()));
+                    restored_messages.push(Value::Object(restored));
+                }
+            }
+        }
+
+        if let Some(pending) = checkpoint
+            .get("pending_tool_calls")
+            .and_then(Value::as_array)
+        {
+            for tool_call in pending {
+                let Some(tool_call) = tool_call.as_object() else {
+                    continue;
+                };
+                let tool_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
+                let name = tool_call
+                    .get("function")
+                    .and_then(Value::as_object)
+                    .and_then(|f| f.get("name"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("tool")
+                    .to_string();
+                let mut obj = serde_json::Map::new();
+                obj.insert("role".into(), Value::String("tool".into()));
+                obj.insert("tool_call_id".into(), tool_id);
+                obj.insert("name".into(), Value::String(name));
+                obj.insert(
+                    "content".into(),
+                    Value::String("Error: Task interrupted before this tool finished.".into()),
+                );
+                obj.insert("timestamp".into(), Value::String(Utc::now().to_rfc3339()));
+                restored_messages.push(Value::Object(obj));
+            }
+        }
+
+        // Find the longest history suffix that already matches the restored
+        // prefix; only the non-overlapping tail is appended.
+        let mut overlap = 0;
+        let max_overlap = session.messages.len().min(restored_messages.len());
+        for size in (1..=max_overlap).rev() {
+            let existing = &session.messages[session.messages.len() - size..];
+            let restored = &restored_messages[..size];
+            if existing.iter().zip(restored).all(|(left, right)| {
+                Self::checkpoint_message_key(left) == Self::checkpoint_message_key(right)
+            }) {
+                overlap = size;
+                break;
+            }
+        }
+        session
+            .messages
+            .extend(restored_messages.split_off(overlap));
+
+        self.clear_runtime_checkpoint(session);
+        true
+    }
+
+    fn clear_runtime_checkpoint(&self, session: &mut Session) {
+        session.metadata.remove(AgentLoop::RUNTIME_CHECKPOINT_KEY);
     }
 }
 
@@ -720,7 +1096,7 @@ mod tests {
                 calls: primary_calls,
                 label: "primary",
             }),
-            vec![Box::new(OrderRecordingHook {
+            vec![Arc::new(OrderRecordingHook {
                 calls: extra_calls,
                 label: "extra",
             })],

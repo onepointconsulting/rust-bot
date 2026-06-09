@@ -8,7 +8,7 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::session::manager::Session;
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
-    async fn handle(&self, ctx: &CommandContext) -> Option<OutboundMessage>;
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage;
 }
 
 /// Everything a command handler needs to produce a response.
@@ -110,29 +110,27 @@ impl CommandRouter {
     pub async fn dispatch_priority(&self, ctx: &CommandContext) -> Option<OutboundMessage> {
         let key = ctx.raw.to_lowercase();
         let handler = self.priority.get(&key)?;
-        handler.handle(ctx).await
+        Some(handler.handle(ctx).await)
     }
 
-    /// Try exact, prefix, then interceptors. Returns None if unhandled.
+    /// Try exact, prefix, then interceptors. Returns None if no route matched.
     pub async fn dispatch(&self, ctx: &mut CommandContext) -> Option<OutboundMessage> {
         let cmd = ctx.raw.to_lowercase();
         let cmd = cmd.trim();
 
         if let Some(handler) = self.exact.get(cmd) {
-            return handler.handle(ctx).await;
+            return Some(handler.handle(ctx).await);
         }
 
         for (pfx, handler) in &self.prefix {
             if cmd.starts_with(pfx) {
                 ctx.args = ctx.raw[pfx.len()..].to_string();
-                return handler.handle(ctx).await;
+                return Some(handler.handle(ctx).await);
             }
         }
 
-        for handler in &self.interceptors {
-            if let Some(out) = handler.handle(ctx).await {
-                return Some(out);
-            }
+        if let Some(handler) = self.interceptors.first() {
+            return Some(handler.handle(ctx).await);
         }
 
         None
@@ -192,15 +190,15 @@ mod tests {
 
     #[async_trait]
     impl CommandHandler for StaticReplyHandler {
-        async fn handle(&self, _ctx: &CommandContext) -> Option<OutboundMessage> {
-            Some(OutboundMessage {
+        async fn handle(&self, _ctx: &CommandContext) -> OutboundMessage {
+            OutboundMessage {
                 channel: "cli".into(),
                 chat_id: "direct".into(),
                 content: self.0.into(),
                 reply_to: None,
                 media: vec![],
                 metadata: Default::default(),
-            })
+            }
         }
     }
 
@@ -208,15 +206,15 @@ mod tests {
 
     #[async_trait]
     impl CommandHandler for ArgsEchoHandler {
-        async fn handle(&self, ctx: &CommandContext) -> Option<OutboundMessage> {
-            Some(OutboundMessage {
+        async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+            OutboundMessage {
                 channel: ctx.msg.channel.clone(),
                 chat_id: ctx.msg.chat_id.clone(),
                 content: ctx.args.clone(),
                 reply_to: None,
                 media: vec![],
                 metadata: Default::default(),
-            })
+            }
         }
     }
 

@@ -20,7 +20,7 @@ pub struct Session {
     pub messages: Vec<Value>,
     created_at: DateTime<Utc>,
     updated_at: DateTime<Utc>,
-    metadata: HashMap<String, Value>,
+    pub metadata: HashMap<String, Value>,
     pub last_consolidated: usize,
 }
 
@@ -211,7 +211,7 @@ impl SessionManager {
     /// # Returns
     ///
     /// The session.
-    fn get_or_create_session(&mut self, key: &str) -> &mut Session {
+    pub fn get_or_create_session(&mut self, key: &str) -> &mut Session {
         if self.cache.contains_key(key) {
             return self.cache.get_mut(key).unwrap();
         }

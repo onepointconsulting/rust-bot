@@ -808,7 +808,7 @@ mod tests {
             )
             .await;
         drop(manager);
-        let mut bus = match Arc::try_unwrap(bus) {
+        let bus = match Arc::try_unwrap(bus) {
             Ok(bus) => bus,
             Err(_) => panic!("manager should release bus Arc"),
         };
@@ -1025,7 +1025,7 @@ mod tests {
             .run_subagent_inner("task-1", task, label, &origin)
             .await;
         drop(manager);
-        let mut bus = match Arc::try_unwrap(bus) {
+        let bus = match Arc::try_unwrap(bus) {
             Ok(bus) => bus,
             Err(_) => panic!("manager should release bus Arc"),
         };

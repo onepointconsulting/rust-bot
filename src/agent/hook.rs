@@ -1,6 +1,7 @@
 /// Shared lifecycle hook primitives for agent runs.
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -83,11 +84,11 @@ pub trait AgentHook: Send + Sync {
 /// agent loop (mirrors the `try/except` in the Python implementation).
 /// `finalize_content` is a plain pipeline — panics surface normally.
 pub struct CompositeHook {
-    hooks: Vec<Box<dyn AgentHook>>,
+    hooks: Vec<Arc<dyn AgentHook>>,
 }
 
 impl CompositeHook {
-    pub fn new(hooks: Vec<Box<dyn AgentHook>>) -> Self {
+    pub fn new(hooks: Vec<Arc<dyn AgentHook>>) -> Self {
         Self { hooks }
     }
 
@@ -365,8 +366,8 @@ mod tests {
     #[test]
     fn test_composite_wants_streaming_any() {
         let composite = CompositeHook::new(vec![
-            Box::new(RecordingHook::new(false)),
-            Box::new(RecordingHook::new(true)),
+            Arc::new(RecordingHook::new(false)),
+            Arc::new(RecordingHook::new(true)),
         ]);
         assert!(composite.wants_streaming());
     }
@@ -374,8 +375,8 @@ mod tests {
     #[test]
     fn test_composite_wants_streaming_none() {
         let composite = CompositeHook::new(vec![
-            Box::new(RecordingHook::new(false)),
-            Box::new(RecordingHook::new(false)),
+            Arc::new(RecordingHook::new(false)),
+            Arc::new(RecordingHook::new(false)),
         ]);
         assert!(!composite.wants_streaming());
     }
@@ -388,7 +389,7 @@ mod tests {
         let hook_a = RecordingHook { calls: Arc::clone(&a), ..Default::default() };
         let hook_b = RecordingHook { calls: Arc::clone(&b), ..Default::default() };
 
-        let composite = CompositeHook::new(vec![Box::new(hook_a), Box::new(hook_b)]);
+        let composite = CompositeHook::new(vec![Arc::new(hook_a), Arc::new(hook_b)]);
         let mut ctx = make_ctx();
 
         composite.before_iteration(&mut ctx).await;
@@ -404,7 +405,7 @@ mod tests {
     async fn test_composite_on_stream_accumulates_delta() {
         let hook = RecordingHook::new(false);
         let stream_ref = Arc::clone(&hook.stream_content);
-        let composite = CompositeHook::new(vec![Box::new(hook)]);
+        let composite = CompositeHook::new(vec![Arc::new(hook)]);
         let mut ctx = make_ctx();
 
         composite.on_stream(&mut ctx, "foo").await;
@@ -417,7 +418,7 @@ mod tests {
     async fn test_composite_on_stream_end_resuming_flag() {
         let hook = RecordingHook::new(false);
         let calls_ref = Arc::clone(&hook.calls);
-        let composite = CompositeHook::new(vec![Box::new(hook)]);
+        let composite = CompositeHook::new(vec![Arc::new(hook)]);
         let mut ctx = make_ctx();
 
         composite.on_stream_end(&mut ctx, false).await;
@@ -428,8 +429,8 @@ mod tests {
     fn test_composite_finalize_content_is_pipeline() {
         // Two wrapping hooks → content gets double-wrapped
         let composite = CompositeHook::new(vec![
-            Box::new(RecordingHook::new(false)),
-            Box::new(RecordingHook::new(false)),
+            Arc::new(RecordingHook::new(false)),
+            Arc::new(RecordingHook::new(false)),
         ]);
         let ctx = make_ctx();
         let result = composite.finalize_content(&ctx, Some("text".into()));
@@ -438,7 +439,7 @@ mod tests {
 
     #[test]
     fn test_composite_finalize_content_none_propagates() {
-        let composite = CompositeHook::new(vec![Box::new(NoopHook)]);
+        let composite = CompositeHook::new(vec![Arc::new(NoopHook)]);
         let ctx = make_ctx();
         assert_eq!(composite.finalize_content(&ctx, None), None);
     }
@@ -460,8 +461,8 @@ mod tests {
 
         // PanickingHook first, then the good hook — good hook must still run
         let composite = CompositeHook::new(vec![
-            Box::new(PanickingHook),
-            Box::new(good),
+            Arc::new(PanickingHook),
+            Arc::new(good),
         ]);
         let mut ctx = make_ctx();
         composite.before_iteration(&mut ctx).await;
@@ -474,7 +475,7 @@ mod tests {
     async fn test_composite_panicking_hook_isolated_on_stream() {
         let good = RecordingHook::new(false);
         let calls_ref = Arc::clone(&good.calls);
-        let composite = CompositeHook::new(vec![Box::new(PanickingHook), Box::new(good)]);
+        let composite = CompositeHook::new(vec![Arc::new(PanickingHook), Arc::new(good)]);
         let mut ctx = make_ctx();
         composite.on_stream(&mut ctx, "x").await;
         assert!(calls_ref.lock().unwrap().contains(&"on_stream".to_string()));
@@ -484,7 +485,7 @@ mod tests {
     async fn test_composite_panicking_hook_isolated_after_iteration() {
         let good = RecordingHook::new(false);
         let calls_ref = Arc::clone(&good.calls);
-        let composite = CompositeHook::new(vec![Box::new(PanickingHook), Box::new(good)]);
+        let composite = CompositeHook::new(vec![Arc::new(PanickingHook), Arc::new(good)]);
         let mut ctx = make_ctx();
         composite.after_iteration(&mut ctx).await;
         assert!(calls_ref.lock().unwrap().contains(&"after_iteration".to_string()));

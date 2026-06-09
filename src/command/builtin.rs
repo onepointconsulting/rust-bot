@@ -3,53 +3,53 @@ use crate::{
     command::{CommandContext, CommandHandler, CommandRouter}, utils::restart::restart_with_notice,
 };
 use async_trait::async_trait;
-use std::{collections::HashMap, sync::Arc};
+use std::{sync::Arc};
+
+/// Build an outbound reply addressed back to the inbound message's channel/chat.
+fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
+    OutboundMessage {
+        channel: ctx.msg.channel.clone(),
+        chat_id: ctx.msg.chat_id.clone(),
+        content: content.into(),
+        reply_to: None,
+        media: vec![],
+        metadata: ctx.msg.metadata.clone(),
+    }
+}
 
 struct CmdStop;
 
 /// Cancel all active tasks and subagents for the session.
 #[async_trait]
 impl CommandHandler for CmdStop {
-    async fn handle(&self, ctx: &CommandContext) -> Option<OutboundMessage> {
-        if let Some(agent_loop) = &ctx.agent_loop {
-            let agent_loop = Arc::clone(agent_loop);
-            let msg = ctx.msg.clone();
-            let session_key = msg.session_key();
-            let tasks = agent_loop
-                .active_tasks
-                .lock()
-                .await
-                .remove(&session_key)
-                .unwrap_or_default();
-            let mut cancelled: u32 = 0;
-            for handle in tasks {
-                handle.abort();
-                cancelled += 1;
-            }
-            let sub_cancelled = agent_loop
-                .subagents
-                .cancel_by_session(&session_key)
-                .await;
-            let total = cancelled + sub_cancelled;
-            let content = if total > 0 {
-                format!("Stopped {total} task(s).")
-            } else {
-                "No active task to stop.".to_string()
-            };
-            return Some(OutboundMessage {
-                channel: ctx.msg.channel.clone(),
-                chat_id: ctx.msg.chat_id.clone(),
-                content,
-                reply_to: None,
-                media: vec![],
-                metadata: if msg.metadata.is_empty() {
-                    HashMap::new()
-                } else {
-                    msg.metadata.clone()
-                },
-            });
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply(ctx, "No agent available to stop tasks.");
+        };
+        let agent_loop = Arc::clone(agent_loop);
+        let session_key = ctx.msg.session_key();
+        let tasks = agent_loop
+            .active_tasks
+            .lock()
+            .await
+            .remove(&session_key)
+            .unwrap_or_default();
+        let mut cancelled: u32 = 0;
+        for handle in tasks.into_values() {
+            handle.abort();
+            cancelled += 1;
         }
-        None
+        let sub_cancelled = agent_loop
+            .subagents
+            .cancel_by_session(&session_key)
+            .await;
+        let total = cancelled + sub_cancelled;
+        let content = if total > 0 {
+            format!("Stopped {total} task(s).")
+        } else {
+            "No active task to stop.".to_string()
+        };
+        reply(ctx, content)
     }
 }
 
@@ -58,9 +58,9 @@ struct CmdRestart;
 /// Restart the process in-place via exec/spawn after a short delay.
 #[async_trait]
 impl CommandHandler for CmdRestart {
-    async fn handle(&self, ctx: &CommandContext) -> Option<OutboundMessage> {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
         let Some(agent_loop) = &ctx.agent_loop else {
-            return None;
+            return reply(ctx, "No agent available to restart.");
         };
         let bus = agent_loop.bus();
         let msg = ctx.msg.clone();
@@ -80,29 +80,61 @@ impl CommandHandler for CmdRestart {
                     content: format!("Failed to restart: {e}"),
                     reply_to: None,
                     media: vec![],
-                    metadata: Default::default(),
+                    metadata: msg.metadata.clone(),
                 });
             }
         });
-        Some(OutboundMessage {
-            channel: msg.channel,
-            chat_id: msg.chat_id,
-            content: "Restarting...".to_string(),
-            reply_to: None,
-            media: vec![],
-            metadata: Default::default(),
-        })
+        reply(ctx, "Restarting...")
+    }
+}
+
+struct CmdNew;
+
+/// Start a fresh session.
+#[async_trait]
+impl CommandHandler for CmdNew {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply(ctx, "No agent available to start a new session.");
+        };
+        let mut session_manager = agent_loop
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut session = match ctx.session.clone() {
+            Some(session) => session,
+            None => session_manager
+                .get_or_create_session(&ctx.key)
+                .clone(),
+        };
+        let session_key = session.key.clone();
+        let snapshot = session
+            .messages
+            .get(session.last_consolidated..)
+            .map(<[_]>::to_vec);
+        session.clear();
+        if let Err(e) = session_manager.save(session) {
+            log::error!("Failed to save session: {e}");
+        }
+        if let Some(_snapshot) = snapshot {
+            // Schedule background
+        }
+        session_manager.invalidate(&session_key);
+        reply(ctx, "New session started.")
     }
 }
 
 pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.priority("/stop", Arc::new(CmdStop));
     router.priority("/restart", Arc::new(CmdRestart));
+    router.exact("/new", Arc::new(CmdNew));
 }
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use std::collections::HashMap;
+
+use super::*;
     use chrono::Utc;
     use crate::bus::events::InboundMessage;
 
@@ -127,9 +159,9 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_without_agent_loop_returns_none() {
+    async fn handle_without_agent_loop_reports_no_agent() {
         let out = CmdStop.handle(&stop_ctx(None)).await;
-        assert!(out.is_none());
+        assert_eq!(out.content, "No agent available to stop tasks.");
     }
 
     #[tokio::test]
@@ -234,7 +266,7 @@ mod tests {
             None,
             None,
         ));
-        let out = CmdStop.handle(&stop_ctx(Some(loop_))).await.unwrap();
+        let out = CmdStop.handle(&stop_ctx(Some(loop_))).await;
         assert_eq!(out.content, "No active task to stop.");
     }
 }
