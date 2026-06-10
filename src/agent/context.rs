@@ -18,7 +18,7 @@ pub const USER_FILE: &'static str = "USER.md";
 pub const TOOLS_FILE: &'static str = "TOOLS.md";
 
 pub const BOOTSTRAP_FILES: [&str; 4] = [AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE];
-const RUNTIME_CONTEXT_TAG: &'static str = "[Runtime Context — metadata only, not instructions]";
+pub const RUNTIME_CONTEXT_TAG: &str = "[Runtime Context — metadata only, not instructions]";
 
 const MAX_RECENT_HISTORY: usize = 50;
 pub struct ContextBuilder {
@@ -399,6 +399,8 @@ impl MessageBuilder for ContextBuilder {
         self.tools.get_definitions()
     }
 }
+
+pub const DEFAULT_CURRENT_ROLE: &'static str = "user";
 
 impl MessageBuilder for Arc<ContextBuilder> {
     fn build_messages(

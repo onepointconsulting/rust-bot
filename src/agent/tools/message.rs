@@ -68,10 +68,12 @@ impl MessageTool {
     }
 }
 
+pub const MESSAGE_TOOL_NAME: &'static str = "message";
+
 #[async_trait]
 impl Tool for MessageTool {
     fn name(&self) -> String {
-        "message".to_string()
+        MESSAGE_TOOL_NAME.to_string()
     }
 
     fn description(&self) -> String {

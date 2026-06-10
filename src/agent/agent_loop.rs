@@ -1,20 +1,23 @@
 use std::collections::HashMap;
 use std::future::Future;
+use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
+use futures::FutureExt;
 use tera::Value;
 use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::agent::context::ContextBuilder;
+use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE, RUNTIME_CONTEXT_TAG};
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
+use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::skills::BUILTIN_SKILLS_DIR;
@@ -29,7 +32,7 @@ use crate::agent::tools::search::{GlobTool, GrepTool};
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
 use crate::agent::tools::web::{WebFetchTool, WebSearchTool};
-use crate::bus::events::InboundMessage;
+use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
@@ -40,7 +43,7 @@ use crate::config::schema::{
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::{Session, SessionManager};
-use crate::utils::helpers::strip_think;
+use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::tool_hints::format_tool_hints;
 
 const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron"];
@@ -294,12 +297,20 @@ pub struct AgentLoop {
     pub active_tasks: Arc<AsyncMutex<HashMap<String, HashMap<u64, JoinHandle<()>>>>>,
     /// Monotonic source of task ids for `active_tasks`.
     next_task_id: AtomicU64,
-    background_tasks: Arc<AsyncMutex<Vec<JoinHandle<()>>>>,
+    background_tasks: Arc<AsyncMutex<HashMap<u64, JoinHandle<()>>>>,
+    /// Monotonic source of task ids for `background_tasks`.
+    next_background_task_id: AtomicU64,
     session_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
     max: usize,
     running: AtomicBool,
     concurrency_gate: Option<Arc<Semaphore>>,
     consolidator: Arc<Consolidator>,
+    /// Sends session keys to the dedicated consolidation worker thread. Wrapped
+    /// in `Option` so shutdown can drop the sender and unblock the worker.
+    consolidation_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
+    /// Handle to the consolidation worker thread, joined on shutdown so any
+    /// queued consolidations are drained.
+    consolidation_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     dream: Arc<Dream>,
     commands: CommandRouter,
 }
@@ -376,6 +387,48 @@ impl AgentLoop {
             timezone.clone(),
             tools.clone(),
         ));
+        let consolidator = Arc::new(Consolidator::new(
+            Arc::clone(&context.memory),
+            provider.clone(),
+            model.clone(),
+            session_manager.clone(),
+            context_window_tokens,
+            Box::new(Arc::clone(&context)),
+            max_tool_result_chars as usize,
+        ));
+
+        // Dedicated consolidation worker. The consolidator drives the `!Send` LLM
+        // provider future (the provider trait is `async_trait(?Send)`), so it cannot
+        // be `tokio::spawn`ed. Instead it runs on its own thread with a current-thread
+        // runtime, fed session keys over a channel, so post-turn consolidation happens
+        // off the run-loop task (Rust's stand-in for Python's `_schedule_background`).
+        let (consolidation_tx, mut consolidation_rx) =
+            tokio::sync::mpsc::unbounded_channel::<String>();
+        let worker_consolidator = Arc::clone(&consolidator);
+        let consolidation_worker = std::thread::Builder::new()
+            .name("consolidation-worker".to_string())
+            .spawn(move || {
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => {
+                        log::error!("Failed to build consolidation worker runtime: {e}");
+                        return;
+                    }
+                };
+                // `recv` returns `None` once the sender is dropped (shutdown), ending
+                // the loop. Keys are consolidated sequentially; the consolidator
+                // already serializes per-session internally.
+                rt.block_on(async move {
+                    while let Some(key) = consolidation_rx.recv().await {
+                        worker_consolidator.maybe_consolidate_by_tokens(&key).await;
+                    }
+                });
+            })
+            .expect("failed to spawn consolidation worker thread");
+
         let agent_loop = Self {
             defaults: defaults.clone(),
             bus: bus.clone(),
@@ -410,19 +463,14 @@ impl AgentLoop {
             mcp_sessions: Mutex::new(Vec::new()),
             active_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             next_task_id: AtomicU64::new(0),
-            background_tasks: Arc::new(AsyncMutex::new(Vec::new())),
+            background_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
+            next_background_task_id: AtomicU64::new(0),
             session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
             max: max,
             concurrency_gate: concurrency_gate,
-            consolidator: Arc::new(Consolidator::new(
-                Arc::clone(&context.memory),
-                provider.clone(),
-                model.clone(),
-                session_manager.clone(),
-                context_window_tokens,
-                Box::new(Arc::clone(&context)),
-                max_tool_result_chars as usize,
-            )),
+            consolidator,
+            consolidation_tx: Mutex::new(Some(consolidation_tx)),
+            consolidation_worker: Mutex::new(Some(consolidation_worker)),
             dream: Arc::new(Dream::new(
                 Arc::clone(&context.memory),
                 provider,
@@ -603,7 +651,7 @@ impl AgentLoop {
         session: Option<Session>,
         channel: &str,
         chat_id: &str,
-        message_id: Option<String>,
+        message_id: Option<&str>,
     ) -> AgentRunResult {
         let loop_hook = LoopHook::with_context(
             Arc::clone(self),
@@ -612,7 +660,7 @@ impl AgentLoop {
             on_stream_end,
             channel,
             chat_id,
-            message_id,
+            message_id.map(|s| s.to_string()),
         );
         let hook: Arc<dyn AgentHook> = if self.extra_hooks.is_empty() {
             Arc::new(loop_hook)
@@ -720,6 +768,14 @@ impl AgentLoop {
                         log::error!("Failed to publish outbound message: {error}");
                     }
                 }
+            } else if msg.channel.eq_ignore_ascii_case("system") {
+                // System messages may run consolidation, which calls the `?Send`
+                // LLM provider — handled on the run-loop task, not via `spawn`.
+                if let Some(response) = Arc::clone(self).process_system_message(msg).await {
+                    if let Err(error) = self.bus.publish_outbound(response) {
+                        log::error!("Failed to publish outbound message: {error}");
+                    }
+                }
             } else {
                 // Everything else is dispatched as its own task so the loop stays
                 // responsive (and the task is cancellable via /stop).
@@ -750,19 +806,410 @@ impl AgentLoop {
 
     /// Process a message: per-session serial, cross-session concurrent.
     async fn dispatch(self: Arc<Self>, msg: InboundMessage) {
+        let session_key = msg.session_key();
+
         // setdefault: get-or-create the per-session lock, then release the map.
         let lock = {
             let mut locks = self.session_locks.lock().await;
             locks
-                .entry(msg.session_key())
+                .entry(session_key.clone())
                 .or_insert_with(|| Arc::new(AsyncMutex::new(())))
                 .clone()
         };
-        // `async with lock:` — now serialize only this session.
+        // `async with lock, gate:` — serialize this session, then cap global concurrency.
         let _guard = lock.lock().await;
+        let _permit = match &self.concurrency_gate {
+            Some(gate) => Some(
+                Arc::clone(gate)
+                    .acquire_owned()
+                    .await
+                    .expect("concurrency semaphore closed"),
+            ),
+            None => None,
+        };
+
+        let mut on_stream: Option<StreamCallback> = None;
+        let mut on_stream_end: Option<StreamEndCallback> = None;
+        if msg
+            .metadata
+            .get("_wants_stream")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            // Split one answer into distinct stream segments. The segment counter
+            // is shared (and mutated) by both callbacks, so it lives in an atomic
+            // (Rust's stand-in for Python's `nonlocal stream_segment`).
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let stream_base_id = format!("{session_key}:{now_ns}");
+            let stream_segment = Arc::new(AtomicUsize::new(0));
+
+            on_stream = Some({
+                let bus = Arc::clone(&self.bus);
+                let channel = msg.channel.clone();
+                let chat_id = msg.chat_id.clone();
+                let base_meta = msg.metadata.clone();
+                let base_id = stream_base_id.clone();
+                let segment = Arc::clone(&stream_segment);
+                Arc::new(move |delta: String| {
+                    let bus = Arc::clone(&bus);
+                    let channel = channel.clone();
+                    let chat_id = chat_id.clone();
+                    let mut meta = base_meta.clone();
+                    let base_id = base_id.clone();
+                    let segment = Arc::clone(&segment);
+                    Box::pin(async move {
+                        let stream_id = format!("{base_id}:{}", segment.load(Ordering::Relaxed));
+                        meta.insert("_stream_delta".into(), Value::Bool(true));
+                        meta.insert("_stream_id".into(), Value::String(stream_id));
+                        let _ = bus.publish_outbound(OutboundMessage {
+                            channel,
+                            chat_id,
+                            content: delta,
+                            reply_to: None,
+                            media: vec![],
+                            metadata: meta,
+                        });
+                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                }) as StreamCallback
+            });
+
+            on_stream_end = Some({
+                let bus = Arc::clone(&self.bus);
+                let channel = msg.channel.clone();
+                let chat_id = msg.chat_id.clone();
+                let base_meta = msg.metadata.clone();
+                let base_id = stream_base_id.clone();
+                let segment = Arc::clone(&stream_segment);
+                Arc::new(move |resuming: bool| {
+                    let bus = Arc::clone(&bus);
+                    let channel = channel.clone();
+                    let chat_id = chat_id.clone();
+                    let mut meta = base_meta.clone();
+                    let base_id = base_id.clone();
+                    let segment = Arc::clone(&segment);
+                    Box::pin(async move {
+                        let stream_id = format!("{base_id}:{}", segment.load(Ordering::Relaxed));
+                        meta.insert("_stream_end".into(), Value::Bool(true));
+                        meta.insert("_resuming".into(), Value::Bool(resuming));
+                        meta.insert("_stream_id".into(), Value::String(stream_id));
+                        let _ = bus.publish_outbound(OutboundMessage {
+                            channel,
+                            chat_id,
+                            content: String::new(),
+                            reply_to: None,
+                            media: vec![],
+                            metadata: meta,
+                        });
+                        // `nonlocal stream_segment += 1`
+                        segment.fetch_add(1, Ordering::Relaxed);
+                    }) as Pin<Box<dyn Future<Output = ()> + Send>>
+                }) as StreamEndCallback
+            });
+        }
+
+        // `try` block. There's no explicit `except asyncio.CancelledError` arm:
+        // Tokio cancellation drops this future instead of raising, so it already
+        // propagates cleanly. `catch_unwind` only intercepts panics, which is the
+        // equivalent of Python's `except Exception`.
+        let processed = AssertUnwindSafe(Arc::clone(&self).process_message(
+            msg.clone(),
+            &session_key,
+            None,
+            on_stream,
+            on_stream_end,
+        ))
+        .catch_unwind()
+        .await;
+
+        match processed {
+            Ok(Some(response)) => {
+                if let Err(e) = self.bus.publish_outbound(response) {
+                    log::error!("Failed to publish outbound message: {e}");
+                }
+            }
+            Ok(None) if msg.channel == "cli" => {
+                let _ = self.bus.publish_outbound(OutboundMessage {
+                    channel: msg.channel.clone(),
+                    chat_id: msg.chat_id.clone(),
+                    content: String::new(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: msg.metadata.clone(),
+                });
+            }
+            Ok(None) => {}
+            Err(panic) => {
+                log::error!(
+                    "Error processing message for session {session_key}: {}",
+                    panic
+                        .downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
+                );
+                let _ = self.bus.publish_outbound(OutboundMessage {
+                    channel: msg.channel.clone(),
+                    chat_id: msg.chat_id.clone(),
+                    content: "Sorry, I encountered an error.".to_string(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: HashMap::new(),
+                });
+            }
+        }
+    }
+
+    /// Handle system-channel messages (checkpoint restore + consolidation).
+    ///
+    /// Kept separate from [`Self::process_message`] so spawned `dispatch`
+    /// tasks stay `Send` (consolidation calls the `?Send` LLM provider).
+    async fn process_system_message(
+        self: Arc<Self>,
+        msg: InboundMessage,
+    ) -> Option<OutboundMessage> {
+        let (channel, chat_id) = if msg.chat_id.contains(':') {
+            let mut splits = msg.chat_id.split(':');
+            let channel = splits.next().unwrap();
+            let chat_id = splits.next().unwrap();
+            (channel, chat_id)
+        } else {
+            ("cli", msg.chat_id.as_str())
+        };
+        log::info!("Processing system message from {}", msg.sender_id);
+        let key = format!("{channel}:{chat_id}");
+
+        // Restore any runtime checkpoint (a partially completed turn from a crash
+        // or interrupt). Persist only when something was actually restored.
+        {
+            let mut manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session = manager.get_or_create_session(&key);
+            if self.restore_runtime_checkpoint(session) {
+                let restored = session.clone();
+                if let Err(e) = manager.save(restored) {
+                    log::error!("Failed to save restored session: {e}");
+                }
+            }
+        }
+
+        // Consolidate if the session history is getting large. The consolidator
+        // mutates the stored session in place via the shared session manager.
+        self.consolidator.maybe_consolidate_by_tokens(&key).await;
+
+        // Route tool output (e.g. `message`, `spawn`) back to the originating chat.
+        self.set_tool_context(
+            channel,
+            chat_id,
+            msg.metadata.get("message_id").and_then(Value::as_str),
+        );
+
+        // Re-read the session AFTER consolidation so history reflects any archiving.
+        let mut snapshot = {
+            let mut manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            manager.get_or_create_session(&key).clone()
+        };
+
+        let history = snapshot.get_history(Some(0));
+        let current_role = if msg.sender_id == "subagent" {
+            "assistant"
+        } else {
+            "user"
+        };
+        let messages = self.context.build_messages(
+            history.as_slice(),
+            msg.content.as_str(),
+            None,
+            None,
+            Some(channel),
+            Some(chat_id),
+            current_role,
+        );
+        let agent_run_result = self
+            .run_agent_loop(
+                messages,
+                None,
+                None,
+                None,
+                Some(snapshot.clone()),
+                channel,
+                chat_id,
+                msg.metadata.get("message_id").and_then(Value::as_str),
+            )
+            .await;
+        let final_content = agent_run_result.final_content;
+        let all_msgs = agent_run_result.messages;
+
+        // Save the turn, clear the checkpoint, and persist the session.
+        self.save_turn(&mut snapshot, all_msgs.as_slice(), 1 + history.len() as u32);
+        self.clear_runtime_checkpoint(&mut snapshot);
+        if let Err(e) = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save(snapshot.clone())
+        {
+            log::error!("Failed to save session after processing system message: {e}");
+        }
+
+        // Schedule background consolidation (Python's `_schedule_background`) on the
+        // dedicated worker thread so it runs off the run-loop task.
+        self.schedule_consolidation(snapshot.key.clone());
+
+        Some(OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            content: final_content.unwrap_or_else(|| "Background task completed.".to_string()),
+            reply_to: None,
+            media: vec![],
+            metadata: HashMap::new(),
+        })
+    }
+
+    /// Save new-turn messages into session, truncating large tool results.
+    fn save_turn(&self, session: &mut Session, messages: &[Value], skip: u32) {
+        let max_tool_result_chars = self.max_tool_result_chars;
+        for message in messages[skip as usize..].iter() {
+            let Some(mut entry) = message.as_object().cloned() else {
+                continue;
+            };
+            let role = entry.get("role").and_then(Value::as_str).unwrap_or("");
+            // Mirror Python `not content` (None, "", [], null are empty; strings/arrays are not).
+            let empty_content = match entry.get("content") {
+                None | Some(Value::Null) => true,
+                Some(Value::String(s)) => s.is_empty(),
+                Some(Value::Array(a)) => a.is_empty(),
+                _ => false,
+            };
+            let has_tool_calls = entry
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .is_some_and(|tc| !tc.is_empty());
+            if role == "assistant" && empty_content && !has_tool_calls {
+                continue;
+            }
+            if role == "tool" {
+                match entry.get("content") {
+                    Some(Value::String(content))
+                        if content.len() > max_tool_result_chars as usize =>
+                    {
+                        entry.insert(
+                            "content".into(),
+                            Value::String(truncate_text(content, max_tool_result_chars as usize)),
+                        );
+                    }
+                    Some(Value::Array(blocks)) => {
+                        let filtered =
+                            self.sanitize_persisted_blocks(blocks.as_slice(), true, false);
+                        if filtered.is_empty() {
+                            continue;
+                        }
+                        entry.insert("content".into(), Value::Array(filtered));
+                    }
+                    _ => {}
+                }
+            } else if role == "user" {
+                match entry.get("content") {
+                    Some(Value::String(content)) if content.starts_with(RUNTIME_CONTEXT_TAG) => {
+                        // Strip the runtime-context prefix, keep only the user text.
+                        let parts = content.splitn(2, "\n\n").collect::<Vec<&str>>();
+                        if parts.len() > 1 && !parts[1].trim().is_empty() {
+                            entry.insert("content".into(), Value::String(parts[1].to_string()));
+                        } else {
+                            continue;
+                        }
+                    }
+                    Some(Value::Array(blocks)) => {
+                        let filtered =
+                            self.sanitize_persisted_blocks(blocks.as_slice(), false, true);
+                        if filtered.is_empty() {
+                            continue;
+                        }
+                        entry.insert("content".into(), Value::Array(filtered));
+                    }
+                    _ => {}
+                }
+            }
+            if entry.get("timestamp").is_none() {
+                entry.insert("timestamp".into(), Value::String(Utc::now().to_rfc3339()));
+            }
+            session.messages.push(Value::Object(entry));
+        }
+        session.updated_at = Utc::now();
+    }
+
+    /// Strip volatile multimodal payloads before writing session history.
+    fn sanitize_persisted_blocks(
+        &self,
+        content: &[Value],
+        should_truncate_text: bool,
+        drop_runtime: bool,
+    ) -> Vec<Value> {
+        let mut filtered = Vec::new();
+        for block in content {
+            let Some(block_obj) = block.as_object() else {
+                filtered.push(block.clone());
+                continue;
+            };
+
+            if drop_runtime
+                && block_obj.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = block_obj.get("text").and_then(Value::as_str)
+                && text.starts_with(RUNTIME_CONTEXT_TAG)
+            {
+                continue;
+            }
+
+            if block_obj.get("type").and_then(Value::as_str) == Some("image_url") {
+                let url = block_obj
+                    .get("image_url")
+                    .and_then(Value::as_object)
+                    .and_then(|iu| iu.get("url"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if url.starts_with("data:image/") {
+                    let path = block_obj
+                        .get("_meta")
+                        .and_then(Value::as_object)
+                        .and_then(|m| m.get("path"))
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty());
+                    filtered.push(serde_json::json!({
+                        "type": "text",
+                        "text": image_placeholder_text(path, "[image]"),
+                    }));
+                    continue;
+                }
+            }
+
+            if block_obj.get("type").and_then(Value::as_str) == Some("text")
+                && let Some(text) = block_obj.get("text").and_then(Value::as_str)
+            {
+                let text =
+                    if should_truncate_text && text.len() > self.max_tool_result_chars as usize {
+                        truncate_text(text, self.max_tool_result_chars as usize)
+                    } else {
+                        text.to_string()
+                    };
+                let mut updated = block_obj.clone();
+                updated.insert("text".into(), Value::String(text));
+                filtered.push(Value::Object(updated));
+                continue;
+            }
+
+            filtered.push(block.clone());
+        }
+        filtered
     }
 
     /// Process a single inbound message and return the response.
+    /// The type of this message should not be "system".
     async fn process_message(
         self: Arc<Self>,
         msg: InboundMessage,
@@ -770,30 +1217,91 @@ impl AgentLoop {
         on_progress: Option<ProgressCallback>,
         on_stream: Option<StreamCallback>,
         on_stream_end: Option<StreamEndCallback>,
-    ) {
-        if msg.channel.to_lowercase() == "system" {
-            let (channel, chat_id) = if msg.chat_id.contains(':') {
-                let mut splits = msg.chat_id.split(':');
-                let channel = splits.next().unwrap();
-                let chat_id = splits.next().unwrap();
-                (channel, chat_id)
-            } else {
-                ("cli", msg.chat_id.as_str())
-            };
-            log::info!("Processing system message from {}", msg.sender_id);
-            let key = format!("{channel}:{chat_id}");
-            let mut manager = self
+    ) -> Option<OutboundMessage> {
+        let preview = if msg.content.len() > 80 {
+            format!("{}...", &msg.content[..80])
+        } else {
+            msg.content.clone()
+        };
+        log::info!(
+            "Processing message from {}:{}: {}",
+            msg.channel,
+            msg.sender_id,
+            preview
+        );
+
+        let key = if session_key.is_empty() {
+            msg.session_key()
+        } else {
+            session_key.to_string()
+        };
+
+        // Restore any runtime checkpoint and snapshot the session. Scope the guard
+        // so the `!Send` `MutexGuard` is dropped before the `.await`s below.
+        let session = {
+            let mut session_manager = self
                 .session_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            let session = manager.get_or_create_session(&key);
-            if self.restore_runtime_checkpoint(session) {
-                let snapshot = session.clone();
-                if let Err(e) = manager.save(snapshot) {
+            let session = session_manager.get_or_create_session(&key);
+            let restored = self.restore_runtime_checkpoint(session);
+            // End the `&mut session` borrow before re-borrowing the manager to save.
+            let snapshot = session.clone();
+            if restored {
+                if let Err(e) = session_manager.save(snapshot.clone()) {
                     log::error!("Failed to save restored session: {e}");
                 }
             }
+            snapshot
+        };
+
+        // Slash commands
+        let raw = msg.content.trim();
+        let mut ctx = CommandContext {
+            msg: msg.clone(),
+            session: Some(session.clone()),
+            key: key.clone(),
+            raw: raw.to_string(),
+            args: String::new(),
+            agent_loop: Some(self.clone()),
+        };
+        if let Some(result) = self.commands.dispatch(&mut ctx).await {
+            return Some(result);
         }
+        self.consolidator.maybe_consolidate_by_tokens(&key).await;
+        self.set_tool_context(
+            msg.channel.as_str(),
+            msg.chat_id.as_str(),
+            msg.metadata.get("message_id").and_then(Value::as_str),
+        );
+        if let Some(message_tool) = self.tools.get("message") {
+            // `isinstance(message_tool, MessageTool)` → downcast the trait object.
+            if let Some(message_tool) =
+                (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
+            {
+                message_tool.start_turn();
+            }
+        }
+
+        // Re-read the session AFTER consolidation so history reflects any archiving.
+        let session = {
+            let mut session_manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager.get_or_create_session(&key).clone()
+        };
+        let history = session.get_history(Some(0));
+        let initial_messages = self.context.build_messages(
+            history.as_slice(),
+            msg.content.as_str(),
+            None, 
+            if !msg.media.is_empty()  { Some(&msg.media) } else { None },
+            Some(msg.channel.as_str()), 
+            Some(msg.chat_id.as_str()),
+            DEFAULT_CURRENT_ROLE,
+        );
+        None
     }
 
     /// Stable identity tuple for a message, used to detect overlap between the
@@ -908,6 +1416,74 @@ impl AgentLoop {
     fn clear_runtime_checkpoint(&self, session: &mut Session) {
         session.metadata.remove(AgentLoop::RUNTIME_CHECKPOINT_KEY);
     }
+
+    /// Schedule a future as a tracked background task (drained on shutdown).
+    fn schedule_background<F>(&self, future: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        let background_tasks = Arc::clone(&self.background_tasks);
+        let task_id = self.next_background_task_id.fetch_add(1, Ordering::Relaxed);
+
+        tokio::spawn(async move {
+            let bg = Arc::clone(&background_tasks);
+            let id = task_id;
+            let mut tasks = background_tasks.lock().await;
+            let handle = tokio::spawn(async move {
+                future.await;
+                let mut tasks = bg.lock().await;
+                tasks.remove(&id);
+            });
+            tasks.insert(task_id, handle);
+        });
+    }
+
+    /// Hand a session key to the consolidation worker thread (non-blocking).
+    ///
+    /// Mirrors Python's
+    /// `_schedule_background(consolidator.maybe_consolidate_by_tokens(...))`: the
+    /// work runs off the run-loop task. The worker drives the `!Send`
+    /// consolidation future on its own current-thread runtime.
+    fn schedule_consolidation(&self, session_key: String) {
+        let guard = self
+            .consolidation_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(tx) = guard.as_ref() {
+            if let Err(e) = tx.send(session_key) {
+                log::error!("Consolidation worker unavailable: {e}");
+            }
+        }
+    }
+
+    /// Drop the worker's sender and join its thread so any queued consolidations
+    /// finish (drained on shutdown). Idempotent.
+    pub fn shutdown_consolidation_worker(&self) {
+        // Dropping the sender makes the worker's `recv()` return `None`, which ends
+        // its loop and lets the thread exit.
+        self.consolidation_tx
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        let handle = self
+            .consolidation_worker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        if let Some(handle) = handle {
+            if let Err(e) = handle.join() {
+                log::error!("Consolidation worker thread panicked: {e:?}");
+            }
+        }
+    }
+}
+
+impl Drop for AgentLoop {
+    fn drop(&mut self) {
+        // Best-effort drain: signal and join the worker thread even if
+        // `shutdown_consolidation_worker` was never called explicitly.
+        self.shutdown_consolidation_worker();
+    }
 }
 
 #[cfg(test)]
@@ -916,6 +1492,7 @@ mod tests {
     use std::collections::HashMap;
 
     use crate::providers::base::{GenerationSettings, LLMResponse, ToolCallRequest};
+    use serde_json::json;
 
     /// Minimal provider placeholder until `AgentLoop` is fully wired.
     struct PlaceholderProvider {
@@ -1141,5 +1718,103 @@ mod tests {
                 "extra:finalize_content".to_string(),
             ]
         );
+    }
+
+    // ── save_turn ─────────────────────────────────────────────────────────────
+
+    fn make_save_turn_loop(max_tool_result_chars: u32) -> Arc<AgentLoop> {
+        let bus = Arc::new(MessageBus::new());
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(PlaceholderProvider {
+            settings: GenerationSettings::new(),
+        });
+        Arc::new(AgentLoop::new(
+            bus,
+            provider,
+            std::env::temp_dir(),
+            None,
+            None,
+            None,
+            None,
+            Some(max_tool_result_chars),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn saved_content(msg: &Value) -> Option<&str> {
+        msg.get("content").and_then(Value::as_str)
+    }
+
+    #[test]
+    fn test_save_turn_filters_and_persists_messages() {
+        const MAX_CHARS: u32 = 10;
+        let loop_ = make_save_turn_loop(MAX_CHARS);
+        let before = Utc::now();
+        let mut session = Session::new("test:save_turn".into());
+
+        let long_tool_output = "0123456789abcdef";
+        let runtime_user = format!("{RUNTIME_CONTEXT_TAG}\n\nhello user");
+        let messages = vec![
+            json!({"role": "system", "content": "prompt"}),
+            json!({"role": "assistant", "content": ""}),
+            json!({"role": "assistant", "content": "visible reply"}),
+            json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{"id": "tc1", "type": "function", "function": {"name": "read"}}]
+            }),
+            json!({"role": "tool", "content": long_tool_output, "tool_call_id": "tc1", "name": "read"}),
+            json!({"role": "user", "content": runtime_user}),
+            json!({"role": "user", "content": format!("{RUNTIME_CONTEXT_TAG}\n\n")}),
+            json!({"role": "user", "content": "plain user", "timestamp": "2020-01-01T00:00:00Z"}),
+        ];
+
+        loop_.save_turn(&mut session, &messages, 1);
+
+        // skip=1 drops the system prompt; empty assistant is dropped too.
+        assert_eq!(session.messages.len(), 5);
+
+        assert_eq!(saved_content(&session.messages[0]), Some("visible reply"));
+
+        assert_eq!(
+            session.messages[1]
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .map(|a| a.len()),
+            Some(1),
+            "assistant with only tool_calls should be kept"
+        );
+
+        let tool_content = saved_content(&session.messages[2]).unwrap();
+        assert_ne!(tool_content, long_tool_output);
+        assert!(tool_content.contains("(truncated)"));
+
+        assert_eq!(saved_content(&session.messages[3]), Some("hello user"));
+
+        assert_eq!(saved_content(&session.messages[4]), Some("plain user"));
+        assert_eq!(
+            session.messages[4].get("timestamp").and_then(Value::as_str),
+            Some("2020-01-01T00:00:00Z"),
+            "existing timestamp must not be overwritten"
+        );
+
+        for (idx, msg) in session.messages.iter().enumerate() {
+            if idx != 4 {
+                assert!(
+                    msg.get("timestamp").and_then(Value::as_str).is_some(),
+                    "message {idx} should have a timestamp"
+                );
+            }
+        }
+
+        assert!(session.updated_at >= before);
     }
 }

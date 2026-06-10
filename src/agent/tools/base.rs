@@ -46,7 +46,7 @@ pub fn json_type_map() -> HashMap<&'static str, &'static [&'static str]> {
 }
 
 #[async_trait]
-pub trait Tool: Send + Sync {
+pub trait Tool: std::any::Any + Send + Sync {
     /// Tool name used in function calls.
     fn name(&self) -> String;
     /// Description of what the tool does.

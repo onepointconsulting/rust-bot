@@ -19,7 +19,7 @@ pub struct Session {
     pub key: String,
     pub messages: Vec<Value>,
     created_at: DateTime<Utc>,
-    updated_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
     pub metadata: HashMap<String, Value>,
     pub last_consolidated: usize,
 }

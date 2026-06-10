@@ -683,7 +683,7 @@ pub struct Consolidator {
     context_window_tokens: u32,
     message_builder: Box<dyn MessageBuilder>,
     max_completion_tokens: usize,
-    locks: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
+    locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
 }
 
 impl Consolidator {
@@ -699,8 +699,6 @@ impl Consolidator {
         message_builder: Box<dyn MessageBuilder>,
         max_completion_tokens: usize,
     ) -> Self {
-        // Initialize the dictionary (typically inside a struct's constructor/init)
-        let locks: HashMap<String, Arc<tokio::sync::Mutex<()>>> = HashMap::new();
         Self {
             store: store,
             provider,
@@ -709,7 +707,7 @@ impl Consolidator {
             context_window_tokens,
             message_builder,
             max_completion_tokens,
-            locks,
+            locks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -824,87 +822,110 @@ impl Consolidator {
     }
 
     /// Loop: archive old messages until prompt fits within safe budget.
+    ///
     /// The budget reserves space for completion tokens and a safety buffer
-    /// so the LLM request never exceeds the context window.
-    pub async fn maybe_consolidate_by_tokens(&mut self, session: &mut Session) {
-        if session.messages.len() == 0 || self.context_window_tokens == 0 {
+    /// so the LLM request never exceeds the context window. Resolves the
+    /// session from `self.sessions` by key so callers need not hold the
+    /// session-manager lock across `await` points.
+    pub async fn maybe_consolidate_by_tokens(&self, session_key: &str) {
+        if self.context_window_tokens == 0 {
             return;
         }
 
-        let lock = self.get_lock(&session.key);
+        let lock = self.get_lock(session_key);
         let _guard = lock.lock().await;
         let window = self.context_window_tokens as usize;
         let budget = window
             .saturating_sub(self.max_completion_tokens)
             .saturating_sub(Consolidator::SAFETY_BUFFER);
         let target = budget / 2;
-        let (mut estimated, source) = self.estimate_session_prompt_tokens(session);
+
+        let (mut estimated, source) = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let session = sessions.get_or_create_session(session_key);
+            if session.messages.is_empty() {
+                return;
+            }
+            self.estimate_session_prompt_tokens(session)
+        };
+
         if estimated == 0 {
             return;
         }
         if estimated < budget {
             log::debug!(
-                "Token consolidation idle {}: {}/{} via {}",
-                session.key,
-                estimated,
-                self.context_window_tokens,
-                source
+                "Token consolidation idle {session_key}: {estimated}/{window} via {source}",
+                window = self.context_window_tokens,
             );
             return;
         }
+
         for round_num in 0..Consolidator::MAX_CONSOLIDATION_ROUNDS {
             if estimated <= target {
                 return;
             }
-            match Consolidator::pick_consolidation_boundary(session, target) {
-                Some((idx, _removed_tokens)) => {
-                    let end_idx = idx;
-                    let chunk = session.messages[session.last_consolidated..end_idx].to_vec();
-                    if chunk.is_empty() {
-                        return;
-                    }
-                    log::info!(
-                        "Token consolidation round {} for {}: {}/{} via {}, chunk={} msgs",
-                        round_num,
-                        session.key,
-                        estimated,
-                        self.context_window_tokens,
-                        source,
-                        chunk.len(),
-                    );
-                    if !self.archive(&chunk).await {
-                        return;
-                    }
-                    session.last_consolidated = end_idx;
-                    if let Err(e) = self
-                        .sessions
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .save(session.clone())
-                    {
-                        log::error!("Failed to save session after consolidation: {}", e);
-                        return;
-                    }
 
-                    estimated = self.estimate_session_prompt_tokens(session).0;
-                    if estimated == 0 {
+            let chunk_and_end = {
+                let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                let session = sessions.get_or_create_session(session_key);
+                match Consolidator::pick_consolidation_boundary(session, target) {
+                    Some((idx, _removed_tokens)) => {
+                        let end_idx = idx;
+                        let chunk = session.messages[session.last_consolidated..end_idx].to_vec();
+                        if chunk.is_empty() {
+                            return;
+                        }
+                        log::info!(
+                            "Token consolidation round {round_num} for {session_key}: {estimated}/{window} via {source}, chunk={chunk_len} msgs",
+                            window = self.context_window_tokens,
+                            chunk_len = chunk.len(),
+                        );
+                        Some((chunk, end_idx))
+                    }
+                    None => {
+                        log::debug!(
+                            "Token consolidation: no safe boundary for {session_key} (round {round_num})",
+                        );
                         return;
                     }
                 }
-                None => {
-                    log::debug!(
-                        "Token consolidation: no safe boundary for {} (round {})",
-                        session.key,
-                        round_num,
-                    );
+            };
+
+            let Some((chunk, end_idx)) = chunk_and_end else {
+                return;
+            };
+
+            if !self.archive(&chunk).await {
+                return;
+            }
+
+            estimated = {
+                let (est, snapshot) = {
+                    let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                    let session = sessions.get_or_create_session(session_key);
+                    session.last_consolidated = end_idx;
+                    let snapshot = session.clone();
+                    let est = self.estimate_session_prompt_tokens(&snapshot).0;
+                    (est, snapshot)
+                };
+                let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+                if let Err(e) = sessions.save(snapshot) {
+                    log::error!("Failed to save session after consolidation: {e}");
                     return;
                 }
+                est
+            };
+
+            if estimated == 0 {
+                return;
             }
         }
     }
 
-    fn get_lock(&mut self, session_key: &str) -> Arc<tokio::sync::Mutex<()>> {
+    fn get_lock(&self, session_key: &str) -> Arc<tokio::sync::Mutex<()>> {
         self.locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
             .entry(session_key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
@@ -1318,9 +1339,22 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("summary".into());
-        let mut c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
-        let mut session = Session::new("s".into());
-        c.maybe_consolidate_by_tokens(&mut session).await;
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        sessions
+            .lock()
+            .unwrap()
+            .save(Session::new("s".into()))
+            .unwrap();
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            ArchiveTestProvider::arc(resp),
+            "test-model".into(),
+            sessions,
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
+        );
+        c.maybe_consolidate_by_tokens("s").await;
         assert!(
             !c.store.history_file.exists()
                 || fs::metadata(&c.store.history_file).unwrap().len() == 0,
@@ -1333,15 +1367,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("summary".into());
-        let mut c = test_consolidator_with_ctx(&tmp, ArchiveTestProvider::arc(resp), 0, 0);
-        let mut session = session_with_messages(
-            vec![
-                json!({"role": "user", "content": "hi"}),
-                json!({"role": "assistant", "content": "yo"}),
-            ],
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        sessions
+            .lock()
+            .unwrap()
+            .save(session_with_messages(
+                vec![
+                    json!({"role": "user", "content": "hi"}),
+                    json!({"role": "assistant", "content": "yo"}),
+                ],
+                0,
+            ))
+            .unwrap();
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            ArchiveTestProvider::arc(resp),
+            "test-model".into(),
+            sessions,
+            0,
+            Box::new(StubArchiveMessageBuilder),
             0,
         );
-        c.maybe_consolidate_by_tokens(&mut session).await;
+        c.maybe_consolidate_by_tokens("s").await;
         assert!(
             !c.store.history_file.exists()
                 || fs::metadata(&c.store.history_file).unwrap().len() == 0,
@@ -1356,15 +1403,28 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("summary".into());
-        let mut c = test_consolidator_with_ctx(&tmp, ArchiveTestProvider::arc(resp), 65_536, 8192);
-        let mut session = session_with_messages(
-            vec![
-                json!({"role": "user", "content": "hi"}),
-                json!({"role": "assistant", "content": "yo"}),
-            ],
-            0,
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        sessions
+            .lock()
+            .unwrap()
+            .save(session_with_messages(
+                vec![
+                    json!({"role": "user", "content": "hi"}),
+                    json!({"role": "assistant", "content": "yo"}),
+                ],
+                0,
+            ))
+            .unwrap();
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            ArchiveTestProvider::arc(resp),
+            "test-model".into(),
+            sessions,
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
         );
-        c.maybe_consolidate_by_tokens(&mut session).await;
+        c.maybe_consolidate_by_tokens("s").await;
         assert!(
             !c.store.history_file.exists()
                 || fs::metadata(&c.store.history_file).unwrap().len() == 0,
@@ -1393,7 +1453,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("archive-summary".into());
-        let mut c = test_consolidator_with_ctx(&tmp, ArchiveTestProvider::arc(resp), 65_536, 8192);
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
 
         // Build a session with several alternating messages starting already past last_consolidated=0.
         // last_consolidated stays 0; after any consolidation round it should advance.
@@ -1403,15 +1463,30 @@ mod tests {
                 json!({"role": role, "content": format!("msg {i}")})
             })
             .collect();
-        let mut session = session_with_messages(msgs, 0);
+        let session = session_with_messages(msgs, 0);
         let lc_before = session.last_consolidated;
+        sessions.lock().unwrap().save(session).unwrap();
 
-        c.maybe_consolidate_by_tokens(&mut session).await;
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            ArchiveTestProvider::arc(resp),
+            "test-model".into(),
+            sessions.clone(),
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
+        );
+        c.maybe_consolidate_by_tokens("s").await;
 
         // With StubArchiveMessageBuilder (returns 0 estimated), consolidation exits early.
         // Verify no history was spuriously written and last_consolidated unchanged.
+        let lc_after = sessions
+            .lock()
+            .unwrap()
+            .get_or_create_session("s")
+            .last_consolidated;
         assert_eq!(
-            session.last_consolidated, lc_before,
+            lc_after, lc_before,
             "last_consolidated must not change when estimated == 0"
         );
         assert!(
@@ -1427,16 +1502,29 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("s".into());
-        let mut c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
-        let mut session = session_with_messages(
-            vec![
-                json!({"role": "user", "content": "a"}),
-                json!({"role": "assistant", "content": "b"}),
-            ],
-            0,
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        sessions
+            .lock()
+            .unwrap()
+            .save(session_with_messages(
+                vec![
+                    json!({"role": "user", "content": "a"}),
+                    json!({"role": "assistant", "content": "b"}),
+                ],
+                0,
+            ))
+            .unwrap();
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            ArchiveTestProvider::arc(resp),
+            "test-model".into(),
+            sessions,
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
         );
-        c.maybe_consolidate_by_tokens(&mut session).await;
-        c.maybe_consolidate_by_tokens(&mut session).await;
+        c.maybe_consolidate_by_tokens("s").await;
+        c.maybe_consolidate_by_tokens("s").await;
         // If we reach here without deadlock the test passes.
     }
 
