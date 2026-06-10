@@ -707,7 +707,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LLMProviderDyn for TestProvider {
         fn api_key(&self) -> Option<String> {
             None
@@ -899,7 +899,7 @@ mod tests {
         }
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LLMProviderDyn for ScriptedProvider {
         fn api_key(&self) -> Option<String> {
             None

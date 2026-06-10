@@ -44,6 +44,7 @@ use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
+use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
 
 const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron"];
@@ -305,12 +306,6 @@ pub struct AgentLoop {
     running: AtomicBool,
     concurrency_gate: Option<Arc<Semaphore>>,
     consolidator: Arc<Consolidator>,
-    /// Sends session keys to the dedicated consolidation worker thread. Wrapped
-    /// in `Option` so shutdown can drop the sender and unblock the worker.
-    consolidation_tx: Mutex<Option<tokio::sync::mpsc::UnboundedSender<String>>>,
-    /// Handle to the consolidation worker thread, joined on shutdown so any
-    /// queued consolidations are drained.
-    consolidation_worker: Mutex<Option<std::thread::JoinHandle<()>>>,
     dream: Arc<Dream>,
     commands: CommandRouter,
 }
@@ -397,38 +392,6 @@ impl AgentLoop {
             max_tool_result_chars as usize,
         ));
 
-        // Dedicated consolidation worker. The consolidator drives the `!Send` LLM
-        // provider future (the provider trait is `async_trait(?Send)`), so it cannot
-        // be `tokio::spawn`ed. Instead it runs on its own thread with a current-thread
-        // runtime, fed session keys over a channel, so post-turn consolidation happens
-        // off the run-loop task (Rust's stand-in for Python's `_schedule_background`).
-        let (consolidation_tx, mut consolidation_rx) =
-            tokio::sync::mpsc::unbounded_channel::<String>();
-        let worker_consolidator = Arc::clone(&consolidator);
-        let consolidation_worker = std::thread::Builder::new()
-            .name("consolidation-worker".to_string())
-            .spawn(move || {
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => {
-                        log::error!("Failed to build consolidation worker runtime: {e}");
-                        return;
-                    }
-                };
-                // `recv` returns `None` once the sender is dropped (shutdown), ending
-                // the loop. Keys are consolidated sequentially; the consolidator
-                // already serializes per-session internally.
-                rt.block_on(async move {
-                    while let Some(key) = consolidation_rx.recv().await {
-                        worker_consolidator.maybe_consolidate_by_tokens(&key).await;
-                    }
-                });
-            })
-            .expect("failed to spawn consolidation worker thread");
-
         let agent_loop = Self {
             defaults: defaults.clone(),
             bus: bus.clone(),
@@ -469,8 +432,6 @@ impl AgentLoop {
             max: max,
             concurrency_gate: concurrency_gate,
             consolidator,
-            consolidation_tx: Mutex::new(Some(consolidation_tx)),
-            consolidation_worker: Mutex::new(Some(consolidation_worker)),
             dream: Arc::new(Dream::new(
                 Arc::clone(&context.memory),
                 provider,
@@ -1058,9 +1019,15 @@ impl AgentLoop {
             log::error!("Failed to save session after processing system message: {e}");
         }
 
-        // Schedule background consolidation (Python's `_schedule_background`) on the
-        // dedicated worker thread so it runs off the run-loop task.
-        self.schedule_consolidation(snapshot.key.clone());
+        // Schedule background consolidation (Python's `_schedule_background`).
+        // The provider is now `Send`, so a plain tokio::spawn suffices.
+        {
+            let consolidator = Arc::clone(&self.consolidator);
+            let key = snapshot.key.clone();
+            tokio::spawn(async move {
+                consolidator.maybe_consolidate_by_tokens(&key).await;
+            });
+        }
 
         Some(OutboundMessage {
             channel: channel.to_string(),
@@ -1219,7 +1186,7 @@ impl AgentLoop {
         on_stream_end: Option<StreamEndCallback>,
     ) -> Option<OutboundMessage> {
         let preview = if msg.content.len() > 80 {
-            format!("{}...", &msg.content[..80])
+            format!("{}...", &msg.content.chars().take(80).collect::<String>())
         } else {
             msg.content.clone()
         };
@@ -1284,7 +1251,7 @@ impl AgentLoop {
         }
 
         // Re-read the session AFTER consolidation so history reflects any archiving.
-        let session = {
+        let mut session = {
             let mut session_manager = self
                 .session_manager
                 .lock()
@@ -1295,13 +1262,113 @@ impl AgentLoop {
         let initial_messages = self.context.build_messages(
             history.as_slice(),
             msg.content.as_str(),
-            None, 
-            if !msg.media.is_empty()  { Some(&msg.media) } else { None },
-            Some(msg.channel.as_str()), 
+            None,
+            if !msg.media.is_empty() {
+                Some(&msg.media)
+            } else {
+                None
+            },
+            Some(msg.channel.as_str()),
             Some(msg.chat_id.as_str()),
             DEFAULT_CURRENT_ROLE,
         );
-        None
+
+        let bus_progress: ProgressCallback = {
+            let bus = Arc::clone(&self.bus);
+            let channel = msg.channel.clone();
+            let chat_id = msg.chat_id.clone();
+            let base_meta = msg.metadata.clone();
+            Arc::new(move |content: String, tool_hint: bool| {
+                let bus = Arc::clone(&bus);
+                let channel = channel.clone();
+                let chat_id = chat_id.clone();
+                let mut meta = base_meta.clone();
+                Box::pin(async move {
+                    meta.insert("_progress".into(), Value::Bool(true));
+                    meta.insert("_tool_hint".into(), Value::Bool(tool_hint));
+                    if let Err(e) = bus.publish_outbound(OutboundMessage {
+                        channel,
+                        chat_id,
+                        content,
+                        reply_to: None,
+                        media: vec![],
+                        metadata: meta,
+                    }) {
+                        log::error!("Failed to publish progress message: {e}");
+                    }
+                }) as Pin<Box<dyn Future<Output = ()> + Send>>
+            })
+        };
+
+        let result = self
+            .run_agent_loop(
+                initial_messages,
+                Some(on_progress.unwrap_or(bus_progress)),
+                on_stream.clone(),
+                on_stream_end,
+                Some(session.clone()),
+                msg.channel.as_str(),
+                msg.chat_id.as_str(),
+                msg.metadata.get("message_id").and_then(Value::as_str),
+            )
+            .await;
+        let mut final_content = result.final_content.unwrap_or_default();
+        let all_msgs = result.messages;
+
+        if final_content.trim().is_empty() {
+            final_content = EMPTY_FINAL_RESPONSE_MESSAGE.to_string();
+        }
+        self.save_turn(&mut session, &all_msgs, 1 + history.len() as u32);
+        self.clear_runtime_checkpoint(&mut session);
+        if let Err(res) = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save(session.clone())
+        {
+            log::error!("Failed to save session after processing message: {res}");
+        }
+        {
+            let consolidator = Arc::clone(&self.consolidator);
+            let key = key.clone();
+            tokio::spawn(async move {
+                consolidator.maybe_consolidate_by_tokens(&key).await;
+            });
+        }
+        if let Some(message_tool) = self.tools.get("message") {
+            if let Some(message_tool) =
+                (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
+            {
+                if *message_tool.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) {
+                    return None;
+                }
+            }
+        }
+        let limit: usize = 120;
+        let preview = if final_content.len() > limit { 
+            format!("{}...", final_content.get(..limit).unwrap_or(&final_content))
+        } else {
+            final_content.clone()
+        };
+        log::info!(
+            "Response to {}:{}: {}",
+            msg.channel,
+            msg.sender_id,
+            preview
+        );
+
+        let mut meta = msg.metadata.clone();
+        if on_stream.is_some() {
+            meta.insert("_streamed".into(), Value::Bool(true));
+        }
+        Some(OutboundMessage {
+            channel: msg.channel.clone(),
+            chat_id: msg.chat_id.clone(),
+            content: final_content,
+            reply_to: None,
+            media: vec![],
+            metadata: meta,
+        })
     }
 
     /// Stable identity tuple for a message, used to detect overlap between the
@@ -1438,51 +1505,9 @@ impl AgentLoop {
         });
     }
 
-    /// Hand a session key to the consolidation worker thread (non-blocking).
-    ///
-    /// Mirrors Python's
-    /// `_schedule_background(consolidator.maybe_consolidate_by_tokens(...))`: the
-    /// work runs off the run-loop task. The worker drives the `!Send`
-    /// consolidation future on its own current-thread runtime.
-    fn schedule_consolidation(&self, session_key: String) {
-        let guard = self
-            .consolidation_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Some(tx) = guard.as_ref() {
-            if let Err(e) = tx.send(session_key) {
-                log::error!("Consolidation worker unavailable: {e}");
-            }
-        }
-    }
-
-    /// Drop the worker's sender and join its thread so any queued consolidations
-    /// finish (drained on shutdown). Idempotent.
-    pub fn shutdown_consolidation_worker(&self) {
-        // Dropping the sender makes the worker's `recv()` return `None`, which ends
-        // its loop and lets the thread exit.
-        self.consolidation_tx
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        let handle = self
-            .consolidation_worker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take();
-        if let Some(handle) = handle {
-            if let Err(e) = handle.join() {
-                log::error!("Consolidation worker thread panicked: {e:?}");
-            }
-        }
-    }
-}
-
-impl Drop for AgentLoop {
-    fn drop(&mut self) {
-        // Best-effort drain: signal and join the worker thread even if
-        // `shutdown_consolidation_worker` was never called explicitly.
-        self.shutdown_consolidation_worker();
+    fn stop(&mut self) {
+        self.running.store(false, Ordering::Relaxed);
+        log::info!("Agent loop stopping ... shutting down");
     }
 }
 
@@ -1499,7 +1524,7 @@ mod tests {
         settings: GenerationSettings,
     }
 
-    #[async_trait(?Send)]
+    #[async_trait]
     impl LLMProviderDyn for PlaceholderProvider {
         fn api_key(&self) -> Option<String> {
             None

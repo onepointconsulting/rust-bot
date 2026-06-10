@@ -21,7 +21,7 @@ pub struct MessageTool {
     default_channel: Mutex<String>,
     default_chat_id: Mutex<String>,
     default_message_id: Mutex<Option<String>>,
-    sent_in_turn: Mutex<bool>,
+    pub sent_in_turn: Mutex<bool>,
 }
 
 impl MessageTool {

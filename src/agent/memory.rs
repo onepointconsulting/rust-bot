@@ -1229,7 +1229,7 @@ mod tests {
         }
     }
 
-    #[async_trait::async_trait(?Send)]
+    #[async_trait::async_trait]
     impl LLMProviderDyn for ArchiveTestProvider {
         fn api_key(&self) -> Option<String> {
             None

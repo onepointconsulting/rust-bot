@@ -32,7 +32,7 @@ async fn test_sub_agent() {
     .expect("timed out waiting for subagent announce");
 
     drop(manager);
-    let mut bus = match Arc::try_unwrap(bus) {
+    let bus = match Arc::try_unwrap(bus) {
         Ok(bus) => bus,
         Err(_) => panic!("manager should release bus Arc"),
     };

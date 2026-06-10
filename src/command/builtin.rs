@@ -169,7 +169,7 @@ use super::*;
         use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
 
         struct TestProvider;
-        #[async_trait(?Send)]
+        #[async_trait]
         impl LLMProviderDyn for TestProvider {
             fn api_key(&self) -> Option<String> {
                 None

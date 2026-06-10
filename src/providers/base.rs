@@ -164,7 +164,7 @@ pub type BoxedStreamCallback =
 /// the core `&self` accessors and the three non-generic async call methods.
 /// A blanket impl covers any `T: LLMProvider + Send + Sync` automatically,
 /// so callers store `Arc<dyn LLMProviderDyn>` and construct it from any concrete provider.
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 pub trait LLMProviderDyn: Send + Sync {
     fn api_key(&self) -> Option<String>;
     fn api_base(&self) -> Option<String>;
@@ -231,7 +231,7 @@ pub trait LLMProviderDyn: Send + Sync {
     ) -> LLMResponse;
 }
 
-#[async_trait::async_trait(?Send)]
+#[async_trait::async_trait]
 impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
     fn api_key(&self) -> Option<String> {
         LLMProvider::api_key(self)
@@ -325,7 +325,7 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
     }
 }
 
-pub trait LLMProvider {
+pub trait LLMProvider: Send + Sync {
     /// Required method to initialize an LLMProvider.
     /// Equivalent Python signature:
     ///     def __init__(self, api_key: str | None = None, api_base: str | None = None):
@@ -510,7 +510,7 @@ pub trait LLMProvider {
     /// # Errors
     /// Should be implemented by the LLMProvider for actual backend.
     #[allow(unused_variables)]
-    async fn chat(
+    fn chat(
         &self,
         messages: Vec<serde_json::Value>,
         tools: Option<Vec<serde_json::Value>>,
@@ -519,7 +519,7 @@ pub trait LLMProvider {
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-    ) -> LLMResponse;
+    ) -> impl std::future::Future<Output = LLMResponse> + Send;
 
 
     fn get_default_model(&self) -> String;
@@ -589,8 +589,7 @@ pub trait LLMProvider {
         if found { Some(result) } else { None }
     }
 
-    #[allow(async_fn_in_trait)]
-    async fn safe_chat(
+    fn safe_chat(
         &self,
         messages: Vec<serde_json::Value>,
         tools: Option<Vec<serde_json::Value>>,
@@ -599,8 +598,9 @@ pub trait LLMProvider {
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-    ) -> LLMResponse
+    ) -> impl std::future::Future<Output = LLMResponse> + Send
     {
+        async move {
 
         match AssertUnwindSafe(
             self.chat(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
@@ -627,6 +627,7 @@ pub trait LLMProvider {
                 }
             }
         }
+        }
     }
 
     /// Stream a chat completion, calling `on_content_delta` for each text chunk.
@@ -650,8 +651,7 @@ pub trait LLMProvider {
     /// # Notes
     /// This dummy implementation can be overridden by providers supporting real streaming.
     #[allow(unused_variables)]
-    #[allow(async_fn_in_trait)]
-    async fn chat_stream<F, Fut>(
+    fn chat_stream<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
         tools: Option<Vec<serde_json::Value>>,
@@ -661,11 +661,12 @@ pub trait LLMProvider {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
-    ) -> LLMResponse
+    ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        async move {
         let response = self.chat(
             messages,
             tools,
@@ -683,11 +684,11 @@ pub trait LLMProvider {
         }
 
         response
+        }
     }
 
     #[allow(unused_variables)]
-    #[allow(async_fn_in_trait)]
-    async fn safe_chat_stream<F, Fut>(
+    fn safe_chat_stream<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
         tools: Option<Vec<serde_json::Value>>,
@@ -697,11 +698,12 @@ pub trait LLMProvider {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
-    ) -> LLMResponse
+    ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        async move {
         match AssertUnwindSafe(
             self.chat_stream(messages, tools, model, max_tokens, temperature,
                 reasoning_effort, tool_choice, on_content_delta)
@@ -728,6 +730,7 @@ pub trait LLMProvider {
                 }
             }
         }
+        }
 
     }
 
@@ -735,8 +738,7 @@ pub trait LLMProvider {
     ///
     /// Parameters default to self.generation when not explicitly passed,
     /// so callers do not need to thread temperature / max_tokens / reasoning_effort through every layer.
-    #[allow(async_fn_in_trait)]
-    async fn chat_with_retry(
+    fn chat_with_retry(
         &self,
         messages: Vec<serde_json::Value>,
         tools: Option<Vec<serde_json::Value>>,
@@ -745,7 +747,8 @@ pub trait LLMProvider {
         temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-    ) -> LLMResponse {
+    ) -> impl std::future::Future<Output = LLMResponse> + Send {
+        async move {
         // Fallback to default values from generation_settings if not specified.
         let gs = self.generation_settings();
         let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
@@ -842,10 +845,10 @@ pub trait LLMProvider {
             tool_choice,
         )
         .await
+        }
     }
 
-    #[allow(async_fn_in_trait)]
-    async fn safe_chat_stream_with_retry<F, Fut>(
+    fn safe_chat_stream_with_retry<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
         tools: Option<Vec<serde_json::Value>>,
@@ -855,11 +858,12 @@ pub trait LLMProvider {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
-    ) -> LLMResponse
+    ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send
     {
+        async move {
         let gs = self.generation_settings();
         let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
         let temperature = temperature.unwrap_or(gs.temperature);
@@ -926,6 +930,7 @@ pub trait LLMProvider {
             on_content_delta,
         )
         .await
+        }
     }
 
     fn handle_error(e: Box<dyn std::error::Error>) -> crate::providers::base::LLMResponse {
