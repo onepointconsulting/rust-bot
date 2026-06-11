@@ -267,13 +267,13 @@ pub struct AgentLoop {
     bus: Arc<MessageBus>,
     provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
-    model: String,
+    pub model: String,
     max_iterations: u32,
-    context_window_tokens: u32,
+    pub context_window_tokens: u64,
     context_block_limit: Option<u32>,
     max_tool_result_chars: u32,
     provider_retry_mode: String,
-    web_config: WebToolsConfig,
+    pub web_config: WebToolsConfig,
     exec_config: ExecToolConfig,
     cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
@@ -286,8 +286,8 @@ pub struct AgentLoop {
     mcp_sessions: Mutex<Vec<LoadedMcpTools>>,
     channels_config: Option<ChannelsConfig>,
     timezone: Option<String>,
-    start_time: SystemTime,
-    last_usage: Mutex<HashMap<String, u64>>,
+    pub start_time: SystemTime,
+    pub last_usage: Mutex<HashMap<String, u64>>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
     tools: Arc<ToolRegistry>,
@@ -305,8 +305,8 @@ pub struct AgentLoop {
     max: usize,
     running: AtomicBool,
     concurrency_gate: Option<Arc<Semaphore>>,
-    consolidator: Arc<Consolidator>,
-    dream: Arc<Dream>,
+    pub consolidator: Arc<Consolidator>,
+    pub dream: Arc<Dream>,
     commands: CommandRouter,
 }
 
@@ -319,7 +319,7 @@ impl AgentLoop {
         workspace: PathBuf,
         model: Option<String>,
         max_iterations: Option<u32>,
-        context_window_tokens: Option<u32>,
+        context_window_tokens: Option<u64>,
         context_block_limit: Option<u32>,
         max_tool_result_chars: Option<u32>,
         provider_retry_mode: Option<ProviderRetryMode>,
@@ -922,6 +922,8 @@ impl AgentLoop {
         }
     }
 
+    
+
     /// Handle system-channel messages (checkpoint restore + consolidation).
     ///
     /// Kept separate from [`Self::process_message`] so spawned `dispatch`
@@ -1020,14 +1022,12 @@ impl AgentLoop {
         }
 
         // Schedule background consolidation (Python's `_schedule_background`).
-        // The provider is now `Send`, so a plain tokio::spawn suffices.
-        {
-            let consolidator = Arc::clone(&self.consolidator);
-            let key = snapshot.key.clone();
-            tokio::spawn(async move {
-                consolidator.maybe_consolidate_by_tokens(&key).await;
-            });
-        }
+        let consolidator = Arc::clone(&self.consolidator);
+        let key = snapshot.key.clone();
+        self.schedule_background(async move {
+            consolidator.maybe_consolidate_by_tokens(&key).await;
+        })
+        .await;
 
         Some(OutboundMessage {
             channel: channel.to_string(),
@@ -1328,13 +1328,14 @@ impl AgentLoop {
         {
             log::error!("Failed to save session after processing message: {res}");
         }
-        {
-            let consolidator = Arc::clone(&self.consolidator);
-            let key = key.clone();
-            tokio::spawn(async move {
-                consolidator.maybe_consolidate_by_tokens(&key).await;
-            });
-        }
+        let consolidator = Arc::clone(&self.consolidator);
+        let consolidate_key = key.clone();
+        self.schedule_background(async move {
+            consolidator
+                .maybe_consolidate_by_tokens(&consolidate_key)
+                .await;
+        })
+        .await;
         if let Some(message_tool) = self.tools.get("message") {
             if let Some(message_tool) =
                 (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
@@ -1484,30 +1485,78 @@ impl AgentLoop {
         session.metadata.remove(AgentLoop::RUNTIME_CHECKPOINT_KEY);
     }
 
-    /// Schedule a future as a tracked background task (drained on shutdown).
-    fn schedule_background<F>(&self, future: F)
+    /// Schedule a future as a tracked background task (drained by [`Self::close_mcp`]).
+    ///
+    /// Returns once the task handle is registered; the future itself runs in the
+    /// background (Python's `_schedule_background` analog).
+    async fn schedule_background<F>(&self, future: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        let background_tasks = Arc::clone(&self.background_tasks);
         let task_id = self.next_background_task_id.fetch_add(1, Ordering::Relaxed);
+        let bg = Arc::clone(&self.background_tasks);
 
-        tokio::spawn(async move {
-            let bg = Arc::clone(&background_tasks);
-            let id = task_id;
-            let mut tasks = background_tasks.lock().await;
-            let handle = tokio::spawn(async move {
-                future.await;
-                let mut tasks = bg.lock().await;
-                tasks.remove(&id);
-            });
-            tasks.insert(task_id, handle);
+        let handle = tokio::spawn(async move {
+            future.await;
+            let mut tasks = bg.lock().await;
+            tasks.remove(&task_id);
         });
+
+        self.background_tasks.lock().await.insert(task_id, handle);
+    }
+
+    /// Drain pending background tasks, then close MCP connections.
+    ///
+    /// Mirrors Python's `close_mcp`: `asyncio.gather(*_background_tasks)` followed
+    /// by `_mcp_stack.aclose()`. MCP sessions use RAII — clearing the vec drops
+    /// [`LoadedMcpTools`] and closes each connection.
+    pub async fn close_mcp(&self) {
+        let handles: Vec<JoinHandle<()>> = {
+            let mut tasks = self.background_tasks.lock().await;
+            tasks.drain().map(|(_, handle)| handle).collect()
+        };
+        for handle in handles {
+            let _ = handle.await;
+        }
+
+        self.mcp_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clear();
+        self.mcp_connected.store(false, Ordering::Relaxed);
     }
 
     fn stop(&mut self) {
         self.running.store(false, Ordering::Relaxed);
         log::info!("Agent loop stopping ... shutting down");
+    }
+
+    async fn process_direct(
+        self: Arc<Self>,
+        content: &str,
+        session_key: Option<&str>,
+        channel: Option<&str>,
+        chat_id: Option<&str>,
+        on_progress: Option<ProgressCallback>,
+        on_stream: Option<StreamCallback>,
+        on_stream_end: Option<StreamEndCallback>
+    ) -> Option<OutboundMessage> {
+        let session_key = session_key.unwrap_or("cli:direct");
+        let channel = channel.unwrap_or("cli");
+        let chat_id = chat_id.unwrap_or("direct");
+
+        self.connect_mcp().await;
+        let msg = InboundMessage {
+            content: content.to_string(),
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            sender_id: "user".to_string(),
+            media: vec![],
+            timestamp: Utc::now(),
+            session_key_override: None,
+            metadata: HashMap::new(),
+        };
+        self.process_message(msg, session_key, on_progress, on_stream, on_stream_end).await
     }
 }
 

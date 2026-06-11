@@ -52,7 +52,7 @@ pub struct AgentRunSpec {
     pub fail_on_tool_error: bool,
     pub workspace: Option<PathBuf>,
     pub session_key: Option<String>,
-    pub context_window_tokens: Option<u32>,
+    pub context_window_tokens: Option<u64>,
     pub context_block_limit: Option<u32>,
     pub provider_retry_mode: String,
     pub progress_callback: Option<Arc<dyn Fn(Value) + Send + Sync>>,
@@ -460,7 +460,7 @@ impl AgentRunner {
             .await
     }
 
-    fn usage_dict(usage: Option<HashMap<String, i64>>) -> HashMap<String, i64> {
+    fn usage_dict(usage: Option<HashMap<String, u64>>) -> HashMap<String, u64> {
         usage.unwrap_or_default()
     }
 
@@ -783,7 +783,7 @@ impl AgentRunner {
             ctx.usage = response
                 .usage
                 .iter()
-                .map(|(k, &v)| (k.clone(), v as i64))
+                .map(|(k, &v)| (k.clone(), v as u64))
                 .collect();
             ctx.response = Some(response.clone());
 

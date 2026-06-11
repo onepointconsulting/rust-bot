@@ -7,3 +7,6 @@ pub mod security;
 pub mod session;
 pub mod cron;
 pub mod command;
+
+// src/lib.rs (or a small version.rs)
+pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");

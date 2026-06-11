@@ -680,7 +680,7 @@ pub struct Consolidator {
     provider: Arc<dyn LLMProviderDyn>,
     model: String,
     sessions: Arc<Mutex<SessionManager>>,
-    context_window_tokens: u32,
+    context_window_tokens: u64,
     message_builder: Box<dyn MessageBuilder>,
     max_completion_tokens: usize,
     locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
@@ -695,7 +695,7 @@ impl Consolidator {
         provider: Arc<dyn LLMProviderDyn>,
         model: String,
         sessions: Arc<Mutex<SessionManager>>,
-        context_window_tokens: u32,
+        context_window_tokens: u64,
         message_builder: Box<dyn MessageBuilder>,
         max_completion_tokens: usize,
     ) -> Self {
@@ -738,7 +738,7 @@ impl Consolidator {
 
     /// Estimate current prompt size for the normal session history view.
     /// "if we sent a request right now, how many tokens would the prompt be?"
-    pub fn estimate_session_prompt_tokens(&self, session: &Session) -> (usize, String) {
+    pub fn estimate_session_prompt_tokens(&self, session: &Session) -> (u64, String) {
         // Same default window as `session.get_history(None)` (500); `Some(0)` is also normalized to that cap.
         let history = session.get_history(None);
         let (channel, chat_id) = session
@@ -755,10 +755,11 @@ impl Consolidator {
             chat_id,
             "user",
         );
-        return estimate_prompt_tokens_chain(
+        let (estimated, source) = estimate_prompt_tokens_chain(
             probe_messages.as_slice(),
             Some(self.message_builder.get_definitions().as_slice()),
         );
+        (estimated as u64, source)
     }
 
     /// Summarize messages via LLM and append to history.jsonl.
@@ -852,7 +853,7 @@ impl Consolidator {
         if estimated == 0 {
             return;
         }
-        if estimated < budget {
+        if estimated < budget as u64 {
             log::debug!(
                 "Token consolidation idle {session_key}: {estimated}/{window} via {source}",
                 window = self.context_window_tokens,
@@ -861,7 +862,7 @@ impl Consolidator {
         }
 
         for round_num in 0..Consolidator::MAX_CONSOLIDATION_ROUNDS {
-            if estimated <= target {
+            if estimated <= target as u64 {
                 return;
             }
 
@@ -1318,7 +1319,7 @@ mod tests {
     fn test_consolidator_with_ctx(
         tmp: &TempDir,
         provider: Arc<dyn LLMProviderDyn>,
-        context_window_tokens: u32,
+        context_window_tokens: u64,
         max_completion_tokens: usize,
     ) -> Consolidator {
         Consolidator::new(

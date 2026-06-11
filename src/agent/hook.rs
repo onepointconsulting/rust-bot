@@ -15,7 +15,7 @@ pub struct AgentHookContext {
     pub iteration: usize,
     pub messages: Vec<serde_json::Value>,
     pub response: Option<LLMResponse>,
-    pub usage: HashMap<String, i64>,
+    pub usage: HashMap<String, u64>,
     pub tool_calls: Vec<ToolCallRequest>,
     pub tool_results: Vec<serde_json::Value>,
     pub tool_events: Vec<HashMap<String, String>>,

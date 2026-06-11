@@ -204,7 +204,7 @@ fn default_agent_workspace() -> String { "~/.rust-bot/workspace".to_string() }
 fn default_agent_model() -> String { "anthropic/claude-opus-4-6".to_string() }
 fn default_agent_provider() -> String { "auto".to_string() }
 fn default_agent_max_tokens() -> u32 { 8192 }
-fn default_agent_context_window_tokens() -> u32 { 65_536 }
+fn default_agent_context_window_tokens() -> u64 { 65_536 }
 fn default_agent_temperature() -> f32 { 0.1 }
 fn default_agent_max_tool_iterations() -> u32 { 100 }
 fn default_agent_max_tool_result_chars() -> u32 { 16_000 }
@@ -236,7 +236,7 @@ pub struct AgentsConfig {
 
     #[serde(alias = "context_window_tokens", default = "default_agent_context_window_tokens")]
     #[garde(range(min = 1))]
-    pub context_window_tokens: u32,
+    pub context_window_tokens: u64,
 
     #[serde(alias = "context_block_limit", skip_serializing)]
     #[garde(skip)]
@@ -473,7 +473,7 @@ impl Default for GatewayConfig {
 
 // ── WebSearchConfig ───────────────────────────────────────────────────────────
 
-fn default_web_search_provider() -> String { "brave".to_string() }
+fn default_web_search_provider() -> String { "duckduckgo".to_string() }
 fn default_web_search_max_results() -> u32 { 5 }
 fn default_web_search_timeout() -> u32 { 30 }
 
@@ -899,7 +899,7 @@ pub struct AgentDefaults {
     pub model: String,
     pub provider: String,
     pub max_tokens: u32,
-    pub context_window_tokens: u32,
+    pub context_window_tokens: u64,
     pub context_block_limit: Option<u32>,
     pub temperature: f32,
     pub max_tool_iterations: u32,
@@ -1385,7 +1385,7 @@ mod tests {
     #[test]
     fn test_web_search_defaults() {
         let cfg = WebSearchConfig::default();
-        assert_eq!(cfg.provider, "brave");
+        assert_eq!(cfg.provider, "duckduckgo");
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.base_url, "");
         assert_eq!(cfg.max_results, 5);
@@ -1448,7 +1448,7 @@ mod tests {
         assert!(cfg.enable);
         assert_eq!(cfg.proxy, None);
         // nested search should carry WebSearchConfig defaults
-        assert_eq!(cfg.search.provider, "brave");
+        assert_eq!(cfg.search.provider, "duckduckgo");
         assert_eq!(cfg.search.max_results, 5);
         assert_eq!(cfg.search.timeout, 30);
         assert!(cfg.validate().is_ok());
@@ -1460,7 +1460,7 @@ mod tests {
         let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.enable);
         assert_eq!(cfg.proxy, None);
-        assert_eq!(cfg.search.provider, "brave");
+        assert_eq!(cfg.search.provider, "duckduckgo");
         assert!(cfg.validate().is_ok());
     }
 

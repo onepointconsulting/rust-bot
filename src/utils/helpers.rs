@@ -561,10 +561,10 @@ pub fn build_status_content(
     version: &str,
     model: &str,
     start_time_secs: f64,
-    last_usage: &HashMap<String, i64>,
-    context_window_tokens: i64,
+    last_usage: &HashMap<String, u64>,
+    context_window_tokens: u64,
     session_msg_count: usize,
-    context_tokens_estimate: i64,
+    context_tokens_estimate: u64,
     search_usage_text: Option<&str>,
 ) -> String {
     let uptime_s = (unix_now() - start_time_secs).max(0.0) as u64;
@@ -577,9 +577,8 @@ pub fn build_status_content(
     let last_in = last_usage.get("prompt_tokens").copied().unwrap_or(0);
     let last_out = last_usage.get("completion_tokens").copied().unwrap_or(0);
     let cached = last_usage.get("cached_tokens").copied().unwrap_or(0);
-    let ctx_total = context_window_tokens.max(0);
-    let ctx_pct = if ctx_total > 0 {
-        (context_tokens_estimate * 100 / ctx_total) as u64
+    let ctx_pct = if context_window_tokens > 0 {
+        (context_tokens_estimate.max(0) as u64 * 100 / context_window_tokens as u64) as u64
     } else {
         0
     };
@@ -588,8 +587,8 @@ pub fn build_status_content(
     } else {
         context_tokens_estimate.to_string()
     };
-    let ctx_total_str = if ctx_total > 0 {
-        format!("{}k", ctx_total / 1024)
+    let ctx_total_str = if context_window_tokens > 0 {
+        format!("{}k", context_window_tokens / 1024)
     } else {
         "n/a".to_string()
     };
@@ -1048,8 +1047,8 @@ mod tests {
     #[test]
     fn test_build_status_content_structure() {
         let mut usage = HashMap::new();
-        usage.insert("prompt_tokens".to_string(), 100_i64);
-        usage.insert("completion_tokens".to_string(), 50_i64);
+        usage.insert("prompt_tokens".to_string(), 100);
+        usage.insert("completion_tokens".to_string(), 50);
         let status = build_status_content(
             "1.0", "gpt-4o",
             unix_now() - 130.0,

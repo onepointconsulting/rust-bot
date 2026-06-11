@@ -1,11 +1,11 @@
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, MutexGuard};
 
 use async_trait::async_trait;
 
 use crate::agent::agent_loop::AgentLoop;
 use crate::bus::events::{InboundMessage, OutboundMessage};
-use crate::session::manager::Session;
+use crate::session::manager::{Session, SessionManager};
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
     async fn handle(&self, ctx: &CommandContext) -> OutboundMessage;
@@ -56,6 +56,27 @@ impl CommandContext {
             args: args.into(),
             agent_loop,
         }
+    }
+
+    /// Lock the agent loop's session manager and resolve the command session.
+    ///
+    /// Uses [`Self::session`] when set; otherwise loads or creates the session
+    /// for [`Self::key`] from the manager.
+    pub fn lock_session_manager_and_session<'a>(
+        &'a self,
+        agent_loop: &'a AgentLoop,
+    ) -> (MutexGuard<'a, SessionManager>, Session) {
+        let mut session_manager = agent_loop
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = match &self.session {
+            Some(session) => session.clone(),
+            None => session_manager
+                .get_or_create_session(&self.key)
+                .clone(),
+        };
+        (session_manager, session)
     }
 }
 
