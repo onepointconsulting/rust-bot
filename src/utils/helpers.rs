@@ -1,5 +1,6 @@
 /// Utility functions for rust-bot.
 use std::collections::HashMap;
+use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -10,7 +11,8 @@ use regex::Regex;
 use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
-use crate::utils::prompt_templates::resolve_templates_root;
+use crate::agent::context::BOOTSTRAP_FILES;
+use crate::utils::gitstore::GitStore;
 use tiktoken_rs::{CoreBPE, cl100k_base};
 
 static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
@@ -599,7 +601,7 @@ pub fn build_status_content(
     }
 
     let mut lines = vec![
-        format!("🐈 nanobot v{}", version),
+        format!("🐈 rust-bot v{}", version),
         format!("🧠 Model: {}", model),
         token_line,
         format!("📚 Context: {}/{} ({}%)", ctx_used_str, ctx_total_str, ctx_pct),
@@ -614,73 +616,145 @@ pub fn build_status_content(
 
 // ── workspace template sync ───────────────────────────────────────────────────
 
+#[derive(Debug)]
+pub enum TemplatesSyncError {
+    TemplatesUnavailable { cwd: PathBuf, workspace: PathBuf },
+}
+
+impl fmt::Display for TemplatesSyncError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::TemplatesUnavailable { cwd, workspace } => write!(
+                f,
+                "Templates unavailable: no templates/ in {} and workspace {} is not fully seeded \
+                 (requires AGENTS.md, SOUL.md, TOOLS.md, USER.md)",
+                cwd.display(),
+                workspace.display()
+            ),
+        }
+    }
+}
+
+impl std::error::Error for TemplatesSyncError {}
+
+/// Resolve the `templates/` directory relative to the current working directory.
+fn sync_templates_root() -> PathBuf {
+    std::env::current_dir()
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join("templates")
+}
+
+/// True when all bootstrap workspace files already exist.
+pub fn workspace_is_seeded(workspace: &Path) -> bool {
+    BOOTSTRAP_FILES
+        .iter()
+        .all(|name| workspace.join(name).is_file())
+}
+
+fn write_dest_if_missing(
+    workspace: &Path,
+    dest: &Path,
+    content: Option<&str>,
+    added: &mut Vec<String>,
+) {
+    if dest.exists() {
+        return;
+    }
+    if let Some(parent) = dest.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let write_ok = match content {
+        Some(text) => fs::write(dest, text).is_ok(),
+        None => std::fs::File::create(dest).is_ok(),
+    };
+    if write_ok {
+        if let Ok(rel) = dest.strip_prefix(workspace) {
+            added.push(rel.to_string_lossy().into_owned());
+        }
+    }
+}
+
 /// Sync bundled templates to the workspace. Only creates missing files.
 ///
 /// Returns the list of relative paths that were created.
-pub fn sync_workspace_templates(workspace: &Path, silent: bool) -> Vec<String> {
-    let templates_root = resolve_templates_root();
-    if !templates_root.is_dir() {
-        return vec![];
+pub fn sync_workspace_templates(
+    workspace: &Path,
+    silent: bool,
+) -> Result<Vec<String>, TemplatesSyncError> {
+    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    let templates_root = sync_templates_root();
+    let has_source = templates_root.is_dir();
+
+    if !has_source && !workspace_is_seeded(workspace) {
+        return Err(TemplatesSyncError::TemplatesUnavailable {
+            cwd,
+            workspace: workspace.to_path_buf(),
+        });
     }
 
     let mut added: Vec<String> = Vec::new();
 
-    let write_if_missing = |src: &Path, dest: &Path, added: &mut Vec<String>| {
-        if dest.exists() {
-            return;
-        }
-        if let Some(parent) = dest.parent() {
-            let _ = fs::create_dir_all(parent);
-        }
-        match fs::read_to_string(src) {
-            Ok(content) => {
-                if fs::write(dest, content).is_ok() {
-                    if let Ok(rel) = dest.strip_prefix(workspace) {
-                        added.push(rel.to_string_lossy().into_owned());
+    if has_source {
+        // Copy top-level .md files
+        if let Ok(entries) = fs::read_dir(&templates_root) {
+            for entry in entries.filter_map(|e| e.ok()) {
+                let src = entry.path();
+                let name = src
+                    .file_name()
+                    .unwrap_or_default()
+                    .to_string_lossy()
+                    .into_owned();
+                if name.ends_with(".md") && !name.starts_with('.') {
+                    let dest = workspace.join(&name);
+                    if let Ok(content) = fs::read_to_string(&src) {
+                        write_dest_if_missing(workspace, &dest, Some(&content), &mut added);
                     }
                 }
             }
-            Err(_) => {}
         }
-    };
 
-    // Copy top-level .md files
-    if let Ok(entries) = fs::read_dir(&templates_root) {
-        for entry in entries.filter_map(|e| e.ok()) {
-            let src = entry.path();
-            let name = src.file_name().unwrap_or_default().to_string_lossy().into_owned();
-            if name.ends_with(".md") && !name.starts_with('.') {
-                write_if_missing(&src, &workspace.join(&name), &mut added);
+        // Copy memory/MEMORY.md
+        let memory_src = templates_root.join("memory").join("MEMORY.md");
+        if memory_src.exists() {
+            if let Ok(content) = fs::read_to_string(&memory_src) {
+                write_dest_if_missing(
+                    workspace,
+                    &workspace.join("memory").join("MEMORY.md"),
+                    Some(&content),
+                    &mut added,
+                );
             }
         }
     }
 
-    // Copy memory/MEMORY.md
-    let memory_src = templates_root.join("memory").join("MEMORY.md");
-    if memory_src.exists() {
-        write_if_missing(&memory_src, &workspace.join("memory").join("MEMORY.md"), &mut added);
-    }
-
     // Touch memory/history.jsonl
-    let history = workspace.join("memory").join("history.jsonl");
-    if !history.exists() {
-        let _ = fs::create_dir_all(history.parent().unwrap());
-        let _ = fs::File::create(&history);
-        if let Ok(rel) = history.strip_prefix(workspace) {
-            added.push(rel.to_string_lossy().into_owned());
-        }
-    }
+    write_dest_if_missing(
+        workspace,
+        &workspace.join("memory").join("history.jsonl"),
+        None,
+        &mut added,
+    );
 
     // Ensure skills/ dir exists
     let _ = fs::create_dir_all(workspace.join("skills"));
 
     if !added.is_empty() && !silent {
         for name in &added {
-            log::info!("Created {}", name);
+            eprintln!("  Created {name}");
         }
     }
 
-    added
+    let git = GitStore::new(
+        workspace.to_path_buf(),
+        vec![
+            "SOUL.md".to_string(),
+            "USER.md".to_string(),
+            "memory/MEMORY.md".to_string(),
+        ],
+    );
+    let _ = git.init();
+
+    Ok(added)
 }
 
 pub fn expand_tilde_path(path: &str) -> std::borrow::Cow<'_, str> {
@@ -1116,10 +1190,28 @@ mod tests {
 
     // ── sync_workspace_templates ──────────────────────────────────────────────
 
+    struct RestoreCwd {
+        original: PathBuf,
+    }
+
+    impl RestoreCwd {
+        fn change_to(path: &Path) -> Self {
+            let original = std::env::current_dir().unwrap();
+            std::env::set_current_dir(path).unwrap();
+            Self { original }
+        }
+    }
+
+    impl Drop for RestoreCwd {
+        fn drop(&mut self) {
+            let _ = std::env::set_current_dir(&self.original);
+        }
+    }
+
     #[test]
     fn test_sync_workspace_templates_creates_files() {
         let tmp = tempdir().unwrap();
-        let added = sync_workspace_templates(tmp.path(), true);
+        let added = sync_workspace_templates(tmp.path(), true).unwrap();
         assert!(!added.is_empty(), "expected files to be created");
         assert!(tmp.path().join("memory").join("history.jsonl").exists());
         assert!(tmp.path().join("skills").is_dir());
@@ -1128,10 +1220,71 @@ mod tests {
     #[test]
     fn test_sync_workspace_templates_idempotent() {
         let tmp = tempdir().unwrap();
-        let first = sync_workspace_templates(tmp.path(), true);
-        let second = sync_workspace_templates(tmp.path(), true);
+        let first = sync_workspace_templates(tmp.path(), true).unwrap();
+        let second = sync_workspace_templates(tmp.path(), true).unwrap();
         assert!(!first.is_empty());
-        assert!(second.is_empty(), "second sync should add nothing: {:?}", second);
+        assert!(
+            second.is_empty(),
+            "second sync should add nothing: {:?}",
+            second
+        );
+    }
+
+    #[test]
+    fn test_sync_git_initialized() {
+        let tmp = tempdir().unwrap();
+        sync_workspace_templates(tmp.path(), true).unwrap();
+        assert!(tmp.path().join(".git").is_dir());
+    }
+
+    #[test]
+    fn test_sync_aborts_without_source_or_seed() {
+        let empty_cwd = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        let _guard = RestoreCwd::change_to(empty_cwd.path());
+
+        let err = sync_workspace_templates(workspace.path(), true).unwrap_err();
+        assert!(matches!(
+            err,
+            TemplatesSyncError::TemplatesUnavailable { .. }
+        ));
+    }
+
+    #[test]
+    fn test_sync_ok_when_workspace_seeded() {
+        let empty_cwd = tempdir().unwrap();
+        let workspace = tempdir().unwrap();
+        for name in BOOTSTRAP_FILES {
+            fs::write(workspace.path().join(name), "# test").unwrap();
+        }
+
+        let _guard = RestoreCwd::change_to(empty_cwd.path());
+        let added = sync_workspace_templates(workspace.path(), true).unwrap();
+        for name in &added {
+            println!("Created {name}");
+        }
+        assert!(
+            added.contains(&"memory/history.jsonl".to_string()) || added.contains(&"memory\\history.jsonl".to_string()),
+            "expected history.jsonl to be created: {:?}",
+            added
+        );
+        assert!(workspace.path().join(".git").is_dir());
+    }
+
+    #[test]
+    fn test_workspace_is_seeded_requires_all_bootstrap_files() {
+        let tmp = tempdir().unwrap();
+        assert!(!workspace_is_seeded(tmp.path()));
+        for name in BOOTSTRAP_FILES {
+            fs::write(tmp.path().join(name), "# test").unwrap();
+            if name != BOOTSTRAP_FILES[BOOTSTRAP_FILES.len() - 1] {
+                assert!(
+                    !workspace_is_seeded(tmp.path()),
+                    "should not be seeded with only partial files"
+                );
+            }
+        }
+        assert!(workspace_is_seeded(tmp.path()));
     }
 
     #[test]

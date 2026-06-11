@@ -723,7 +723,7 @@ impl AgentLoop {
             if self.commands.is_priority(raw) {
                 // Priority commands (/stop, /restart) run inline so they can't be
                 // queued behind the very work they're meant to interrupt.
-                let ctx = CommandContext::new(msg.clone(), None, msg.session_key(), raw);
+                let ctx = CommandContext::with_options(msg.clone(), None, msg.session_key(), raw, "", Some(Arc::clone(self)));
                 if let Some(result) = self.commands.dispatch_priority(&ctx).await {
                     if let Err(error) = self.bus.publish_outbound(result) {
                         log::error!("Failed to publish outbound message: {error}");

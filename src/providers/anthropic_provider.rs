@@ -27,7 +27,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    const DEFAULT_MODEL: &str = "claude-sonnet-4-20250514";
+    const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
 
     fn strip_prefix(model: &str) -> String {
         model

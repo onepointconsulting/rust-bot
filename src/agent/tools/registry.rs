@@ -1,5 +1,4 @@
 /// Tool registry for dynamic tool management.
-use async_trait::async_trait;
 use std::collections::HashMap;
 use std::sync::Arc;
 
@@ -170,10 +169,12 @@ impl Default for ToolRegistry {
 mod tests {
     use super::*;
     use crate::agent::tools::base::Tool;
+    use async_trait::async_trait;
 
     // ── test fixtures ─────────────────────────────────────────────────────────
 
     struct EchoTool;
+
 
     #[async_trait]
     impl Tool for EchoTool {

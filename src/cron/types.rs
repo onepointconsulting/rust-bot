@@ -210,7 +210,7 @@ mod tests {
     }
 
     #[test]
-    fn deserializes_nanobot_jobs_json_shape() {
+    fn deserializes_rust_bot_jobs_json_shape() {
         let json = r#"{
             "version": 1,
             "jobs": [{

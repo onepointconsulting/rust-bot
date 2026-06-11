@@ -256,7 +256,6 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.priority("/status", Arc::new(CmdStatus));
     router.exact("/new", Arc::new(CmdNew));
     router.exact("/dream", Arc::new(CmdDream));
-    router.exact("/status", Arc::new(CmdStatus));
 }
 
 #[cfg(test)]

@@ -39,6 +39,8 @@ which = "6"
 glob = "0.3.3"
 html-escape = "0.2.13"
 dom_smoothie = "0.17.0"
+clap = { version = "4", features = ["derive"] }
+anstyle = "1"
 
 [dev-dependencies]
 tempfile = "3"

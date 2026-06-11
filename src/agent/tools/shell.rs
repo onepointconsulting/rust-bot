@@ -558,7 +558,8 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
 }
 
 mod tests {
-    use super::*;
+    use crate::agent::tools::shell::{IS_WINDOWS, ShellTool};
+
 
     #[test]
     fn test_extract_absolute_paths() {

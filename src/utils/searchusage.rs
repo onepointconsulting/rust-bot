@@ -88,7 +88,7 @@ impl SearchUsageInfo {
 
 pub async fn fetch_search_usage(
     provider: &str,
-    api_key: Option<&str>,
+    _api_key: Option<&str>,
 ) -> SearchUsageInfo {
     let p = if provider.is_empty() {
         "duckduckgo"

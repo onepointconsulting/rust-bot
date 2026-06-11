@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::LazyLock;
 
-use serde_json::json;
-
 use crate::providers::base::ToolCallRequest;
 use crate::utils::path::abbreviate_path;
 
@@ -281,6 +279,7 @@ fn fmt_fallback(tc: &ToolCallRequest) -> String {
 mod tests {
     use super::*;
     use std::collections::HashMap;
+    use serde_json::json;
 
     fn tool_call(name: &str, args: HashMap<String, serde_json::Value>) -> ToolCallRequest {
         tool_call_with_id("call_1", name, args)

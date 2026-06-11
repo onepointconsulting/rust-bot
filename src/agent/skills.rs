@@ -1,5 +1,4 @@
 use regex::Regex;
-use serde_json::map::Values;
 use std::sync::LazyLock;
 use std::{
     collections::{HashMap, HashSet},
@@ -182,7 +181,7 @@ impl SkillsLoader {
     /// Get skills marked as `always=true` that also meet their requirements.
     ///
     /// An "always" skill is one where either:
-    /// - the parsed rust-bot/nanobot/openclaw JSON metadata (in the `metadata` frontmatter field)
+    /// - the parsed rust-bot/openclaw JSON metadata (in the `metadata` frontmatter field)
     ///   contains a truthy `always` value, or
     /// - the raw frontmatter has a truthy top-level `always` key.
     pub fn get_always_skills(&self) -> Vec<String> {

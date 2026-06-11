@@ -101,24 +101,6 @@ impl CompositeHook {
     }
 }
 
-/// Run `$call` for each hook with panic isolation, logging errors.
-macro_rules! for_each_hook_safe {
-    ($self:expr, $method:literal, $call:expr) => {{
-        for hook in &$self.hooks {
-            match AssertUnwindSafe($call(hook)).catch_unwind().await {
-                Ok(()) => {}
-                Err(e) => {
-                    log::error!(
-                        "AgentHook.{} panicked: {:?}",
-                        $method,
-                        e.downcast_ref::<&str>().copied().unwrap_or("(non-string panic)")
-                    );
-                }
-            }
-        }
-    }};
-}
-
 #[async_trait]
 impl AgentHook for CompositeHook {
     fn wants_streaming(&self) -> bool {

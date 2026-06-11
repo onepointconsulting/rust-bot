@@ -94,7 +94,6 @@ impl OpenAICompatProvider {
     pub fn coerce_map(
         value: &serde_json::Value,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
-        use serde_json::{Map, Value};
 
         // If value is null, return None
         if value.is_null() {
@@ -208,7 +207,7 @@ impl OpenAICompatProvider {
     }
 
     fn uses_openrouter_attribution(spec: Option<&ProviderSpec>, api_base: Option<&str>) -> bool {
-        // Apply Nanobot attribution headers to OpenRouter requests by default.
+        // Apply Rust-bot attribution headers to OpenRouter requests by default.
         if let Some(spec) = spec {
             if spec.name == "openrouter" {
                 return true;

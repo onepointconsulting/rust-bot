@@ -75,7 +75,7 @@
       "enable": true,
       "proxy": null,
       "search": {
-        "provider": "brave",
+        "provider": "duckduckgo",
         "apiKey": "",
         "baseUrl": "",
         "maxResults": 5,

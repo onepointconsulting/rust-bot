@@ -18,7 +18,7 @@ pub(crate) fn now_ms() -> i64 {
 
 /// Next cron fire time strictly after `now_ms` for a cron expression (croniter parity).
 fn next_cron_run(expr: &str, now_ms: i64, tz: Option<&str>) -> Option<i64> {
-    // Five-field nanobot expressions use Cron::new (not bare FromStr in croner 2.x).
+    // Five-field rust-bot expressions use Cron::new (not bare FromStr in croner 2.x).
     let cron = Cron::new(expr).parse().ok()?;
     let secs = now_ms.div_euclid(1000);
     let nanos = (now_ms.rem_euclid(1000) * 1_000_000) as u32;

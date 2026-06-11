@@ -110,7 +110,7 @@ impl GitStore {
         };
 
         let sig = Self::signature();
-        match repo.commit(Some("HEAD"), &sig, &sig, "init: nanobot memory store", &tree, &[]) {
+        match repo.commit(Some("HEAD"), &sig, &sig, "init: rust-bot memory store", &tree, &[]) {
             Ok(_) => {
                 log::info!("Git store initialized at {:?}", self.workspace);
                 true

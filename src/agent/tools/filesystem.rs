@@ -5,7 +5,7 @@ use super::base::Tool;
 use globwalk::GlobWalkerBuilder;
 
 #[derive(Debug)]
-pub(crate) enum ResolvePathError {
+pub enum ResolvePathError {
     HomeDirUnavailable,
     NotUnderAllowedDir { path: PathBuf, allowed: PathBuf },
     NotUnderAnyAllowedDir { path: PathBuf }
