@@ -1,14 +1,29 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
-use log::LevelFilter;
+use futures::lock::Mutex;
+use serde_json::Value;
+use termimad::MadSkin;
 
+use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
 use crate::bus::queue::MessageBus;
+use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
-use crate::config::schema::Config;
-use crate::utils::helpers::{ensure_dir, sync_workspace_templates, TemplatesSyncError};
+use crate::config::log::init_runtime_logging;
+use crate::config::schema::{ChannelsConfig, Config};
+use crate::cron::CronService;
+use crate::providers::anthropic_provider::AnthropicProvider;
+use crate::providers::base::{LLMProvider, LLMProviderDyn};
+use crate::providers::openai_compat_provider::OpenAICompatProvider;
+use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
+use crate::utils::restart::{
+    consume_restart_notice_from_env, format_restart_completed_message,
+    should_show_cli_restart_notice,
+};
 
 #[derive(Debug, Parser)]
 #[command(
@@ -80,7 +95,10 @@ impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             Self::InteractiveNotImplemented => {
-                write!(f, "Interactive mode is not yet implemented; use -m/--message")
+                write!(
+                    f,
+                    "Interactive mode is not yet implemented; use -m/--message"
+                )
             }
         }
     }
@@ -91,25 +109,52 @@ impl std::error::Error for CliError {}
 /// Print an error line to stderr (red when the terminal supports color).
 pub fn eprint_error(message: impl fmt::Display) {
     let style = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red)));
-    eprintln!(
-        "{}Error: {message}{}",
-        style.render(),
-        style.render_reset()
-    );
+    eprintln!("{}Error: {message}{}", style.render(), style.render_reset());
 }
 
-fn init_runtime_logging(logs: bool) {
-    let has_rust_log = std::env::var_os("RUST_LOG").is_some();
-    if !logs && !has_rust_log {
-        return;
-    }
+fn render_as_text(metadata: Option<&HashMap<String, Value>>) -> bool {
+    metadata
+        .and_then(|m| m.get("render_as"))
+        .and_then(Value::as_str)
+        == Some("text")
+}
 
-    let mut builder = env_logger::Builder::from_default_env();
-    // `--logs` without RUST_LOG: default to info. RUST_LOG wins when set.
-    if logs && !has_rust_log {
-        builder.filter_level(LevelFilter::Info);
+fn response_body(
+    content: &str,
+    render_markdown: bool,
+    metadata: Option<&HashMap<String, Value>>,
+) -> String {
+    if !render_markdown || render_as_text(metadata) {
+        return content.to_string();
     }
-    let _ = builder.try_init();
+    format!("{}", MadSkin::default().term_text(content))
+}
+
+/// Render assistant output with consistent terminal styling.
+pub fn print_agent_response(
+    response: &str,
+    render_markdown: bool,
+    metadata: Option<&HashMap<String, Value>>,
+) {
+    print_agent_response_with_header(response, render_markdown, metadata, true);
+}
+
+pub fn print_agent_response_with_header(
+    response: &str,
+    render_markdown: bool,
+    metadata: Option<&HashMap<String, Value>>,
+    show_header: bool,
+) {
+    if show_header {
+        let header = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Cyan)));
+        println!();
+        println!("{}rust-bot{}", header.render(), header.render_reset());
+    }
+    print!("{}", response_body(response, render_markdown, metadata));
+    println!();
+    if show_header {
+        println!();
+    }
 }
 
 /// Parse and dispatch CLI commands.
@@ -120,6 +165,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
 }
 
 async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
+    let session_id = args.session.clone();
     let markdown = args.markdown_enabled();
     let logs = args.logs_enabled();
     init_runtime_logging(logs);
@@ -134,21 +180,80 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         std::process::exit(2);
     }
     let bus = MessageBus::new();
+    let provider = create_provider(&config);
+
+    let cron_store_path = config.workspace_path().join("cron").join("jobs.json");
+    let cron_service = CronService::new(cron_store_path, None);
+
+    let agent_loop = AgentLoop::new(
+        Arc::new(bus),
+        provider,
+        workspace,
+        Some(config.agents.model.clone()),
+        Some(config.agents.max_tool_iterations),
+        Some(config.agents.context_window_tokens),
+        config.agents.context_block_limit,
+        Some(config.agents.max_tool_result_chars),
+        Some(config.agents.provider_retry_mode),
+        Some(config.tools.web.clone()),
+        Some(config.tools.exec),
+        Some(cron_service),
+        Some(config.tools.restrict_to_workspace),
+        None,
+        Some(config.tools.mcp_servers),
+        Some(config.channels.clone()),
+        Some(config.agents.timezone.clone()),
+        None,
+    );
+    if let Some(restart_notice) = consume_restart_notice_from_env() {
+        if should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
+            print_agent_response(
+                &format_restart_completed_message(&restart_notice.started_at_raw),
+                false,
+                None,
+            );
+        }
+    }
 
     match args.message {
-        Some(message) => {
+        Some(message) if !message.is_empty() => {
             log::info!("message={message}");
-            // Agent loop wiring is a follow-up; parsing validated here.
-            eprintln!("(agent runtime not yet wired; received message: {message})");
+            let renderer = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
+            let on_progress = create_on_progress(config.channels.clone(), Arc::clone(&renderer));
+            let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
+            let response = Arc::new(agent_loop)
+                .process_direct(
+                    &message,
+                    Some(&session_id),
+                    None,
+                    None,
+                    Some(on_progress),
+                    Some(on_stream),
+                    Some(on_stream_end),
+                )
+                .await;
+            let streamed = renderer.lock().await.streamed;
+            let header_printed = renderer.lock().await.header_printed;
+            if !streamed {
+                renderer.lock().await.close().await;
+            }
+            if !streamed {
+                print_agent_response_with_header(
+                    &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
+                    markdown,
+                    response.as_ref().map(|r| &r.metadata),
+                    !header_printed,
+                );
+            }
             Ok(())
         }
+        Some(_) => Ok(()),
         None => Err(CliError::InteractiveNotImplemented),
     }
 }
 
 /// Load config and optionally override the active workspace.
 fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> Config {
-
     if let Some(config) = config {
         if !config.exists() {
             eprint_error(format!("Config file not found: {}", config.display()));
@@ -163,7 +268,7 @@ fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> C
                     loaded.agents.workspace = workspace.clone().to_string_lossy().into_owned();
                 }
                 loaded
-            },
+            }
             Err(e) => {
                 eprint_error(e);
                 std::process::exit(1);
@@ -173,4 +278,57 @@ fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> C
         eprint_error("No config file provided");
         std::process::exit(1);
     }
+}
+
+fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
+    let model = config.agents.model.clone();
+    let provider_name = config.agents.provider.clone();
+    match provider_name.as_str() {
+        "openai" | "openai_compat" | "openrouter" => Arc::new(OpenAICompatProvider::new(
+            Some(config.providers.custom.api_key.clone()),
+            config.providers.custom.api_base.clone(),
+            Some(model),
+            None,
+            None,
+        )),
+        "anthropic" => Arc::new(AnthropicProvider::new(
+            Some(config.providers.custom.api_key.clone()),
+            config.providers.custom.api_base.clone(),
+            Some(model),
+            None,
+            None,
+        )),
+        _ => {
+            eprint_error(format!("Invalid provider: {provider_name}"));
+            std::process::exit(3);
+        }
+    }
+}
+
+fn print_cli_progress_line(renderer: &mut StreamRenderer, text: &str) {
+    if text.trim().is_empty() {
+        return;
+    }
+    renderer.pause_spinner(|renderer| {
+        renderer.ensure_header();
+        let dim = Style::new().dimmed();
+        println!("  {}↳ {text}{}", dim.render(), dim.render_reset());
+    });
+}
+
+fn create_on_progress(channels: ChannelsConfig, renderer: Arc<Mutex<StreamRenderer>>) -> ProgressCallback {
+    Arc::new(move |content, tool_hint| {
+        let renderer = Arc::clone(&renderer);
+        Box::pin(async move {
+            if tool_hint {
+                if !channels.send_tool_hints {
+                    return;
+                }
+            } else if !channels.send_progress {
+                return;
+            }
+            let mut renderer_guard = renderer.lock().await;
+            print_cli_progress_line(&mut renderer_guard, &content);
+        })
+    })
 }

@@ -278,7 +278,7 @@ pub struct AgentLoop {
     cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
     pub session_manager: Arc<Mutex<SessionManager>>,
-    mcp_servers: HashMap<String, Arc<McpServerConfig>>,
+    mcp_servers: HashMap<String, McpServerConfig>,
     mcp_connected: AtomicBool,
     mcp_connecting: AtomicBool,
     /// Live MCP sessions. Holding these keeps the connections open; dropping
@@ -328,7 +328,7 @@ impl AgentLoop {
         cron_service: Option<Arc<CronService>>,
         restrict_to_workspace: Option<bool>,
         session_manager: Option<Arc<Mutex<SessionManager>>>,
-        mcp_servers: Option<HashMap<String, Arc<McpServerConfig>>>,
+        mcp_servers: Option<HashMap<String, McpServerConfig>>,
         channels_config: Option<ChannelsConfig>,
         timezone: Option<String>,
         hooks: Option<Vec<Arc<dyn AgentHook>>>,
@@ -572,7 +572,7 @@ impl AgentLoop {
     /// wrappers). Fails fast on the first server that cannot be reached; the
     /// sessions established so far are dropped as the error unwinds.
     async fn connect_mcp_servers(
-        servers: &HashMap<String, Arc<McpServerConfig>>,
+        servers: &HashMap<String, McpServerConfig>,
     ) -> Result<Vec<LoadedMcpTools>, LoadMcpToolsError> {
         let mut sessions = Vec::with_capacity(servers.len());
         for (name, config) in servers {
@@ -640,7 +640,8 @@ impl AgentLoop {
                     this.set_runtime_checkpoint(&key, payload);
                 }) as Arc<dyn Fn(Value) + Send + Sync>
             });
-
+        
+        log::info!("Running agent loop");
         let result = self
             .runner
             .run(AgentRunSpec {
@@ -1531,7 +1532,7 @@ impl AgentLoop {
         log::info!("Agent loop stopping ... shutting down");
     }
 
-    async fn process_direct(
+    pub async fn process_direct(
         self: Arc<Self>,
         content: &str,
         session_key: Option<&str>,

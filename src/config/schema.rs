@@ -49,7 +49,7 @@ fn default_transcription_provider() -> String { "groq".to_string() }
 /// Built-in and plugin channel configs are stored in `extra`. Each channel
 /// parses its own config independently. Per-channel `"streaming": true`
 /// enables streaming output (requires a `send_delta` implementation).
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelsConfig {
     /// Stream agent's text progress to the channel.

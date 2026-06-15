@@ -41,6 +41,8 @@ html-escape = "0.2.13"
 dom_smoothie = "0.17.0"
 clap = { version = "4", features = ["derive"] }
 anstyle = "1"
+termimad = "0.34.1"
+indicatif = "0.18.4"
 
 [dev-dependencies]
 tempfile = "3"

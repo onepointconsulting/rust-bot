@@ -518,6 +518,7 @@ impl AgentRunner {
         let mut fatal_error: Option<String> = None;
 
         for (result, event, error) in tool_results {
+            log::info!("Tool result: {}", result.chars().take(100).collect::<String>());
             results.push(result);
             events.push(event);
             if error.is_some() && fatal_error.is_none() {
@@ -803,6 +804,7 @@ impl AgentRunner {
                     response.reasoning_content.as_deref(),
                     thinking,
                 );
+                log::info!("Assistant message: {}", assistant_msg.clone().to_string().chars().take(400).collect::<String>());
                 messages.push(assistant_msg);
                 Self::emit_checkpoint(&spec, serde_json::json!({"type": "awaiting_tools"}));
 

@@ -68,6 +68,7 @@ Omitting `-m` / `--message` is reserved for a future interactive REPL (not yet i
 | `0` | Success |
 | `1` | Config or general CLI error |
 | `2` | Workspace templates unavailable (no `templates/` in the current working directory and the workspace is not fully seeded with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`) |
+| `3` | Invalid provider (unknown value in `agents.provider`) |
 
 Run from the project root (or any directory that contains `templates/`) so workspace seed files can be created on first use.
 
@@ -85,7 +86,8 @@ cargo run -- agent -m "status" --no-markdown --logs
 ```
 
 ```ps1
-cargo run -- agent -m "What files are in the workspace?" --config ./configs/openai-compat/config.json
+cargo run -- agent -m "What files are in the workspace?" --config ./configs/openai-compat/config.json --logs
+cargo run -- agent -m "What files are in the workspace?" --config ./configs/openai-compat/config.json --no-logs
 ```
 
 ```bash

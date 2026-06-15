@@ -1,3 +1,8 @@
 pub mod commands;
+pub mod stream;
 
-pub use commands::{eprint_error, AgentArgs, Cli, CliError, Commands, run};
+pub use commands::{
+    eprint_error, print_agent_response, print_agent_response_with_header, AgentArgs, Cli, CliError,
+    Commands, run,
+};
+pub use stream::{StreamRenderer, ThinkingSpinner};
