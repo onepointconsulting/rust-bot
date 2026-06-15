@@ -407,6 +407,7 @@ impl AgentRunner {
         hook: &dyn AgentHook,
         context: &mut AgentHookContext,
     ) -> LLMResponse {
+        log::info!("Using model: {}", spec.model);
         let tools = spec.tools.get_definitions();
         let tools_opt = if tools.is_empty() { None } else { Some(tools) };
 
@@ -775,10 +776,12 @@ impl AgentRunner {
             let mut ctx = AgentHookContext::new(iteration, messages.clone());
             hook.before_iteration(&mut ctx).await;
 
+            log::debug!("Messages for model: {}", messages_for_model.clone().iter().map(|m| m.to_string().chars().take(400).collect::<String>()).collect::<Vec<String>>().join("\n"));
             // ── LLM call ──────────────────────────────────────────────────────
             let response = self
                 .request_model(&spec, messages_for_model.clone(), hook.as_ref(), &mut ctx)
                 .await;
+            log::info!("Response: {}", response.content.clone().unwrap_or("".to_string()).chars().take(400).collect::<String>());
 
             Self::accumulate_usage(&mut usage, &response.usage);
             ctx.usage = response
@@ -790,6 +793,7 @@ impl AgentRunner {
 
             // ── Tool calls branch ─────────────────────────────────────────────
             if !response.tool_calls.is_empty() {
+                log::info!("Tool calls: {}", response.tool_calls.iter().map(|tc| tc.to_string()).collect::<Vec<String>>().join("\n"));
                 hook.on_stream_end(&mut ctx, true).await;
 
                 let tool_calls_json: Vec<Value> = response

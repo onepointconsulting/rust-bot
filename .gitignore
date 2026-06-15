@@ -17,3 +17,9 @@ workspace/assoc_result.txt
 workspace/workspace/
 workspace/weather_in_london.txt
 shell_tool_result.txt
+
+AGENTS.md
+HEARTBEAT.md
+SOUL.md
+TOOLS.md
+USER.md

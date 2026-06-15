@@ -86,8 +86,11 @@ cargo run -- agent -m "status" --no-markdown --logs
 ```
 
 ```ps1
-cargo run -- agent -m "What files are in the workspace?" --config ./configs/openai-compat/config.json --logs
-cargo run -- agent -m "What files are in the workspace?" --config ./configs/openai-compat/config.json --no-logs
+cargo run -- agent -m "How is the weather in London?" --config ./configs/openai-compat/config.json --logs
+cargo run -- agent -m "How is the weather in London?" --config ./configs/openai-compat/config.json --no-logs
+cargo run -- agent -m "Can you please give me a quick summary of the services offered by Onepoint Consulting Ltd from London? Then please write this summary to a file called onepoint.html in the workspace folder." --config ./configs/openai-compat/config.json --logs
+cargo run -- agent -m "Which are the main competitors of Onepoint Consulting Ltd?" --config ./configs/openai-compat/config.json --logs
+cargo run -- agent -m "Can you produce a commit message for the staged files in the current git project (current folder)?" --config ./configs/openai-compat/config_current_folder.json --logs
 ```
 
 ```bash

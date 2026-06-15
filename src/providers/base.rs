@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
@@ -62,6 +63,30 @@ impl ToolCallRequest {
         }
 
         serde_json::Value::Object(tool_call)
+    }
+}
+
+impl fmt::Display for ToolCallRequest {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let args = serde_json::to_string(&self.arguments).unwrap_or_else(|_| "{}".to_string());
+        write!(
+            f,
+            "ToolCall {{ id: {}, name: {}, arguments: {}",
+            self.id, self.name, args
+        )?;
+        if let Some(extra) = &self.extra_content {
+            let extra = serde_json::to_string(extra).unwrap_or_else(|_| "{}".to_string());
+            write!(f, ", extra_content: {extra}")?;
+        }
+        if let Some(fields) = &self.provider_specific_fields {
+            let fields = serde_json::to_string(fields).unwrap_or_else(|_| "{}".to_string());
+            write!(f, ", provider_specific_fields: {fields}")?;
+        }
+        if let Some(fields) = &self.function_provider_specific_fields {
+            let fields = serde_json::to_string(fields).unwrap_or_else(|_| "{}".to_string());
+            write!(f, ", function_provider_specific_fields: {fields}")?;
+        }
+        write!(f, " }}")
     }
 }
 
@@ -1101,6 +1126,16 @@ mod tests {
         assert!(result.get("function").unwrap().is_object());
         assert!(result.get("extra_content").unwrap().is_object());
         assert!(result.get("provider_specific_fields").unwrap().is_object());
+    }
+
+    #[test]
+    fn test_tool_call_request_display() {
+        let tool_call_request = create_tool_call_request();
+        let s = tool_call_request.to_string();
+        assert!(s.contains("id: 123"));
+        assert!(s.contains("name: test"));
+        assert!(s.contains("extra_content:"));
+        assert!(s.contains("provider_specific_fields:"));
     }
 
     #[test]

@@ -1,6 +1,6 @@
 {
   "agents": {
-    "workspace": "~/.rust-bot/workspace",
+    "workspace": ".",
     "model": "${OPENAI_API_MODEL}",
     "provider": "openrouter",
     "maxTokens": 8192,

@@ -817,6 +817,7 @@ impl LLMProvider for OpenAICompatProvider {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send,
     {
+
         let request_args = self.build_request(
             &messages,
             tools,
@@ -826,13 +827,23 @@ impl LLMProvider for OpenAICompatProvider {
             reasoning_effort,
             tool_choice,
         );
+        log::debug!("chat stream request: {:?}", request_args);
         match request_args.build() {
             Ok(request) => {
                 match self.client.chat().create_stream(request).await {
                     Ok(mut stream) => {
                         let mut content_buf = String::new();
                         let mut finish_reason = "stop".to_string();
-                        let mut raw_tool_calls: Vec<ChatCompletionMessageToolCalls> = vec![];
+                        // Streaming tool calls arrive as fragments keyed by `index`:
+                        // the first fragment for an index carries the id + function
+                        // name; later fragments for the same index carry only pieces
+                        // of the JSON `arguments` string that must be concatenated.
+                        // Accumulate by index here and assemble complete tool calls
+                        // once the stream finishes. A BTreeMap preserves index order.
+                        let mut tool_call_acc: std::collections::BTreeMap<
+                            u32,
+                            (Option<String>, String, String),
+                        > = std::collections::BTreeMap::new();
                         let cb = on_content_delta.as_ref();
                         while let Some(chunk) = stream.next().await {
                             if let Ok(chunk) = chunk {
@@ -845,17 +856,24 @@ impl LLMProvider for OpenAICompatProvider {
                                     }
                                     if let Some(ref tcs) = choice.delta.tool_calls {
                                         for tc in tcs {
-                                            if let Some(ref func) = tc.function {
-                                                let name = func.name.clone().unwrap_or_default();
-                                                let arguments = func.arguments.clone().unwrap_or_default();
-                                                raw_tool_calls.push(
-                                                    ChatCompletionMessageToolCalls::Function(
-                                                        ChatCompletionMessageToolCall {
-                                                            id: tc.id.clone().unwrap_or_else(Self::short_tool_id),
-                                                            function: FunctionCall { name, arguments },
-                                                        },
-                                                    ),
-                                                );
+                                            // (id, name, arguments) accumulated per index.
+                                            let entry = tool_call_acc
+                                                .entry(tc.index)
+                                                .or_insert_with(|| (None, String::new(), String::new()));
+                                            if let Some(id) = &tc.id {
+                                                if !id.is_empty() {
+                                                    entry.0 = Some(id.clone());
+                                                }
+                                            }
+                                            if let Some(func) = &tc.function {
+                                                if let Some(name) = &func.name {
+                                                    if !name.is_empty() {
+                                                        entry.1 = name.clone();
+                                                    }
+                                                }
+                                                if let Some(args) = &func.arguments {
+                                                    entry.2.push_str(args);
+                                                }
                                             }
                                         }
                                     }
@@ -868,6 +886,17 @@ impl LLMProvider for OpenAICompatProvider {
                                 }
                             }
                         }
+                        let raw_tool_calls: Vec<ChatCompletionMessageToolCalls> = tool_call_acc
+                            .into_values()
+                            .map(|(id, name, arguments)| {
+                                ChatCompletionMessageToolCalls::Function(
+                                    ChatCompletionMessageToolCall {
+                                        id: id.unwrap_or_else(Self::short_tool_id),
+                                        function: FunctionCall { name, arguments },
+                                    },
+                                )
+                            })
+                            .collect();
                         return Self::parse_stream_response(content_buf, finish_reason, raw_tool_calls);
                     }
                     Err(e) => {

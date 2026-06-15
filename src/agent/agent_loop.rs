@@ -641,7 +641,7 @@ impl AgentLoop {
                 }) as Arc<dyn Fn(Value) + Send + Sync>
             });
         
-        log::info!("Running agent loop");
+        log::info!("Running agent loop with {} tools", self.tools.len());
         let result = self
             .runner
             .run(AgentRunSpec {
