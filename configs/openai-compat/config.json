@@ -20,7 +20,7 @@
   },
   "channels": {
     "sendProgress": true,
-    "sendToolHints": false,
+    "sendToolHints": true,
     "sendMaxRetries": 3,
     "transcriptionProvider": "groq"
   },
