@@ -23,3 +23,10 @@ HEARTBEAT.md
 SOUL.md
 TOOLS.md
 USER.md
+
+# Log files
+*.log
+
+# Runtime data directories
+memory/
+sessions/

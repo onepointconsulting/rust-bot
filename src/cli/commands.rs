@@ -6,6 +6,7 @@ use std::sync::Arc;
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
+use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
 use serde_json::Value;
 use termimad::MadSkin;
 
@@ -14,6 +15,7 @@ use crate::bus::queue::MessageBus;
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
 use crate::config::log::init_runtime_logging;
+use crate::config::paths::get_cli_history_path;
 use crate::config::schema::{ChannelsConfig, Config};
 use crate::cron::CronService;
 use crate::providers::anthropic_provider::AnthropicProvider;
@@ -218,11 +220,50 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     match args.message {
         Some(message) if !message.is_empty() => {
-            message_session(&message, markdown, &config.channels, &session_id, agent_loop).await
+            message_session(&message, markdown, &config.channels, &session_id, Arc::new(agent_loop)).await
         }
         Some(_) => Ok(()),
-        None => interactive_session(&agent_loop),
+        None => interactive_session(Arc::new(agent_loop), markdown, &config.channels, &session_id).await,
     }
+}
+
+async fn message_session(
+    message: &str,
+    markdown: bool,
+    channels_config: &ChannelsConfig,
+    session_id: &str,
+    agent_loop: Arc<AgentLoop>,
+) -> Result<(), CliError> {
+    log::info!("message={message}");
+    let renderer: Arc<Mutex<StreamRenderer>> = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
+    let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
+    let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
+    let response = agent_loop
+        .process_direct(
+            &message,
+            Some(&session_id),
+            None,
+            None,
+            Some(on_progress),
+            Some(on_stream),
+            Some(on_stream_end),
+        )
+        .await;
+    let locked_renderer = renderer.lock().await;
+    let streamed = locked_renderer.streamed;
+    let header_printed = locked_renderer.header_printed;
+    if !streamed {
+        renderer.lock().await.close().await;
+    }
+    if !streamed {
+        print_agent_response_with_header(
+            &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
+            markdown,
+            response.as_ref().map(|r| &r.metadata),
+            !header_printed,
+        );
+    }
+    Ok(())
 }
 
 /// Load config and optionally override the active workspace.
@@ -306,51 +347,69 @@ fn create_on_progress(channels: ChannelsConfig, renderer: Arc<Mutex<StreamRender
     })
 }
 
-fn interactive_session(agent_loop: &AgentLoop) -> Result<(), CliError> {
+async fn interactive_session(
+    agent_loop: Arc<AgentLoop>,
+    markdown: bool,
+    channels_config: &ChannelsConfig,
+    session_id: &str,
+) -> Result<(), CliError> {
     print_agent_response_with_header(
-        format!("{} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n", LOGO).as_str(),
-         false,
-          None, 
-          true
-        );
+        format!("{} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+D[/bold] to quit)\n", LOGO).as_str(),
+        false,
+        None,
+        true,
+    );
+    let mut line_editor = init_prompt_session();
+    let prompt = DefaultPrompt::default();
+    loop {
+        let sig = tokio::task::block_in_place(|| line_editor.read_line(&prompt))
+            .map_err(|_| CliError::InteractiveNotImplemented)?;
+        match sig {
+            Signal::Success(line) => {
+                let line = line.trim();
+                if line.is_empty() {
+                    continue;
+                }
+                if line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit") {
+                    break;
+                }
+                message_session(
+                    line,
+                    markdown,
+                    channels_config,
+                    session_id,
+                    Arc::clone(&agent_loop),
+                ).await?;
+            }
+            Signal::CtrlC => {
+                continue;
+            }
+            Signal::CtrlD => break,
+            _ => continue,
+        }
+    };
+
     Ok(())
 }
 
-async fn message_session(
-    message: &str,
-    markdown: bool, 
-    channels_config: &ChannelsConfig, 
-    session_id: &str,
-    agent_loop: AgentLoop
-) -> Result<(), CliError> {
-    log::info!("message={message}");
-    let renderer: Arc<Mutex<StreamRenderer>> = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
-    let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
-    let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
-    let response = Arc::new(agent_loop)
-        .process_direct(
-            &message,
-            Some(&session_id),
-            None,
-            None,
-            Some(on_progress),
-            Some(on_stream),
-            Some(on_stream_end),
-        )
-        .await;
-    let locked_renderer = renderer.lock().await;
-    let streamed = locked_renderer.streamed;
-    let header_printed = locked_renderer.header_printed;
-    if !streamed {
-        renderer.lock().await.close().await;
+fn init_prompt_session() -> Reedline {
+    let history_file = get_cli_history_path();
+    if let Some(parent) = history_file.parent() {
+        ensure_dir(parent);
     }
-    if !streamed {
-        print_agent_response_with_header(
-            &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
-            markdown,
-            response.as_ref().map(|r| &r.metadata),
-            !header_printed,
-        );
-    }
-    Ok(())
+
+    let history_result = FileBackedHistory::with_file(
+        100,
+        history_file,
+    );
+
+    match history_result {
+        Ok(history) => {
+            Reedline::create().with_history(Box::new(history))
+        }
+        Err(e) => {
+            log::warn!("Failed to read history file: {}", e);
+            Reedline::create()
+        }
+    } 
 }

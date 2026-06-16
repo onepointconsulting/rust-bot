@@ -19,12 +19,14 @@ fn rust_log_mentions_target(target: &str) -> bool {
 /// Initialize CLI runtime logging.
 ///
 /// Mirrors Python nanobot's `logger.enable("nanobot")` / `logger.disable("nanobot")`:
-/// `--logs` toggles only this crate's logs, not third-party crates.
+/// `--logs` toggles only this crate's logs by default, not third-party crates.
 ///
-/// When `RUST_LOG` is set, its filters apply; `--no-logs` still suppresses `rust_bot`.
+/// When `RUST_LOG` is set and `--logs` is on, its filters apply (e.g. `RUST_LOG=html5ever=warn`
+/// for debugging a dependency). With `--no-logs`, all logging is suppressed, including
+/// third-party crates, even if `RUST_LOG` is set in the environment or `.env`.
 pub fn init_runtime_logging(logs: bool) {
     let has_rust_log = std::env::var_os("RUST_LOG").is_some();
-    let mut builder = if has_rust_log {
+    let mut builder = if logs && has_rust_log {
         env_logger::Builder::from_default_env()
     } else {
         let mut builder = env_logger::Builder::new();
