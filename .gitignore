@@ -30,3 +30,4 @@ USER.md
 # Runtime data directories
 memory/
 sessions/
+workspace/cron/

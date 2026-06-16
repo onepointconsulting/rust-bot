@@ -109,7 +109,7 @@ impl StreamRenderer {
     }
 
     fn stop_spinner(&mut self) {
-        if let Some(spinner) = self.spinner.as_mut() {
+        if let Some(mut spinner) = self.spinner.take() {
             spinner.stop();
         }
     }
@@ -268,5 +268,21 @@ mod tests {
         let mut renderer = StreamRenderer::new(true, false);
         renderer.buf = "**hi**".to_string();
         assert!(renderer.render_body().contains("hi"));
+    }
+
+    #[tokio::test]
+    async fn on_end_resuming_restarts_thinking_spinner() {
+        let mut renderer = StreamRenderer::new(false, true);
+        assert!(
+            renderer.spinner.as_ref().is_some_and(|s| s.is_active()),
+            "spinner should start with the renderer"
+        );
+
+        renderer.on_end(true).await;
+
+        assert!(
+            renderer.spinner.as_ref().is_some_and(|s| s.is_active()),
+            "spinner should restart while the agent continues after a tool-call round"
+        );
     }
 }

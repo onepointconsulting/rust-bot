@@ -3,7 +3,7 @@
 Tool signatures are provided automatically via function calling.
 This file documents non-obvious constraints and usage patterns.
 
-## exec — Safety Limits
+## shell — Safety Limits
 
 - Commands have a configurable timeout (default 60s)
 - Dangerous commands are blocked (rm -rf, format, dd, shutdown, etc.)

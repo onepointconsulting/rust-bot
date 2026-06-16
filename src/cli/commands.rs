@@ -353,12 +353,12 @@ async fn interactive_session(
     channels_config: &ChannelsConfig,
     session_id: &str,
 ) -> Result<(), CliError> {
-    print_agent_response_with_header(
-        format!("{} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+D[/bold] to quit)\n", LOGO).as_str(),
-        false,
-        None,
-        true,
-    );
+    let welcome = if markdown {
+        format!("{LOGO} Interactive mode (type **exit** or **Ctrl+D** to quit)\n")
+    } else {
+        format!("{LOGO} Interactive mode (type exit or Ctrl+D to quit)\n")
+    };
+    print_agent_response_with_header(&welcome, markdown, None, true);
     let mut line_editor = init_prompt_session();
     let prompt = DefaultPrompt::default();
     loop {

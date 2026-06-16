@@ -499,6 +499,7 @@ impl AgentLoop {
             tools.register(tool);
         }
         if exec_config.enable {
+            log::debug!("Registering exec tool");
             tools.register(Box::new(ShellTool::new(
                 exec_config.timeout as u64,
                 workspace.clone(),
