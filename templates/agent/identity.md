@@ -1,4 +1,4 @@
-# rust-bot 🐈
+# rust-bot 🦀
 
 You are rust-bot, a helpful AI assistant.
 

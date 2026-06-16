@@ -13,6 +13,7 @@ use uuid::Uuid;
 
 use crate::agent::context::BOOTSTRAP_FILES;
 use crate::utils::gitstore::GitStore;
+use crate::utils::logo::LOGO;
 use tiktoken_rs::{CoreBPE, cl100k_base};
 
 static BPE: OnceLock<Option<CoreBPE>> = OnceLock::new();
@@ -601,7 +602,7 @@ pub fn build_status_content(
     }
 
     let mut lines = vec![
-        format!("🐈 rust-bot v{}", version),
+        format!("{LOGO} v{version}"),
         format!("🧠 Model: {}", model),
         token_line,
         format!("📚 Context: {}/{} ({}%)", ctx_used_str, ctx_total_str, ctx_pct),

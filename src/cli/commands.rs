@@ -20,6 +20,7 @@ use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
+use crate::utils::logo::LOGO;
 use crate::utils::restart::{
     consume_restart_notice_from_env, format_restart_completed_message,
     should_show_cli_restart_notice,
@@ -184,7 +185,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     let cron_store_path = config.workspace_path().join("cron").join("jobs.json");
     let cron_service = CronService::new(cron_store_path, None);
-
+ 
     let agent_loop = AgentLoop::new(
         Arc::new(bus),
         provider,
@@ -217,38 +218,10 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     match args.message {
         Some(message) if !message.is_empty() => {
-            log::info!("message={message}");
-            let renderer = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
-            let on_progress = create_on_progress(config.channels.clone(), Arc::clone(&renderer));
-            let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
-            let response = Arc::new(agent_loop)
-                .process_direct(
-                    &message,
-                    Some(&session_id),
-                    None,
-                    None,
-                    Some(on_progress),
-                    Some(on_stream),
-                    Some(on_stream_end),
-                )
-                .await;
-            let streamed = renderer.lock().await.streamed;
-            let header_printed = renderer.lock().await.header_printed;
-            if !streamed {
-                renderer.lock().await.close().await;
-            }
-            if !streamed {
-                print_agent_response_with_header(
-                    &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
-                    markdown,
-                    response.as_ref().map(|r| &r.metadata),
-                    !header_printed,
-                );
-            }
-            Ok(())
+            message_session(&message, markdown, &config.channels, &session_id, agent_loop).await
         }
         Some(_) => Ok(()),
-        None => Err(CliError::InteractiveNotImplemented),
+        None => interactive_session(&agent_loop),
     }
 }
 
@@ -331,4 +304,53 @@ fn create_on_progress(channels: ChannelsConfig, renderer: Arc<Mutex<StreamRender
             print_cli_progress_line(&mut renderer_guard, &content);
         })
     })
+}
+
+fn interactive_session(agent_loop: &AgentLoop) -> Result<(), CliError> {
+    print_agent_response_with_header(
+        format!("{} Interactive mode (type [bold]exit[/bold] or [bold]Ctrl+C[/bold] to quit)\n", LOGO).as_str(),
+         false,
+          None, 
+          true
+        );
+    Ok(())
+}
+
+async fn message_session(
+    message: &str,
+    markdown: bool, 
+    channels_config: &ChannelsConfig, 
+    session_id: &str,
+    agent_loop: AgentLoop
+) -> Result<(), CliError> {
+    log::info!("message={message}");
+    let renderer: Arc<Mutex<StreamRenderer>> = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
+    let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
+    let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
+    let response = Arc::new(agent_loop)
+        .process_direct(
+            &message,
+            Some(&session_id),
+            None,
+            None,
+            Some(on_progress),
+            Some(on_stream),
+            Some(on_stream_end),
+        )
+        .await;
+    let locked_renderer = renderer.lock().await;
+    let streamed = locked_renderer.streamed;
+    let header_printed = locked_renderer.header_printed;
+    if !streamed {
+        renderer.lock().await.close().await;
+    }
+    if !streamed {
+        print_agent_response_with_header(
+            &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
+            markdown,
+            response.as_ref().map(|r| &r.metadata),
+            !header_printed,
+        );
+    }
+    Ok(())
 }

@@ -47,6 +47,9 @@ impl OpenAICompatProvider {
 
     // Standard function call keys
     const STANDARD_FN_KEYS: &[&str] = &["name", "arguments"];
+    const ARG_PARSE_ERROR_KEY: &str = "__args_json_parse_error";
+    const ARG_PARSE_RAW_KEY: &str = "__args_json_raw";
+    const ARG_PARSE_RAW_LIMIT: usize = 400;
 
     // Default OpenRouter headers as a static map
     fn default_openrouter_headers() -> std::collections::HashMap<&'static str, &'static str> {
@@ -71,6 +74,25 @@ impl OpenAICompatProvider {
                 Self::ALNUM.chars().nth(idx).unwrap()
             })
             .collect()
+    }
+
+    fn parse_tool_arguments(arguments_json: &str) -> HashMap<String, serde_json::Value> {
+        match serde_json::from_str(arguments_json) {
+            Ok(args) => args,
+            Err(err) => {
+                let mut args = HashMap::new();
+                let raw: String = arguments_json.chars().take(Self::ARG_PARSE_RAW_LIMIT).collect();
+                args.insert(
+                    Self::ARG_PARSE_ERROR_KEY.to_string(),
+                    serde_json::Value::String(err.to_string()),
+                );
+                args.insert(
+                    Self::ARG_PARSE_RAW_KEY.to_string(),
+                    serde_json::Value::String(raw),
+                );
+                args
+            }
+        }
     }
 
     /// Get a value from a serde_json::Value::Object or struct field, returning None if absent.
@@ -554,8 +576,7 @@ impl OpenAICompatProvider {
         // Parse tool calls
         let tool_calls = raw_tool_calls.into_iter().filter_map(|tc| {
             let ChatCompletionMessageToolCalls::Function(tc) = tc else { return None; };
-            let args: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let args = Self::parse_tool_arguments(&tc.function.arguments);
             Some(ToolCallRequest {
                 id: Self::short_tool_id(),
                 name: tc.function.name.clone(),
@@ -597,8 +618,7 @@ impl OpenAICompatProvider {
     ) -> LLMResponse {
         let tool_calls = raw_tool_calls.into_iter().filter_map(|tc| {
             let ChatCompletionMessageToolCalls::Function(tc) = tc else { return None; };
-            let args: HashMap<String, serde_json::Value> =
-                serde_json::from_str(&tc.function.arguments).unwrap_or_default();
+            let args = Self::parse_tool_arguments(&tc.function.arguments);
             Some(ToolCallRequest {
                 id: Self::short_tool_id(),
                 name: tc.function.name.clone(),
@@ -1025,6 +1045,32 @@ mod tests {
         assert_eq!(
             sanitized[1],
             serde_json::json!({ "role": "user", "content": "Hello, how are you?" })
+        );
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_valid_json() {
+        let args = OpenAICompatProvider::parse_tool_arguments(r#"{"path":"a.txt","content":"hi"}"#);
+        assert_eq!(
+            args.get("path").and_then(serde_json::Value::as_str),
+            Some("a.txt")
+        );
+        assert_eq!(
+            args.get("content").and_then(serde_json::Value::as_str),
+            Some("hi")
+        );
+        assert!(args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY).is_none());
+    }
+
+    #[test]
+    fn test_parse_tool_arguments_malformed_json_adds_markers() {
+        let malformed = r#"{"path":"a.txt","content":"hi""#;
+        let args = OpenAICompatProvider::parse_tool_arguments(malformed);
+        assert!(args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY).is_some());
+        assert_eq!(
+            args.get(OpenAICompatProvider::ARG_PARSE_RAW_KEY)
+                .and_then(serde_json::Value::as_str),
+            Some(malformed)
         );
     }
 }

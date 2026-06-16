@@ -6,3 +6,4 @@ pub mod tool_hints;
 pub mod path;
 pub mod restart;
 pub mod searchusage;
+pub mod logo;

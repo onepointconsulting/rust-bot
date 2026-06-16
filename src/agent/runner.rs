@@ -34,6 +34,8 @@ const COMPACTABLE_TOOLS: &[&str] = &[
     "list_dir",
 ];
 const BACKFILL_CONTENT: &str = "[Tool result unavailable — call was interrupted or lost]";
+const ARG_PARSE_ERROR_KEY: &str = "__args_json_parse_error";
+const ARG_PARSE_RAW_KEY: &str = "__args_json_raw";
 
 /// Configuration for a single agent execution.
 pub struct AgentRunSpec {
@@ -620,7 +622,37 @@ impl AgentRunner {
             return (format!("{lookup_error}{HINT}"), event, error);
         }
 
-        // ── 2. Resolve and validate parameters ───────────────────────────────
+        // ── 2. Malformed arguments JSON (provider parse failure) ─────────────
+        if let Some(parse_error) = tool_call
+            .arguments
+            .get(ARG_PARSE_ERROR_KEY)
+            .and_then(Value::as_str)
+        {
+            let raw = tool_call
+                .arguments
+                .get(ARG_PARSE_RAW_KEY)
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let raw_preview: String = raw.chars().take(200).collect();
+            let err = format!(
+                "Error: malformed tool arguments JSON for '{}': {}. Raw arguments: {}",
+                tool_call.name, parse_error, raw_preview
+            );
+            let detail: String = err.replace('\n', " ").trim().chars().take(120).collect();
+            let event = HashMap::from([
+                ("name".to_string(), tool_call.name.clone()),
+                ("status".to_string(), "error".to_string()),
+                ("detail".to_string(), detail),
+            ]);
+            let error = if spec.fail_on_tool_error {
+                Some(err.clone())
+            } else {
+                None
+            };
+            return (format!("{err}{HINT}"), event, error);
+        }
+
+        // ── 3. Resolve and validate parameters ───────────────────────────────
         // Convert HashMap<String, Value> → Value::Object so prepare_call can
         // cast and validate the parameters against the tool's JSON schema.
         let params_value = Value::Object(
@@ -656,7 +688,7 @@ impl AgentRunner {
             return (format!("{err}{HINT}"), event, error);
         }
 
-        // ── 3. Execute ────────────────────────────────────────────────────────
+        // ── 4. Execute ────────────────────────────────────────────────────────
         // `prepare_call` guarantees `tool = Some(_)` when `prep_error = None`.
         // Python's `await tool.execute(**params)` maps to the sync call below.
         // Unlike Python, Rust tools do not raise exceptions; a tool that wants
@@ -666,7 +698,7 @@ impl AgentRunner {
             .execute(&cast_params)
             .await;
 
-        // ── 4. Treat "Error…" result strings as soft errors ──────────────────
+        // ── 5. Treat "Error…" result strings as soft errors ──────────────────
         if result.starts_with("Error") {
             let detail: String = result.replace('\n', " ").trim().chars().take(120).collect();
             log::error!("Tool error: {}", result);
@@ -683,7 +715,7 @@ impl AgentRunner {
             return (format!("{result}{HINT}"), event, error);
         }
 
-        // ── 5. Success ────────────────────────────────────────────────────────
+        // ── 6. Success ────────────────────────────────────────────────────────
         let replaced = result.replace('\n', " ");
         let trimmed = replaced.trim();
         let detail = if trimmed.is_empty() {
@@ -1612,6 +1644,43 @@ mod tests {
         assert_eq!(
             fatal_error,
             Some("Error: Tool 'dummy_tool' not found. Available: ".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_tool_malformed_arguments_json_returns_first_class_error() {
+        let spec = AgentRunSpec {
+            fail_on_tool_error: true,
+            ..Default::default()
+        };
+        let mut arguments = HashMap::new();
+        arguments.insert(
+            "__args_json_parse_error".to_string(),
+            Value::String("expected `,` at line 1 column 17".to_string()),
+        );
+        arguments.insert(
+            "__args_json_raw".to_string(),
+            Value::String("{\"path\":\"a.txt\" \"content\":\"x\"}".to_string()),
+        );
+        let tool_call = crate::providers::base::ToolCallRequest {
+            id: "1".to_string(),
+            name: "write_file".to_string(),
+            arguments,
+            extra_content: None,
+            provider_specific_fields: None,
+            function_provider_specific_fields: None,
+        };
+        let external_lookup_counts = HashMap::<String, usize>::new();
+        let (result, event, fatal_error) =
+            AgentRunner::run_tool(&spec, &tool_call, Arc::new(Mutex::new(external_lookup_counts))).await;
+        assert!(result.contains("Error: malformed tool arguments JSON for 'write_file'"));
+        assert!(result.contains("expected `,` at line 1 column 17"));
+        assert_eq!(event.get("name").unwrap(), &"write_file".to_string());
+        assert_eq!(event.get("status").unwrap(), &"error".to_string());
+        assert!(
+            fatal_error
+                .unwrap_or_default()
+                .contains("malformed tool arguments JSON for 'write_file'")
         );
     }
 
