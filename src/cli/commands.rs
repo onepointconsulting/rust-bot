@@ -6,7 +6,10 @@ use std::sync::Arc;
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
-use reedline::{DefaultPrompt, FileBackedHistory, Reedline, Signal};
+use reedline::{
+    default_emacs_keybindings, EditCommand, Emacs, FileBackedHistory, Keybindings, KeyCode,
+    KeyModifiers, Reedline, ReedlineEvent, Signal, DefaultPrompt,
+};
 use serde_json::Value;
 use termimad::MadSkin;
 
@@ -354,9 +357,9 @@ async fn interactive_session(
     session_id: &str,
 ) -> Result<(), CliError> {
     let welcome = if markdown {
-        format!("{LOGO} Interactive mode (type **exit** or **Ctrl+D** to quit)\n")
+        format!("{LOGO} Interactive mode (type **exit** or **Ctrl+D** to quit; **Ctrl+Enter** for a new line)\n")
     } else {
-        format!("{LOGO} Interactive mode (type exit or Ctrl+D to quit)\n")
+        format!("{LOGO} Interactive mode (type exit or Ctrl+D to quit; Ctrl+Enter for a new line)\n")
     };
     print_agent_response_with_header(&welcome, markdown, None, true);
     let mut line_editor = init_prompt_session();
@@ -366,15 +369,14 @@ async fn interactive_session(
             .map_err(|_| CliError::InteractiveNotImplemented)?;
         match sig {
             Signal::Success(line) => {
-                let line = line.trim();
-                if line.is_empty() {
+                if line.trim().is_empty() {
                     continue;
                 }
-                if line.eq_ignore_ascii_case("exit") || line.eq_ignore_ascii_case("quit") {
+                if line.trim().eq_ignore_ascii_case("exit") || line.trim().eq_ignore_ascii_case("quit") {
                     break;
                 }
                 message_session(
-                    line,
+                    line.trim_end(),
                     markdown,
                     channels_config,
                     session_id,
@@ -392,24 +394,39 @@ async fn interactive_session(
     Ok(())
 }
 
+fn interactive_keybindings() -> Keybindings {
+    let mut kb = default_emacs_keybindings();
+    kb.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Enter,
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+    kb
+}
+
+fn build_reedline(history: Option<FileBackedHistory>) -> Reedline {
+    let mut editor = Reedline::create()
+        .use_bracketed_paste(true)
+        .with_edit_mode(Box::new(Emacs::new(interactive_keybindings())));
+    if let Some(history) = history {
+        editor = editor.with_history(Box::new(history));
+    }
+    editor
+}
+
 fn init_prompt_session() -> Reedline {
     let history_file = get_cli_history_path();
     if let Some(parent) = history_file.parent() {
         ensure_dir(parent);
     }
 
-    let history_result = FileBackedHistory::with_file(
-        100,
-        history_file,
-    );
+    let history_result = FileBackedHistory::with_file(100, history_file);
 
     match history_result {
-        Ok(history) => {
-            Reedline::create().with_history(Box::new(history))
-        }
+        Ok(history) => build_reedline(Some(history)),
         Err(e) => {
             log::warn!("Failed to read history file: {}", e);
-            Reedline::create()
+            build_reedline(None)
         }
-    } 
+    }
 }
