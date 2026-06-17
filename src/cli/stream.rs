@@ -126,6 +126,15 @@ impl StreamRenderer {
         self.live_lines = body.lines().count().max(1);
     }
 
+    fn write_delta(&self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        let mut out = io::stdout();
+        let _ = write!(out, "{delta}");
+        let _ = out.flush();
+    }
+
     fn stop_live(&mut self) {
         if !self.live_active {
             return;
@@ -185,6 +194,14 @@ impl StreamRenderer {
     pub async fn on_delta(&mut self, delta: String) {
         self.streamed = true;
         self.buf.push_str(&delta);
+        if !self.is_tty {
+            if self.buf.trim().is_empty() {
+                return;
+            }
+            self.ensure_header();
+            self.write_delta(&delta);
+            return;
+        }
         if !self.live_active {
             if self.buf.trim().is_empty() {
                 return;
@@ -201,7 +218,7 @@ impl StreamRenderer {
             self.stop_live();
         }
         self.stop_spinner();
-        if !resuming && !self.buf.trim().is_empty() {
+        if !resuming && self.is_tty && !self.buf.trim().is_empty() {
             let rendered = self.render_body();
             let mut out = io::stdout();
             let _ = write!(out, "{rendered}");

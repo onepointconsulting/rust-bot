@@ -641,6 +641,25 @@ impl OpenAICompatProvider {
             thinking_blocks: None,
         }
     }
+
+    /// Normalize streaming chunks so repeated snapshots or overlaps do not
+    /// duplicate already-emitted content.
+    fn non_overlapping_suffix<'a>(existing: &str, incoming: &'a str) -> &'a str {
+        if existing.is_empty() || incoming.is_empty() {
+            return incoming;
+        }
+        let max_overlap = existing.len().min(incoming.len());
+        for overlap in (1..=max_overlap).rev() {
+            let existing_start = existing.len() - overlap;
+            if !existing.is_char_boundary(existing_start) || !incoming.is_char_boundary(overlap) {
+                continue;
+            }
+            if existing[existing_start..] == incoming[..overlap] {
+                return &incoming[overlap..];
+            }
+        }
+        incoming
+    }
 }
 
 impl LLMProvider for OpenAICompatProvider {
@@ -872,9 +891,15 @@ impl LLMProvider for OpenAICompatProvider {
                             if let Ok(chunk) = chunk {
                                 for choice in &chunk.choices {
                                     if let Some(delta_content) = &choice.delta.content {
-                                        content_buf.push_str(delta_content);
-                                        if let Some(cb) = cb {
-                                            cb(delta_content.clone()).await;
+                                        let normalized = Self::non_overlapping_suffix(
+                                            &content_buf,
+                                            delta_content.as_str(),
+                                        );
+                                        if !normalized.is_empty() {
+                                            content_buf.push_str(normalized);
+                                            if let Some(cb) = cb {
+                                                cb(normalized.to_string()).await;
+                                            }
                                         }
                                     }
                                     if let Some(ref tcs) = choice.delta.tool_calls {
@@ -1075,5 +1100,23 @@ mod tests {
                 .and_then(serde_json::Value::as_str),
             Some(malformed)
         );
+    }
+
+    #[test]
+    fn test_non_overlapping_suffix_keeps_true_delta() {
+        let suffix = OpenAICompatProvider::non_overlapping_suffix("Hello ", "world");
+        assert_eq!(suffix, "world");
+    }
+
+    #[test]
+    fn test_non_overlapping_suffix_trims_cumulative_snapshot() {
+        let suffix = OpenAICompatProvider::non_overlapping_suffix("Hello", "Hello world");
+        assert_eq!(suffix, " world");
+    }
+
+    #[test]
+    fn test_non_overlapping_suffix_handles_repeated_chunk() {
+        let suffix = OpenAICompatProvider::non_overlapping_suffix("Hello world", "world");
+        assert_eq!(suffix, "");
     }
 }
