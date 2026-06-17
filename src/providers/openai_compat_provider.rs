@@ -80,6 +80,9 @@ impl OpenAICompatProvider {
         match serde_json::from_str(arguments_json) {
             Ok(args) => args,
             Err(err) => {
+                log::error!(
+                    "Failed to parse tool arguments: {}. Arguments length: {}", err, arguments_json.len()
+                );
                 let mut args = HashMap::new();
                 let raw: String = arguments_json.chars().take(Self::ARG_PARSE_RAW_LIMIT).collect();
                 args.insert(

@@ -197,6 +197,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         workspace,
         Some(config.agents.model.clone()),
         Some(config.agents.max_tool_iterations),
+        Some(config.agents.max_tokens),
         Some(config.agents.context_window_tokens),
         config.agents.context_block_limit,
         Some(config.agents.max_tool_result_chars),
@@ -302,7 +303,8 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
     let provider_name = config.agents.provider.clone();
     match provider_name.as_str() {
         "openai" | "openai_compat" | "openrouter" => Arc::new(OpenAICompatProvider::new(
-            Some(config.providers.custom.api_key.clone()),
+            Some(
+                config.providers.custom.api_key.clone()),
             config.providers.custom.api_base.clone(),
             Some(model),
             None,

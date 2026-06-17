@@ -269,6 +269,7 @@ pub struct AgentLoop {
     workspace: PathBuf,
     pub model: String,
     max_iterations: u32,
+    max_tokens: u32,
     pub context_window_tokens: u64,
     context_block_limit: Option<u32>,
     max_tool_result_chars: u32,
@@ -319,6 +320,7 @@ impl AgentLoop {
         workspace: PathBuf,
         model: Option<String>,
         max_iterations: Option<u32>,
+        max_tokens: Option<u32>,
         context_window_tokens: Option<u64>,
         context_block_limit: Option<u32>,
         max_tool_result_chars: Option<u32>,
@@ -354,6 +356,7 @@ impl AgentLoop {
             context_window_tokens.unwrap_or(defaults.clone().context_window_tokens);
         let max_tool_result_chars =
             max_tool_result_chars.unwrap_or(defaults.clone().max_tool_result_chars);
+        let max_tokens = max_tokens.unwrap_or(defaults.clone().max_tokens);
         let subagents = Arc::new(SubagentManager::new(
             provider.clone(),
             workspace.clone(),
@@ -400,6 +403,7 @@ impl AgentLoop {
             workspace: workspace.clone(),
             model: model.clone(),
             max_iterations: max_iterations.unwrap_or(defaults.clone().max_tool_iterations),
+            max_tokens,
             context_window_tokens,
             context_block_limit: context_block_limit,
             max_tool_result_chars,
@@ -643,6 +647,7 @@ impl AgentLoop {
             });
         
         log::info!("Running agent loop with {} tools", self.tools.len());
+        log::info!("Max Tokens: {}", self.max_tokens);
         let result = self
             .runner
             .run(AgentRunSpec {
@@ -666,7 +671,7 @@ impl AgentLoop {
                 fail_on_tool_error: false,
                 temperature: None,
                 max_iterations_message: None,
-                max_tokens: None,
+                max_tokens: Some(self.max_tokens as usize),
                 reasoning_effort: None,
             })
             .await;
@@ -1807,6 +1812,7 @@ mod tests {
             bus,
             provider,
             std::env::temp_dir(),
+            None,
             None,
             None,
             None,

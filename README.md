@@ -106,4 +106,6 @@ cargo build -r
 ```ps1
 cargo build -r
 .\target\release\rust-bot agent -m "What files are in the workspace?"
+
+.\target\release\rust-bot agent --config ./configs/openai-compat/config_current_folder.json --no-logs
 ```
