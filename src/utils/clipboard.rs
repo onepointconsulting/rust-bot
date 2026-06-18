@@ -3,7 +3,7 @@ use std::path::PathBuf;
 use arboard::Clipboard;
 use uuid::Uuid;
 
-pub const IMAGE_PASTE_SENTINEL: &str = "\0PASTE_IMAGE\0";
+pub const IMAGE_PASTE_SENTINEL: &str = "\0[PASTED_IMAGE]\0";
 
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {

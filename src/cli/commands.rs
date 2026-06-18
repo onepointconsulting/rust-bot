@@ -269,9 +269,10 @@ async fn message_session(
             Some(on_stream_end),
         )
         .await;
-    let locked_renderer = renderer.lock().await;
-    let streamed = locked_renderer.streamed;
-    let header_printed = locked_renderer.header_printed;
+    let (streamed, header_printed) = {
+        let locked_renderer = renderer.lock().await;
+        (locked_renderer.streamed, locked_renderer.header_printed)
+    }; // guard dropped here — lock is free before the next acquire
     if !streamed {
         renderer.lock().await.close().await;
     }

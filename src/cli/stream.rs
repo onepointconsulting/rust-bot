@@ -48,13 +48,17 @@ impl ThinkingSpinner {
     }
 }
 
-/// Rich Live-style streaming renderer for CLI assistant output.
+/// Streaming renderer for CLI assistant output.
 ///
 /// Deltas arrive pre-filtered (no think tags) from the agent loop.
 ///
 /// Flow per round:
-///   spinner -> first visible delta -> header + live redraws ->
-///   on_end -> live clears, final render persists on screen
+///   spinner -> first visible delta -> header printed once -> deltas appended
+///   inline as they arrive -> on_end finishes the line.
+///
+/// Output is append-only: each delta is written immediately and never
+/// redrawn. This avoids any cursor-positioning that would be unreliable once
+/// the output scrolls the viewport (which previously caused duplicated lines).
 pub struct StreamRenderer {
     render_markdown: bool,
     show_spinner: bool,
@@ -62,8 +66,6 @@ pub struct StreamRenderer {
     buf: String,
     pub streamed: bool,
     spinner: Option<ThinkingSpinner>,
-    live_active: bool,
-    live_lines: usize,
     pub header_printed: bool,
     is_tty: bool,
 }
@@ -85,8 +87,6 @@ impl StreamRenderer {
             buf: String::new(),
             streamed: false,
             spinner: None,
-            live_active: false,
-            live_lines: 0,
             header_printed: false,
             is_tty: io::stdout().is_terminal(),
         };
@@ -94,6 +94,7 @@ impl StreamRenderer {
         renderer
     }
 
+    #[cfg_attr(not(test), allow(dead_code))]
     fn render_body(&self) -> String {
         if self.render_markdown && !self.buf.is_empty() {
             format!("{}", MadSkin::default().term_text(&self.buf))
@@ -114,18 +115,6 @@ impl StreamRenderer {
         }
     }
 
-    fn refresh_live(&mut self) {
-        let body = self.render_body();
-        let mut out = io::stdout();
-        if self.live_lines > 0 {
-            let _ = write!(out, "\x1b[{live_lines}A", live_lines = self.live_lines);
-            let _ = write!(out, "\x1b[J");
-        }
-        let _ = write!(out, "{body}");
-        let _ = out.flush();
-        self.live_lines = body.lines().count().max(1);
-    }
-
     fn write_delta(&self, delta: &str) {
         if delta.is_empty() {
             return;
@@ -133,20 +122,6 @@ impl StreamRenderer {
         let mut out = io::stdout();
         let _ = write!(out, "{delta}");
         let _ = out.flush();
-    }
-
-    fn stop_live(&mut self) {
-        if !self.live_active {
-            return;
-        }
-        if self.live_lines > 0 && self.is_tty {
-            let mut out = io::stdout();
-            let _ = write!(out, "\x1b[{live_lines}A", live_lines = self.live_lines);
-            let _ = write!(out, "\x1b[J");
-            let _ = out.flush();
-        }
-        self.live_lines = 0;
-        self.live_active = false;
     }
 
     /// Stop transient status and print the assistant header once.
@@ -178,9 +153,6 @@ impl StreamRenderer {
     where
         F: FnOnce(&mut Self) -> R,
     {
-        if self.live_active {
-            self.stop_live();
-        }
         let spinner = self.spinner.take();
         let result = if let Some(ref spinner) = spinner {
             spinner.pause(|| f(self))
@@ -194,40 +166,27 @@ impl StreamRenderer {
     pub async fn on_delta(&mut self, delta: String) {
         self.streamed = true;
         self.buf.push_str(&delta);
-        if !self.is_tty {
-            if self.buf.trim().is_empty() {
-                return;
-            }
-            self.ensure_header();
-            self.write_delta(&delta);
+        // Don't print until there is some non-whitespace content, so the header
+        // isn't emitted ahead of leading blank deltas.
+        if self.buf.trim().is_empty() {
             return;
         }
-        if !self.live_active {
-            if self.buf.trim().is_empty() {
-                return;
-            }
-            self.ensure_header();
-            self.live_active = true;
-        }
-        self.refresh_live();
+        self.ensure_header();
+        self.write_delta(&delta);
     }
 
     pub async fn on_end(&mut self, resuming: bool) {
-        if self.live_active {
-            self.refresh_live();
-            self.stop_live();
-        }
         self.stop_spinner();
-        if !resuming && self.is_tty && !self.buf.trim().is_empty() {
-            let rendered = self.render_body();
-            let mut out = io::stdout();
-            let _ = write!(out, "{rendered}");
-            let _ = out.flush();
-        }
         if resuming {
+            // Tool-call round: keep what was streamed, separate it from the next
+            // round, and resume the spinner while the agent keeps working.
+            if self.streamed && !self.buf.trim().is_empty() {
+                let _ = writeln!(io::stdout());
+            }
             self.buf.clear();
             self.start_spinner();
-        } else {
+        } else if self.streamed && !self.buf.trim().is_empty() {
+            // Final round: finish the streamed line.
             let _ = writeln!(io::stdout());
         }
     }
@@ -237,11 +196,8 @@ impl StreamRenderer {
         self.stop_spinner();
     }
 
-    /// Stop spinner/live without rendering a final streamed round.
+    /// Stop spinner without rendering a final streamed round.
     pub async fn close(&mut self) {
-        if self.live_active {
-            self.stop_live();
-        }
         self.stop_spinner();
     }
 }
