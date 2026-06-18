@@ -4,8 +4,16 @@ use crate::providers::{
     registry::ProviderSpec,
 };
 use async_openai::types::chat::{
-    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls, ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage, ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage, ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs, ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest, CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall
+    ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs,
+    ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
+    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest,
+    CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall,
 };
+use async_openai::types::chat::ImageUrl;
 use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -462,11 +470,59 @@ impl OpenAICompatProvider {
                             },
                         ))
                     }
-                    _ => ChatCompletionRequestUserMessageArgs::default()
-                        .content(content_str)
-                        .build()
-                        .ok()
-                        .map(Into::into),
+                    _ => {
+                        let raw_content = msg.get("content");
+                        let user_content =
+                            if let Some(arr) = raw_content.and_then(|c| c.as_array()) {
+                                // Multimodal: build a typed content array, dropping _meta.
+                                let parts: Vec<ChatCompletionRequestUserMessageContentPart> = arr
+                                    .iter()
+                                    .filter_map(|block| {
+                                        match block.get("type").and_then(|t| t.as_str()) {
+                                            Some("text") => {
+                                                let text = block
+                                                    .get("text")
+                                                    .and_then(|t| t.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                Some(ChatCompletionRequestUserMessageContentPart::Text(
+                                                    ChatCompletionRequestMessageContentPartText { text },
+                                                ))
+                                            }
+                                            Some("image_url") => {
+                                                let url = block
+                                                    .get("image_url")
+                                                    .and_then(|u| u.get("url"))
+                                                    .and_then(|u| u.as_str())
+                                                    .unwrap_or("")
+                                                    .to_string();
+                                                if url.is_empty() {
+                                                    return None;
+                                                }
+                                                Some(ChatCompletionRequestUserMessageContentPart::ImageUrl(
+                                                    ChatCompletionRequestMessageContentPartImage {
+                                                        image_url: ImageUrl { url, detail: None },
+                                                    },
+                                                ))
+                                            }
+                                            _ => None,
+                                        }
+                                    })
+                                    .collect();
+                                if parts.is_empty() {
+                                    ChatCompletionRequestUserMessageContent::Text(String::new())
+                                } else {
+                                    ChatCompletionRequestUserMessageContent::Array(parts)
+                                }
+                            } else {
+                                ChatCompletionRequestUserMessageContent::Text(content_str)
+                            };
+                        ChatCompletionRequestUserMessageArgs::default()
+                            .content(user_content)
+                            .build()
+                            .ok()
+                            .map(Into::into)
+                    }
                 }
             })
             .collect();

@@ -1,5 +1,6 @@
 use std::collections::HashMap;
 use std::fmt;
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -24,8 +25,10 @@ use crate::cron::CronService;
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
+use crate::utils::clipboard::ClipboardImage;
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
+use crate::utils::clipboard::{IMAGE_PASTE_SENTINEL, try_get_clipboard_image};
 use crate::utils::restart::{
     consume_restart_notice_from_env, format_restart_completed_message,
     should_show_cli_restart_notice,
@@ -224,7 +227,15 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     match args.message {
         Some(message) if !message.is_empty() => {
-            message_session(&message, markdown, &config.channels, &session_id, Arc::new(agent_loop)).await
+            message_session(
+                &message,
+                vec![],
+                markdown,
+                &config.channels,
+                &session_id,
+                Arc::new(agent_loop),
+            )
+            .await
         }
         Some(_) => Ok(()),
         None => interactive_session(Arc::new(agent_loop), markdown, &config.channels, &session_id).await,
@@ -233,12 +244,16 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
 async fn message_session(
     message: &str,
+    media: Vec<String>,
     markdown: bool,
     channels_config: &ChannelsConfig,
     session_id: &str,
     agent_loop: Arc<AgentLoop>,
 ) -> Result<(), CliError> {
     log::info!("message={message}");
+    for media_path in &media {
+        log::info!("media={media_path}");
+    }
     let renderer: Arc<Mutex<StreamRenderer>> = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
     let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
     let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
@@ -248,6 +263,7 @@ async fn message_session(
             Some(&session_id),
             None,
             None,
+            Some(media),
             Some(on_progress),
             Some(on_stream),
             Some(on_stream_end),
@@ -352,6 +368,50 @@ fn create_on_progress(channels: ChannelsConfig, renderer: Arc<Mutex<StreamRender
     })
 }
 
+fn extract_paste_sentinel_with<F>(
+    line: &str,
+    renderer: &mut StreamRenderer,
+    mut read_clipboard_image: F,
+) -> (String, Vec<String>)
+where
+    F: FnMut() -> Option<ClipboardImage>,
+{
+    if !line.contains(IMAGE_PASTE_SENTINEL) {
+        return (line.to_string(), vec![]);
+    }
+
+    let mut media: Vec<String> = Vec::new();
+    let sentinel_count = line.matches(IMAGE_PASTE_SENTINEL).count();
+    for _ in 0..sentinel_count {
+        if let Some(image) = read_clipboard_image() {
+            let filename = image
+                .path
+                .file_name()
+                .and_then(|n: &std::ffi::OsStr| n.to_str())
+                .unwrap_or("clipboard-image.png");
+            print_cli_progress_line(
+                renderer,
+                &format!(
+                    "Image attached from clipboard ({filename}, {}x{})",
+                    image.width, image.height
+                ),
+            );
+            media.push(image.path.to_string_lossy().into_owned());
+        } else {
+            print_cli_progress_line(renderer, "No image found in clipboard");
+        }
+    }
+
+    let text = line.replace(IMAGE_PASTE_SENTINEL, "").trim().to_string();
+    log::info!("text={text}");
+    log::info!("Number of images: {}", media.len());
+    (text, media)
+}
+
+fn extract_paste_sentinel(line: &str, renderer: &mut StreamRenderer) -> (String, Vec<String>) {
+    extract_paste_sentinel_with(line, renderer, try_get_clipboard_image)
+}
+
 async fn interactive_session(
     agent_loop: Arc<AgentLoop>,
     markdown: bool,
@@ -359,9 +419,13 @@ async fn interactive_session(
     session_id: &str,
 ) -> Result<(), CliError> {
     let welcome = if markdown {
-        format!("{LOGO} Interactive mode (type **exit** or **Ctrl+D** to quit; **Ctrl+Enter** for a new line)\n")
+        format!(
+            "{LOGO} Interactive mode (type **exit** or **Ctrl+D** to quit; **Ctrl+Enter** for a new line; **Ctrl+I** to paste image)\n"
+        )
     } else {
-        format!("{LOGO} Interactive mode (type exit or Ctrl+D to quit; Ctrl+Enter for a new line)\n")
+        format!(
+            "{LOGO} Interactive mode (type exit or Ctrl+D to quit; Ctrl+Enter for a new line; Ctrl+I to paste image)\n"
+        )
     };
     print_agent_response_with_header(&welcome, markdown, None, true);
     let mut line_editor = init_prompt_session();
@@ -371,19 +435,29 @@ async fn interactive_session(
             .map_err(|_| CliError::InteractiveNotImplemented)?;
         match sig {
             Signal::Success(line) => {
-                if line.trim().is_empty() {
+                let mut renderer = StreamRenderer::new(markdown, true);
+                let (text, media) = extract_paste_sentinel(line.trim_end(), &mut renderer);
+                if text.trim().is_empty() && media.is_empty() {
                     continue;
                 }
-                if line.trim().eq_ignore_ascii_case("exit") || line.trim().eq_ignore_ascii_case("quit") {
+                if text.trim().eq_ignore_ascii_case("exit") || text.trim().eq_ignore_ascii_case("quit") {
                     break;
                 }
-                message_session(
-                    line.trim_end(),
+                let send_result = message_session(
+                    text.as_str(),
+                    media.clone(),
                     markdown,
                     channels_config,
                     session_id,
                     Arc::clone(&agent_loop),
-                ).await?;
+                )
+                .await;
+                for media_path in media {
+                    if let Err(err) = fs::remove_file(&media_path) {
+                        log::debug!("Failed to delete temporary clipboard image {media_path}: {err}");
+                    }
+                }
+                send_result?;
             }
             Signal::CtrlC => {
                 continue;
@@ -398,6 +472,13 @@ async fn interactive_session(
 
 fn interactive_keybindings() -> Keybindings {
     let mut kb = default_emacs_keybindings();
+    kb.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('i'),
+        ReedlineEvent::Edit(vec![EditCommand::InsertString(
+            IMAGE_PASTE_SENTINEL.to_string(),
+        )]),
+    );
     kb.add_binding(
         KeyModifiers::CONTROL,
         KeyCode::Enter,
@@ -430,5 +511,31 @@ fn init_prompt_session() -> Reedline {
             log::warn!("Failed to read history file: {}", e);
             build_reedline(None)
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn extract_paste_sentinel_strips_sentinel_and_collects_media() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let img_path = temp.path().join("paste.png");
+        let mut renderer = StreamRenderer::new(false, true);
+        let line = format!("describe{}", IMAGE_PASTE_SENTINEL);
+        let mut responses = vec![
+            Some(ClipboardImage {
+                path: img_path.clone(),
+                width: 640,
+                height: 480,
+            }),
+        ]
+        .into_iter();
+        let (text, media) =
+            extract_paste_sentinel_with(&line, &mut renderer, || responses.next().unwrap_or(None));
+
+        assert_eq!(text, "describe");
+        assert_eq!(media, vec![img_path.to_string_lossy().into_owned()]);
     }
 }

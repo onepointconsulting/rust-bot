@@ -1198,10 +1198,11 @@ impl AgentLoop {
             msg.content.clone()
         };
         log::info!(
-            "Processing message from {}:{}: {}",
+            "Processing message from {}:{}: {}. Media: {}",
             msg.channel,
             msg.sender_id,
-            preview
+            preview,
+            msg.media.join(",")
         );
 
         let key = if session_key.is_empty() {
@@ -1266,15 +1267,17 @@ impl AgentLoop {
             session_manager.get_or_create_session(&key).clone()
         };
         let history = session.get_history(Some(0));
+        let media = if !msg.media.is_empty() {
+            Some(&msg.media.as_slice()[..])
+        } else {
+            None
+        };
+        log::info!("Building messages with media: {}", media.is_some());
         let initial_messages = self.context.build_messages(
             history.as_slice(),
             msg.content.as_str(),
             None,
-            if !msg.media.is_empty() {
-                Some(&msg.media)
-            } else {
-                None
-            },
+            media,
             Some(msg.channel.as_str()),
             Some(msg.chat_id.as_str()),
             DEFAULT_CURRENT_ROLE,
@@ -1544,6 +1547,7 @@ impl AgentLoop {
         session_key: Option<&str>,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        media: Option<Vec<String>>,
         on_progress: Option<ProgressCallback>,
         on_stream: Option<StreamCallback>,
         on_stream_end: Option<StreamEndCallback>
@@ -1553,12 +1557,18 @@ impl AgentLoop {
         let chat_id = chat_id.unwrap_or("direct");
 
         self.connect_mcp().await;
+        let media = media.unwrap_or_default();
+        if !media.is_empty() {
+            for media_url in &media {
+                log::info!("Processing direct message with media: {}", media_url);
+            }
+        }
         let msg = InboundMessage {
             content: content.to_string(),
             channel: channel.to_string(),
             chat_id: chat_id.to_string(),
             sender_id: "user".to_string(),
-            media: vec![],
+            media,
             timestamp: Utc::now(),
             session_key_override: None,
             metadata: HashMap::new(),

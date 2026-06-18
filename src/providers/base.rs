@@ -906,6 +906,12 @@ pub trait LLMProvider: Send + Sync {
                 on_content_delta,
             )
             .await;
+            log::info!("LLM stream response: {:?}", response);
+            // Successful stream response: return immediately.
+            if response.finish_reason != "error" {
+                return response;
+            }
+
             if !Self::is_transient_error(response.content.as_deref()) {
                 // Attempt to strip image content and retry just once if possible.
                 if let Some(stripped) = Self::strip_image_content(&messages) {
@@ -926,10 +932,6 @@ pub trait LLMProvider: Send + Sync {
                     .await;
                 }
                 // All else failed, return last response.
-                return response;
-            }
-            // If finish_reason is not "error", return response.
-            if response.finish_reason != "error" {
                 return response;
             }
             // Otherwise, transient error; log and sleep before retrying.
@@ -1441,5 +1443,135 @@ mod tests {
             }),
         ).await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
+    }
+
+    #[tokio::test]
+    async fn test_safe_chat_stream_with_retry_does_not_retry_successful_image_request() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountingProvider {
+            generation: GenerationSettings,
+            stream_calls: AtomicUsize,
+        }
+
+        impl LLMProvider for CountingProvider {
+            fn new(
+                _api_key: Option<String>,
+                _api_base: Option<String>,
+                _default_model: Option<String>,
+                _extra_headers: Option<HashMap<String, String>>,
+                _spec: Option<ProviderSpec>,
+            ) -> Self {
+                Self {
+                    generation: GenerationSettings::new(),
+                    stream_calls: AtomicUsize::new(0),
+                }
+            }
+
+            fn api_key(&self) -> Option<String> {
+                None
+            }
+
+            fn api_base(&self) -> Option<String> {
+                None
+            }
+
+            fn generation_settings(&self) -> &GenerationSettings {
+                &self.generation
+            }
+
+            fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+                &mut self.generation
+            }
+
+            fn extra_headers(&self) -> Option<HashMap<String, String>> {
+                None
+            }
+
+            fn spec(&self) -> Option<&ProviderSpec> {
+                None
+            }
+
+            async fn chat(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+                _model: Option<String>,
+                _max_tokens: usize,
+                _temperature: f32,
+                _reasoning_effort: Option<String>,
+                _tool_choice: Option<serde_json::Value>,
+            ) -> LLMResponse {
+                LLMResponse {
+                    content: Some("ok".to_string()),
+                    finish_reason: "stop".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                }
+            }
+
+            fn get_default_model(&self) -> String {
+                "test".to_string()
+            }
+
+            async fn chat_stream<F, Fut>(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+                _model: Option<String>,
+                _max_tokens: usize,
+                _temperature: f32,
+                _reasoning_effort: Option<String>,
+                _tool_choice: Option<serde_json::Value>,
+                _on_content_delta: &Option<F>,
+            ) -> LLMResponse
+            where
+                F: Fn(String) -> Fut + Send + Sync,
+                Fut: std::future::Future<Output = ()> + Send,
+            {
+                self.stream_calls.fetch_add(1, Ordering::SeqCst);
+                LLMResponse {
+                    content: Some("ok".to_string()),
+                    finish_reason: "stop".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                }
+            }
+        }
+
+        let provider = CountingProvider::new(None, None, None, None, None);
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Describe this"
+                },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,AA==" },
+                    "_meta": { "path": "/tmp/test.png" }
+                }
+            ]
+        })];
+
+        let _ = provider
+            .safe_chat_stream_with_retry(
+                messages,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &None::<fn(String) -> std::future::Ready<()>>,
+            )
+            .await;
+
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
     }
 }
