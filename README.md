@@ -150,7 +150,7 @@ cargo build -r
 
 ## Interactive console
 
-Rust Bot ships with a small REPL-style interactive console built on [`reedline`](https://github.com/nushell/reedline). It uses Emacs-style keybindings by default, supports history, and lets you paste images and write multi-line prompts without leaving the terminal.
+Rust Bot ships with a small REPL-style interactive console built on [`reedline`](https://github.com/nushell/reedline). It uses Emacs-style keybindings by default, supports history, and lets you paste images, paste clipboard text, and write multi-line prompts without leaving the terminal.
 
 ### Starting the console
 
@@ -166,7 +166,7 @@ A short banner is printed, showing the logo and the available shortcuts. Then th
 
 ### Key bindings
 
-The line editor uses **Emacs** keybindings. The full default set is available; the table below highlights the bindings that are most useful day-to-day. The two custom bindings added by Rust Bot are marked.
+The line editor uses **Emacs** keybindings. The full default set is available; the table below highlights the bindings that are most useful day-to-day. Custom bindings added by Rust Bot are marked.
 
 #### Movement
 
@@ -198,6 +198,7 @@ The line editor uses **Emacs** keybindings. The full default set is available; t
 | `Ctrl+T` | Transpose characters |
 | `Alt+T` | Transpose words |
 | `Ctrl+I` / `Tab` | _(custom)_ Paste image from clipboard — see [Image paste](#image-paste) |
+| `Alt+V` | _(custom)_ Paste clipboard text into the current prompt — see [Text paste](#text-paste) |
 | `Ctrl+Enter` | _(custom)_ Insert a newline, do not submit — see [Multi-line input](#multi-line-input) |
 | `Ctrl+C` | Cancel the current line and re-show the prompt (does not exit) |
 | `Ctrl+L` | Clear the screen |
@@ -228,6 +229,15 @@ Pressing `Ctrl+I` (or `Tab`) reads the current clipboard image and inserts a sen
 - The image is stored in a temporary file in the workspace; if the message is sent successfully the file is cleaned up.
 - `Ctrl+I` is bound to image paste because `Tab` would otherwise complete completions; if you don't have an image on the clipboard the binding is a safe no-op (the sentinel stays in the buffer and is stripped on submit).
 - The console uses **bracketed paste mode**, so multi-line text pasted from the terminal is treated as one block rather than being submitted early.
+
+### Text paste
+
+Pressing `Alt+V` captures the current clipboard text and inserts it into the prompt at the cursor position. The text is sent as part of the same message when you press `Enter`.
+
+This is useful when pasting larger snippets, code, logs, or text that may contain newlines. The console captures the clipboard contents through a small sentinel token and replaces that token before sending the message.
+
+- Multiple `Alt+V` presses in one prompt are supported; captured snippets are inserted in order.
+- If clipboard text cannot be read, the paste is treated as empty and the placeholder is stripped on submit.
 
 ### Multi-line input
 
