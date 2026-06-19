@@ -176,18 +176,22 @@ impl StreamRenderer {
     }
 
     pub async fn on_end(&mut self, resuming: bool) {
-        self.stop_spinner();
+        let printed = self.streamed && !self.buf.trim().is_empty();
+        if printed {
+            // Streamed text was emitted this round: stop the spinner and finish
+            // the line so the next round (or the prompt) starts cleanly.
+            self.stop_spinner();
+            let _ = writeln!(io::stdout());
+        }
         if resuming {
-            // Tool-call round: keep what was streamed, separate it from the next
-            // round, and resume the spinner while the agent keeps working.
-            if self.streamed && !self.buf.trim().is_empty() {
-                let _ = writeln!(io::stdout());
-            }
+            // Tool-call round: keep a SINGLE spinner running across the round
+            // rather than stopping and recreating it. Recreating churns
+            // indicatif's live line and races with its steady-tick thread,
+            // which leaves an orphaned "thinking" line behind.
             self.buf.clear();
             self.start_spinner();
-        } else if self.streamed && !self.buf.trim().is_empty() {
-            // Final round: finish the streamed line.
-            let _ = writeln!(io::stdout());
+        } else {
+            self.stop_spinner();
         }
     }
 

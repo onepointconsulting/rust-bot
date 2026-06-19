@@ -26,6 +26,8 @@ use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
 use crate::utils::clipboard::ClipboardImage;
+use crate::utils::clipboard::{TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL};
+use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
 use crate::utils::clipboard::{IMAGE_PASTE_SENTINEL, try_get_clipboard_image};
@@ -382,8 +384,7 @@ where
     }
 
     let mut media: Vec<String> = Vec::new();
-    let sentinel_count = line.matches(IMAGE_PASTE_SENTINEL).count();
-    for _ in 0..sentinel_count {
+    for _ in 0..line.matches(IMAGE_PASTE_SENTINEL).count() {
         if let Some(image) = read_clipboard_image() {
             let filename = image
                 .path
@@ -413,6 +414,15 @@ fn extract_paste_sentinel(line: &str, renderer: &mut StreamRenderer) -> (String,
     extract_paste_sentinel_with(line, renderer, try_get_clipboard_image)
 }
 
+fn replace_text_sentinels(line: &str, captures: &[String]) -> String {
+    let mut out = line.to_string();
+    for capture in captures {
+        out = out.replacen(TEXT_PASTE_SENTINEL, capture, 1);
+    }
+    // Drop any leftover sentinels (e.g. failed capture / manual edits).
+    out.replace(TEXT_PASTE_SENTINEL, "").trim().to_string()
+}
+
 async fn interactive_session(
     agent_loop: Arc<AgentLoop>,
     markdown: bool,
@@ -421,23 +431,42 @@ async fn interactive_session(
 ) -> Result<(), CliError> {
     let welcome = if markdown {
         format!(
-            "{LOGO} Interactive mode (type **exit** or **Ctrl+D** to quit; **Ctrl+Enter** for a new line; **Ctrl+I** to paste image)\n"
+            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
+            "type **exit** or **Ctrl+D** to quit",
+            "**Ctrl+Enter** for a new line",
+            "**Ctrl+I** to paste image",
+            "**Alt+V** to paste text"
         )
     } else {
         format!(
-            "{LOGO} Interactive mode (type exit or Ctrl+D to quit; Ctrl+Enter for a new line; Ctrl+I to paste image)\n"
+            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
+            "type exit or Ctrl+D to quit",
+            "Ctrl+Enter for a new line",
+            "Ctrl+I to paste image",
+            "Alt+V to paste text"
         )
     };
     print_agent_response_with_header(&welcome, markdown, None, true);
     let mut line_editor = init_prompt_session();
     let prompt = DefaultPrompt::default();
+    let mut text_captures: Vec<String> = Vec::new();
     loop {
         let sig = tokio::task::block_in_place(|| line_editor.read_line(&prompt))
             .map_err(|_| CliError::InteractiveNotImplemented)?;
         match sig {
+            Signal::HostCommand(cmd) if cmd == TEXT_PASTE_COMMAND => {
+                let captured = try_get_clipboard_text().unwrap_or_default();
+                text_captures.push(captured);
+                continue;
+            }
             Signal::Success(line) => {
-                let mut renderer = StreamRenderer::new(markdown, true);
+                // No spinner here: this renderer only prints clipboard-attach
+                // progress lines. message_session owns the "thinking" spinner,
+                // so starting one here would duplicate it.
+                let mut renderer = StreamRenderer::new(markdown, false);
                 let (text, media) = extract_paste_sentinel(line.trim_end(), &mut renderer);
+                let text = replace_text_sentinels(text.as_str(), &text_captures);
+                text_captures.clear();
                 if text.trim().is_empty() && media.is_empty() {
                     continue;
                 }
@@ -479,6 +508,16 @@ fn interactive_keybindings() -> Keybindings {
         ReedlineEvent::Edit(vec![EditCommand::InsertString(
             IMAGE_PASTE_SENTINEL.to_string(),
         )]),
+    );
+    kb.add_binding(
+        KeyModifiers::ALT,
+        KeyCode::Char('v'),
+        ReedlineEvent::Multiple(vec![
+            ReedlineEvent::Edit(vec![EditCommand::InsertString(
+                TEXT_PASTE_SENTINEL.to_string(),
+            )]),
+            ReedlineEvent::ExecuteHostCommand(TEXT_PASTE_COMMAND.to_string()),
+        ]),
     );
     kb.add_binding(
         KeyModifiers::CONTROL,
@@ -538,5 +577,23 @@ mod tests {
 
         assert_eq!(text, "describe");
         assert_eq!(media, vec![img_path.to_string_lossy().into_owned()]);
+    }
+
+    #[test]
+    fn replace_text_sentinels_substitutes_captures_in_order() {
+        let line = format!(
+            "first {TEXT_PASTE_SENTINEL} then {TEXT_PASTE_SENTINEL} end"
+        );
+        let captures = vec!["alpha".to_string(), "beta".to_string()];
+        let text = replace_text_sentinels(&line, &captures);
+        assert_eq!(text, "first alpha then beta end");
+    }
+
+    #[test]
+    fn replace_text_sentinels_drops_leftover_sentinel_without_capture() {
+        let line = format!("a {TEXT_PASTE_SENTINEL} b {TEXT_PASTE_SENTINEL}");
+        let captures = vec!["one".to_string()];
+        let text = replace_text_sentinels(&line, &captures);
+        assert_eq!(text, "a one b");
     }
 }

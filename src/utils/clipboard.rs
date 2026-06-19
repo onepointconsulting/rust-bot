@@ -5,6 +5,10 @@ use uuid::Uuid;
 
 pub const IMAGE_PASTE_SENTINEL: &str = "\0[PASTED_IMAGE]\0";
 
+pub const TEXT_PASTE_SENTINEL: &str = "\0[PASTED_TEXT]\0";
+
+pub const TEXT_PASTE_COMMAND: &str = "\0[PASTE_TEXT_CMD]\0";
+
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {
     pub path: PathBuf,
@@ -42,6 +46,12 @@ pub fn try_get_clipboard_image() -> Option<ClipboardImage> {
         width: image.width,
         height: image.height,
     })
+}
+
+pub fn try_get_clipboard_text() -> Option<String> {
+    let mut clipboard = Clipboard::new().ok()?;
+    let text = clipboard.get_text().ok()?;
+    Some(text)
 }
 
 #[cfg(test)]
