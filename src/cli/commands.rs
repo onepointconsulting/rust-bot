@@ -8,8 +8,8 @@ use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use reedline::{
-    default_emacs_keybindings, EditCommand, Emacs, FileBackedHistory, Keybindings, KeyCode,
-    KeyModifiers, Reedline, ReedlineEvent, Signal, DefaultPrompt,
+    DefaultPrompt, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers, Keybindings,
+    Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
 };
 use serde_json::Value;
 use termimad::MadSkin;
@@ -26,11 +26,13 @@ use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
 use crate::utils::clipboard::ClipboardImage;
-use crate::utils::clipboard::{TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL};
 use crate::utils::clipboard::try_get_clipboard_text;
+use crate::utils::clipboard::{IMAGE_PASTE_SENTINEL, try_get_clipboard_image};
+use crate::utils::clipboard::{
+    TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX, format_text_paste_sentinel,
+};
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
-use crate::utils::clipboard::{IMAGE_PASTE_SENTINEL, try_get_clipboard_image};
 use crate::utils::restart::{
     consume_restart_notice_from_env, format_restart_completed_message,
     should_show_cli_restart_notice,
@@ -195,7 +197,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     let cron_store_path = config.workspace_path().join("cron").join("jobs.json");
     let cron_service = CronService::new(cron_store_path, None);
- 
+
     let agent_loop = AgentLoop::new(
         Arc::new(bus),
         provider,
@@ -240,7 +242,15 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
             .await
         }
         Some(_) => Ok(()),
-        None => interactive_session(Arc::new(agent_loop), markdown, &config.channels, &session_id).await,
+        None => {
+            interactive_session(
+                Arc::new(agent_loop),
+                markdown,
+                &config.channels,
+                &session_id,
+            )
+            .await
+        }
     }
 }
 
@@ -256,7 +266,8 @@ async fn message_session(
     for media_path in &media {
         log::info!("media={media_path}");
     }
-    let renderer: Arc<Mutex<StreamRenderer>> = Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
+    let renderer: Arc<Mutex<StreamRenderer>> =
+        Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
     let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
     let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
     let response = agent_loop
@@ -322,8 +333,7 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
     let provider_name = config.agents.provider.clone();
     match provider_name.as_str() {
         "openai" | "openai_compat" | "openrouter" => Arc::new(OpenAICompatProvider::new(
-            Some(
-                config.providers.custom.api_key.clone()),
+            Some(config.providers.custom.api_key.clone()),
             config.providers.custom.api_base.clone(),
             Some(model),
             None,
@@ -354,7 +364,10 @@ fn print_cli_progress_line(renderer: &mut StreamRenderer, text: &str) {
     });
 }
 
-fn create_on_progress(channels: ChannelsConfig, renderer: Arc<Mutex<StreamRenderer>>) -> ProgressCallback {
+fn create_on_progress(
+    channels: ChannelsConfig,
+    renderer: Arc<Mutex<StreamRenderer>>,
+) -> ProgressCallback {
     Arc::new(move |content, tool_hint| {
         let renderer = Arc::clone(&renderer);
         Box::pin(async move {
@@ -415,12 +428,13 @@ fn extract_paste_sentinel(line: &str, renderer: &mut StreamRenderer) -> (String,
 }
 
 fn replace_text_sentinels(line: &str, captures: &[String]) -> String {
-    let mut out = line.to_string();
-    for capture in captures {
-        out = out.replacen(TEXT_PASTE_SENTINEL, capture, 1);
-    }
-    // Drop any leftover sentinels (e.g. failed capture / manual edits).
-    out.replace(TEXT_PASTE_SENTINEL, "").trim().to_string()
+    TEXT_PASTE_SENTINEL_REGEX
+        .replace_all(line, |caps: &regex::Captures<'_>| {
+            let idx = caps[1].parse::<usize>().unwrap_or(usize::MAX);
+            captures.get(idx).map(String::as_str).unwrap_or("")
+        })
+        .trim()
+        .to_string()
 }
 
 async fn interactive_session(
@@ -455,8 +469,19 @@ async fn interactive_session(
             .map_err(|_| CliError::InteractiveNotImplemented)?;
         match sig {
             Signal::HostCommand(cmd) if cmd == TEXT_PASTE_COMMAND => {
+                let index = text_captures.len();
                 let captured = try_get_clipboard_text().unwrap_or_default();
-                text_captures.push(captured);
+                let line_count = captured.lines().count();
+                if line_count > 1 {
+                    text_captures.push(captured);
+                    line_editor.run_edit_commands(&[EditCommand::InsertString(
+                        format_text_paste_sentinel(index, line_count),
+                    )]);
+                } else {
+                    line_editor.run_edit_commands(&[EditCommand::InsertString(
+                        captured,
+                    )]);
+                }
                 continue;
             }
             Signal::Success(line) => {
@@ -470,10 +495,12 @@ async fn interactive_session(
                 if text.trim().is_empty() && media.is_empty() {
                     continue;
                 }
-                if text.trim().eq_ignore_ascii_case("exit") || text.trim().eq_ignore_ascii_case("quit") {
+                if text.trim().eq_ignore_ascii_case("exit")
+                    || text.trim().eq_ignore_ascii_case("quit")
+                {
                     break;
                 }
-                let send_result = message_session(
+                let send_result: Result<(), CliError> = message_session(
                     text.as_str(),
                     media.clone(),
                     markdown,
@@ -484,7 +511,9 @@ async fn interactive_session(
                 .await;
                 for media_path in media {
                     if let Err(err) = fs::remove_file(&media_path) {
-                        log::debug!("Failed to delete temporary clipboard image {media_path}: {err}");
+                        log::debug!(
+                            "Failed to delete temporary clipboard image {media_path}: {err}"
+                        );
                     }
                 }
                 send_result?;
@@ -495,7 +524,7 @@ async fn interactive_session(
             Signal::CtrlD => break,
             _ => continue,
         }
-    };
+    }
 
     Ok(())
 }
@@ -512,12 +541,7 @@ fn interactive_keybindings() -> Keybindings {
     kb.add_binding(
         KeyModifiers::ALT,
         KeyCode::Char('v'),
-        ReedlineEvent::Multiple(vec![
-            ReedlineEvent::Edit(vec![EditCommand::InsertString(
-                TEXT_PASTE_SENTINEL.to_string(),
-            )]),
-            ReedlineEvent::ExecuteHostCommand(TEXT_PASTE_COMMAND.to_string()),
-        ]),
+        ReedlineEvent::ExecuteHostCommand(TEXT_PASTE_COMMAND.to_string()),
     );
     kb.add_binding(
         KeyModifiers::CONTROL,
@@ -564,13 +588,11 @@ mod tests {
         let img_path = temp.path().join("paste.png");
         let mut renderer = StreamRenderer::new(false, true);
         let line = format!("describe{}", IMAGE_PASTE_SENTINEL);
-        let mut responses = vec![
-            Some(ClipboardImage {
-                path: img_path.clone(),
-                width: 640,
-                height: 480,
-            }),
-        ]
+        let mut responses = vec![Some(ClipboardImage {
+            path: img_path.clone(),
+            width: 640,
+            height: 480,
+        })]
         .into_iter();
         let (text, media) =
             extract_paste_sentinel_with(&line, &mut renderer, || responses.next().unwrap_or(None));
@@ -580,20 +602,34 @@ mod tests {
     }
 
     #[test]
-    fn replace_text_sentinels_substitutes_captures_in_order() {
+    fn replace_text_sentinels_substitutes_captures_by_index() {
         let line = format!(
-            "first {TEXT_PASTE_SENTINEL} then {TEXT_PASTE_SENTINEL} end"
+            "first {} then {} end",
+            format_text_paste_sentinel(1, 1),
+            format_text_paste_sentinel(0, 1),
         );
         let captures = vec!["alpha".to_string(), "beta".to_string()];
         let text = replace_text_sentinels(&line, &captures);
-        assert_eq!(text, "first alpha then beta end");
+        assert_eq!(text, "first beta then alpha end");
     }
 
     #[test]
-    fn replace_text_sentinels_drops_leftover_sentinel_without_capture() {
-        let line = format!("a {TEXT_PASTE_SENTINEL} b {TEXT_PASTE_SENTINEL}");
+    fn replace_text_sentinels_drops_unknown_index_without_capture() {
+        let line = format!(
+            "a {} b {}",
+            format_text_paste_sentinel(0, 1),
+            format_text_paste_sentinel(3, 5),
+        );
         let captures = vec!["one".to_string()];
         let text = replace_text_sentinels(&line, &captures);
         assert_eq!(text, "a one b");
+    }
+
+    #[test]
+    fn replace_text_sentinels_ignores_line_count_metadata() {
+        let line = format!("a {} b", format_text_paste_sentinel(0, 99));
+        let captures = vec!["content".to_string()];
+        let text = replace_text_sentinels(&line, &captures);
+        assert_eq!(text, "a content b");
     }
 }
