@@ -16,7 +16,7 @@ use termimad::MadSkin;
 
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
 use crate::bus::queue::MessageBus;
-use crate::cli::paste_edit_mode::{PasteCapturingEmacs, prepare_text_paste_insert};
+use crate::cli::paste_edit_mode::{prepare_image_paste_insert, PasteCapturingEmacs, prepare_text_paste_insert};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
 use crate::config::log::init_runtime_logging;
@@ -27,8 +27,9 @@ use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
 use crate::utils::clipboard::ClipboardImage;
+use crate::utils::clipboard::IMAGE_PASTE_COMMAND_REGEX;
 use crate::utils::clipboard::try_get_clipboard_text;
-use crate::utils::clipboard::{IMAGE_PASTE_SENTINEL, try_get_clipboard_image};
+use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
 use crate::utils::clipboard::{
     TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX,
 };
@@ -393,12 +394,12 @@ fn extract_paste_sentinel_with<F>(
 where
     F: FnMut() -> Option<ClipboardImage>,
 {
-    if !line.contains(IMAGE_PASTE_SENTINEL) {
+    if !line.contains(IMAGE_PASTE_COMMAND) {
         return (line.to_string(), vec![]);
     }
 
     let mut media: Vec<String> = Vec::new();
-    for _ in 0..line.matches(IMAGE_PASTE_SENTINEL).count() {
+    for _ in 0..line.matches(IMAGE_PASTE_COMMAND).count() {
         if let Some(image) = read_clipboard_image() {
             let filename = image
                 .path
@@ -418,14 +419,39 @@ where
         }
     }
 
-    let text = line.replace(IMAGE_PASTE_SENTINEL, "").trim().to_string();
+    let text = line.replace(IMAGE_PASTE_COMMAND, "").trim().to_string();
     log::info!("text={text}");
     log::info!("Number of images: {}", media.len());
     (text, media)
 }
 
-fn extract_paste_sentinel(line: &str, renderer: &mut StreamRenderer) -> (String, Vec<String>) {
-    extract_paste_sentinel_with(line, renderer, try_get_clipboard_image)
+fn extract_images(
+    line: &str,
+    renderer: &mut StreamRenderer,
+    image_captures: &[String],
+) -> (String, Vec<String>) {
+    let mut media: Vec<String> = Vec::new();
+
+    for caps in IMAGE_PASTE_COMMAND_REGEX.captures_iter(line) {
+        let idx = caps[1].parse::<usize>().unwrap_or(usize::MAX);
+        if let Some(path) = image_captures.get(idx) {
+            media.push(path.clone());
+            let filename = std::path::Path::new(path)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or(path.as_str());
+            print_cli_progress_line(
+                renderer,
+                &format!("Image attached from clipboard ({filename})"),
+            );
+        }
+    }
+
+    let text = IMAGE_PASTE_COMMAND_REGEX
+        .replace_all(line, "")
+        .trim()
+        .to_string();
+    (text, media)
 }
 
 fn replace_text_sentinels(line: &str, captures: &[String]) -> String {
@@ -447,6 +473,7 @@ async fn interactive_session(
     let welcome = interactive_welcome_text(markdown);
     print_agent_response_with_header(&welcome, markdown, None, true);
     let text_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let image_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let mut line_editor = init_prompt_session(text_captures.clone());
     let prompt = DefaultPrompt::default();
     loop {
@@ -462,17 +489,36 @@ async fn interactive_session(
                 line_editor.run_edit_commands(&[EditCommand::InsertString(insert)]);
                 continue;
             }
+            Signal::HostCommand(cmd) if cmd == IMAGE_PASTE_COMMAND => {
+                log::info!("IMAGE_PASTE_COMMAND");
+                if let Some(captured) = try_get_clipboard_image() {
+                    let insert = prepare_image_paste_insert(
+                        &mut image_captures.lock().expect("image captures lock"),
+                        captured.path.to_string_lossy().into_owned(),
+                    );
+                    line_editor.run_edit_commands(&[EditCommand::InsertString(insert)]);
+                } else {
+                    let mut renderer = StreamRenderer::new(markdown, false);
+                    print_cli_progress_line(&mut renderer, "No image found in clipboard");
+                }
+                continue;
+            }
             Signal::Success(line) => {
                 // No spinner here: this renderer only prints clipboard-attach
                 // progress lines. message_session owns the "thinking" spinner,
                 // so starting one here would duplicate it.
                 let mut renderer = StreamRenderer::new(markdown, false);
-                let (text, media) = extract_paste_sentinel(line.trim_end(), &mut renderer);
+                let (text, media) = extract_images(
+                    line.trim_end(),
+                    &mut renderer,
+                    &image_captures.lock().expect("image captures lock"),
+                );
                 let text = replace_text_sentinels(
                     text.as_str(),
                     &text_captures.lock().expect("text captures lock"),
                 );
                 text_captures.lock().expect("text captures lock").clear();
+                image_captures.lock().expect("image captures lock").clear();
                 if text.trim().is_empty() && media.is_empty() {
                     continue;
                 }
@@ -516,7 +562,7 @@ fn interactive_welcome_text(markdown: bool) -> String {
             "{LOGO} Interactive mode ({}; {}; {}; {})\n",
             "type **exit** or **Ctrl+D** to quit",
             "**Ctrl+Enter** for a new line",
-            "**Ctrl+I** to paste image",
+            "**Alt+I** or **Ctrl+Tab** to paste image",
             "**Ctrl+V** or **Alt+V** to paste text",
         )
     } else {
@@ -524,7 +570,7 @@ fn interactive_welcome_text(markdown: bool) -> String {
             "{LOGO} Interactive mode ({}; {}; {}; {})\n",
             "type exit or Ctrl+D to quit",
             "Ctrl+Enter for a new line",
-            "Ctrl+I to paste image",
+            "Alt+I or Ctrl+Tab to paste image",
             "Ctrl+V or Alt+V to paste text",
         )
     }
@@ -532,12 +578,16 @@ fn interactive_welcome_text(markdown: bool) -> String {
 
 fn interactive_keybindings() -> Keybindings {
     let mut kb = default_emacs_keybindings();
+    // Ctrl+I is ASCII Tab (0x09); terminals emit KeyCode::Tab, not Control+Char('i').
     kb.add_binding(
         KeyModifiers::CONTROL,
+        KeyCode::Tab,
+        ReedlineEvent::ExecuteHostCommand(IMAGE_PASTE_COMMAND.to_string()),
+    );
+    kb.add_binding(
+        KeyModifiers::ALT,
         KeyCode::Char('i'),
-        ReedlineEvent::Edit(vec![EditCommand::InsertString(
-            IMAGE_PASTE_SENTINEL.to_string(),
-        )]),
+        ReedlineEvent::ExecuteHostCommand(IMAGE_PASTE_COMMAND.to_string()),
     );
     kb.add_binding(
         KeyModifiers::ALT,
@@ -596,14 +646,40 @@ fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::clipboard::format_text_paste_sentinel;
+    use crate::utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel};
+
+    #[test]
+    fn extract_images_resolves_captures_by_index_and_strips_sentinels() {
+        let img0 = "/tmp/paste-0.png".to_string();
+        let img1 = "/tmp/paste-1.png".to_string();
+        let captures = vec![img0.clone(), img1.clone()];
+        let line = format!(
+            "look at {} and {}",
+            format_image_paste_sentinel(1),
+            format_image_paste_sentinel(0),
+        );
+        let mut renderer = StreamRenderer::new(false, true);
+        let (text, media) = extract_images(&line, &mut renderer, &captures);
+        assert_eq!(text, "look at  and");
+        assert_eq!(media, vec![img1, img0]);
+    }
+
+    #[test]
+    fn extract_images_ignores_unknown_index() {
+        let captures = vec!["/tmp/paste-0.png".to_string()];
+        let line = format!("a {} b", format_image_paste_sentinel(3));
+        let mut renderer = StreamRenderer::new(false, true);
+        let (text, media) = extract_images(&line, &mut renderer, &captures);
+        assert_eq!(text, "a  b");
+        assert!(media.is_empty());
+    }
 
     #[test]
     fn extract_paste_sentinel_strips_sentinel_and_collects_media() {
         let temp = tempfile::tempdir().expect("tempdir");
         let img_path = temp.path().join("paste.png");
         let mut renderer = StreamRenderer::new(false, true);
-        let line = format!("describe{}", IMAGE_PASTE_SENTINEL);
+        let line = format!("describe{}", IMAGE_PASTE_COMMAND);
         let mut responses = vec![Some(ClipboardImage {
             path: img_path.clone(),
             width: 640,

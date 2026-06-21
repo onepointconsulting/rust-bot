@@ -4,16 +4,23 @@ use arboard::Clipboard;
 use regex::Regex;
 use uuid::Uuid;
 
-pub const IMAGE_PASTE_SENTINEL: &str = "\0[PASTED_IMAGE]\0";
+pub const IMAGE_PASTE_COMMAND: &str = "\0[PASTED_IMAGE]\0";
 
 pub static TEXT_PASTE_SENTINEL_REGEX: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\x00\[PASTED_TEXT-#(\d+)\s\d+\slines\]\x00").unwrap());
+
+pub const TEXT_PASTE_COMMAND: &str = "\0[PASTE_TEXT_CMD]\0";
+
+pub static IMAGE_PASTE_COMMAND_REGEX: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\x00\[PASTED_IMAGE-#(\d+)\]\x00").unwrap());
 
 pub fn format_text_paste_sentinel(index: usize, line_count: usize) -> String {
     format!("\0[PASTED_TEXT-#{index} {line_count} lines]\0")
 }
 
-pub const TEXT_PASTE_COMMAND: &str = "\0[PASTE_TEXT_CMD]\0";
+pub fn format_image_paste_sentinel(index: usize) -> String {
+    format!("\0[PASTED_IMAGE-#{index}]\0")
+}
 
 #[derive(Debug, Clone)]
 pub struct ClipboardImage {

@@ -5,7 +5,7 @@ use reedline::{
     EditCommand, EditMode, Emacs, Keybindings, PromptEditMode, ReedlineEvent, ReedlineRawEvent,
 };
 
-use crate::utils::clipboard::format_text_paste_sentinel;
+use crate::utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel};
 
 pub fn normalize_paste_text(text: String) -> String {
     text.replace("\r\n", "\n").replace('\r', "\n")
@@ -23,6 +23,12 @@ pub fn prepare_text_paste_insert(captures: &mut Vec<String>, text: String) -> St
     } else {
         normalized
     }
+}
+
+pub fn prepare_image_paste_insert(captures: &mut Vec<String>, image_path: String) -> String {
+    let index = captures.len();
+    captures.push(image_path);
+    format_image_paste_sentinel(index)
 }
 
 /// Emacs edit mode that intercepts terminal bracketed paste (`Event::Paste`) and
@@ -83,6 +89,14 @@ mod tests {
         let insert = prepare_text_paste_insert(&mut captures, "hello".to_string());
         assert!(captures.is_empty());
         assert_eq!(insert, "hello");
+    }
+
+    #[test]
+    fn prepare_image_paste_insert_stores_path_and_returns_sentinel() {
+        let mut captures = Vec::new();
+        let insert = prepare_image_paste_insert(&mut captures, "/tmp/a.png".to_string());
+        assert_eq!(captures, vec!["/tmp/a.png".to_string()]);
+        assert_eq!(insert, format_image_paste_sentinel(0));
     }
 
     #[test]
