@@ -1,4 +1,5 @@
 pub mod commands;
+mod paste_edit_mode;
 pub mod stream;
 
 pub use commands::{

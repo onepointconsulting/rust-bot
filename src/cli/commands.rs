@@ -2,13 +2,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex as StdMutex};
 
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use reedline::{
-    DefaultPrompt, EditCommand, Emacs, FileBackedHistory, KeyCode, KeyModifiers, Keybindings,
+    DefaultPrompt, EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings,
     Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
 };
 use serde_json::Value;
@@ -16,6 +16,7 @@ use termimad::MadSkin;
 
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
 use crate::bus::queue::MessageBus;
+use crate::cli::paste_edit_mode::{PasteCapturingEmacs, prepare_text_paste_insert};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
 use crate::config::log::init_runtime_logging;
@@ -29,7 +30,7 @@ use crate::utils::clipboard::ClipboardImage;
 use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::clipboard::{IMAGE_PASTE_SENTINEL, try_get_clipboard_image};
 use crate::utils::clipboard::{
-    TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX, format_text_paste_sentinel,
+    TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX,
 };
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
@@ -443,45 +444,22 @@ async fn interactive_session(
     channels_config: &ChannelsConfig,
     session_id: &str,
 ) -> Result<(), CliError> {
-    let welcome = if markdown {
-        format!(
-            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
-            "type **exit** or **Ctrl+D** to quit",
-            "**Ctrl+Enter** for a new line",
-            "**Ctrl+I** to paste image",
-            "**Alt+V** to paste text"
-        )
-    } else {
-        format!(
-            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
-            "type exit or Ctrl+D to quit",
-            "Ctrl+Enter for a new line",
-            "Ctrl+I to paste image",
-            "Alt+V to paste text"
-        )
-    };
+    let welcome = interactive_welcome_text(markdown);
     print_agent_response_with_header(&welcome, markdown, None, true);
-    let mut line_editor = init_prompt_session();
+    let text_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
+    let mut line_editor = init_prompt_session(text_captures.clone());
     let prompt = DefaultPrompt::default();
-    let mut text_captures: Vec<String> = Vec::new();
     loop {
         let sig = tokio::task::block_in_place(|| line_editor.read_line(&prompt))
             .map_err(|_| CliError::InteractiveNotImplemented)?;
         match sig {
             Signal::HostCommand(cmd) if cmd == TEXT_PASTE_COMMAND => {
-                let index = text_captures.len();
                 let captured = try_get_clipboard_text().unwrap_or_default();
-                let line_count = captured.lines().count();
-                if line_count > 1 {
-                    text_captures.push(captured);
-                    line_editor.run_edit_commands(&[EditCommand::InsertString(
-                        format_text_paste_sentinel(index, line_count),
-                    )]);
-                } else {
-                    line_editor.run_edit_commands(&[EditCommand::InsertString(
-                        captured,
-                    )]);
-                }
+                let insert = prepare_text_paste_insert(
+                    &mut text_captures.lock().expect("text captures lock"),
+                    captured,
+                );
+                line_editor.run_edit_commands(&[EditCommand::InsertString(insert)]);
                 continue;
             }
             Signal::Success(line) => {
@@ -490,8 +468,11 @@ async fn interactive_session(
                 // so starting one here would duplicate it.
                 let mut renderer = StreamRenderer::new(markdown, false);
                 let (text, media) = extract_paste_sentinel(line.trim_end(), &mut renderer);
-                let text = replace_text_sentinels(text.as_str(), &text_captures);
-                text_captures.clear();
+                let text = replace_text_sentinels(
+                    text.as_str(),
+                    &text_captures.lock().expect("text captures lock"),
+                );
+                text_captures.lock().expect("text captures lock").clear();
                 if text.trim().is_empty() && media.is_empty() {
                     continue;
                 }
@@ -529,6 +510,26 @@ async fn interactive_session(
     Ok(())
 }
 
+fn interactive_welcome_text(markdown: bool) -> String {
+    if markdown {
+        format!(
+            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
+            "type **exit** or **Ctrl+D** to quit",
+            "**Ctrl+Enter** for a new line",
+            "**Ctrl+I** to paste image",
+            "**Ctrl+V** or **Alt+V** to paste text",
+        )
+    } else {
+        format!(
+            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
+            "type exit or Ctrl+D to quit",
+            "Ctrl+Enter for a new line",
+            "Ctrl+I to paste image",
+            "Ctrl+V or Alt+V to paste text",
+        )
+    }
+}
+
 fn interactive_keybindings() -> Keybindings {
     let mut kb = default_emacs_keybindings();
     kb.add_binding(
@@ -543,6 +544,14 @@ fn interactive_keybindings() -> Keybindings {
         KeyCode::Char('v'),
         ReedlineEvent::ExecuteHostCommand(TEXT_PASTE_COMMAND.to_string()),
     );
+    // On Windows, conhost/Windows Terminal often inject clipboard text directly
+    // instead of sending Event::Paste (crossterm 0.29 lacks Windows bracketed-paste
+    // parsing). This binding handles Ctrl+V when the terminal forwards the key event.
+    kb.add_binding(
+        KeyModifiers::CONTROL,
+        KeyCode::Char('v'),
+        ReedlineEvent::ExecuteHostCommand(TEXT_PASTE_COMMAND.to_string()),
+    );
     kb.add_binding(
         KeyModifiers::CONTROL,
         KeyCode::Enter,
@@ -551,17 +560,23 @@ fn interactive_keybindings() -> Keybindings {
     kb
 }
 
-fn build_reedline(history: Option<FileBackedHistory>) -> Reedline {
+fn build_reedline(
+    history: Option<FileBackedHistory>,
+    text_captures: Arc<StdMutex<Vec<String>>>,
+) -> Reedline {
     let mut editor = Reedline::create()
         .use_bracketed_paste(true)
-        .with_edit_mode(Box::new(Emacs::new(interactive_keybindings())));
+        .with_edit_mode(Box::new(PasteCapturingEmacs::new(
+            interactive_keybindings(),
+            text_captures,
+        )));
     if let Some(history) = history {
         editor = editor.with_history(Box::new(history));
     }
     editor
 }
 
-fn init_prompt_session() -> Reedline {
+fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
     let history_file = get_cli_history_path();
     if let Some(parent) = history_file.parent() {
         ensure_dir(parent);
@@ -570,10 +585,10 @@ fn init_prompt_session() -> Reedline {
     let history_result = FileBackedHistory::with_file(100, history_file);
 
     match history_result {
-        Ok(history) => build_reedline(Some(history)),
+        Ok(history) => build_reedline(Some(history), text_captures),
         Err(e) => {
             log::warn!("Failed to read history file: {}", e);
-            build_reedline(None)
+            build_reedline(None, text_captures)
         }
     }
 }
@@ -581,6 +596,7 @@ fn init_prompt_session() -> Reedline {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::utils::clipboard::format_text_paste_sentinel;
 
     #[test]
     fn extract_paste_sentinel_strips_sentinel_and_collects_media() {

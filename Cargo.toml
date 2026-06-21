@@ -52,3 +52,9 @@ crossterm = "0.29"
 tempfile = "3"
 # Extra rmcp features needed only for integration tests (server, macros, schemars)
 rmcp = { version = "1.6.0", features = ["server", "macros", "schemars"] }
+
+# crossterm 0.29 does not parse bracketed paste on Windows; WT sends ESC[200~…ESC[201~
+# but the stock parser ignores it and conhost injects raw text instead.
+# See https://github.com/crossterm-rs/crossterm/pull/1030
+[patch.crates-io]
+crossterm = { git = "https://github.com/eitsupi/crossterm", branch = "feature/windows-vt-input" }

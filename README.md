@@ -234,9 +234,11 @@ Pressing `Ctrl+I` (or `Tab`) reads the current clipboard image and inserts a sen
 
 Pressing `Alt+V` captures the current clipboard text and inserts it into the prompt at the cursor position. The text is sent as part of the same message when you press `Enter`.
 
-This is useful when pasting larger snippets, code, logs, or text that may contain newlines. The console captures the clipboard contents through a small sentinel token and replaces that token before sending the message.
+This is useful when pasting larger snippets, code, logs, or text that may contain newlines. Internally, each paste is recorded with an index and a line-count hint (e.g. `[PASTED_TEXT-#0 12 lines]`). On submit, every sentinel is replaced by its corresponding captured text using that index, so the substitution is always correct regardless of cursor position or paste order.
 
-- Multiple `Alt+V` presses in one prompt are supported; captured snippets are inserted in order.
+- **Single-line text** is inserted directly into the buffer as plain text — no sentinel is used.
+- **Multi-line text** is stored separately and represented by an indexed sentinel in the buffer. The sentinel shows the paste index and line count so you can see what is queued.
+- Multiple `Alt+V` presses in one prompt are fully supported; each paste gets its own index and is substituted independently on submit.
 - If clipboard text cannot be read, the paste is treated as empty and the placeholder is stripped on submit.
 
 ### Multi-line input
