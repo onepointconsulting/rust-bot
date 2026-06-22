@@ -1,12 +1,11 @@
 use crate::{
     PKG_VERSION, bus::events::OutboundMessage, command::{CommandContext, CommandHandler, CommandRouter}, utils::{
-        helpers::build_status_content, restart::restart_with_notice,
-        searchusage::fetch_search_usage,
+        gitstore::{CommitInfo, GitStore}, helpers::build_status_content, restart::restart_with_notice, searchusage::fetch_search_usage
     }
 };
 use async_trait::async_trait;
 use futures::FutureExt;
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Instant};
+use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc, time::Instant};
 
 /// Build an outbound reply addressed back to the inbound message's channel/chat.
 fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
@@ -20,11 +19,32 @@ fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
     }
 }
 
+fn reply_as_text(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
+    let mut metadata = ctx.msg.metadata.clone();
+    metadata.insert("render_as".to_string(), "text".into());
+    OutboundMessage {
+        channel: ctx.msg.channel.clone(),
+        chat_id: ctx.msg.chat_id.clone(),
+        content: content.into(),
+        reply_to: None,
+        media: vec![],
+        metadata,
+    }
+}
+
 fn reply_no_loop(ctx: &CommandContext, command: &str) -> OutboundMessage {
     reply(
         ctx,
         format!("No agent available to execute command: {command}."),
     )
+}
+
+fn dream_git_uninitialized_message(last_dream_cursor: u64) -> &'static str {
+    if last_dream_cursor == 0 {
+        "Dream has not run yet. Run `/dream`, or wait for the next scheduled Dream cycle."
+    } else {
+        "Dream history is not available because memory versioning is not initialized."
+    }
 }
 
 struct CmdStop;
@@ -250,12 +270,243 @@ impl CommandHandler for CmdDream {
     }
 }
 
+struct CmdHelp;
+
+/// Show available commands.
+#[async_trait]
+impl CommandHandler for CmdHelp {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        reply(ctx, build_help_text())
+    }
+}
+
+struct CmdDreamLog;
+
+impl CmdDreamLog {
+    fn extract_changed_files(diff: &str) -> Vec<String> {
+        let mut files = Vec::new();
+        let mut seen = std::collections::HashSet::new();
+        for line in diff.lines() {
+            if !line.starts_with("diff --git ") {
+                continue;
+            }
+            let parts: Vec<&str> = line.split_whitespace().collect();
+            if parts.len() < 4 {
+                continue;
+            }
+            let mut path = parts[3].to_string();
+            if let Some(stripped) = path.strip_prefix("b/") {
+                path = stripped.to_string();
+            }
+            if seen.insert(path.clone()) {
+                files.push(path);
+            }
+        }
+        files
+    }
+
+    fn format_changed_files(diff: &str) -> String {
+        let files = Self::extract_changed_files(diff);
+        if files.is_empty() {
+            "No tracked memory files changed.".to_string()
+        } else {
+            files
+                .iter()
+                .map(|path| format!("`{path}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        }
+    }
+
+    fn format_dream_log_content(commit: &CommitInfo, diff: &str, requested_sha: Option<&str>) -> String {
+        let files_line = Self::format_changed_files(diff);
+        let intro = if requested_sha.is_none() {
+            "Here is the latest Dream memory change."
+        } else {
+            "Here is the selected Dream memory change."
+        };
+
+        let mut lines = vec![
+            "## Dream Update".to_string(),
+            String::new(),
+            intro.to_string(),
+            String::new(),
+            format!("- Commit: `{}`", commit.sha),
+            format!("- Time: {}", commit.timestamp),
+            format!("- Changed files: {files_line}"),
+        ];
+
+        if !diff.is_empty() {
+            lines.push(String::new());
+            lines.push(format!(
+                "Use `/dream-restore {}` to undo this change.",
+                commit.sha
+            ));
+            lines.push(String::new());
+            lines.push("```diff".to_string());
+            lines.push(diff.trim_end().to_string());
+            lines.push("```".to_string());
+        } else {
+            lines.push(String::new());
+            lines.push(
+                "Dream recorded this version, but there is no file diff to display.".to_string(),
+            );
+        }
+
+        lines.join("\n")
+    }
+}
+
+/// Show what the last Dream changed.
+/// Default: diff of the latest commit (HEAD~1 vs HEAD).
+///With /dream-log <sha>: diff of that specific commit.
+#[async_trait]
+impl CommandHandler for CmdDreamLog {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/dream-log");
+        };
+        let store = &agent_loop.consolidator.store;
+        let git = &store.git;
+
+        if !git.is_initialized() {
+            return reply_as_text(
+                ctx,
+                dream_git_uninitialized_message(store.get_last_dream_cursor()),
+            );
+        }
+
+        let args = ctx.args.trim();
+        let content = if !args.is_empty() {
+            let sha = args.split_whitespace().next().unwrap_or("");
+            match git.show_commit_diff(sha) {
+                Some((commit, diff)) => {
+                    Self::format_dream_log_content(&commit, &diff, Some(sha))
+                }
+                None => format!(
+                    "Couldn't find Dream change `{sha}`.\n\n\
+                     Use `/dream-restore` to list recent versions, \
+                     or `/dream-log` to inspect the latest one."
+                ),
+            }
+        } else {
+            let commits = git.log(1);
+            match commits.first().and_then(|c| git.show_commit_diff(&c.sha)) {
+                Some((commit, diff)) => Self::format_dream_log_content(&commit, &diff, None),
+                None => "Dream memory has no saved versions yet.".to_string(),
+            }
+        };
+
+        reply_as_text(ctx, content)
+    }
+}
+
+struct CmdDreamRestore;
+
+impl CmdDreamRestore {
+    fn format_restore_list(commits: &[CommitInfo]) -> String {
+        let mut lines = vec![
+            "## Dream Restore".to_string(),
+            String::new(),
+            "Choose a Dream memory version to restore. Latest first:".to_string(),
+            String::new(),
+        ];
+        for commit in commits {
+            let first_line = commit.message.lines().next().unwrap_or("");
+            lines.push(format!(
+                "- `{}` {} - {first_line}",
+                commit.sha, commit.timestamp
+            ));
+        }
+        lines.extend([
+            String::new(),
+            "Preview a version with `/dream-log <sha>` before restoring it.".to_string(),
+            "Restore a version with `/dream-restore <sha>`.".to_string(),
+        ]);
+        lines.join("\n")
+    }
+
+    fn restore_content(git: &GitStore, sha: &str) -> String {
+        let result = git.show_commit_diff(sha);
+        let changed_files = if let Some((_, diff)) = &result {
+            CmdDreamLog::format_changed_files(diff)
+        } else {
+            "the tracked memory files".to_string()
+        };
+
+        match git.revert(sha) {
+            Some(new_sha) => format!(
+                "Restored Dream memory to the state before `{sha}`.\n\n\
+                 - New safety commit: `{new_sha}`\n\
+                 - Restored files: {changed_files}\n\n\
+                 Use `/dream-log {new_sha}` to inspect the restore diff."
+            ),
+            None => format!(
+                "Couldn't restore Dream change `{sha}`.\n\n\
+                 It may not exist, or it may be the first saved version with no earlier state to restore."
+            ),
+        }
+    }
+}
+
+/// Revert memory to a previous state.
+#[async_trait]
+impl CommandHandler for CmdDreamRestore {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/dream-restore");
+        };
+        let store = &agent_loop.consolidator.store;
+        let git = &store.git;
+        if !git.is_initialized() {
+            return reply_as_text(
+                ctx,
+                dream_git_uninitialized_message(store.get_last_dream_cursor()),
+            );
+        }
+
+        let args = ctx.args.trim();
+        let content = if args.is_empty() {
+            let commits = git.log(10);
+            if commits.is_empty() {
+                "Dream memory has no saved versions to restore yet.".to_string()
+            } else {
+                Self::format_restore_list(&commits)
+            }
+        } else {
+            let sha = args.split_whitespace().next().unwrap_or("");
+            Self::restore_content(git, sha)
+        };
+
+        reply_as_text(ctx, content)
+    }
+}
+
+/// Build canonical help text shared across channels.
+fn build_help_text() -> String {
+    let lines = vec![
+        "🦀 nanobot commands:",
+        "/new — Start a new conversation",
+        "/stop — Stop the current task",
+        "/restart — Restart the bot",
+        "/status — Show bot status",
+        "/dream — Manually trigger Dream consolidation",
+        "/dream-log — Show what the last Dream changed",
+        "/dream-restore — Revert memory to a previous state",
+        "/help — Show available commands",
+    ];
+    lines.join("\n")
+}
+
 pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.priority("/stop", Arc::new(CmdStop));
     router.priority("/restart", Arc::new(CmdRestart));
     router.priority("/status", Arc::new(CmdStatus));
     router.exact("/new", Arc::new(CmdNew));
     router.exact("/dream", Arc::new(CmdDream));
+    router.exact("/dream-log", Arc::new(CmdDreamLog));
+    router.exact("/dream-restore", Arc::new(CmdDreamRestore));
+    router.exact("/help", Arc::new(CmdHelp));
 }
 
 #[cfg(test)]
@@ -421,5 +672,62 @@ mod tests {
         ));
         let out = CmdStop.handle(&stop_ctx(Some(loop_))).await;
         assert_eq!(out.content, "No active task to stop.");
+    }
+
+    #[test]
+    fn format_dream_log_content_latest_with_diff() {
+        let commit = CommitInfo {
+            sha: "abcd1234".into(),
+            message: "dream: test".into(),
+            timestamp: "2026-04-04 12:00".into(),
+        };
+        let diff = "diff --git a/SOUL.md b/SOUL.md\n--- a/SOUL.md\n+++ b/SOUL.md\n@@ -1 +1 @@\n-old\n+new\n";
+        let content = CmdDreamLog::format_dream_log_content(&commit, diff, None);
+
+        assert!(content.contains("## Dream Update"));
+        assert!(content.contains("Here is the latest Dream memory change."));
+        assert!(content.contains("- Commit: `abcd1234`"));
+        assert!(content.contains("- Changed files: `SOUL.md`"));
+        assert!(content.contains("Use `/dream-restore abcd1234` to undo this change."));
+        assert!(content.contains("```diff"));
+        assert!(content.contains("+new"));
+    }
+
+    #[test]
+    fn format_dream_log_content_selected_without_diff() {
+        let commit = CommitInfo {
+            sha: "abcd1234".into(),
+            message: "dream: test".into(),
+            timestamp: "2026-04-04 12:00".into(),
+        };
+        let content = CmdDreamLog::format_dream_log_content(&commit, "", Some("abcd1234"));
+
+        assert!(content.contains("Here is the selected Dream memory change."));
+        assert!(content.contains("No tracked memory files changed."));
+        assert!(content.contains("Dream recorded this version, but there is no file diff to display."));
+        assert!(!content.contains("```diff"));
+    }
+
+    #[test]
+    fn format_restore_list_includes_commits_and_next_steps() {
+        let commits = vec![
+            CommitInfo {
+                sha: "abcd1234".into(),
+                message: "dream: latest\nextra".into(),
+                timestamp: "2026-04-04 12:00".into(),
+            },
+            CommitInfo {
+                sha: "bbbb2222".into(),
+                message: "dream: older".into(),
+                timestamp: "2026-04-04 08:00".into(),
+            },
+        ];
+        let content = CmdDreamRestore::format_restore_list(&commits);
+
+        assert!(content.contains("## Dream Restore"));
+        assert!(content.contains("- `abcd1234` 2026-04-04 12:00 - dream: latest"));
+        assert!(content.contains("- `bbbb2222` 2026-04-04 08:00 - dream: older"));
+        assert!(content.contains("Preview a version with `/dream-log <sha>`"));
+        assert!(content.contains("Restore a version with `/dream-restore <sha>`"));
     }
 }

@@ -556,6 +556,7 @@ impl AgentLoop {
             Ok(sessions) => {
                 *self.mcp_sessions.lock().unwrap_or_else(|e| e.into_inner()) = sessions;
                 self.mcp_connected.store(true, Ordering::Relaxed);
+                log::info!("{} MCP server(s) connected successfully", self.mcp_servers.len());
             }
             Err(e) => {
                 log::error!("Failed to connect MCP servers (will retry next message): {e}");

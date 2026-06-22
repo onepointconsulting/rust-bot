@@ -51,7 +51,7 @@ pub struct MemoryStore {
     pub user_file: PathBuf,
     cursor_file: PathBuf,
     dream_cursor_file: PathBuf,
-    git: GitStore,
+    pub git: GitStore,
 }
 
 impl MemoryStore {
@@ -676,7 +676,7 @@ pub trait MessageBuilder: Send + Sync {
 }
 
 pub struct Consolidator {
-    store: Arc<MemoryStore>,
+    pub store: Arc<MemoryStore>,
     provider: Arc<dyn LLMProviderDyn>,
     model: String,
     sessions: Arc<Mutex<SessionManager>>,
