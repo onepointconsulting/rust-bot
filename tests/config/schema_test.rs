@@ -1,5 +1,5 @@
 use rust_bot::config::{loader::save_config, schema::{Config, McpServerConfig, McpTransportType, ToolsConfig}};
-use std::{collections::HashMap, path::PathBuf};
+use std::collections::HashMap;
 
 use crate::config::helpers::read_mcp_env;
 
@@ -27,5 +27,9 @@ fn test_create_mcp_server_config() {
         ..Config::default()
     };
     assert_eq!(cfg.tools.mcp_servers.len(), 1);
-    save_config(&cfg, Some(PathBuf::from("configs/simple1/mcp_config.json")));
+    let temp_path = std::env::temp_dir().join(format!(
+        "rust-bot-mcp-config-{}.json",
+        uuid::Uuid::new_v4()
+    ));
+    save_config(&cfg, Some(temp_path));
 }

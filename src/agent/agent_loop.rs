@@ -122,6 +122,21 @@ fn safe_strip_think(text: Option<&str>) -> Option<String> {
     if text.is_empty() { None } else { Some(text) }
 }
 
+fn mcp_server_endpoint(config: &McpServerConfig) -> String {
+    if !config.url.is_empty() {
+        config.url.clone()
+    } else if !config.command.is_empty() {
+        let mut endpoint = config.command.clone();
+        if !config.args.is_empty() {
+            endpoint.push(' ');
+            endpoint.push_str(&config.args.join(" "));
+        }
+        endpoint
+    } else {
+        "(unknown)".to_string()
+    }
+}
+
 #[async_trait]
 impl AgentHook for LoopHook {
     fn wants_streaming(&self) -> bool {
@@ -599,6 +614,37 @@ impl AgentLoop {
             sessions.push(load_mcp_tools_from_config(config, name).await?);
         }
         Ok(sessions)
+    }
+
+    /// Connect to configured MCP servers if not already connected or connecting.
+    pub async fn ensure_mcp_connected(&self) {
+        self.connect_mcp().await;
+    }
+
+    /// Whether all configured MCP servers are connected.
+    pub fn is_mcp_connected(&self) -> bool {
+        self.mcp_connected.load(Ordering::Relaxed)
+    }
+
+    /// Whether any MCP servers are configured.
+    pub fn is_mcp_configured(&self) -> bool {
+        !self.mcp_servers.is_empty()
+    }
+
+    /// Connected MCP servers as `(name, endpoint)` pairs, sorted by name.
+    ///
+    /// Returns an empty vec when not connected.
+    pub fn connected_mcp_endpoints(&self) -> Vec<(String, String)> {
+        if !self.is_mcp_connected() {
+            return Vec::new();
+        }
+        let mut servers: Vec<(String, String)> = self
+            .mcp_servers
+            .iter()
+            .map(|(name, config)| (name.clone(), mcp_server_endpoint(config)))
+            .collect();
+        servers.sort_by(|a, b| a.0.cmp(&b.0));
+        servers
     }
 
     /// Shared message bus handle for publishing outbound messages.

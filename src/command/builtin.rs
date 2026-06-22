@@ -280,6 +280,37 @@ impl CommandHandler for CmdHelp {
     }
 }
 
+struct CmdMcpList;
+
+fn format_mcp_list(servers: &[(String, String)]) -> String {
+    let mut lines = vec![format!("MCP servers ({} connected):", servers.len())];
+    for (name, endpoint) in servers {
+        lines.push(format!("- {name} — {endpoint}"));
+    }
+    lines.join("\n")
+}
+
+/// List connected MCP servers and their endpoints.
+#[async_trait]
+impl CommandHandler for CmdMcpList {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/mcp-list");
+        };
+        if !agent_loop.is_mcp_configured() {
+            return reply_as_text(ctx, "No MCP servers configured.");
+        }
+        agent_loop.ensure_mcp_connected().await;
+        let servers = agent_loop.connected_mcp_endpoints();
+        let content = if servers.is_empty() {
+            "No MCP servers connected.".to_string()
+        } else {
+            format_mcp_list(&servers)
+        };
+        reply_as_text(ctx, content)
+    }
+}
+
 struct CmdDreamLog;
 
 impl CmdDreamLog {
@@ -494,6 +525,7 @@ fn build_help_text() -> String {
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
         "/help — Show available commands",
+        "/mcp-list — List available MCP servers",
     ];
     lines.join("\n")
 }
@@ -507,6 +539,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact("/dream-log", Arc::new(CmdDreamLog));
     router.exact("/dream-restore", Arc::new(CmdDreamRestore));
     router.exact("/help", Arc::new(CmdHelp));
+    router.exact("/mcp-list", Arc::new(CmdMcpList));
 }
 
 #[cfg(test)]
@@ -729,5 +762,67 @@ mod tests {
         assert!(content.contains("- `bbbb2222` 2026-04-04 08:00 - dream: older"));
         assert!(content.contains("Preview a version with `/dream-log <sha>`"));
         assert!(content.contains("Restore a version with `/dream-restore <sha>`"));
+    }
+
+    #[test]
+    fn format_mcp_list_empty() {
+        let content = format_mcp_list(&[]);
+        assert_eq!(content, "MCP servers (0 connected):");
+    }
+
+    #[test]
+    fn format_mcp_list_single_url_server() {
+        let servers = vec![(
+            "ems".to_string(),
+            "https://ems.example.org/mcp".to_string(),
+        )];
+        let content = format_mcp_list(&servers);
+        assert_eq!(
+            content,
+            "MCP servers (1 connected):\n- ems — https://ems.example.org/mcp"
+        );
+    }
+
+    #[test]
+    fn format_mcp_list_multiple_servers_including_stdio() {
+        let servers = vec![
+            (
+                "ems".to_string(),
+                "https://ems.example.org/mcp".to_string(),
+            ),
+            (
+                "filesystem".to_string(),
+                "npx -y @modelcontextprotocol/server-filesystem".to_string(),
+            ),
+        ];
+        let content = format_mcp_list(&servers);
+        assert!(content.contains("MCP servers (2 connected):"));
+        assert!(content.contains("- ems — https://ems.example.org/mcp"));
+        assert!(content.contains(
+            "- filesystem — npx -y @modelcontextprotocol/server-filesystem"
+        ));
+    }
+
+    #[tokio::test]
+    async fn mcp_list_without_agent_loop_returns_no_loop_message() {
+        let ctx = CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: "/mcp-list".into(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "mcp-list",
+            "/mcp-list",
+            "",
+            None,
+        );
+        let out = CmdMcpList.handle(&ctx).await;
+        assert!(out.content.contains("No agent available to execute command: /mcp-list"));
     }
 }

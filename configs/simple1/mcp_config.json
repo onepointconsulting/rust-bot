@@ -97,7 +97,7 @@
         "env": {},
         "url": "https://ems.brahmakumaris.org/mcp",
         "headers": {
-          "Authorization": "eyJhbGciOiJSUzI1NiJ9.eyJpc3MiOiJFdmVudCBNYW5hZ2VtZW50IEJyYWhtYSBLdW1hcmlzIiwic3ViIjoiRGVtbyIsImNvdW50cnkiOiJVbml0ZWQgS2luZ2RvbSIsIm9yZ2FuaXNhdGlvbklkIjo2MjIsImFsbG93ZWRPcmdhbmlzYXRpb25zIjoiNjIyIn0.iheN36mwpVlEn2Hk_RK8ba4J_E1dTEKYOUY4N3RBIRTUT199JFC4q8-R71PhtqYdznZ5CL_NfoigSLsKhTjkg5eO9EN9ojNvLBfG51w93iOWacAcM_yY0HmQEh_sF9Puw15MFMl6Acatf6DuUJMk2-4zp4owRLTV4aDFji03JcrIRlVuU4mrM3OSBI6AcRLs-Sw02rtAyW0wcjlMV3kCjIGTxBX3S9F5ysLJwt_QMdkIZhBGwFcRIcQwcsPxtpcMyZTNAAk4KUcW3WwLR6yi_MDVV13yauM7D0FDlKbqX92rNCbiC8iwroO5Ou5m29PazBcIXSVCjS0KSAFf4JNDSQ"
+          "Authorization": "${MCP_HEADERS_JWT}"
         },
         "toolTimeout": 30,
         "enabledTools": []
