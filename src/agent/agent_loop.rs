@@ -291,7 +291,7 @@ pub struct AgentLoop {
     pub last_usage: Mutex<HashMap<String, u64>>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
-    tools: Arc<ToolRegistry>,
+    tools: Arc<Mutex<ToolRegistry>>,
     runner: Arc<AgentRunner>,
     pub subagents: Arc<SubagentManager>,
     /// In-flight per-session tasks, keyed by session then by a unique task id so
@@ -379,7 +379,7 @@ impl AgentLoop {
             &workspace,
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
-        let tools = Arc::new(tools);
+        let tools = Arc::new(Mutex::new(tools));
         let context = Arc::new(ContextBuilder::new(
             workspace.clone(),
             timezone.clone(),
@@ -553,10 +553,24 @@ impl AgentLoop {
         // alive by storing them on `self`; on failure they are dropped here,
         // which is the equivalent of `await stack.aclose()`.
         match Self::connect_mcp_servers(&self.mcp_servers).await {
-            Ok(sessions) => {
+            Ok(mut sessions) => {
+                let mut mcp_tool_count = 0usize;
+                {
+                    let mut registry = self
+                        .tools
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    for session in &mut sessions {
+                        mcp_tool_count += session.tools.len();
+                        for tool in session.tools.drain(..) {
+                            registry.register(tool);
+                        }
+                    }
+                }
                 *self.mcp_sessions.lock().unwrap_or_else(|e| e.into_inner()) = sessions;
                 self.mcp_connected.store(true, Ordering::Relaxed);
                 log::info!("{} MCP server(s) connected successfully", self.mcp_servers.len());
+                log::info!("{mcp_tool_count} MCP tools registered");
             }
             Err(e) => {
                 log::error!("Failed to connect MCP servers (will retry next message): {e}");
@@ -594,8 +608,9 @@ impl AgentLoop {
 
     /// Update context for all tools that need routing info.
     pub fn set_tool_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
+        let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
         for name in CONTEXT_AWARE_TOOLS {
-            let Some(tool) = self.tools.get(name) else {
+            let Some(tool) = registry.get(name) else {
                 continue;
             };
             let message_id = if *name == "message" { message_id } else { None };
@@ -647,13 +662,14 @@ impl AgentLoop {
                 }) as Arc<dyn Fn(Value) + Send + Sync>
             });
         
-        log::info!("Running agent loop with {} tools", self.tools.len());
+        let run_tools = self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone();
+        log::info!("Running agent loop with {} tools", run_tools.len());
         log::info!("Max Tokens: {}", self.max_tokens);
         let result = self
             .runner
             .run(AgentRunSpec {
                 initial_messages,
-                tools: (*self.tools).clone(),
+                tools: run_tools,
                 model: self.model.clone(),
                 max_iterations: self.max_iterations as usize,
                 max_tool_result_chars: self.max_tool_result_chars as usize,
@@ -1250,7 +1266,7 @@ impl AgentLoop {
             msg.chat_id.as_str(),
             msg.metadata.get("message_id").and_then(Value::as_str),
         );
-        if let Some(message_tool) = self.tools.get("message") {
+        if let Some(message_tool) = self.tools.lock().unwrap_or_else(|e| e.into_inner()).get("message") {
             // `isinstance(message_tool, MessageTool)` → downcast the trait object.
             if let Some(message_tool) =
                 (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
@@ -1347,7 +1363,7 @@ impl AgentLoop {
                 .await;
         })
         .await;
-        if let Some(message_tool) = self.tools.get("message") {
+        if let Some(message_tool) = self.tools.lock().unwrap_or_else(|e| e.into_inner()).get("message") {
             if let Some(message_tool) =
                 (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
             {

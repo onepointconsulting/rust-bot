@@ -458,6 +458,11 @@ impl OpenAICompatProvider {
                         builder.build().ok().map(Into::into)
                     }
                     "tool" => {
+                        let tool_content = match msg.get("content") {
+                            Some(c) if c.is_string() => c.as_str().unwrap_or("").to_string(),
+                            Some(c) => c.to_string(),
+                            None => String::new(),
+                        };
                         let tool_call_id = msg
                             .get("tool_call_id")
                             .and_then(|v| v.as_str())
@@ -465,7 +470,7 @@ impl OpenAICompatProvider {
                             .to_string();
                         Some(ChatCompletionRequestMessage::Tool(
                             ChatCompletionRequestToolMessage {
-                                content: ChatCompletionRequestToolMessageContent::Text(content_str),
+                                content: ChatCompletionRequestToolMessageContent::Text(tool_content),
                                 tool_call_id,
                             },
                         ))

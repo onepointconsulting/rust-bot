@@ -58,15 +58,31 @@ pub fn ensure_nonempty_tool_result(tool_name: &str, content: Value) -> Value {
     }
 }
 
+/// Returns true when every array element looks like a multimodal content block
+/// (`{"type": "text", ...}` / `{"type": "image_url", ...}`), not arbitrary JSON.
+fn is_content_block_array(value: &Value) -> bool {
+    let Some(items) = value.as_array() else {
+        return false;
+    };
+    !items.is_empty()
+        && items.iter().all(|block| {
+            block
+                .as_object()
+                .and_then(|obj| obj.get("type"))
+                .and_then(Value::as_str)
+                .is_some()
+        })
+}
+
 /// Parse a tool's string return value into message content.
 ///
 /// Image tools such as `web_fetch` serialize content blocks as JSON arrays;
-/// plain-text tools return regular strings.
+/// plain-text tools (including MCP tools returning JSON payloads) stay strings.
 pub fn coerce_tool_execute_result(result: String) -> Value {
     let trimmed = result.trim_start();
     if trimmed.starts_with('[')
         && let Ok(value) = serde_json::from_str::<Value>(&result)
-        && value.is_array()
+        && is_content_block_array(&value)
     {
         return value;
     }
@@ -274,6 +290,13 @@ mod tests {
     fn test_coerce_tool_execute_result_invalid_json_array_stays_string() {
         let result = coerce_tool_execute_result("[not json".into());
         assert_eq!(result, Value::String("[not json".into()));
+    }
+
+    #[test]
+    fn test_coerce_tool_execute_result_mcp_json_array_stays_string() {
+        let payload = r#"[{"id":1,"name":"lecture","description":"Lecture"}]"#;
+        let result = coerce_tool_execute_result(payload.to_string());
+        assert_eq!(result, Value::String(payload.to_string()));
     }
 
     // ── is_blank_text ─────────────────────────────────────────────────────────

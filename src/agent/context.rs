@@ -1,5 +1,5 @@
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
 use tera::Context;
@@ -26,11 +26,11 @@ pub struct ContextBuilder {
     timezone: Option<String>,
     pub memory: Arc<MemoryStore>,
     skills: SkillsLoader,
-    tools: Arc<ToolRegistry>,
+    tools: Arc<Mutex<ToolRegistry>>,
 }
 
 impl ContextBuilder {
-    pub fn new(workspace: PathBuf, timezone: Option<String>, tools: Arc<ToolRegistry>) -> Self {
+    pub fn new(workspace: PathBuf, timezone: Option<String>, tools: Arc<Mutex<ToolRegistry>>) -> Self {
         let skills = SkillsLoader::new(&workspace, None);
         let memory = Arc::new(MemoryStore::new(workspace.clone(), None));
         Self {
@@ -396,7 +396,10 @@ impl MessageBuilder for ContextBuilder {
     }
 
     fn get_definitions(&self) -> Vec<serde_json::Value> {
-        self.tools.get_definitions()
+        self.tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_definitions()
     }
 }
 
@@ -435,7 +438,7 @@ mod tests {
     use tempfile::TempDir;
 
     fn make_builder(tmp: &TempDir) -> ContextBuilder {
-        ContextBuilder::new(tmp.path().to_path_buf(), None, Arc::new(ToolRegistry::new()))
+        ContextBuilder::new(tmp.path().to_path_buf(), None, Arc::new(Mutex::new(ToolRegistry::new())))
     }
 
     // ── os_display_name ───────────────────────────────────────────────────────
