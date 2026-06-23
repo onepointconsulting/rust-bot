@@ -4,6 +4,8 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::bus::events::{InboundMessage, OutboundMessage};
+
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
@@ -231,7 +233,13 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         }
     }
 
-    match args.message {
+    let agent_loop = Arc::new(agent_loop);
+    // Subagent completions publish system-channel messages to the inbound bus.
+    // The gateway handles those in `AgentLoop::run()`; CLI uses `process_direct`
+    // instead, so we need a background listener to deliver async results.
+    let system_listener = spawn_system_message_listener(Arc::clone(&agent_loop), markdown);
+
+    let result = match args.message {
         Some(message) if !message.is_empty() => {
             message_session(
                 &message,
@@ -239,21 +247,60 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 markdown,
                 &config.channels,
                 &session_id,
-                Arc::new(agent_loop),
+                Arc::clone(&agent_loop),
             )
             .await
         }
         Some(_) => Ok(()),
         None => {
             interactive_session(
-                Arc::new(agent_loop),
+                Arc::clone(&agent_loop),
                 markdown,
                 &config.channels,
                 &session_id,
             )
             .await
         }
+    };
+
+    system_listener.abort();
+    result
+}
+
+/// Consume inbound system messages (e.g. subagent announcements) and print responses.
+fn spawn_system_message_listener(
+    agent_loop: Arc<AgentLoop>,
+    markdown: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let bus = agent_loop.bus();
+        while let Some(msg) = bus.consume_inbound().await {
+            if let Some(response) =
+                handle_cli_system_message(Arc::clone(&agent_loop), msg).await
+            {
+                print_agent_response_with_header(
+                    &response.content,
+                    markdown,
+                    Some(&response.metadata),
+                    true,
+                );
+            }
+        }
+    })
+}
+
+async fn handle_cli_system_message(
+    agent_loop: Arc<AgentLoop>,
+    msg: InboundMessage,
+) -> Option<OutboundMessage> {
+    if !msg.channel.eq_ignore_ascii_case("system") {
+        log::warn!(
+            "Ignoring non-system inbound message in CLI listener: channel={}",
+            msg.channel
+        );
+        return None;
     }
+    agent_loop.process_system_message(msg).await
 }
 
 async fn message_session(

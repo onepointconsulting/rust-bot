@@ -152,14 +152,18 @@ impl SubagentManager {
                 .build()
                 .expect("subagent runtime")
                 .block_on(async move {
+                    log::info!("Running subagent task: {}", task_id_bg);
                     manager
                         .run_subagent(&task_id_bg, &task_owned, &display_label, &origin)
                         .await;
+                    log::info!("Completed: {}", task_id_bg);
                     running_tasks.lock().unwrap().remove(&task_id_bg);
+                    log::info!("Removed from running tasks: {}", task_id_bg);
                     if let Some(session_key) = session_key_owned {
                         if let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key)
                         {
                             tasks.remove(&task_id_bg);
+                            log::info!("Removed from tasks: {}", task_id_bg);
                         }
                     }
                 });
@@ -420,6 +424,8 @@ impl SubagentManager {
         ctx.insert("result", result);
         let announce_content_result = render_template("agent/subagent_announce.md", &ctx, true);
 
+        log::info!("Announcing subagent result: {}", announce_content_result.is_ok());
+        
         if let Ok(announce_content) = announce_content_result {
             let origin_channel = origin.get("channel").map(|s| s.as_str()).unwrap_or("cli");
             let origin_chat_id = origin

@@ -998,7 +998,7 @@ impl AgentLoop {
     ///
     /// Kept separate from [`Self::process_message`] so spawned `dispatch`
     /// tasks stay `Send` (consolidation calls the `?Send` LLM provider).
-    async fn process_system_message(
+    pub async fn process_system_message(
         self: Arc<Self>,
         msg: InboundMessage,
     ) -> Option<OutboundMessage> {
@@ -1050,11 +1050,7 @@ impl AgentLoop {
         };
 
         let history = snapshot.get_history(Some(0));
-        let current_role = if msg.sender_id == "subagent" {
-            "assistant"
-        } else {
-            "user"
-        };
+        let current_role = Self::subagent_announce_role(&self.model);
         let messages = self.context.build_messages(
             history.as_slice(),
             msg.content.as_str(),
@@ -1637,6 +1633,16 @@ impl AgentLoop {
             metadata: HashMap::new(),
         };
         self.process_message(msg, session_key, on_progress, on_stream, on_stream_end).await
+    }
+
+    fn subagent_announce_role(model: &str) -> &'static str {
+        const REQUIRES_USER_LAST: &[&str] = &["claude", "anthropic"];
+        let model = model.to_ascii_lowercase();
+        if REQUIRES_USER_LAST.iter().any(|m| model.contains(m)) {
+            "user"
+        } else {
+            "assistant"
+        }
     }
 }
 
