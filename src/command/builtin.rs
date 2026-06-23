@@ -702,6 +702,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         let out = CmdStop.handle(&stop_ctx(Some(loop_))).await;
         assert_eq!(out.content, "No active task to stop.");

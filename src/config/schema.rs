@@ -714,6 +714,25 @@ impl Default for ToolsConfig {
     }
 }
 
+// ── Subagent Config ───────────────────────────────────────────────────────────
+/// Subagent configuration to change subagent behaviour.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SubagentConfig {
+    /// Bind address for the gateway. Defaults to `0.0.0.0` (all interfaces).
+    #[serde(alias = "fail_on_tool_error")]
+    #[garde(skip)]
+    pub fail_on_tool_error: bool,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            fail_on_tool_error: true,
+        }
+    }
+}
+
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Root configuration for the bot.
@@ -749,6 +768,10 @@ pub struct Config {
     #[serde(alias = "tools")]
     #[garde(dive)]
     pub tools: ToolsConfig,
+
+    #[serde(alias = "subagent")]
+    #[garde(dive)]
+    pub subagent: SubagentConfig,
 }
 
 impl Config {
@@ -888,6 +911,7 @@ impl Default for Config {
             api: ApiConfig::default(),
             gateway: GatewayConfig::default(),
             tools: ToolsConfig::default(),
+            subagent: SubagentConfig::default(),
         }
     }
 }

@@ -37,8 +37,7 @@ use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    AgentDefaults, ChannelsConfig, ExecToolConfig, McpServerConfig, ProviderRetryMode,
-    WebToolsConfig,
+    AgentDefaults, ChannelsConfig, ExecToolConfig, McpServerConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
@@ -342,6 +341,7 @@ impl AgentLoop {
         provider_retry_mode: Option<ProviderRetryMode>,
         web_config: Option<WebToolsConfig>,
         exec_config: Option<ExecToolConfig>,
+        subagent_config: Option<SubagentConfig>,
         cron_service: Option<Arc<CronService>>,
         restrict_to_workspace: Option<bool>,
         session_manager: Option<Arc<Mutex<SessionManager>>>,
@@ -353,7 +353,8 @@ impl AgentLoop {
         let defaults = AgentDefaults::default();
         let model = model.unwrap_or(provider.clone().get_default_model());
         let web_config = web_config.unwrap_or(WebToolsConfig::default());
-        let exec_config = exec_config.clone().unwrap_or(ExecToolConfig::default());
+        let exec_config = exec_config.unwrap_or(ExecToolConfig::default());
+        let subagent_config = subagent_config.unwrap_or(SubagentConfig::default());
         let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
             .unwrap_or_else(|_| "3".to_string())
@@ -380,6 +381,7 @@ impl AgentLoop {
             Some(model.clone()),
             Some(web_config.clone()),
             Some(exec_config.clone()),
+            Some(subagent_config.clone()),
             Some(restrict_to_workspace),
         ));
         let mut tools = ToolRegistry::new();
@@ -1651,7 +1653,7 @@ mod tests {
     use super::*;
     use std::collections::HashMap;
 
-    use crate::providers::base::{GenerationSettings, LLMResponse, ToolCallRequest};
+    use crate::providers::base::{GenerationSettings, LLMResponse};
     use serde_json::json;
 
     /// Minimal provider placeholder until `AgentLoop` is fully wired.
@@ -1897,6 +1899,7 @@ mod tests {
             None,
             None,
             Some(max_tool_result_chars),
+            None,
             None,
             None,
             None,

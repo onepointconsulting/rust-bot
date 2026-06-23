@@ -22,7 +22,7 @@ use crate::{
         },
     },
     bus::{events::InboundMessage, queue::MessageBus},
-    config::schema::{ExecToolConfig, WebToolsConfig},
+    config::schema::{ExecToolConfig, SubagentConfig, WebToolsConfig},
     providers::base::LLMProviderDyn,
     utils::prompt_templates::render_template,
 };
@@ -62,6 +62,7 @@ pub struct SubagentManager {
     pub model: String,
     pub web_config: WebToolsConfig,
     pub exec_config: ExecToolConfig,
+    pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
     pub runner: AgentRunner,
     running_tasks: Arc<Mutex<HashMap<String, std::thread::JoinHandle<()>>>>,
@@ -77,6 +78,7 @@ impl SubagentManager {
         model: Option<String>,
         web_config: Option<WebToolsConfig>,
         exec_config: Option<ExecToolConfig>,
+        subagent_config: Option<SubagentConfig>,
         restrict_to_workspace: Option<bool>,
     ) -> Self {
         let model = model.unwrap_or_else(|| provider.get_default_model());
@@ -87,6 +89,7 @@ impl SubagentManager {
             model,
             web_config: web_config.unwrap_or(WebToolsConfig::default()),
             exec_config: exec_config.unwrap_or(ExecToolConfig::default()),
+            subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             runner: AgentRunner::new(provider),
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -105,6 +108,7 @@ impl SubagentManager {
             workspace,
             bus,
             max_tool_result_chars,
+            None,
             None,
             None,
             None,
@@ -307,7 +311,7 @@ impl SubagentManager {
                     "Task completed but no final response was generated.".to_string(),
                 ),
                 error_message: None,
-                fail_on_tool_error: true,
+                fail_on_tool_error: self.subagent_config.fail_on_tool_error,
                 ..Default::default()
             })
             .await;
@@ -425,7 +429,7 @@ impl SubagentManager {
         let announce_content_result = render_template("agent/subagent_announce.md", &ctx, true);
 
         log::info!("Announcing subagent result: {}", announce_content_result.is_ok());
-        
+
         if let Ok(announce_content) = announce_content_result {
             let origin_channel = origin.get("channel").map(|s| s.as_str()).unwrap_or("cli");
             let origin_chat_id = origin

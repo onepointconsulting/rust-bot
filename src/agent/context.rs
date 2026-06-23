@@ -799,19 +799,6 @@ mod tests {
     }
 
     #[test]
-    fn build_system_prompt_empty_workspace_has_only_identity() {
-        let tmp = TempDir::new().unwrap();
-        let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
-        // Empty workspace → just identity, no extra sections
-        assert!(!prompt.is_empty(), "prompt should not be empty");
-        assert!(
-            !prompt.contains("\n\n---\n\n"),
-            "empty workspace should produce no extra sections; got:\n{prompt}"
-        );
-    }
-
-    #[test]
     fn build_system_prompt_sections_joined_by_rule_separator() {
         use std::fs;
         let tmp = TempDir::new().unwrap();

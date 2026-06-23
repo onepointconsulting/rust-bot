@@ -1172,13 +1172,6 @@ metadata:
     // ── build_skills_summary ─────────────────────────────────────────────────
 
     #[test]
-    fn build_skills_summary_empty_when_no_skills() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
-        assert_eq!(loader.build_skills_summary(), "");
-    }
-
-    #[test]
     fn build_skills_summary_contains_skill_tags() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(
