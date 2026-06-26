@@ -4,8 +4,12 @@ use crate::providers::{
     base::{GenerationSettings, LLMProvider, LLMResponse},
     registry::ProviderSpec,
 };
+use adk_anthropic::Anthropic;
 use rand::seq::IndexedRandom;
+use regex::Regex;
+use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
+use std::sync::OnceLock;
 
 const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 
@@ -21,13 +25,64 @@ pub struct AnthropicProvider {
     api_key: Option<String>,
     api_base: Option<String>,
     default_model: Option<String>,
-    extra_headers: Option<HashMap<String, String>>,
+    extra_headers: HashMap<String, String>,
     spec: Option<ProviderSpec>,
     generation: GenerationSettings,
+    /// Typed SDK client (does not include `extra_headers`; use `http_client` for requests).
+    client: Anthropic,
+    /// Raw HTTP client with Anthropic defaults plus merged `extra_headers` for `chat()`.
+    http_client: reqwest::Client,
+    messages_url: String,
 }
 
 impl AnthropicProvider {
     const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+    const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
+    const ANTHROPIC_API_VERSION: &str = "2023-06-01";
+
+    fn build_request_headers(api_key: &str, extra_headers: &HashMap<String, String>) -> HeaderMap {
+        let mut headers = HeaderMap::new();
+        headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
+        headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
+        headers.insert(
+            HeaderName::from_static("x-api-key"),
+            HeaderValue::from_str(api_key).unwrap_or_else(|e| {
+                log::error!("Invalid Anthropic API key header value: {e}");
+                panic!("Invalid Anthropic API key header value: {e}");
+            }),
+        );
+        headers.insert(
+            HeaderName::from_static("anthropic-version"),
+            HeaderValue::from_static(Self::ANTHROPIC_API_VERSION),
+        );
+
+        for (key, value) in extra_headers {
+            let header_name = HeaderName::from_bytes(key.as_bytes()).unwrap_or_else(|e| {
+                log::error!("Invalid HTTP header name '{key}': {e}");
+                panic!("Invalid HTTP header name '{key}': {e}");
+            });
+            let header_value = HeaderValue::from_str(value).unwrap_or_else(|e| {
+                log::error!("Invalid HTTP header value for '{key}': {e}");
+                panic!("Invalid HTTP header value for '{key}': {e}");
+            });
+            headers.insert(header_name, header_value);
+        }
+
+        headers
+    }
+
+    fn build_http_client(
+        api_key: &str,
+        extra_headers: &HashMap<String, String>,
+    ) -> reqwest::Client {
+        reqwest::Client::builder()
+            .default_headers(Self::build_request_headers(api_key, extra_headers))
+            .build()
+            .unwrap_or_else(|e| {
+                log::error!("Failed to build Anthropic HTTP client: {e}");
+                panic!("Failed to build Anthropic HTTP client: {e}");
+            })
+    }
 
     fn strip_prefix(model: &str) -> String {
         model
@@ -70,6 +125,401 @@ impl AnthropicProvider {
 
         Some(json!({ "type": "auto" }))
     }
+
+    /// Convert the Anthropic format to the de-facto OpenAI format which is used in the application.
+    fn convert_messages(
+        &self,
+        messages: Vec<serde_json::Value>,
+    ) -> (serde_json::Value, Vec<serde_json::Value>) {
+        let mut system: serde_json::Value = serde_json::Value::String("".to_string());
+        let mut raw: Vec<serde_json::Value> = Vec::new();
+
+        for msg in messages {
+            let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let mut content = msg.get("content");
+            if role == "system" {
+                system = match content {
+                    Some(v) if v.is_string() || v.is_array() => v.clone(),
+                    Some(v) if v.is_null() => serde_json::Value::String(String::new()),
+                    Some(v) => serde_json::Value::String(v.to_string()),
+                    None => serde_json::Value::String(String::new()),
+                };
+                continue;
+            }
+            if role == "tool" {
+                let block = Self::tool_result_block(&msg);
+                if let Some(last_msg) = raw.last_mut() {
+                    if last_msg.get("role").and_then(|v| v.as_str()) == Some("user") {
+                        if let Some(content) = last_msg.get_mut("content") {
+                            if let Some(content_array) = content.as_array_mut() {
+                                content_array.push(block);
+                            } else {
+                                let prev_c = content.as_str().unwrap_or("").to_string();
+                                *content = json!([
+                                    { "type": "text", "text": prev_c },
+                                    block,
+                                ]);
+                            }
+                        }
+                    } else {
+                        raw.push(serde_json::json!({
+                            "role": "user",
+                            "content": [block],
+                        }));
+                    }
+                }
+                continue;
+            }
+
+            if role == "assistant" {
+                raw.push(json!({
+                    "role": "assistant",
+                    "content": Self::assistant_blocks(&msg),
+                }));
+                continue;
+            }
+
+            if role == "user" {
+                raw.push(json!({
+                    "role": "user",
+                    "content": Self::convert_user_content(&msg),
+                }));
+                continue;
+            }
+        }
+        return (system, AnthropicProvider::merge_consecutive(raw));
+    }
+
+    fn convert_tools(tools: Option<Vec<serde_json::Value>>) -> Option<Vec<serde_json::Value>> {
+        let tools = tools?;
+        if tools.is_empty() {
+            return None;
+        }
+
+        let default_schema = json!({"type": "object", "properties": {}});
+        let mut result = Vec::new();
+        for tool in tools {
+            let func = tool.get("function").unwrap_or(&tool);
+            let mut entry = json!({
+                "name": func.get("name").and_then(|v| v.as_str()).unwrap_or(""),
+                "input_schema": func
+                    .get("parameters")
+                    .cloned()
+                    .unwrap_or_else(|| default_schema.clone()),
+            });
+            if let Some(desc) = func.get("description").and_then(|d| d.as_str()).filter(|s| !s.is_empty()) {
+                entry["description"] = serde_json::Value::String(desc.to_string());
+            }
+            if tool.get("cache_control").is_some() {
+                entry["cache_control"] = tool["cache_control"].clone();
+            }
+            result.push(entry);
+        }
+        Some(result)
+    }
+
+    /// Anthropic requires alternating user/assistant roles.
+    fn merge_consecutive(messages: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+        let mut merged: Vec<serde_json::Value> = Vec::new();
+        for msg in messages {
+            if let Some(last) = merged.last_mut()
+                && last.get("role") == msg.get("role")
+            {
+                let mut prev_c = last.get("content").cloned().unwrap_or(json!([]));
+                let mut cur_c = msg.get("content").cloned().unwrap_or(json!([]));
+
+                if prev_c.is_string() {
+                    prev_c = json!([{
+                        "type": "text",
+                        "text": prev_c.as_str().unwrap_or(""),
+                    }]);
+                }
+                if cur_c.is_string() {
+                    cur_c = json!([{
+                        "type": "text",
+                        "text": cur_c.as_str().unwrap_or(""),
+                    }]);
+                }
+                if cur_c.is_array() {
+                    if let (Some(prev_arr), Some(cur_arr)) =
+                        (prev_c.as_array_mut(), cur_c.as_array())
+                    {
+                        prev_arr.extend(cur_arr.iter().cloned());
+                    }
+                }
+                last["content"] = prev_c;
+            } else {
+                merged.push(msg);
+            }
+        }
+        merged
+    }
+
+    fn tool_result_block(msg: &serde_json::Value) -> serde_json::Value {
+        let content = msg.get("content");
+        let tool_use_id = msg
+            .get("tool_call_id")
+            .and_then(|v| v.as_str())
+            .unwrap_or("")
+            .to_string();
+
+        let block_content = match content {
+            Some(v) if v.is_string() || v.is_array() => v.clone(),
+            Some(v) => serde_json::Value::String(v.to_string()),
+            None => serde_json::Value::String(String::new()),
+        };
+
+        json!({
+            "type": "tool_result",
+            "tool_use_id": tool_use_id,
+            "content": block_content,
+        })
+    }
+
+    fn parse_tool_input(arguments: &serde_json::Value) -> serde_json::Value {
+        if let Some(s) = arguments.as_str() {
+            serde_json::from_str(s).unwrap_or_else(|_| json!({}))
+        } else if arguments.is_object() {
+            arguments.clone()
+        } else {
+            json!({})
+        }
+    }
+
+    fn assistant_blocks(msg: &serde_json::Value) -> serde_json::Value {
+        let mut blocks: Vec<serde_json::Value> = Vec::new();
+        let content = msg.get("content");
+
+        if let Some(thinking_blocks) = msg.get("thinking_blocks").and_then(|v| v.as_array()) {
+            for tb in thinking_blocks {
+                if tb.get("type").and_then(|v| v.as_str()) == Some("thinking") {
+                    blocks.push(json!({
+                        "type": "thinking",
+                        "thinking": tb.get("thinking").and_then(|v| v.as_str()).unwrap_or(""),
+                        "signature": tb.get("signature").and_then(|v| v.as_str()).unwrap_or(""),
+                    }));
+                }
+            }
+        }
+
+        match content {
+            Some(v) if v.is_string() => {
+                if let Some(text) = v.as_str() {
+                    if !text.is_empty() {
+                        blocks.push(json!({ "type": "text", "text": text }));
+                    }
+                }
+            }
+            Some(v) if v.is_array() => {
+                for item in v.as_array().unwrap() {
+                    if item.is_object() {
+                        blocks.push(item.clone());
+                    } else {
+                        blocks.push(json!({ "type": "text", "text": item.to_string() }));
+                    }
+                }
+            }
+            _ => {}
+        }
+
+        if let Some(tool_calls) = msg.get("tool_calls").and_then(|v| v.as_array()) {
+            for tc in tool_calls {
+                let Some(tc) = tc.as_object() else {
+                    continue;
+                };
+                let func = tc.get("function");
+                let args = func
+                    .and_then(|f| f.get("arguments"))
+                    .map(Self::parse_tool_input)
+                    .unwrap_or_else(|| json!({}));
+                let id = tc
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+                    .unwrap_or_else(gen_tool_id);
+                blocks.push(json!({
+                    "type": "tool_use",
+                    "id": id,
+                    "name": func
+                        .and_then(|f| f.get("name"))
+                        .and_then(|v| v.as_str())
+                        .unwrap_or(""),
+                    "input": args,
+                }));
+            }
+        }
+
+        if blocks.is_empty() {
+            json!([{ "type": "text", "text": "" }])
+        } else {
+            serde_json::Value::Array(blocks)
+        }
+    }
+
+    fn convert_user_content(msg: &serde_json::Value) -> serde_json::Value {
+        let content = msg.get("content");
+
+        match content {
+            None => json!("(empty)"),
+            Some(v) if v.is_null() => json!("(empty)"),
+            Some(v) if v.is_string() => {
+                let text = v.as_str().unwrap_or("");
+                if text.is_empty() {
+                    json!("(empty)")
+                } else {
+                    v.clone()
+                }
+            }
+            Some(v) if v.is_array() => {
+                let mut result: Vec<serde_json::Value> = Vec::new();
+                for item in v.as_array().unwrap() {
+                    if let Some(obj) = item.as_object() {
+                        if obj.get("type").and_then(|t| t.as_str()) == Some("image_url") {
+                            if let Some(converted) = Self::convert_image_block(item) {
+                                result.push(converted);
+                            }
+                            continue;
+                        }
+                        result.push(item.clone());
+                    } else {
+                        result.push(json!({ "type": "text", "text": item.to_string() }));
+                    }
+                }
+                if result.is_empty() {
+                    json!("(empty)")
+                } else {
+                    serde_json::Value::Array(result)
+                }
+            }
+            Some(v) => serde_json::Value::String(v.to_string()),
+        }
+    }
+
+    fn convert_image_block(block: &serde_json::Value) -> Option<serde_json::Value> {
+        let url = block
+            .get("image_url")
+            .and_then(|iu| {
+                iu.get("url")
+                    .and_then(|u| u.as_str())
+                    .or_else(|| iu.as_str())
+            })
+            .unwrap_or("");
+        if url.is_empty() {
+            return None;
+        }
+
+        static DATA_IMAGE_RE: OnceLock<Regex> = OnceLock::new();
+        let re = DATA_IMAGE_RE
+            .get_or_init(|| Regex::new(r"(?s)^data:(image/\w+);base64,(.+)$").unwrap());
+        if let Some(caps) = re.captures(url) {
+            return Some(json!({
+                "type": "image",
+                "source": {
+                    "type": "base64",
+                    "media_type": caps.get(1).unwrap().as_str(),
+                    "data": caps.get(2).unwrap().as_str(),
+                }
+            }));
+        }
+
+        Some(json!({
+            "type": "image",
+            "source": {
+                "type": "url",
+                "url": url,
+            }
+        }))
+    }
+
+    fn build_args(
+        &self,
+        messages: &[serde_json::Value],
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        supports_caching: bool,
+    ) -> HashMap<String, serde_json::Value> {
+        let model_name =
+            AnthropicProvider::strip_prefix(&model.unwrap_or_else(|| self.get_default_model()));
+        let (mut system, mut anthropic_msgs) =
+            self.convert_messages(AnthropicProvider::sanitize_empty_content(messages));
+        let mut anthropic_tools = Self::convert_tools(tools);
+
+        if supports_caching {
+            (system, anthropic_msgs, anthropic_tools) = self.apply_cache_control(
+                system, anthropic_msgs, anthropic_tools,
+            );
+        }
+        let max_tokens = std::cmp::max(1, max_tokens);
+        let thinking_enabled = if let Some(reasoning_effort) = reasoning_effort {
+            !reasoning_effort.is_empty();
+        } else {
+            false;
+        };
+
+        HashMap::new()
+    }
+
+    fn apply_cache_control(
+        &self, 
+        system_param: serde_json::Value, 
+        messages: Vec<serde_json::Value>, 
+        tools: Option<Vec<serde_json::Value>>) -> (serde_json::Value, Vec<serde_json::Value>, Option<Vec<serde_json::Value>>) {
+        let marker = serde_json::json!({"type": "ephemeral"});
+
+        let system = if system_param.is_string() && !system_param.as_str().unwrap_or("").is_empty() {
+            serde_json::json!([{
+                "type": "text",
+                "text": system_param.as_str().unwrap_or(""),
+                "cache_control": marker.clone(),
+            }])
+        } else if let Some(system) = system_param.as_array() {
+            let mut system = system.clone();
+            if let Some(last) = system.last_mut() {
+                last["cache_control"] = marker.clone();
+            }
+            serde_json::Value::Array(system)
+        } else {
+            system_param
+        };
+
+        let mut new_msgs = messages;
+        let new_msgs_len = new_msgs.len();
+        if new_msgs_len >= 3 {
+            let c = new_msgs[new_msgs_len - 2].get("content").cloned();
+            if let Some(c) = c {
+                if c.is_string() {
+                    new_msgs[new_msgs_len - 2]["content"] = serde_json::json!([
+                        {"type": "text", "text": c, "cache_control": marker}
+                    ]);
+                } else if let Some(c) = c.as_array() && !c.is_empty() {
+                    let mut nc = c.clone();
+                    let last_option = nc.last_mut();
+                    if let Some(last) = last_option {
+                        last["cache_control"] = marker.clone();
+                    }
+                    new_msgs[new_msgs_len - 2]["content"] = serde_json::Value::Array(nc);
+                }
+            }
+        }
+
+        let new_tools = match tools {
+            None => None,
+            Some(tools) if tools.is_empty() => Some(tools),
+            Some(tools) => {
+                let mut new_tools = tools.clone();
+                for idx in Self::tool_cache_marker_indices(Some(tools)).unwrap_or_default() {
+                    new_tools[idx]["cache_control"] = marker.clone();
+                }
+                Some(new_tools)
+            }
+        };
+        (system, new_msgs, new_tools)
+    }
 }
 
 impl LLMProvider for AnthropicProvider {
@@ -80,13 +530,29 @@ impl LLMProvider for AnthropicProvider {
         extra_headers: Option<HashMap<String, String>>,
         spec: Option<ProviderSpec>,
     ) -> Self {
+        let extra_headers = extra_headers.unwrap_or_default();
+        let effective_base = api_base
+            .clone()
+            .unwrap_or_else(|| Self::DEFAULT_API_BASE.to_string());
+
+        let client = Anthropic::new(api_key.clone())
+            .expect("Failed to create Anthropic client")
+            .with_base_url(effective_base.clone());
+
+        let resolved_key = client.api_key().to_string();
+        let http_client = Self::build_http_client(&resolved_key, &extra_headers);
+        let messages_url = format!("{}/v1/messages", effective_base.trim_end_matches('/'));
+
         Self {
             api_key,
-            api_base,
+            api_base: Some(effective_base),
             default_model: Some(default_model.unwrap_or_else(|| Self::DEFAULT_MODEL.to_string())),
             extra_headers,
             spec,
             generation: GenerationSettings::new(),
+            client,
+            http_client,
+            messages_url,
         }
     }
 
@@ -99,7 +565,7 @@ impl LLMProvider for AnthropicProvider {
     }
 
     fn extra_headers(&self) -> Option<HashMap<String, String>> {
-        self.extra_headers.clone()
+        Some(self.extra_headers.clone())
     }
 
     fn generation_settings(&self) -> &GenerationSettings {
@@ -244,5 +710,368 @@ mod tests {
             false,
         );
         assert_eq!(result, Some(serde_json::json!({ "type": "auto" })));
+    }
+
+    #[test]
+    fn build_request_headers_includes_anthropic_defaults() {
+        let headers = AnthropicProvider::build_request_headers("sk-ant-test", &HashMap::new());
+
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-test");
+        assert_eq!(headers.get("anthropic-version").unwrap(), "2023-06-01");
+        assert_eq!(headers.get("content-type").unwrap(), "application/json");
+        assert_eq!(headers.get("accept").unwrap(), "application/json");
+    }
+
+    #[test]
+    fn tool_result_block_preserves_string_content() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "toolu_abc123",
+            "content": "search results here"
+        });
+
+        let block = AnthropicProvider::tool_result_block(&msg);
+
+        assert_eq!(
+            block,
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_abc123",
+                "content": "search results here"
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_block_preserves_array_content() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "toolu_xyz",
+            "content": [{ "type": "text", "text": "hello" }]
+        });
+
+        let block = AnthropicProvider::tool_result_block(&msg);
+
+        assert_eq!(
+            block,
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_xyz",
+                "content": [{ "type": "text", "text": "hello" }]
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_block_stringifies_non_string_content() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "toolu_1",
+            "content": { "key": "value" }
+        });
+
+        let block = AnthropicProvider::tool_result_block(&msg);
+
+        assert_eq!(block["type"], "tool_result");
+        assert_eq!(block["tool_use_id"], "toolu_1");
+        assert!(block["content"].is_string());
+    }
+
+    #[test]
+    fn tool_result_block_empty_when_no_content() {
+        let msg = json!({
+            "role": "tool",
+            "tool_call_id": "toolu_1"
+        });
+
+        let block = AnthropicProvider::tool_result_block(&msg);
+
+        assert_eq!(
+            block,
+            json!({
+                "type": "tool_result",
+                "tool_use_id": "toolu_1",
+                "content": ""
+            })
+        );
+    }
+
+    #[test]
+    fn tool_result_block_defaults_tool_use_id() {
+        let msg = json!({
+            "role": "tool",
+            "content": "done"
+        });
+
+        let block = AnthropicProvider::tool_result_block(&msg);
+
+        assert_eq!(block["tool_use_id"], "");
+    }
+
+    #[test]
+    fn assistant_blocks_empty_fallback() {
+        let blocks = AnthropicProvider::assistant_blocks(&json!({ "role": "assistant" }));
+        assert_eq!(blocks, json!([{ "type": "text", "text": "" }]));
+    }
+
+    #[test]
+    fn assistant_blocks_text_and_tool_use() {
+        let msg = json!({
+            "role": "assistant",
+            "content": "Hello",
+            "tool_calls": [{
+                "id": "call_1",
+                "function": {
+                    "name": "search",
+                    "arguments": "{\"q\":\"rust\"}"
+                }
+            }]
+        });
+
+        let blocks = AnthropicProvider::assistant_blocks(&msg);
+
+        assert_eq!(blocks[0], json!({ "type": "text", "text": "Hello" }));
+        assert_eq!(blocks[1]["type"], "tool_use");
+        assert_eq!(blocks[1]["id"], "call_1");
+        assert_eq!(blocks[1]["name"], "search");
+        assert_eq!(blocks[1]["input"], json!({ "q": "rust" }));
+    }
+
+    #[test]
+    fn assistant_blocks_thinking_block() {
+        let msg = json!({
+            "role": "assistant",
+            "thinking_blocks": [{
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "sig123"
+            }]
+        });
+
+        let blocks = AnthropicProvider::assistant_blocks(&msg);
+
+        assert_eq!(
+            blocks[0],
+            json!({
+                "type": "thinking",
+                "thinking": "hmm",
+                "signature": "sig123"
+            })
+        );
+    }
+
+    #[test]
+    fn convert_user_content_empty_string() {
+        let msg = json!({ "role": "user", "content": "" });
+        assert_eq!(
+            AnthropicProvider::convert_user_content(&msg),
+            json!("(empty)")
+        );
+    }
+
+    #[test]
+    fn convert_user_content_plain_text() {
+        let msg = json!({ "role": "user", "content": "hello" });
+        assert_eq!(
+            AnthropicProvider::convert_user_content(&msg),
+            json!("hello")
+        );
+    }
+
+    #[test]
+    fn convert_user_content_converts_image_url_block() {
+        let msg = json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,abc123" }
+                },
+                { "type": "text", "text": "what is this?" }
+            ]
+        });
+
+        let content = AnthropicProvider::convert_user_content(&msg);
+        assert_eq!(content[0]["type"], "image");
+        assert_eq!(content[0]["source"]["type"], "base64");
+        assert_eq!(content[0]["source"]["media_type"], "image/png");
+        assert_eq!(content[0]["source"]["data"], "abc123");
+        assert_eq!(
+            content[1],
+            json!({ "type": "text", "text": "what is this?" })
+        );
+    }
+
+    #[test]
+    fn convert_user_content_http_image_url() {
+        let msg = json!({
+            "role": "user",
+            "content": [{
+                "type": "image_url",
+                "image_url": { "url": "https://example.com/a.png" }
+            }]
+        });
+
+        let content = AnthropicProvider::convert_user_content(&msg);
+        assert_eq!(content[0]["source"]["type"], "url");
+        assert_eq!(content[0]["source"]["url"], "https://example.com/a.png");
+    }
+
+    #[test]
+    fn convert_user_content_empty_array() {
+        let msg = json!({ "role": "user", "content": [] });
+        assert_eq!(
+            AnthropicProvider::convert_user_content(&msg),
+            json!("(empty)")
+        );
+    }
+
+    #[test]
+    fn convert_tools_returns_none_for_empty_input() {
+        assert_eq!(AnthropicProvider::convert_tools(None), None);
+        assert_eq!(AnthropicProvider::convert_tools(Some(vec![])), None);
+    }
+
+    #[test]
+    fn convert_tools_converts_openai_function_tool() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "search",
+                "description": "Search the web",
+                "parameters": {
+                    "type": "object",
+                    "properties": { "query": { "type": "string" } }
+                }
+            }
+        })];
+
+        let result = AnthropicProvider::convert_tools(Some(tools)).unwrap();
+
+        assert_eq!(result.len(), 1);
+        assert_eq!(result[0]["name"], "search");
+        assert_eq!(result[0]["description"], "Search the web");
+        assert_eq!(
+            result[0]["input_schema"],
+            json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } }
+            })
+        );
+    }
+
+    #[test]
+    fn convert_tools_uses_default_schema_and_skips_empty_description() {
+        let tools = vec![json!({
+            "type": "function",
+            "function": {
+                "name": "noop",
+                "description": ""
+            }
+        })];
+
+        let result = AnthropicProvider::convert_tools(Some(tools)).unwrap();
+
+        assert_eq!(result[0]["name"], "noop");
+        assert_eq!(
+            result[0]["input_schema"],
+            json!({ "type": "object", "properties": {} })
+        );
+        assert!(result[0].get("description").is_none());
+    }
+
+    #[test]
+    fn convert_tools_reads_cache_control_from_tool_not_function() {
+        let tools = vec![json!({
+            "type": "function",
+            "cache_control": { "type": "ephemeral" },
+            "function": {
+                "name": "cached_tool",
+                "parameters": { "type": "object", "properties": {} }
+            }
+        })];
+
+        let result = AnthropicProvider::convert_tools(Some(tools)).unwrap();
+
+        assert_eq!(
+            result[0]["cache_control"],
+            json!({ "type": "ephemeral" })
+        );
+    }
+
+    #[test]
+    fn convert_tools_falls_back_to_tool_when_function_missing() {
+        let tools = vec![json!({
+            "name": "direct_tool",
+            "description": "No wrapper",
+            "parameters": { "type": "object", "properties": { "x": { "type": "number" } } }
+        })];
+
+        let result = AnthropicProvider::convert_tools(Some(tools)).unwrap();
+
+        assert_eq!(result[0]["name"], "direct_tool");
+        assert_eq!(result[0]["description"], "No wrapper");
+    }
+
+    #[test]
+    fn merge_consecutive_merges_same_role_string_content() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "hello" }),
+            json!({ "role": "user", "content": " world" }),
+        ];
+
+        let merged = AnthropicProvider::merge_consecutive(msgs);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(
+            merged[0]["content"],
+            json!([
+                { "type": "text", "text": "hello" },
+                { "type": "text", "text": " world" },
+            ])
+        );
+    }
+
+    #[test]
+    fn merge_consecutive_merges_same_role_array_content() {
+        let msgs = vec![
+            json!({
+                "role": "user",
+                "content": [{ "type": "text", "text": "a" }]
+            }),
+            json!({
+                "role": "user",
+                "content": [{ "type": "tool_result", "tool_use_id": "1", "content": "ok" }]
+            }),
+        ];
+
+        let merged = AnthropicProvider::merge_consecutive(msgs);
+
+        assert_eq!(merged.len(), 1);
+        assert_eq!(merged[0]["content"].as_array().unwrap().len(), 2);
+    }
+
+    #[test]
+    fn merge_consecutive_keeps_alternating_roles() {
+        let msgs = vec![
+            json!({ "role": "user", "content": "hi" }),
+            json!({ "role": "assistant", "content": [{ "type": "text", "text": "hey" }] }),
+            json!({ "role": "user", "content": "again" }),
+        ];
+
+        let merged = AnthropicProvider::merge_consecutive(msgs);
+
+        assert_eq!(merged.len(), 3);
+    }
+
+    #[test]
+    fn build_request_headers_merges_extra_headers() {
+        let mut extra = HashMap::new();
+        extra.insert("X-Custom-Header".to_string(), "custom-value".to_string());
+
+        let headers = AnthropicProvider::build_request_headers("sk-ant-test", &extra);
+
+        assert_eq!(headers.get("X-Custom-Header").unwrap(), "custom-value");
+        assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-test");
     }
 }

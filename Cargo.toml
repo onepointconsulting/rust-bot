@@ -47,6 +47,8 @@ reedline = "0.48.0"
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 png = "0.17"
 crossterm = "0.29"
+yup-oauth2 = "12.1.2"
+adk-anthropic = "1.0.0"
 
 [dev-dependencies]
 tempfile = "3"

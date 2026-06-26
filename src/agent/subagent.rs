@@ -12,19 +12,19 @@ use crate::{
         context::ContextBuilder,
         hook::{AgentHook, AgentHookContext},
         runner::{AgentRunResult, AgentRunSpec, AgentRunner},
-        skills::{BUILTIN_SKILLS_DIR, SkillsLoader},
-        tools::{
-            filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool},
-            registry::ToolRegistry,
-            search::{GlobTool, GrepTool},
-            shell::ShellTool,
-            web::{WebFetchTool, WebSearchTool},
-        },
+        skills::SkillsLoader,
+        tools::{registry::ToolRegistry, shell::ShellTool},
     },
     bus::{events::InboundMessage, queue::MessageBus},
-    config::schema::{ExecToolConfig, SubagentConfig, WebToolsConfig},
+    config::schema::{ExecToolConfig, GmailToolConfig, SubagentConfig, WebToolsConfig},
     providers::base::LLMProviderDyn,
-    utils::prompt_templates::render_template,
+    utils::{
+        prompt_templates::render_template,
+        registry_helper::{
+            filesystem_tool_scope, register_filesystem_tools, register_gmail_tools,
+            register_web_tools,
+        },
+    },
 };
 
 use tera::Context;
@@ -62,6 +62,7 @@ pub struct SubagentManager {
     pub model: String,
     pub web_config: WebToolsConfig,
     pub exec_config: ExecToolConfig,
+    pub gmail_config: GmailToolConfig,
     pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
     pub runner: AgentRunner,
@@ -78,6 +79,7 @@ impl SubagentManager {
         model: Option<String>,
         web_config: Option<WebToolsConfig>,
         exec_config: Option<ExecToolConfig>,
+        gmail_config: Option<GmailToolConfig>,
         subagent_config: Option<SubagentConfig>,
         restrict_to_workspace: Option<bool>,
     ) -> Self {
@@ -89,6 +91,7 @@ impl SubagentManager {
             model,
             web_config: web_config.unwrap_or(WebToolsConfig::default()),
             exec_config: exec_config.unwrap_or(ExecToolConfig::default()),
+            gmail_config: gmail_config.unwrap_or(GmailToolConfig::default()),
             subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             runner: AgentRunner::new(provider),
@@ -108,6 +111,7 @@ impl SubagentManager {
             workspace,
             bus,
             max_tool_result_chars,
+            None,
             None,
             None,
             None,
@@ -219,51 +223,16 @@ impl SubagentManager {
         log::info!("Subagent [{}] starting task: {}", task_id, label);
         // Build subagent tools (no message tool, no spawn tool)
         let mut tools = ToolRegistry::new();
-        let allowed_dir = if self.restrict_to_workspace || !self.exec_config.sandbox.is_empty() {
-            Some(self.workspace.clone())
-        } else {
-            None
-        };
-        let extra_read = if allowed_dir.is_some() {
-            vec![BUILTIN_SKILLS_DIR.clone()]
-        } else {
-            vec![]
-        };
-        let workspace = Some(self.workspace.clone());
-        tools.register(Box::new(ReadFileTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            Some(extra_read),
-        )));
-        tools.register(Box::new(WriteFileTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            None,
-        )));
-        tools.register(Box::new(EditFileTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            None,
-        )));
-        tools.register(Box::new(ListDirTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            None,
-        )));
-        tools.register(Box::new(GlobTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            None,
-        )));
-        tools.register(Box::new(GrepTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            None,
-        )));
+        let (allowed_dir, extra_read) = filesystem_tool_scope(
+            &self.workspace,
+            self.restrict_to_workspace,
+            &self.exec_config.sandbox,
+        );
+        register_filesystem_tools(&mut tools, &self.workspace, allowed_dir, extra_read);
         if self.exec_config.enable {
             tools.register(Box::new(ShellTool::new(
                 self.exec_config.timeout as u64,
-                workspace.clone(),
+                Some(self.workspace.clone()),
                 None,
                 None,
                 self.restrict_to_workspace,
@@ -279,16 +248,9 @@ impl SubagentManager {
                 },
             )));
         }
-        if self.web_config.enable {
-            tools.register(Box::new(WebSearchTool::new(
-                Some(self.web_config.search.clone()),
-                self.web_config.proxy.clone(),
-            )));
-            tools.register(Box::new(WebFetchTool::new(
-                None,
-                self.web_config.proxy.clone(),
-            )));
-        }
+        register_web_tools(&self.web_config, &mut tools);
+        register_gmail_tools(&self.gmail_config, &mut tools);
+
         let system_prompt = self.build_subagent_prompt();
         if system_prompt.is_empty() {
             return Err("Failed to build subagent prompt".to_string());

@@ -63,14 +63,21 @@
       "pathAppend": "",
       "sandbox": ""
     },
-    "gmail": {
-      "enable": true,
-      "client_secret_path": "~/.rust-bot/workspace/credentials/client_secret.json",
-      "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
-      "max_results": 20
-    },
     "restrictToWorkspace": false,
-    "mcpServers": {},
+    "mcpServers": {
+      "ems": {
+        "transportType": "sse",
+        "command": "",
+        "args": [],
+        "env": {},
+        "url": "https://ems.brahmakumaris.org/mcp",
+        "headers": {
+          "Authorization": "${MCP_HEADERS_JWT}"
+        },
+        "toolTimeout": 30,
+        "enabledTools": ["*"]
+      }
+    },
     "ssrfWhitelist": [
       "100.64.0.0/10",
       "192.168.0.0/16"

@@ -20,29 +20,29 @@ use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
-use crate::agent::skills::BUILTIN_SKILLS_DIR;
+use crate::agent::skills::SkillsLoader;
 use crate::agent::subagent::SubagentManager;
-use crate::agent::tools::base::Tool;
 use crate::agent::tools::cron::CronTool;
-use crate::agent::tools::filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool};
 use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_from_config};
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
-use crate::agent::tools::search::{GlobTool, GrepTool};
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
-use crate::agent::tools::web::{WebFetchTool, WebSearchTool};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    AgentDefaults, ChannelsConfig, ExecToolConfig, McpServerConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig
+    AgentDefaults, ChannelsConfig, ExecToolConfig, GmailToolConfig, McpServerConfig, ProviderRetryMode,
+    SubagentConfig, WebToolsConfig
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
+use crate::utils::registry_helper::{
+    filesystem_tool_scope, register_filesystem_tools, register_gmail_tools, register_web_tools,
+};
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
 
@@ -341,6 +341,7 @@ impl AgentLoop {
         provider_retry_mode: Option<ProviderRetryMode>,
         web_config: Option<WebToolsConfig>,
         exec_config: Option<ExecToolConfig>,
+        gmail_config: Option<GmailToolConfig>,
         subagent_config: Option<SubagentConfig>,
         cron_service: Option<Arc<CronService>>,
         restrict_to_workspace: Option<bool>,
@@ -354,6 +355,7 @@ impl AgentLoop {
         let model = model.unwrap_or(provider.clone().get_default_model());
         let web_config = web_config.unwrap_or(WebToolsConfig::default());
         let exec_config = exec_config.unwrap_or(ExecToolConfig::default());
+        let gmail_config = gmail_config.unwrap_or(GmailToolConfig::default());
         let subagent_config = subagent_config.unwrap_or(SubagentConfig::default());
         let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
@@ -381,6 +383,7 @@ impl AgentLoop {
             Some(model.clone()),
             Some(web_config.clone()),
             Some(exec_config.clone()),
+            Some(gmail_config.clone()),
             Some(subagent_config.clone()),
             Some(restrict_to_workspace),
         ));
@@ -390,6 +393,7 @@ impl AgentLoop {
             restrict_to_workspace,
             &exec_config,
             &web_config,
+            &gmail_config,
             bus.clone(),
             &cron_service,
             &timezone,
@@ -477,53 +481,24 @@ impl AgentLoop {
         restrict_to_workspace: bool,
         exec_config: &ExecToolConfig,
         web_config: &WebToolsConfig,
+        gmail_config: &GmailToolConfig,
         bus: Arc<MessageBus>,
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
         workspace: &PathBuf,
     ) {
-        let allowed_dir = if restrict_to_workspace || !exec_config.sandbox.is_empty() {
-            Some(workspace.clone())
-        } else {
-            None
-        };
-        let extra_read = if allowed_dir.is_some() {
-            vec![BUILTIN_SKILLS_DIR.clone()]
-        } else {
-            vec![]
-        };
-        let workspace = Some(workspace.clone());
-        tools.register(Box::new(ReadFileTool::new(
-            workspace.clone(),
-            allowed_dir.clone(),
-            Some(extra_read),
-        )));
-        for tool in [
-            Box::new(WriteFileTool::new(
-                workspace.clone(),
-                allowed_dir.clone(),
-                None,
-            )) as Box<dyn Tool>,
-            Box::new(EditFileTool::new(
-                workspace.clone(),
-                allowed_dir.clone(),
-                None,
-            )),
-            Box::new(ListDirTool::new(
-                workspace.clone(),
-                allowed_dir.clone(),
-                None,
-            )),
-            Box::new(GlobTool::new(workspace.clone(), allowed_dir.clone(), None)),
-            Box::new(GrepTool::new(workspace.clone(), allowed_dir.clone(), None)),
-        ] {
-            tools.register(tool);
-        }
+        log::info!("Registering default tools");
+        let (allowed_dir, extra_read) = filesystem_tool_scope(
+            workspace,
+            restrict_to_workspace,
+            &exec_config.sandbox,
+        );
+        register_filesystem_tools(tools, workspace, allowed_dir, extra_read);
         if exec_config.enable {
             log::debug!("Registering exec tool");
             tools.register(Box::new(ShellTool::new(
                 exec_config.timeout as u64,
-                workspace.clone(),
+                Some(workspace.clone()),
                 None,
                 None,
                 restrict_to_workspace,
@@ -531,13 +506,8 @@ impl AgentLoop {
                 Some(exec_config.path_append.clone()),
             )));
         }
-        if web_config.enable {
-            tools.register(Box::new(WebSearchTool::new(
-                Some(web_config.search.clone()),
-                web_config.proxy.clone(),
-            )));
-            tools.register(Box::new(WebFetchTool::new(None, web_config.proxy.clone())));
-        }
+        register_web_tools(web_config, tools);
+        register_gmail_tools(gmail_config, tools);
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",
@@ -1651,7 +1621,6 @@ impl AgentLoop {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
 
     use crate::providers::base::{GenerationSettings, LLMResponse};
     use serde_json::json;
@@ -1899,6 +1868,7 @@ mod tests {
             None,
             None,
             Some(max_tool_result_chars),
+            None,
             None,
             None,
             None,

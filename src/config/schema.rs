@@ -3,7 +3,10 @@ use std::{collections::HashMap, path::PathBuf};
 use garde::Validate;
 use serde::{Deserialize, Serialize};
 
-use crate::{providers::registry::{find_by_name, providers}, utils::helpers::expand_tilde_path};
+use crate::{
+    providers::registry::{find_by_name, providers},
+    utils::helpers::expand_tilde_path,
+};
 
 // ── ProviderConfig ────────────────────────────────────────────────────────────
 
@@ -40,9 +43,15 @@ impl Default for ProviderConfig {
 
 // ── ChannelsConfig ────────────────────────────────────────────────────────────
 
-fn default_send_progress() -> bool { true }
-fn default_send_max_retries() -> u8 { 3 }
-fn default_transcription_provider() -> String { "groq".to_string() }
+fn default_send_progress() -> bool {
+    true
+}
+fn default_send_max_retries() -> u8 {
+    3
+}
+fn default_transcription_provider() -> String {
+    "groq".to_string()
+}
 
 /// Configuration for chat channels.
 ///
@@ -68,7 +77,10 @@ pub struct ChannelsConfig {
     pub send_max_retries: u8,
 
     /// Voice transcription backend: `"groq"` or `"openai"`.
-    #[serde(alias = "transcription_provider", default = "default_transcription_provider")]
+    #[serde(
+        alias = "transcription_provider",
+        default = "default_transcription_provider"
+    )]
     #[garde(skip)]
     pub transcription_provider: String,
 
@@ -102,9 +114,15 @@ pub enum CronSchedule {
     Every { every_ms: u64 },
 }
 
-fn default_dream_interval_h() -> u32 { 2 }
-fn default_dream_max_batch_size() -> u32 { 20 }
-fn default_dream_max_iterations() -> u32 { 10 }
+fn default_dream_interval_h() -> u32 {
+    2
+}
+fn default_dream_max_batch_size() -> u32 {
+    20
+}
+fn default_dream_max_iterations() -> u32 {
+    10
+}
 
 /// Dream memory consolidation configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
@@ -200,23 +218,46 @@ impl ProviderRetryMode {
     }
 }
 
-fn default_agent_workspace() -> String { "~/.rust-bot/workspace".to_string() }
-fn default_agent_model() -> String { "anthropic/claude-opus-4-6".to_string() }
-fn default_agent_provider() -> String { "auto".to_string() }
-fn default_agent_max_tokens() -> u32 { 8192 }
-fn default_agent_context_window_tokens() -> u64 { 65_536 }
-fn default_agent_temperature() -> f32 { 0.1 }
-fn default_agent_max_tool_iterations() -> u32 { 100 }
-fn default_agent_max_tool_result_chars() -> u32 { 16_000 }
-fn default_agent_provider_retry_mode() -> ProviderRetryMode { ProviderRetryMode::Standard }
-fn default_agent_reasoning_effort() -> Option<String> { None }
-fn default_agent_timezone() -> String { "UTC".to_string() }
-fn default_agent_dream_config() -> DreamConfig { DreamConfig::default() }
+fn default_agent_workspace() -> String {
+    "~/.rust-bot/workspace".to_string()
+}
+fn default_agent_model() -> String {
+    "anthropic/claude-opus-4-6".to_string()
+}
+fn default_agent_provider() -> String {
+    "auto".to_string()
+}
+fn default_agent_max_tokens() -> u32 {
+    8192
+}
+fn default_agent_context_window_tokens() -> u64 {
+    65_536
+}
+fn default_agent_temperature() -> f32 {
+    0.1
+}
+fn default_agent_max_tool_iterations() -> u32 {
+    100
+}
+fn default_agent_max_tool_result_chars() -> u32 {
+    16_000
+}
+fn default_agent_provider_retry_mode() -> ProviderRetryMode {
+    ProviderRetryMode::Standard
+}
+fn default_agent_reasoning_effort() -> Option<String> {
+    None
+}
+fn default_agent_timezone() -> String {
+    "UTC".to_string()
+}
+fn default_agent_dream_config() -> DreamConfig {
+    DreamConfig::default()
+}
 
 #[derive(Debug, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentsConfig {
-
     #[serde(alias = "workspace", default = "default_agent_workspace")]
     #[garde(skip)]
     pub workspace: String,
@@ -234,7 +275,10 @@ pub struct AgentsConfig {
     #[garde(range(min = 1))]
     pub max_tokens: u32,
 
-    #[serde(alias = "context_window_tokens", default = "default_agent_context_window_tokens")]
+    #[serde(
+        alias = "context_window_tokens",
+        default = "default_agent_context_window_tokens"
+    )]
     #[garde(range(min = 1))]
     pub context_window_tokens: u64,
 
@@ -246,15 +290,24 @@ pub struct AgentsConfig {
     #[garde(range(min = 0.0, max = 1.0))]
     pub temperature: f32,
 
-    #[serde(alias = "max_tool_iterations", default = "default_agent_max_tool_iterations")]
+    #[serde(
+        alias = "max_tool_iterations",
+        default = "default_agent_max_tool_iterations"
+    )]
     #[garde(range(min = 1))]
     pub max_tool_iterations: u32,
 
-    #[serde(alias = "max_tool_result_chars", default = "default_agent_max_tool_result_chars")]
+    #[serde(
+        alias = "max_tool_result_chars",
+        default = "default_agent_max_tool_result_chars"
+    )]
     #[garde(range(min = 1))]
     pub max_tool_result_chars: u32,
 
-    #[serde(alias = "provider_retry_mode", default = "default_agent_provider_retry_mode")]
+    #[serde(
+        alias = "provider_retry_mode",
+        default = "default_agent_provider_retry_mode"
+    )]
     #[garde(skip)]
     pub provider_retry_mode: ProviderRetryMode,
 
@@ -353,22 +406,28 @@ impl ProvidersConfig {
     /// This is the Rust equivalent of Python's `getattr(self.providers, spec.name, None)`.
     pub fn get_by_name(&self, name: &str) -> Option<&ProviderConfig> {
         match name {
-            "custom"       => Some(&self.custom),
+            "custom" => Some(&self.custom),
             "azure_openai" => Some(&self.azure_openai),
-            "anthropic"    => Some(&self.anthropic),
-            "openai"       => Some(&self.openai),
-            "openrouter"   => Some(&self.openrouter),
-            "gemini"       => Some(&self.gemini),
-            _              => None,
+            "anthropic" => Some(&self.anthropic),
+            "openai" => Some(&self.openai),
+            "openrouter" => Some(&self.openrouter),
+            "gemini" => Some(&self.gemini),
+            _ => None,
         }
     }
 }
 
 // ── HeartbeatConfig ───────────────────────────────────────────────────────────
 
-fn default_heartbeat_enabled() -> bool { true }
-fn default_heartbeat_interval_s() -> u32 { 30 * 60 }
-fn default_heartbeat_keep_recent_messages() -> u32 { 8 }
+fn default_heartbeat_enabled() -> bool {
+    true
+}
+fn default_heartbeat_interval_s() -> u32 {
+    30 * 60
+}
+fn default_heartbeat_keep_recent_messages() -> u32 {
+    8
+}
 
 /// Heartbeat service configuration.
 #[derive(Debug, Deserialize, Serialize, Validate)]
@@ -385,7 +444,10 @@ pub struct HeartbeatConfig {
     pub interval_s: u32,
 
     /// Number of recent messages to retain for context. Default: 8.
-    #[serde(alias = "keep_recent_messages", default = "default_heartbeat_keep_recent_messages")]
+    #[serde(
+        alias = "keep_recent_messages",
+        default = "default_heartbeat_keep_recent_messages"
+    )]
     #[garde(range(min = 1))]
     pub keep_recent_messages: u32,
 }
@@ -402,9 +464,15 @@ impl Default for HeartbeatConfig {
 
 // ── ApiConfig ─────────────────────────────────────────────────────────────────
 
-fn default_api_host() -> String { "127.0.0.1".to_string() }
-fn default_api_port() -> u16 { 8900 }
-fn default_api_timeout() -> f64 { 120.0 }
+fn default_api_host() -> String {
+    "127.0.0.1".to_string()
+}
+fn default_api_port() -> u16 {
+    8900
+}
+fn default_api_timeout() -> f64 {
+    120.0
+}
 
 /// OpenAI-compatible API server configuration.
 #[derive(Debug, Deserialize, Serialize, Validate)]
@@ -438,8 +506,12 @@ impl Default for ApiConfig {
 
 // ── GatewayConfig ─────────────────────────────────────────────────────────────
 
-fn default_gateway_host() -> String { "0.0.0.0".to_string() }
-fn default_gateway_port() -> u16 { 18790 }
+fn default_gateway_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_gateway_port() -> u16 {
+    18790
+}
 
 /// Gateway/server configuration.
 #[derive(Debug, Deserialize, Serialize, Validate)]
@@ -473,9 +545,15 @@ impl Default for GatewayConfig {
 
 // ── WebSearchConfig ───────────────────────────────────────────────────────────
 
-fn default_web_search_provider() -> String { "duckduckgo".to_string() }
-fn default_web_search_max_results() -> u32 { 5 }
-fn default_web_search_timeout() -> u32 { 30 }
+fn default_web_search_provider() -> String {
+    "duckduckgo".to_string()
+}
+fn default_web_search_max_results() -> u32 {
+    5
+}
+fn default_web_search_timeout() -> u32 {
+    30
+}
 
 /// Web search tool configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -521,7 +599,9 @@ impl Default for WebSearchConfig {
 
 // ── WebToolsConfig ────────────────────────────────────────────────────────────
 
-fn default_web_tools_enable() -> bool { true }
+fn default_web_tools_enable() -> bool {
+    true
+}
 
 /// Web tools configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -554,10 +634,76 @@ impl Default for WebToolsConfig {
     }
 }
 
+fn default_gmail_tool_enable() -> bool {
+    false
+}
+
+fn default_gmail_max_results() -> u32 {
+    20
+}
+
+fn default_gmail_token_cache_path() -> String {
+    "~/.rust-bot/credentials/token_cache.json".to_string()
+}
+
+fn default_gmail_client_secret_path() -> String {
+    "~/.rust-bot/credentials/client_secret.json".to_string()
+}
+
+/// Gmail Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GmailToolConfig {
+    /// Enable or disable the Gmail Tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_gmail_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// OAuth client secret file (client_secret.json). Default: `~/.rust-bot/credentials/client_secret.json`.
+    #[serde(alias = "client_secret_path", default = "default_gmail_client_secret_path")]
+    #[garde(skip)]
+    pub client_secret_path: String,
+
+    /// OAuth token cache file (refresh/access tokens). Default: `~/.rust-bot/credentials/token_cache.json`.
+    #[serde(alias = "token_cache_path", default = "default_gmail_token_cache_path")]
+    #[garde(skip)]
+    pub token_cache_path: String,
+
+    /// Maximum number of results to return per query. Default: 20.
+    #[serde(alias = "max_results", default = "default_gmail_max_results")]
+    #[garde(range(min = 1))]
+    pub max_results: u32,
+}
+
+impl GmailToolConfig {
+    pub fn token_cache_path(&self) -> PathBuf {
+        PathBuf::from(expand_tilde_path(&self.token_cache_path).as_ref())
+    }
+
+    pub fn client_secret_path(&self) -> PathBuf {
+        PathBuf::from(expand_tilde_path(&self.client_secret_path).as_ref())
+    }
+}
+
+impl Default for GmailToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_gmail_tool_enable(),
+            token_cache_path: default_gmail_token_cache_path(),
+            client_secret_path: default_gmail_client_secret_path(),
+            max_results: default_gmail_max_results(),
+        }
+    }
+}
+
 // ── ExecToolConfig ────────────────────────────────────────────────────────────
 
-fn default_exec_tool_enable() -> bool { true }
-fn default_exec_tool_timeout() -> u32 { 60 }
+fn default_exec_tool_enable() -> bool {
+    true
+}
+fn default_exec_tool_timeout() -> u32 {
+    60
+}
 
 /// Shell exec tool configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
@@ -597,8 +743,12 @@ impl Default for ExecToolConfig {
 
 // ── MCPServerConfig ───────────────────────────────────────────────────────────
 
-fn default_mcp_tool_timeout() -> u32 { 30 }
-fn default_mcp_enabled_tools() -> Vec<String> { vec!["*".to_string()] }
+fn default_mcp_tool_timeout() -> u32 {
+    30
+}
+fn default_mcp_enabled_tools() -> Vec<String> {
+    vec!["*".to_string()]
+}
 
 /// Transport type for an MCP server connection.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
@@ -700,6 +850,10 @@ pub struct ToolsConfig {
     #[serde(alias = "ssrf_whitelist")]
     #[garde(skip)]
     pub ssrf_whitelist: Vec<String>,
+
+    #[serde(alias = "gmail")]
+    #[garde(dive)]
+    pub gmail: GmailToolConfig,
 }
 
 impl Default for ToolsConfig {
@@ -710,6 +864,7 @@ impl Default for ToolsConfig {
             restrict_to_workspace: false,
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
+            gmail: GmailToolConfig::default(),
         }
     }
 }
@@ -791,7 +946,9 @@ impl Config {
             }
         }
 
-        let model_lower = model.map(|m| m.to_lowercase()).unwrap_or(self.agents.model.to_lowercase());
+        let model_lower = model
+            .map(|m| m.to_lowercase())
+            .unwrap_or(self.agents.model.to_lowercase());
         let model_replaced = model_lower.replace('-', "_");
         let model_normalized = model_replaced.as_str();
         let model_prefix = if model_lower.contains('/') {
@@ -803,17 +960,25 @@ impl Config {
 
         fn kw_matches(kw: &str, model_lower: &str, model_normalized: &str) -> bool {
             let kw_lower = kw.to_lowercase();
-            model_lower.contains(kw_lower.as_str()) || model_normalized.contains(&kw_lower.replace('-', "_"))
+            model_lower.contains(kw_lower.as_str())
+                || model_normalized.contains(&kw_lower.replace('-', "_"))
         }
-
 
         for spec in providers() {
             let p = self.providers.get_by_name(&spec.name);
             if let Some(p) = p {
-                if !model_prefix.is_empty() && normalized_prefix == spec.name && (spec.is_oauth || spec.is_local || !p.api_key.is_empty()) {
+                if !model_prefix.is_empty()
+                    && normalized_prefix == spec.name
+                    && (spec.is_oauth || spec.is_local || !p.api_key.is_empty())
+                {
                     return (Some(p), Some(spec.name.clone()));
                 }
-                if spec.keywords.iter().any(|kw| kw_matches(kw, &model_lower, &model_normalized)) && (spec.is_oauth || spec.is_local || !p.api_key.is_empty()) {
+                if spec
+                    .keywords
+                    .iter()
+                    .any(|kw| kw_matches(kw, &model_lower, &model_normalized))
+                    && (spec.is_oauth || spec.is_local || !p.api_key.is_empty())
+                {
                     return (Some(p), Some(spec.name.clone()));
                 }
             }
@@ -829,7 +994,9 @@ impl Config {
             if !spec.is_local {
                 continue;
             }
-            let Some(p) = self.providers.get_by_name(&spec.name) else { continue };
+            let Some(p) = self.providers.get_by_name(&spec.name) else {
+                continue;
+            };
             if p.api_base.is_none() {
                 continue;
             }
@@ -852,7 +1019,9 @@ impl Config {
             if spec.is_oauth {
                 continue;
             }
-            let Some(p) = self.providers.get_by_name(&spec.name) else { continue };
+            let Some(p) = self.providers.get_by_name(&spec.name) else {
+                continue;
+            };
             if !p.api_key.is_empty() {
                 return (Some(p), Some(spec.name));
             }
@@ -864,7 +1033,7 @@ impl Config {
     /// Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
     pub fn get_provider(&self, model: Option<&str>) -> Option<&ProviderConfig> {
         let (p, _) = self.match_provider(model);
-        return p
+        return p;
     }
 
     pub fn get_provider_name(&self, model: Option<&str>) -> Option<String> {
@@ -1020,7 +1189,9 @@ mod tests {
         let interval_h = 4;
         let max_batch_size = 25;
         let max_iterations = 15;
-        let json = format!("{{\"intervalH\": {interval_h}, \"maxBatchSize\": {max_batch_size}, \"maxIterations\": {max_iterations}}}");
+        let json = format!(
+            "{{\"intervalH\": {interval_h}, \"maxBatchSize\": {max_batch_size}, \"maxIterations\": {max_iterations}}}"
+        );
         let cfg: DreamConfig = serde_json::from_str(&json).unwrap();
         assert_eq!(cfg.interval_h, interval_h);
         assert_eq!(cfg.max_batch_size, max_batch_size);
@@ -1065,9 +1236,17 @@ mod tests {
 
     #[test]
     fn test_dream_build_schedule_interval() {
-        let cfg = DreamConfig { interval_h: 3, ..DreamConfig::default() };
+        let cfg = DreamConfig {
+            interval_h: 3,
+            ..DreamConfig::default()
+        };
         let schedule = cfg.build_schedule("UTC");
-        assert_eq!(schedule, CronSchedule::Every { every_ms: 3 * 3_600_000 });
+        assert_eq!(
+            schedule,
+            CronSchedule::Every {
+                every_ms: 3 * 3_600_000
+            }
+        );
     }
 
     #[test]
@@ -1077,15 +1256,21 @@ mod tests {
             ..DreamConfig::default()
         };
         let schedule = cfg.build_schedule("Europe/London");
-        assert_eq!(schedule, CronSchedule::Cron {
-            expr: "0 2 * * *".to_string(),
-            tz: "Europe/London".to_string(),
-        });
+        assert_eq!(
+            schedule,
+            CronSchedule::Cron {
+                expr: "0 2 * * *".to_string(),
+                tz: "Europe/London".to_string(),
+            }
+        );
     }
 
     #[test]
     fn test_dream_describe_schedule_interval() {
-        let cfg = DreamConfig { interval_h: 6, ..DreamConfig::default() };
+        let cfg = DreamConfig {
+            interval_h: 6,
+            ..DreamConfig::default()
+        };
         assert_eq!(cfg.describe_schedule(), "every 6h");
     }
 
@@ -1119,11 +1304,17 @@ mod tests {
         assert_eq!(cfg.model, default_agent_model());
         assert_eq!(cfg.provider, default_agent_provider());
         assert_eq!(cfg.max_tokens, default_agent_max_tokens());
-        assert_eq!(cfg.context_window_tokens, default_agent_context_window_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
         assert_eq!(cfg.context_block_limit, None);
         assert_eq!(cfg.temperature, default_agent_temperature());
         assert_eq!(cfg.max_tool_iterations, default_agent_max_tool_iterations());
-        assert_eq!(cfg.max_tool_result_chars, default_agent_max_tool_result_chars());
+        assert_eq!(
+            cfg.max_tool_result_chars,
+            default_agent_max_tool_result_chars()
+        );
     }
 
     #[test]
@@ -1133,11 +1324,17 @@ mod tests {
         assert_eq!(cfg.workspace, default_agent_workspace());
         assert_eq!(cfg.provider, default_agent_provider());
         assert_eq!(cfg.max_tokens, default_agent_max_tokens());
-        assert_eq!(cfg.context_window_tokens, default_agent_context_window_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
         assert_eq!(cfg.context_block_limit, None);
         assert_eq!(cfg.temperature, default_agent_temperature());
         assert_eq!(cfg.max_tool_iterations, default_agent_max_tool_iterations());
-        assert_eq!(cfg.max_tool_result_chars, default_agent_max_tool_result_chars());
+        assert_eq!(
+            cfg.max_tool_result_chars,
+            default_agent_max_tool_result_chars()
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -1155,7 +1352,13 @@ mod tests {
         let cfg: ProviderConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.api_key, "abc123");
         assert_eq!(cfg.api_base, Some("https://api.provider.com".to_string()));
-        assert_eq!(cfg.extra_headers, Some(HashMap::from([("APP-Code".to_string(), "123456".to_string())])));
+        assert_eq!(
+            cfg.extra_headers,
+            Some(HashMap::from([(
+                "APP-Code".to_string(),
+                "123456".to_string()
+            )]))
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -1164,8 +1367,17 @@ mod tests {
         let json = r#"{"openrouter": {"apiKey": "abc123", "apiBase": "https://api.provider.com", "extraHeaders": {"APP-Code": "123456"}}}"#;
         let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.openrouter.api_key, "abc123");
-        assert_eq!(cfg.openrouter.api_base, Some("https://api.provider.com".to_string()));
-        assert_eq!(cfg.openrouter.extra_headers, Some(HashMap::from([("APP-Code".to_string(), "123456".to_string())])));
+        assert_eq!(
+            cfg.openrouter.api_base,
+            Some("https://api.provider.com".to_string())
+        );
+        assert_eq!(
+            cfg.openrouter.extra_headers,
+            Some(HashMap::from([(
+                "APP-Code".to_string(),
+                "123456".to_string()
+            )]))
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -1173,8 +1385,11 @@ mod tests {
     fn test_providers_config_default_all_empty() {
         let cfg = ProvidersConfig::default();
         for provider in [
-            &cfg.custom, &cfg.azure_openai, &cfg.anthropic,
-            &cfg.openai, &cfg.openrouter,
+            &cfg.custom,
+            &cfg.azure_openai,
+            &cfg.anthropic,
+            &cfg.openai,
+            &cfg.openrouter,
         ] {
             assert_eq!(provider.api_key, "");
             assert_eq!(provider.api_base, None);
@@ -1214,7 +1429,10 @@ mod tests {
         let json = r#"{"azure_openai": {"apiKey": "az-key", "apiBase": "https://mydeployment.openai.azure.com"}}"#;
         let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.azure_openai.api_key, "az-key");
-        assert_eq!(cfg.azure_openai.api_base, Some("https://mydeployment.openai.azure.com".to_string()));
+        assert_eq!(
+            cfg.azure_openai.api_base,
+            Some("https://mydeployment.openai.azure.com".to_string())
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -1230,7 +1448,10 @@ mod tests {
         let json = r#"{"custom": {"apiKey": "local-key", "apiBase": "http://localhost:11434/v1"}}"#;
         let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.custom.api_key, "local-key");
-        assert_eq!(cfg.custom.api_base, Some("http://localhost:11434/v1".to_string()));
+        assert_eq!(
+            cfg.custom.api_base,
+            Some("http://localhost:11434/v1".to_string())
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -1272,7 +1493,10 @@ mod tests {
         let cfg: HeartbeatConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.enabled);
         assert_eq!(cfg.interval_s, default_heartbeat_interval_s());
-        assert_eq!(cfg.keep_recent_messages, default_heartbeat_keep_recent_messages());
+        assert_eq!(
+            cfg.keep_recent_messages,
+            default_heartbeat_keep_recent_messages()
+        );
     }
 
     #[test]
@@ -1369,7 +1593,8 @@ mod tests {
 
     #[test]
     fn test_gateway_deserialize_nested_heartbeat() {
-        let json = r#"{"heartbeat": {"enabled": false, "intervalS": 300, "keepRecentMessages": 4}}"#;
+        let json =
+            r#"{"heartbeat": {"enabled": false, "intervalS": 300, "keepRecentMessages": 4}}"#;
         let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.host, default_gateway_host());
         assert_eq!(cfg.port, default_gateway_port());
@@ -1601,8 +1826,14 @@ mod tests {
         let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.transport_type, Some(McpTransportType::Stdio));
         assert_eq!(cfg.command, "npx");
-        assert_eq!(cfg.args, vec!["-y", "@modelcontextprotocol/server-filesystem"]);
-        assert_eq!(cfg.env.get("NODE_ENV").map(String::as_str), Some("production"));
+        assert_eq!(
+            cfg.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem"]
+        );
+        assert_eq!(
+            cfg.env.get("NODE_ENV").map(String::as_str),
+            Some("production")
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -1616,7 +1847,10 @@ mod tests {
         let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.transport_type, Some(McpTransportType::Sse));
         assert_eq!(cfg.url, "http://localhost:8080/sse");
-        assert_eq!(cfg.headers.get("Authorization").map(String::as_str), Some("Bearer token123"));
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token123")
+        );
         assert!(cfg.validate().is_ok());
     }
 

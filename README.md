@@ -1,6 +1,6 @@
 # Rust Bot
 
-A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot), written in Rust. It ships as a single CLI binary (`rust-bot`) that can run the agent in one-shot mode or as an interactive console.
+A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot), written in Rust. It ships as a CLI binary (`rust-bot`) that can run the agent in one-shot mode or as an interactive console, plus an optional `gmail-auth` helper for Gmail OAuth setup.
 
 ## Table of contents
 
@@ -19,6 +19,10 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
   - [Image paste](#image-paste)
   - [Multi-line input](#multi-line-input)
   - [Leaving the console](#leaving-the-console)
+- [Gmail support](#gmail-support)
+  - [Google Cloud setup](#google-cloud-setup)
+  - [OAuth helper (`gmail-auth`)](#oauth-helper-gmail-auth)
+  - [Enabling the Gmail tool](#enabling-the-gmail-tool)
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 
@@ -50,6 +54,14 @@ cargo build -r
 ```
 
 This produces `target/release/rust-bot` (or `.\target\release\rust-bot.exe` on Windows).
+
+A separate helper binary for Gmail OAuth is built alongside the main CLI:
+
+```
+cargo build -r --bin gmail-auth
+```
+
+This produces `target/release/gmail-auth` (or `.\target\release\gmail-auth.exe` on Windows).
 
 ## Quick start
 
@@ -259,6 +271,86 @@ The console always prints the banner on entry — that's the easiest way to conf
 
 ---
 
+## Gmail support
+
+Rust Bot can expose a `gmail` agent tool that reads messages from the user's inbox (read-only). Access is granted through Google OAuth; credentials are stored on disk and reused by the agent.
+
+### Google Cloud setup
+
+1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create or select a project.
+2. Enable the **Gmail API** for that project.
+3. Configure the **OAuth consent screen** (External or Internal, depending on your use case).
+4. Create an OAuth **Desktop app** client and download the client secret JSON.
+5. Ensure the client allows the redirect URI `http://localhost:8080` (required for the installed-app flow used by `gmail-auth`).
+
+Save the downloaded file as `client_secret.json` in the project root before running the OAuth helper (see below). The agent expects credential files under `~/.rust-bot/credentials/` by default; you can override the paths in config (see [Enabling the Gmail tool](#enabling-the-gmail-tool)).
+
+> Credential files contain secrets and are gitignored. Do not commit `client_secret.json` or `token_cache.json`.
+
+### OAuth helper (`gmail-auth`)
+
+The `gmail-auth` binary is a standalone utility (not part of the main agent loop) that walks through Google login, requests Gmail read-only access, and writes a `token_cache.json` file containing the refresh and access tokens. Run it once per machine (or again if tokens are revoked).
+
+**Prerequisites:** place `client_secret.json` in the project root.
+
+```bash
+# Run the OAuth flow (opens a browser, listens on localhost:8080)
+cargo run --bin gmail-auth
+
+# Or build a release binary
+cargo build --release --bin gmail-auth
+./target/release/gmail-auth
+```
+
+On Windows (PowerShell):
+
+```ps1
+cargo run --bin gmail-auth
+cargo build --release --bin gmail-auth
+.\target\release\gmail-auth.exe
+```
+
+What happens:
+
+1. A local HTTP server on port **8080** receives the OAuth callback (no manual code copy-paste).
+2. You sign in with Google and grant Gmail read-only permission.
+3. Tokens are persisted to **`token_cache.json`** in the project root.
+4. The helper fetches a few inbox subjects to confirm the connection works.
+
+Copy the generated files to the credential directory the agent uses (defaults shown):
+
+```bash
+mkdir -p ~/.rust-bot/credentials
+cp client_secret.json ~/.rust-bot/credentials/
+cp token_cache.json ~/.rust-bot/credentials/
+```
+
+If your config points elsewhere (for example `configs/openai-compat/config_gmail.json` uses `~/.rust-bot/workspace/credentials/`), copy the files to those paths instead.
+
+### Enabling the Gmail tool
+
+Enable the tool in your agent config under `tools.gmail`:
+
+```json
+"gmail": {
+  "enable": true,
+  "client_secret_path": "~/.rust-bot/credentials/client_secret.json",
+  "token_cache_path": "~/.rust-bot/credentials/token_cache.json",
+  "max_results": 20
+}
+```
+
+A sample config with Gmail enabled is in `configs/openai-compat/config_gmail.json`. Run the agent with that config once credentials are in place:
+
+```bash
+cargo run -- agent -m "Summarize my latest inbox emails" \
+  --config ./configs/openai-compat/config_gmail.json
+```
+
+The agent registers the `gmail` tool when `tools.gmail.enable` is `true`. It uses the cached tokens from `token_cache.json` and refreshes them automatically via `yup-oauth2` when they expire.
+
+---
+
 ## Configuration
 
 The agent reads its configuration from a JSON file passed via `--config`. Sample configs live in `configs/`:
@@ -277,6 +369,8 @@ The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TO
 ```
 rust-bot/
 ├── src/
+│   ├── bin/
+│   │   └── gmail-auth.rs   # OAuth helper for Gmail token setup
 │   ├── agent/        # Agent loop, runner, tools, skills
 │   ├── bus/          # Internal event bus
 │   ├── cli/          # CLI commands, stream rendering, interactive console

@@ -1,14 +1,14 @@
+use futures::FutureExt;
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
-use futures::FutureExt;
 
 use crate::providers::registry::ProviderSpec;
 
 #[derive(Debug, Clone, PartialEq)]
-pub struct  ToolCallRequest {
+pub struct ToolCallRequest {
     /// A tool call request from the LLM.
     pub id: String,
     pub name: String,
@@ -93,7 +93,7 @@ impl fmt::Display for ToolCallRequest {
 // Not used right now
 pub enum RetryMode {
     Standard,
-    Persistent
+    Persistent,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -165,10 +165,6 @@ const TRANSIENT_ERROR_MARKERS: &[&str] = &[
     "server error",
     "temporarily unavailable",
 ];
-
-
-
-
 
 /// A dyn-safe streaming callback: receives one content delta per token and
 /// returns a boxed `Send` future.
@@ -290,7 +286,17 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
-        LLMProvider::chat(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+        LLMProvider::chat(
+            self,
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        )
+        .await
     }
 
     async fn safe_chat(
@@ -303,7 +309,17 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
-        LLMProvider::safe_chat(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+        LLMProvider::safe_chat(
+            self,
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        )
+        .await
     }
 
     async fn chat_with_retry(
@@ -316,7 +332,17 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
-        LLMProvider::chat_with_retry(self, messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice).await
+        LLMProvider::chat_with_retry(
+            self,
+            messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+        )
+        .await
     }
 
     async fn chat_stream_with_retry_boxed(
@@ -362,7 +388,7 @@ pub trait LLMProvider: Send + Sync {
         api_base: Option<String>,
         default_model: Option<String>,
         extra_headers: Option<HashMap<String, String>>,
-        spec: Option<ProviderSpec>
+        spec: Option<ProviderSpec>,
     ) -> Self
     where
         Self: Sized;
@@ -518,6 +544,48 @@ pub trait LLMProvider: Send + Sync {
         sanitized
     }
 
+    /// Extract tool name from either OpenAI or Anthropic-style tool schemas.
+    fn tool_name(tool: &serde_json::Value) -> String {
+        if let Some(name) = tool.get("name").and_then(|v| v.as_str()) {
+            return name.to_string();
+        }
+        if let Some(fname) = tool
+            .get("function")
+            .and_then(|f| f.get("name"))
+            .and_then(|n| n.as_str())
+        {
+            return fname.to_string();
+        }
+        String::new()
+    }
+
+    /// Return cache marker indices: builtin/MCP boundary and tail index.
+    fn tool_cache_marker_indices(tools: Option<Vec<serde_json::Value>>) -> Option<Vec<usize>> {
+        let tools = tools?;
+        if tools.is_empty() {
+            return Some(Vec::new());
+        }
+
+        let tail_idx = tools.len() - 1;
+        let mut last_builtin_idx: Option<usize> = None;
+        for i in (0..=tail_idx).rev() {
+            if !Self::tool_name(&tools[i]).starts_with("mcp_") {
+                last_builtin_idx = Some(i);
+                break;
+            }
+        }
+
+        let mut ordered_unique = Vec::new();
+        for idx in [last_builtin_idx, Some(tail_idx)] {
+            if let Some(idx) = idx {
+                if !ordered_unique.contains(&idx) {
+                    ordered_unique.push(idx);
+                }
+            }
+        }
+        Some(ordered_unique)
+    }
+
     /// Send a chat completion request.
     ///
     /// # Arguments
@@ -546,9 +614,7 @@ pub trait LLMProvider: Send + Sync {
         tool_choice: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send;
 
-
     fn get_default_model(&self) -> String;
-    
 
     fn is_transient_error(content: Option<&str>) -> bool {
         let err = content.unwrap_or("").to_lowercase();
@@ -559,9 +625,7 @@ pub trait LLMProvider: Send + Sync {
 
     /// Replace image_url blocks with text placeholder. Returns None if no images found.
     /// Rough equivalent of the Python static method _strip_image_content.
-    fn strip_image_content(
-        messages: &[serde_json::Value],
-    ) -> Option<Vec<serde_json::Value>> {
+    fn strip_image_content(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
         let mut found = false;
         let mut result = Vec::with_capacity(messages.len());
 
@@ -623,35 +687,39 @@ pub trait LLMProvider: Send + Sync {
         temperature: f32,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
-    ) -> impl std::future::Future<Output = LLMResponse> + Send
-    {
+    ) -> impl std::future::Future<Output = LLMResponse> + Send {
         async move {
-
-        match AssertUnwindSafe(
-            self.chat(messages, tools, model, max_tokens, temperature, reasoning_effort, tool_choice)
-        )
-        .catch_unwind()
-        .await
-        {
-            Ok(resp) => resp,
-            Err(panic_info) => {
-                let err_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic".to_string()
-                };
-                LLMResponse {
-                    content: Some(format!("Error calling LLM: {err_msg}")),
-                    finish_reason: "error".to_string(),
-                    tool_calls: Vec::new(),
-                    usage: HashMap::new(),
-                    reasoning_content: None,
-                    thinking_blocks: None,
+            match AssertUnwindSafe(self.chat(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                reasoning_effort,
+                tool_choice,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(resp) => resp,
+                Err(panic_info) => {
+                    let err_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    LLMResponse {
+                        content: Some(format!("Error calling LLM: {err_msg}")),
+                        finish_reason: "error".to_string(),
+                        tool_calls: Vec::new(),
+                        usage: HashMap::new(),
+                        reasoning_content: None,
+                        thinking_blocks: None,
+                    }
                 }
             }
-        }
         }
     }
 
@@ -692,23 +760,25 @@ pub trait LLMProvider: Send + Sync {
         Fut: std::future::Future<Output = ()> + Send,
     {
         async move {
-        let response = self.chat(
-            messages,
-            tools,
-            model,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            tool_choice,
-        ).await;
+            let response = self
+                .chat(
+                    messages,
+                    tools,
+                    model,
+                    max_tokens,
+                    temperature,
+                    reasoning_effort,
+                    tool_choice,
+                )
+                .await;
 
-        if let Some(on_delta) = on_content_delta {
-            if let Some(ref content) = response.content {
-                on_delta(content.clone()).await;
+            if let Some(on_delta) = on_content_delta {
+                if let Some(ref content) = response.content {
+                    on_delta(content.clone()).await;
+                }
             }
-        }
 
-        response
+            response
         }
     }
 
@@ -729,34 +799,39 @@ pub trait LLMProvider: Send + Sync {
         Fut: std::future::Future<Output = ()> + Send,
     {
         async move {
-        match AssertUnwindSafe(
-            self.chat_stream(messages, tools, model, max_tokens, temperature,
-                reasoning_effort, tool_choice, on_content_delta)
-        )
-        .catch_unwind()
-        .await
-        {
-            Ok(resp) => resp,
-            Err(panic_info) => {
-                let err_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
-                    s.to_string()
-                } else if let Some(s) = panic_info.downcast_ref::<String>() {
-                    s.clone()
-                } else {
-                    "unknown panic".to_string()
-                };
-                LLMResponse {
-                    content: Some(format!("Error calling LLM: {err_msg}")),
-                    finish_reason: "error".to_string(),
-                    tool_calls: Vec::new(),
-                    usage: HashMap::new(),
-                    reasoning_content: None,
-                    thinking_blocks: None,
+            match AssertUnwindSafe(self.chat_stream(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                reasoning_effort,
+                tool_choice,
+                on_content_delta,
+            ))
+            .catch_unwind()
+            .await
+            {
+                Ok(resp) => resp,
+                Err(panic_info) => {
+                    let err_msg = if let Some(s) = panic_info.downcast_ref::<&str>() {
+                        s.to_string()
+                    } else if let Some(s) = panic_info.downcast_ref::<String>() {
+                        s.clone()
+                    } else {
+                        "unknown panic".to_string()
+                    };
+                    LLMResponse {
+                        content: Some(format!("Error calling LLM: {err_msg}")),
+                        finish_reason: "error".to_string(),
+                        tool_calls: Vec::new(),
+                        usage: HashMap::new(),
+                        reasoning_content: None,
+                        thinking_blocks: None,
+                    }
                 }
             }
         }
-        }
-
     }
 
     /// Calls chat() with retry logic on transient provider failures.
@@ -774,24 +849,99 @@ pub trait LLMProvider: Send + Sync {
         tool_choice: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send {
         async move {
-        // Fallback to default values from generation_settings if not specified.
-        let gs = self.generation_settings();
-        let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
-        let temperature = temperature.unwrap_or(gs.temperature);
-        let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
+            // Fallback to default values from generation_settings if not specified.
+            let gs = self.generation_settings();
+            let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
+            let temperature = temperature.unwrap_or(gs.temperature);
+            let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
 
-        // Helper closure for calling self.chat and handling .await
-        async fn call_safe_chat<T: LLMProvider + ?Sized>(
-            provider: &T,
-            messages: Vec<serde_json::Value>,
-            tools: Option<Vec<serde_json::Value>>,
-            model: Option<String>,
-            max_tokens: usize,
-            temperature: f32,
-            reasoning_effort: Option<String>,
-            tool_choice: Option<serde_json::Value>,
-        ) -> LLMResponse {
-            provider.safe_chat(
+            // Helper closure for calling self.chat and handling .await
+            async fn call_safe_chat<T: LLMProvider + ?Sized>(
+                provider: &T,
+                messages: Vec<serde_json::Value>,
+                tools: Option<Vec<serde_json::Value>>,
+                model: Option<String>,
+                max_tokens: usize,
+                temperature: f32,
+                reasoning_effort: Option<String>,
+                tool_choice: Option<serde_json::Value>,
+            ) -> LLMResponse {
+                provider
+                    .safe_chat(
+                        messages,
+                        tools,
+                        model,
+                        max_tokens,
+                        temperature,
+                        reasoning_effort,
+                        tool_choice,
+                    )
+                    .await
+            }
+
+            // The retry loop.
+            for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
+                let response = call_safe_chat(
+                    self,
+                    messages.clone(),
+                    tools.clone(),
+                    model.clone(),
+                    max_tokens,
+                    temperature,
+                    reasoning_effort.clone(),
+                    tool_choice.clone(),
+                )
+                .await;
+
+                // If finish_reason is not "error", return response.
+                if response.finish_reason != "error" {
+                    return response;
+                }
+
+                // If the error is NOT transient, attempt to strip image content, else return.
+                if !Self::is_transient_error(response.content.as_deref()) {
+                    // Attempt to strip image content and retry just once if possible.
+                    if let Some(stripped) = Self::strip_image_content(&messages) {
+                        log::warn!(
+                            "Non-transient LLM error with image content, retrying without images"
+                        );
+                        // Retry immediately with stripped messages.
+                        return call_safe_chat(
+                            self,
+                            stripped,
+                            tools.clone(),
+                            model.clone(),
+                            max_tokens,
+                            temperature,
+                            reasoning_effort.clone(),
+                            tool_choice.clone(),
+                        )
+                        .await;
+                    }
+                    // All else failed, return last response.
+                    return response;
+                }
+                // Otherwise, transient error; log and sleep before retrying.
+                log::warn!(
+                    "LLM transient error with {} (attempt {}/{}) retrying in {}s: {}",
+                    model.clone().unwrap_or("unknown model".to_string()),
+                    attempt + 1,
+                    CHAT_RETRY_DELAYS.len(),
+                    delay,
+                    response
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .get(..120)
+                        .unwrap_or(""),
+                );
+
+                // Sleep the retry delay.
+                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+            }
+            // Last attempt after retries exhausted
+            call_safe_chat(
+                self,
                 messages,
                 tools,
                 model,
@@ -801,75 +951,6 @@ pub trait LLMProvider: Send + Sync {
                 tool_choice,
             )
             .await
-        }
-
-        // The retry loop.
-        for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
-            let response = call_safe_chat(
-                self,
-                messages.clone(),
-                tools.clone(),
-                model.clone(),
-                max_tokens,
-                temperature,
-                reasoning_effort.clone(),
-                tool_choice.clone(),
-            )
-            .await;
-
-            // If finish_reason is not "error", return response.
-            if response.finish_reason != "error" {
-                return response;
-            }
-
-            // If the error is NOT transient, attempt to strip image content, else return.
-            if !Self::is_transient_error(response.content.as_deref()) {
-                // Attempt to strip image content and retry just once if possible.
-                if let Some(stripped) = Self::strip_image_content(&messages) {
-                    log::warn!(
-                        "Non-transient LLM error with image content, retrying without images"
-                    );
-                    // Retry immediately with stripped messages.
-                    return call_safe_chat(
-                        self,
-                        stripped,
-                        tools.clone(),
-                        model.clone(),
-                        max_tokens,
-                        temperature,
-                        reasoning_effort.clone(),
-                        tool_choice.clone(),
-                    )
-                    .await;
-                }
-                // All else failed, return last response.
-                return response;
-            }
-            // Otherwise, transient error; log and sleep before retrying.
-            log::warn!(
-                "LLM transient error with {} (attempt {}/{}) retrying in {}s: {}",
-                model.clone().unwrap_or("unknown model".to_string()),
-                attempt + 1,
-                CHAT_RETRY_DELAYS.len(),
-                delay,
-                response.content.as_deref().unwrap_or("").get(..120).unwrap_or(""),
-            );
-
-            // Sleep the retry delay.
-            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
-        }
-        // Last attempt after retries exhausted
-        call_safe_chat(
-            self,
-            messages,
-            tools,
-            model,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            tool_choice,
-        )
-        .await
         }
     }
 
@@ -886,41 +967,18 @@ pub trait LLMProvider: Send + Sync {
     ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = ()> + Send
+        Fut: std::future::Future<Output = ()> + Send,
     {
         async move {
-        let gs = self.generation_settings();
-        let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
-        let temperature = temperature.unwrap_or(gs.temperature);
-        let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
+            let gs = self.generation_settings();
+            let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
+            let temperature = temperature.unwrap_or(gs.temperature);
+            let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
 
-        for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
-            let response = self.safe_chat_stream(
-                messages.clone(),
-                tools.clone(),
-                model.clone(),
-                max_tokens,
-                temperature,
-                reasoning_effort.clone(),
-                tool_choice.clone(),
-                on_content_delta,
-            )
-            .await;
-            log::info!("LLM stream response: {:?}", response);
-            // Successful stream response: return immediately.
-            if response.finish_reason != "error" {
-                return response;
-            }
-
-            if !Self::is_transient_error(response.content.as_deref()) {
-                // Attempt to strip image content and retry just once if possible.
-                if let Some(stripped) = Self::strip_image_content(&messages) {
-                    log::warn!(
-                        "Non-transient LLM error with image content, retrying without images"
-                    );
-                    // Retry immediately with stripped messages.
-                    return self.safe_chat_stream(
-                        stripped,
+            for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
+                let response = self
+                    .safe_chat_stream(
+                        messages.clone(),
                         tools.clone(),
                         model.clone(),
                         max_tokens,
@@ -930,33 +988,63 @@ pub trait LLMProvider: Send + Sync {
                         on_content_delta,
                     )
                     .await;
+                log::info!("LLM stream response: {:?}", response);
+                // Successful stream response: return immediately.
+                if response.finish_reason != "error" {
+                    return response;
                 }
-                // All else failed, return last response.
-                return response;
-            }
-            // Otherwise, transient error; log and sleep before retrying.
-            log::warn!(
-                "LLM transient error (attempt {}/{}) retrying in {}s: {}",
-                attempt + 1,
-                CHAT_RETRY_DELAYS.len(),
-                delay,
-                response.content.as_deref().unwrap_or("").get(..120).unwrap_or(""),
-            );
 
-            // Sleep the retry delay.
-            tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
-        }
-        self.safe_chat_stream(
-            messages,
-            tools,
-            model,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            tool_choice,
-            on_content_delta,
-        )
-        .await
+                if !Self::is_transient_error(response.content.as_deref()) {
+                    // Attempt to strip image content and retry just once if possible.
+                    if let Some(stripped) = Self::strip_image_content(&messages) {
+                        log::warn!(
+                            "Non-transient LLM error with image content, retrying without images"
+                        );
+                        // Retry immediately with stripped messages.
+                        return self
+                            .safe_chat_stream(
+                                stripped,
+                                tools.clone(),
+                                model.clone(),
+                                max_tokens,
+                                temperature,
+                                reasoning_effort.clone(),
+                                tool_choice.clone(),
+                                on_content_delta,
+                            )
+                            .await;
+                    }
+                    // All else failed, return last response.
+                    return response;
+                }
+                // Otherwise, transient error; log and sleep before retrying.
+                log::warn!(
+                    "LLM transient error (attempt {}/{}) retrying in {}s: {}",
+                    attempt + 1,
+                    CHAT_RETRY_DELAYS.len(),
+                    delay,
+                    response
+                        .content
+                        .as_deref()
+                        .unwrap_or("")
+                        .get(..120)
+                        .unwrap_or(""),
+                );
+
+                // Sleep the retry delay.
+                tokio::time::sleep(std::time::Duration::from_secs(*delay)).await;
+            }
+            self.safe_chat_stream(
+                messages,
+                tools,
+                model,
+                max_tokens,
+                temperature,
+                reasoning_effort,
+                tool_choice,
+                on_content_delta,
+            )
+            .await
         }
     }
 
@@ -970,13 +1058,12 @@ pub trait LLMProvider: Send + Sync {
             thinking_blocks: None,
         };
     }
-    
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::{collections::HashSet};
+    use std::collections::HashSet;
 
     struct TestLLMProvider {
         api_key: Option<String>,
@@ -990,7 +1077,7 @@ mod tests {
             api_base: Option<String>,
             _default_model: Option<String>,
             _extra_headers: Option<HashMap<String, String>>,
-            _spec: Option<ProviderSpec>
+            _spec: Option<ProviderSpec>,
         ) -> Self {
             Self {
                 api_key,
@@ -1113,7 +1200,7 @@ mod tests {
             Some("https://test.com".to_string()),
             Some("test".to_string()),
             None,
-            None
+            None,
         )
     }
 
@@ -1157,13 +1244,22 @@ mod tests {
     #[test]
     fn test_create_test_llm_provider() {
         let llm_provider = create_test_llm_provider();
-        assert_eq!(LLMProvider::api_key(&llm_provider), Some("test".to_string()));
+        assert_eq!(
+            LLMProvider::api_key(&llm_provider),
+            Some("test".to_string())
+        );
         assert_eq!(
             LLMProvider::api_base(&llm_provider),
             Some("https://test.com".to_string())
         );
-        assert_eq!(LLMProvider::generation_settings(&llm_provider).temperature, 0.7);
-        assert_eq!(LLMProvider::generation_settings(&llm_provider).max_tokens, 4096);
+        assert_eq!(
+            LLMProvider::generation_settings(&llm_provider).temperature,
+            0.7
+        );
+        assert_eq!(
+            LLMProvider::generation_settings(&llm_provider).max_tokens,
+            4096
+        );
         assert!(
             LLMProvider::generation_settings(&llm_provider)
                 .reasoning_effort
@@ -1291,12 +1387,14 @@ mod tests {
             }
         )];
         let result = TestLLMProvider::strip_image_content(&messages);
-        println!("result: {}", serde_json::to_string_pretty(&result.clone().unwrap()).unwrap());
+        println!(
+            "result: {}",
+            serde_json::to_string_pretty(&result.clone().unwrap()).unwrap()
+        );
         assert!(result.is_some());
         assert_eq!(result.unwrap().len(), 1);
     }
 
-    
     #[test]
     fn test_strip_image_content_no_images() {
         let messages = vec![serde_json::json!(
@@ -1344,7 +1442,8 @@ mod tests {
             0.0,
             None,
             None,
-        ).await;
+        )
+        .await;
         println!("result: {}", result.content.unwrap());
     }
 
@@ -1358,16 +1457,18 @@ mod tests {
             }
         )];
         let llm_provider = create_test_llm_provider();
-        let result = llm_provider.chat_stream(
-            messages,
-            None,
-            None,
-            4096,
-            0.0,
-            None,
-            None,
-            &None::<fn(String) -> std::future::Ready<()>>,
-        ).await;
+        let result = llm_provider
+            .chat_stream(
+                messages,
+                None,
+                None,
+                4096,
+                0.0,
+                None,
+                None,
+                &None::<fn(String) -> std::future::Ready<()>>,
+            )
+            .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
 
@@ -1381,18 +1482,20 @@ mod tests {
             }
         )];
         let llm_provider = create_test_llm_provider();
-        let result = llm_provider.chat_stream(
-            messages,
-            None,
-            None,
-            4096,
-            0.0,
-            None,
-            None,
-            &Some(|content| async move {
-                println!("content: {}", content);
-            }),
-        ).await;
+        let result = llm_provider
+            .chat_stream(
+                messages,
+                None,
+                None,
+                4096,
+                0.0,
+                None,
+                None,
+                &Some(|content| async move {
+                    println!("content: {}", content);
+                }),
+            )
+            .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
 
@@ -1405,18 +1508,20 @@ mod tests {
                 "content": [{"type": "text", "text": "Hello, world!"}]
             }
         )];
-    
+
         let llm_provider = create_test_llm_provider();
-        let result = llm_provider.safe_chat_stream(
-            messages,
-            None,
-            None,
-            4096,
-            0.0,
-            None,
-            None,
-            &None::<fn(String) -> std::future::Ready<()>>,
-        ).await;
+        let result = llm_provider
+            .safe_chat_stream(
+                messages,
+                None,
+                None,
+                4096,
+                0.0,
+                None,
+                None,
+                &None::<fn(String) -> std::future::Ready<()>>,
+            )
+            .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
 
@@ -1430,18 +1535,20 @@ mod tests {
             }
         )];
         let llm_provider = create_test_llm_provider();
-        let result = llm_provider.safe_chat_stream(
-            messages,
-            None,
-            None,
-            4096,
-            0.0,
-            None,
-            None,
-            &Some(|content| async move {
-                println!("content: {}", content);
-            }),
-        ).await;
+        let result = llm_provider
+            .safe_chat_stream(
+                messages,
+                None,
+                None,
+                4096,
+                0.0,
+                None,
+                None,
+                &Some(|content| async move {
+                    println!("content: {}", content);
+                }),
+            )
+            .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
 
@@ -1573,5 +1680,77 @@ mod tests {
             .await;
 
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn openai_tool(name: &str) -> serde_json::Value {
+        serde_json::json!({
+            "type": "function",
+            "function": { "name": name }
+        })
+    }
+
+    #[test]
+    fn tool_cache_marker_indices_returns_none_for_missing_tools() {
+        assert_eq!(TestLLMProvider::tool_cache_marker_indices(None), None);
+    }
+
+    #[test]
+    fn tool_cache_marker_indices_returns_empty_for_empty_tools() {
+        assert_eq!(
+            TestLLMProvider::tool_cache_marker_indices(Some(vec![])),
+            Some(vec![])
+        );
+    }
+
+    #[test]
+    fn tool_cache_marker_indices_marks_boundary_and_tail() {
+        let tools = vec![
+            openai_tool("search"),
+            openai_tool("mcp_github_search"),
+            openai_tool("mcp_github_read"),
+        ];
+
+        assert_eq!(
+            TestLLMProvider::tool_cache_marker_indices(Some(tools)),
+            Some(vec![0, 2])
+        );
+    }
+
+    #[test]
+    fn tool_cache_marker_indices_deduplicates_single_tool() {
+        let tools = vec![openai_tool("search")];
+
+        assert_eq!(
+            TestLLMProvider::tool_cache_marker_indices(Some(tools)),
+            Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn tool_cache_marker_indices_tail_only_when_all_mcp() {
+        let tools = vec![
+            openai_tool("mcp_a"),
+            openai_tool("mcp_b"),
+        ];
+
+        assert_eq!(
+            TestLLMProvider::tool_cache_marker_indices(Some(tools)),
+            Some(vec![1])
+        );
+    }
+
+    #[test]
+    fn tool_name_reads_openai_and_anthropic_schemas() {
+        assert_eq!(
+            TestLLMProvider::tool_name(&openai_tool("search")),
+            "search"
+        );
+        assert_eq!(
+            TestLLMProvider::tool_name(&serde_json::json!({
+                "name": "direct",
+                "input_schema": { "type": "object", "properties": {} }
+            })),
+            "direct"
+        );
     }
 }

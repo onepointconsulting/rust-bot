@@ -736,8 +736,7 @@ impl LLMProvider for OpenAICompatProvider {
         // client, etc., must be handled in the struct definition, but are omitted/handled elsewhere for clarity.
         let default_model =
             default_model.unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string());
-        let extra_headers: std::collections::HashMap<String, String> =
-            extra_headers.unwrap_or_else(|| std::collections::HashMap::new());
+        let extra_headers: std::collections::HashMap<String, String> = extra_headers.unwrap_or_default();
         let spec: Option<ProviderSpec> = spec.clone();
 
         // Compute effective_base.

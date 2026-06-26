@@ -8,3 +8,4 @@ pub mod path;
 pub mod restart;
 pub mod searchusage;
 pub mod logo;
+pub mod registry_helper;
