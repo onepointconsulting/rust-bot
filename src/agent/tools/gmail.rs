@@ -1,7 +1,7 @@
 use crate::{agent::tools::base::Tool, config::schema::GmailToolConfig};
 use async_trait::async_trait;
 use base64::Engine;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 
 const DEFAULT_LIMIT: u32 = 20;
@@ -24,16 +24,23 @@ pub struct GmailEmailsTool {
     scopes: Vec<String>,
 }
 
+fn show_error_and_exit(path: &PathBuf) {
+    let error_message = format!("ERROR: {} not found.", path.display());
+    log::error!("{}", error_message);
+    eprintln!("{}", error_message);
+    std::process::exit(4); // EXIT_CONFIG_ERROR
+}
+
 impl GmailEmailsTool {
     pub fn new(config: GmailToolConfig) -> Self {
         let secret_path = config.client_secret_path();
         if !Path::new(&secret_path).exists() {
-            let error_message = format!("ERROR: {} not found.", secret_path.display());
-            log::error!("{}", error_message);
-            eprintln!("{}", error_message);
-            std::process::exit(4); // EXIT_CONFIG_ERROR
+            show_error_and_exit(&secret_path); // EXIT_CONFIG_ERROR
         }
         let token_cache_path = config.token_cache_path();
+        if !Path::new(&token_cache_path).exists() {
+            show_error_and_exit(&token_cache_path); // EXIT_CONFIG_ERROR
+        }
         Self {
             name: "gmail".to_string(),
             description: "Gmail Tool. Returns the latest emails from the user's inbox.".to_string(),
