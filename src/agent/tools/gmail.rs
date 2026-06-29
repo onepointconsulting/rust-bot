@@ -30,6 +30,7 @@ impl GmailEmailsTool {
         if !Path::new(&secret_path).exists() {
             let error_message = format!("ERROR: {} not found.", secret_path.display());
             log::error!("{}", error_message);
+            eprintln!("{}", error_message);
             std::process::exit(4); // EXIT_CONFIG_ERROR
         }
         let token_cache_path = config.token_cache_path();
