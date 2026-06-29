@@ -1,17 +1,27 @@
 use std::collections::HashMap;
+use std::env;
+use std::time::Duration;
 
 use crate::providers::{
-    base::{GenerationSettings, LLMProvider, LLMResponse},
+    base::{GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest},
     registry::ProviderSpec,
 };
-use adk_anthropic::Anthropic;
+use adk_anthropic::{
+    AccumulatingStream, Anthropic, ContentBlockDelta, Error as AdkError, Message, MessageStreamEvent,
+};
+use futures::StreamExt;
 use rand::seq::IndexedRandom;
 use regex::Regex;
 use reqwest::header::{ACCEPT, CONTENT_TYPE, HeaderMap, HeaderName, HeaderValue};
 use serde_json::json;
 use std::sync::OnceLock;
+use tokio::time::timeout;
 
 const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+
+/// Upper bound on the SSE byte buffer; guards against a stream that never emits
+/// a complete `\n\n`-terminated event from growing memory without bound.
+const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 
 fn gen_tool_id() -> String {
     let mut rng = rand::rng();
@@ -28,9 +38,7 @@ pub struct AnthropicProvider {
     extra_headers: HashMap<String, String>,
     spec: Option<ProviderSpec>,
     generation: GenerationSettings,
-    /// Typed SDK client (does not include `extra_headers`; use `http_client` for requests).
-    client: Anthropic,
-    /// Raw HTTP client with Anthropic defaults plus merged `extra_headers` for `chat()`.
+    /// Raw HTTP client with Anthropic defaults plus merged `extra_headers`, used for all requests.
     http_client: reqwest::Client,
     messages_url: String,
 }
@@ -207,7 +215,11 @@ impl AnthropicProvider {
                     .cloned()
                     .unwrap_or_else(|| default_schema.clone()),
             });
-            if let Some(desc) = func.get("description").and_then(|d| d.as_str()).filter(|s| !s.is_empty()) {
+            if let Some(desc) = func
+                .get("description")
+                .and_then(|d| d.as_str())
+                .filter(|s| !s.is_empty())
+            {
                 entry["description"] = serde_json::Value::String(desc.to_string());
             }
             if tool.get("cache_control").is_some() {
@@ -450,28 +462,113 @@ impl AnthropicProvider {
         let mut anthropic_tools = Self::convert_tools(tools);
 
         if supports_caching {
-            (system, anthropic_msgs, anthropic_tools) = self.apply_cache_control(
-                system, anthropic_msgs, anthropic_tools,
-            );
+            (system, anthropic_msgs, anthropic_tools) =
+                self.apply_cache_control(system, anthropic_msgs, anthropic_tools);
         }
         let max_tokens = std::cmp::max(1, max_tokens);
-        let thinking_enabled = if let Some(reasoning_effort) = reasoning_effort {
-            !reasoning_effort.is_empty();
+        let thinking_enabled = if let Some(reasoning_effort) = reasoning_effort.clone() {
+            !reasoning_effort.is_empty()
         } else {
-            false;
+            false
         };
 
-        HashMap::new()
+        let mut args = HashMap::new();
+        args.insert("model".to_string(), serde_json::Value::String(model_name));
+        args.insert(
+            "messages".to_string(),
+            serde_json::Value::Array(anthropic_msgs),
+        );
+        args.insert(
+            "max_tokens".to_string(),
+            serde_json::Value::Number(serde_json::Number::from(max_tokens as u32)),
+        );
+        log::debug!("anthropic max_tokens: {}", max_tokens);
+
+        let system_is_truthy = match &system {
+            serde_json::Value::String(s) => !s.is_empty(),
+            serde_json::Value::Array(a) => !a.is_empty(),
+            _ => false,
+        };
+        if system_is_truthy {
+            args.insert("system".to_string(), system);
+        }
+
+        if let Some(reasoning_effort) = reasoning_effort.clone()
+            && reasoning_effort == "adaptive"
+        {
+            args.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "adaptive"}),
+            );
+            args.insert("temperature".to_string(), serde_json::json!(1.0));
+        } else if let Some(reasoning_effort) = reasoning_effort
+            && thinking_enabled
+        {
+            let budget_map = serde_json::json!({"low": 1024, "medium": 4096, "high": std::cmp::max(8192, max_tokens)});
+            let budget_default = serde_json::Value::Number(serde_json::Number::from(4096u32));
+            let budget = budget_map
+                .get(reasoning_effort.to_lowercase().as_str())
+                .unwrap_or(&budget_default);
+            let budget_tokens = budget.as_u64().unwrap_or(4096) as usize;
+            args.insert(
+                "thinking".to_string(),
+                serde_json::json!({"type": "enabled", "budget_tokens": budget}),
+            );
+            args.insert(
+                "max_tokens".to_string(),
+                serde_json::Value::Number(serde_json::Number::from(std::cmp::max(
+                    max_tokens,
+                    budget_tokens + 4096,
+                ) as u32)),
+            );
+            args.insert("temperature".to_string(), serde_json::json!(1.0));
+        } else {
+            args.insert("temperature".to_string(), serde_json::json!(temperature));
+        }
+
+        if let Some(anthropic_tools) = anthropic_tools
+            && !anthropic_tools.is_empty()
+        {
+            args.insert(
+                "tools".to_string(),
+                serde_json::Value::Array(anthropic_tools),
+            );
+            let tc = Self::convert_tool_choice(tool_choice, thinking_enabled);
+            if let Some(tc) = tc {
+                args.insert("tool_choice".to_string(), tc);
+            }
+        }
+
+        if !self.extra_headers.is_empty() {
+            args.insert(
+                "extra_headers".to_string(),
+                serde_json::Value::Object(
+                    self.extra_headers
+                        .clone()
+                        .into_iter()
+                        .map(|(k, v)| (k, serde_json::Value::String(v)))
+                        .collect(),
+                ),
+            );
+        }
+
+        args
     }
 
     fn apply_cache_control(
-        &self, 
-        system_param: serde_json::Value, 
-        messages: Vec<serde_json::Value>, 
-        tools: Option<Vec<serde_json::Value>>) -> (serde_json::Value, Vec<serde_json::Value>, Option<Vec<serde_json::Value>>) {
+        &self,
+        system_param: serde_json::Value,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+    ) -> (
+        serde_json::Value,
+        Vec<serde_json::Value>,
+        Option<Vec<serde_json::Value>>,
+    ) {
         let marker = serde_json::json!({"type": "ephemeral"});
 
-        let system = if system_param.is_string() && !system_param.as_str().unwrap_or("").is_empty() {
+        let system = if system_param.is_string() && !system_param.as_str().unwrap_or("").is_empty()
+        {
             serde_json::json!([{
                 "type": "text",
                 "text": system_param.as_str().unwrap_or(""),
@@ -496,7 +593,9 @@ impl AnthropicProvider {
                     new_msgs[new_msgs_len - 2]["content"] = serde_json::json!([
                         {"type": "text", "text": c, "cache_control": marker}
                     ]);
-                } else if let Some(c) = c.as_array() && !c.is_empty() {
+                } else if let Some(c) = c.as_array()
+                    && !c.is_empty()
+                {
                     let mut nc = c.clone();
                     let last_option = nc.last_mut();
                     if let Some(last) = last_option {
@@ -520,6 +619,294 @@ impl AnthropicProvider {
         };
         (system, new_msgs, new_tools)
     }
+
+    fn parse_usage(usage: &serde_json::Value) -> HashMap<String, u64> {
+        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let total_prompt_tokens = input_tokens + cache_creation + cache_read;
+
+        let mut map = HashMap::new();
+        map.insert("prompt_tokens".to_string(), total_prompt_tokens);
+        map.insert("completion_tokens".to_string(), output_tokens);
+        map.insert("total_tokens".to_string(), total_prompt_tokens + output_tokens);
+        if cache_creation > 0 {
+            map.insert("cache_creation_input_tokens".to_string(), cache_creation);
+        }
+        if cache_read > 0 {
+            map.insert("cache_read_input_tokens".to_string(), cache_read);
+            map.insert("cached_tokens".to_string(), cache_read);
+        }
+        map
+    }
+
+    fn parse_json_response(content: serde_json::Value) -> LLMResponse {
+        let mut content_parts: Vec<String> = Vec::new();
+        let mut tool_calls: Vec<ToolCallRequest> = Vec::new();
+        let mut thinking_blocks: Vec<HashMap<String, serde_json::Value>> = Vec::new();
+
+        if let Some(blocks) = content.get("content").and_then(|c| c.as_array()) {
+            for block in blocks {
+                let block_type = block.get("type").and_then(|t| t.as_str()).unwrap_or("");
+                if block_type == "text" {
+                    let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                    content_parts.push(text.to_string());
+                } else if block_type == "tool_use" {
+                    let block_id = block.get("id").and_then(|t| t.as_str()).unwrap_or("");
+                    let block_name = block.get("name").and_then(|t| t.as_str()).unwrap_or("");
+                    let default_input = serde_json::Map::new();
+                    let block_input = block
+                        .get("input")
+                        .and_then(|t| t.as_object())
+                        .unwrap_or_else(|| &default_input);
+                    tool_calls.push(ToolCallRequest {
+                        id: block_id.to_string(),
+                        name: block_name.to_string(),
+                        arguments: block_input.clone().into_iter().collect(),
+                        extra_content: None,
+                        provider_specific_fields: None,
+                        function_provider_specific_fields: None,
+                    });
+                } else if block_type == "thinking" {
+                    let signature = block
+                        .get("signature")
+                        .and_then(|t| t.as_str())
+                        .unwrap_or("");
+                    let mut value = HashMap::new();
+                    value.insert(
+                        "type".to_string(),
+                        serde_json::Value::String("thinking".to_string()),
+                    );
+                    value.insert(
+                        "thinking".to_string(),
+                        serde_json::Value::String(
+                            block
+                                .get("thinking")
+                                .and_then(|t| t.as_str())
+                                .unwrap_or("")
+                                .to_string(),
+                        ),
+                    );
+                    value.insert(
+                        "signature".to_string(),
+                        serde_json::Value::String(signature.to_string()),
+                    );
+                    thinking_blocks.push(value);
+                }
+            }
+        }
+
+        let stop_map =
+            serde_json::json!({"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length"});
+        let default_stop = serde_json::Value::String("stop".to_string());
+        let finish_reason = stop_map
+            .get(
+                content
+                    .get("stop_reason")
+                    .and_then(|t| t.as_str())
+                    .unwrap_or(""),
+            )
+            .unwrap_or(&default_stop)
+            .as_str()
+            .unwrap_or("stop");
+
+        let usage = content
+            .get("usage")
+            .map(Self::parse_usage)
+            .unwrap_or_default();
+
+        let joined = content_parts.join("");
+        LLMResponse {
+            content: if joined.is_empty() { None } else { Some(joined) },
+            finish_reason: finish_reason.to_string(),
+            tool_calls,
+            usage,
+            reasoning_content: None,
+            thinking_blocks: if thinking_blocks.is_empty() {
+                None
+            } else {
+                Some(thinking_blocks)
+            },
+        }
+    }
+
+    async fn parse_response(response: Result<reqwest::Response, reqwest::Error>) -> LLMResponse {
+        match response {
+            Ok(response) => match response.json::<serde_json::Value>().await {
+                Ok(content) => Self::parse_json_response(content),
+                Err(e) => LLMResponse {
+                    content: Some(format!(
+                        "No content:Code: {}, Error: {}",
+                        e.status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+                        e
+                    )),
+                    finish_reason: "error".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                },
+            },
+            Err(e) => LLMResponse {
+                content: Some(format!(
+                    "Code: {}, Error: {}",
+                    e.status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
+                    e
+                )),
+                finish_reason: "error".to_string(),
+                tool_calls: Vec::new(),
+                usage: HashMap::new(),
+                reasoning_content: None,
+                thinking_blocks: None,
+            },
+        }
+    }
+
+    fn handle_error(message: impl ToString) -> LLMResponse {
+        LLMResponse {
+            content: Some(message.to_string()),
+            finish_reason: "error".to_string(),
+            tool_calls: Vec::new(),
+            usage: HashMap::new(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
+    }
+
+    fn stream_stalled_error(idle_timeout_s: u64) -> LLMResponse {
+        Self::handle_error(format!(
+            "Error calling LLM: stream stalled for more than {idle_timeout_s} seconds"
+        ))
+    }
+
+    fn parse_message(message: Message) -> LLMResponse {
+        match serde_json::to_value(message) {
+            Ok(value) => Self::parse_json_response(value),
+            Err(e) => Self::handle_error(format!("Failed to serialize Anthropic message: {e}")),
+        }
+    }
+
+    fn take_sse_message_event(buffer: &mut Vec<u8>) -> Option<Result<MessageStreamEvent, AdkError>> {
+        let split_pos = buffer.windows(2).position(|window| window == b"\n\n")?;
+        // Decode only the complete event block; the `\n\n` boundary falls on
+        // whole bytes, so no multi-byte UTF-8 sequence is split here.
+        let raw = String::from_utf8_lossy(&buffer[..split_pos]).into_owned();
+        buffer.drain(..split_pos + 2);
+        Self::parse_sse_event(&raw)
+    }
+
+    fn parse_sse_event(raw: &str) -> Option<Result<MessageStreamEvent, AdkError>> {
+        let trimmed = raw.trim();
+        if trimmed.is_empty() || trimmed == "event: ping" {
+            return Some(Ok(MessageStreamEvent::Ping));
+        }
+
+        let data = raw
+            .lines()
+            .filter_map(|line| line.strip_prefix("data:").map(str::trim))
+            .collect::<Vec<_>>()
+            .join("\n");
+        if data.is_empty() {
+            return Some(Ok(MessageStreamEvent::Ping));
+        }
+
+        Some(
+            serde_json::from_str::<MessageStreamEvent>(&data).map_err(AdkError::from),
+        )
+    }
+
+    fn sse_event_stream<S, B>(
+        byte_stream: S,
+    ) -> impl futures::Stream<Item = Result<MessageStreamEvent, AdkError>> + Send
+    where
+        S: futures::Stream<Item = Result<B, reqwest::Error>> + Send + Unpin + 'static,
+        B: AsRef<[u8]>,
+    {
+        futures::stream::unfold(
+            (byte_stream, Vec::<u8>::new()),
+            |(mut byte_stream, mut buffer)| async move {
+                loop {
+                    if let Some(result) = Self::take_sse_message_event(&mut buffer) {
+                        return Some((result, (byte_stream, buffer)));
+                    }
+
+                    if buffer.len() > MAX_SSE_BUFFER_BYTES {
+                        buffer.clear();
+                        return Some((
+                            Err(AdkError::streaming(
+                                format!(
+                                    "SSE buffer exceeded {MAX_SSE_BUFFER_BYTES} bytes without a complete event"
+                                ),
+                                None::<Box<dyn std::error::Error + Send + Sync>>,
+                            )),
+                            (byte_stream, buffer),
+                        ));
+                    }
+
+                    match byte_stream.next().await {
+                        None => {
+                            if buffer.iter().all(u8::is_ascii_whitespace) {
+                                return None;
+                            }
+                            // Flush a trailing event that was not terminated by `\n\n`.
+                            buffer.extend_from_slice(b"\n\n");
+                            return Self::take_sse_message_event(&mut buffer)
+                                .map(|result| (result, (byte_stream, buffer)));
+                        }
+                        Some(Ok(chunk)) => {
+                            buffer.extend_from_slice(chunk.as_ref());
+                        }
+                        Some(Err(e)) => {
+                            return Some((
+                                Err(AdkError::streaming(
+                                    format!("Error in HTTP stream: {e}"),
+                                    Some(Box::new(e)),
+                                )),
+                                (byte_stream, buffer),
+                            ));
+                        }
+                    }
+                }
+            },
+        )
+    }
+
+    async fn consume_stream<F, Fut>(
+        mut acc_stream: AccumulatingStream,
+        message_rx: tokio::sync::oneshot::Receiver<Result<Message, AdkError>>,
+        idle_timeout: Duration,
+        idle_timeout_s: u64,
+        on_content_delta: &Option<F>,
+    ) -> LLMResponse
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        while let Some(item) = match timeout(idle_timeout, acc_stream.next()).await {
+            Ok(item) => item,
+            Err(_) => return Self::stream_stalled_error(idle_timeout_s),
+        } {
+            match item {
+                Err(e) => return Self::handle_error(e.to_string()),
+                Ok(event) => {
+                    if let Some(cb) = on_content_delta.as_ref()
+                        && let MessageStreamEvent::ContentBlockDelta(delta) = event
+                        && let ContentBlockDelta::TextDelta(text_delta) = delta.delta
+                    {
+                        cb(text_delta.text).await;
+                    }
+                }
+            }
+        }
+
+        match timeout(idle_timeout, message_rx).await {
+            Err(_) => Self::stream_stalled_error(idle_timeout_s),
+            Ok(Ok(Ok(message))) => Self::parse_message(message),
+            Ok(Ok(Err(e))) => Self::handle_error(e.to_string()),
+            Ok(Err(_)) => Self::handle_error("Anthropic stream ended without a final message"),
+        }
+    }
 }
 
 impl LLMProvider for AnthropicProvider {
@@ -535,11 +922,13 @@ impl LLMProvider for AnthropicProvider {
             .clone()
             .unwrap_or_else(|| Self::DEFAULT_API_BASE.to_string());
 
-        let client = Anthropic::new(api_key.clone())
+        // `Anthropic::new` only resolves the API key here (env-var fallback and
+        // `file://` indirection); the client itself is not retained because all
+        // requests go through `http_client`, which carries `extra_headers`.
+        let resolved_key = Anthropic::new(api_key.clone())
             .expect("Failed to create Anthropic client")
-            .with_base_url(effective_base.clone());
-
-        let resolved_key = client.api_key().to_string();
+            .api_key()
+            .to_string();
         let http_client = Self::build_http_client(&resolved_key, &extra_headers);
         let messages_url = format!("{}/v1/messages", effective_base.trim_end_matches('/'));
 
@@ -550,7 +939,6 @@ impl LLMProvider for AnthropicProvider {
             extra_headers,
             spec,
             generation: GenerationSettings::new(),
-            client,
             http_client,
             messages_url,
         }
@@ -582,22 +970,95 @@ impl LLMProvider for AnthropicProvider {
 
     async fn chat(
         &self,
-        _messages: Vec<serde_json::Value>,
-        _tools: Option<Vec<serde_json::Value>>,
-        _model: Option<String>,
-        _max_tokens: usize,
-        _temperature: f32,
-        _reasoning_effort: Option<String>,
-        _tool_choice: Option<serde_json::Value>,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
-        LLMResponse {
-            content: Some("AnthropicProvider chat() not implemented yet".to_string()),
-            finish_reason: "error".to_string(),
-            tool_calls: Vec::new(),
-            usage: HashMap::new(),
-            reasoning_content: None,
-            thinking_blocks: None,
+        let args = self.build_args(
+            &messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+            true,
+        );
+        let mut body = args;
+        body.remove("extra_headers");
+        let response = self
+            .http_client
+            .post(&self.messages_url)
+            .json(&body)
+            .send()
+            .await;
+        Self::parse_response(response).await
+    }
+
+    async fn chat_stream<F, Fut>(
+        &self,
+        messages: Vec<serde_json::Value>,
+        tools: Option<Vec<serde_json::Value>>,
+        model: Option<String>,
+        max_tokens: usize,
+        temperature: f32,
+        reasoning_effort: Option<String>,
+        tool_choice: Option<serde_json::Value>,
+        on_content_delta: &Option<F>,
+    ) -> LLMResponse
+    where
+        F: Fn(String) -> Fut + Send + Sync,
+        Fut: std::future::Future<Output = ()> + Send,
+    {
+        let idle_timeout_s: u64 = env::var("RUSTBOT_STREAM_IDLE_TIMEOUT_S")
+            .unwrap_or_else(|_| "90".to_string())
+            .parse()
+            .unwrap_or(90);
+        let idle_timeout = Duration::from_secs(idle_timeout_s);
+
+        let mut body = self.build_args(
+            &messages,
+            tools,
+            model,
+            max_tokens,
+            temperature,
+            reasoning_effort,
+            tool_choice,
+            true,
+        );
+        body.remove("extra_headers");
+        body.insert("stream".to_string(), json!(true));
+
+        let response = match self
+            .http_client
+            .post(&self.messages_url)
+            .header(ACCEPT, "text/event-stream")
+            .json(&serde_json::Value::Object(body.into_iter().collect()))
+            .send()
+            .await
+        {
+            Ok(response) => response,
+            Err(e) => return AnthropicProvider::handle_error(e.to_string()),
+        };
+
+        if !response.status().is_success() {
+            return AnthropicProvider::parse_response(Ok(response)).await;
         }
+
+        let event_stream = AnthropicProvider::sse_event_stream(response.bytes_stream());
+        let (acc_stream, message_rx) = AccumulatingStream::new(event_stream);
+        AnthropicProvider::consume_stream(
+            acc_stream,
+            message_rx,
+            idle_timeout,
+            idle_timeout_s,
+            on_content_delta,
+        )
+        .await
     }
 
     fn get_default_model(&self) -> String {
@@ -993,10 +1454,7 @@ mod tests {
 
         let result = AnthropicProvider::convert_tools(Some(tools)).unwrap();
 
-        assert_eq!(
-            result[0]["cache_control"],
-            json!({ "type": "ephemeral" })
-        );
+        assert_eq!(result[0]["cache_control"], json!({ "type": "ephemeral" }));
     }
 
     #[test]
@@ -1073,5 +1531,362 @@ mod tests {
 
         assert_eq!(headers.get("X-Custom-Header").unwrap(), "custom-value");
         assert_eq!(headers.get("x-api-key").unwrap(), "sk-ant-test");
+    }
+
+    // --- parse_usage ---
+
+    #[test]
+    fn parse_usage_basic_token_counts() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50
+        });
+
+        let result = AnthropicProvider::parse_usage(&usage);
+
+        assert_eq!(result["prompt_tokens"], 100);
+        assert_eq!(result["completion_tokens"], 50);
+        assert_eq!(result["total_tokens"], 150);
+        assert!(!result.contains_key("cache_creation_input_tokens"));
+        assert!(!result.contains_key("cache_read_input_tokens"));
+        assert!(!result.contains_key("cached_tokens"));
+    }
+
+    #[test]
+    fn parse_usage_includes_cache_creation_tokens() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_creation_input_tokens": 200
+        });
+
+        let result = AnthropicProvider::parse_usage(&usage);
+
+        assert_eq!(result["prompt_tokens"], 300); // 100 + 200
+        assert_eq!(result["total_tokens"], 350);
+        assert_eq!(result["cache_creation_input_tokens"], 200);
+        assert!(!result.contains_key("cached_tokens"));
+    }
+
+    #[test]
+    fn parse_usage_includes_cache_read_tokens_and_normalises_cached_tokens() {
+        let usage = json!({
+            "input_tokens": 100,
+            "output_tokens": 50,
+            "cache_read_input_tokens": 400
+        });
+
+        let result = AnthropicProvider::parse_usage(&usage);
+
+        assert_eq!(result["prompt_tokens"], 500); // 100 + 400
+        assert_eq!(result["total_tokens"], 550);
+        assert_eq!(result["cache_read_input_tokens"], 400);
+        assert_eq!(result["cached_tokens"], 400);
+    }
+
+    #[test]
+    fn parse_usage_with_both_cache_fields() {
+        let usage = json!({
+            "input_tokens": 10,
+            "output_tokens": 20,
+            "cache_creation_input_tokens": 30,
+            "cache_read_input_tokens": 40
+        });
+
+        let result = AnthropicProvider::parse_usage(&usage);
+
+        assert_eq!(result["prompt_tokens"], 80); // 10 + 30 + 40
+        assert_eq!(result["completion_tokens"], 20);
+        assert_eq!(result["total_tokens"], 100);
+        assert_eq!(result["cache_creation_input_tokens"], 30);
+        assert_eq!(result["cache_read_input_tokens"], 40);
+        assert_eq!(result["cached_tokens"], 40);
+    }
+
+    #[test]
+    fn parse_usage_zero_cache_fields_are_omitted() {
+        let usage = json!({
+            "input_tokens": 5,
+            "output_tokens": 5,
+            "cache_creation_input_tokens": 0,
+            "cache_read_input_tokens": 0
+        });
+
+        let result = AnthropicProvider::parse_usage(&usage);
+
+        assert_eq!(result["prompt_tokens"], 5);
+        assert!(!result.contains_key("cache_creation_input_tokens"));
+        assert!(!result.contains_key("cached_tokens"));
+    }
+
+    #[test]
+    fn parse_usage_handles_missing_fields_gracefully() {
+        let result = AnthropicProvider::parse_usage(&json!({}));
+
+        assert_eq!(result["prompt_tokens"], 0);
+        assert_eq!(result["completion_tokens"], 0);
+        assert_eq!(result["total_tokens"], 0);
+    }
+
+    // --- parse_json_response ---
+
+    #[test]
+    fn parse_json_response_plain_text_block() {
+        let body = json!({
+            "content": [{ "type": "text", "text": "Hello, world!" }],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.content, Some("Hello, world!".to_string()));
+        assert_eq!(resp.finish_reason, "stop");
+        assert!(resp.tool_calls.is_empty());
+        assert!(resp.thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn parse_json_response_concatenates_multiple_text_blocks() {
+        let body = json!({
+            "content": [
+                { "type": "text", "text": "Hello" },
+                { "type": "text", "text": ", world!" }
+            ],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.content, Some("Hello, world!".to_string()));
+    }
+
+    #[test]
+    fn parse_json_response_empty_content_array_yields_none() {
+        let body = json!({
+            "content": [],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert!(resp.content.is_none());
+    }
+
+    #[test]
+    fn parse_json_response_tool_use_block() {
+        let body = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_abc123",
+                "name": "get_weather",
+                "input": { "city": "London", "units": "celsius" }
+            }],
+            "stop_reason": "tool_use"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.finish_reason, "tool_calls");
+        assert_eq!(resp.tool_calls.len(), 1);
+        let call = &resp.tool_calls[0];
+        assert_eq!(call.id, "toolu_abc123");
+        assert_eq!(call.name, "get_weather");
+        assert_eq!(call.arguments["city"], json!("London"));
+        assert_eq!(call.arguments["units"], json!("celsius"));
+        assert!(resp.content.is_none());
+    }
+
+    #[test]
+    fn parse_json_response_tool_use_with_non_object_input_defaults_to_empty() {
+        let body = json!({
+            "content": [{
+                "type": "tool_use",
+                "id": "toolu_x",
+                "name": "noop",
+                "input": null
+            }],
+            "stop_reason": "tool_use"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert!(resp.tool_calls[0].arguments.is_empty());
+    }
+
+    #[test]
+    fn parse_json_response_thinking_block() {
+        let body = json!({
+            "content": [{
+                "type": "thinking",
+                "thinking": "Let me reason through this...",
+                "signature": "sig_abc"
+            }],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        let blocks = resp.thinking_blocks.unwrap();
+        assert_eq!(blocks.len(), 1);
+        assert_eq!(blocks[0]["type"], json!("thinking"));
+        assert_eq!(blocks[0]["thinking"], json!("Let me reason through this..."));
+        assert_eq!(blocks[0]["signature"], json!("sig_abc"));
+        assert!(resp.content.is_none());
+    }
+
+    #[test]
+    fn parse_json_response_thinking_block_missing_signature_defaults_to_empty_string() {
+        let body = json!({
+            "content": [{
+                "type": "thinking",
+                "thinking": "Hmm..."
+            }],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        let blocks = resp.thinking_blocks.unwrap();
+        assert_eq!(blocks[0]["signature"], json!(""));
+    }
+
+    #[test]
+    fn parse_json_response_mixed_blocks() {
+        let body = json!({
+            "content": [
+                { "type": "thinking", "thinking": "reasoning...", "signature": "s1" },
+                { "type": "text", "text": "The answer is 42." },
+                { "type": "tool_use", "id": "toolu_1", "name": "lookup", "input": { "q": "x" } }
+            ],
+            "stop_reason": "tool_use"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.content, Some("The answer is 42.".to_string()));
+        assert_eq!(resp.tool_calls.len(), 1);
+        assert_eq!(resp.thinking_blocks.as_ref().unwrap().len(), 1);
+        assert_eq!(resp.finish_reason, "tool_calls");
+    }
+
+    #[test]
+    fn parse_json_response_stop_reason_mapping() {
+        let cases = [
+            ("end_turn", "stop"),
+            ("tool_use", "tool_calls"),
+            ("max_tokens", "length"),
+            ("unknown_reason", "stop"), // unmapped → default "stop"
+            ("", "stop"),               // missing → default "stop"
+        ];
+        for (stop_reason, expected_finish) in cases {
+            let body = json!({ "stop_reason": stop_reason, "content": [] });
+            let resp = AnthropicProvider::parse_json_response(body);
+            assert_eq!(
+                resp.finish_reason, expected_finish,
+                "stop_reason={stop_reason:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_json_response_unknown_block_types_are_ignored() {
+        let body = json!({
+            "content": [
+                { "type": "redacted_thinking", "data": "opaque" },
+                { "type": "text", "text": "visible" }
+            ],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.content, Some("visible".to_string()));
+        assert!(resp.thinking_blocks.is_none());
+    }
+
+    #[test]
+    fn parse_json_response_with_usage() {
+        let body = json!({
+            "content": [{ "type": "text", "text": "hi" }],
+            "stop_reason": "end_turn",
+            "usage": {
+                "input_tokens": 10,
+                "output_tokens": 5,
+                "cache_read_input_tokens": 20
+            }
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert_eq!(resp.usage["prompt_tokens"], 30); // 10 + 20
+        assert_eq!(resp.usage["completion_tokens"], 5);
+        assert_eq!(resp.usage["cached_tokens"], 20);
+    }
+
+    #[test]
+    fn parse_json_response_missing_usage_field_returns_empty_map() {
+        let body = json!({
+            "content": [{ "type": "text", "text": "hi" }],
+            "stop_reason": "end_turn"
+        });
+
+        let resp = AnthropicProvider::parse_json_response(body);
+
+        assert!(resp.usage.is_empty());
+    }
+
+    #[test]
+    fn parse_sse_event_parses_text_delta() {
+        let raw = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Hi\"}}\n";
+        let event = AnthropicProvider::parse_sse_event(raw).unwrap().unwrap();
+        match event {
+            MessageStreamEvent::ContentBlockDelta(delta) => {
+                assert_eq!(
+                    delta.delta,
+                    ContentBlockDelta::TextDelta(adk_anthropic::TextDelta::new("Hi".to_string()))
+                );
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_sse_event_treats_ping_as_no_op() {
+        let event = AnthropicProvider::parse_sse_event("event: ping\n\n")
+            .unwrap()
+            .unwrap();
+        assert_eq!(event, MessageStreamEvent::Ping);
+    }
+
+    #[tokio::test]
+    async fn sse_event_stream_reassembles_utf8_split_across_chunks() {
+        // "café" — the 'é' is two UTF-8 bytes (0xC3 0xA9); split the event so
+        // the boundary lands in the middle of that sequence to exercise the
+        // byte-buffer reassembly.
+        let event = "event: content_block_delta\ndata: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"café\"}}\n\n";
+        let bytes = event.as_bytes().to_vec();
+        let e_acute_start = bytes
+            .windows(2)
+            .position(|w| w == [0xC3, 0xA9])
+            .expect("é byte sequence present");
+        let split = e_acute_start + 1;
+
+        let chunks: Vec<Result<Vec<u8>, reqwest::Error>> =
+            vec![Ok(bytes[..split].to_vec()), Ok(bytes[split..].to_vec())];
+
+        let mut stream = Box::pin(AnthropicProvider::sse_event_stream(futures::stream::iter(
+            chunks,
+        )));
+
+        let event = stream.next().await.unwrap().unwrap();
+        match event {
+            MessageStreamEvent::ContentBlockDelta(delta) => assert_eq!(
+                delta.delta,
+                ContentBlockDelta::TextDelta(adk_anthropic::TextDelta::new("café".to_string()))
+            ),
+            other => panic!("unexpected event: {other:?}"),
+        }
+        assert!(stream.next().await.is_none());
     }
 }
