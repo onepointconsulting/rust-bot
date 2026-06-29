@@ -25,7 +25,7 @@ pub struct GmailEmailsTool {
 }
 
 fn show_error_and_exit(path: &PathBuf) {
-    let error_message = format!("ERROR: {} not found.", path.display());
+    let error_message = format!("ERROR: {} not found. Make sure this path exists.", path.display());
     log::error!("{}", error_message);
     eprintln!("{}", error_message);
     std::process::exit(4); // EXIT_CONFIG_ERROR
