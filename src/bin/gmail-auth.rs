@@ -7,7 +7,7 @@ const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1";
 #[tokio::main]
 async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Step 1: Load the client secret JSON downloaded from Google Cloud Console ---
-    let secret_path = "client_secret.json";
+    let secret_path = "./credentials/client_secret.json";
     if !Path::new(secret_path).exists() {
         eprintln!("ERROR: {} not found. Place your downloaded client secret JSON in the project root.", secret_path);
         std::process::exit(1);
@@ -27,7 +27,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         .await?;
 
     // --- Step 3: Request an access token for the Gmail read-only scope ---
-    let scopes = &["https://www.googleapis.com/auth/gmail.readonly"];
+    let scopes = &[
+        "https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"
+    ];
     let token = auth.token(scopes).await?;
     let access_token = token.token().expect("No access token returned");
 

@@ -3,8 +3,7 @@ use std::path::PathBuf;
 use chrono::{Datelike, Local, Months};
 use dotenv::dotenv;
 use rust_bot::{
-    agent::tools::{base::Tool, gmail::GmailEmailsTool},
-    config::loader::load_config,
+    agent::tools::{base::Tool, gmail::{GmailEmailSendTool, GmailEmailsTool}}, config::loader::load_config,
 };
 
 /// Gmail `after` is inclusive; `before` is exclusive — use the 1st of next month
@@ -35,5 +34,21 @@ async fn test_gmail_tool() {
     let params = current_month_gmail_params(10);
     let result = gmail_tool.execute(&params).await;
     println!("Gmail query params: {}", params);
+    println!("{}", result);
+}
+
+#[tokio::test]
+async fn test_gmail_send_tool() {
+    dotenv().ok();
+    let config =
+        load_config(Some(PathBuf::from("./configs/openai-compat/config_gmail.json")));
+    let gmail_tool = GmailEmailSendTool::new(config.tools.gmail);
+    let params = serde_json::json!({
+        "to": "gil.fernandes@gmail.com",
+        "subject": "Test Email",
+        "body": "<p>This is a test email. This is <b>bold</b> and <i>italic</i>.</p>",
+        "format": "html",
+    });
+    let result = gmail_tool.execute(&params).await;
     println!("{}", result);
 }

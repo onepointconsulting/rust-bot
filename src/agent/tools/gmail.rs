@@ -15,13 +15,91 @@ fn gmail_err(msg: impl Into<String>) -> String {
     msg
 }
 
-pub struct GmailEmailsTool {
-    name: String,
-    description: String,
+fn sanitize_mime_header_value(value: &str) -> String {
+    value
+        .replace(['\r', '\n'], " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+/// RFC 2047 encoded-word for non-ASCII header values (Subject, etc.).
+fn encode_mime_header_value(value: &str) -> String {
+    let sanitized = sanitize_mime_header_value(value);
+    if sanitized.is_ascii() {
+        return sanitized;
+    }
+    use base64::engine::general_purpose::STANDARD;
+    format!("=?UTF-8?B?{}?=", STANDARD.encode(sanitized.as_bytes()))
+}
+
+fn normalize_mime_body(body: &str) -> String {
+    body.replace("\r\n", "\n").replace('\r', "\n").replace('\n', "\r\n")
+}
+
+fn build_rfc2822_message(to: &str, subject: &str, body: &str, format: &str) -> String {
+    let subject = encode_mime_header_value(subject);
+    let body = normalize_mime_body(body);
+    let content_type = match format {
+        "plain" => "text/plain; charset=utf-8",
+        "html" => "text/html; charset=utf-8",
+        _ => unreachable!("format validated by parse_email_format"),
+    };
+    format!(
+        "To: {to}\r\nSubject: {subject}\r\nMIME-Version: 1.0\r\nContent-Type: {content_type}\r\n\r\n{body}"
+    )
+}
+
+fn parse_email_format(format: &str) -> Result<&'static str, String> {
+    match format {
+        "plain" => Ok("plain"),
+        "html" => Ok("html"),
+        other => Err(format!("Error: invalid format: {other} (expected plain or html)")),
+    }
+}
+
+fn encode_gmail_raw_message(mime: &str) -> String {
+    use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+    URL_SAFE_NO_PAD.encode(mime.as_bytes())
+}
+
+struct GmailToolCommon {
     config: GmailToolConfig,
     secret_path: String,
     token_cache_path: String,
     scopes: Vec<String>,
+}
+
+impl GmailToolCommon {
+    async fn access_token(&self) -> Result<String, String> {
+        let secret = yup_oauth2::read_application_secret(self.secret_path.clone())
+            .await
+            .map_err(|_| "Error: failed to read client secret JSON".to_string())?;
+
+        log::info!("Reading token from {}", self.token_cache_path);
+        let auth =
+            InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
+                .persist_tokens_to_disk(self.token_cache_path.clone())
+                .build()
+                .await
+                .map_err(|_| "Error: failed to read client secret JSON".to_string())?;
+
+        let token = auth
+            .token(self.scopes.as_slice())
+            .await
+            .map_err(|_| "Error: failed to get token".to_string())?;
+
+        token
+            .token()
+            .map(str::to_string)
+            .ok_or_else(|| "Error: failed to get token".to_string())
+    }
+}
+
+pub struct GmailEmailsTool {
+    name: String,
+    description: String,
+    common: GmailToolCommon,
 }
 
 fn show_error_and_exit(path: &PathBuf) {
@@ -41,13 +119,16 @@ impl GmailEmailsTool {
         if !Path::new(&token_cache_path).exists() {
             show_error_and_exit(&token_cache_path); // EXIT_CONFIG_ERROR
         }
-        Self {
-            name: "gmail".to_string(),
-            description: "Gmail Tool. Returns the latest emails from the user's inbox.".to_string(),
+        let common = GmailToolCommon {
             config: config.clone(),
             secret_path: secret_path.to_string_lossy().to_string(),
             token_cache_path: token_cache_path.to_string_lossy().to_string(),
             scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
+        };
+        Self {
+            name: "gmail".to_string(),
+            description: "Gmail Tool. Returns the latest emails from the user's inbox.".to_string(),
+            common,
         }
     }
 
@@ -248,7 +329,7 @@ impl Tool for GmailEmailsTool {
                     "type": "integer",
                     "description": "",
                     "minimum": 1,
-                    "maximum": self.config.max_results,
+                    "maximum": self.common.config.max_results,
                     "default": DEFAULT_LIMIT,
                 },
                 "after": {
@@ -283,10 +364,10 @@ impl Tool for GmailEmailsTool {
         if limit < 1 {
             return "Error: limit must be greater than 0".to_string();
         }
-        if limit > self.config.max_results as u64 {
+        if limit > self.common.config.max_results as u64 {
             return format!(
                 "Error: limit must be less than or equal to {}",
-                self.config.max_results
+                self.common.config.max_results
             )
             .to_string();
         }
@@ -314,81 +395,260 @@ impl Tool for GmailEmailsTool {
             Err(e) => return e,
         };
 
-        if let Ok(secret) = yup_oauth2::read_application_secret(self.secret_path.clone()).await
-            && let Ok(auth) =
-                InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
-                    .persist_tokens_to_disk(self.token_cache_path.clone())
-                    .build()
-                    .await
+        let token = match self.common.access_token().await {
+            Ok(token) => token,
+            Err(e) => return gmail_err(e),
+        };
+
+        log::info!("Successfully authenticated with Gmail API");
+        let client = reqwest::Client::new();
+        if let Ok(response) = client
+            .get(format!("{}/users/me/messages", GMAIL_API))
+            .bearer_auth(&token)
+            .query(&[
+                ("q", &query),
+                ("maxResults", &limit.to_string()),
+            ])
+            .send()
+            .await
         {
-            let scopes = self.scopes.as_slice();
-            if let Ok(token) = auth.token(scopes).await
-                && let Some(token) = token.token()
-            {
-                log::info!("Successfully authenticated with Gmail API");
-                let client = reqwest::Client::new();
-                if let Ok(response) = client
-                    .get(format!("{}/users/me/messages", GMAIL_API))
-                    .bearer_auth(token)
-                    .query(&[
-                        ("q", &query),
-                        ("maxResults", &limit.to_string()),
-                    ])
-                    .send()
-                    .await
-                {
-                    if !response.status().is_success() {
-                        let status = response.status();
-                        if let Ok(body) = response.text().await {
-                            return gmail_err(format!("Gmail API error {}: {}", status, body));
-                        } else {
-                            return gmail_err(format!(
-                                "Failed to read response body. Status: {}",
-                                status
-                            ));
-                        }
-                    } else {
-                        // Successfully fetched emails
-                        let messages_result: Result<serde_json::Value, reqwest::Error> =
-                            response.json().await;
-                        if let Ok(messages) = messages_result {
-                            // --- Step 5: Print each message subject ---
-                            let message_list = messages["messages"]
-                                .as_array()
-                                .map(|v| v.as_slice())
-                                .unwrap_or(&[]);
-                            log::info!(
-                                "\nFetching subjects for {} messages...\n",
-                                message_list.len()
-                            );
-                            return self
-                                .loop_messages(
-                                    &client,
-                                    token,
-                                    message_list,
-                                    only_subject,
-                                    body_limit,
-                                )
-                                .await;
-                        } else {
-                            return gmail_err("Failed to parse response JSON");
-                        }
-                    }
+            if !response.status().is_success() {
+                let status = response.status();
+                if let Ok(body) = response.text().await {
+                    return gmail_err(format!("Gmail API error {}: {}", status, body));
                 } else {
-                    return gmail_err("Error: failed to fetch emails");
+                    return gmail_err(format!(
+                        "Failed to read response body. Status: {}",
+                        status
+                    ));
                 }
-            } else {
-                return gmail_err("Error: failed to get token");
             }
-        } else {
-            return gmail_err("Error: failed to read client secret JSON");
+            let messages_result: Result<serde_json::Value, reqwest::Error> = response.json().await;
+            if let Ok(messages) = messages_result {
+                let message_list = messages["messages"]
+                    .as_array()
+                    .map(|v| v.as_slice())
+                    .unwrap_or(&[]);
+                log::info!(
+                    "\nFetching subjects for {} messages...\n",
+                    message_list.len()
+                );
+                return self
+                    .loop_messages(
+                        &client,
+                        &token,
+                        message_list,
+                        only_subject,
+                        body_limit,
+                    )
+                    .await;
+            }
+            return gmail_err("Failed to parse response JSON");
         }
+        gmail_err("Error: failed to fetch emails")
+    }
+}
+
+pub struct GmailEmailSendTool {
+    name: String,
+    description: String,
+    common: GmailToolCommon,
+}
+
+impl GmailEmailSendTool {
+    pub fn new(config: GmailToolConfig) -> Self {
+        let common = GmailToolCommon {
+            config: config.clone(),
+            secret_path: config.client_secret_path().to_string_lossy().to_string(),
+            token_cache_path: config.token_cache_path().to_string_lossy().to_string(),
+            scopes: vec!["https://www.googleapis.com/auth/gmail.send".to_string()],
+        };
+        Self {
+            name: "gmail_email_send".to_string(),
+            description: "Gmail Email Send Tool. Sends an automated email to a recipient email address.".to_string(),
+            common,
+        }
+    }
+}
+
+#[async_trait]
+impl Tool for GmailEmailSendTool {
+    
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+
+    fn description(&self) -> String {
+        self.description.clone()
+    }
+
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({
+            "type": "object",
+            "properties": {
+                "to": {
+                    "type": "string",
+                    "description": "The email address of the recipient",
+                },
+                "subject": {
+                    "type": "string",
+                    "description": "The subject of the email",
+                },
+                "body": {
+                    "type": "string",
+                    "description": "The body of the email (plain text or HTML, depending on format)",
+                },
+                "format": {
+                    "type": "string",
+                    "description": "Email body format: plain (default) or html",
+                    "enum": ["plain", "html"],
+                }
+            },
+            "required": ["to", "subject", "body"],
+        })
+    }
+
+    async fn execute(&self, params: &serde_json::Value) -> String {
+        let to = params
+            .get("to")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let subject = params
+            .get("subject")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let body = params
+            .get("body")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty());
+        let format = params
+            .get("format")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("plain");
+        let (Some(to), Some(subject), Some(body)) = (to, subject, body) else {
+            return format!("Error: missing required parameters: to={}, subject={}, body={}", 
+            to.unwrap_or("(none)"), subject.unwrap_or("(none)"), body.unwrap_or("(none)")).to_string();
+        };
+        let format = match parse_email_format(format) {
+            Ok(format) => format,
+            Err(e) => return e,
+        };
+
+        let token = match self.common.access_token().await {
+            Ok(token) => token,
+            Err(e) => return gmail_err(e),
+        };
+
+        let raw = encode_gmail_raw_message(&build_rfc2822_message(to, subject, body, format));
+
+        log::info!("Successfully authenticated with Gmail API");
+        let client = reqwest::Client::new();
+        if let Ok(response) = client
+            .post(format!("{}/users/me/messages/send", GMAIL_API))
+            .bearer_auth(&token)
+            .json(&serde_json::json!({ "raw": raw }))
+            .send()
+            .await
+        {
+            if !response.status().is_success() {
+                let status = response.status();
+                if let Ok(response_body) = response.text().await {
+                    return gmail_err(format!("Gmail API error {}: {}", status, response_body));
+                } else {
+                    return gmail_err(format!("Failed to read response body. Status: {}", status));
+                }
+            }
+            let response_json: Result<serde_json::Value, reqwest::Error> = response.json().await;
+            if let Ok(response_json) = response_json {
+                if let Some(id) = response_json.get("id").and_then(|v| v.as_str()) {
+                    return format!("Email sent (id: {id})");
+                }
+                return response_json.to_string();
+            }
+            return gmail_err("Failed to parse response JSON");
+        }
+        gmail_err("Error: failed to send email")
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn build_rfc2822_message_formats_plain_headers_and_body() {
+        let mime = build_rfc2822_message(
+            "a@example.com",
+            "Hello",
+            "Line one\nLine two",
+            "plain",
+        );
+        assert!(mime.starts_with("To: a@example.com\r\n"));
+        assert!(mime.contains("Subject: Hello\r\n"));
+        assert!(mime.contains("Content-Type: text/plain; charset=utf-8\r\n"));
+        assert!(mime.ends_with("Line one\r\nLine two"));
+    }
+
+    #[test]
+    fn build_rfc2822_message_uses_html_content_type() {
+        let mime = build_rfc2822_message(
+            "a@example.com",
+            "Hello",
+            "<p>Line one</p>",
+            "html",
+        );
+        assert!(mime.contains("Content-Type: text/html; charset=utf-8\r\n"));
+        assert!(mime.ends_with("<p>Line one</p>"));
+    }
+
+    #[test]
+    fn build_rfc2822_message_strips_newlines_from_subject() {
+        let mime = build_rfc2822_message("a@example.com", "Hello\r\nWorld", "body", "plain");
+        assert!(mime.contains("Subject: Hello World\r\n"));
+    }
+
+    #[test]
+    fn build_rfc2822_message_rfc2047_encodes_non_ascii_subject() {
+        let mime = build_rfc2822_message(
+            "a@example.com",
+            "Rust-bot — Overview of Functionality",
+            "body",
+            "plain",
+        );
+        assert!(mime.contains("Subject: =?UTF-8?B?"));
+        assert!(!mime.contains("Subject: Rust-bot —"));
+    }
+
+    #[test]
+    fn parse_email_format_rejects_unknown_values() {
+        assert_eq!(
+            parse_email_format("markdown"),
+            Err("Error: invalid format: markdown (expected plain or html)".to_string())
+        );
+    }
+
+    #[test]
+    fn encode_gmail_raw_message_is_url_safe_without_padding() {
+        let raw = encode_gmail_raw_message("To: a@example.com\r\n\r\nHello");
+        assert!(!raw.contains('+'));
+        assert!(!raw.contains('/'));
+        assert!(!raw.ends_with('='));
+    }
+
+    #[test]
+    fn encode_gmail_raw_message_round_trips_with_decode_helper() {
+        let mime = build_rfc2822_message("a@example.com", "Hi", "Body", "plain");
+        let raw = encode_gmail_raw_message(&mime);
+        assert_eq!(
+            GmailEmailsTool::decode_gmail_body_data(&raw),
+            Some(mime)
+        );
+    }
 
     #[test]
     fn limit_body_truncates_long_text() {

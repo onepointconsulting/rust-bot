@@ -10,7 +10,7 @@
     "maxToolResultChars": 16000,
     "providerRetryMode": "standard",
     "reasoningEffort": null,
-    "timezone": "UTC",
+    "timezone": "Europe/London",
     "dream": {
       "intervalH": 2,
       "modelOverride": null,

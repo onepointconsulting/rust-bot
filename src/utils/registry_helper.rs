@@ -6,7 +6,7 @@ use crate::{
         tools::{
             base::Tool,
             filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool},
-            gmail::GmailEmailsTool,
+            gmail::{GmailEmailsTool, GmailEmailSendTool},
             registry::ToolRegistry,
             search::{GlobTool, GrepTool},
             web::{WebFetchTool, WebSearchTool},
@@ -85,6 +85,7 @@ pub fn register_gmail_tools(gmail_config: &GmailToolConfig, tools: &mut ToolRegi
     if gmail_config.enable {
         log::debug!("Registering gmail tool");
         tools.register(Box::new(GmailEmailsTool::new(gmail_config.clone())));
+        tools.register(Box::new(GmailEmailSendTool::new(gmail_config.clone())));
     }
 }
 
