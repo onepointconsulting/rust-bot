@@ -277,7 +277,7 @@ The console always prints the banner on entry — that's the easiest way to conf
 Rust Bot can expose two Gmail agent tools when enabled in config:
 
 - **`gmail`** — reads messages from the user's inbox (read-only)
-- **`gmail_email_send`** — sends a plain-text email to a recipient
+- **`gmail_email_send`** — sends an email to a recipient (plain text or HTML)
 
 Access is granted through Google OAuth; credentials are stored on disk and reused by the agent. Both tools share the same `client_secret.json` and `token_cache.json` paths from config.
 
@@ -357,8 +357,12 @@ A sample config with Gmail enabled is in `configs/openai-compat/config_gmail.jso
 cargo run -- agent -m "Summarize my latest inbox emails" \
   --config ./configs/openai-compat/config_gmail.json
 
-# Send email (the model chooses the gmail_email_send tool)
+# Send plain-text email (the model chooses the gmail_email_send tool)
 cargo run -- agent -m "Send an email to alice@example.com with subject Hello and body Hi Alice" \
+  --config ./configs/openai-compat/config_gmail.json
+
+# Send HTML email (ask the model to use format html and HTML in the body)
+cargo run -- agent -m "Send an HTML email to alice@example.com with subject Report and body containing a bold greeting" \
   --config ./configs/openai-compat/config_gmail.json
 ```
 
@@ -369,7 +373,18 @@ The agent uses the cached tokens from `token_cache.json` and refreshes them auto
 | Tool name | Purpose | Key parameters |
 |-----------|---------|----------------|
 | `gmail` | List and read inbox messages | `limit`, `after`, `before`, `only_subject`, `body_limit` |
-| `gmail_email_send` | Send a plain-text email | `to`, `subject`, `body` (all required) |
+| `gmail_email_send` | Send an email | `to`, `subject`, `body` (required); `format` (optional) |
+
+#### `gmail_email_send` parameters
+
+| Parameter | Required | Default | Description |
+|-----------|----------|---------|-------------|
+| `to` | yes | — | Recipient email address |
+| `subject` | yes | — | Email subject (non-ASCII characters are RFC 2047–encoded) |
+| `body` | yes | — | Message body: plain text or HTML, depending on `format` |
+| `format` | no | `plain` | `plain` for `text/plain`, or `html` for `text/html` |
+
+When `format` is `html`, pass HTML markup in `body` (for example `<p>Hello</p>`). Gmail renders it as HTML in the recipient's client. When omitted or set to `plain`, the body is sent as plain text.
 
 Send uses the Gmail API `users.messages.send` endpoint with an RFC 2822 MIME message encoded as base64url. Messages are sent from the authenticated Google account.
 
