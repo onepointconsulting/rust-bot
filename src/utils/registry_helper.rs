@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::{
     agent::{
         skills::BUILTIN_SKILLS_DIR, tools::{
-            base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
+            base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, ocr::OcrTool, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
         },
-    }, config::schema::{GmailToolConfig, WebToolsConfig},
+    }, config::schema::{GmailToolConfig, OcrToolConfig, WebToolsConfig},
 };
 
 /// Workspace restriction and builtin-skills read path used by filesystem tools.
@@ -87,6 +87,28 @@ pub fn register_gmail_tools(
             gmail_config.clone(),
             workspace.clone(),
         )));
+    }
+}
+
+pub fn register_ocr_tools(
+    ocr_config: &OcrToolConfig,
+    workspace: &PathBuf,
+    allowed_dir: Option<PathBuf>,
+    extra_read: Vec<PathBuf>,
+    tools: &mut ToolRegistry,
+) {
+    if !ocr_config.enable {
+        return;
+    }
+    log::debug!("Registering OCR tool");
+    match OcrTool::new(
+        ocr_config.clone(),
+        workspace.clone(),
+        allowed_dir,
+        extra_read,
+    ) {
+        Ok(tool) => tools.register(Box::new(tool)),
+        Err(e) => log::error!("Failed to register OCR tool: {e}"),
     }
 }
 

@@ -4,8 +4,7 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    providers::registry::{find_by_name, providers},
-    utils::helpers::expand_tilde_path,
+    providers::{anthropic_provider::AnthropicProvider, registry::{find_by_name, providers}}, utils::helpers::expand_tilde_path,
 };
 
 // ── ProviderConfig ────────────────────────────────────────────────────────────
@@ -668,6 +667,28 @@ fn default_gmail_client_secret_path() -> String {
     "~/.rust-bot/credentials/client_secret.json".to_string()
 }
 
+fn default_ocr_tool_enable() -> bool {
+    false
+}
+
+fn default_ocr_tool_model() -> String {
+    AnthropicProvider::DEFAULT_MODEL.to_string()
+}
+
+fn default_ocr_tool_base_url() -> String {
+    AnthropicProvider::DEFAULT_API_BASE.to_string()
+}
+
+fn default_ocr_tool_provider() -> OcrProvider {
+    OcrProvider::Anthropic
+}
+
+fn default_ocr_tool_api_key() -> String {
+    String::new()
+}
+
+// ── GmailToolConfig ───────────────────────────────────────────────────────────
+
 /// Gmail Tool configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
@@ -755,6 +776,71 @@ impl Default for ExecToolConfig {
             timeout: default_exec_tool_timeout(),
             path_append: String::new(),
             sandbox: String::new(),
+        }
+    }
+}
+
+// ── OcrToolConfig ───────────────────────────────────────────────────────────
+
+/// LLM provider for the OCR tool.
+#[derive(Deserialize, Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OcrProvider {
+    #[default]
+    Anthropic,
+}
+
+impl std::fmt::Display for OcrProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl OcrProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OcrToolConfig {
+    /// Enable or disable the OCR tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_ocr_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// The model to use for the OCR tool. Default: Claude Sonnet (Anthropic default).
+    #[serde(alias = "model", default = "default_ocr_tool_model")]
+    #[garde(skip)]
+    pub model: String,
+
+    /// API base URL for the OCR provider.
+    #[serde(alias = "base_url", default = "default_ocr_tool_base_url")]
+    #[garde(skip)]
+    pub base_url: String,
+
+    /// LLM provider for OCR. Default: `"anthropic"`.
+    #[serde(alias = "provider", default = "default_ocr_tool_provider")]
+    #[garde(skip)]
+    pub provider: OcrProvider,
+
+    /// API key for the OCR provider. Empty string uses `ANTHROPIC_API_KEY` at runtime.
+    #[serde(alias = "api_key", default = "default_ocr_tool_api_key")]
+    #[garde(skip)]
+    pub api_key: String,
+}
+
+impl Default for OcrToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_ocr_tool_enable(),
+            model: default_ocr_tool_model(),
+            base_url: default_ocr_tool_base_url(),
+            provider: default_ocr_tool_provider(),
+            api_key: default_ocr_tool_api_key(),
         }
     }
 }
@@ -872,6 +958,10 @@ pub struct ToolsConfig {
     #[serde(alias = "gmail")]
     #[garde(dive)]
     pub gmail: GmailToolConfig,
+
+    #[serde(alias = "ocr")]
+    #[garde(dive)]
+    pub ocr: OcrToolConfig,
 }
 
 impl Default for ToolsConfig {
@@ -883,6 +973,7 @@ impl Default for ToolsConfig {
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
             gmail: GmailToolConfig::default(),
+            ocr: OcrToolConfig::default(),
         }
     }
 }

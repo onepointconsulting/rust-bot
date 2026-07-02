@@ -216,6 +216,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         Some(config.tools.web.clone()),
         Some(config.tools.exec),
         Some(config.tools.gmail.clone()),
+        Some(config.tools.ocr.clone()),
         Some(config.subagent),
         Some(cron_service),
         Some(config.tools.restrict_to_workspace),

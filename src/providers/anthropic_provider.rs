@@ -44,8 +44,8 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
-    const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
+    pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+    pub const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
     const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
     fn build_request_headers(api_key: &str, extra_headers: &HashMap<String, String>) -> HeaderMap {

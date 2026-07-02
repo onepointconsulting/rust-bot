@@ -69,6 +69,13 @@
       "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
       "max_results": 20
     },
+    "ocr": {
+      "enable": true,
+      "provider": "anthropic",
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "model": "${ANTHROPIC_API_MODEL}",
+      "baseUrl": "${ANTHROPIC_API_BASE}"
+    },
     "restrictToWorkspace": false,
     "mcpServers": {},
     "ssrfWhitelist": [

@@ -10,3 +10,4 @@ pub mod spawn;
 pub mod cron;
 pub mod message;
 pub mod gmail;
+pub mod ocr;

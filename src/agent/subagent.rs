@@ -16,13 +16,13 @@ use crate::{
         tools::{registry::ToolRegistry, shell::ShellTool},
     },
     bus::{events::InboundMessage, queue::MessageBus},
-    config::schema::{ExecToolConfig, GmailToolConfig, SubagentConfig, WebToolsConfig},
+    config::schema::{ExecToolConfig, GmailToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig},
     providers::base::LLMProviderDyn,
     utils::{
         prompt_templates::render_template,
         registry_helper::{
             filesystem_tool_scope, register_filesystem_tools, register_gmail_tools,
-            register_web_tools,
+            register_ocr_tools, register_web_tools,
         },
     },
 };
@@ -63,6 +63,7 @@ pub struct SubagentManager {
     pub web_config: WebToolsConfig,
     pub exec_config: ExecToolConfig,
     pub gmail_config: GmailToolConfig,
+    pub ocr_config: OcrToolConfig,
     pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
     pub runner: AgentRunner,
@@ -80,6 +81,7 @@ impl SubagentManager {
         web_config: Option<WebToolsConfig>,
         exec_config: Option<ExecToolConfig>,
         gmail_config: Option<GmailToolConfig>,
+        ocr_config: Option<OcrToolConfig>,
         subagent_config: Option<SubagentConfig>,
         restrict_to_workspace: Option<bool>,
     ) -> Self {
@@ -92,6 +94,7 @@ impl SubagentManager {
             web_config: web_config.unwrap_or(WebToolsConfig::default()),
             exec_config: exec_config.unwrap_or(ExecToolConfig::default()),
             gmail_config: gmail_config.unwrap_or(GmailToolConfig::default()),
+            ocr_config: ocr_config.unwrap_or(OcrToolConfig::default()),
             subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             runner: AgentRunner::new(provider),
@@ -111,6 +114,7 @@ impl SubagentManager {
             workspace,
             bus,
             max_tool_result_chars,
+            None,
             None,
             None,
             None,
@@ -228,7 +232,12 @@ impl SubagentManager {
             self.restrict_to_workspace,
             &self.exec_config.sandbox,
         );
-        register_filesystem_tools(&mut tools, &self.workspace, allowed_dir, extra_read);
+        register_filesystem_tools(
+            &mut tools,
+            &self.workspace,
+            allowed_dir.clone(),
+            extra_read.clone(),
+        );
         if self.exec_config.enable {
             tools.register(Box::new(ShellTool::new(
                 self.exec_config.timeout as u64,
@@ -250,6 +259,13 @@ impl SubagentManager {
         }
         register_web_tools(&self.web_config, &mut tools);
         register_gmail_tools(&self.gmail_config, &self.workspace, &mut tools);
+        register_ocr_tools(
+            &self.ocr_config,
+            &self.workspace,
+            allowed_dir,
+            extra_read,
+            &mut tools,
+        );
 
         let system_prompt = self.build_subagent_prompt();
         if system_prompt.is_empty() {
