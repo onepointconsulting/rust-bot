@@ -1,8 +1,8 @@
 {
   "agents": {
     "workspace": "~/.rust-bot/workspace",
-    "model": "${OPENAI_API_MODEL}",
-    "provider": "openrouter",
+    "model": "${ANTHROPIC_API_MODEL}",
+    "provider": "anthropic",
     "maxTokens": 32768,
     "contextWindowTokens": 65536,
     "temperature": 0.1,
@@ -25,9 +25,9 @@
     "transcriptionProvider": "groq"
   },
   "providers": {
-    "custom": {
-      "apiKey": "${OPENAI_API_KEY}",
-      "apiBase": "${OPENAI_API_BASE}",
+    "anthropic": {
+      "apiKey": "${ANTHROPIC_API_KEY}",
+      "apiBase": "${ANTHROPIC_API_BASE}",
       "extraHeaders": null
     }
   },

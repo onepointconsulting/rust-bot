@@ -5,9 +5,36 @@ use crate::config::paths::get_media_dir;
 use regex::Regex;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::io::Read;
 use std::process::{Child, Command, Stdio};
 
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
+
+/// Kills the process tree on drop unless [`Self::disarm`] was called.
+///
+/// Mirrors Python's `except asyncio.CancelledError: await self._kill_process(process); raise`.
+struct ChildGuard {
+    pid: u32,
+    armed: bool,
+}
+
+impl ChildGuard {
+    fn new(pid: u32) -> Self {
+        Self { pid, armed: true }
+    }
+
+    fn disarm(&mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        if self.armed {
+            ShellTool::kill_process_tree_sync(self.pid);
+        }
+    }
+}
 
 pub struct ShellTool {
     timeout: u64,
@@ -115,31 +142,59 @@ impl ShellTool {
         };
 
         // ── Collect output with timeout ───────────────────────────────────────
-        // `Child::wait_with_output` is blocking; run it on the thread-pool so
-        // the async executor is not stalled.
         let timeout_dur = std::time::Duration::from_secs(effective_timeout);
+        let mut child = child;
+        let pid = child.id();
+        let mut guard = ChildGuard::new(pid);
 
-        let output_result = tokio::time::timeout(
-            timeout_dur,
-            tokio::task::spawn_blocking(move || child.wait_with_output()),
-        )
-        .await;
+        let mut stdout_pipe = child.stdout.take().expect("stdout piped");
+        let mut stderr_pipe = child.stderr.take().expect("stderr piped");
 
-        let output = match output_result {
-            // Timed out — the Child was moved into the closure so we can no
-            // longer call kill_process here; the OS will reap it when the
-            // thread unblocks.  Return the timeout message immediately.
-            Err(_elapsed) => {
+        let stdout_handle = tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            stdout_pipe.read_to_end(&mut buf).map(|_| buf)
+        });
+        let stderr_handle = tokio::task::spawn_blocking(move || {
+            let mut buf = Vec::new();
+            stderr_pipe.read_to_end(&mut buf).map(|_| buf)
+        });
+
+        let deadline = tokio::time::Instant::now() + timeout_dur;
+        let status = loop {
+            if tokio::time::Instant::now() >= deadline {
+                Self::kill_process(&mut child).await;
+                guard.disarm();
                 return format!("Error: Command timed out after {effective_timeout} seconds");
             }
-            // Thread panicked or was cancelled.
-            Ok(Err(join_err)) => {
-                return format!("Error executing command: {join_err}");
+
+            match child.try_wait() {
+                Ok(Some(status)) => break status,
+                Ok(None) => {
+                    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+                }
+                Err(e) => {
+                    guard.disarm();
+                    return format!("Error executing command: {e}");
+                }
             }
-            Ok(Ok(Err(io_err))) => {
-                return format!("Error executing command: {io_err}");
-            }
-            Ok(Ok(Ok(out))) => out,
+        };
+        guard.disarm();
+
+        let stdout = match stdout_handle.await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => return format!("Error reading stdout: {e}"),
+            Err(e) => return format!("Error executing command: {e}"),
+        };
+        let stderr = match stderr_handle.await {
+            Ok(Ok(buf)) => buf,
+            Ok(Err(e)) => return format!("Error reading stderr: {e}"),
+            Err(e) => return format!("Error executing command: {e}"),
+        };
+
+        let output = std::process::Output {
+            status,
+            stdout,
+            stderr,
         };
 
         // ── Build result string ───────────────────────────────────────────────
@@ -439,6 +494,22 @@ impl ShellTool {
         }
     }
 
+    /// Forcefully terminate a process and its descendants by PID.
+    fn kill_process_tree_sync(pid: u32) {
+        #[cfg(windows)]
+        {
+            let _ = Command::new("taskkill")
+                .args(["/F", "/T", "/PID", &pid.to_string()])
+                .output();
+        }
+        #[cfg(unix)]
+        {
+            let _ = Command::new("kill")
+                .args(["-9", &pid.to_string()])
+                .output();
+        }
+    }
+
     /// Kill a subprocess and its entire process tree, then reap it.
     ///
     /// On **Windows**, `taskkill /F /T /PID` is used instead of `Child::kill()`
@@ -452,23 +523,7 @@ impl ShellTool {
     ///
     /// In both cases the function waits up to 5 seconds for the process to exit.
     async fn kill_process(child: &mut Child) {
-        #[cfg(windows)]
-        {
-            // `taskkill /F /T /PID <pid>` kills the process AND all its descendants.
-            let pid = child.id().to_string();
-            if let Err(e) = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid])
-                .output()
-            {
-                log::debug!("kill_process: taskkill failed: {e}");
-            }
-        }
-        #[cfg(not(windows))]
-        {
-            if let Err(e) = child.kill() {
-                log::debug!("kill_process: kill() failed: {e}");
-            }
-        }
+        Self::kill_process_tree_sync(child.id());
 
         // Wait up to 5 s for the process to exit.
         //
@@ -557,9 +612,9 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
     }
 }
 
+#[cfg(test)]
 mod tests {
     use crate::agent::tools::shell::{IS_WINDOWS, ShellTool};
-
 
     #[test]
     fn test_extract_absolute_paths() {

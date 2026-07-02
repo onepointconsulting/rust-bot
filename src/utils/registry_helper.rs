@@ -2,17 +2,10 @@ use std::path::PathBuf;
 
 use crate::{
     agent::{
-        skills::BUILTIN_SKILLS_DIR,
-        tools::{
-            base::Tool,
-            filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool},
-            gmail::{GmailEmailsTool, GmailEmailSendTool},
-            registry::ToolRegistry,
-            search::{GlobTool, GrepTool},
-            web::{WebFetchTool, WebSearchTool},
+        skills::BUILTIN_SKILLS_DIR, tools::{
+            base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
         },
-    },
-    config::schema::{GmailToolConfig, WebToolsConfig},
+    }, config::schema::{GmailToolConfig, WebToolsConfig},
 };
 
 /// Workspace restriction and builtin-skills read path used by filesystem tools.
@@ -80,12 +73,20 @@ pub fn register_web_tools(web_config: &WebToolsConfig, tools: &mut ToolRegistry)
     }
 }
 
-pub fn register_gmail_tools(gmail_config: &GmailToolConfig, tools: &mut ToolRegistry) {
+pub fn register_gmail_tools(
+    gmail_config: &GmailToolConfig,
+    workspace: &PathBuf,
+    tools: &mut ToolRegistry,
+) {
     log::info!("Gmail config: {:?}", gmail_config);
     if gmail_config.enable {
         log::debug!("Registering gmail tool");
         tools.register(Box::new(GmailEmailsTool::new(gmail_config.clone())));
         tools.register(Box::new(GmailEmailSendTool::new(gmail_config.clone())));
+        tools.register(Box::new(GmailEmailDownloadTool::new(
+            gmail_config.clone(),
+            workspace.clone(),
+        )));
     }
 }
 

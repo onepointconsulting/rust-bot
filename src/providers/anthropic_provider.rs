@@ -144,7 +144,7 @@ impl AnthropicProvider {
 
         for msg in messages {
             let role = msg.get("role").and_then(|v| v.as_str()).unwrap_or("");
-            let mut content = msg.get("content");
+            let content = msg.get("content");
             if role == "system" {
                 system = match content {
                     Some(v) if v.is_string() || v.is_array() => v.clone(),
@@ -894,6 +894,7 @@ impl AnthropicProvider {
                         && let MessageStreamEvent::ContentBlockDelta(delta) = event
                         && let ContentBlockDelta::TextDelta(text_delta) = delta.delta
                     {
+                        log::info!("Received content delta: {}", text_delta.text);
                         cb(text_delta.text).await;
                     }
                 }
@@ -1014,6 +1015,7 @@ impl LLMProvider for AnthropicProvider {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send,
     {
+        log::info!("Starting Anthropic chat stream");
         let idle_timeout_s: u64 = env::var("RUSTBOT_STREAM_IDLE_TIMEOUT_S")
             .unwrap_or_else(|_| "90".to_string())
             .parse()
@@ -1046,6 +1048,8 @@ impl LLMProvider for AnthropicProvider {
         };
 
         if !response.status().is_success() {
+            log::error!("Response status: {:?}", response.status());
+            log::error!("API Key is set: {:?}", self.api_key.as_ref().is_some() && !self.api_key.as_ref().unwrap().is_empty());
             return AnthropicProvider::parse_response(Ok(response)).await;
         }
 

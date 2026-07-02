@@ -131,7 +131,7 @@ impl LLMResponse {
     }
 }
 
-pub(crate) struct GenerationSettings {
+pub struct GenerationSettings {
     temperature: f32,
     max_tokens: usize,
     reasoning_effort: Option<String>,

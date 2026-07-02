@@ -20,7 +20,6 @@ use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
-use crate::agent::skills::SkillsLoader;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_from_config};
@@ -305,7 +304,7 @@ pub struct AgentLoop {
     pub last_usage: Mutex<HashMap<String, u64>>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
-    tools: Arc<Mutex<ToolRegistry>>,
+    pub(crate) tools: Arc<Mutex<ToolRegistry>>,
     runner: Arc<AgentRunner>,
     pub subagents: Arc<SubagentManager>,
     /// In-flight per-session tasks, keyed by session then by a unique task id so
@@ -507,7 +506,7 @@ impl AgentLoop {
             )));
         }
         register_web_tools(web_config, tools);
-        register_gmail_tools(gmail_config, tools);
+        register_gmail_tools(gmail_config, workspace, tools);
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",

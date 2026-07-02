@@ -249,7 +249,7 @@ impl SubagentManager {
             )));
         }
         register_web_tools(&self.web_config, &mut tools);
-        register_gmail_tools(&self.gmail_config, &mut tools);
+        register_gmail_tools(&self.gmail_config, &self.workspace, &mut tools);
 
         let system_prompt = self.build_subagent_prompt();
         if system_prompt.is_empty() {

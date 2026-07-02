@@ -46,6 +46,11 @@ impl Default for ProviderConfig {
 fn default_send_progress() -> bool {
     true
 }
+
+fn default_streaming() -> bool {
+    false
+}
+
 fn default_send_max_retries() -> u8 {
     3
 }
@@ -61,6 +66,12 @@ fn default_transcription_provider() -> String {
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelsConfig {
+
+    /// Stream agent's text progress to the channel.
+    #[serde(alias = "streaming")]
+    #[garde(skip)]
+    pub streaming: bool,
+
     /// Stream agent's text progress to the channel.
     #[serde(alias = "send_progress")]
     #[garde(skip)]
@@ -88,16 +99,23 @@ pub struct ChannelsConfig {
     #[serde(flatten)]
     #[garde(skip)]
     pub extra: HashMap<String, serde_json::Value>,
+
+    /// List of allowed sender IDs.
+    #[serde(alias = "allow_from")]
+    #[garde(skip)]
+    pub allow_from: Vec<String>,
 }
 
 impl Default for ChannelsConfig {
     fn default() -> Self {
         Self {
             send_progress: default_send_progress(),
+            streaming: default_streaming(),
             send_tool_hints: false,
             send_max_retries: default_send_max_retries(),
             transcription_provider: default_transcription_provider(),
             extra: HashMap::new(),
+            allow_from: vec!["*".to_string()],
         }
     }
 }

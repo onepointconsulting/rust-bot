@@ -382,6 +382,8 @@ fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> C
 fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
     let model = config.agents.model.clone();
     let provider_name = config.agents.provider.clone();
+    log::info!("Provider Name: {:?}", provider_name);
+    log::info!("Model: {:?}", model);
     match provider_name.as_str() {
         "openai" | "openai_compat" | "openrouter" => Arc::new(OpenAICompatProvider::new(
             Some(config.providers.custom.api_key.clone()),
@@ -391,8 +393,8 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
             None,
         )),
         "anthropic" => Arc::new(AnthropicProvider::new(
-            Some(config.providers.custom.api_key.clone()),
-            config.providers.custom.api_base.clone(),
+            Some(config.providers.anthropic.api_key.clone()),
+            config.providers.anthropic.api_base.clone(),
             Some(model),
             None,
             None,
@@ -608,19 +610,21 @@ async fn interactive_session(
 fn interactive_welcome_text(markdown: bool) -> String {
     if markdown {
         format!(
-            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
+            "{LOGO} Interactive mode \n({}; {}; {}; {}; {})\n",
             "type **exit** or **Ctrl+D** to quit",
             "**Ctrl+Enter** for a new line",
             "**Alt+I** or **Ctrl+Tab** to paste image",
             "**Ctrl+V** or **Alt+V** to paste text",
+            "Type **/help** for available commands",
         )
     } else {
         format!(
-            "{LOGO} Interactive mode ({}; {}; {}; {})\n",
+            "{LOGO} Interactive mode \n({}; {}; {}; {}; {})\n",
             "type exit or Ctrl+D to quit",
             "Ctrl+Enter for a new line",
             "Alt+I or Ctrl+Tab to paste image",
             "Ctrl+V or Alt+V to paste text",
+            "Type /help for available commands",
         )
     }
 }

@@ -5,7 +5,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::FutureExt;
-use std::{collections::HashMap, panic::AssertUnwindSafe, sync::Arc, time::Instant};
+use std::{panic::AssertUnwindSafe, sync::Arc, time::Instant};
 
 /// Build an outbound reply addressed back to the inbound message's channel/chat.
 fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
@@ -513,6 +513,51 @@ impl CommandHandler for CmdDreamRestore {
     }
 }
 
+struct CmdTools;
+
+#[async_trait]
+impl CommandHandler for CmdTools {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/tools");
+        };
+        let registry = agent_loop
+            .tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut names = registry.tool_names();
+        names.sort();
+        let content = if names.is_empty() {
+            "No tools registered.".to_string()
+        } else {
+            let lines: Vec<String> = names
+                .iter()
+                .filter_map(|name| {
+                    registry
+                        .get(name)
+                        .map(|tool| format!("- {name} — {}", tool.description()))
+                })
+                .collect();
+            format!("Tools ({} available):\n{}", lines.len(), lines.join("\n"))
+        };
+        reply_as_text(ctx, content)
+    }
+}
+
+struct CmdWorkspace;
+
+#[async_trait]
+impl CommandHandler for CmdWorkspace {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/tools");
+        };
+        let store = &agent_loop.consolidator.store;
+        let workspace = store.workspace.clone();
+        reply_as_text(ctx, format!("Workspace: {}", workspace.display()))
+    }
+}
+
 /// Build canonical help text shared across channels.
 fn build_help_text() -> String {
     let lines = vec![
@@ -526,6 +571,8 @@ fn build_help_text() -> String {
         "/dream-restore — Revert memory to a previous state",
         "/help — Show available commands",
         "/mcp-list — List available MCP servers",
+        "/tools — List available tools",
+        "/workspace — Display the current workspace directory",
     ];
     lines.join("\n")
 }
@@ -540,6 +587,8 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact("/dream-restore", Arc::new(CmdDreamRestore));
     router.exact("/help", Arc::new(CmdHelp));
     router.exact("/mcp-list", Arc::new(CmdMcpList));
+    router.exact("/tools", Arc::new(CmdTools));
+    router.exact("/workspace", Arc::new(CmdWorkspace));
 }
 
 #[cfg(test)]
