@@ -4,7 +4,10 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::api::rest::ApiServer;
+use crate::api::rest::create_api_server;
 use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
 
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
@@ -58,6 +61,9 @@ pub struct Cli {
 pub enum Commands {
     /// Run the agent from the command line
     Agent(AgentArgs),
+
+    /// Run the API server
+    Api(ApiArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -101,6 +107,32 @@ impl AgentArgs {
     pub fn logs_enabled(&self) -> bool {
         self.logs && !self.no_logs
     }
+}
+
+#[derive(Debug, Parser)]
+pub struct ApiArgs {
+    /// Port to listen on
+    #[arg(short, long, default_value = "8900")]
+    pub port: Option<u16>,
+
+    /// Bind address to listen on
+    #[arg(long, default_value = "0.0.0.0")]
+    pub host: Option<String>,
+
+    /// Workspace directory
+    #[arg(short, long)]
+    pub workspace: Option<PathBuf>,
+
+    /// Timeout for API requests
+    #[arg(short, long, default_value = "30")]
+    pub timeout: u64,
+
+    #[arg(short, long, default_value = "api:default")]
+    pub session: String,
+
+    /// Config file path
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -178,16 +210,12 @@ pub fn print_agent_response_with_header(
 pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Commands::Agent(args) => run_agent(args).await,
+        Commands::Api(args) => run_api(args).await,
     }
 }
 
-async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
-    let session_id = args.session.clone();
-    let markdown = args.markdown_enabled();
-    let logs = args.logs_enabled();
-    init_runtime_logging(logs);
-
-    let config = load_runtime_config(args.config, args.workspace);
+fn prepare_workspace(config: Option<PathBuf>, workspace: Option<PathBuf>) -> (Config, PathBuf) {
+    let config = load_runtime_config(config, workspace);
     let workspace = config.workspace_path();
     ensure_dir(&workspace);
     if let Err(err @ TemplatesSyncError::TemplatesUnavailable { .. }) =
@@ -196,6 +224,10 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         eprint_error(err);
         std::process::exit(2);
     }
+    (config, workspace)
+}
+
+fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
     let bus = MessageBus::new();
     let provider = create_provider(&config);
 
@@ -214,18 +246,30 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         Some(config.agents.max_tool_result_chars),
         Some(config.agents.provider_retry_mode),
         Some(config.tools.web.clone()),
-        Some(config.tools.exec),
+        Some(config.tools.exec.clone()),
         Some(config.tools.gmail.clone()),
         Some(config.tools.ocr.clone()),
-        Some(config.subagent),
+        Some(config.subagent.clone()),
         Some(cron_service),
         Some(config.tools.restrict_to_workspace),
         None,
-        Some(config.tools.mcp_servers),
+        Some(config.tools.mcp_servers.clone()),
         Some(config.channels.clone()),
         Some(config.agents.timezone.clone()),
         None,
     );
+    agent_loop
+}
+
+async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
+    let session_id = args.session.clone();
+    let markdown = args.markdown_enabled();
+    let logs = args.logs_enabled();
+    init_runtime_logging(logs);
+
+    let (config, workspace) = prepare_workspace(args.config, args.workspace);
+    let agent_loop = init_agent_loop(&config, workspace);
+
     if let Some(restart_notice) = consume_restart_notice_from_env() {
         if should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
             print_agent_response(
@@ -268,6 +312,55 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     system_listener.abort();
     result
+}
+
+async fn run_api(args: ApiArgs) -> Result<(), CliError> {
+    init_runtime_logging(true);
+    let (config, workspace) = prepare_workspace(args.config, args.workspace);
+    let agent_loop = init_agent_loop(&config, workspace.clone());
+    let host = args.host.unwrap_or_else(|| config.api.host.clone());
+    let port = args.port.unwrap_or_else(|| config.api.port);
+    let model_name = config.agents.model.clone();
+    let session_id = args.session.clone();
+    let timeout = args.timeout;
+    render_api_startup_message(&host, port, &model_name, &workspace, &session_id, &timeout);
+    if let Err(err) = create_api_server(ApiServer {
+        agent_loop: Arc::new(agent_loop),
+        host,
+        port,
+        session_id,
+        model_name,
+        timeout,
+    })
+    .await
+    {
+        eprintln!("Failed to start API server: {err}");
+        std::process::exit(1);
+    }
+    Ok(())
+}
+
+fn render_api_startup_message(
+    host: &str,
+    port: u16,
+    model_name: &str,
+    workspace: &PathBuf,
+    session_id: &str,
+    timeout: &u64,
+) {
+    print_markdown(&format!("{} Starting OpenAI-compatible API server", LOGO));
+    println!();
+    print_markdown(&format!("Endpoint: **http://{host}:{port}/v1/chat/completions**"));
+    print_markdown(&format!("Swagger UI: **http://{host}:{port}/swagger-ui**"));
+    print_markdown(&format!("Model: **{}**", model_name));
+    print_markdown(&format!("Workspace: **{}**", workspace.display()));
+    print_markdown(&format!("Session: **{}**", session_id));
+    print_markdown(&format!("Timeout: **{timeout} seconds**"));
+    if is_all_interfaces_host(host) {
+        print_warning(
+            "API is bound to all interfaces. Only do this behind a trusted network boundary, firewall, or reverse proxy.",
+        );
+    }
 }
 
 /// Consume inbound system messages (e.g. subagent announcements) and print responses.
@@ -613,7 +706,7 @@ fn interactive_welcome_text(markdown: bool) -> String {
         format!(
             "{LOGO} Interactive mode \n({}; {}; {}; {}; {})\n",
             "type **exit** or **Ctrl+D** to quit",
-            "**Ctrl+Enter** for a new line",
+            "**Ctrl+O** for a new line",
             "**Alt+I** or **Ctrl+Tab** to paste image",
             "**Ctrl+V** or **Alt+V** to paste text",
             "Type **/help** for available commands",
@@ -622,7 +715,7 @@ fn interactive_welcome_text(markdown: bool) -> String {
         format!(
             "{LOGO} Interactive mode \n({}; {}; {}; {}; {})\n",
             "type exit or Ctrl+D to quit",
-            "Ctrl+Enter for a new line",
+            "Ctrl+O for a new line",
             "Alt+I or Ctrl+Tab to paste image",
             "Ctrl+V or Alt+V to paste text",
             "Type /help for available commands",
@@ -656,8 +749,26 @@ fn interactive_keybindings() -> Keybindings {
         KeyCode::Char('v'),
         ReedlineEvent::ExecuteHostCommand(TEXT_PASTE_COMMAND.to_string()),
     );
+    // Newline without submitting. Ctrl/Shift/Alt+Enter cannot be used reliably:
+    // with ENABLE_VIRTUAL_TERMINAL_INPUT (needed for bracketed paste), Windows
+    // Terminal reports every modifier+Enter as a bare `\r`, so the modifier is
+    // lost before reedline sees it. A Ctrl+<letter> arrives as a real control
+    // byte (0x0F for Ctrl+O), which survives VT input and is parsed as
+    // Char('o') + CONTROL on every platform.
     kb.add_binding(
         KeyModifiers::CONTROL,
+        KeyCode::Char('o'),
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+    // Also honor Alt+Enter / Shift+Enter (reedline defaults) for terminals that
+    // do disambiguate them (e.g. kitty-protocol-capable emulators on Unix).
+    kb.add_binding(
+        KeyModifiers::ALT,
+        KeyCode::Enter,
+        ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
+    );
+    kb.add_binding(
+        KeyModifiers::SHIFT,
         KeyCode::Enter,
         ReedlineEvent::Edit(vec![EditCommand::InsertNewline]),
     );
@@ -689,7 +800,8 @@ fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
     let history_result = FileBackedHistory::with_file(100, history_file);
 
     match history_result {
-        Ok(history) => build_reedline(Some(history), text_captures),
+        Ok(history) => build_reedline(Some(history), text_captures)
+            .use_kitty_keyboard_enhancement(true),
         Err(e) => {
             log::warn!("Failed to read history file: {}", e);
             build_reedline(None, text_captures)

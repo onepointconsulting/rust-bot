@@ -8,7 +8,7 @@ chrono = { version = "0.4", features = ["serde"] }
 home = "0.5.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = {version = "1.0", features = ["preserve_order"]}
-tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time"] }
+tokio = { version = "1", features = ["sync", "rt-multi-thread", "macros", "time", "net", "signal"] }
 similar = "2"
 globwalk = "0.9"
 futures = "0.3"
@@ -49,6 +49,10 @@ png = "0.17"
 crossterm = "0.29"
 yup-oauth2 = "12.1.2"
 adk-anthropic = "1.0.0"
+utoipa = { version = "5.5.0", features = ["axum_extras"] }
+utoipa-axum = "0.2.0"
+utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
+axum = "0.8.9"
 
 [dev-dependencies]
 tempfile = "3"

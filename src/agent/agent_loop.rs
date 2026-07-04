@@ -537,7 +537,7 @@ impl AgentLoop {
     ///
     /// Takes `&self` (state is held in atomics / a mutex) so it can be called
     /// from a shared `Arc<Self>` in the run loop.
-    async fn connect_mcp(&self) {
+    pub async fn connect_mcp(&self) {
         if self.mcp_connected.load(Ordering::Relaxed)
             || self.mcp_connecting.load(Ordering::Relaxed)
             || self.mcp_servers.is_empty()

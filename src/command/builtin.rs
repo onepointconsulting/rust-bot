@@ -1,6 +1,6 @@
 use crate::{
     PKG_VERSION, bus::events::OutboundMessage, command::{CommandContext, CommandHandler, CommandRouter}, utils::{
-        gitstore::{CommitInfo, GitStore}, helpers::build_status_content, restart::restart_with_notice, searchusage::fetch_search_usage
+        cli::convert_text_to_markdown, gitstore::{CommitInfo, GitStore}, helpers::build_status_content, restart::restart_with_notice, searchusage::fetch_search_usage
     }
 };
 use async_trait::async_trait;
@@ -535,12 +535,12 @@ impl CommandHandler for CmdTools {
                 .filter_map(|name| {
                     registry
                         .get(name)
-                        .map(|tool| format!("- {name} — {}", tool.description()))
+                        .map(|tool| format!("- **{name}** — {}", tool.description()))
                 })
                 .collect();
             format!("Tools ({} available):\n{}", lines.len(), lines.join("\n"))
         };
-        reply_as_text(ctx, content)
+        reply_as_text(ctx, convert_text_to_markdown(&content))
     }
 }
 

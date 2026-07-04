@@ -864,7 +864,7 @@ pub enum McpTransportType {
 }
 
 /// MCP server connection configuration (stdio or HTTP).
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpServerConfig {
     /// Transport type. Auto-detected from `command`/`url` when `None`.

@@ -9,3 +9,4 @@ pub mod restart;
 pub mod searchusage;
 pub mod logo;
 pub mod registry_helper;
+pub mod cli;

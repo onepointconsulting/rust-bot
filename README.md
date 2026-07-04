@@ -212,7 +212,8 @@ The line editor uses **Emacs** keybindings. The full default set is available; t
 | `Alt+T` | Transpose words |
 | `Ctrl+I` / `Tab` | _(custom)_ Paste image from clipboard — see [Image paste](#image-paste) |
 | `Alt+V` | _(custom)_ Paste clipboard text into the current prompt — see [Text paste](#text-paste) |
-| `Ctrl+Enter` | _(custom)_ Insert a newline, do not submit — see [Multi-line input](#multi-line-input) |
+| `Ctrl+O` | _(custom)_ Insert a newline, do not submit — see [Multi-line input](#multi-line-input) |
+| `Alt+Enter` / `Shift+Enter` | Insert a newline, do not submit (only on terminals that report the modifier — see [Multi-line input](#multi-line-input)) |
 | `Ctrl+C` | Cancel the current line and re-show the prompt (does not exit) |
 | `Ctrl+L` | Clear the screen |
 
@@ -256,9 +257,11 @@ This is useful when pasting larger snippets, code, logs, or text that may contai
 
 ### Multi-line input
 
-By default, `Enter` submits the current line. To continue a thought on a new line without sending the message, press `Ctrl+Enter` — a newline is inserted and you can keep typing. The whole block is sent to the agent as a single message when you finally press `Enter` on an empty trailing line (or on the last actual line).
+By default, `Enter` submits the current line. To continue a thought on a new line without sending the message, press `Ctrl+O` — a newline is inserted and you can keep typing. The whole block is sent to the agent as a single message when you finally press `Enter`.
 
 This is useful for pasting code blocks, listing steps, or writing prompts that span several lines.
+
+> **Why not `Ctrl+Enter`?** The console enables `ENABLE_VIRTUAL_TERMINAL_INPUT` (required for bracketed paste). In that mode Windows Terminal reports `Ctrl+Enter`, `Shift+Enter`, and `Alt+Enter` all as a plain `Enter`, so the modifier is lost before it reaches the line editor. A `Ctrl`+letter combo (`Ctrl+O`) arrives as a distinct control byte and works reliably on every platform. `Alt+Enter` / `Shift+Enter` still work on terminals that disambiguate them (e.g. kitty-protocol-capable emulators on Unix).
 
 ### Leaving the console
 
