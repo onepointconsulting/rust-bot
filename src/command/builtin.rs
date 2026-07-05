@@ -1,11 +1,19 @@
 use crate::{
-    PKG_VERSION, bus::events::OutboundMessage, command::{CommandContext, CommandHandler, CommandRouter}, utils::{
-        cli::convert_text_to_markdown, gitstore::{CommitInfo, GitStore}, helpers::build_status_content, restart::restart_with_notice, searchusage::fetch_search_usage
-    }
+    PKG_VERSION,
+    agent::context::BOOTSTRAP_FILES,
+    bus::events::OutboundMessage,
+    command::{CommandContext, CommandHandler, CommandRouter},
+    utils::{
+        cli::convert_text_to_markdown,
+        gitstore::{CommitInfo, GitStore},
+        helpers::build_status_content,
+        restart::restart_with_notice,
+        searchusage::fetch_search_usage,
+    },
 };
 use async_trait::async_trait;
 use futures::FutureExt;
-use std::{panic::AssertUnwindSafe, sync::Arc, time::Instant};
+use std::{fs, io, panic::AssertUnwindSafe, path::{Path, PathBuf}, sync::Arc, time::Instant};
 
 /// Build an outbound reply addressed back to the inbound message's channel/chat.
 fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
@@ -559,6 +567,93 @@ impl CommandHandler for CmdWorkspace {
     }
 }
 
+struct CmdCleanup;
+
+/// Workspace subtrees that must never be touched by `/cleanup`.
+const CLEANUP_EXCLUDED_DIRS: &[&str] = &[
+    "skills",
+    "memory",
+    "credentials",
+    "sessions",
+    "cron",
+    ".git",
+];
+
+/// Individual files to preserve anywhere in the workspace tree.
+const CLEANUP_EXCLUDED_FILES: &[&str] = &["HEARTBEAT.md", ".gitignore"];
+
+impl CmdCleanup {
+    fn path_has_excluded_dir(path: &Path, workspace: &Path) -> bool {
+        let Ok(rel) = path.strip_prefix(workspace) else {
+            return true;
+        };
+        rel.components().any(|component| {
+            if let std::path::Component::Normal(name) = component {
+                CLEANUP_EXCLUDED_DIRS
+                    .iter()
+                    .any(|excluded| name.eq_ignore_ascii_case(excluded))
+            } else {
+                false
+            }
+        })
+    }
+
+    fn is_protected_file(path: &Path) -> bool {
+        let Some(name) = path.file_name().and_then(|s| s.to_str()) else {
+            return true;
+        };
+        BOOTSTRAP_FILES
+            .iter()
+            .any(|file| name.eq_ignore_ascii_case(file))
+            || CLEANUP_EXCLUDED_FILES
+                .iter()
+                .any(|file| name.eq_ignore_ascii_case(file))
+    }
+
+    fn list_cleanable_files(dir: &Path, workspace: &Path) -> io::Result<Vec<PathBuf>> {
+        let mut files = Vec::new();
+        for entry in fs::read_dir(dir)? {
+            let path = entry?.path();
+            if Self::path_has_excluded_dir(&path, workspace) {
+                continue;
+            }
+            if path.is_dir() {
+                files.extend(Self::list_cleanable_files(&path, workspace)?);
+            } else if !Self::is_protected_file(&path) {
+                files.push(path);
+            }
+        }
+        Ok(files)
+    }
+}
+
+#[async_trait]
+impl CommandHandler for CmdCleanup {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/cleanup");
+        };
+        let workspace = agent_loop.consolidator.store.workspace.clone();
+        let files = match CmdCleanup::list_cleanable_files(&workspace, &workspace) {
+            Ok(files) => files,
+            Err(err) => {
+                return reply_as_text(
+                    ctx,
+                    format!("Cleanup failed while scanning workspace: {err}"),
+                );
+            }
+        };
+        let mut removed_count = 0;
+        for file in files {
+            log::info!("Cleanup removing {}", file.display());
+            if fs::remove_file(&file).is_ok() {
+                removed_count += 1;
+            }
+        }
+        reply_as_text(ctx, format!("Cleaned up {} files.", removed_count))
+    }
+}
+
 /// Build canonical help text shared across channels.
 fn build_help_text() -> String {
     let lines = vec![
@@ -574,6 +669,7 @@ fn build_help_text() -> String {
         "/mcp-list — List available MCP servers",
         "/tools — List available tools",
         "/workspace — Display the current workspace directory",
+        "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
     ];
     lines.join("\n")
 }
@@ -590,6 +686,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact("/mcp-list", Arc::new(CmdMcpList));
     router.exact("/tools", Arc::new(CmdTools));
     router.exact("/workspace", Arc::new(CmdWorkspace));
+    router.exact("/cleanup", Arc::new(CmdCleanup));
 }
 
 #[cfg(test)]
@@ -877,5 +974,41 @@ mod tests {
         );
         let out = CmdMcpList.handle(&ctx).await;
         assert!(out.content.contains("No agent available to execute command: /mcp-list"));
+    }
+
+    #[test]
+    fn cleanup_skips_protected_dirs_and_bootstrap_files() {
+        let workspace = tempfile::tempdir().expect("tempdir");
+        let root = workspace.path();
+
+        fs::create_dir_all(root.join("memory")).unwrap();
+        fs::create_dir_all(root.join("sessions")).unwrap();
+        fs::create_dir_all(root.join(".rust-bot/tool-results/default")).unwrap();
+        fs::write(root.join("memory/MEMORY.md"), "keep").unwrap();
+        fs::write(root.join("sessions/cli.json"), "keep").unwrap();
+        fs::write(root.join("AGENTS.md"), "keep").unwrap();
+        fs::write(root.join("HEARTBEAT.md"), "keep").unwrap();
+        fs::write(root.join("scratch.txt"), "remove").unwrap();
+        fs::write(root.join(".rust-bot/tool-results/default/abc.txt"), "remove").unwrap();
+
+        let cleanable = CmdCleanup::list_cleanable_files(root, root).unwrap();
+        let rel_paths: Vec<String> = cleanable
+            .iter()
+            .map(|path| {
+                path.strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .replace('\\', "/")
+            })
+            .collect();
+
+        let mut expected = vec![
+            "scratch.txt".to_string(),
+            ".rust-bot/tool-results/default/abc.txt".to_string(),
+        ];
+        let mut actual = rel_paths;
+        expected.sort();
+        actual.sort();
+        assert_eq!(actual, expected);
     }
 }
