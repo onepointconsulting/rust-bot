@@ -393,6 +393,7 @@ impl MemoryStore {
     }
 
     pub fn read_unprocessed_history(&self, since_cursor: u64) -> Vec<serde_json::Value> {
+        log::info!("Dream: reading unprocessed history since cursor: {}", since_cursor);
         self.read_entries()
             .into_iter()
             .filter(|e| {
@@ -421,10 +422,12 @@ impl MemoryStore {
 
     /// Read all entries from self.history_file as JSONL lines line by line skipping blank lines.
     fn read_entries(&self) -> Vec<serde_json::Value> {
+        log::info!("Dream: reading entries from history file: {}", self.history_file.display());
         let file_result = File::open(&self.history_file);
         let mut entries = Vec::new();
         if let Ok(f) = file_result {
             let reader = BufReader::new(f);
+            log::info!("Dream: reader created");
             for line_result in reader.lines() {
                 if let Ok(line) = line_result {
                     if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line.trim()) {
@@ -432,6 +435,8 @@ impl MemoryStore {
                     } else {
                         log::error!("Failed to parse JSONL line: {}", line);
                     }
+                } else {
+                    log::error!("Failed to read line: {}", line_result.unwrap_err());
                 }
             }
         } else {
@@ -440,6 +445,7 @@ impl MemoryStore {
                 self.history_file.display()
             );
         }
+        log::info!("Dream: entries read: {}", entries.len());
         entries
     }
 
@@ -986,9 +992,11 @@ impl Dream {
 
     /// Process unprocessed history entries. Returns True if work was done.    
     pub async fn run(&self) -> bool {
+        log::info!("Dream: running");
         let last_cursor = self.store.get_last_dream_cursor();
         let entries = self.store.read_unprocessed_history(last_cursor);
         if entries.is_empty() {
+            log::info!("Dream: no entries to process");
             return false;
         }
 

@@ -285,7 +285,8 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     // The gateway handles those in `AgentLoop::run()`; CLI uses `process_direct`
     // instead, so we need a background listener to deliver async results.
     let system_listener = spawn_system_message_listener(Arc::clone(&agent_loop), markdown);
-
+    let outbound_listener =
+        spawn_outbound_message_listener(Arc::clone(&agent_loop), markdown);
     let result = match args.message {
         Some(message) if !message.is_empty() => {
             message_session(
@@ -311,6 +312,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     };
 
     system_listener.abort();
+    outbound_listener.abort();
     result
 }
 
@@ -383,6 +385,40 @@ fn spawn_system_message_listener(
             }
         }
     })
+}
+
+/// Consume async outbound messages (e.g. `/dream` completion) and print them.
+fn spawn_outbound_message_listener(
+    agent_loop: Arc<AgentLoop>,
+    markdown: bool,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let bus = agent_loop.bus();
+        while let Some(msg) = bus.consume_outbound().await {
+            if !msg.channel.eq_ignore_ascii_case("cli") {
+                continue;
+            }
+            if is_internal_outbound(&msg) {
+                continue;
+            }
+            print_agent_response_with_header(
+                &msg.content,
+                markdown,
+                Some(&msg.metadata),
+                true,
+            );
+        }
+    })
+}
+
+/// Skip progress/stream control messages that gateway mode routes via outbound.
+fn is_internal_outbound(msg: &OutboundMessage) -> bool {
+    let meta = &msg.metadata;
+    meta.get("_progress").and_then(|v| v.as_bool()) == Some(true)
+        || meta.get("_stream_delta").and_then(|v| v.as_bool()) == Some(true)
+        || meta.get("_stream_end").and_then(|v| v.as_bool()) == Some(true)
+        || (msg.content.is_empty()
+            && (meta.contains_key("_stream_end") || meta.contains_key("_stream_delta")))
 }
 
 async fn handle_cli_system_message(

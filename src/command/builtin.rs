@@ -256,6 +256,7 @@ impl CommandHandler for CmdDream {
                     format!("Dream failed after {:.1}s: {detail}", elapsed)
                 }
             };
+            log::info!("Dream: content: {}", content);
             let _ = bus.publish_outbound(OutboundMessage {
                 channel,
                 chat_id,
