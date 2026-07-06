@@ -22,6 +22,7 @@ use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
+use crate::agent::tools::filesystem::FsToolConfig;
 use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_from_config};
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
@@ -32,16 +33,14 @@ use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    AgentDefaults, ChannelsConfig, ExecToolConfig, GmailToolConfig, McpServerConfig,
-    OcrToolConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig,
+    AgentDefaults, ChannelsConfig, DocxToolConfig, ExecToolConfig, GmailToolConfig, McpServerConfig, OcrToolConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
-    filesystem_tool_scope, register_filesystem_tools, register_gmail_tools, register_ocr_tools,
-    register_web_tools,
+    filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_ocr_tools, register_web_tools,
 };
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
@@ -343,6 +342,7 @@ impl AgentLoop {
         exec_config: Option<ExecToolConfig>,
         gmail_config: Option<GmailToolConfig>,
         ocr_config: Option<OcrToolConfig>,
+        docx_config: Option<DocxToolConfig>,
         subagent_config: Option<SubagentConfig>,
         cron_service: Option<Arc<CronService>>,
         restrict_to_workspace: Option<bool>,
@@ -358,6 +358,7 @@ impl AgentLoop {
         let exec_config = exec_config.unwrap_or(ExecToolConfig::default());
         let gmail_config = gmail_config.unwrap_or(GmailToolConfig::default());
         let ocr_config = ocr_config.unwrap_or(OcrToolConfig::default());
+        let docx_config = docx_config.unwrap_or(DocxToolConfig::default());
         let subagent_config = subagent_config.unwrap_or(SubagentConfig::default());
         let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
@@ -387,6 +388,7 @@ impl AgentLoop {
             Some(exec_config.clone()),
             Some(gmail_config.clone()),
             Some(ocr_config.clone()),
+            Some(docx_config.clone()),
             Some(subagent_config.clone()),
             Some(restrict_to_workspace),
         ));
@@ -398,6 +400,7 @@ impl AgentLoop {
             &web_config,
             &gmail_config,
             &ocr_config,
+            &docx_config,
             bus.clone(),
             &cron_service,
             &timezone,
@@ -487,6 +490,7 @@ impl AgentLoop {
         web_config: &WebToolsConfig,
         gmail_config: &GmailToolConfig,
         ocr_config: &OcrToolConfig,
+        docx_config: &DocxToolConfig,
         bus: Arc<MessageBus>,
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
@@ -518,7 +522,13 @@ impl AgentLoop {
         }
         register_web_tools(web_config, tools);
         register_gmail_tools(gmail_config, workspace, tools);
-        register_ocr_tools(ocr_config, workspace, allowed_dir, extra_read, tools);
+        register_ocr_tools(ocr_config, workspace, allowed_dir.clone(), extra_read.clone(), tools);
+        register_conversion_tools(
+            docx_config, 
+            &FsToolConfig::new(
+                Some(workspace.clone()),
+                 allowed_dir, Some(extra_read)), tools
+        );
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",
@@ -1892,6 +1902,7 @@ mod tests {
             None,
             None,
             None,
+            None
         ))
     }
 

@@ -13,9 +13,7 @@ use crate::utils::helpers::{
 };
 
 use crate::utils::runtime::{
-    EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
-    coerce_tool_execute_result, ensure_nonempty_tool_result, is_blank_text,
-    repeated_external_lookup_error,
+    EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message, build_truncated_tool_call_recovery_message, coerce_tool_execute_result, ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
@@ -825,6 +823,16 @@ impl AgentRunner {
 
             // ── Tool calls branch ─────────────────────────────────────────────
             if !response.tool_calls.is_empty() {
+                if response.finish_reason == "length" && length_recoveries < MAX_LENGTH_RECOVERIES {
+                    hook.on_stream_end(&mut ctx, true).await;
+                    log::warn!(
+                        "Tool call response truncated (finish_reason=length); skipping execution"
+                    );
+                    messages.push(build_truncated_tool_call_recovery_message());
+                    length_recoveries += 1;
+                    hook.after_iteration(&mut ctx).await;
+                    continue;
+                }
                 log::info!("Tool calls: {}", response.tool_calls.iter().map(|tc| tc.to_string()).collect::<Vec<String>>().join("\n"));
                 hook.on_stream_end(&mut ctx, true).await;
 

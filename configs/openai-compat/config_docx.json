@@ -1,8 +1,8 @@
 {
   "agents": {
-    "workspace": "~/.rust-bot/workspace2",
-    "model": "${ANTHROPIC_API_MODEL}",
-    "provider": "anthropic",
+    "workspace": "~/.rust-bot/workspace",
+    "model": "${OPENAI_API_MODEL}",
+    "provider": "openrouter",
     "maxTokens": 32768,
     "contextWindowTokens": 65536,
     "temperature": 0.1,
@@ -25,9 +25,9 @@
     "transcriptionProvider": "groq"
   },
   "providers": {
-    "anthropic": {
-      "apiKey": "${ANTHROPIC_API_KEY}",
-      "apiBase": "${ANTHROPIC_API_BASE}",
+    "custom": {
+      "apiKey": "${OPENAI_API_KEY}",
+      "apiBase": "${OPENAI_API_BASE}",
       "extraHeaders": null
     }
   },
@@ -68,13 +68,6 @@
       "client_secret_path": "~/.rust-bot/workspace/credentials/client_secret.json",
       "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
       "max_results": 20
-    },
-    "ocr": {
-      "enable": true,
-      "provider": "anthropic",
-      "apiKey": "${ANTHROPIC_API_KEY}",
-      "model": "${ANTHROPIC_API_MODEL}",
-      "baseUrl": "${ANTHROPIC_API_BASE}"
     },
     "docx": {
       "enable": true

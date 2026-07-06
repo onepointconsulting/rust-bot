@@ -23,6 +23,13 @@ const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234
 /// a complete `\n\n`-terminated event from growing memory without bound.
 const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 
+/// Claude 5 models reject legacy `temperature` and `thinking.type.enabled`.
+const CLAUDE_5_MODEL_PREFIXES: &[&str] = &[
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-haiku-5",
+];
+
 fn gen_tool_id() -> String {
     let mut rng = rand::rng();
     let suffix: String = (0..22)
@@ -473,7 +480,7 @@ impl AnthropicProvider {
         };
 
         let mut args = HashMap::new();
-        args.insert("model".to_string(), serde_json::Value::String(model_name));
+        args.insert("model".to_string(), serde_json::Value::String(model_name.clone()));
         args.insert(
             "messages".to_string(),
             serde_json::Value::Array(anthropic_msgs),
@@ -493,14 +500,33 @@ impl AnthropicProvider {
             args.insert("system".to_string(), system);
         }
 
-        if let Some(reasoning_effort) = reasoning_effort.clone()
+        if Self::uses_adaptive_thinking(&model_name) {
+            if thinking_enabled {
+                args.insert(
+                    "thinking".to_string(),
+                    serde_json::json!({"type": "adaptive"}),
+                );
+                if let Some(reasoning_effort) = reasoning_effort.as_ref()
+                    && reasoning_effort != "adaptive"
+                {
+                    args.insert(
+                        "output_config".to_string(),
+                        serde_json::json!({"effort": reasoning_effort}),
+                    );
+                }
+            } else if Self::supports_temperature(&model_name) {
+                args.insert("temperature".to_string(), serde_json::json!(temperature));
+            }
+        } else if let Some(reasoning_effort) = reasoning_effort.clone()
             && reasoning_effort == "adaptive"
         {
             args.insert(
                 "thinking".to_string(),
                 serde_json::json!({"type": "adaptive"}),
             );
-            args.insert("temperature".to_string(), serde_json::json!(1.0));
+            if Self::supports_temperature(&model_name) {
+                args.insert("temperature".to_string(), serde_json::json!(1.0));
+            }
         } else if let Some(reasoning_effort) = reasoning_effort
             && thinking_enabled
         {
@@ -521,8 +547,10 @@ impl AnthropicProvider {
                     budget_tokens + 4096,
                 ) as u32)),
             );
-            args.insert("temperature".to_string(), serde_json::json!(1.0));
-        } else {
+            if Self::supports_temperature(&model_name) {
+                args.insert("temperature".to_string(), serde_json::json!(1.0));
+            }
+        } else if Self::supports_temperature(&model_name) {
             args.insert("temperature".to_string(), serde_json::json!(temperature));
         }
 
@@ -553,6 +581,39 @@ impl AnthropicProvider {
         }
 
         args
+    }
+
+    fn is_claude_5_family(model: &str) -> bool {
+        CLAUDE_5_MODEL_PREFIXES
+            .iter()
+            .any(|prefix| model.starts_with(prefix))
+    }
+
+    fn supports_temperature(model: &str) -> bool {
+        !Self::is_claude_5_family(model)
+    }
+
+    fn uses_adaptive_thinking(model: &str) -> bool {
+        Self::is_claude_5_family(model)
+    }
+
+    fn format_api_error(status: u16, body: &str) -> String {
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
+            if let Some(message) = json
+                .get("error")
+                .and_then(|error| error.get("message"))
+                .and_then(|message| message.as_str())
+            {
+                return format!("Anthropic API error ({status}): {message}");
+            }
+        }
+
+        let trimmed = body.trim();
+        if trimmed.is_empty() {
+            format!("Anthropic API error ({status})")
+        } else {
+            format!("Anthropic API error ({status}): {trimmed}")
+        }
     }
 
     fn apply_cache_control(
@@ -733,33 +794,33 @@ impl AnthropicProvider {
 
     async fn parse_response(response: Result<reqwest::Response, reqwest::Error>) -> LLMResponse {
         match response {
-            Ok(response) => match response.json::<serde_json::Value>().await {
-                Ok(content) => Self::parse_json_response(content),
-                Err(e) => LLMResponse {
-                    content: Some(format!(
-                        "No content:Code: {}, Error: {}",
-                        e.status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
-                        e
+            Ok(response) => {
+                let status = response.status();
+                if !status.is_success() {
+                    let body = response.text().await.unwrap_or_default();
+                    log::error!(
+                        "Anthropic API request failed ({}): {}",
+                        status.as_u16(),
+                        body.chars().take(500).collect::<String>()
+                    );
+                    return Self::handle_error(Self::format_api_error(status.as_u16(), &body));
+                }
+                match response.json::<serde_json::Value>().await {
+                    Ok(content) => Self::parse_json_response(content),
+                    Err(e) => Self::handle_error(format!(
+                        "Anthropic API response parse error ({}): {e}",
+                        e.status()
+                            .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR)
+                            .as_u16()
                     )),
-                    finish_reason: "error".to_string(),
-                    tool_calls: Vec::new(),
-                    usage: HashMap::new(),
-                    reasoning_content: None,
-                    thinking_blocks: None,
-                },
-            },
-            Err(e) => LLMResponse {
-                content: Some(format!(
-                    "Code: {}, Error: {}",
-                    e.status().unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR),
-                    e
-                )),
-                finish_reason: "error".to_string(),
-                tool_calls: Vec::new(),
-                usage: HashMap::new(),
-                reasoning_content: None,
-                thinking_blocks: None,
-            },
+                }
+            }
+            Err(e) => Self::handle_error(format!(
+                "Anthropic API transport error ({}): {e}",
+                e.status()
+                    .unwrap_or(http::StatusCode::INTERNAL_SERVER_ERROR)
+                    .as_u16()
+            )),
         }
     }
 
@@ -1838,6 +1899,42 @@ mod tests {
         let resp = AnthropicProvider::parse_json_response(body);
 
         assert!(resp.usage.is_empty());
+    }
+
+    #[test]
+    fn supports_temperature_for_claude_4_models() {
+        assert!(AnthropicProvider::supports_temperature("claude-sonnet-4-6"));
+        assert!(AnthropicProvider::supports_temperature("claude-opus-4-6"));
+        assert!(AnthropicProvider::supports_temperature("claude-haiku-4-5"));
+    }
+
+    #[test]
+    fn supports_temperature_rejects_claude_5_models() {
+        assert!(!AnthropicProvider::supports_temperature("claude-sonnet-5"));
+        assert!(!AnthropicProvider::supports_temperature("claude-opus-5"));
+        assert!(!AnthropicProvider::supports_temperature("claude-haiku-5"));
+    }
+
+    #[test]
+    fn uses_adaptive_thinking_for_claude_5_models() {
+        assert!(AnthropicProvider::uses_adaptive_thinking("claude-sonnet-5"));
+        assert!(!AnthropicProvider::uses_adaptive_thinking("claude-sonnet-4-6"));
+    }
+
+    #[test]
+    fn format_api_error_extracts_anthropic_message() {
+        let body = r#"{"type":"error","error":{"type":"invalid_request_error","message":"`temperature` is deprecated for this model."}}"#;
+        let message = AnthropicProvider::format_api_error(400, body);
+        assert_eq!(
+            message,
+            "Anthropic API error (400): `temperature` is deprecated for this model."
+        );
+    }
+
+    #[test]
+    fn format_api_error_falls_back_to_raw_body() {
+        let message = AnthropicProvider::format_api_error(502, "bad gateway");
+        assert_eq!(message, "Anthropic API error (502): bad gateway");
     }
 
     #[test]

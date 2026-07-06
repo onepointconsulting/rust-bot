@@ -115,10 +115,11 @@ fn _find_match(content: &str, old_text: &str) -> (Option<String>, usize) {
 // expressed as a plain struct that each FS tool embeds by composition.
 // ---------------------------------------------------------------------------
 
+#[derive(Debug, Clone)]
 pub struct FsToolConfig {
-    pub(crate) workspace: Option<PathBuf>,
-    pub(crate) allowed_dir: Option<PathBuf>,
-    pub(crate) extra_allowed_dirs: Option<Vec<PathBuf>>,
+    pub workspace: Option<PathBuf>,
+    pub allowed_dir: Option<PathBuf>,
+    pub extra_allowed_dirs: Option<Vec<PathBuf>>,
 }
 
 impl FsToolConfig {
@@ -138,6 +139,12 @@ impl FsToolConfig {
             self.allowed_dir.clone(),
             self.extra_allowed_dirs.clone(),
         )
+    }
+}
+
+impl Default for FsToolConfig {
+    fn default() -> Self {
+        Self { workspace: Some(PathBuf::from("~/workspace")), allowed_dir: None, extra_allowed_dirs: None }
     }
 }
 
@@ -383,7 +390,8 @@ impl Tool for WriteFileTool {
     }
     
     fn description(&self) -> String {
-        "Write content to a file at the given path. Creates parent directories if needed."
+        "Write content to a file at the given path. Creates parent directories if needed. \
+For large files, write an initial chunk with this tool, then append further sections with edit_file."
             .to_string()
     }
 
@@ -396,7 +404,7 @@ impl Tool for WriteFileTool {
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "The file path to write to"},
-                "content": {"type": "string", "description": "The content to write"},
+                "content": {"type": "string", "description": "The content to write. Must be a valid UTF-8 string. For large files, keep each write under ~3000 tokens and append with edit_file."},
             },
             "required": ["path", "content"],
         })

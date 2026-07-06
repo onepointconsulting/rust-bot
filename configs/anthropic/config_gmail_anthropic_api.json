@@ -1,6 +1,6 @@
 {
   "agents": {
-    "workspace": "~/.rust-bot/workspace2",
+    "workspace": "~/.rust-bot/workspace_api",
     "model": "${ANTHROPIC_API_MODEL}",
     "provider": "anthropic",
     "maxTokens": 32768,
@@ -75,9 +75,6 @@
       "apiKey": "${ANTHROPIC_API_KEY}",
       "model": "${ANTHROPIC_API_MODEL}",
       "baseUrl": "${ANTHROPIC_API_BASE}"
-    },
-    "docx": {
-      "enable": true
     },
     "restrictToWorkspace": false,
     "mcpServers": {},

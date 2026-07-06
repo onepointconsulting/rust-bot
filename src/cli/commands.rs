@@ -249,6 +249,7 @@ fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
         Some(config.tools.exec.clone()),
         Some(config.tools.gmail.clone()),
         Some(config.tools.ocr.clone()),
+        Some(config.tools.docx.clone()),
         Some(config.subagent.clone()),
         Some(cron_service),
         Some(config.tools.restrict_to_workspace),

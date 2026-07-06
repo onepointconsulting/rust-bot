@@ -9,20 +9,10 @@ use chrono::Utc;
 
 use crate::{
     agent::{
-        context::ContextBuilder,
-        hook::{AgentHook, AgentHookContext},
-        runner::{AgentRunResult, AgentRunSpec, AgentRunner},
-        skills::SkillsLoader,
-        tools::{registry::ToolRegistry, shell::ShellTool},
-    },
-    bus::{events::InboundMessage, queue::MessageBus},
-    config::schema::{ExecToolConfig, GmailToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig},
-    providers::base::LLMProviderDyn,
-    utils::{
-        prompt_templates::render_template,
-        registry_helper::{
-            filesystem_tool_scope, register_filesystem_tools, register_gmail_tools,
-            register_ocr_tools, register_web_tools,
+        context::ContextBuilder, hook::{AgentHook, AgentHookContext}, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, skills::SkillsLoader, tools::{filesystem::FsToolConfig, registry::ToolRegistry, shell::ShellTool},
+    }, bus::{events::InboundMessage, queue::MessageBus}, config::schema::{DocxToolConfig, ExecToolConfig, GmailToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig}, providers::base::LLMProviderDyn, utils::{
+        prompt_templates::render_template, registry_helper::{
+            filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_ocr_tools, register_web_tools,
         },
     },
 };
@@ -64,6 +54,7 @@ pub struct SubagentManager {
     pub exec_config: ExecToolConfig,
     pub gmail_config: GmailToolConfig,
     pub ocr_config: OcrToolConfig,
+    pub docx_config: DocxToolConfig,
     pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
     pub runner: AgentRunner,
@@ -82,6 +73,7 @@ impl SubagentManager {
         exec_config: Option<ExecToolConfig>,
         gmail_config: Option<GmailToolConfig>,
         ocr_config: Option<OcrToolConfig>,
+        docx_config: Option<DocxToolConfig>,
         subagent_config: Option<SubagentConfig>,
         restrict_to_workspace: Option<bool>,
     ) -> Self {
@@ -95,6 +87,7 @@ impl SubagentManager {
             exec_config: exec_config.unwrap_or(ExecToolConfig::default()),
             gmail_config: gmail_config.unwrap_or(GmailToolConfig::default()),
             ocr_config: ocr_config.unwrap_or(OcrToolConfig::default()),
+            docx_config: docx_config.unwrap_or(DocxToolConfig::default()),
             subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             runner: AgentRunner::new(provider),
@@ -114,6 +107,7 @@ impl SubagentManager {
             workspace,
             bus,
             max_tool_result_chars,
+            None,
             None,
             None,
             None,
@@ -262,9 +256,18 @@ impl SubagentManager {
         register_ocr_tools(
             &self.ocr_config,
             &self.workspace,
-            allowed_dir,
-            extra_read,
+            allowed_dir.clone(),
+            extra_read.clone(),
             &mut tools,
+        );
+        register_conversion_tools(
+            &self.docx_config, 
+            &FsToolConfig::new(Some(
+                self.workspace.clone()), 
+                allowed_dir,
+                 Some(extra_read)
+            ), 
+            &mut tools
         );
 
         let system_prompt = self.build_subagent_prompt();

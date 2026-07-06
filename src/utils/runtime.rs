@@ -20,6 +20,13 @@ pub const LENGTH_RECOVERY_PROMPT: &str =
     "Output limit reached. Continue exactly where you left off \
      — no recap, no apology. Break remaining work into smaller steps if needed.";
 
+pub const TRUNCATED_TOOL_CALL_RECOVERY_PROMPT: &str =
+     "Your previous tool call was cut off because the output token limit was reached. \
+ The tool was NOT executed — its arguments were incomplete. \
+ Do not repeat the same large tool call. \
+ For write_file: write a smaller initial section first, then use edit_file to append \
+ remaining content in additional chunks.";
+
 // ── tool result helpers ───────────────────────────────────────────────────────
 
 /// Short prompt-safe marker for tools that completed without visible output.
@@ -178,6 +185,10 @@ pub fn repeated_external_lookup_error(
          Use the results you already have to answer, or try a meaningfully different source."
             .to_string(),
     )
+}
+
+pub fn build_truncated_tool_call_recovery_message() -> Value {
+    serde_json::json!({ "role": "user", "content": TRUNCATED_TOOL_CALL_RECOVERY_PROMPT })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────

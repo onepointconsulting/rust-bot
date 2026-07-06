@@ -687,6 +687,10 @@ fn default_ocr_tool_api_key() -> String {
     String::new()
 }
 
+fn default_docx_tool_enable() -> bool {
+    false
+}
+
 // ── GmailToolConfig ───────────────────────────────────────────────────────────
 
 /// Gmail Tool configuration.
@@ -731,6 +735,28 @@ impl Default for GmailToolConfig {
             token_cache_path: default_gmail_token_cache_path(),
             client_secret_path: default_gmail_client_secret_path(),
             max_results: default_gmail_max_results(),
+        }
+    }
+}
+
+// ── DocxToolConfig ───────────────────────────────────────────────────────────
+
+/// Gmail Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DocxToolConfig {
+    /// Enable or disable the Gmail Tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_docx_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+}
+
+impl Default for DocxToolConfig {
+
+    fn default() -> Self {
+        Self {
+            enable: default_docx_tool_enable(),
         }
     }
 }
@@ -959,6 +985,10 @@ pub struct ToolsConfig {
     #[garde(dive)]
     pub gmail: GmailToolConfig,
 
+    #[serde(alias = "docx")]
+    #[garde(dive)]
+    pub docx: DocxToolConfig,
+
     #[serde(alias = "ocr")]
     #[garde(dive)]
     pub ocr: OcrToolConfig,
@@ -973,6 +1003,7 @@ impl Default for ToolsConfig {
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
             gmail: GmailToolConfig::default(),
+            docx: DocxToolConfig::default(),
             ocr: OcrToolConfig::default(),
         }
     }

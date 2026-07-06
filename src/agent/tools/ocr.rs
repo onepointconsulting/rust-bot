@@ -117,7 +117,7 @@ impl OcrTool {
         workspace: PathBuf,
         allowed_dir: Option<PathBuf>,
         extra_read: Vec<PathBuf>,
-    ) -> Result<Self, String> {
+    ) -> Self {
         let provider = match config.provider {
             OcrProvider::Anthropic => AnthropicProvider::new(
                 Some(config.api_key.clone()).filter(|k| !k.is_empty()),
@@ -127,14 +127,14 @@ impl OcrTool {
                 None,
             ),
         };
-        Ok(Self {
+        Self {
             name: "ocr".to_string(),
             description: "Extract text from a PDF document or image file (png, jpg, gif, webp)."
                 .to_string(),
             config,
             fs: FsToolConfig::new(Some(workspace), allowed_dir, Some(extra_read)),
             provider,
-        })
+        }
     }
 }
 

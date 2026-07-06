@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::{
     agent::{
         skills::BUILTIN_SKILLS_DIR, tools::{
-            base::Tool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, ocr::OcrTool, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
+            base::Tool, docx::DocxConversionTool, filesystem::{EditFileTool, FsToolConfig, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, ocr::OcrTool, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
         },
-    }, config::schema::{GmailToolConfig, OcrToolConfig, WebToolsConfig},
+    }, config::schema::{DocxToolConfig, GmailToolConfig, OcrToolConfig, WebToolsConfig},
 };
 
 /// Workspace restriction and builtin-skills read path used by filesystem tools.
@@ -101,15 +101,26 @@ pub fn register_ocr_tools(
         return;
     }
     log::debug!("Registering OCR tool");
-    match OcrTool::new(
+    let tool = OcrTool::new(
         ocr_config.clone(),
         workspace.clone(),
         allowed_dir,
         extra_read,
-    ) {
-        Ok(tool) => tools.register(Box::new(tool)),
-        Err(e) => log::error!("Failed to register OCR tool: {e}"),
+    );
+    tools.register(Box::new(tool));
+}
+
+pub fn register_conversion_tools(
+    docx_config: &DocxToolConfig,
+    fs_tool_config: &FsToolConfig,
+    tools: &mut ToolRegistry,
+) {
+    if !docx_config.enable {
+        return;
     }
+    log::debug!("Registering DOCX tool");
+    let tool = DocxConversionTool::new(fs_tool_config.clone());
+    tools.register(Box::new(tool))
 }
 
 #[cfg(test)]
