@@ -929,7 +929,8 @@ impl LLMProvider for OpenAICompatProvider {
             reasoning_effort,
             tool_choice,
         );
-        log::debug!("chat stream request: {:?}", request_args);
+        // TODO: Uncomment this when we have a way to log the request
+        // log::debug!("chat stream request: {:?}", request_args);
         match request_args.build() {
             Ok(request) => {
                 match self.client.chat().create_stream(request).await {

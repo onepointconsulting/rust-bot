@@ -289,6 +289,19 @@ impl CommandHandler for CmdHelp {
     }
 }
 
+struct CmdModel;
+
+/// Show the LLM model currently configured for this session.
+#[async_trait]
+impl CommandHandler for CmdModel {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/model");
+        };
+        reply_as_text(ctx, format!("Model: {}", agent_loop.model))
+    }
+}
+
 struct CmdMcpList;
 
 fn format_mcp_list(servers: &[(String, String)]) -> String {
@@ -657,11 +670,12 @@ impl CommandHandler for CmdCleanup {
 /// Build canonical help text shared across channels.
 fn build_help_text() -> String {
     let lines = vec![
-        "🦀 nanobot commands:",
+        "🦀 rust-bot commands:",
         "/new — Start a new conversation",
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
+        "/model — Show the current LLM model",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -683,6 +697,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact("/dream-log", Arc::new(CmdDreamLog));
     router.exact("/dream-restore", Arc::new(CmdDreamRestore));
     router.exact("/help", Arc::new(CmdHelp));
+    router.exact("/model", Arc::new(CmdModel));
     router.exact("/mcp-list", Arc::new(CmdMcpList));
     router.exact("/tools", Arc::new(CmdTools));
     router.exact("/workspace", Arc::new(CmdWorkspace));
@@ -744,6 +759,135 @@ mod tests {
         );
         let out = CmdDream.handle(&ctx).await;
         assert_eq!(out.content, "No agent available to execute command: /dream.");
+    }
+
+    #[tokio::test]
+    async fn model_command_reports_current_model() {
+        use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
+
+        struct TestProvider;
+        #[async_trait]
+        impl LLMProviderDyn for TestProvider {
+            fn api_key(&self) -> Option<String> {
+                None
+            }
+            fn api_base(&self) -> Option<String> {
+                None
+            }
+            fn extra_headers(&self) -> Option<HashMap<String, String>> {
+                None
+            }
+            fn generation_settings(&self) -> &GenerationSettings {
+                static SETTINGS: std::sync::OnceLock<GenerationSettings> =
+                    std::sync::OnceLock::new();
+                SETTINGS.get_or_init(GenerationSettings::new)
+            }
+            fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+                unimplemented!()
+            }
+            fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+                None
+            }
+            fn get_default_model(&self) -> String {
+                "test".into()
+            }
+            async fn chat(
+                &self,
+                _: Vec<serde_json::Value>,
+                _: Option<Vec<serde_json::Value>>,
+                _: Option<String>,
+                _: usize,
+                _: f32,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+            ) -> LLMResponse {
+                LLMResponse::new()
+            }
+            async fn safe_chat(
+                &self,
+                _: Vec<serde_json::Value>,
+                _: Option<Vec<serde_json::Value>>,
+                _: Option<String>,
+                _: usize,
+                _: f32,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+            ) -> LLMResponse {
+                LLMResponse::new()
+            }
+            async fn chat_with_retry(
+                &self,
+                _: Vec<serde_json::Value>,
+                _: Option<Vec<serde_json::Value>>,
+                _: Option<String>,
+                _: Option<usize>,
+                _: Option<f32>,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+            ) -> LLMResponse {
+                LLMResponse::new()
+            }
+            async fn chat_stream_with_retry_boxed(
+                &self,
+                _: Vec<serde_json::Value>,
+                _: Option<Vec<serde_json::Value>>,
+                _: Option<String>,
+                _: Option<usize>,
+                _: Option<f32>,
+                _: Option<String>,
+                _: Option<serde_json::Value>,
+                _: Option<crate::providers::base::BoxedStreamCallback>,
+            ) -> LLMResponse {
+                LLMResponse::new()
+            }
+        }
+
+        let bus = Arc::new(crate::bus::queue::MessageBus::new());
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(TestProvider);
+        let loop_ = Arc::new(crate::agent::agent_loop::AgentLoop::new(
+            bus,
+            provider,
+            std::env::temp_dir(),
+            Some("claude-sonnet-5".into()),
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        ));
+        let ctx = CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: "/model".into(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "model",
+            "/model",
+            "",
+            Some(loop_),
+        );
+        let out = CmdModel.handle(&ctx).await;
+        assert_eq!(out.content, "Model: claude-sonnet-5");
     }
 
     #[tokio::test]

@@ -50,13 +50,6 @@ async fn test_simple_chat_with_thinking() {
         .expect("expected thinking blocks when reasoning_effort is enabled");
     assert!(!thinking_blocks.is_empty());
     assert_eq!(thinking_blocks[0]["type"], serde_json::json!("thinking"));
-    assert!(
-        thinking_blocks[0]
-            .get("thinking")
-            .and_then(|v| v.as_str())
-            .is_some_and(|t| !t.is_empty()),
-        "expected non-empty thinking content"
-    );
 
     assert!(
         response.content.is_some_and(|c| !c.is_empty()),

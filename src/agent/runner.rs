@@ -298,10 +298,14 @@ impl AgentRunner {
     ///      `spec.max_tokens` (or 4096 as a fallback).
     ///   3. Estimate the current prompt size; return unchanged if it already fits.
     ///   4. Separate system messages (which are always kept) from the rest.
-    ///   5. Walk non-system messages from newest to oldest, accumulating until the per-turn
-    ///      budget (`total budget - system tokens`, minimum 128) would be exceeded.
-    ///   6. Trim the kept slice so it starts on a user turn and has no orphaned tool results
-    ///      (via `find_legal_message_start`).
+    ///   5. Locate the last `user` message — it anchors the *current* turn, which must never be
+    ///      dropped even if its accompanying tool results alone exceed the remaining budget.
+    ///      Everything from that user message to the end of the list is kept unconditionally;
+    ///      older messages are then prepended, newest-first, while they still fit the per-turn
+    ///      budget (`total budget - system tokens - tool-definition tokens`, minimum 128).
+    ///      If no `user` message exists at all (e.g. a system-triggered turn), fall back to the
+    ///      previous purely greedy newest-to-oldest accumulation.
+    ///   6. Trim the kept slice so it has no orphaned tool results (via `find_legal_message_start`).
     ///   7. If nothing survives the trim, fall back to the last four non-system messages and
     ///      apply the same legality check.
     ///   8. Return system messages followed by the trimmed history.
@@ -313,7 +317,7 @@ impl AgentRunner {
             return messages;
         }
 
-        let max_output = spec.max_tokens.unwrap_or(4096);
+        let max_output = spec.max_tokens.unwrap_or(4096 * 2);
         let budget = spec
             .context_block_limit
             .map(|n| n as usize)
@@ -353,27 +357,58 @@ impl AgentRunner {
         }
 
         let system_tokens: usize = system_messages.iter().map(estimate_message_tokens).sum();
-        let remaining_budget = budget.saturating_sub(system_tokens).max(128);
+        let tool_defs_tokens = tools_slice
+            .map(|slice| estimate_prompt_tokens(&[], Some(slice)))
+            .unwrap_or(0);
+        let remaining_budget = budget
+            .saturating_sub(system_tokens)
+            .saturating_sub(tool_defs_tokens)
+            .max(128);
+
+        let last_user_idx = non_system
+            .iter()
+            .rposition(|m| m.get("role").and_then(Value::as_str) == Some("user"));
 
         let mut kept: Vec<Value> = Vec::new();
-        let mut kept_tokens = 0usize;
-        for message in non_system.iter().rev() {
-            let msg_tokens = estimate_message_tokens(message);
-            if !kept.is_empty() && kept_tokens + msg_tokens > remaining_budget {
-                break;
+        match last_user_idx {
+            Some(idx) => {
+                // The current turn (last user message onward) is mandatory: it is
+                // kept in full even if it alone exceeds the remaining budget, so the
+                // model never loses sight of the question it is meant to answer.
+                let mandatory = &non_system[idx..];
+                let mut kept_tokens: usize = mandatory.iter().map(estimate_message_tokens).sum();
+
+                let mut prefix: Vec<Value> = Vec::new();
+                for message in non_system[..idx].iter().rev() {
+                    let msg_tokens = estimate_message_tokens(message);
+                    if kept_tokens + msg_tokens > remaining_budget {
+                        break;
+                    }
+                    prefix.push(message.clone());
+                    kept_tokens += msg_tokens;
+                }
+                prefix.reverse();
+
+                kept = prefix;
+                kept.extend(mandatory.iter().cloned());
             }
-            kept.push(message.clone());
-            kept_tokens += msg_tokens;
+            None => {
+                // No user message in this batch — fall back to greedy newest-to-oldest
+                // accumulation, as before.
+                let mut kept_tokens = 0usize;
+                for message in non_system.iter().rev() {
+                    let msg_tokens = estimate_message_tokens(message);
+                    if !kept.is_empty() && kept_tokens + msg_tokens > remaining_budget {
+                        break;
+                    }
+                    kept.push(message.clone());
+                    kept_tokens += msg_tokens;
+                }
+                kept.reverse();
+            }
         }
-        kept.reverse();
 
         if !kept.is_empty() {
-            if let Some(first_user) = kept
-                .iter()
-                .position(|m| m.get("role").and_then(Value::as_str) == Some("user"))
-            {
-                kept = kept[first_user..].to_vec();
-            }
             let start = find_legal_message_start(&kept);
             if start > 0 {
                 kept = kept[start..].to_vec();
@@ -1617,6 +1652,60 @@ mod tests {
         assert_eq!(result.len(), 2, "expected only the recent pair to be kept");
         assert_eq!(result[0], recent_user);
         assert_eq!(result[1], recent_asst);
+    }
+
+    #[test]
+    fn test_snip_history_never_drops_current_user_turn() {
+        // Regression test for the bug where a single turn's large tool results
+        // (e.g. several web_search calls) consumed the entire snip budget on
+        // their own, causing the *current* user question to be dropped while
+        // its tool results were kept — leaving the model with results but no
+        // idea what was asked. The current turn (from the last user message
+        // onward) must always survive snipping, even if it alone exceeds the
+        // configured budget.
+        let user_msg = serde_json::json!({
+            "role": "user",
+            "content": "What are the best newsletter software offerings for a small business?"
+        });
+        let assistant_msg = serde_json::json!({
+            "role": "assistant",
+            "content": null,
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "web_search", "arguments": "{}"}},
+                {"id": "call_2", "type": "function", "function": {"name": "web_search", "arguments": "{}"}},
+                {"id": "call_3", "type": "function", "function": {"name": "web_search", "arguments": "{}"}},
+            ]
+        });
+        let large_result = "x".repeat(2_000);
+        let tool_1 = serde_json::json!({"role": "tool", "tool_call_id": "call_1", "name": "web_search", "content": large_result.clone()});
+        let tool_2 = serde_json::json!({"role": "tool", "tool_call_id": "call_2", "name": "web_search", "content": large_result.clone()});
+        let tool_3 = serde_json::json!({"role": "tool", "tool_call_id": "call_3", "name": "web_search", "content": large_result.clone()});
+
+        let messages = vec![
+            user_msg.clone(),
+            assistant_msg.clone(),
+            tool_1.clone(),
+            tool_2.clone(),
+            tool_3.clone(),
+        ];
+
+        // A tiny budget that the three large tool results alone vastly exceed.
+        let spec = AgentRunSpec {
+            context_window_tokens: Some(8_000),
+            context_block_limit: Some(100),
+            ..Default::default()
+        };
+        let runner = make_runner();
+        let result = runner.snip_history(&spec, messages.clone());
+
+        // The user question must survive, and the whole sequence must remain
+        // legal (every tool result's call id is declared by a preceding
+        // assistant message within the kept window).
+        assert!(
+            result.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("user")),
+            "current user turn was dropped by snip_history: {result:?}"
+        );
+        assert_eq!(result, messages, "the whole single turn should be kept intact");
     }
 
     // ── run_tool ──────────────────────────────────────────────────────────────

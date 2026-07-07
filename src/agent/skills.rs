@@ -283,7 +283,7 @@ impl SkillsLoader {
         let parsed: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                log::error!("Failed to parse skill metadata: {}", e);
+                log::warn!("Failed to parse skill metadata: {}", e);
                 return serde_json::json!({});
             }
         };
@@ -347,7 +347,7 @@ impl SkillsLoader {
             .unwrap_or(serde_json::json!({}));
         let empty_metadata = &serde_json::json!("");
         let metadata = meta.get("metadata").unwrap_or(empty_metadata);
-        return self.parse_rustbot_metadata(metadata.as_str().unwrap_or(""));
+        self.parse_rustbot_metadata(metadata.as_str().unwrap_or(""))
     }
 
     /// Get a description of missing requirements.
