@@ -1292,6 +1292,14 @@ impl AgentLoop {
             args: String::new(),
             agent_loop: Some(self.clone()),
         };
+        // Priority commands (/stop, /restart, /status) are normally handled inline by
+        // `run()`'s bus loop before it ever reaches `dispatch()`. Callers that skip the
+        // bus (API, CLI `process_direct`) still need them to be recognized here.
+        if self.commands.is_priority(raw) {
+            if let Some(result) = self.commands.dispatch_priority(&ctx).await {
+                return Some(result);
+            }
+        }
         if let Some(result) = self.commands.dispatch(&mut ctx).await {
             return Some(result);
         }

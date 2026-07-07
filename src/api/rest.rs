@@ -1,3 +1,4 @@
+use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -9,14 +10,17 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 use utoipa::OpenApi;
-use utoipa::ToSchema;
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
-use crate::agent::agent_loop::AgentLoop;
+use crate::{agent::agent_loop::AgentLoop, api::types::{ChatCommandRequest, ChatCommandResponse}, bus::events::OutboundMessage, command::types::ChatCommand};
+
+use super::types::{
+    AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
+    ChatMessage, Usage, extract_last_user_message,
+};
 
 pub struct ApiServer {
     pub agent_loop: Arc<AgentLoop>,
@@ -46,72 +50,9 @@ impl From<ApiServer> for AppState {
     }
 }
 
-#[derive(Debug, Deserialize, ToSchema)]
-struct ChatCompletionRequest {
-    messages: Vec<ChatMessage>,
-    #[serde(default)]
-    model: Option<String>,
-    #[serde(default)]
-    stream: Option<bool>,
-    #[serde(default)]
-    user: Option<String>,
-}
-
-#[derive(Debug, Deserialize, ToSchema)]
-struct ChatMessage {
-    role: String,
-    #[schema(value_type = String)]
-    content: ChatMessageContent,
-}
-
-#[derive(Debug, Deserialize)]
-#[serde(untagged)]
-enum ChatMessageContent {
-    Text(String),
-    Parts(Vec<ContentPart>),
-}
-
-#[derive(Debug, Deserialize)]
-struct ContentPart {
-    #[serde(rename = "type")]
-    part_type: String,
-    #[serde(default)]
-    text: Option<String>,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-struct ChatCompletionResponse {
-    id: String,
-    object: String,
-    created: i64,
-    model: String,
-    choices: Vec<ChatCompletionChoice>,
-    usage: Usage,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-struct ChatCompletionChoice {
-    index: u32,
-    message: AssistantMessage,
-    finish_reason: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-struct AssistantMessage {
-    role: String,
-    content: String,
-}
-
-#[derive(Debug, Serialize, ToSchema)]
-struct Usage {
-    prompt_tokens: u32,
-    completion_tokens: u32,
-    total_tokens: u32,
-}
-
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, chat_completions),
+    paths(health, chat_completions, chat_commands),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,
@@ -119,6 +60,9 @@ struct Usage {
         AssistantMessage,
         ChatMessage,
         Usage,
+        ChatCommandRequest,
+        ChatCommandResponse,
+        ChatCommand,
     )),
     tags((name = "chat", description = "OpenAI-compatible chat completions API"))
 )]
@@ -173,33 +117,6 @@ impl IntoResponse for ApiError {
 fn error_json(status: u16, message: &str, err_type: Option<String>) -> serde_json::Value {
     let err_type = err_type.unwrap_or_else(|| "invalid_request_error".to_string());
     serde_json::json!({"error": {"message": message, "type": err_type, "code": status}})
-}
-
-fn content_as_string(content: &ChatMessageContent) -> Option<String> {
-    match content {
-        ChatMessageContent::Text(text) => Some(text.clone()),
-        ChatMessageContent::Parts(parts) => {
-            let texts: Vec<&str> = parts
-                .iter()
-                .filter(|part| part.part_type == "text")
-                .filter_map(|part| part.text.as_deref())
-                .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(texts.join("\n"))
-            }
-        }
-    }
-}
-
-fn extract_last_user_message(messages: &[ChatMessage]) -> Option<String> {
-    messages
-        .iter()
-        .rev()
-        .filter(|message| message.role == "user")
-        .find_map(|message| content_as_string(&message.content))
-        .filter(|content| !content.trim().is_empty())
 }
 
 #[utoipa::path(
@@ -265,7 +182,16 @@ async fn chat_completions(
             .await
     };
 
-    let outbound = tokio::time::timeout(timeout, process)
+    let outbound = await_agent_outbound(process, timeout).await?;
+    Ok(Json(build_chat_completion_response(outbound, model)))
+}
+
+/// Await an agent response with a timeout, translating bus/timeout failures into `ApiError`.
+async fn await_agent_outbound(
+    process: impl Future<Output = Option<OutboundMessage>>,
+    timeout: Duration,
+) -> Result<OutboundMessage, ApiError> {
+    tokio::time::timeout(timeout, process)
         .await
         .map_err(|_| {
             ApiError::request_timeout(format!(
@@ -273,9 +199,11 @@ async fn chat_completions(
                 timeout.as_secs()
             ))
         })?
-        .ok_or_else(|| ApiError::internal("Agent did not produce a response."))?;
+        .ok_or_else(|| ApiError::internal("Agent did not produce a response."))
+}
 
-    Ok(Json(ChatCompletionResponse {
+fn build_chat_completion_response(outbound: OutboundMessage, model: String) -> ChatCompletionResponse {
+    ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
         created: Utc::now().timestamp(),
@@ -293,6 +221,52 @@ async fn chat_completions(
             completion_tokens: 0,
             total_tokens: 0,
         },
+    }
+}
+
+#[utoipa::path(
+    post,
+    path = "/v1/chat/commands",
+    request_body = ChatCommandRequest,
+    responses(
+        (status = 200, description = "Command response", body = ChatCommandResponse),
+        (status = 400, description = "Invalid request"),
+        (status = 408, description = "Request timed out"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "chat"
+)]
+async fn chat_commands(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ChatCommandRequest>,
+) -> Result<Json<ChatCommandResponse>, ApiError> {
+    let command = request.command;
+    let command_text = command.to_string();
+    let session_id = request
+        .session_id
+        .unwrap_or_else(|| state.session_id.clone());
+
+    let agent_loop = Arc::clone(&state.agent_loop);
+    let timeout = state.timeout;
+    let process = async move {
+        agent_loop
+            .process_direct(
+                command_text.as_str(),
+                Some(session_id.as_str()),
+                Some("api"),
+                Some("default"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+    };
+
+    let outbound = await_agent_outbound(process, timeout).await?;
+    Ok(Json(ChatCommandResponse {
+        command,
+        response: outbound.content,
     }))
 }
 
@@ -312,6 +286,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
+        .route("/v1/chat/commands", post(chat_commands))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state);
 

@@ -1,9 +1,5 @@
 use crate::{
-    PKG_VERSION,
-    agent::context::BOOTSTRAP_FILES,
-    bus::events::OutboundMessage,
-    command::{CommandContext, CommandHandler, CommandRouter},
-    utils::{
+    PKG_VERSION, agent::context::BOOTSTRAP_FILES, bus::events::OutboundMessage, command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand}, utils::{
         cli::convert_text_to_markdown,
         gitstore::{CommitInfo, GitStore},
         helpers::build_status_content,
@@ -123,7 +119,7 @@ impl CommandHandler for CmdRestart {
     }
 }
 
-struct CmdNew;
+pub struct CmdNew;
 
 /// Start a fresh session.
 #[async_trait]
@@ -689,19 +685,19 @@ fn build_help_text() -> String {
 }
 
 pub fn register_builtin_commands(router: &mut CommandRouter) {
-    router.priority("/stop", Arc::new(CmdStop));
-    router.priority("/restart", Arc::new(CmdRestart));
-    router.priority("/status", Arc::new(CmdStatus));
-    router.exact("/new", Arc::new(CmdNew));
-    router.exact("/dream", Arc::new(CmdDream));
-    router.exact("/dream-log", Arc::new(CmdDreamLog));
-    router.exact("/dream-restore", Arc::new(CmdDreamRestore));
-    router.exact("/help", Arc::new(CmdHelp));
-    router.exact("/model", Arc::new(CmdModel));
-    router.exact("/mcp-list", Arc::new(CmdMcpList));
-    router.exact("/tools", Arc::new(CmdTools));
-    router.exact("/workspace", Arc::new(CmdWorkspace));
-    router.exact("/cleanup", Arc::new(CmdCleanup));
+    router.priority(ChatCommand::Stop.to_string(), Arc::new(CmdStop));
+    router.priority(ChatCommand::Restart.to_string(), Arc::new(CmdRestart));
+    router.priority(ChatCommand::Status.to_string(), Arc::new(CmdStatus));
+    router.exact(ChatCommand::New.to_string(), Arc::new(CmdNew));
+    router.exact(ChatCommand::Dream.to_string(), Arc::new(CmdDream));
+    router.exact(ChatCommand::DreamLog.to_string(), Arc::new(CmdDreamLog));
+    router.exact(ChatCommand::DreamRestore.to_string(), Arc::new(CmdDreamRestore));
+    router.exact(ChatCommand::Help.to_string(), Arc::new(CmdHelp));
+    router.exact(ChatCommand::Model.to_string(), Arc::new(CmdModel));
+    router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
+    router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
+    router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
+    router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
 }
 
 #[cfg(test)]
