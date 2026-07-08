@@ -663,6 +663,24 @@ impl CommandHandler for CmdCleanup {
     }
 }
 
+struct CmdListSessions;
+
+#[async_trait]
+impl CommandHandler for CmdListSessions {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/list-sessions");
+        };
+        let session_manager = agent_loop
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let sessions = session_manager.list_sessions();
+        let content =
+            crate::session::manager::format_sessions_list(&sessions, Some(ctx.key.as_str()));
+        reply_as_text(ctx, content)
+    }
+}
 /// Build canonical help text shared across channels.
 fn build_help_text() -> String {
     let lines = vec![
@@ -680,6 +698,7 @@ fn build_help_text() -> String {
         "/tools — List available tools",
         "/workspace — Display the current workspace directory",
         "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
+        "/list-sessions — List available sessions in current workspace",
     ];
     lines.join("\n")
 }
@@ -698,6 +717,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
     router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
+    router.exact(ChatCommand::ListSessions.to_string(), Arc::new(CmdListSessions));
 }
 
 #[cfg(test)]

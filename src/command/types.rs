@@ -17,6 +17,8 @@ pub enum ChatCommand {
     Tools,
     Workspace,
     Cleanup,
+    #[serde(rename = "list-sessions", alias = "listsessions")]
+    ListSessions,
 }
 
 impl Default for ChatCommand {
@@ -44,6 +46,7 @@ impl std::str::FromStr for ChatCommand {
             "tools" => Ok(ChatCommand::Tools),
             "workspace" => Ok(ChatCommand::Workspace),
             "cleanup" => Ok(ChatCommand::Cleanup),
+            "list-sessions" => Ok(ChatCommand::ListSessions),
             _ => Err(()),
         }
     }
@@ -65,6 +68,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::Tools => write!(f, "/tools"),
             ChatCommand::Workspace => write!(f, "/workspace"),
             ChatCommand::Cleanup => write!(f, "/cleanup"),
+            ChatCommand::ListSessions => write!(f, "/list-sessions"),
         }
     }
 }

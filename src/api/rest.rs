@@ -4,11 +4,12 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{Query, State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use serde::Deserialize;
 use chrono::Utc;
 use tokio::net::TcpListener;
 use utoipa::OpenApi;
@@ -19,7 +20,7 @@ use crate::{agent::agent_loop::AgentLoop, api::types::{ChatCommandRequest, ChatC
 
 use super::types::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-    ChatMessage, Usage, extract_last_user_message,
+    ChatMessage, SessionSummary, SessionsListResponse, Usage, extract_last_user_message,
 };
 
 pub struct ApiServer {
@@ -52,7 +53,7 @@ impl From<ApiServer> for AppState {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, chat_completions, chat_commands),
+    paths(health, chat_completions, chat_commands, list_sessions),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,
@@ -63,10 +64,15 @@ impl From<ApiServer> for AppState {
         ChatCommandRequest,
         ChatCommandResponse,
         ChatCommand,
+        SessionSummary,
+        SessionsListResponse,
     )),
     tags((name = "chat", description = "OpenAI-compatible chat completions API"))
 )]
 struct ApiDoc;
+
+#[derive(Debug, Deserialize)]
+struct SessionsQuery;
 
 struct ApiError {
     status: StatusCode,
@@ -270,6 +276,28 @@ async fn chat_commands(
     }))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/sessions",
+    responses(
+        (status = 200, description = "List of persisted sessions", body = SessionsListResponse),
+    ),
+    tag = "chat"
+)]
+async fn list_sessions(
+    State(state): State<Arc<AppState>>,
+) -> Json<SessionsListResponse> {
+    let session_manager = state
+        .agent_loop
+        .session_manager
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
+    let entries = session_manager.list_sessions();
+    Json(SessionsListResponse::from_session_entries(
+        &entries
+    ))
+}
+
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         log::info!("Shutdown signal received, stopping API server...");
@@ -287,6 +315,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
         .route("/health", get(health))
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/commands", post(chat_commands))
+        .route("/v1/sessions", get(list_sessions))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .with_state(state);
 

@@ -401,6 +401,32 @@ impl SessionManager {
     }
 }
 
+/// Format persisted sessions for CLI or chat command output.
+pub fn format_sessions_list(sessions: &[Value], current_key: Option<&str>) -> String {
+    if sessions.is_empty() {
+        return "No sessions available.".to_string();
+    }
+
+    let mut lines = vec!["Sessions (most recent first):".to_string()];
+    for entry in sessions {
+        let key = entry
+            .get("key")
+            .and_then(|v| v.as_str())
+            .unwrap_or("unknown");
+        let updated = entry
+            .get("updated_at")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let current = current_key == Some(key);
+        let suffix = if current { " (current)" } else { "" };
+        match updated {
+            Some(ts) => lines.push(format!("- {key}{suffix} — updated {ts}")),
+            None => lines.push(format!("- {key}{suffix}")),
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -930,5 +956,27 @@ mod tests {
         assert_eq!(listed.len(), 2);
         assert_eq!(listed[0]["key"], json!("has_ts"));
         assert_eq!(listed[1]["key"], json!("no_ts"));
+    }
+
+    #[test]
+    fn format_sessions_list_marks_current_and_shows_updated_at() {
+        let sessions = vec![
+            json!({
+                "key": "cli:direct",
+                "updated_at": "2026-06-01T00:00:00Z",
+            }),
+            json!({
+                "key": "other:session",
+                "updated_at": "2026-06-02T00:00:00Z",
+            }),
+        ];
+        let text = format_sessions_list(&sessions, Some("cli:direct"));
+        assert!(text.contains("cli:direct (current) — updated 2026-06-01T00:00:00Z"));
+        assert!(text.contains("- other:session — updated 2026-06-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn format_sessions_list_empty() {
+        assert_eq!(format_sessions_list(&[], None), "No sessions available.");
     }
 }
