@@ -57,7 +57,7 @@ async fn simple_test_chat(message: &str) -> LLMResponse {
         "content": message
     })];
     let response = provider
-        .chat(messages, None, None, 100, 0.5, None, None)
+        .chat(messages, None, None, 1000, 0.5, None, None)
         .await;
     response
 }

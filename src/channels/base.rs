@@ -1,4 +1,4 @@
-use std::{collections::HashMap};
+use std::{collections::HashMap, sync::Arc};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -86,7 +86,7 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     /// 1. Connects to the chat platform
     /// 2. Listens for incoming messages
     /// 3. Forwards messages to the bus via _handle_message()
-    async fn start(&self);
+    async fn start(&mut self);
 
     /// Stop the channel and clean up resources.
     async fn stop(&self);
@@ -199,4 +199,9 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         return self.running();
     }
 
+}
+
+pub struct BaseChannelCommon {
+    pub bus: Arc<MessageBus>,
+    pub running: bool,
 }
