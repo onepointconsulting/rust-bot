@@ -1,5 +1,6 @@
 use std::path::Path;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
+use rust_bot::utils::exit_codes::{self, GENERAL_ERROR};
 
 // Gmail API base URL
 const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -10,7 +11,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let secret_path = "./credentials/client_secret.json";
     if !Path::new(secret_path).exists() {
         eprintln!("ERROR: {} not found. Place your downloaded client secret JSON in the project root.", secret_path);
-        std::process::exit(1);
+        exit_codes::exit(GENERAL_ERROR);
     }
 
     let secret = yup_oauth2::read_application_secret(secret_path)
@@ -53,7 +54,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let status = response.status();
         let body = response.text().await?;
         eprintln!("Gmail API error {}: {}", status, body);
-        std::process::exit(1);
+        exit_codes::exit(GENERAL_ERROR);
     }
 
     let messages: serde_json::Value = response.json().await?;

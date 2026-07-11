@@ -30,9 +30,11 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         return self.config().transcription_provider.as_str();
     }
 
-    fn transcription_api_key(&self) -> &'static str {
-        return "";
+    fn transcription_api_key(&self) -> &str {
+        ""
     }
+
+    fn set_transcription_api_key(&mut self, key: String);
 
     fn running(&self) -> bool;
 
@@ -81,25 +83,29 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     }
 
     /// Start the channel and begin listening for messages.
-    /// 
+    ///
     /// This should be a long-running async task that:
     /// 1. Connects to the chat platform
     /// 2. Listens for incoming messages
-    /// 3. Forwards messages to the bus via _handle_message()
-    async fn start(&mut self);
+    /// 3. Forwards messages to the bus via [`Self::handle_message`]
+    ///
+    /// Takes `&self` so the channel manager can share the channel via [`Arc`]
+    /// and run outbound `send` concurrently with the listen loop (Python does
+    /// this naturally; Rust needs interior mutability for mutable state).
+    async fn start(&self);
 
     /// Stop the channel and clean up resources.
     async fn stop(&self);
 
     /// Send a message through this channel.
-    /// 
+    ///
     /// # Arguments
-    /// 
+    ///
     /// * `msg` — The message to send.
-    /// 
-    /// Implementations should raise on delivery failure so the channel manager
-    /// can retry or mark as failed.
-    async fn send(&self, msg: OutboundMessage);
+    ///
+    /// Returns `Err` on delivery failure so the channel manager can retry
+    /// or mark as failed. Intentional skips (e.g. consent/policy) should return `Ok(())`.
+    async fn send(&self, msg: OutboundMessage) -> Result<(), String>;
 
     /// Deliver a streaming text chunk.
     ///
@@ -114,7 +120,8 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         _chat_id: &str,
         _delta: &str,
         _metadata: Option<HashMap<String, serde_json::Value>>,
-    ) {
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// Whether this channel overrides [`Self::send_delta`].
@@ -204,4 +211,5 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
 pub struct BaseChannelCommon {
     pub bus: Arc<MessageBus>,
     pub running: bool,
+    pub transcription_api_key: String,
 }

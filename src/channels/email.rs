@@ -1,26 +1,38 @@
-use glob::Pattern;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use regex::Regex;
+use glob::Pattern;
 use rand::seq::SliceRandom;
+use regex::Regex;
 use std::{
-    collections::{HashMap, HashSet}, path::PathBuf, sync::{Arc, LazyLock},
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+    sync::{
+        atomic::{AtomicBool, Ordering},
+        Arc, LazyLock, Mutex,
+    },
 };
 
 use futures::TryStreamExt;
-use serde::Serialize;
 
 use crate::{
-    bus::{events::OutboundMessage, queue::MessageBus}, channels::{
+    bus::{events::OutboundMessage, queue::MessageBus},
+    channels::{
         base::{BaseChannel, BaseChannelCommon},
         types::MessageBytes,
-    }, config::{paths::get_media_dir, schema::ChannelsConfig}, utils::helpers::safe_filename,
+    },
+    config::{
+        channels::EmailConfig, paths::get_media_dir, schema::ChannelsConfig,
+    },
+    utils::helpers::safe_filename,
 };
 
 use async_imap::{Client, Session};
-use mailparse::{
-    addrparse_header, parse_mail, DispositionType, MailHeaderMap, ParsedMail,
+use lettre::{
+    message::{Mailbox, MessageBuilder},
+    transport::smtp::authentication::Credentials,
+    AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
 };
+use mailparse::{DispositionType, MailHeaderMap, ParsedMail, addrparse_header, parse_mail};
 use native_tls::TlsConnector as NativeTlsConnector;
 use tokio::net::TcpStream;
 use tokio_native_tls::{TlsConnector, TlsStream};
@@ -176,99 +188,6 @@ impl ImapSession {
     }
 }
 
-/// Email channel configuration (IMAP inbound + SMTP outbound).
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct EmailConfig {
-    enabled: bool,
-    consent_granted: bool,
-
-    imap_host: String,
-    imap_port: u16,
-    imap_username: String,
-    imap_password: String,
-    imap_mailbox: String,
-    imap_use_ssl: bool,
-
-    smtp_host: String,
-    smtp_port: u16,
-    smtp_username: String,
-    smtp_password: String,
-    smtp_use_tls: bool,
-    smtp_use_ssl: bool,
-    from_address: String,
-
-    auto_reply_enabled: bool,
-    poll_interval_seconds: u32,
-    mark_seen: bool,
-    max_body_chars: u32,
-    subject_prefix: String,
-    allow_from: Vec<String>,
-
-    // Email authentication verification (anti-spoofing)
-    /// Require Authentication-Results with dkim=pass
-    verify_dkim: bool,
-
-    /// Require Authentication-Results with spf=pass
-    verify_spf: bool,
-
-    /// Attachment handling — set allowed types to enable (e.g. ["application/pdf", "image/*"], or ["*"] for all)
-    allowed_attachment_types: Vec<String>,
-    max_attachment_size: u32,
-    max_attachments_per_email: u32,
-}
-
-impl Default for EmailConfig {
-    fn default() -> Self {
-        Self {
-            enabled: false,
-            consent_granted: false,
-
-            imap_host: String::new(),
-            imap_port: 993,
-            imap_username: String::new(),
-            imap_password: String::new(),
-            imap_mailbox: String::new(),
-            imap_use_ssl: true,
-
-            smtp_host: String::new(),
-            smtp_port: 587,
-            smtp_username: String::new(),
-            smtp_password: String::new(),
-            smtp_use_tls: true,
-            smtp_use_ssl: false,
-            from_address: String::new(),
-
-            auto_reply_enabled: false,
-            poll_interval_seconds: 60,
-            mark_seen: true,
-            max_body_chars: 12000,
-
-            subject_prefix: "Re: ".to_string(),
-            allow_from: Vec::new(),
-
-            // Email authentication verification (anti-spoofing)
-            verify_dkim: true, // Require Authentication-Results with dkim=pass
-            verify_spf: true,  // Require Authentication-Results with spf=pass
-
-            allowed_attachment_types: Vec::new(),
-            // 2MB per attachment
-            max_attachment_size: 2 * 1024 * 1024, // 10MB
-            max_attachments_per_email: 5,
-        }
-    }
-}
-
-impl EmailConfig {
-    /// Serialize this config to a map using camelCase keys (Pydantic `model_dump(by_alias=True)`).
-    fn to_config_map(&self) -> HashMap<String, serde_json::Value> {
-        match serde_json::to_value(self).expect("EmailConfig should serialize") {
-            serde_json::Value::Object(map) => map.into_iter().collect(),
-            _ => HashMap::new(),
-        }
-    }
-}
-
 /// Email channel.
 
 /// Inbound:
@@ -278,16 +197,14 @@ impl EmailConfig {
 /// Outbound:
 ///- Send responses via SMTP back to the sender address.
 ///- Send responses via SMTP back to the sender address.
-struct EmailChannel {
-    name: String,
-    display_name: String,
+pub struct EmailChannel {
     base: BaseChannelCommon,
     channels_config: ChannelsConfig,
     config: EmailConfig,
-    last_subject_by_chat_id: HashMap<String, String>,
-    last_message_id_by_chat: HashMap<String, String>,
-    processed_uids: HashSet<String>, // Capped to prevent unbounded growth
-    running: bool,
+    last_subject_by_chat_id: Mutex<HashMap<String, String>>,
+    last_message_id_by_chat: Mutex<HashMap<String, String>>,
+    processed_uids: Mutex<HashSet<String>>, // Capped to prevent unbounded growth
+    running: AtomicBool,
 }
 
 impl EmailChannel {
@@ -312,20 +229,19 @@ impl EmailChannel {
 
     const MAX_PROCESSED_UIDS: usize = 100000;
 
-    fn new(config: EmailConfig, bus: Arc<MessageBus>, channels_config: ChannelsConfig) -> Self {
+    pub fn new(config: EmailConfig, bus: Arc<MessageBus>, channels_config: ChannelsConfig) -> Self {
         Self {
-            name: "email".to_string(),
-            display_name: "Email".to_string(),
             base: BaseChannelCommon {
-                bus: bus,
+                bus,
                 running: false,
+                transcription_api_key: String::new(),
             },
             channels_config,
             config: config,
-            last_subject_by_chat_id: HashMap::new(),
-            last_message_id_by_chat: HashMap::new(),
-            processed_uids: HashSet::new(),
-            running: false,
+            last_subject_by_chat_id: Mutex::new(HashMap::new()),
+            last_message_id_by_chat: Mutex::new(HashMap::new()),
+            processed_uids: Mutex::new(HashSet::new()),
+            running: AtomicBool::new(false),
         }
     }
 
@@ -360,13 +276,13 @@ impl EmailChannel {
     }
 
     /// Poll IMAP and return parsed unread messages.
-    async fn fetch_new_messages(&mut self) -> Vec<HashMap<String, serde_json::Value>> {
+    async fn fetch_new_messages(&self) -> Vec<HashMap<String, serde_json::Value>> {
         self.fetch_messages(vec!["UNSEEN"], self.config.mark_seen, true, 0)
             .await
     }
 
     async fn fetch_messages(
-        &mut self,
+        &self,
         search_criteria: Vec<&str>,
         mark_seen: bool,
         dedupe: bool,
@@ -403,7 +319,7 @@ impl EmailChannel {
 
     /// Fetch messages by arbitrary IMAP search criteria.
     async fn fetch_messages_once(
-        &mut self,
+        &self,
         search_criteria: Vec<&str>,
         mark_seen: bool,
         dedupe: bool,
@@ -441,7 +357,7 @@ impl EmailChannel {
     }
 
     async fn fetch_messages_once_with_session(
-        &mut self,
+        &self,
         session: &mut ImapSession,
         mailbox: &str,
         search_criteria: Vec<&str>,
@@ -494,7 +410,7 @@ impl EmailChannel {
             if cycle_uids.contains(&uid_key) {
                 continue;
             }
-            if dedupe && self.processed_uids.contains(&uid_key) {
+            if dedupe && self.processed_uids.lock().unwrap().contains(&uid_key) {
                 continue;
             }
 
@@ -512,7 +428,7 @@ impl EmailChannel {
                 .and_then(|addrs| addrs.extract_single_info())
                 .map(|info| info.addr)
                 .unwrap_or_default();
-            if sender.is_empty() {
+            if sender.trim().is_empty() {
                 continue;
             }
             let (spf_pass, dkim_pass) = Self::check_authentication_results(&parsed);
@@ -601,16 +517,16 @@ impl EmailChannel {
 
             cycle_uids.insert(uid_key.clone());
             if dedupe {
-                self.processed_uids.insert(uid_key);
+                let mut processed = self.processed_uids.lock().unwrap();
+                processed.insert(uid_key);
                 // mark_seen is the primary dedup; this set is a safety net
-                if self.processed_uids.len() >= Self::MAX_PROCESSED_UIDS {
+                if processed.len() >= Self::MAX_PROCESSED_UIDS {
                     // Evict a random half to cap memory; mark_seen is the primary dedup
-                    let to_remove = self.processed_uids.len() / 2;
-                    let mut keys: Vec<String> =
-                        self.processed_uids.iter().cloned().collect();
+                    let to_remove = processed.len() / 2;
+                    let mut keys: Vec<String> = processed.iter().cloned().collect();
                     keys.shuffle(&mut rand::rng());
                     for key in keys.iter().take(to_remove) {
-                        self.processed_uids.remove(key);
+                        processed.remove(key);
                     }
                 }
             }
@@ -735,7 +651,7 @@ impl EmailChannel {
         allowed_types: &[&str],
         max_count: u32,
         max_size: u32,
-        media_dir: &PathBuf
+        media_dir: &PathBuf,
     ) -> Vec<PathBuf> {
         if !Self::is_multipart(parsed) {
             return vec![];
@@ -761,9 +677,7 @@ impl EmailChannel {
 
             let content_type = part.ctype.mimetype.as_str();
             if !Self::is_allowed_content_type(content_type, allowed_types) {
-                log::debug!(
-                    "Email attachment skipped (type {content_type}): not in allowed list"
-                );
+                log::debug!("Email attachment skipped (type {content_type}): not in allowed list");
                 continue;
             }
 
@@ -817,6 +731,54 @@ impl EmailChannel {
                 .unwrap_or(false)
         })
     }
+
+    fn reply_subject(&self, base_subject: &str) -> String {
+        let subject = {
+            let trimmed = base_subject.trim();
+            if trimmed.is_empty() {
+                "rust-bot reply".to_string()
+            } else {
+                trimmed.to_string()
+            }
+        };
+        // Already a reply thread — don't stack another Re:
+        if subject.to_lowercase().starts_with("re:") {
+            return subject;
+        }
+        let prefix = {
+            let trimmed = self.config.subject_prefix.trim();
+            if trimmed.is_empty() {
+                "Re:"
+            } else {
+                trimmed
+            }
+        };
+        format!("{prefix} {subject}")
+    }
+
+    /// Build an SMTP transport from config (implicit TLS, STARTTLS, or plain).
+    fn build_smtp_transport(
+        &self,
+    ) -> Result<AsyncSmtpTransport<Tokio1Executor>, lettre::transport::smtp::Error> {
+        let creds = Credentials::new(
+            self.config.smtp_username.clone(),
+            self.config.smtp_password.clone(),
+        );
+        let host = self.config.smtp_host.as_str();
+        let port = self.config.smtp_port;
+
+        let builder = if self.config.smtp_use_ssl {
+            // Implicit TLS (SMTPS), typically port 465
+            AsyncSmtpTransport::<Tokio1Executor>::relay(host)?.port(port)
+        } else if self.config.smtp_use_tls {
+            // STARTTLS upgrade, typically port 587
+            AsyncSmtpTransport::<Tokio1Executor>::starttls_relay(host)?.port(port)
+        } else {
+            AsyncSmtpTransport::<Tokio1Executor>::builder_dangerous(host).port(port)
+        };
+
+        Ok(builder.credentials(creds).build())
+    }
 }
 
 #[async_trait]
@@ -825,8 +787,12 @@ impl BaseChannel for EmailChannel {
         "email"
     }
 
+    fn display_name(&self) -> &'static str {
+        "Email"
+    }
+
     fn running(&self) -> bool {
-        self.running
+        self.running.load(Ordering::Relaxed)
     }
 
     fn bus(&self) -> &MessageBus {
@@ -837,38 +803,225 @@ impl BaseChannel for EmailChannel {
         &self.channels_config
     }
 
+    fn transcription_api_key(&self) -> &str {
+        &self.base.transcription_api_key
+    }
+
+    fn set_transcription_api_key(&mut self, key: String) {
+        self.base.transcription_api_key = key;
+    }
+
     fn default_config(&self) -> HashMap<String, serde_json::Value> {
         EmailConfig::default().to_config_map()
     }
 
-    async fn stop(&self) {}
+    async fn stop(&self) {
+        self.running.store(false, Ordering::Relaxed);
+    }
 
-    async fn send(&self, _msg: OutboundMessage) {}
+    /// Send email via SMTP.
+    async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
+        if !self.config.consent_granted {
+            log::warn!("Skip email send: consent_granted is false.");
+            return Ok(());
+        }
+
+        if self.config.smtp_host.trim().is_empty() {
+            log::warn!("Email channel SMTP host not configured.");
+            return Err("Email channel SMTP host not configured".to_string());
+        }
+
+        let to_addr = msg.chat_id.to_string();
+        if to_addr.trim().is_empty() {
+            log::warn!("Email channel missing recipient address.");
+            return Err("Email channel missing recipient address".to_string());
+        }
+
+        // Determine if this is a reply (recipient has sent us an email before)
+        let is_reply = self
+            .last_message_id_by_chat
+            .lock()
+            .unwrap()
+            .contains_key(&to_addr);
+        let force_send = msg
+            .metadata
+            .get("force_send")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+
+        // autoReplyEnabled only controls automatic replies, not proactive sends
+        if is_reply && !self.config.auto_reply_enabled && !force_send {
+            log::info!(
+                "Skip automatic email reply to {}: auto_reply_enabled is false",
+                to_addr
+            );
+            return Ok(());
+        }
+
+        let base_subject = self
+            .last_subject_by_chat_id
+            .lock()
+            .unwrap()
+            .get(&to_addr)
+            .cloned()
+            .unwrap_or_else(|| "rust-bot reply".to_string());
+        let mut subject = self.reply_subject(&base_subject);
+
+        if !msg.metadata.is_empty() {
+            let subject_option = msg.metadata.get("subject");
+            if subject_option
+                .and_then(|v| Some(v.is_string()))
+                .unwrap_or(false)
+            {
+                let override_subject = subject_option.and_then(|v| v.as_str()).unwrap_or("");
+                if !override_subject.is_empty() {
+                    subject = override_subject.to_string();
+                };
+            }
+        }
+
+        let from_addr = {
+            let candidates = [
+                self.config.from_address.as_str(),
+                self.config.smtp_username.as_str(),
+                self.config.imap_username.as_str(),
+            ];
+            candidates
+                .into_iter()
+                .find(|s| !s.trim().is_empty())
+                .unwrap_or("")
+                .to_string()
+        };
+        if from_addr.is_empty() {
+            log::warn!("Email channel missing From address.");
+            return Err("Email channel missing From address".to_string());
+        }
+
+        let from_mailbox: Mailbox = match from_addr.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                let err = format!("Email channel invalid From address {from_addr}: {e}");
+                log::warn!("{err}");
+                return Err(err);
+            }
+        };
+        let to_mailbox: Mailbox = match to_addr.parse() {
+            Ok(m) => m,
+            Err(e) => {
+                let err = format!("Email channel invalid To address {to_addr}: {e}");
+                log::warn!("{err}");
+                return Err(err);
+            }
+        };
+
+        let mut builder: MessageBuilder = Message::builder()
+            .from(from_mailbox)
+            .to(to_mailbox)
+            .subject(subject);
+
+        if let Some(in_reply_to) = self
+            .last_message_id_by_chat
+            .lock()
+            .unwrap()
+            .get(&to_addr)
+            .cloned()
+        {
+            if !in_reply_to.trim().is_empty() {
+                builder = builder
+                    .in_reply_to(in_reply_to.clone())
+                    .references(in_reply_to);
+            }
+        }
+
+        let email_msg = match builder.body(msg.content.clone()) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = format!("Failed to build email message: {e}");
+                log::error!("{err}");
+                return Err(err);
+            }
+        };
+
+        let mailer = match self.build_smtp_transport() {
+            Ok(m) => m,
+            Err(e) => {
+                let err = format!("Failed to create SMTP transport: {e}");
+                log::error!("{err}");
+                return Err(err);
+            }
+        };
+
+        match mailer.send(email_msg).await {
+            Ok(_) => {
+                log::info!("Email sent to {to_addr}");
+                Ok(())
+            }
+            Err(e) => {
+                let err = format!("Failed to send email to {to_addr}: {e}");
+                log::error!("{err}");
+                Err(err)
+            }
+        }
+    }
 
     /// Start polling IMAP for inbound emails.
-    async fn start(&mut self) {
+    async fn start(&self) {
         if !self.config.consent_granted {
             log::error!(
-                "Email channel disabled: consent_granted is false. 
-            Set channels.email.consentGranted=true after explicit user permission."
+                "Email channel disabled: consent_granted is false. Set channels.email.consentGranted=true after explicit user permission."
             );
             return;
         }
         if !self.validate_config() {
             return;
         }
-        self.running = true;
+        self.running.store(true, Ordering::Relaxed);
 
         if !self.config.verify_dkim && !self.config.verify_spf {
             log::warn!(
                 "Email channel: DKIM and SPF verification are both DISABLED.
-                Emails with spoofed From headers will be accepted.
-                Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
+Emails with spoofed From headers will be accepted.
+Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
             )
         }
         log::info!("Starting Email channel (IMAP polling mode)...");
-        let _poll_seconds = std::cmp::max(5, self.config.poll_interval_seconds);
-        while self.running {}
+        let poll_seconds = std::cmp::max(5, self.config.poll_interval_seconds) as u64;
+        while self.running.load(Ordering::Relaxed) {
+            let inbound_items = self.fetch_new_messages().await;
+            for item in inbound_items {
+                let sender = item.get("sender").and_then(|v| v.as_str()).unwrap_or("");
+                if sender.trim().is_empty() {
+                    continue;
+                }
+                let subject = item.get("subject").and_then(|v| v.as_str()).unwrap_or("");
+                let message_id = item
+                    .get("message_id")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("");
+                if !subject.trim().is_empty() {
+                    self.last_subject_by_chat_id
+                        .lock()
+                        .unwrap()
+                        .insert(sender.to_string(), subject.to_string());
+                }
+                if !message_id.trim().is_empty() {
+                    self.last_message_id_by_chat
+                        .lock()
+                        .unwrap()
+                        .insert(sender.to_string(), message_id.to_string());
+                }
+                let content = item.get("content").and_then(|v| v.as_str()).unwrap_or("");
+                let media = item
+                    .get("media")
+                    .and_then(|v| serde_json::from_value::<Vec<String>>(v.clone()).ok());
+                let metadata = item.get("metadata").and_then(|v| {
+                    serde_json::from_value::<HashMap<String, serde_json::Value>>(v.clone()).ok()
+                });
+                self.handle_message(sender, sender, content, media, metadata, None)
+                    .await;
+            }
+            tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)).await;
+        }
     }
 }
 
@@ -1120,7 +1273,14 @@ mod tests {
         media_dir: &std::path::Path,
     ) -> Vec<PathBuf> {
         let parsed = parse_mail(raw.as_bytes()).expect("test mail should parse");
-        EmailChannel::extract_attachments(&parsed, uid, allowed, max_count, max_size, &media_dir.to_path_buf())
+        EmailChannel::extract_attachments(
+            &parsed,
+            uid,
+            allowed,
+            max_count,
+            max_size,
+            &media_dir.to_path_buf(),
+        )
     }
 
     #[test]
@@ -1268,5 +1428,64 @@ mod tests {
             "application/pdf",
             &["image/*"]
         ));
+    }
+
+    fn channel_with_prefix(prefix: &str) -> EmailChannel {
+        EmailChannel::new(
+            EmailConfig {
+                subject_prefix: prefix.to_string(),
+                ..EmailConfig::default()
+            },
+            Arc::new(MessageBus::new()),
+            ChannelsConfig::default(),
+        )
+    }
+
+    #[test]
+    fn reply_subject_prefixes_plain_subject() {
+        let channel = channel_with_prefix("Re:");
+        assert_eq!(channel.reply_subject("Hello"), "Re: Hello");
+    }
+
+    #[test]
+    fn reply_subject_default_prefix_has_single_space() {
+        // Default config uses "Re: " (trailing space); join must not double-space.
+        let channel = channel_with_prefix("Re: ");
+        assert_eq!(channel.reply_subject("Hello"), "Re: Hello");
+    }
+
+    #[test]
+    fn reply_subject_empty_prefix_falls_back_to_re() {
+        let channel = channel_with_prefix("");
+        assert_eq!(channel.reply_subject("Hello"), "Re: Hello");
+        let channel = channel_with_prefix("   ");
+        assert_eq!(channel.reply_subject("Hello"), "Re: Hello");
+    }
+
+    #[test]
+    fn reply_subject_custom_prefix() {
+        let channel = channel_with_prefix("[Bot]");
+        assert_eq!(channel.reply_subject("Hello"), "[Bot] Hello");
+    }
+
+    #[test]
+    fn reply_subject_skips_prefix_when_already_re() {
+        let channel = channel_with_prefix("Re:");
+        assert_eq!(channel.reply_subject("Re: Hello"), "Re: Hello");
+        assert_eq!(channel.reply_subject("RE: Hello"), "RE: Hello");
+        assert_eq!(channel.reply_subject("re:Hello"), "re:Hello");
+    }
+
+    #[test]
+    fn reply_subject_empty_base_uses_default() {
+        let channel = channel_with_prefix("Re:");
+        assert_eq!(channel.reply_subject(""), "Re: rust-bot reply");
+        assert_eq!(channel.reply_subject("   "), "Re: rust-bot reply");
+    }
+
+    #[test]
+    fn reply_subject_trims_base_subject() {
+        let channel = channel_with_prefix("Re:");
+        assert_eq!(channel.reply_subject("  Hello  "), "Re: Hello");
     }
 }

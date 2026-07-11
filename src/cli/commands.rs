@@ -38,6 +38,9 @@ use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
 use crate::utils::clipboard::{
     TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX,
 };
+use crate::utils::exit_codes::{
+    self, GENERAL_ERROR, INVALID_PROVIDER, TEMPLATES_UNAVAILABLE,
+};
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
 use crate::utils::restart::{
@@ -222,7 +225,7 @@ fn prepare_workspace(config: Option<PathBuf>, workspace: Option<PathBuf>) -> (Co
         sync_workspace_templates(&workspace, false)
     {
         eprint_error(err);
-        std::process::exit(2);
+        exit_codes::exit(TEMPLATES_UNAVAILABLE);
     }
     (config, workspace)
 }
@@ -338,7 +341,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     .await
     {
         eprintln!("Failed to start API server: {err}");
-        std::process::exit(1);
+        exit_codes::exit(GENERAL_ERROR);
     }
     Ok(())
 }
@@ -487,7 +490,7 @@ fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> C
     if let Some(config) = config {
         if !config.exists() {
             eprint_error(format!("Config file not found: {}", config.display()));
-            std::process::exit(1);
+            exit_codes::exit(GENERAL_ERROR);
         }
         set_config_path(config.clone());
         let loaded = resolve_config_env_vars(&load_config(Some(config.clone())));
@@ -501,12 +504,12 @@ fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> C
             }
             Err(e) => {
                 eprint_error(e);
-                std::process::exit(1);
+                exit_codes::exit(GENERAL_ERROR);
             }
         }
     } else {
         eprint_error("No config file provided");
-        std::process::exit(1);
+        exit_codes::exit(GENERAL_ERROR);
     }
 }
 
@@ -532,7 +535,7 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
         )),
         _ => {
             eprint_error(format!("Invalid provider: {provider_name}"));
-            std::process::exit(3);
+            exit_codes::exit(INVALID_PROVIDER);
         }
     }
 }

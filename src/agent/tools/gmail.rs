@@ -1,4 +1,8 @@
-use crate::{agent::tools::base::Tool, config::schema::GmailToolConfig};
+use crate::{
+    agent::tools::base::Tool,
+    config::schema::GmailToolConfig,
+    utils::exit_codes::{self, GMAIL_CONFIG_ERROR},
+};
 use async_trait::async_trait;
 use base64::Engine;
 use std::path::{Path, PathBuf};
@@ -396,15 +400,15 @@ fn show_error_and_exit(path: &PathBuf) {
     );
     log::error!("{}", error_message);
     eprintln!("{}", error_message);
-    std::process::exit(4); // EXIT_CONFIG_ERROR
+    exit_codes::exit(GMAIL_CONFIG_ERROR);
 }
 
 fn validate_secret_and_token_cache_paths(secret_path: &PathBuf, token_cache_path: &PathBuf) {
     if !Path::new(&secret_path).exists() {
-        show_error_and_exit(&secret_path); // EXIT_CONFIG_ERROR
+        show_error_and_exit(&secret_path);
     }
     if !Path::new(&token_cache_path).exists() {
-        show_error_and_exit(&token_cache_path); // EXIT_CONFIG_ERROR
+        show_error_and_exit(&token_cache_path);
     }
 }
 

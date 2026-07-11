@@ -10,3 +10,4 @@ pub mod searchusage;
 pub mod logo;
 pub mod registry_helper;
 pub mod cli;
+pub mod exit_codes;

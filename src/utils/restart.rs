@@ -60,7 +60,7 @@ pub fn restart_with_notice(channel: &str, chat_id: &str) -> std::io::Result<()> 
     #[cfg(not(unix))]
     {
         cmd.spawn()?;
-        std::process::exit(0);
+        crate::utils::exit_codes::exit(crate::utils::exit_codes::SUCCESS);
     }
 }
 

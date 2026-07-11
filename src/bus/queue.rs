@@ -25,6 +25,12 @@ impl<T> TrackedReceiver<T> {
         }
         msg
     }
+
+    fn try_recv(&mut self) -> Result<T, mpsc::error::TryRecvError> {
+        let msg = self.inner.try_recv()?;
+        self.count.fetch_sub(1, Ordering::Relaxed);
+        Ok(msg)
+    }
 }
 
 /// Wraps an unbounded sender and increments the pending count on each send.
@@ -93,6 +99,12 @@ impl<T> AsyncQueue<T> {
     /// Returns a sender handle that can be cloned and shared to push messages from elsewhere.
     pub fn sender(&self) -> TrackedSender<T> {
         self.tx.clone()
+    }
+
+    pub fn try_recv(&self) -> Result<T, mpsc::error::TryRecvError> {
+        // Prefer try_lock so an empty/busy queue doesn't await
+        let mut rx = self.rx.try_lock().map_err(|_| mpsc::error::TryRecvError::Empty)?;
+        rx.try_recv()
     }
 }
 

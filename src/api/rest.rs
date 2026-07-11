@@ -4,7 +4,7 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{Query, State},
+    extract::{State},
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::{get, post},

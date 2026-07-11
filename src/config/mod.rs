@@ -1,3 +1,4 @@
+pub mod channels;
 pub mod log;
 pub mod schema;
 pub mod paths;

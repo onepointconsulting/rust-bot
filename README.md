@@ -112,12 +112,16 @@ cargo run -- agent --help
 
 ### Exit codes
 
-| Code | Meaning |
-|------|---------|
-| `0` | Success |
-| `1` | Config or general CLI error |
-| `2` | Workspace templates unavailable (no `templates/` in the current working directory and the workspace is not fully seeded with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`) |
-| `3` | Invalid provider (unknown value in `agents.provider`) |
+| Code | Constant | Meaning |
+|------|----------|---------|
+| `0` | `SUCCESS` | Success (also used after spawning a restarted process on Windows) |
+| `1` | `GENERAL_ERROR` | Config or general CLI error |
+| `2` | `TEMPLATES_UNAVAILABLE` | Workspace templates unavailable (no `templates/` in the current working directory and the workspace is not fully seeded with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`) |
+| `3` | `INVALID_PROVIDER` | Invalid provider (unknown value in `agents.provider`) |
+| `4` | `GMAIL_CONFIG_ERROR` | Gmail tool credentials missing (OAuth client secret or token cache) |
+| `5` | `CHANNEL_ALLOW_FROM_EMPTY` | Channel has an empty `allowFrom` list (set `["*"]` or specific user IDs) |
+
+Constants live in `src/utils/exit_codes.rs`.
 
 Run from the project root (or any directory that contains `templates/`) so workspace seed files can be created on first use.
 

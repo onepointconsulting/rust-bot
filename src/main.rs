@@ -1,5 +1,6 @@
 use clap::Parser;
 use rust_bot::cli::{eprint_error, Cli, run};
+use rust_bot::utils::exit_codes::{self, GENERAL_ERROR};
 
 #[tokio::main]
 async fn main() {
@@ -9,6 +10,6 @@ async fn main() {
     let cli = Cli::parse();
     if let Err(e) = run(cli).await {
         eprint_error(e);
-        std::process::exit(1);
+        exit_codes::exit(GENERAL_ERROR);
     }
 }

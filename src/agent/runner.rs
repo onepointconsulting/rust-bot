@@ -68,7 +68,7 @@ impl Default for AgentRunSpec {
             max_iterations: 0,
             max_tool_result_chars: 0,
             temperature: None,
-            max_tokens: None,
+            max_tokens: Some(4096 * 2),
             reasoning_effort: None,
             hook: None,
             error_message: Some(DEFAULT_ERROR_MESSAGE.to_string()),

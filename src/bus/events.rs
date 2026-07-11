@@ -35,6 +35,7 @@ impl InboundMessage {
 }
 
 /// Message to send to a chat channel.
+#[derive(Debug, Clone)]
 pub struct OutboundMessage {
     pub channel: String,
     pub chat_id: String,

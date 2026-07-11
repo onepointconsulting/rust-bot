@@ -402,6 +402,11 @@ pub struct ProvidersConfig {
     #[serde(alias = "gemini")]
     #[garde(dive)]
     pub gemini: ProviderConfig,
+
+    /// Groq provider.
+    #[serde(alias = "groq")]
+    #[garde(dive)]
+    pub groq: ProviderConfig,
 }
 
 impl Default for ProvidersConfig {
@@ -413,6 +418,7 @@ impl Default for ProvidersConfig {
             openai: ProviderConfig::default(),
             openrouter: ProviderConfig::default(),
             gemini: ProviderConfig::default(),
+            groq: ProviderConfig::default(),
         }
     }
 }
