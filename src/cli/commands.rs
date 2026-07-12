@@ -744,18 +744,20 @@ async fn interactive_session(
 fn interactive_welcome_text(markdown: bool) -> String {
     if markdown {
         format!(
-            "{LOGO} Interactive mode \n({}; {}; {}; {}; {})\n",
+            "{LOGO} Interactive mode \n({}; {}; {}; {}; {}; {})\n",
             "type **exit** or **Ctrl+D** to quit",
             "**Ctrl+O** for a new line",
+            "**Ctrl+W** or **Alt+Backspace** to delete word",
             "**Alt+I** or **Ctrl+Tab** to paste image",
             "**Ctrl+V** or **Alt+V** to paste text",
             "Type **/help** for available commands",
         )
     } else {
         format!(
-            "{LOGO} Interactive mode \n({}; {}; {}; {}; {})\n",
+            "{LOGO} Interactive mode \n({}; {}; {}; {}; {}; {})\n",
             "type exit or Ctrl+D to quit",
             "Ctrl+O for a new line",
+            "Ctrl+W or Alt+Backspace to delete word",
             "Alt+I or Ctrl+Tab to paste image",
             "Ctrl+V or Alt+V to paste text",
             "Type /help for available commands",

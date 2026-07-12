@@ -294,7 +294,8 @@ impl CommandHandler for CmdModel {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/model");
         };
-        reply_as_text(ctx, format!("Model: {}", agent_loop.model))
+        let provider_name = agent_loop.provider.api_base().map(|base| base.to_string()).unwrap_or_else(|| "Unknown".to_string());
+        reply_as_text(ctx, format!("Model: {}\nProvider base url: {}", agent_loop.model, provider_name))
     }
 }
 

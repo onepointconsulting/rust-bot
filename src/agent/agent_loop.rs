@@ -278,7 +278,7 @@ impl AgentHook for LoopHookChain {
 pub struct AgentLoop {
     defaults: AgentDefaults,
     bus: Arc<MessageBus>,
-    provider: Arc<dyn LLMProviderDyn>,
+    pub provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
     pub model: String,
     max_iterations: u32,
