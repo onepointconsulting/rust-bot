@@ -308,6 +308,7 @@ impl EmailChannel {
                 Err(error) => {
                     if attempt == attempt_limit - 1 {
                         log::error!("Email channel: Failed to fetch messages: {}", error);
+                        log::error!("Email channel: user: {:?}", self.config.imap_username);
                         return messages;
                     }
                     log::warn!("Email channel: Failed to fetch messages: {}", error);
@@ -429,6 +430,10 @@ impl EmailChannel {
                 .map(|info| info.addr)
                 .unwrap_or_default();
             if sender.trim().is_empty() {
+                continue;
+            }
+            let allow_from = self.config.allow_from.clone();
+            if !allow_from.contains(&sender.to_string()) && !allow_from.contains(&"*".to_string()) {
                 continue;
             }
             let (spf_pass, dkim_pass) = Self::check_authentication_results(&parsed);

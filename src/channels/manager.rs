@@ -35,7 +35,7 @@ type SharedChannel = Arc<dyn BaseChannel>;
 /// - Start/stop channels
 /// - Route outbound messages
 pub struct ChannelManager {
-    config: Config,
+    config: Arc<Config>,
     bus: Arc<MessageBus>,
     channels: HashMap<String, SharedChannel>,
     /// Python: `self._dispatch_task = asyncio.create_task(...)`
@@ -51,8 +51,8 @@ pub struct ChannelManager {
 
 impl ChannelManager {
     /// Discover enabled built-in channels and attach them to the shared bus.
-    pub fn new(config: Config, bus: Arc<MessageBus>) -> Self {
-        let channels = Self::init_channels(&config, Arc::clone(&bus));
+    pub fn new(config: Arc<Config>, bus: Arc<MessageBus>) -> Self {
+        let channels = Self::init_channels(config.as_ref(), Arc::clone(&bus));
         if let Err(name) = Self::validate_allow_from(&channels) {
             log::error!("Channel {name} has no allow list configured");
             log::error!("Set [\"*\"] to allow everyone, or add specific user IDs.");
@@ -398,6 +398,11 @@ impl ChannelManager {
         }
         output
     }
+
+    /// Get list of enabled channel names.
+    pub fn get_enabled_channels(&self) -> Vec<String> {
+        self.channels.keys().cloned().collect()
+    }
 }
 
 #[cfg(test)]
@@ -466,7 +471,7 @@ mod tests {
     fn new_attaches_shared_bus() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(config, Arc::clone(&bus));
+        let manager = ChannelManager::new(Arc::new(config), Arc::clone(&bus));
         // Same Arc allocation (pointer equality).
         assert!(Arc::ptr_eq(&manager.bus, &bus));
         assert_eq!(
@@ -505,7 +510,7 @@ mod tests {
     async fn start_channel_missing_is_noop() {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(config, bus);
+        let manager = ChannelManager::new(Arc::new(config), bus);
         manager.start_channel("does-not-exist").await;
         assert!(manager.channels.is_empty());
     }
@@ -514,7 +519,7 @@ mod tests {
     fn new_with_disabled_channels_succeeds() {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(config, bus);
+        let manager = ChannelManager::new(Arc::new(config), bus);
         assert!(manager.channels.is_empty());
         assert_eq!(manager.config.channels.transcription_provider, "groq");
     }
@@ -767,7 +772,7 @@ mod tests {
     fn get_status_reports_all_channels() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(config, bus);
+        let manager = ChannelManager::new(Arc::new(config), bus);
         let status = manager.get_status();
         assert_eq!(
             status.get("email"),
@@ -779,7 +784,7 @@ mod tests {
     fn get_channel_returns_registered_channel() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(config, bus);
+        let manager = ChannelManager::new(Arc::new(config), bus);
         assert!(manager.get_channel("email").is_some());
         assert!(manager.get_channel("missing").is_none());
     }
@@ -795,7 +800,7 @@ mod tests {
         // instead of trying real network I/O.
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = Arc::new(ChannelManager::new(config, bus));
+        let manager = Arc::new(ChannelManager::new(Arc::new(config), bus));
 
         let manager_for_start = Arc::clone(&manager);
         let start_handle = tokio::spawn(async move {

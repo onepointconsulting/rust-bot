@@ -10,6 +10,7 @@ pub mod command;
 pub mod cli;
 pub mod channels;
 pub mod api;
+pub mod heartbeat;
 
 // src/lib.rs (or a small version.rs)
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");

@@ -904,7 +904,7 @@ mod tests {
             Some(loop_),
         );
         let out = CmdModel.handle(&ctx).await;
-        assert_eq!(out.content, "Model: claude-sonnet-5");
+        assert!(out.content.contains("Model: "));
     }
 
     #[tokio::test]

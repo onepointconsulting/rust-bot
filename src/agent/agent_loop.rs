@@ -276,7 +276,7 @@ impl AgentHook for LoopHookChain {
 /// 5. Sends responses back
 ///
 pub struct AgentLoop {
-    defaults: AgentDefaults,
+    pub defaults: AgentDefaults,
     bus: Arc<MessageBus>,
     pub provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
@@ -289,7 +289,7 @@ pub struct AgentLoop {
     provider_retry_mode: String,
     pub web_config: WebToolsConfig,
     exec_config: ExecToolConfig,
-    cron_service: Option<Arc<CronService>>,
+    pub cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
     pub session_manager: Arc<Mutex<SessionManager>>,
     mcp_servers: HashMap<String, McpServerConfig>,
@@ -467,8 +467,11 @@ impl AgentLoop {
             dream: Arc::new(Dream::new(
                 Arc::clone(&context.memory),
                 provider,
-                &model,
-                SessionManager::new(workspace),
+                defaults
+                    .dream
+                    .model_override
+                    .as_deref()
+                    .unwrap_or(&model),
                 defaults.dream.max_batch_size as usize,
                 defaults.dream.max_iterations as usize,
                 max_tool_result_chars as usize,
@@ -768,7 +771,7 @@ impl AgentLoop {
     }
 
     /// Run the agent loop, dispatching messages as tasks to stay responsive to /stop.
-    async fn run(self: &Arc<Self>) {
+    pub async fn run(self: &Arc<Self>) {
         self.running.store(true, Ordering::Relaxed);
         self.connect_mcp().await;
         log::info!("Agent loop started");
@@ -1596,7 +1599,7 @@ impl AgentLoop {
         self.mcp_connected.store(false, Ordering::Relaxed);
     }
 
-    fn stop(&mut self) {
+    pub fn stop(&self) {
         self.running.store(false, Ordering::Relaxed);
         log::info!("Agent loop stopping ... shutting down");
     }

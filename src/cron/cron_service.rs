@@ -69,6 +69,11 @@ impl CronService {
         })
     }
 
+    pub async fn set_on_job(self: &Arc<Self>, on_job: CronJobCallback) {
+        let mut inner = self.inner.lock().await;
+        inner.on_job = Some(on_job);
+    }
+
     /// Start the cron service.
     pub async fn start(self: &Arc<Self>) {
         let mut inner = self.inner.lock().await;

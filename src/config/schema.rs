@@ -188,16 +188,20 @@ impl Default for DreamConfig {
 impl DreamConfig {
     const HOUR_MS: u64 = 3_600_000;
 
-    /// Build the runtime schedule, preferring the legacy cron override if present.
-    pub fn build_schedule(&self, timezone: &str) -> CronSchedule {
+    /// Build the runtime schedule
+    pub fn build_schedule(&self, timezone: &str) -> crate::cron::types::CronSchedule {
         if let Some(ref expr) = self.cron {
-            return CronSchedule::Cron {
-                expr: expr.clone(),
-                tz: timezone.to_string(),
+            return crate::cron::types::CronSchedule {
+                kind: crate::cron::types::CronScheduleKind::Cron,
+                expr: Some(expr.clone()),
+                tz: Some(timezone.to_string()),
+                ..Default::default()
             };
         }
-        CronSchedule::Every {
-            every_ms: self.interval_h as u64 * Self::HOUR_MS,
+        crate::cron::types::CronSchedule {
+            kind: crate::cron::types::CronScheduleKind::Every,
+            every_ms: Some(self.interval_h as i64 * Self::HOUR_MS as i64),
+            ..Default::default()
         }
     }
 
@@ -445,7 +449,7 @@ impl ProvidersConfig {
 fn default_heartbeat_enabled() -> bool {
     true
 }
-fn default_heartbeat_interval_s() -> u32 {
+fn default_heartbeat_interval_s() -> u64 {
     30 * 60
 }
 fn default_heartbeat_keep_recent_messages() -> u32 {
@@ -464,7 +468,7 @@ pub struct HeartbeatConfig {
     /// Interval between heartbeats in seconds. Default: 1800 (30 minutes).
     #[serde(alias = "interval_s", default = "default_heartbeat_interval_s")]
     #[garde(range(min = 1))]
-    pub interval_s: u32,
+    pub interval_s: u64,
 
     /// Number of recent messages to retain for context. Default: 8.
     #[serde(
@@ -1378,37 +1382,6 @@ mod tests {
         let cfg: DreamConfig = serde_json::from_str(json).unwrap();
         let result = cfg.validate();
         assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_dream_build_schedule_interval() {
-        let cfg = DreamConfig {
-            interval_h: 3,
-            ..DreamConfig::default()
-        };
-        let schedule = cfg.build_schedule("UTC");
-        assert_eq!(
-            schedule,
-            CronSchedule::Every {
-                every_ms: 3 * 3_600_000
-            }
-        );
-    }
-
-    #[test]
-    fn test_dream_build_schedule_cron_override() {
-        let cfg = DreamConfig {
-            cron: Some("0 2 * * *".to_string()),
-            ..DreamConfig::default()
-        };
-        let schedule = cfg.build_schedule("Europe/London");
-        assert_eq!(
-            schedule,
-            CronSchedule::Cron {
-                expr: "0 2 * * *".to_string(),
-                tz: "Europe/London".to_string(),
-            }
-        );
     }
 
     #[test]

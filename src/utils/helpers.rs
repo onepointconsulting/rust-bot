@@ -167,12 +167,17 @@ pub fn image_placeholder_text(path: Option<&str>, empty: &str) -> String {
     }
 }
 
-/// Truncate text to `max_chars`, appending `"\n... (truncated)"` when cut.
+/// Truncate text to `max_chars` bytes, appending `"\n... (truncated)"` when cut.
 pub fn truncate_text(text: &str, max_chars: usize) -> String {
     if max_chars == 0 || text.len() <= max_chars {
         return text.to_string();
     }
-    format!("{}\n... (truncated)", &text[..max_chars])
+    // Byte-index slicing panics mid-character; back up to a UTF-8 boundary.
+    let mut end = max_chars;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}\n... (truncated)", &text[..end])
 }
 
 // ── message utilities ─────────────────────────────────────────────────────────
@@ -975,6 +980,15 @@ mod tests {
     #[test]
     fn test_truncate_zero_max() {
         assert_eq!(truncate_text("any", 0), "any");
+    }
+
+    #[test]
+    fn test_truncate_does_not_split_multibyte_char() {
+        // '’' is 3 bytes (e2 80 99); cutting at byte 4 lands mid-character.
+        let text = "abc’def";
+        let result = truncate_text(text, 4);
+        assert!(result.starts_with("abc"));
+        assert!(result.contains("(truncated)"));
     }
 
     // ── find_legal_message_start ──────────────────────────────────────────────

@@ -74,7 +74,7 @@ fn configure_log_file(builder: &mut env_logger::Builder) {
 ///
 /// When `RUST_LOG_FILE` is set to a file path, log output is appended to that file
 /// (parent directories are created if missing) instead of stderr.
-pub fn init_runtime_logging(logs: bool) {
+pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
     let has_rust_log = std::env::var_os("RUST_LOG").is_some();
     let mut builder = if logs && has_rust_log {
         env_logger::Builder::from_default_env()
@@ -85,8 +85,16 @@ pub fn init_runtime_logging(logs: bool) {
     };
 
     if logs {
+        let has_debug = if let Some(debug) = debug && debug { true } else { false };
         if !has_rust_log || !rust_log_mentions_target(RUNTIME_LOG_TARGET) {
-            builder.filter_module(RUNTIME_LOG_TARGET, LevelFilter::Info);
+            let level = if has_debug {
+                LevelFilter::Debug
+            } else {
+                LevelFilter::Info
+            };
+            builder.filter_module(RUNTIME_LOG_TARGET, level);
+        } else if has_rust_log && has_debug {
+            builder.filter_module(RUNTIME_LOG_TARGET, LevelFilter::Debug);
         }
     } else {
         builder.filter_module(RUNTIME_LOG_TARGET, LevelFilter::Off);
@@ -117,10 +125,7 @@ mod tests {
 
     #[test]
     fn open_log_file_creates_parent_directory() {
-        let base = std::env::temp_dir().join(format!(
-            "rust-bot-log-test-{}",
-            std::process::id()
-        ));
+        let base = std::env::temp_dir().join(format!("rust-bot-log-test-{}", std::process::id()));
         let log_path = base.join("nested").join("runtime.log");
         let _ = fs::remove_dir_all(&base);
 
@@ -137,10 +142,8 @@ mod tests {
 
     #[test]
     fn open_log_file_appends_to_existing_file() {
-        let log_path = std::env::temp_dir().join(format!(
-            "rust-bot-log-append-{}.log",
-            std::process::id()
-        ));
+        let log_path =
+            std::env::temp_dir().join(format!("rust-bot-log-append-{}.log", std::process::id()));
         let _ = fs::remove_file(&log_path);
 
         {

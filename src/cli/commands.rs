@@ -1,33 +1,49 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
+use std::future::Future;
 use std::path::PathBuf;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::agent::cron_context::with_cron_context_stack;
+use crate::agent::tools::cron::CronTool;
+use crate::agent::tools::message::MessageTool;
 use crate::api::rest::ApiServer;
 use crate::api::rest::create_api_server;
 use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::channels::manager::ChannelManager;
+use crate::cron::CronJobState;
+use crate::cron::CronPayload;
+use crate::cron::CronPayloadKind;
+use crate::cron::compute_next_run;
+use crate::cron::service::now_ms;
+use crate::heartbeat::service::HeartbeatService;
+use crate::session::manager::SessionManager;
 use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
+use crate::utils::evaluator::evaluate_response;
 
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use reedline::{
-    DefaultPrompt, EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings,
-    Reedline, ReedlineEvent, Signal, default_emacs_keybindings,
+    DefaultPrompt, EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Reedline,
+    ReedlineEvent, Signal, default_emacs_keybindings,
 };
 use serde_json::Value;
 use termimad::MadSkin;
 
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
 use crate::bus::queue::MessageBus;
-use crate::cli::paste_edit_mode::{prepare_image_paste_insert, PasteCapturingEmacs, prepare_text_paste_insert};
+use crate::cli::paste_edit_mode::{
+    PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
+};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
 use crate::config::schema::{ChannelsConfig, Config};
-use crate::cron::CronService;
+use crate::cron::{CronJob, CronService};
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
@@ -35,12 +51,8 @@ use crate::utils::clipboard::ClipboardImage;
 use crate::utils::clipboard::IMAGE_PASTE_COMMAND_REGEX;
 use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
-use crate::utils::clipboard::{
-    TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX,
-};
-use crate::utils::exit_codes::{
-    self, GENERAL_ERROR, INVALID_PROVIDER, TEMPLATES_UNAVAILABLE,
-};
+use crate::utils::clipboard::{TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX};
+use crate::utils::exit_codes::{self, GENERAL_ERROR, INVALID_PROVIDER, TEMPLATES_UNAVAILABLE};
 use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
 use crate::utils::restart::{
@@ -67,6 +79,9 @@ pub enum Commands {
 
     /// Run the API server
     Api(ApiArgs),
+
+    /// Run the gateway server
+    Gateway(GatewayArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -83,9 +98,9 @@ pub struct AgentArgs {
     #[arg(short, long)]
     pub workspace: Option<PathBuf>,
 
-    /// Config file path
+    /// JSON configuration file path
     #[arg(short, long)]
-    pub config: Option<PathBuf>,
+    pub config: PathBuf,
 
     /// Render assistant output as Markdown
     #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
@@ -133,9 +148,24 @@ pub struct ApiArgs {
     #[arg(short, long, default_value = "api:default")]
     pub session: String,
 
-    /// Config file path
+    /// JSON configuration file path
     #[arg(short, long)]
-    pub config: Option<PathBuf>,
+    pub config: PathBuf,
+}
+
+#[derive(Debug, Parser)]
+pub struct GatewayArgs {
+    /// Workspace directory
+    #[arg(short, long)]
+    pub workspace: Option<PathBuf>,
+
+    /// Set logging to debug during runtime.
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub verbose: bool,
+
+    /// JSON configuration file path
+    #[arg(short, long)]
+    pub config: PathBuf,
 }
 
 #[derive(Debug)]
@@ -214,10 +244,11 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     match cli.command {
         Commands::Agent(args) => run_agent(args).await,
         Commands::Api(args) => run_api(args).await,
+        Commands::Gateway(args) => run_gateway(args).await,
     }
 }
 
-fn prepare_workspace(config: Option<PathBuf>, workspace: Option<PathBuf>) -> (Config, PathBuf) {
+fn prepare_workspace(config: PathBuf, workspace: Option<PathBuf>) -> (Config, PathBuf) {
     let config = load_runtime_config(config, workspace);
     let workspace = config.workspace_path();
     ensure_dir(&workspace);
@@ -269,7 +300,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     let session_id = args.session.clone();
     let markdown = args.markdown_enabled();
     let logs = args.logs_enabled();
-    init_runtime_logging(logs);
+    init_runtime_logging(logs, None);
 
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
     let agent_loop = init_agent_loop(&config, workspace);
@@ -289,8 +320,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     // The gateway handles those in `AgentLoop::run()`; CLI uses `process_direct`
     // instead, so we need a background listener to deliver async results.
     let system_listener = spawn_system_message_listener(Arc::clone(&agent_loop), markdown);
-    let outbound_listener =
-        spawn_outbound_message_listener(Arc::clone(&agent_loop), markdown);
+    let outbound_listener = spawn_outbound_message_listener(Arc::clone(&agent_loop), markdown);
     let result = match args.message {
         Some(message) if !message.is_empty() => {
             message_session(
@@ -321,7 +351,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 }
 
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
-    init_runtime_logging(true);
+    init_runtime_logging(true, None);
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
     let agent_loop = init_agent_loop(&config, workspace.clone());
     let host = args.host.unwrap_or_else(|| config.api.host.clone());
@@ -346,6 +376,398 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
+    init_runtime_logging(true, Some(args.verbose));
+    let (config, workspace) = prepare_workspace(args.config, args.workspace);
+    let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone()));
+    let session_manager = agent_loop.session_manager.clone();
+    let cron = agent_loop.cron_service.clone();
+
+    // Execute a cron job through the agent.
+    let on_cron_job = {
+        let agent_loop = Arc::clone(&agent_loop);
+        move |job: CronJob| {
+            let agent_loop = Arc::clone(&agent_loop);
+            Box::pin(async move {
+                with_cron_context_stack(|| async move {
+                    // Dream is an internal job — run directly, not through the agent loop.
+                    if job.name == "dream" {
+                        let _ = agent_loop.dream.run().await;
+                        return Ok(());
+                    }
+                    let reminder_note = [
+                        "[Scheduled Task] Timer finished.\n",
+                        format!("Task '{}' has been triggered.", job.name).as_str(),
+                        format!("Scheduled instruction: {}", job.payload.message).as_str(),
+                    ]
+                    .join("\n");
+                    let session_key = format!("cron:{}", job.id);
+                    let cron_tool = {
+                        let guard = agent_loop.tools.lock().unwrap_or_else(|e| e.into_inner());
+                        guard.get("cron")
+                    };
+                    let cron_token = cron_tool.as_ref().and_then(|tool| {
+                        (tool.as_ref() as &dyn std::any::Any)
+                            .downcast_ref::<CronTool>()
+                            .map(|cron_tool| cron_tool.set_cron_context(true))
+                    });
+                    let channel = job
+                        .payload
+                        .channel
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("cli");
+                    let chat_id = job
+                        .payload
+                        .to
+                        .as_deref()
+                        .filter(|s| !s.is_empty())
+                        .unwrap_or("direct");
+                    let resp = Arc::clone(&agent_loop)
+                        .process_direct(
+                            &reminder_note,
+                            Some(session_key.as_str()),
+                            Some(channel),
+                            Some(chat_id),
+                            None,
+                            None,
+                            None,
+                            None,
+                        )
+                        .await;
+                    if let Some(token) = cron_token {
+                        if let Some(tool) = cron_tool.as_ref() {
+                            if let Some(cron_tool) =
+                                (tool.as_ref() as &dyn std::any::Any).downcast_ref::<CronTool>()
+                            {
+                                cron_tool.reset_cron_context(token);
+                            }
+                        }
+                    }
+
+                    // If the message tool already delivered the reply, we're done.
+                    let already_sent = {
+                        let message_tool = agent_loop
+                            .tools
+                            .lock()
+                            .unwrap_or_else(|e| e.into_inner())
+                            .get("message");
+                        message_tool
+                            .as_ref()
+                            .and_then(|tool| {
+                                (tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
+                            })
+                            .map(|message_tool| {
+                                *message_tool
+                                    .sent_in_turn
+                                    .lock()
+                                    .unwrap_or_else(|e| e.into_inner())
+                            })
+                            .unwrap_or(false)
+                    };
+                    if let Some(response) = resp {
+                        if already_sent {
+                            return Ok(());
+                        }
+                        if job.payload.deliver
+                            && let Some(to) = job.payload.to
+                            && !to.is_empty()
+                            && !response.content.is_empty()
+                        {
+                            let should_notify = evaluate_response(
+                                &response.content,
+                                &reminder_note,
+                                Arc::clone(&agent_loop.provider),
+                                &agent_loop.model,
+                            )
+                            .await;
+                            if should_notify {
+                                let outbound = OutboundMessage {
+                                    channel: channel.to_string(),
+                                    chat_id: to,
+                                    content: response.content.clone(),
+                                    reply_to: None,
+                                    media: vec![],
+                                    metadata: HashMap::new(),
+                                };
+                                let bus = agent_loop.bus();
+                                if let Err(e) = bus.publish_outbound(outbound) {
+                                    log::error!("Failed to publish cron outbound message: {e}");
+                                }
+                            }
+                        }
+                    }
+                    Ok(())
+                })
+                .await
+            }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        }
+    };
+
+    if let Some(cron) = &cron {
+        cron.set_on_job(Arc::new(on_cron_job)).await;
+    }
+
+    // Create the channel manager
+    let config = Arc::new(config);
+    let channels = Arc::new(ChannelManager::new(
+        Arc::clone(&config),
+        Arc::clone(&agent_loop.bus()),
+    ));
+
+    /// Pick a routable channel/chat target for heartbeat-triggered messages.
+    async fn pick_heartbeat_target(
+        channels: Arc<ChannelManager>,
+        session_manager: Arc<StdMutex<SessionManager>>,
+    ) -> (String, String) {
+        let enabled = channels.get_enabled_channels();
+        // Prefer the most recently updated non-internal session on an enabled channel.
+        for item in session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .list_sessions()
+        {
+            let key = item
+                .get("key")
+                .and_then(|v| v.as_str())
+                .filter(|k| !k.is_empty())
+                .unwrap_or("");
+            if !key.contains(':') {
+                continue;
+            }
+            let splits = key.splitn(2, ':').collect::<Vec<&str>>();
+            let channel = splits[0];
+            let chat_id = splits[1];
+            if channel == "cli" || channel == "system" {
+                continue;
+            }
+            if enabled.contains(&channel.to_string()) && !chat_id.is_empty() {
+                return (channel.to_string(), chat_id.to_string());
+            }
+        }
+        ("cli".to_string(), "direct".to_string())
+    }
+
+    // Create heartbeat service
+    let on_heartbeat_execute = {
+        let agent_loop = Arc::clone(&agent_loop);
+        let session_manager = Arc::clone(&session_manager);
+        let channels = Arc::clone(&channels);
+        let config = Arc::clone(&config);
+        move |tasks: &str| {
+            let tasks = tasks.to_string();
+            let agent_loop = Arc::clone(&agent_loop);
+            let session_manager = Arc::clone(&session_manager);
+            let channels = Arc::clone(&channels);
+            let config = Arc::clone(&config);
+            Box::pin(async move {
+                let (channel, chat_id) = pick_heartbeat_target(
+                    Arc::clone(&channels),
+                    Arc::clone(&session_manager),
+                )
+                .await;
+                // Suppress progress publishing during heartbeat (matches Python `_silent`).
+                let silent: ProgressCallback = Arc::new(|_message, _tool_hint| {
+                    Box::pin(async {})
+                });
+                let resp = Arc::clone(&agent_loop)
+                    .process_direct(
+                        &tasks,
+                        Some("heartbeat"),
+                        Some(&channel),
+                        Some(&chat_id),
+                        None,
+                        Some(silent),
+                        None,
+                        None,
+                    )
+                    .await;
+                // Keep a small tail of heartbeat history so the loop stays bounded
+                // without losing all short-term context between runs.
+                let mut manager = session_manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let session = {
+                    let session = manager.get_or_create_session("heartbeat");
+                    session.retain_recent_legal_suffix(
+                        config.gateway.heartbeat.keep_recent_messages as usize,
+                    );
+                    session.clone()
+                };
+                let _ = manager.save(session);
+                resp.map(|r| r.content).unwrap_or_default()
+            }) as Pin<Box<dyn Future<Output = String> + Send>>
+        }
+    };
+
+    let on_heartbeat_notify = {
+        let bus = Arc::clone(&agent_loop).bus();
+        let session_manager = Arc::clone(&session_manager);
+        let channels = Arc::clone(&channels);
+        move |response: &str| {
+            let response = response.to_string();
+            let bus = Arc::clone(&bus);
+            let session_manager = Arc::clone(&session_manager);
+            let channels = Arc::clone(&channels);
+            Box::pin(async move {
+                let (channel, chat_id) =
+                    pick_heartbeat_target(channels, session_manager).await;
+                if channel == "cli" {
+                    return Ok(());
+                }
+                let outbound = OutboundMessage {
+                    channel,
+                    chat_id,
+                    content: response,
+                    reply_to: None,
+                    media: vec![],
+                    metadata: HashMap::new(),
+                };
+                bus.publish_outbound(outbound).map_err(|e| e.to_string())
+            }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>
+        }
+    };
+
+    let hb_cfg = &config.gateway.heartbeat;
+    let heartbeat = Arc::new(HeartbeatService::new(
+        workspace.clone(),
+        Arc::clone(&agent_loop.provider),
+        agent_loop.model.clone(),
+        Some(Arc::new(on_heartbeat_execute)),
+        Some(Arc::new(on_heartbeat_notify)),
+        hb_cfg.interval_s,
+        hb_cfg.enabled,
+        Some(config.agents.timezone.clone()),
+    ));
+
+    let green = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green)));
+    let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
+
+    let enabled = channels.get_enabled_channels();
+    if !enabled.is_empty() {
+        println!(
+            "{}✓{} Channels enabled: {}",
+            green.render(),
+            green.render_reset(),
+            enabled.join(", ")
+        );
+    } else {
+        println!(
+            "{}Warning: No channels enabled{}",
+            yellow.render(),
+            yellow.render_reset()
+        );
+    }
+
+    // Python: console.print(f"[green]✓[/green] Cron: {cron_status['jobs']} scheduled jobs")
+    if let Some(cron) = &cron {
+        let cron_status = cron.status().await;
+        if cron_status.jobs > 0 {
+            println!(
+                "{}✓{} Cron: {} scheduled jobs",
+                green.render(),
+                green.render_reset(),
+                cron_status.jobs
+            );
+        }
+    }
+
+    if hb_cfg.enabled {
+        println!(
+            "{}✓{} Heartbeat: every {}s",
+            green.render(),
+            green.render_reset(),
+            hb_cfg.interval_s
+        );
+    } else {
+        println!(
+            "{}✗{} Heartbeat: disabled",
+            yellow.render(),
+            yellow.render_reset()
+        );
+    }
+
+    // Register Dream system job (always-on, idempotent on restart)
+    // Note: dream.model_override is already applied in AgentLoop::new.
+
+    // Register Cron system job (always-on, idempotent on restart)
+    let mut cron_option: Option<Arc<CronService>> = None;
+    if let Some(cron) = &cron {
+        cron_option = Some(Arc::clone(cron));
+        let dream_cfg = agent_loop.defaults.dream.clone();
+        let timezone = agent_loop.defaults.timezone.clone();
+        let now = now_ms();
+        let schedule = dream_cfg.build_schedule(&timezone); 
+        cron.register_system_job(crate::cron::types::CronJob {
+            id: "dream".to_string(),
+            name: "dream".to_string(),
+            enabled: true,
+            schedule: schedule.clone(),
+            payload: CronPayload {
+                kind: CronPayloadKind::SystemEvent,
+                ..Default::default()
+            },
+            created_at_ms: now,
+            updated_at_ms: now,
+            delete_after_run: false,
+            state: CronJobState {
+                next_run_at_ms: compute_next_run(&schedule, now),
+                ..Default::default()
+            }
+        }).await;
+        println!(
+            "{}✓{} Dream: {}",
+            green.render(),
+            green.render_reset(),
+            dream_cfg.describe_schedule()
+        );
+    }
+
+    // Python: async def run() / try / gather / finally shutdown
+    let red = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red)));
+
+    if let Some(cron) = &cron_option {
+        cron.start().await;
+    }
+    heartbeat.start().await;
+
+    let mut gather = tokio::spawn({
+        let agent_loop = Arc::clone(&agent_loop);
+        let channels = Arc::clone(&channels);
+        async move {
+            tokio::join!(agent_loop.run(), channels.start_all());
+        }
+    });
+
+    tokio::select! {
+        result = &mut gather => {
+            if let Err(join_err) = result {
+                println!(
+                    "\n{}Error: Gateway crashed unexpectedly{}",
+                    red.render(),
+                    red.render_reset()
+                );
+                println!("{join_err}");
+            }
+        }
+        _ = tokio::signal::ctrl_c() => {
+            println!("\nShutting down...");
+            gather.abort();
+            let _ = gather.await;
+        }
+    }
+
+    agent_loop.close_mcp().await;
+    heartbeat.stop().await;
+    if let Some(cron) = &cron_option {
+        cron.stop().await;
+    }
+    agent_loop.stop();
+    channels.stop_all().await;
+
+    Ok(())
+}
+
 fn render_api_startup_message(
     host: &str,
     port: u16,
@@ -356,7 +778,9 @@ fn render_api_startup_message(
 ) {
     print_markdown(&format!("{} Starting OpenAI-compatible API server", LOGO));
     println!();
-    print_markdown(&format!("Endpoint: **http://{host}:{port}/v1/chat/completions**"));
+    print_markdown(&format!(
+        "Endpoint: **http://{host}:{port}/v1/chat/completions**"
+    ));
     print_markdown(&format!("Swagger UI: **http://{host}:{port}/swagger-ui**"));
     print_markdown(&format!("Model: **{}**", model_name));
     print_markdown(&format!("Workspace: **{}**", workspace.display()));
@@ -377,9 +801,7 @@ fn spawn_system_message_listener(
     tokio::spawn(async move {
         let bus = agent_loop.bus();
         while let Some(msg) = bus.consume_inbound().await {
-            if let Some(response) =
-                handle_cli_system_message(Arc::clone(&agent_loop), msg).await
-            {
+            if let Some(response) = handle_cli_system_message(Arc::clone(&agent_loop), msg).await {
                 print_agent_response_with_header(
                     &response.content,
                     markdown,
@@ -405,12 +827,7 @@ fn spawn_outbound_message_listener(
             if is_internal_outbound(&msg) {
                 continue;
             }
-            print_agent_response_with_header(
-                &msg.content,
-                markdown,
-                Some(&msg.metadata),
-                true,
-            );
+            print_agent_response_with_header(&msg.content, markdown, Some(&msg.metadata), true);
         }
     })
 }
@@ -486,30 +903,25 @@ async fn message_session(
 }
 
 /// Load config and optionally override the active workspace.
-fn load_runtime_config(config: Option<PathBuf>, workspace: Option<PathBuf>) -> Config {
-    if let Some(config) = config {
-        if !config.exists() {
-            eprint_error(format!("Config file not found: {}", config.display()));
+fn load_runtime_config(config: PathBuf, workspace: Option<PathBuf>) -> Config {
+    if !config.exists() {
+        eprint_error(format!("Config file not found: {}", config.display()));
+        exit_codes::exit(GENERAL_ERROR);
+    }
+    set_config_path(config.clone());
+    let loaded = resolve_config_env_vars(&load_config(Some(config.clone())));
+    println!("Using config: {}", config.display());
+    match loaded {
+        Ok(mut loaded) => {
+            if let Some(workspace) = workspace {
+                loaded.agents.workspace = workspace.clone().to_string_lossy().into_owned();
+            }
+            loaded
+        }
+        Err(e) => {
+            eprint_error(e);
             exit_codes::exit(GENERAL_ERROR);
         }
-        set_config_path(config.clone());
-        let loaded = resolve_config_env_vars(&load_config(Some(config.clone())));
-        println!("Using config: {}", config.display());
-        match loaded {
-            Ok(mut loaded) => {
-                if let Some(workspace) = workspace {
-                    loaded.agents.workspace = workspace.clone().to_string_lossy().into_owned();
-                }
-                loaded
-            }
-            Err(e) => {
-                eprint_error(e);
-                exit_codes::exit(GENERAL_ERROR);
-            }
-        }
-    } else {
-        eprint_error("No config file provided");
-        exit_codes::exit(GENERAL_ERROR);
     }
 }
 
@@ -842,8 +1254,9 @@ fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
     let history_result = FileBackedHistory::with_file(100, history_file);
 
     match history_result {
-        Ok(history) => build_reedline(Some(history), text_captures)
-            .use_kitty_keyboard_enhancement(true),
+        Ok(history) => {
+            build_reedline(Some(history), text_captures).use_kitty_keyboard_enhancement(true)
+        }
         Err(e) => {
             log::warn!("Failed to read history file: {}", e);
             build_reedline(None, text_captures)
