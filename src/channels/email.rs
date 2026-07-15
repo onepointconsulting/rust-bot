@@ -5,10 +5,10 @@ use rand::seq::SliceRandom;
 use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, LazyLock, Mutex,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
@@ -20,17 +20,17 @@ use crate::{
         base::{BaseChannel, BaseChannelCommon},
         types::MessageBytes,
     },
-    config::{
-        channels::EmailConfig, paths::get_media_dir, schema::ChannelsConfig,
-    },
-    utils::helpers::safe_filename,
+    config::{channels::EmailConfig, paths::get_media_dir, schema::ChannelsConfig},
+    utils::helpers::{detect_image_mime, safe_filename},
 };
 
 use async_imap::{Client, Session};
 use lettre::{
-    message::{Mailbox, MessageBuilder},
-    transport::smtp::authentication::Credentials,
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
+    message::{
+        Attachment, Mailbox, MessageBuilder, MultiPart, SinglePart, header::ContentType,
+    },
+    transport::smtp::authentication::Credentials,
 };
 use mailparse::{DispositionType, MailHeaderMap, ParsedMail, addrparse_header, parse_mail};
 use native_tls::TlsConnector as NativeTlsConnector;
@@ -208,9 +208,6 @@ pub struct EmailChannel {
 }
 
 impl EmailChannel {
-    const IMAP_MONTHS: [&str; 12] = [
-        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
-    ];
     const IMAP_RECONNECT_MARKERS: [&str; 6] = [
         "disconnected for inactivity",
         "eof occurred in violation of protocol",
@@ -752,11 +749,7 @@ impl EmailChannel {
         }
         let prefix = {
             let trimmed = self.config.subject_prefix.trim();
-            if trimmed.is_empty() {
-                "Re:"
-            } else {
-                trimmed
-            }
+            if trimmed.is_empty() { "Re:" } else { trimmed }
         };
         format!("{prefix} {subject}")
     }
@@ -783,6 +776,114 @@ impl EmailChannel {
         };
 
         Ok(builder.credentials(creds).build())
+    }
+
+    fn guess_attachment_content_type(path: &Path, bytes: &[u8]) -> ContentType {
+        if let Some(mime) = detect_image_mime(bytes)
+            && let Ok(content_type) = ContentType::parse(mime)
+        {
+            return content_type;
+        }
+        let mime = match path
+            .extension()
+            .and_then(|ext| ext.to_str())
+            .map(|ext| ext.to_ascii_lowercase())
+            .as_deref()
+        {
+            Some("pdf") => "application/pdf",
+            Some("txt") | Some("md") | Some("csv") | Some("log") => "text/plain; charset=utf-8",
+            Some("html") | Some("htm") => "text/html; charset=utf-8",
+            Some("json") => "application/json",
+            Some("xml") => "application/xml",
+            Some("zip") => "application/zip",
+            Some("png") => "image/png",
+            Some("jpg") | Some("jpeg") => "image/jpeg",
+            Some("gif") => "image/gif",
+            Some("webp") => "image/webp",
+            Some("svg") => "image/svg+xml",
+            Some("mp3") => "audio/mpeg",
+            Some("wav") => "audio/wav",
+            Some("mp4") => "video/mp4",
+            Some("doc") => "application/msword",
+            Some("docx") => {
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
+            }
+            Some("xls") => "application/vnd.ms-excel",
+            Some("xlsx") => {
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            }
+            _ => "application/octet-stream",
+        };
+        ContentType::parse(mime).unwrap_or_else(|_| {
+            ContentType::parse("application/octet-stream")
+                .expect("application/octet-stream is a valid content type")
+        })
+    }
+
+    fn build_attachment_part(path_str: &str) -> Result<SinglePart, String> {
+        let path = Path::new(path_str);
+        if !path.is_file() {
+            return Err(format!("not a readable file: {path_str}"));
+        }
+        let bytes = std::fs::read(path).map_err(|e| format!("failed to read {path_str}: {e}"))?;
+        let filename = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .filter(|name| !name.trim().is_empty())
+            .unwrap_or("attachment");
+        let filename = safe_filename(filename);
+        let content_type = Self::guess_attachment_content_type(path, &bytes);
+        Ok(Attachment::new(filename).body(bytes, content_type))
+    }
+
+    fn build_email_message(
+        msg: OutboundMessage,
+        builder: MessageBuilder,
+    ) -> Result<Message, String> {
+        let content = msg.content;
+        let looks_like_html =
+            content.trim_start().starts_with('<') && content.to_lowercase().contains("<html");
+        let (plain, html) = if looks_like_html {
+            (Self::html_to_text(&content), content)
+        } else {
+            (
+                content.clone(),
+                format!(
+                    "<html><body>{}</body></html>",
+                    html_escape::encode_text(&content).replace('\n', "<br>\n")
+                ),
+            )
+        };
+
+        let mut attachments = Vec::new();
+        for path_str in &msg.media {
+            match Self::build_attachment_part(path_str) {
+                Ok(part) => attachments.push(part),
+                Err(e) => log::warn!("Email attachment skipped ({path_str}): {e}"),
+            }
+        }
+
+        let multipart = if attachments.is_empty() {
+            MultiPart::alternative_plain_html(plain, html)
+        } else {
+            let mut mixed =
+                MultiPart::mixed().multipart(MultiPart::alternative_plain_html(plain, html));
+            for part in attachments {
+                mixed = mixed.singlepart(part);
+            }
+            mixed
+        };
+
+        let email_msg = match builder.multipart(multipart) {
+            Ok(m) => m,
+            Err(e) => {
+                let err = format!("Failed to build email message: {e}");
+                log::error!("{err}");
+                return Err(err);
+            }
+        };
+
+        Ok(email_msg)
     }
 }
 
@@ -938,14 +1039,7 @@ impl BaseChannel for EmailChannel {
             }
         }
 
-        let email_msg = match builder.body(msg.content.clone()) {
-            Ok(m) => m,
-            Err(e) => {
-                let err = format!("Failed to build email message: {e}");
-                log::error!("{err}");
-                return Err(err);
-            }
-        };
+        let email_msg = Self::build_email_message(msg, builder)?;
 
         let mailer = match self.build_smtp_transport() {
             Ok(m) => m,
@@ -1492,5 +1586,97 @@ mod tests {
     fn reply_subject_trims_base_subject() {
         let channel = channel_with_prefix("Re:");
         assert_eq!(channel.reply_subject("  Hello  "), "Re: Hello");
+    }
+
+    fn test_message_builder() -> MessageBuilder {
+        Message::builder()
+            .from("bot@example.com".parse().unwrap())
+            .to("user@example.com".parse().unwrap())
+            .subject("test")
+    }
+
+    fn outbound_with_media(content: &str, media: Vec<String>) -> OutboundMessage {
+        OutboundMessage {
+            channel: "email".to_string(),
+            chat_id: "user@example.com".to_string(),
+            content: content.to_string(),
+            reply_to: None,
+            media,
+            metadata: HashMap::new(),
+        }
+    }
+
+    #[test]
+    fn build_email_message_without_media_is_multipart_alternative() {
+        let msg = outbound_with_media("Hello", vec![]);
+        let email = EmailChannel::build_email_message(msg, test_message_builder())
+            .expect("build should succeed");
+        let formatted = email.formatted();
+        let raw = String::from_utf8_lossy(&formatted);
+        assert!(raw.contains("Content-Type: multipart/alternative"));
+        assert!(!raw.contains("Content-Disposition: attachment"));
+        assert!(raw.contains("Hello"));
+    }
+
+    #[test]
+    fn build_email_message_attaches_media_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-bot-email-attach-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let pdf_path = dir.join("report.pdf");
+        let txt_path = dir.join("notes.txt");
+        std::fs::write(&pdf_path, b"%PDF-1.4 fake").unwrap();
+        std::fs::write(&txt_path, b"hello notes").unwrap();
+
+        let msg = outbound_with_media(
+            "See attachments",
+            vec![
+                pdf_path.to_string_lossy().into_owned(),
+                txt_path.to_string_lossy().into_owned(),
+            ],
+        );
+        let email = EmailChannel::build_email_message(msg, test_message_builder())
+            .expect("build should succeed");
+        let formatted = email.formatted();
+        let raw = String::from_utf8_lossy(&formatted);
+        assert!(raw.contains("Content-Type: multipart/mixed"));
+        assert!(raw.contains("Content-Disposition: attachment; filename=\"report.pdf\""));
+        assert!(raw.contains("Content-Disposition: attachment; filename=\"notes.txt\""));
+        assert!(raw.contains("application/pdf"));
+        assert!(raw.contains("See attachments"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn build_email_message_skips_missing_media_paths() {
+        let dir = std::env::temp_dir().join(format!(
+            "rust-bot-email-attach-missing-{}",
+            std::process::id()
+        ));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        let good_path = dir.join("ok.txt");
+        std::fs::write(&good_path, b"ok").unwrap();
+        let missing = dir.join("missing.txt");
+
+        let msg = outbound_with_media(
+            "partial",
+            vec![
+                good_path.to_string_lossy().into_owned(),
+                missing.to_string_lossy().into_owned(),
+            ],
+        );
+        let email = EmailChannel::build_email_message(msg, test_message_builder())
+            .expect("build should succeed");
+        let formatted = email.formatted();
+        let raw = String::from_utf8_lossy(&formatted);
+        assert!(raw.contains("filename=\"ok.txt\""));
+        assert!(!raw.contains("filename=\"missing.txt\""));
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
