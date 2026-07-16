@@ -21,7 +21,7 @@ Preserve reading order, paragraph breaks, and table structure where possible. \
 Return only the extracted text with no commentary or preamble.";
 
 const MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
-const OCR_MAX_TOKENS: usize = 8192;
+const OCR_MAX_TOKENS: usize = 8192 * 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum OcrContentKind {

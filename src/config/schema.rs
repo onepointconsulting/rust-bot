@@ -246,10 +246,10 @@ fn default_agent_model() -> String {
     "anthropic/claude-opus-4-6".to_string()
 }
 fn default_agent_provider() -> String {
-    "auto".to_string()
+    "openrouter".to_string()
 }
 fn default_agent_max_tokens() -> u32 {
-    8192
+    8192 * 2
 }
 fn default_agent_context_window_tokens() -> u64 {
     65_536
@@ -1151,6 +1151,8 @@ impl Config {
                 continue;
             }
             let api_base = p.api_base.as_deref().unwrap_or("");
+            log::info!("api_base: {}", api_base);
+            log::info!("spec.detect_by_base_keyword: {}", spec.detect_by_base_keyword);
             if !spec.detect_by_base_keyword.is_empty()
                 && api_base.contains(&spec.detect_by_base_keyword)
             {

@@ -25,7 +25,7 @@
     "transcriptionProvider": "groq"
   },
   "providers": {
-    "custom": {
+    "openrouter": {
       "apiKey": "${OPENAI_API_KEY}",
       "apiBase": "${OPENAI_API_BASE}",
       "extraHeaders": null

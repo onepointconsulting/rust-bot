@@ -44,37 +44,24 @@ fn rust_log_file_path() -> Option<PathBuf> {
     Some(PathBuf::from(path))
 }
 
-fn configure_log_file(builder: &mut env_logger::Builder) {
-    let Some(path) = rust_log_file_path() else {
-        return;
-    };
-
-    match open_log_file(&path) {
-        Ok(file) => {
-            builder.target(env_logger::Target::Pipe(Box::new(file)));
-            builder.write_style(env_logger::WriteStyle::Never);
-        }
-        Err(err) => {
-            eprintln!(
-                "Warning: failed to open {RUST_LOG_FILE_ENV} {}: {err}",
-                path.display()
-            );
-        }
-    }
-}
-
 /// Initialize CLI runtime logging.
 ///
 /// Mirrors Python nanobot's `logger.enable("nanobot")` / `logger.disable("nanobot")`:
 /// `--logs` toggles only this crate's logs by default, not third-party crates.
 ///
-/// When `RUST_LOG` is set and `--logs` is on, its filters apply (e.g. `RUST_LOG=html5ever=warn`
-/// for debugging a dependency). With `--no-logs`, all logging is suppressed, including
-/// third-party crates, even if `RUST_LOG` is set in the environment or `.env`.
+/// When `RUST_LOG` is set and logging is enabled, its filters apply (e.g.
+/// `RUST_LOG=html5ever=warn` for debugging a dependency). With `--no-logs` and no
+/// `RUST_LOG_FILE`, all logging is suppressed, including third-party crates, even if
+/// `RUST_LOG` is set in the environment or `.env`.
 ///
-/// When `RUST_LOG_FILE` is set to a file path, log output is appended to that file
-/// (parent directories are created if missing) instead of stderr.
+/// When `RUST_LOG_FILE` is set to a file path, logging is enabled and output is
+/// appended to that file (parent directories are created if missing) instead of stderr.
+/// This works even without `--logs`, so agent chat stays clean while still writing
+/// a log file.
 pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
+    let log_file = rust_log_file_path();
+    // File destination implies logging is wanted even when `--logs` is off (CLI chat).
+    let logs = logs || log_file.is_some();
     let has_rust_log = std::env::var_os("RUST_LOG").is_some();
     let mut builder = if logs && has_rust_log {
         env_logger::Builder::from_default_env()
@@ -100,7 +87,20 @@ pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
         builder.filter_module(RUNTIME_LOG_TARGET, LevelFilter::Off);
     }
 
-    configure_log_file(&mut builder);
+    if let Some(path) = log_file.as_deref() {
+        match open_log_file(path) {
+            Ok(file) => {
+                builder.target(env_logger::Target::Pipe(Box::new(file)));
+                builder.write_style(env_logger::WriteStyle::Never);
+            }
+            Err(err) => {
+                eprintln!(
+                    "Warning: failed to open {RUST_LOG_FILE_ENV} {}: {err}",
+                    path.display()
+                );
+            }
+        }
+    }
 
     let _ = builder.try_init();
 }

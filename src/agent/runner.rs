@@ -907,12 +907,9 @@ impl AgentRunner {
 
                 if let Some(err) = fatal_error {
                     log::error!("Fatal tool error: {}", err);
-                    let error_msg = spec
-                        .error_message
-                        .as_deref()
-                        .unwrap_or(DEFAULT_ERROR_MESSAGE);
+                    let error_msg = format!("Error: {}\n{}", err, spec.error_message.as_deref().unwrap_or(DEFAULT_ERROR_MESSAGE));
                     stop_reason = "tool_error".to_string();
-                    Self::append_final_message(&mut messages, Some(error_msg));
+                    Self::append_final_message(&mut messages, Some(&error_msg));
                     ctx.stop_reason = Some("tool_error".to_string());
                     ctx.error = Some(err.clone());
                     hook.after_iteration(&mut ctx).await;
@@ -995,12 +992,9 @@ impl AgentRunner {
 
             // Provider-signalled error.
             if finish_reason == "error" {
-                let error_msg = spec
-                    .error_message
-                    .as_deref()
-                    .unwrap_or(DEFAULT_ERROR_MESSAGE);
+                let error_msg = format!("Error: {}\n{}", "Provider-signalled error", spec.error_message.as_deref().unwrap_or(DEFAULT_ERROR_MESSAGE));
                 stop_reason = "error".to_string();
-                Self::append_final_message(&mut messages, Some(error_msg));
+                Self::append_final_message(&mut messages, Some(&error_msg));
                 log::error!("Provider-signalled error: {}", error_msg);
                 ctx.stop_reason = Some("error".to_string());
                 hook.after_iteration(&mut ctx).await;

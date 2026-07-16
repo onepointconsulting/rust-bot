@@ -2,6 +2,7 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
+use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -39,7 +40,9 @@ use crate::cli::paste_edit_mode::{
     PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
 };
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
-use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
+use crate::config::loader::{
+    get_config_path, load_config, resolve_config_env_vars, save_config, set_config_path,
+};
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
 use crate::config::schema::{ChannelsConfig, Config};
@@ -47,12 +50,15 @@ use crate::cron::{CronJob, CronService};
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
+use crate::providers::registry::find_by_name;
 use crate::utils::clipboard::IMAGE_PASTE_COMMAND_REGEX;
 use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
 use crate::utils::clipboard::{TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX};
 use crate::utils::exit_codes::{self, GENERAL_ERROR, INVALID_PROVIDER, TEMPLATES_UNAVAILABLE};
-use crate::utils::helpers::{TemplatesSyncError, ensure_dir, sync_workspace_templates};
+use crate::utils::helpers::{
+    TemplatesSyncError, ensure_dir, expand_tilde_path, sync_workspace_templates,
+};
 use crate::utils::logo::LOGO;
 use crate::utils::restart::{
     consume_restart_notice_from_env, format_restart_completed_message,
@@ -81,6 +87,9 @@ pub enum Commands {
 
     /// Run the gateway server
     Gateway(GatewayArgs),
+
+    /// Initialize configuration and workspace
+    Onboard(OnboardArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -161,6 +170,21 @@ pub struct GatewayArgs {
     pub config: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+pub struct OnboardArgs {
+    /// Workspace directory
+    #[arg(short, long)]
+    pub workspace: Option<PathBuf>,
+
+    /// JSON configuration file path (defaults to ~/.rust-bot/config.json)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
+
+    /// Use interactive setup wizard (not yet implemented)
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub wizard: bool,
+}
+
 #[derive(Debug)]
 pub enum CliError {
     InteractiveNotImplemented,
@@ -238,6 +262,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Agent(args) => run_agent(args).await,
         Commands::Api(args) => run_api(args).await,
         Commands::Gateway(args) => run_gateway(args).await,
+        Commands::Onboard(args) => run_onboard(args),
     }
 }
 
@@ -257,6 +282,7 @@ fn prepare_workspace(config: PathBuf, workspace: Option<PathBuf>) -> (Config, Pa
 fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
     let bus = MessageBus::new();
     let provider = create_provider(&config);
+    log::info!("provider api base: {:?}", provider.api_base());
 
     let cron_store_path = config.workspace_path().join("cron").join("jobs.json");
     let cron_service = CronService::new(cron_store_path, None);
@@ -342,6 +368,141 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     system_listener.abort();
     outbound_listener.abort();
     result
+}
+
+/// Lightweight non-interactive config bootstrap (wizard mode not yet implemented).
+fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
+    if args.wizard {
+        eprint_error("Wizard mode is not yet implemented; run without --wizard");
+        exit_codes::exit(GENERAL_ERROR);
+    }
+
+    let config_path = resolve_onboard_config_path(args.config);
+    let config = if config_path.exists() {
+        let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
+        let bold = Style::new().bold();
+        println!(
+            "{}Config already exists at {}{}",
+            yellow.render(),
+            config_path.display(),
+            yellow.render_reset()
+        );
+        println!(
+            "  {}y{} = overwrite with defaults (existing values will be lost)",
+            bold.render(),
+            bold.render_reset()
+        );
+        println!(
+            "  {}N{} = refresh config, keeping existing values and adding new fields",
+            bold.render(),
+            bold.render_reset()
+        );
+        if confirm_overwrite() {
+            let config = apply_workspace_override(Config::default(), args.workspace.as_ref());
+            save_config(&config, Some(config_path.clone()));
+            print_onboard_ok(format!(
+                "Config reset to defaults at {}",
+                config_path.display()
+            ));
+            config
+        } else {
+            let config = apply_workspace_override(
+                load_config(Some(config_path.clone())),
+                args.workspace.as_ref(),
+            );
+            save_config(&config, Some(config_path.clone()));
+            print_onboard_ok(format!(
+                "Config refreshed at {} (existing values preserved)",
+                config_path.display()
+            ));
+            config
+        }
+    } else {
+        let config = apply_workspace_override(Config::default(), args.workspace.as_ref());
+        save_config(&config, Some(config_path.clone()));
+        print_onboard_ok(format!("Created config at {}", config_path.display()));
+        config
+    };
+
+    // Prefer the configured workspace path (including any --workspace override).
+    let workspace_path = config.workspace_path();
+    if !workspace_path.exists() {
+        ensure_dir(&workspace_path);
+        print_onboard_ok(format!(
+            "Created workspace at {}",
+            workspace_path.display()
+        ));
+    } else {
+        ensure_dir(&workspace_path);
+    }
+
+    if let Err(err @ TemplatesSyncError::TemplatesUnavailable { .. }) =
+        sync_workspace_templates(&workspace_path, false)
+    {
+        eprint_error(err);
+        exit_codes::exit(TEMPLATES_UNAVAILABLE);
+    }
+
+    println!();
+    println!("{LOGO} is ready!");
+    println!();
+    println!("Next steps:");
+    println!("  1. Add your API key to {}", config_path.display());
+    println!(
+        "  2. Chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
+        config_path.display()
+    );
+    Ok(())
+}
+
+fn resolve_onboard_config_path(config: Option<PathBuf>) -> PathBuf {
+    if let Some(config) = config {
+        let expanded = PathBuf::from(expand_tilde_path(&config.to_string_lossy()).as_ref());
+        let config_path = if expanded.is_absolute() {
+            expanded
+        } else {
+            std::env::current_dir()
+                .unwrap_or_else(|_| PathBuf::from("."))
+                .join(expanded)
+        };
+        set_config_path(config_path.clone());
+        let dim = Style::new().dimmed();
+        println!(
+            "{}Using config: {}{}",
+            dim.render(),
+            config_path.display(),
+            dim.render_reset()
+        );
+        config_path
+    } else {
+        get_config_path()
+    }
+}
+
+fn apply_workspace_override(mut config: Config, workspace: Option<&PathBuf>) -> Config {
+    if let Some(workspace) = workspace {
+        config.agents.workspace = workspace.to_string_lossy().into_owned();
+    }
+    config
+}
+
+fn confirm_overwrite() -> bool {
+    print!("Overwrite? [y/N]: ");
+    let _ = io::stdout().flush();
+    let mut input = String::new();
+    if io::stdin().read_line(&mut input).is_err() {
+        return false;
+    }
+    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
+}
+
+fn print_onboard_ok(message: impl fmt::Display) {
+    let green = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green)));
+    println!(
+        "{}✓{} {message}",
+        green.render(),
+        green.render_reset()
+    );
 }
 
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
@@ -926,19 +1087,42 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
     log::info!("Provider Name: {:?}", provider_name);
     log::info!("Model: {:?}", model);
     match provider_name.as_str() {
-        "openai" | "openai_compat" | "openrouter" => Arc::new(OpenAICompatProvider::new(
-            Some(config.providers.custom.api_key.clone()),
-            config.providers.custom.api_base.clone(),
-            Some(model),
-            None,
-            None,
-        )),
+        "openai" | "custom" | "openrouter" => {
+            let (api_key, api_base, extra_headers) = if provider_name.as_str() == "openai" {
+                (
+                    Some(config.providers.openai.api_key.clone()),
+                    config.providers.openai.api_base.clone(),
+                    config.providers.openai.extra_headers.clone(),
+                )
+            } else if provider_name.as_str() == "custom" {
+                (
+                    Some(config.providers.custom.api_key.clone()),
+                    config.providers.custom.api_base.clone(),
+                    config.providers.custom.extra_headers.clone(),
+                )
+            } else if provider_name.as_str() == "openrouter" {
+                (
+                    Some(config.providers.openrouter.api_key.clone()),
+                    config.providers.openrouter.api_base.clone(),
+                    config.providers.openrouter.extra_headers.clone(),
+                )
+            } else {
+                unreachable!("Invalid provider: {provider_name}");
+            };
+            Arc::new(OpenAICompatProvider::new(
+                api_key,
+                api_base,
+                Some(model),
+                extra_headers,
+                find_by_name(&provider_name),
+            ))
+        },
         "anthropic" => Arc::new(AnthropicProvider::new(
             Some(config.providers.anthropic.api_key.clone()),
             config.providers.anthropic.api_base.clone(),
             Some(model),
-            None,
-            None,
+            config.providers.anthropic.extra_headers.clone(),
+            find_by_name("anthropic"),
         )),
         _ => {
             eprint_error(format!("Invalid provider: {provider_name}"));
