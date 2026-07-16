@@ -47,7 +47,6 @@ use crate::cron::{CronJob, CronService};
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
-use crate::utils::clipboard::ClipboardImage;
 use crate::utils::clipboard::IMAGE_PASTE_COMMAND_REGEX;
 use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
@@ -104,27 +103,21 @@ pub struct AgentArgs {
 
     /// Render assistant output as Markdown
     #[arg(long, default_value_t = true, action = clap::ArgAction::SetTrue)]
+    #[arg(
+        long = "no-markdown",
+        action = clap::ArgAction::SetFalse,
+        overrides_with = "markdown"
+    )]
     pub markdown: bool,
-
-    #[arg(long = "no-markdown", action = clap::ArgAction::SetTrue, hide = true)]
-    no_markdown: bool,
 
     /// Show rust-bot runtime logs during chat
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    #[arg(
+        long = "no-logs",
+        action = clap::ArgAction::SetFalse,
+        overrides_with = "logs"
+    )]
     pub logs: bool,
-
-    #[arg(long = "no-logs", action = clap::ArgAction::SetTrue, hide = true)]
-    no_logs: bool,
-}
-
-impl AgentArgs {
-    pub fn markdown_enabled(&self) -> bool {
-        self.markdown && !self.no_markdown
-    }
-
-    pub fn logs_enabled(&self) -> bool {
-        self.logs && !self.no_logs
-    }
 }
 
 #[derive(Debug, Parser)]
@@ -298,8 +291,8 @@ fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
 
 async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     let session_id = args.session.clone();
-    let markdown = args.markdown_enabled();
-    let logs = args.logs_enabled();
+    let markdown = args.markdown;
+    let logs = args.logs;
     init_runtime_logging(logs, None);
 
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
@@ -330,6 +323,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 &config.channels,
                 &session_id,
                 Arc::clone(&agent_loop),
+                true
             )
             .await
         }
@@ -863,6 +857,7 @@ async fn message_session(
     channels_config: &ChannelsConfig,
     session_id: &str,
     agent_loop: Arc<AgentLoop>,
+    stream: bool,
 ) -> Result<(), CliError> {
     log::info!("message={message}");
     for media_path in &media {
@@ -880,8 +875,8 @@ async fn message_session(
             None,
             Some(media),
             Some(on_progress),
-            Some(on_stream),
-            Some(on_stream_end),
+            if stream { Some(on_stream) } else { None },
+            if stream { Some(on_stream_end) } else { None },
         )
         .await;
     let (streamed, header_printed) = {
@@ -956,6 +951,7 @@ fn print_cli_progress_line(renderer: &mut StreamRenderer, text: &str) {
     if text.trim().is_empty() {
         return;
     }
+    
     renderer.pause_spinner(|renderer| {
         renderer.ensure_header();
         let dim = Style::new().dimmed();
@@ -981,45 +977,6 @@ fn create_on_progress(
             print_cli_progress_line(&mut renderer_guard, &content);
         })
     })
-}
-
-fn extract_paste_sentinel_with<F>(
-    line: &str,
-    renderer: &mut StreamRenderer,
-    mut read_clipboard_image: F,
-) -> (String, Vec<String>)
-where
-    F: FnMut() -> Option<ClipboardImage>,
-{
-    if !line.contains(IMAGE_PASTE_COMMAND) {
-        return (line.to_string(), vec![]);
-    }
-
-    let mut media: Vec<String> = Vec::new();
-    for _ in 0..line.matches(IMAGE_PASTE_COMMAND).count() {
-        if let Some(image) = read_clipboard_image() {
-            let filename = image
-                .path
-                .file_name()
-                .and_then(|n: &std::ffi::OsStr| n.to_str())
-                .unwrap_or("clipboard-image.png");
-            print_cli_progress_line(
-                renderer,
-                &format!(
-                    "Image attached from clipboard ({filename}, {}x{})",
-                    image.width, image.height
-                ),
-            );
-            media.push(image.path.to_string_lossy().into_owned());
-        } else {
-            print_cli_progress_line(renderer, "No image found in clipboard");
-        }
-    }
-
-    let text = line.replace(IMAGE_PASTE_COMMAND, "").trim().to_string();
-    log::info!("text={text}");
-    log::info!("Number of images: {}", media.len());
-    (text, media)
 }
 
 fn extract_images(
@@ -1131,6 +1088,7 @@ async fn interactive_session(
                     channels_config,
                     session_id,
                     Arc::clone(&agent_loop),
+                    !markdown,
                 )
                 .await;
                 for media_path in media {
@@ -1156,7 +1114,7 @@ async fn interactive_session(
 fn interactive_welcome_text(markdown: bool) -> String {
     if markdown {
         format!(
-            "{LOGO} Interactive mode \n({}; {}; {}; {}; {}; {})\n",
+            "{LOGO} Interactive mode \n{}\n{}\n{}\n{}\n{}\n{}",
             "type **exit** or **Ctrl+D** to quit",
             "**Ctrl+O** for a new line",
             "**Ctrl+W** or **Alt+Backspace** to delete word",
@@ -1166,7 +1124,7 @@ fn interactive_welcome_text(markdown: bool) -> String {
         )
     } else {
         format!(
-            "{LOGO} Interactive mode \n({}; {}; {}; {}; {}; {})\n",
+            "{LOGO} Interactive mode \n{}\n{}\n{}\n{}\n{}\n{}",
             "type exit or Ctrl+D to quit",
             "Ctrl+O for a new line",
             "Ctrl+W or Alt+Backspace to delete word",
@@ -1293,25 +1251,6 @@ mod tests {
         let (text, media) = extract_images(&line, &mut renderer, &captures);
         assert_eq!(text, "a  b");
         assert!(media.is_empty());
-    }
-
-    #[test]
-    fn extract_paste_sentinel_strips_sentinel_and_collects_media() {
-        let temp = tempfile::tempdir().expect("tempdir");
-        let img_path = temp.path().join("paste.png");
-        let mut renderer = StreamRenderer::new(false, true);
-        let line = format!("describe{}", IMAGE_PASTE_COMMAND);
-        let mut responses = vec![Some(ClipboardImage {
-            path: img_path.clone(),
-            width: 640,
-            height: 480,
-        })]
-        .into_iter();
-        let (text, media) =
-            extract_paste_sentinel_with(&line, &mut renderer, || responses.next().unwrap_or(None));
-
-        assert_eq!(text, "describe");
-        assert_eq!(media, vec![img_path.to_string_lossy().into_owned()]);
     }
 
     #[test]

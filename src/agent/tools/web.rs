@@ -427,7 +427,7 @@ impl WebFetchTool {
             description: format!("Fetch a URL and extract readable content (HTML → markdown/text).
             Output is capped at maxChars (default {MAX_CHARS}).
             Works for most web pages and docs; may fail on login-walled or JS-heavy sites.
-            "),
+            For image URLs (Content-Type image/*), fetches the image and inlines it to the model as multimodal content (not saved to disk)."),
             max_chars: max_chars.unwrap_or(MAX_CHARS),
             client: build_http_client(proxy.as_deref()),
         }

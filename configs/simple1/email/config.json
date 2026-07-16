@@ -1,0 +1,107 @@
+{
+    "agents": {
+      "workspace": "~/.rust-bot/workspace",
+      "model": "anthropic/claude-opus-4-6",
+      "provider": "auto",
+      "maxTokens": 8192,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "maxToolIterations": 100,
+      "maxToolResultChars": 16000,
+      "providerRetryMode": "standard",
+      "reasoningEffort": null,
+      "timezone": "UTC",
+      "dream": {
+        "intervalH": 2,
+        "modelOverride": null,
+        "maxBatchSize": 20,
+        "maxIterations": 10
+      }
+    },
+    "channels": {
+      "sendProgress": true,
+      "sendToolHints": false,
+      "sendMaxRetries": 3,
+      "transcriptionProvider": "groq",
+      "email": {
+        "enabled": true,
+        "consentGranted": true,
+        "imapHost": "imap.example.com",
+        "imapPort": 993,
+        "imapUsername": "username",
+        "imapPassword": "password"
+      }
+    },
+    "providers": {
+      "custom": {
+        "apiKey": "",
+        "apiBase": null,
+        "extraHeaders": null
+      },
+      "azureOpenai": {
+        "apiKey": "",
+        "apiBase": null,
+        "extraHeaders": null
+      },
+      "anthropic": {
+        "apiKey": "",
+        "apiBase": null,
+        "extraHeaders": null
+      },
+      "openai": {
+        "apiKey": "",
+        "apiBase": null,
+        "extraHeaders": null
+      },
+      "openrouter": {
+        "apiKey": "",
+        "apiBase": null,
+        "extraHeaders": null
+      },
+      "gemini": {
+        "apiKey": "",
+        "apiBase": null,
+        "extraHeaders": null
+      }
+    },
+    "api": {
+      "host": "127.0.0.1",
+      "port": 8900,
+      "timeout": 120.0
+    },
+    "gateway": {
+      "host": "0.0.0.0",
+      "port": 18790,
+      "heartbeat": {
+        "enabled": true,
+        "intervalS": 1800,
+        "keepRecentMessages": 8
+      }
+    },
+    "tools": {
+      "web": {
+        "enable": true,
+        "proxy": null,
+        "search": {
+          "provider": "duckduckgo",
+          "apiKey": "",
+          "baseUrl": "",
+          "maxResults": 5,
+          "timeout": 30
+        }
+      },
+      "exec": {
+        "enable": true,
+        "timeout": 60,
+        "pathAppend": "",
+        "sandbox": ""
+      },
+      "restrictToWorkspace": false,
+      "mcpServers": {},
+      "ssrfWhitelist": [
+        "100.64.0.0/10",
+        "192.168.0.0/16"
+      ]
+    }
+  }
+  

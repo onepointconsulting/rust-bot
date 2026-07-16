@@ -1,6 +1,6 @@
 {
   "agents": {
-    "workspace": "~/.rust-bot/workspace2",
+    "workspace": "~/.rust-bot/workspace-email-gateway",
     "model": "${ANTHROPIC_API_MODEL}",
     "provider": "anthropic",
     "maxTokens": 32768,
@@ -22,7 +22,31 @@
     "sendProgress": false,
     "sendToolHints": false,
     "sendMaxRetries": 3,
-    "transcriptionProvider": "groq"
+    "transcriptionProvider": "groq",
+    "allowFrom": ["*"],
+    "email": {
+      "enabled": true,
+      "consentGranted": true,
+      "autoReplyEnabled": true,
+      "imapHost": "${IMAP_HOST}",
+      "imapPort": 993,
+      "imapUsername": "${IMAP_USERNAME}",
+      "imapPassword": "${IMAP_PASSWORD}",
+      "imapMailbox": "${IMAP_MAILBOX}",
+      "imapUseSsl": true,
+      "smtpHost": "${SMTP_HOST}",
+      "smtpPort": 587,
+      "smtpUsername": "${SMTP_USERNAME}",
+      "smtpPassword": "${SMTP_PASSWORD}",
+      "smtpUseTls": true,
+      "smtpUseSsl": false,
+      "fromAddress": "${FROM_ADDRESS}",
+      "allowFrom": [
+        "gil.fernandes.newsletter@gmail.com",
+        "gil.fernandes@gmail.com",
+        "gil.fernandes@onepointltd.com"
+      ]
+    }
   },
   "providers": {
     "anthropic": {
@@ -65,8 +89,8 @@
     },
     "gmail": {
       "enable": true,
-      "client_secret_path": "~/.rust-bot/workspace/credentials/client_secret.json",
-      "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
+      "client_secret_path": "~/.rust-bot/workspace-email-gateway/credentials/client_secret.json",
+      "token_cache_path": "~/.rust-bot/workspace-email-gateway/credentials/token_cache.json",
       "max_results": 20
     },
     "ocr": {

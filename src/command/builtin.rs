@@ -554,7 +554,7 @@ impl CommandHandler for CmdTools {
                 .filter_map(|name| {
                     registry
                         .get(name)
-                        .map(|tool| format!("- **{name}** — {}", tool.description()))
+                        .map(|tool| format!("* **{name}** — {}", tool.description()))
                 })
                 .collect();
             format!("Tools ({} available):\n{}", lines.len(), lines.join("\n"))
