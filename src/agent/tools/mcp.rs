@@ -217,6 +217,7 @@ async fn connect_http(config: &McpServerConfig, allow_stateless: bool) -> Result
     for (name, value) in &config.headers {
         if name.eq_ignore_ascii_case("authorization") {
             transport_config = transport_config.auth_header(value.clone());
+            log::info!("MCP Authorization header: {}", value);
         } else {
             let header_name = HeaderName::from_bytes(name.as_bytes())
                 .map_err(|_| ConnectMcpError::InvalidHeader(name.clone()))?;
