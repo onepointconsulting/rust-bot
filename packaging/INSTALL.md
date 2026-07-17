@@ -75,6 +75,12 @@ instead.
 
 Omit `-m/--message` to start the interactive console.
 
+If you want to create a new configuration though, you can run this command, that will create a new default configuration that you can edit yourself:
+
+```bash
+rust-bot.exe onboard --config ./config.json
+```
+
 ## 5. Next steps
 
 - Copy a sample config to a location of your choice and adjust it (workspace

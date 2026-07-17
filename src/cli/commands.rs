@@ -69,7 +69,7 @@ use crate::utils::restart::{
 #[command(
     name = "rust-bot",
     version = env!("CARGO_PKG_VERSION"),
-    about = "Rust port of the Nanobot agent",
+    about = "Personal AI agent with workspace tools, interactive console, API, and gateway",
     arg_required_else_help = true
 )]
 pub struct Cli {
