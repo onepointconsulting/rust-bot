@@ -25,6 +25,7 @@ fn current_month_gmail_params(limit: u32) -> serde_json::Value {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_gmail_tool() {
     // Note: this test will only work if you have a valid client_secret.json and token_cache.json in the default workspace.
     dotenv().ok();
@@ -38,6 +39,7 @@ async fn test_gmail_tool() {
 }
 
 #[tokio::test]
+#[ignore]
 async fn test_gmail_send_tool() {
     dotenv().ok();
     let config =

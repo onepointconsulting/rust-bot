@@ -65,8 +65,8 @@
     },
     "gmail": {
       "enable": true,
-      "client_secret_path": "~/.rust-bot/workspace/credentials/client_secret.json",
-      "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
+      "client_secret_path": "./credentials/client_secret.json",
+      "token_cache_path": "./credentials/token_cache.json",
       "max_results": 20
     },
     "restrictToWorkspace": false,

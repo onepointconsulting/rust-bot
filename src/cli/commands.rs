@@ -14,6 +14,10 @@ use crate::api::rest::ApiServer;
 use crate::api::rest::create_api_server;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::manager::ChannelManager;
+use crate::cli::wizard;
+use crate::cli::wizard::apply_workspace_override;
+use crate::cli::wizard::resolve_onboard_config_path;
+use crate::cli::wizard::wizard;
 use crate::cron::CronJobState;
 use crate::cron::CronPayload;
 use crate::cron::CronPayloadKind;
@@ -27,6 +31,7 @@ use crate::utils::evaluator::evaluate_response;
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
+use inquire::Select;
 use reedline::{
     DefaultPrompt, EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Reedline,
     ReedlineEvent, Signal, default_emacs_keybindings,
@@ -188,6 +193,7 @@ pub struct OnboardArgs {
 #[derive(Debug)]
 pub enum CliError {
     InteractiveNotImplemented,
+    Inquire(inquire::InquireError),
 }
 
 impl fmt::Display for CliError {
@@ -199,7 +205,16 @@ impl fmt::Display for CliError {
                     "Interactive mode is not yet implemented; use -m/--message"
                 )
             }
+            Self::Inquire(err) => {
+                write!(f, "Inquire error: {err}")
+            }
         }
+    }
+}
+
+impl From<inquire::InquireError> for CliError {
+    fn from(err: inquire::InquireError) -> Self {
+        Self::Inquire(err)
     }
 }
 
@@ -372,12 +387,12 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
 /// Lightweight non-interactive config bootstrap (wizard mode not yet implemented).
 fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
-    if args.wizard {
-        eprint_error("Wizard mode is not yet implemented; run without --wizard");
-        exit_codes::exit(GENERAL_ERROR);
-    }
 
+    if args.wizard {
+        return wizard(args);
+    }
     let config_path = resolve_onboard_config_path(args.config);
+
     let config = if config_path.exists() {
         let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
         let bold = Style::new().bold();
@@ -449,42 +464,17 @@ fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     println!("Next steps:");
     println!("  1. Add your API key to {}", config_path.display());
     println!(
-        "  2. Chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
+        "  2. a) Chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
+        config_path.display()
+    );
+    println!(
+        "  2. b) API: rust-bot agent -c \"{}\"",
         config_path.display()
     );
     Ok(())
 }
 
-fn resolve_onboard_config_path(config: Option<PathBuf>) -> PathBuf {
-    if let Some(config) = config {
-        let expanded = PathBuf::from(expand_tilde_path(&config.to_string_lossy()).as_ref());
-        let config_path = if expanded.is_absolute() {
-            expanded
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(expanded)
-        };
-        set_config_path(config_path.clone());
-        let dim = Style::new().dimmed();
-        println!(
-            "{}Using config: {}{}",
-            dim.render(),
-            config_path.display(),
-            dim.render_reset()
-        );
-        config_path
-    } else {
-        get_config_path()
-    }
-}
 
-fn apply_workspace_override(mut config: Config, workspace: Option<&PathBuf>) -> Config {
-    if let Some(workspace) = workspace {
-        config.agents.workspace = workspace.to_string_lossy().into_owned();
-    }
-    config
-}
 
 fn confirm_overwrite() -> bool {
     print!("Overwrite? [y/N]: ");

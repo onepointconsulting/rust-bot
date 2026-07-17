@@ -33,3 +33,7 @@ sessions/
 workspace/cron/
 
 credentials/
+
+Python
+.rust-bot/
+*.py

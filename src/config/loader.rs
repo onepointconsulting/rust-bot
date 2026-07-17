@@ -7,6 +7,7 @@ use std::sync::{LazyLock, OnceLock};
 use regex::Regex;
 
 
+use crate::cli::CliError;
 use crate::config::schema::Config;
 use crate::security::network::configure_ssrf_whitelist;
 use crate::utils::helpers::expand_tilde_path;
@@ -63,7 +64,7 @@ pub fn load_config(path_option: Option<PathBuf>) -> Config {
 ///
 /// Panics if the parent directory cannot be created, the file cannot be
 /// opened for writing, or the config cannot be serialised.
-pub fn save_config(config: &Config, path_option: Option<PathBuf>) {
+pub fn save_config(config: &Config, path_option: Option<PathBuf>) -> Result<(), CliError> {
     let path = path_option.unwrap_or_else(get_config_path);
 
     if let Some(parent) = path.parent() {
@@ -83,6 +84,7 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) {
     file.write_all(json.as_bytes()).unwrap_or_else(|e| {
         panic!("Failed to write config file '{}': {e}", path.display());
     });
+    Ok(())
 }
 
 static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {

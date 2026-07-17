@@ -10,7 +10,7 @@ use crate::{
 // ── ProviderConfig ────────────────────────────────────────────────────────────
 
 /// LLM provider configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProviderConfig {
     /// API key for the provider. Defaults to an empty string so it can be
@@ -246,7 +246,7 @@ fn default_agent_model() -> String {
     "anthropic/claude-opus-4-6".to_string()
 }
 fn default_agent_provider() -> String {
-    "openrouter".to_string()
+    "auto".to_string()
 }
 fn default_agent_max_tokens() -> u32 {
     8192 * 2
@@ -276,7 +276,7 @@ fn default_agent_dream_config() -> DreamConfig {
     DreamConfig::default()
 }
 
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct AgentsConfig {
     #[serde(alias = "workspace", default = "default_agent_workspace")]
@@ -374,7 +374,7 @@ impl Default for AgentsConfig {
 /// Each field holds the credentials and endpoint settings for one provider.
 /// All fields default to an empty `ProviderConfig` so missing sections in the
 /// config file are silently filled in with safe no-op values.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ProvidersConfig {
     /// Any OpenAI-compatible endpoint (custom deployments, local models, etc.).
@@ -457,7 +457,7 @@ fn default_heartbeat_keep_recent_messages() -> u32 {
 }
 
 /// Heartbeat service configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct HeartbeatConfig {
     /// Whether the heartbeat service is active.
@@ -502,7 +502,7 @@ fn default_api_timeout() -> f64 {
 }
 
 /// OpenAI-compatible API server configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ApiConfig {
     /// Bind address for the API server. Defaults to local-only `127.0.0.1`.
@@ -541,7 +541,7 @@ fn default_gateway_port() -> u16 {
 }
 
 /// Gateway/server configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct GatewayConfig {
     /// Bind address for the gateway. Defaults to `0.0.0.0` (all interfaces).
@@ -963,7 +963,7 @@ impl Default for McpServerConfig {
 // ── ToolsConfig ───────────────────────────────────────────────────────────────
 
 /// Tools configuration.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ToolsConfig {
     /// Web tool configuration (search, proxy, etc.).
@@ -1041,7 +1041,7 @@ impl Default for SubagentConfig {
 // ── Config ────────────────────────────────────────────────────────────────────
 
 /// Root configuration for the bot.
-#[derive(Debug, Deserialize, Serialize, Validate)]
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct Config {
     /// Agent behaviour and model configuration.
@@ -2175,7 +2175,8 @@ mod tests {
 "tools": {"ssrfWhitelist": ["100.64.0.0/10", "192.168.0.0/16"]}
 }
         "#;
-        let cfg: Config = serde_json::from_str(json).unwrap();
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        cfg.agents.provider = "auto".to_string();
         let p = cfg.get_provider(Some("gpt-5.2-codex"));
         let name = cfg.get_provider_name(Some("gpt-5.2-codex"));
         let ssrf_whitelist = cfg.tools.ssrf_whitelist.clone();
