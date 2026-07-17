@@ -1,0 +1,82 @@
+{
+  "agents": {
+    "workspace": "~/.rust-bot/workspace",
+    "model": "${OPENAI_API_MODEL}",
+    "provider": "openrouter",
+    "maxTokens": 32768,
+    "contextWindowTokens": 65536,
+    "temperature": 0.1,
+    "maxToolIterations": 100,
+    "maxToolResultChars": 16000,
+    "providerRetryMode": "standard",
+    "reasoningEffort": null,
+    "timezone": "Europe/London",
+    "dream": {
+      "intervalH": 2,
+      "modelOverride": null,
+      "maxBatchSize": 20,
+      "maxIterations": 10
+    }
+  },
+  "channels": {
+    "sendProgress": true,
+    "sendToolHints": true,
+    "sendMaxRetries": 3,
+    "transcriptionProvider": "groq"
+  },
+  "providers": {
+    "openrouter": {
+      "apiKey": "${OPENAI_API_KEY}",
+      "apiBase": "${OPENAI_API_BASE}",
+      "extraHeaders": null
+    }
+  },
+  "api": {
+    "host": "127.0.0.1",
+    "port": 8900,
+    "timeout": 120.0
+  },
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 18790,
+    "heartbeat": {
+      "enabled": true,
+      "intervalS": 1800,
+      "keepRecentMessages": 8
+    }
+  },
+  "tools": {
+    "web": {
+      "enable": true,
+      "proxy": null,
+      "search": {
+        "provider": "brave",
+        "apiKey": "${BRAVE_API_KEY}",
+        "baseUrl": "",
+        "maxResults": 5,
+        "timeout": 30
+      }
+    },
+    "exec": {
+      "enable": true,
+      "timeout": 60,
+      "pathAppend": "",
+      "sandbox": ""
+    },
+    "gmail": {
+      "enable": false,
+      "client_secret_path": "~/.rust-bot/workspace/credentials/client_secret.json",
+      "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
+      "max_results": 20
+    },
+    "restrictToWorkspace": false,
+    "mcpServers": {},
+    "ssrfWhitelist": [
+      "100.64.0.0/10",
+      "192.168.0.0/16"
+    ]
+  },
+  "subagent": {
+    "fail_on_tool_error": false
+  }
+}

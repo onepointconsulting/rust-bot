@@ -1,0 +1,106 @@
+name: Release (Linux)
+
+on:
+  push:
+    branches:
+      - deployment
+
+permissions:
+  contents: write
+
+jobs:
+  build-package-release:
+    name: Build, package and release (linux-x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^\[package\]/{found=1; next} /^\[/{found=0} found && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "Could not determine [package].version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "Resolved version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "tag=v$version" >> "$GITHUB_OUTPUT"
+
+      - name: Ensure release tag is not already used by another commit
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          tag="${{ steps.version.outputs.tag }}"
+          if ref_json=$(gh api "repos/${GITHUB_REPOSITORY}/git/ref/tags/${tag}" 2>/dev/null); then
+            existing_sha=$(echo "$ref_json" | jq -r '.object.sha')
+            if [ "$existing_sha" != "$GITHUB_SHA" ]; then
+              echo "Tag $tag already exists at $existing_sha (current commit is $GITHUB_SHA). Bump the version in Cargo.toml before releasing again." >&2
+              exit 1
+            fi
+            echo "Tag $tag already points at the current commit; continuing."
+          else
+            echo "Tag $tag does not exist yet; it will be created by this release."
+          fi
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y pkg-config libssl-dev cmake
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-unknown-linux-gnu
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: linux-x86_64-unknown-linux-gnu
+
+      - name: Build release binary
+        run: cargo build --release --bin rust-bot --target x86_64-unknown-linux-gnu
+
+      - name: Assemble package
+        id: package
+        shell: bash
+        run: |
+          version="${{ steps.version.outputs.version }}"
+          stage_name="rust-bot-${version}-linux-x86_64"
+          archive_name="${stage_name}.tar.gz"
+
+          mkdir -p "${stage_name}/configuration/samples"
+          cp "target/x86_64-unknown-linux-gnu/release/rust-bot" "${stage_name}/rust-bot"
+          cp "packaging/INSTALL.md" "${stage_name}/INSTALL.md"
+          cp -r templates "${stage_name}/templates"
+          cp packaging/samples/* "${stage_name}/configuration/samples/"
+          chmod +x "${stage_name}/rust-bot"
+
+          tar czf "$archive_name" "$stage_name"
+
+          echo "archive=$archive_name" >> "$GITHUB_OUTPUT"
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Rust Bot ${{ steps.version.outputs.tag }}
+          body: |
+            Automated release for Rust Bot ${{ steps.version.outputs.tag }}.
+
+            Platform packages:
+            - rust-bot-${{ steps.version.outputs.version }}-windows-x86_64.zip
+            - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+            - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
+
+            Each package bundles the `rust-bot` binary, `templates/`, sample
+            configurations under `configuration/samples/`, and an `INSTALL.md`
+            with setup instructions.
+          files: ${{ steps.package.outputs.archive }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

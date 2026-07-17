@@ -1,0 +1,112 @@
+name: Release (Windows)
+
+on:
+  push:
+    branches:
+      - deployment
+
+permissions:
+  contents: write
+
+jobs:
+  build-package-release:
+    name: Build, package and release (windows-x86_64)
+    runs-on: windows-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version from Cargo.toml
+        id: version
+        shell: pwsh
+        run: |
+          $inPackage = $false
+          $version = $null
+          foreach ($line in Get-Content Cargo.toml) {
+            if ($line -match '^\[package\]') { $inPackage = $true; continue }
+            if ($inPackage -and $line -match '^\[') { break }
+            if ($inPackage -and $line -match '^version\s*=\s*"([^"]+)"') {
+              $version = $Matches[1]
+              break
+            }
+          }
+          if (-not $version) {
+            Write-Error "Could not determine [package].version from Cargo.toml"
+            exit 1
+          }
+          Write-Host "Resolved version: $version"
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "tag=v$version" >> $env:GITHUB_OUTPUT
+
+      - name: Ensure release tag is not already used by another commit
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          $tag = "${{ steps.version.outputs.tag }}"
+          $refOutput = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>$null
+          if ($LASTEXITCODE -eq 0) {
+            $existingSha = ($refOutput | ConvertFrom-Json).object.sha
+            if ($existingSha -ne "$env:GITHUB_SHA") {
+              Write-Error "Tag $tag already exists at $existingSha (current commit is $env:GITHUB_SHA). Bump the version in Cargo.toml before releasing again."
+              exit 1
+            }
+            Write-Host "Tag $tag already points at the current commit; continuing."
+          } else {
+            Write-Host "Tag $tag does not exist yet; it will be created by this release."
+          }
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: x86_64-pc-windows-msvc
+
+      - name: Cache cargo registry and build artifacts
+        uses: Swatinem/rust-cache@v2
+        with:
+          key: windows-x86_64-pc-windows-msvc
+
+      - name: Build release binary
+        run: cargo build --release --bin rust-bot --target x86_64-pc-windows-msvc
+
+      - name: Assemble package
+        id: package
+        shell: pwsh
+        run: |
+          $version = "${{ steps.version.outputs.version }}"
+          $stageName = "rust-bot-$version-windows-x86_64"
+          $archiveName = "$stageName.zip"
+
+          New-Item -ItemType Directory -Path $stageName | Out-Null
+          New-Item -ItemType Directory -Path "$stageName\configuration\samples" -Force | Out-Null
+
+          Copy-Item "target\x86_64-pc-windows-msvc\release\rust-bot.exe" -Destination "$stageName\rust-bot.exe"
+          Copy-Item "packaging\INSTALL.md" -Destination "$stageName\INSTALL.md"
+          Copy-Item -Recurse "templates" -Destination "$stageName\templates"
+          Copy-Item "packaging\samples\*" -Destination "$stageName\configuration\samples\"
+
+          Compress-Archive -Path $stageName -DestinationPath $archiveName -Force
+
+          "archive=$archiveName" >> $env:GITHUB_OUTPUT
+
+      - name: Create or update GitHub release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ steps.version.outputs.tag }}
+          target_commitish: ${{ github.sha }}
+          name: Rust Bot ${{ steps.version.outputs.tag }}
+          body: |
+            Automated release for Rust Bot ${{ steps.version.outputs.tag }}.
+
+            Platform packages:
+            - rust-bot-${{ steps.version.outputs.version }}-windows-x86_64.zip
+            - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+            - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
+
+            Each package bundles the `rust-bot` binary, `templates/`, sample
+            configurations under `configuration/samples/`, and an `INSTALL.md`
+            with setup instructions.
+          files: ${{ steps.package.outputs.archive }}
+          fail_on_unmatched_files: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

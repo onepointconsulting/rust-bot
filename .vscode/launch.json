@@ -1,0 +1,79 @@
+{
+    // Use IntelliSense to learn about possible attributes.
+    // Hover to view descriptions of existing attributes.
+    // For more information, visit: https://go.microsoft.com/fwlink/?linkid=830387
+    "version": "0.2.0",
+    "configurations": [
+    
+        {
+            "name": "Debug unit tests in library 'rust_bot'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test"
+                ]
+            }
+        },
+        {
+            "name": "Debug executable 'rust-bot'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=rust-bot"
+                ]
+            },
+            "args": [
+                "agent",
+                "-m",
+                "How is the weather in London?",
+                "--config",
+                "./configs/openai-compat/config.json",
+                "--logs"
+            ]
+        },
+        {
+            "name": "Debug executable 'rust-bot' in current folder",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "run",
+                    "--bin=rust-bot"
+                ]
+            },
+            "args": [
+                "agent",
+                "-m",
+                "How is the weather in London?",
+                "--config",
+                "./configs/openai-compat/config_current_folder.json",
+                "--logs"
+            ]
+        },
+        {
+            "name": "Debug unit tests in executable 'rust-bot'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--bin=rust-bot"
+                ]
+            }
+        },
+        {
+            "name": "Debug integration test 'mod'",
+            "type": "lldb",
+            "request": "launch",
+            "cargo": {
+                "args": [
+                    "test",
+                    "--test=mod"
+                ]
+            }
+        }
+    ]
+}
