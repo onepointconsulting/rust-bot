@@ -45,7 +45,8 @@ jobs:
         run: |
           $tag = "${{ steps.version.outputs.tag }}"
           $refOutput = gh api "repos/$env:GITHUB_REPOSITORY/git/ref/tags/$tag" 2>$null
-          if ($LASTEXITCODE -eq 0) {
+          $apiExitCode = $LASTEXITCODE
+          if ($apiExitCode -eq 0) {
             $existingSha = ($refOutput | ConvertFrom-Json).object.sha
             if ($existingSha -ne "$env:GITHUB_SHA") {
               Write-Error "Tag $tag already exists at $existingSha (current commit is $env:GITHUB_SHA). Bump the version in Cargo.toml before releasing again."
@@ -55,6 +56,12 @@ jobs:
           } else {
             Write-Host "Tag $tag does not exist yet; it will be created by this release."
           }
+
+          # `gh api` (an external command) leaves a non-zero $LASTEXITCODE when the
+          # tag lookup 404s. The GitHub Actions pwsh runner fails the step if
+          # $LASTEXITCODE is non-zero when the script ends, even though we handled
+          # that case above without calling `exit`. Reset it explicitly on success.
+          exit 0
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
