@@ -1082,7 +1082,6 @@ mod tests {
 
     #[test]
     fn build_messages_skill_names_appear_in_system_prompt() {
-        use std::fs;
         let tmp = TempDir::new().unwrap();
         write_skill_md(&tmp, "my-skill", "description: My skill\n", "# Skill content here");
         let b = make_builder(&tmp);

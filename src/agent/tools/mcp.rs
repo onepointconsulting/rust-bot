@@ -1,6 +1,7 @@
 use async_trait::async_trait;
-use serde_json::{json, Value};
+use serde_json::{json, Map, Value};
 
+use std::collections::HashSet;
 use std::time::Duration;
 use http::HeaderName;
 use rmcp::{Peer, RoleClient, ServiceExt};
@@ -39,6 +40,116 @@ fn extract_nullable_branch(options: Value) -> Option<(Value, bool)> {
     None
 }
 
+/// Resolve a local JSON Schema `$ref` against collected `$defs` / `definitions`.
+fn resolve_local_ref<'a>(ref_str: &str, defs: &'a Map<String, Value>) -> Option<&'a Value> {
+    for prefix in ["#/$defs/", "#/definitions/"] {
+        if let Some(name) = ref_str.strip_prefix(prefix) {
+            return defs.get(name);
+        }
+    }
+    None
+}
+
+/// Collect `$defs` / `definitions` from anywhere in the schema.
+///
+/// Some MCP/OpenAPI generators nest `$defs` on inner objects while still emitting
+/// root-absolute refs like `#/$defs/Name` (EMS `saveEvent` does this).
+fn collect_schema_defs(value: &Value, defs: &mut Map<String, Value>) {
+    match value {
+        Value::Array(items) => {
+            for item in items {
+                collect_schema_defs(item, defs);
+            }
+        }
+        Value::Object(obj) => {
+            for key in ["$defs", "definitions"] {
+                if let Some(Value::Object(d)) = obj.get(key) {
+                    for (k, v) in d {
+                        defs.entry(k.clone()).or_insert_with(|| v.clone());
+                    }
+                }
+            }
+            for v in obj.values() {
+                collect_schema_defs(v, defs);
+            }
+        }
+        _ => {}
+    }
+}
+
+/// Inline local `$ref`s so providers that reject `$defs` (e.g. Moonshot) accept the schema.
+fn inline_json_schema_refs(schema: &Value) -> Value {
+    let mut defs = Map::new();
+    collect_schema_defs(schema, &mut defs);
+
+    let mut visiting = HashSet::new();
+    let mut result = inline_refs_node(schema, &defs, &mut visiting);
+    if let Some(obj) = result.as_object_mut() {
+        obj.remove("$defs");
+        obj.remove("definitions");
+    }
+    result
+}
+
+fn inline_refs_node(
+    value: &Value,
+    defs: &Map<String, Value>,
+    visiting: &mut HashSet<String>,
+) -> Value {
+    match value {
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|item| inline_refs_node(item, defs, visiting))
+                .collect(),
+        ),
+        Value::Object(obj) => {
+            if let Some(Value::String(ref_str)) = obj.get("$ref") {
+                if visiting.contains(ref_str) {
+                    return json!({"type": "object", "properties": {}});
+                }
+                if let Some(resolved) = resolve_local_ref(ref_str, defs) {
+                    visiting.insert(ref_str.clone());
+                    let mut inlined = inline_refs_node(resolved, defs, visiting);
+                    visiting.remove(ref_str);
+
+                    if let Some(inlined_obj) = inlined.as_object_mut() {
+                        for (k, v) in obj {
+                            if k == "$ref" {
+                                continue;
+                            }
+                            inlined_obj.insert(k.clone(), inline_refs_node(v, defs, visiting));
+                        }
+                    }
+                    return inlined;
+                }
+                // Unresolvable $ref — drop it so strict providers (Moonshot) don't 400.
+                log::warn!("Unresolved JSON Schema $ref in MCP tool parameters: {ref_str}");
+                let mut out = Map::new();
+                out.insert("type".to_string(), json!("object"));
+                out.insert("properties".to_string(), json!({}));
+                for (k, v) in obj {
+                    if k == "$ref" {
+                        continue;
+                    }
+                    out.insert(k.clone(), inline_refs_node(v, defs, visiting));
+                }
+                return Value::Object(out);
+            }
+
+            let mut out = Map::new();
+            for (k, v) in obj {
+                if k == "$defs" || k == "definitions" {
+                    continue;
+                }
+                out.insert(k.clone(), inline_refs_node(v, defs, visiting));
+            }
+            Value::Object(out)
+        }
+        other => other.clone(),
+    }
+}
+
 
 /// Normalize only nullable JSON Schema patterns for tool definitions.
 ///
@@ -46,9 +157,15 @@ fn extract_nullable_branch(options: Value) -> Option<(Value, bool)> {
 /// - Non-object input → `{"type":"object","properties":{}}`
 /// - `"type": ["T","null"]` → `"type":"T", "nullable":true`
 /// - `anyOf`/`oneOf` with a single non-null branch → merged + `"nullable":true`
+/// - Local `$ref` / `$defs` are inlined (Moonshot and similar reject `$defs`)
 /// - `properties` and `items` are recursively normalized
 /// - Object schemas always have `"properties"` and `"required"` keys
 fn normalize_schema_for_openai(schema: &Value) -> Value {
+    let inlined = inline_json_schema_refs(schema);
+    normalize_schema_for_openai_inner(&inlined)
+}
+
+fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
     let Some(obj) = schema.as_object() else {
         return json!({"type": "object", "properties": {}});
     };
@@ -89,11 +206,11 @@ fn normalize_schema_for_openai(schema: &Value) -> Value {
     // Recursively normalize each property schema
     if let Some(props) = normalized.get("properties").cloned() {
         if let Some(props_obj) = props.as_object() {
-            let new_props: serde_json::Map<String, Value> = props_obj
+            let new_props: Map<String, Value> = props_obj
                 .iter()
                 .map(|(name, prop)| {
                     let v = if prop.is_object() {
-                        normalize_schema_for_openai(prop)
+                        normalize_schema_for_openai_inner(prop)
                     } else {
                         prop.clone()
                     };
@@ -107,7 +224,32 @@ fn normalize_schema_for_openai(schema: &Value) -> Value {
     // Recursively normalize items schema
     if let Some(items) = normalized.get("items").cloned() {
         if items.is_object() {
-            normalized.insert("items".to_string(), normalize_schema_for_openai(&items));
+            normalized.insert("items".to_string(), normalize_schema_for_openai_inner(&items));
+        }
+    }
+
+    // Recursively normalize composition / additionalProperties schemas
+    for key in ["anyOf", "oneOf", "allOf"] {
+        if let Some(Value::Array(options)) = normalized.get(key).cloned() {
+            let normalized_options: Vec<Value> = options
+                .iter()
+                .map(|opt| {
+                    if opt.is_object() {
+                        normalize_schema_for_openai_inner(opt)
+                    } else {
+                        opt.clone()
+                    }
+                })
+                .collect();
+            normalized.insert(key.to_string(), Value::Array(normalized_options));
+        }
+    }
+    if let Some(additional) = normalized.get("additionalProperties").cloned() {
+        if additional.is_object() {
+            normalized.insert(
+                "additionalProperties".to_string(),
+                normalize_schema_for_openai_inner(&additional),
+            );
         }
     }
 
@@ -591,6 +733,110 @@ mod tests {
         });
         let result = normalize_schema_for_openai(&schema);
         assert_eq!(result["properties"]["raw"], true);
+    }
+
+    #[test]
+    fn test_normalize_inlines_defs_refs() {
+        // Mirrors EMS / Moonshot failure: nested $ref to #/$defs/ISimpleDate
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "eventData": {
+                    "type": "object",
+                    "properties": {
+                        "deleteDateList": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/ISimpleDate" }
+                        }
+                    }
+                }
+            },
+            "$defs": {
+                "ISimpleDate": {
+                    "type": "object",
+                    "properties": {
+                        "year": { "type": "integer" },
+                        "month": { "type": "integer" },
+                        "day": { "type": "integer" }
+                    },
+                    "required": ["year", "month", "day"]
+                }
+            }
+        });
+        let result = normalize_schema_for_openai(&schema);
+        assert!(result.get("$defs").is_none());
+        let items = &result["properties"]["eventData"]["properties"]["deleteDateList"]["items"];
+        assert!(items.get("$ref").is_none());
+        assert_eq!(items["type"], "object");
+        assert_eq!(items["properties"]["year"]["type"], "integer");
+        assert_eq!(items["required"], json!(["year", "month", "day"]));
+    }
+
+    #[test]
+    fn test_normalize_inlines_nested_defs_with_root_absolute_ref() {
+        // EMS places $defs under properties.eventData but refs #/$defs/...
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "eventData": {
+                    "$defs": {
+                        "ISimpleDate": { "type": "object" }
+                    },
+                    "type": "object",
+                    "properties": {
+                        "deleteDateList": {
+                            "type": "array",
+                            "items": { "$ref": "#/$defs/ISimpleDate" }
+                        }
+                    }
+                }
+            }
+        });
+        let result = normalize_schema_for_openai(&schema);
+        let event_data = &result["properties"]["eventData"];
+        assert!(event_data.get("$defs").is_none());
+        let items = &event_data["properties"]["deleteDateList"]["items"];
+        assert!(items.get("$ref").is_none());
+        assert_eq!(items["type"], "object");
+    }
+
+    #[test]
+    fn test_normalize_inlines_definitions_refs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "when": { "$ref": "#/definitions/Date" }
+            },
+            "definitions": {
+                "Date": { "type": "string", "format": "date" }
+            }
+        });
+        let result = normalize_schema_for_openai(&schema);
+        assert!(result.get("definitions").is_none());
+        assert_eq!(result["properties"]["when"]["type"], "string");
+        assert_eq!(result["properties"]["when"]["format"], "date");
+    }
+
+    #[test]
+    fn test_normalize_breaks_circular_refs() {
+        let schema = json!({
+            "type": "object",
+            "properties": {
+                "node": { "$ref": "#/$defs/Node" }
+            },
+            "$defs": {
+                "Node": {
+                    "type": "object",
+                    "properties": {
+                        "child": { "$ref": "#/$defs/Node" }
+                    }
+                }
+            }
+        });
+        let result = normalize_schema_for_openai(&schema);
+        let child = &result["properties"]["node"]["properties"]["child"];
+        assert!(child.get("$ref").is_none());
+        assert_eq!(child["type"], "object");
     }
 
     use crate::config::schema::McpServerConfig;

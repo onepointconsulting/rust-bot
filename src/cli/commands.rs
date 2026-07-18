@@ -1075,25 +1075,46 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
     log::info!("Provider Name: {:?}", provider_name);
     log::info!("Model: {:?}", model);
     match provider_name.as_str() {
-        "openai" | "custom" | "openrouter" => {
-            let (api_key, api_base, extra_headers) = if provider_name.as_str() == "openai" {
+        "openai" | "custom" | "openrouter" | "auto" => {
+            let provider_name_str = provider_name.as_str();
+            let (api_key, api_base, extra_headers) = 
+            if provider_name_str == "openai" {
                 (
                     Some(config.providers.openai.api_key.clone()),
                     config.providers.openai.api_base.clone(),
                     config.providers.openai.extra_headers.clone(),
                 )
-            } else if provider_name.as_str() == "custom" {
+            } else if provider_name_str == "custom" {
                 (
                     Some(config.providers.custom.api_key.clone()),
                     config.providers.custom.api_base.clone(),
                     config.providers.custom.extra_headers.clone(),
                 )
-            } else if provider_name.as_str() == "openrouter" {
+            } else if provider_name_str == "openrouter" {
                 (
                     Some(config.providers.openrouter.api_key.clone()),
                     config.providers.openrouter.api_base.clone(),
                     config.providers.openrouter.extra_headers.clone(),
                 )
+            } else if provider_name_str == "auto" {
+                let (provider_name, api_key, api_base, extra_headers) = 
+                    get_auto_provider(config);
+                if provider_name == "anthropic" {
+                    return Arc::new(AnthropicProvider::new(
+                        api_key,
+                        api_base,
+                        Some(model),
+                        extra_headers,
+                        find_by_name(&provider_name),
+                    ));
+                }
+                return Arc::new(OpenAICompatProvider::new(
+                    api_key,
+                    api_base,
+                    Some(model),
+                    extra_headers,
+                    find_by_name(&provider_name),
+                ));
             } else {
                 unreachable!("Invalid provider: {provider_name}");
             };
@@ -1116,6 +1137,41 @@ fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
             eprint_error(format!("Invalid provider: {provider_name}"));
             exit_codes::exit(INVALID_PROVIDER);
         }
+    }
+}
+
+fn get_auto_provider(config: &Config) -> (String, Option<String>, Option<String>, Option<HashMap<String, String>>) {
+    if !config.providers.openai.api_key.is_empty() {
+        return (
+            "openai".to_string(),
+            Some(config.providers.openai.api_key.clone()),
+            config.providers.openai.api_base.clone(),
+            config.providers.openai.extra_headers.clone(),
+        );
+    } else if !config.providers.openrouter.api_key.is_empty() {
+        return (
+            "openrouter".to_string(),
+            Some(config.providers.openrouter.api_key.clone()),
+            config.providers.openrouter.api_base.clone(),
+            config.providers.openrouter.extra_headers.clone(),
+        );
+    } else if !config.providers.custom.api_key.is_empty() {
+        return (
+            "custom".to_string(),
+            Some(config.providers.custom.api_key.clone()),
+            config.providers.custom.api_base.clone(),
+            config.providers.custom.extra_headers.clone(),
+        );
+    } else if !config.providers.anthropic.api_key.is_empty() {
+        return (
+            "anthropic".to_string(),
+            Some(config.providers.anthropic.api_key.clone()),
+            config.providers.anthropic.api_base.clone(),
+            config.providers.anthropic.extra_headers.clone(),
+        );
+    } else {
+        eprint_error(format!("Could not resolve auto provider, please set a provider (custom, openai, openrouter, anthropic) in the config"));
+        exit_codes::exit(INVALID_PROVIDER);
     }
 }
 

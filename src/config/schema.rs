@@ -1758,7 +1758,7 @@ mod tests {
         assert_eq!(cfg.provider, "duckduckgo");
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.base_url, "");
-        assert_eq!(cfg.max_results, 5);
+        assert_eq!(cfg.max_results, 20);
         assert_eq!(cfg.timeout, 30);
         assert!(cfg.validate().is_ok());
     }
@@ -1819,7 +1819,7 @@ mod tests {
         assert_eq!(cfg.proxy, None);
         // nested search should carry WebSearchConfig defaults
         assert_eq!(cfg.search.provider, "duckduckgo");
-        assert_eq!(cfg.search.max_results, 5);
+        assert_eq!(cfg.search.max_results, 20);
         assert_eq!(cfg.search.timeout, 30);
         assert!(cfg.validate().is_ok());
     }

@@ -1,6 +1,6 @@
 use std::path::PathBuf;
 use dotenv::dotenv;
-use rust_bot::{agent::tools::{base::Tool, docx::DocxConversionTool, filesystem::FsToolConfig}, config::{loader::load_config, schema::DocxToolConfig}};
+use rust_bot::agent::tools::{base::Tool, docx::DocxConversionTool, filesystem::FsToolConfig};
 
 
 #[tokio::test]
