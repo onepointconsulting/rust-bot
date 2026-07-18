@@ -476,6 +476,45 @@ fn configure_tool_options(config: &mut Config) -> Result<(), CliError> {
         .with_default(tools.restrict_to_workspace)
         .with_help_message("Only allow tools to access files in the workspace directory")
         .prompt()?;
+
+    if !tools.ssrf_whitelist.is_empty() {
+        println!(
+            "Current SSRF whitelist: {}",
+            tools.ssrf_whitelist.join(", ")
+        );
+    }
+
+    let edit_whitelist = Confirm::new("Configure SSRF whitelist?")
+        .with_default(!tools.ssrf_whitelist.is_empty())
+        .with_help_message("CIDR ranges allowed past private-network blocking (e.g. Tailscale)")
+        .prompt()?;
+    if edit_whitelist {
+        let mut whitelist = Vec::new();
+        loop {
+            let add_more = Confirm::new("Add a CIDR range to the SSRF whitelist?")
+                .with_default(whitelist.is_empty())
+                .with_help_message("y to add a range, n when finished")
+                .prompt()?;
+            if !add_more {
+                break;
+            }
+            let entry = Text::new("CIDR range")
+                .with_help_message("Whitelist entries let the web tools reach otherwise-blocked private/internal networks. e.g. 100.64.0.0/10 or 192.168.0.0/16")
+                .prompt()?;
+            let entry = entry.trim().to_string();
+            if entry.is_empty() {
+                eprint_error("CIDR range cannot be empty");
+                continue;
+            }
+            if entry.parse::<ipnet::IpNet>().is_err() {
+                eprint_error(format!("'{entry}' is not a valid CIDR range"));
+                continue;
+            }
+            whitelist.push(entry);
+        }
+        tools.ssrf_whitelist = whitelist;
+    }
+
     Ok(())
 }
 
