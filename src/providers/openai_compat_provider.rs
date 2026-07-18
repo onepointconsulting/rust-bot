@@ -5,9 +5,11 @@ use crate::providers::{
 };
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
-    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestMessage,
+    ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestAssistantMessageContent,
+    ChatCompletionRequestAssistantMessageContentPart, ChatCompletionRequestMessage,
     ChatCompletionRequestMessageContentPartImage, ChatCompletionRequestMessageContentPartText,
-    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestToolMessage,
+    ChatCompletionRequestSystemMessageArgs, ChatCompletionRequestSystemMessageContent,
+    ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
     ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest,
@@ -369,6 +371,87 @@ impl OpenAICompatProvider {
         sanitized
     }
 
+    /// Extract non-empty text strings from content-part arrays.
+    ///
+    /// Used after [`apply_cache_control`] rewrites string content into
+    /// `[{"type":"text","text":"...","cache_control":...}]`.
+    fn content_text_parts(blocks: &[serde_json::Value]) -> Vec<String> {
+        blocks
+            .iter()
+            .filter_map(|block| {
+                let typ = block.get("type").and_then(|t| t.as_str());
+                if typ.is_some() && typ != Some("text") {
+                    return None;
+                }
+                let text = block.get("text").and_then(|t| t.as_str()).unwrap_or("");
+                if text.is_empty() {
+                    None
+                } else {
+                    Some(text.to_string())
+                }
+            })
+            .collect()
+    }
+
+    /// Convert a JSON `content` value into typed system-message content.
+    ///
+    /// Supports both plain strings and content-part arrays.
+    fn system_message_content(content: Option<&serde_json::Value>) -> ChatCompletionRequestSystemMessageContent {
+        match content {
+            Some(serde_json::Value::String(text)) => {
+                ChatCompletionRequestSystemMessageContent::Text(text.clone())
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                let parts: Vec<ChatCompletionRequestSystemMessageContentPart> =
+                    Self::content_text_parts(blocks)
+                        .into_iter()
+                        .map(|text| {
+                            ChatCompletionRequestSystemMessageContentPart::Text(
+                                ChatCompletionRequestMessageContentPartText { text },
+                            )
+                        })
+                        .collect();
+                if parts.is_empty() {
+                    ChatCompletionRequestSystemMessageContent::Text(String::new())
+                } else {
+                    ChatCompletionRequestSystemMessageContent::Array(parts)
+                }
+            }
+            _ => ChatCompletionRequestSystemMessageContent::Text(String::new()),
+        }
+    }
+
+    /// Convert a JSON `content` value into typed assistant-message content.
+    ///
+    /// Returns `None` when content is empty so tool-call-only assistant turns
+    /// can omit `content`. Supports both plain strings and content-part arrays.
+    fn assistant_message_content(
+        content: Option<&serde_json::Value>,
+    ) -> Option<ChatCompletionRequestAssistantMessageContent> {
+        match content {
+            Some(serde_json::Value::String(text)) if !text.is_empty() => {
+                Some(ChatCompletionRequestAssistantMessageContent::Text(text.clone()))
+            }
+            Some(serde_json::Value::Array(blocks)) => {
+                let parts: Vec<ChatCompletionRequestAssistantMessageContentPart> =
+                    Self::content_text_parts(blocks)
+                        .into_iter()
+                        .map(|text| {
+                            ChatCompletionRequestAssistantMessageContentPart::Text(
+                                ChatCompletionRequestMessageContentPartText { text },
+                            )
+                        })
+                        .collect();
+                if parts.is_empty() {
+                    None
+                } else {
+                    Some(ChatCompletionRequestAssistantMessageContent::Array(parts))
+                }
+            }
+            _ => None,
+        }
+    }
+
     fn build_request(
         &self,
         messages: &[serde_json::Value],
@@ -419,14 +502,14 @@ impl OpenAICompatProvider {
                     .to_string();
                 match role {
                     "system" => ChatCompletionRequestSystemMessageArgs::default()
-                        .content(content_str)
+                        .content(Self::system_message_content(msg.get("content")))
                         .build()
                         .ok()
                         .map(Into::into),
                     "assistant" => {
                         let mut builder = ChatCompletionRequestAssistantMessageArgs::default();
-                        if !content_str.is_empty() {
-                            builder.content(content_str);
+                        if let Some(content) = Self::assistant_message_content(msg.get("content")) {
+                            builder.content(content);
                         }
                         if let Some(tcs_val) = msg.get("tool_calls").and_then(|v| v.as_array()) {
                             let tcs: Vec<ChatCompletionMessageToolCalls> = tcs_val
@@ -1179,5 +1262,110 @@ mod tests {
     fn test_non_overlapping_suffix_handles_repeated_chunk() {
         let suffix = OpenAICompatProvider::non_overlapping_suffix("Hello world", "world");
         assert_eq!(suffix, "");
+    }
+
+    #[test]
+    fn test_system_message_content_from_string() {
+        let content = serde_json::json!("You are a helpful assistant.");
+        let converted = OpenAICompatProvider::system_message_content(Some(&content));
+        assert_eq!(
+            converted,
+            ChatCompletionRequestSystemMessageContent::Text(
+                "You are a helpful assistant.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn test_system_message_content_from_text_array_with_cache_control() {
+        let content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Cached system prompt",
+                "cache_control": { "type": "ephemeral" }
+            }
+        ]);
+        let converted = OpenAICompatProvider::system_message_content(Some(&content));
+        match converted {
+            ChatCompletionRequestSystemMessageContent::Array(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    ChatCompletionRequestSystemMessageContentPart::Text(part) => {
+                        assert_eq!(part.text, "Cached system prompt");
+                    }
+                }
+            }
+            other => panic!("expected Array content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_system_message_content_skips_empty_and_non_text_parts() {
+        let content = serde_json::json!([
+            { "type": "text", "text": "" },
+            { "type": "image_url", "image_url": { "url": "https://example.com/x.png" } },
+            { "type": "text", "text": "Keep me" }
+        ]);
+        let converted = OpenAICompatProvider::system_message_content(Some(&content));
+        match converted {
+            ChatCompletionRequestSystemMessageContent::Array(parts) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    ChatCompletionRequestSystemMessageContentPart::Text(part) => {
+                        assert_eq!(part.text, "Keep me");
+                    }
+                }
+            }
+            other => panic!("expected Array content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_assistant_message_content_from_string() {
+        let content = serde_json::json!("Hello from assistant");
+        let converted = OpenAICompatProvider::assistant_message_content(Some(&content));
+        assert_eq!(
+            converted,
+            Some(ChatCompletionRequestAssistantMessageContent::Text(
+                "Hello from assistant".to_string()
+            ))
+        );
+    }
+
+    #[test]
+    fn test_assistant_message_content_from_text_array_with_cache_control() {
+        let content = serde_json::json!([
+            {
+                "type": "text",
+                "text": "Cached assistant reply",
+                "cache_control": { "type": "ephemeral" }
+            }
+        ]);
+        let converted = OpenAICompatProvider::assistant_message_content(Some(&content));
+        match converted {
+            Some(ChatCompletionRequestAssistantMessageContent::Array(parts)) => {
+                assert_eq!(parts.len(), 1);
+                match &parts[0] {
+                    ChatCompletionRequestAssistantMessageContentPart::Text(part) => {
+                        assert_eq!(part.text, "Cached assistant reply");
+                    }
+                    other => panic!("expected Text part, got {other:?}"),
+                }
+            }
+            other => panic!("expected Array content, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_assistant_message_content_empty_returns_none() {
+        assert_eq!(
+            OpenAICompatProvider::assistant_message_content(Some(&serde_json::json!(""))),
+            None
+        );
+        assert_eq!(
+            OpenAICompatProvider::assistant_message_content(Some(&serde_json::json!([]))),
+            None
+        );
+        assert_eq!(OpenAICompatProvider::assistant_message_content(None), None);
     }
 }

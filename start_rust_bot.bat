@@ -14,6 +14,7 @@ if /I "%~1"=="--session" (
 
 @REM .\target\release\rust-bot agent --config ./configs/anthropic/config_gmail_anthropic.json --logs %SESSION_ARGS%
 @REM .\target\release\rust-bot agent --config ./configs/openai-compat/config_xai_groq.json --logs %SESSION_ARGS%
-.\target\release\rust-bot agent --config ./configs/openai-compat/config_mcp_strapi.json %SESSION_ARGS%
+@REM .\target\release\rust-bot agent --config ./configs/openai-compat/config_mcp_strapi.json %SESSION_ARGS%
+.\target\release\rust-bot agent --config ./configs/openai-compat/config.json %SESSION_ARGS%
 
 

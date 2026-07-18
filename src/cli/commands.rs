@@ -14,7 +14,6 @@ use crate::api::rest::ApiServer;
 use crate::api::rest::create_api_server;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::manager::ChannelManager;
-use crate::cli::wizard;
 use crate::cli::wizard::apply_workspace_override;
 use crate::cli::wizard::resolve_onboard_config_path;
 use crate::cli::wizard::wizard;
@@ -61,7 +60,7 @@ use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
 use crate::utils::clipboard::{TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX};
 use crate::utils::exit_codes::{self, GENERAL_ERROR, INVALID_PROVIDER, TEMPLATES_UNAVAILABLE};
 use crate::utils::helpers::{
-    TemplatesSyncError, ensure_dir, expand_tilde_path, sync_workspace_templates,
+    TemplatesSyncError, ensure_dir, sync_workspace_templates,
 };
 use crate::utils::logo::LOGO;
 use crate::utils::restart::{

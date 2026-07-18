@@ -90,6 +90,7 @@ pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
     if let Some(path) = log_file.as_deref() {
         match open_log_file(path) {
             Ok(file) => {
+                println!("log file: {}", path.display());
                 builder.target(env_logger::Target::Pipe(Box::new(file)));
                 builder.write_style(env_logger::WriteStyle::Never);
             }
