@@ -31,7 +31,6 @@ use crate::utils::evaluator::evaluate_response;
 use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
-use inquire::Select;
 use reedline::{
     DefaultPrompt, EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Reedline,
     ReedlineEvent, Signal, default_emacs_keybindings,
@@ -46,7 +45,7 @@ use crate::cli::paste_edit_mode::{
 };
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{
-    get_config_path, load_config, resolve_config_env_vars, save_config, set_config_path,
+    load_config, resolve_config_env_vars, save_config, set_config_path,
 };
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;

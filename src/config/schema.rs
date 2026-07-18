@@ -576,7 +576,7 @@ fn default_web_search_provider() -> String {
     "duckduckgo".to_string()
 }
 fn default_web_search_max_results() -> u32 {
-    5
+    20
 }
 fn default_web_search_timeout() -> u32 {
     30

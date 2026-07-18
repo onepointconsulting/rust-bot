@@ -10,14 +10,14 @@ use crate::{
     config::{
         channels::EmailConfig,
         loader::{get_config_path, load_config, save_config, set_config_path},
-        schema::{AgentsConfig, Config, ProviderRetryMode},
+        schema::{AgentsConfig, Config, ProviderRetryMode, ToolsConfig},
     },
     providers::registry::providers,
     utils::helpers::expand_tilde_path,
 };
 
 const LLM_PROVIDER: &'static str = "LLM Provider";
-const CHAT_CHANNEL: &'static str = "Chat Channel";
+const CHAT_CHANNELS: &'static str = "Chat Channels";
 const AGENT_SETTINGS: &'static str = "Agent Settings";
 const GATEWAY: &'static str = "Gateway";
 const TOOLS: &'static str = "Tools";
@@ -30,7 +30,7 @@ const PROVIDER_ANTHROPIC: &'static str = "anthropic";
 
 const WIZARD_OPTIONS: [&str; 8] = [
     LLM_PROVIDER,
-    CHAT_CHANNEL,
+    CHAT_CHANNELS,
     AGENT_SETTINGS,
     GATEWAY,
     TOOLS,
@@ -40,8 +40,13 @@ const WIZARD_OPTIONS: [&str; 8] = [
 ];
 
 const CHANNEL_EMAIL: &'static str = "email";
-
 const AVAILABLE_CHANNELS: [&str; 1] = [CHANNEL_EMAIL];
+
+const TOOL_GMAIL: &'static str = "gmail";
+const TOOL_WEB: &'static str = "web";
+const AVAILABLE_TOOLS: [&str; 2] = [TOOL_GMAIL, TOOL_WEB];
+
+const WEB_SEARCH_PROVIDERS: [&str; 5] = ["brave", "tavily", "duckduckgo", "searxng", "jina"];
 
 pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
     let config_path = resolve_onboard_config_path(args.config);
@@ -54,11 +59,14 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
             LLM_PROVIDER => {
                 choose_providers(&mut config)?;
             }
-            CHAT_CHANNEL => {
+            CHAT_CHANNELS => {
                 configure_chat_channel(&mut config)?;
             }
             AGENT_SETTINGS => {
                 configure_agent_settings(&mut config)?;
+            }
+            TOOLS => {
+                configure_tools_main_menu(&mut config)?;
             }
             SAVE_AND_EXIT => {
                 save_config(&config, Some(config_path))?;
@@ -441,6 +449,160 @@ fn configure_dream_settings(agents: &mut AgentsConfig) -> Result<(), CliError> {
         .with_default(dream.max_iterations)
         .with_help_message("Max tool calls allowed during Dream Phase 2")
         .with_error_message("Please enter a positive integer")
+        .prompt()?;
+
+    Ok(())
+}
+
+fn configure_tools_main_menu(config: &mut Config) -> Result<(), CliError> {
+    const TOOLS_OPTION: &str = "Configure tools";
+    const TOOL_OPTIONS_OPTION: &str = "General tool options";
+    let selected = Select::new(
+        "Configure tools or general tool options",
+        vec![TOOLS_OPTION, TOOL_OPTIONS_OPTION],
+    )
+    .prompt()?;
+    match selected {
+        TOOLS_OPTION => configure_tools(config)?,
+        TOOL_OPTIONS_OPTION => configure_tool_options(config)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn configure_tool_options(config: &mut Config) -> Result<(), CliError> {
+    let tools = &mut config.tools;
+    tools.restrict_to_workspace = Confirm::new("Restrict all tools to workspace folder?")
+        .with_default(tools.restrict_to_workspace)
+        .with_help_message("Only allow tools to access files in the workspace directory")
+        .prompt()?;
+    Ok(())
+}
+
+fn configure_tools(config: &mut Config) -> Result<(), CliError> {
+    let tools = &mut config.tools;
+    let tool = Select::new("Select a tool to configure", AVAILABLE_TOOLS.to_vec())
+        .prompt()?;
+    match tool {
+        TOOL_GMAIL => {
+            configure_email_tool(tools)?;
+        }
+        TOOL_WEB => {
+            configure_web_tool(tools)?;
+        }
+        _ => return Ok(()),
+    }
+    Ok(())
+}
+
+fn configure_email_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
+    let gmail = &mut tools.gmail;
+
+    gmail.enable = Confirm::new("Enable Gmail tool?")
+        .with_default(gmail.enable)
+        .with_help_message("Requires OAuth client_secret.json and token cache")
+        .prompt()?;
+
+    let client_secret_path = gmail.client_secret_path.clone();
+    gmail.client_secret_path = Text::new("Gmail OAuth client secret path")
+        .with_default(client_secret_path.as_str())
+        .with_help_message("Path to client_secret.json from Google Cloud Console")
+        .prompt()?;
+
+    let token_cache_path = gmail.token_cache_path.clone();
+    gmail.token_cache_path = Text::new("Gmail OAuth token cache path")
+        .with_default(token_cache_path.as_str())
+        .with_help_message("Where refresh/access tokens are stored")
+        .prompt()?;
+
+    gmail.max_results = CustomType::<u32>::new("Gmail max results")
+        .with_default(gmail.max_results)
+        .with_help_message("Maximum messages returned per query (≥ 1)")
+        .with_error_message("Please enter a positive integer")
+        .with_validator(|v: &u32| {
+            if *v >= 1 {
+                Ok(Validation::Valid)
+            } else {
+                Ok(Validation::Invalid("Must be at least 1".into()))
+            }
+        })
+        .prompt()?;
+
+    Ok(())
+}
+
+fn configure_web_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
+    let web = &mut tools.web;
+
+    web.enable = Confirm::new("Enable web tools?")
+        .with_default(web.enable)
+        .with_help_message("Web search and related HTTP tools")
+        .prompt()?;
+
+    let current_proxy = web.proxy.clone().unwrap_or_default();
+    let proxy = Text::new("HTTP/SOCKS5 proxy URL")
+        .with_default(current_proxy.as_str())
+        .with_help_message("e.g. http://127.0.0.1:7890 — leave empty for none")
+        .prompt()?;
+    web.proxy = {
+        let trimmed = proxy.trim();
+        if trimmed.is_empty() {
+            None
+        } else {
+            Some(trimmed.to_string())
+        }
+    };
+
+    let provider_idx = WEB_SEARCH_PROVIDERS
+        .iter()
+        .position(|p| *p == web.search.provider.as_str())
+        .unwrap_or(0);
+    web.search.provider = Select::new("Web search provider", WEB_SEARCH_PROVIDERS.to_vec())
+        .with_starting_cursor(provider_idx)
+        .with_help_message("brave, tavily, duckduckgo, searxng, or jina")
+        .prompt()?
+        .to_string();
+
+    if web.search.provider == "duckduckgo" {
+        web.search.api_key.clear();
+    } else {
+        let api_key = web.search.api_key.clone();
+        web.search.api_key = Text::new("Search provider API key")
+            .with_default(api_key.as_str())
+            .with_help_message("Required for brave/tavily/jina; leave empty if unused")
+            .prompt()?;
+    }
+
+    let base_url = web.search.base_url.clone();
+    web.search.base_url = Text::new("Search provider base URL")
+        .with_default(base_url.as_str())
+        .with_help_message("Used by self-hosted backends like SearXNG; leave empty for defaults")
+        .prompt()?;
+
+    web.search.max_results = CustomType::<u32>::new("Web search max results")
+        .with_default(web.search.max_results)
+        .with_help_message("Maximum results returned per query (≥ 1)")
+        .with_error_message("Please enter a positive integer")
+        .with_validator(|v: &u32| {
+            if *v >= 1 {
+                Ok(Validation::Valid)
+            } else {
+                Ok(Validation::Invalid("Must be at least 1".into()))
+            }
+        })
+        .prompt()?;
+
+    web.search.timeout = CustomType::<u32>::new("Web search timeout (seconds)")
+        .with_default(web.search.timeout)
+        .with_help_message("Wall-clock timeout per search (≥ 1)")
+        .with_error_message("Please enter a positive integer")
+        .with_validator(|v: &u32| {
+            if *v >= 1 {
+                Ok(Validation::Valid)
+            } else {
+                Ok(Validation::Invalid("Must be at least 1".into()))
+            }
+        })
         .prompt()?;
 
     Ok(())

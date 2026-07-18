@@ -365,6 +365,7 @@ impl Tool for WebSearchTool {
     }
 
     fn parameters(&self) -> serde_json::Value {
+        let max_results = self.config.max_results.max(1);
         serde_json::json!({
             "type": "object",
             "properties": {
@@ -374,10 +375,12 @@ impl Tool for WebSearchTool {
                 },
                 "count": {
                     "type": "integer",
-                    "description": "The number of results to return (default 5, max 10)",
+                    "description": format!(
+                        "The number of results to return (default {max_results}, max {max_results})"
+                    ),
                     "minimum": 1,
-                    "maximum": 10,
-                    "default": 5,
+                    "maximum": max_results,
+                    "default": max_results,
                 },
             },
             "required": ["query"],
@@ -393,10 +396,13 @@ impl Tool for WebSearchTool {
         if query.is_empty() {
             return "Error: missing required parameter 'query'".to_string();
         }
-        let count = std::cmp::min(
-            std::cmp::max(params.get("count").and_then(Value::as_u64).unwrap_or(5), 1),
-            10,
-        ) as usize;
+        // `max_results` is an upper bound from config; clamp requested count into [1, max_results].
+        let max_results = self.config.max_results.max(1) as u64;
+        let count = params
+            .get("count")
+            .and_then(Value::as_u64)
+            .unwrap_or(max_results)
+            .clamp(1, max_results) as usize;
 
         log::info!("Searching web with provider: {provider}");
         if provider == "duckduckgo" {

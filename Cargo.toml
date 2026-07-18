@@ -73,6 +73,6 @@ rmcp = { version = "1.6.0", features = ["server", "macros", "schemars"] }
 [patch.crates-io]
 crossterm = { git = "https://github.com/eitsupi/crossterm", branch = "feature/windows-vt-input" }
 
-[profile.release]
-opt-level = "z"
-lto = true
+# [profile.release]
+# opt-level = "z"
+# lto = true
