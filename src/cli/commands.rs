@@ -42,6 +42,7 @@ use crate::bus::queue::MessageBus;
 use crate::cli::paste_edit_mode::{
     PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
 };
+use crate::cli::progress::{create_on_progress, print_cli_progress_line, ProgressType};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{
     load_config, resolve_config_env_vars, save_config, set_config_path,
@@ -1175,38 +1176,6 @@ fn get_auto_provider(config: &Config) -> (String, Option<String>, Option<String>
     }
 }
 
-fn print_cli_progress_line(renderer: &mut StreamRenderer, text: &str) {
-    if text.trim().is_empty() {
-        return;
-    }
-    
-    renderer.pause_spinner(|renderer| {
-        renderer.ensure_header();
-        let dim = Style::new().dimmed();
-        println!("  {}↳ {text}{}", dim.render(), dim.render_reset());
-    });
-}
-
-fn create_on_progress(
-    channels: ChannelsConfig,
-    renderer: Arc<Mutex<StreamRenderer>>,
-) -> ProgressCallback {
-    Arc::new(move |content, tool_hint| {
-        let renderer = Arc::clone(&renderer);
-        Box::pin(async move {
-            if tool_hint {
-                if !channels.send_tool_hints {
-                    return;
-                }
-            } else if !channels.send_progress {
-                return;
-            }
-            let mut renderer_guard = renderer.lock().await;
-            print_cli_progress_line(&mut renderer_guard, &content);
-        })
-    })
-}
-
 fn extract_images(
     line: &str,
     renderer: &mut StreamRenderer,
@@ -1225,6 +1194,7 @@ fn extract_images(
             print_cli_progress_line(
                 renderer,
                 &format!("Image attached from clipboard ({filename})"),
+                ProgressType::Image,
             );
         }
     }
@@ -1281,7 +1251,11 @@ async fn interactive_session(
                     line_editor.run_edit_commands(&[EditCommand::InsertString(insert)]);
                 } else {
                     let mut renderer = StreamRenderer::new(markdown, false);
-                    print_cli_progress_line(&mut renderer, "No image found in clipboard");
+                    print_cli_progress_line(
+                        &mut renderer,
+                        "No image found in clipboard",
+                        ProgressType::Image,
+                    );
                 }
                 continue;
             }
