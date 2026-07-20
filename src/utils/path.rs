@@ -1,5 +1,6 @@
 //! Path abbreviation utilities for display.
 
+use std::path::Path;
 use std::sync::LazyLock;
 
 use home::home_dir;
@@ -9,6 +10,22 @@ use url::Url;
 static HTTP_PREFIX: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^https?://").unwrap());
 
 const ELLIPSIS: &str = "\u{2026}";
+
+/// Normalize path separators for the current platform.
+///
+/// On Windows, replaces `/` with `\`. On other platforms, returns the path unchanged.
+pub fn normalize_path_separators(path: &str) -> String {
+    if cfg!(windows) {
+        path.replace('/', "\\")
+    } else {
+        path.to_string()
+    }
+}
+
+/// Format a path for display with platform-native separators.
+pub fn display_path(path: &Path) -> String {
+    normalize_path_separators(&path.to_string_lossy())
+}
 
 /// Abbreviate a file path or URL, preserving basename and key directories.
 ///
@@ -135,9 +152,42 @@ fn truncate_chars(s: &str, max_len: usize) -> String {
     format!("{}{ELLIPSIS}", take_chars(s, take))
 }
 
+
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::path::PathBuf;
+
+    #[test]
+    fn test_normalize_path_separators_mixed() {
+        let mixed = r"C:\Users\gilfe\.rust-bot/config.json";
+        let result = normalize_path_separators(mixed);
+        #[cfg(windows)]
+        assert_eq!(result, r"C:\Users\gilfe\.rust-bot\config.json");
+        #[cfg(not(windows))]
+        assert_eq!(result, mixed);
+    }
+
+    #[test]
+    fn test_normalize_path_separators_unix_style() {
+        let path = "~/.rust-bot/config.json";
+        let result = normalize_path_separators(path);
+        #[cfg(windows)]
+        assert_eq!(result, r"~\.rust-bot\config.json");
+        #[cfg(not(windows))]
+        assert_eq!(result, path);
+    }
+
+    #[test]
+    fn test_display_path() {
+        let path = PathBuf::from(r"C:\Users\gilfe\.rust-bot").join("config.json");
+        let displayed = display_path(&path);
+        #[cfg(windows)]
+        assert!(!displayed.contains('/'));
+        #[cfg(not(windows))]
+        assert_eq!(displayed, path.to_string_lossy());
+    }
 
     #[test]
     fn test_abbreviate_path_empty() {

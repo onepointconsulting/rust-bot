@@ -66,20 +66,23 @@ impl ChannelManager {
         }
     }
 
-    fn resolve_transcription_key(config: &Config, provider: &str) -> String {
+    fn resolve_transcription_key(config: &Config, provider: Option<&str>) -> String {
         match provider {
-            "groq" => config.providers.groq.api_key.clone(),
-            "openai" => config.providers.openai.api_key.clone(),
-            _ => {
-                log::error!("Unknown transcription provider: {provider}");
+            Some("groq") => config.providers.groq.api_key.clone(),
+            Some("openai") => config.providers.openai.api_key.clone(),
+            Some(other) => {
+                log::error!("Unknown transcription provider: {other}");
                 String::new()
             }
+            None => String::new(),
         }
     }
 
     fn init_channels(config: &Config, bus: Arc<MessageBus>) -> HashMap<String, SharedChannel> {
-        let transcription_key =
-            Self::resolve_transcription_key(config, &config.channels.transcription_provider);
+        let transcription_key = Self::resolve_transcription_key(
+            config,
+            config.channels.transcription_provider.as_deref(),
+        );
         let mut channels = HashMap::new();
         for (name, mut channel) in discover_all(config, Arc::clone(&bus)) {
             channel.set_transcription_api_key(transcription_key.clone());
@@ -429,11 +432,11 @@ mod tests {
     fn resolve_transcription_key_groq_and_openai() {
         let config = config_with_email(false);
         assert_eq!(
-            ChannelManager::resolve_transcription_key(&config, "groq"),
+            ChannelManager::resolve_transcription_key(&config, Some("groq")),
             "test-groq-key"
         );
         assert_eq!(
-            ChannelManager::resolve_transcription_key(&config, "openai"),
+            ChannelManager::resolve_transcription_key(&config, Some("openai")),
             "test-openai-key"
         );
     }
@@ -442,9 +445,15 @@ mod tests {
     fn resolve_transcription_key_unknown_returns_empty() {
         let config = config_with_email(false);
         assert_eq!(
-            ChannelManager::resolve_transcription_key(&config, "whisper-local"),
+            ChannelManager::resolve_transcription_key(&config, Some("whisper-local")),
             ""
         );
+    }
+
+    #[test]
+    fn resolve_transcription_key_none_returns_empty() {
+        let config = config_with_email(false);
+        assert_eq!(ChannelManager::resolve_transcription_key(&config, None), "");
     }
 
     #[test]
@@ -521,13 +530,16 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(Arc::new(config), bus);
         assert!(manager.channels.is_empty());
-        assert_eq!(manager.config.channels.transcription_provider, "groq");
+        assert_eq!(
+            manager.config.channels.transcription_provider,
+            Some("groq".to_string())
+        );
     }
 
     #[test]
     fn openai_transcription_provider_sets_openai_key() {
         let mut config = config_with_email(true);
-        config.channels.transcription_provider = "openai".to_string();
+        config.channels.transcription_provider = Some("openai".to_string());
         let bus = Arc::new(MessageBus::new());
         let channels = ChannelManager::init_channels(&config, bus);
         assert_eq!(

@@ -773,8 +773,14 @@ pub fn expand_tilde_path(path: &str) -> std::borrow::Cow<'_, str> {
     };
 
     match expanded {
-        Some(p) => p.to_string_lossy().into_owned().into(),
-        None => path.into(),
+        Some(p) => crate::utils::path::normalize_path_separators(&p.to_string_lossy()).into(),
+        None => {
+            if cfg!(windows) && path.contains('/') {
+                crate::utils::path::normalize_path_separators(path).into()
+            } else {
+                path.into()
+            }
+        }
     }
 }
 

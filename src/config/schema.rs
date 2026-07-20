@@ -53,8 +53,8 @@ fn default_streaming() -> bool {
 fn default_send_max_retries() -> u8 {
     3
 }
-fn default_transcription_provider() -> String {
-    "groq".to_string()
+fn default_transcription_provider() -> Option<String> {
+    Some("groq".to_string())
 }
 
 /// Configuration for chat channels.
@@ -86,13 +86,14 @@ pub struct ChannelsConfig {
     #[garde(range(min = 0, max = 10))]
     pub send_max_retries: u8,
 
-    /// Voice transcription backend: `"groq"` or `"openai"`.
+    /// Voice transcription backend: `"groq"` or `"openai"`. `None` disables transcription.
     #[serde(
         alias = "transcription_provider",
-        default = "default_transcription_provider"
+        default = "default_transcription_provider",
+        skip_serializing_if = "Option::is_none"
     )]
     #[garde(skip)]
-    pub transcription_provider: String,
+    pub transcription_provider: Option<String>,
 
     /// Plugin-specific channel configs not covered by the typed fields above.
     #[serde(flatten)]
@@ -1024,7 +1025,7 @@ impl Default for ToolsConfig {
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct SubagentConfig {
-    /// Bind address for the gateway. Defaults to `0.0.0.0` (all interfaces).
+    /// Used to fail the subagent if a tool call fails.
     #[serde(alias = "fail_on_tool_error")]
     #[garde(skip)]
     pub fail_on_tool_error: bool,
@@ -1285,7 +1286,7 @@ mod tests {
         assert!(cfg.send_progress);
         assert!(!cfg.send_tool_hints);
         assert_eq!(cfg.send_max_retries, 3);
-        assert_eq!(cfg.transcription_provider, "groq");
+        assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
         assert!(cfg.extra.is_empty());
     }
 
@@ -1295,7 +1296,7 @@ mod tests {
         let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.send_progress);
         assert_eq!(cfg.send_max_retries, 5);
-        assert_eq!(cfg.transcription_provider, "groq");
+        assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
         assert!(cfg.validate().is_ok());
     }
 
@@ -1322,8 +1323,15 @@ mod tests {
         let json = r#"{"sendMaxRetries": 11}"#;
         let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.validate().is_err());
-        assert_eq!(cfg.transcription_provider, "groq");
+        assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
         assert_eq!(cfg.send_progress, default_send_progress());
+    }
+
+    #[test]
+    fn test_transcription_provider_null_is_none() {
+        let json = r#"{"transcriptionProvider": null}"#;
+        let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transcription_provider, None);
     }
 
     #[test]
@@ -2145,7 +2153,7 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(!cfg.channels.send_progress);
         assert_eq!(cfg.channels.send_max_retries, 5);
-        assert_eq!(cfg.channels.transcription_provider, "test");
+        assert_eq!(cfg.channels.transcription_provider, Some("test".to_string()));
         assert!(cfg.validate().is_ok());
     }
 

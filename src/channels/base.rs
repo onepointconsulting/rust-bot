@@ -25,9 +25,9 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         return "Base";
     }
 
-    /// Transcription provider
-    fn transcription_provider(&self) -> &str {
-        return self.config().transcription_provider.as_str();
+    /// Transcription provider name, if configured.
+    fn transcription_provider(&self) -> Option<&str> {
+        self.config().transcription_provider.as_deref()
     }
 
     fn transcription_api_key(&self) -> &str {
@@ -44,11 +44,18 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
 
     /// Transcribe an audio file via Whisper (OpenAI or Groq). Returns empty string on failure.
     async fn transcribe_audio(&self, file_path: PathLike) -> String {
+        let Some(provider_name) = self.transcription_provider() else {
+            log::error!(
+                "No transcription provider configured for channel {}",
+                self.name()
+            );
+            return "".to_string();
+        };
         if self.transcription_api_key().is_empty() {
             log::error!("No transcription API key configured for channel {}", self.name());
             return "".to_string();
         }
-        let provider: Box<dyn TranscriptionProvider> = match self.transcription_provider() {
+        let provider: Box<dyn TranscriptionProvider> = match provider_name {
             "openai" => Box::new(OpenAITranscriptionProvider::new(
                 OPENAI_DEFAULT_API_URL,
                 Some(self.transcription_api_key().to_string()),
