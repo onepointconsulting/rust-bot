@@ -204,7 +204,6 @@ pub struct EmailChannel {
     last_subject_by_chat_id: Mutex<HashMap<String, String>>,
     last_message_id_by_chat: Mutex<HashMap<String, String>>,
     processed_uids: Mutex<HashSet<String>>, // Capped to prevent unbounded growth
-    running: AtomicBool,
 }
 
 impl EmailChannel {
@@ -230,7 +229,7 @@ impl EmailChannel {
         Self {
             base: BaseChannelCommon {
                 bus,
-                running: false,
+                running: AtomicBool::new(false),
                 transcription_api_key: String::new(),
             },
             channels_config,
@@ -238,7 +237,6 @@ impl EmailChannel {
             last_subject_by_chat_id: Mutex::new(HashMap::new()),
             last_message_id_by_chat: Mutex::new(HashMap::new()),
             processed_uids: Mutex::new(HashSet::new()),
-            running: AtomicBool::new(false),
         }
     }
 
@@ -898,7 +896,7 @@ impl BaseChannel for EmailChannel {
     }
 
     fn running(&self) -> bool {
-        self.running.load(Ordering::Relaxed)
+        self.base.running.load(Ordering::Relaxed)
     }
 
     fn bus(&self) -> &MessageBus {
@@ -922,7 +920,7 @@ impl BaseChannel for EmailChannel {
     }
 
     async fn stop(&self) {
-        self.running.store(false, Ordering::Relaxed);
+        self.base.running.store(false, Ordering::Relaxed);
     }
 
     /// Send email via SMTP.
@@ -1074,7 +1072,7 @@ impl BaseChannel for EmailChannel {
         if !self.validate_config() {
             return;
         }
-        self.running.store(true, Ordering::Relaxed);
+        self.base.running.store(true, Ordering::Relaxed);
 
         if !self.config.verify_dkim && !self.config.verify_spf {
             log::warn!(
@@ -1085,7 +1083,7 @@ Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
         }
         log::info!("Starting Email channel (IMAP polling mode)...");
         let poll_seconds = std::cmp::max(5, self.config.poll_interval_seconds) as u64;
-        while self.running.load(Ordering::Relaxed) {
+        while self.base.running.load(Ordering::Relaxed) {
             let inbound_items = self.fetch_new_messages().await;
             for item in inbound_items {
                 let sender = item.get("sender").and_then(|v| v.as_str()).unwrap_or("");

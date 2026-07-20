@@ -1,4 +1,10 @@
-use std::{collections::HashMap, sync::Arc};
+use std::{
+    collections::HashMap,
+    sync::{
+        Arc,
+        atomic::AtomicBool,
+    },
+};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -84,7 +90,7 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     /// Returns `true` if already authenticated or login succeeds.
     ///
     /// Override in channel implementations that support interactive login.
-    fn login(&self, force: bool) -> bool {
+    async fn login(&self, force: bool) -> bool {
         let _ = force;
         true
     }
@@ -217,6 +223,6 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
 
 pub struct BaseChannelCommon {
     pub bus: Arc<MessageBus>,
-    pub running: bool,
+    pub running: AtomicBool,
     pub transcription_api_key: String,
 }

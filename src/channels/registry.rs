@@ -4,12 +4,16 @@ use std::{collections::HashMap, sync::Arc};
 
 use crate::{
     bus::queue::MessageBus,
-    channels::{base::BaseChannel, email::EmailChannel},
+    channels::{
+        base::BaseChannel,
+        email::EmailChannel,
+        whatsapp::{WhatsAppChannel, WhatsAppConfig},
+    },
     config::{channels::EmailConfig, schema::Config},
 };
 
 /// Built-in channel module names.
-const BUILTIN_CHANNELS: &[&str] = &["email"];
+const BUILTIN_CHANNELS: &[&str] = &["email", "whatsapp"];
 
 /// Return all built-in channel module names.
 pub fn discover_channel_names() -> Vec<&'static str> {
@@ -38,6 +42,26 @@ pub fn discover_all(
                     name,
                     Box::new(EmailChannel::new(
                         email_cfg,
+                        Arc::clone(&bus),
+                        config.channels.clone(),
+                    )),
+                );
+            }
+            "whatsapp" => {
+                let whatsapp_cfg = config
+                    .channels
+                    .extra
+                    .get("whatsapp")
+                    .cloned()
+                    .and_then(|v| serde_json::from_value::<WhatsAppConfig>(v).ok())
+                    .unwrap_or_default();
+                if !whatsapp_cfg.enabled {
+                    continue;
+                }
+                channels.insert(
+                    name,
+                    Box::new(WhatsAppChannel::new(
+                        whatsapp_cfg,
                         Arc::clone(&bus),
                         config.channels.clone(),
                     )),

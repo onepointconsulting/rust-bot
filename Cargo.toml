@@ -61,6 +61,19 @@ mailparse = "0.16.1"
 lettre = { version = "0.11.22", features = ["tokio1", "tokio1-native-tls"] }
 html2md = "0.2.15"
 inquire = "0.9.4"
+# Default features include `simd`, which needs nightly (`portable_simd`).
+# Keep the rest of the defaults for stable builds.
+whatsapp-rust = { version = "0.6", default-features = false, features = [
+    "moka-cache",
+    "sqlite-storage",
+    "tokio-transport",
+    "tokio-runtime",
+    "ureq-client",
+    "tokio-native",
+    "signal",
+] }
+whatsapp-rust-tokio-transport = "0.6"
+whatsapp-rust-ureq-http-client = "0.6"
 
 [dev-dependencies]
 tempfile = "3"

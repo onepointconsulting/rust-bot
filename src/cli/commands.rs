@@ -13,7 +13,9 @@ use crate::agent::tools::message::MessageTool;
 use crate::api::rest::ApiServer;
 use crate::api::rest::create_api_server;
 use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::channels::base::BaseChannel;
 use crate::channels::manager::ChannelManager;
+use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
 use crate::cli::wizard::apply_workspace_override;
 use crate::cli::wizard::resolve_onboard_config_path;
 use crate::cli::wizard::wizard;
@@ -91,6 +93,9 @@ pub enum Commands {
 
     /// Run the gateway server
     Gateway(GatewayArgs),
+
+    /// Perform interactive channel login (e.g. WhatsApp QR pairing)
+    Login(LoginArgs),
 
     /// Initialize configuration and workspace
     Onboard(OnboardArgs),
@@ -189,6 +194,21 @@ pub struct OnboardArgs {
     pub wizard: bool,
 }
 
+#[derive(Debug, Parser)]
+pub struct LoginArgs {
+    /// Channel to log in to (e.g. whatsapp)
+    #[arg(long)]
+    pub channel: String,
+
+    /// Ignore existing credentials and force re-authentication
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub force: bool,
+
+    /// JSON configuration file path (defaults to ~/.rust-bot/config.json)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
+}
+
 #[derive(Debug)]
 pub enum CliError {
     InteractiveNotImplemented,
@@ -276,6 +296,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Agent(args) => run_agent(args).await,
         Commands::Api(args) => run_api(args).await,
         Commands::Gateway(args) => run_gateway(args).await,
+        Commands::Login(args) => run_login(args).await,
         Commands::Onboard(args) => run_onboard(args),
     }
 }
@@ -385,6 +406,61 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 }
 
 /// Lightweight non-interactive config bootstrap (wizard mode not yet implemented).
+async fn run_login(args: LoginArgs) -> Result<(), CliError> {
+    init_runtime_logging(true, None);
+    let config_path = resolve_onboard_config_path(args.config);
+    if !config_path.exists() {
+        eprint_error(format!("Config file not found: {}", config_path.display()));
+        exit_codes::exit(GENERAL_ERROR);
+    }
+    let config = match resolve_config_env_vars(&load_config(Some(config_path.clone()))) {
+        Ok(config) => config,
+        Err(e) => {
+            eprint_error(e);
+            exit_codes::exit(GENERAL_ERROR);
+        }
+    };
+
+    let channel_name = args.channel.trim().to_ascii_lowercase();
+    let bus = Arc::new(MessageBus::new());
+    let channel: Arc<dyn BaseChannel> = match channel_name.as_str() {
+        "whatsapp" => {
+            let whatsapp_cfg = config
+                .channels
+                .extra
+                .get("whatsapp")
+                .cloned()
+                .and_then(|v| serde_json::from_value::<WhatsAppConfig>(v).ok())
+                .unwrap_or_default();
+            Arc::new(WhatsAppChannel::new(
+                whatsapp_cfg,
+                Arc::clone(&bus),
+                config.channels.clone(),
+            ))
+        }
+        other => {
+            eprint_error(format!(
+                "Unsupported channel for login: '{other}'. Currently supported: whatsapp"
+            ));
+            exit_codes::exit(GENERAL_ERROR);
+        }
+    };
+
+    println!(
+        "Logging in to {}{}...",
+        channel.display_name(),
+        if args.force { " (force)" } else { "" }
+    );
+    let ok = channel.login(args.force).await;
+    if ok {
+        println!("{} login succeeded.", channel.display_name());
+        Ok(())
+    } else {
+        eprint_error(format!("{} login failed.", channel.display_name()));
+        exit_codes::exit(GENERAL_ERROR);
+    }
+}
+
 fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
 
     if args.wizard {
