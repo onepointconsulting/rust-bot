@@ -1,4 +1,5 @@
 pub mod commands;
+pub mod onboard;
 mod paste_edit_mode;
 pub mod stream;
 pub mod wizard;

@@ -2,7 +2,6 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
-use std::io::{self, Write};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -16,9 +15,8 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
 use crate::channels::manager::ChannelManager;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
-use crate::cli::wizard::apply_workspace_override;
+use crate::cli::onboard::run_onboard;
 use crate::cli::wizard::resolve_onboard_config_path;
-use crate::cli::wizard::wizard;
 use crate::cron::CronJobState;
 use crate::cron::CronPayload;
 use crate::cron::CronPayloadKind;
@@ -47,7 +45,7 @@ use crate::cli::paste_edit_mode::{
 use crate::cli::progress::{create_on_progress, print_cli_progress_line, ProgressType};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{
-    load_config, resolve_config_env_vars, save_config, set_config_path,
+    load_config, resolve_config_env_vars, set_config_path,
 };
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
@@ -61,10 +59,8 @@ use crate::utils::clipboard::IMAGE_PASTE_COMMAND_REGEX;
 use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
 use crate::utils::clipboard::{TEXT_PASTE_COMMAND, TEXT_PASTE_SENTINEL_REGEX};
-use crate::utils::exit_codes::{self, GENERAL_ERROR, INVALID_PROVIDER, TEMPLATES_UNAVAILABLE};
-use crate::utils::helpers::{
-    TemplatesSyncError, ensure_dir, sync_workspace_templates,
-};
+use crate::utils::exit_codes::{self, GENERAL_ERROR, INVALID_PROVIDER};
+use crate::utils::helpers::{ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
 use crate::utils::restart::{
     consume_restart_notice_from_env, format_restart_completed_message,
@@ -182,14 +178,14 @@ pub struct GatewayArgs {
 #[derive(Debug, Parser)]
 pub struct OnboardArgs {
     /// Workspace directory
-    #[arg(short, long)]
-    pub workspace: Option<PathBuf>,
+    #[arg(short, long, default_value = "./.rust-bot/workspace")]
+    pub workspace: PathBuf,
 
-    /// JSON configuration file path (defaults to ~/.rust-bot/config.json)
-    #[arg(short, long)]
-    pub config: Option<PathBuf>,
+    /// JSON configuration file path
+    #[arg(short, long, default_value = "./.rust-bot/config.json")]
+    pub config: PathBuf,
 
-    /// Use interactive setup wizard (not yet implemented)
+    /// Use interactive setup wizard
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub wizard: bool,
 }
@@ -204,9 +200,9 @@ pub struct LoginArgs {
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub force: bool,
 
-    /// JSON configuration file path (defaults to ~/.rust-bot/config.json)
-    #[arg(short, long)]
-    pub config: Option<PathBuf>,
+    /// JSON configuration file path
+    #[arg(short, long, default_value = "./rust-bot/config.json")]
+    pub config: PathBuf,
 }
 
 #[derive(Debug)]
@@ -305,12 +301,7 @@ fn prepare_workspace(config: PathBuf, workspace: Option<PathBuf>) -> (Config, Pa
     let config = load_runtime_config(config, workspace);
     let workspace = config.workspace_path();
     ensure_dir(&workspace);
-    if let Err(err @ TemplatesSyncError::TemplatesUnavailable { .. }) =
-        sync_workspace_templates(&workspace, false)
-    {
-        eprint_error(err);
-        exit_codes::exit(TEMPLATES_UNAVAILABLE);
-    }
+    sync_workspace_templates(&workspace, false);
     (config, workspace)
 }
 
@@ -329,6 +320,8 @@ fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
         Some(config.agents.model.clone()),
         Some(config.agents.max_tool_iterations),
         Some(config.agents.max_tokens),
+        Some(config.agents.temperature),
+        config.agents.reasoning_effort.clone(),
         Some(config.agents.context_window_tokens),
         config.agents.context_block_limit,
         Some(config.agents.max_tool_result_chars),
@@ -459,115 +452,6 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
         eprint_error(format!("{} login failed.", channel.display_name()));
         exit_codes::exit(GENERAL_ERROR);
     }
-}
-
-fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
-
-    if args.wizard {
-        return wizard(args);
-    }
-    let config_path = resolve_onboard_config_path(args.config);
-
-    let config = if config_path.exists() {
-        let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
-        let bold = Style::new().bold();
-        println!(
-            "{}Config already exists at {}{}",
-            yellow.render(),
-            config_path.display(),
-            yellow.render_reset()
-        );
-        println!(
-            "  {}y{} = overwrite with defaults (existing values will be lost)",
-            bold.render(),
-            bold.render_reset()
-        );
-        println!(
-            "  {}N{} = refresh config, keeping existing values and adding new fields",
-            bold.render(),
-            bold.render_reset()
-        );
-        if confirm_overwrite() {
-            let config = apply_workspace_override(Config::default(), args.workspace.as_ref());
-            save_config(&config, Some(config_path.clone()));
-            print_onboard_ok(format!(
-                "Config reset to defaults at {}",
-                config_path.display()
-            ));
-            config
-        } else {
-            let config = apply_workspace_override(
-                load_config(Some(config_path.clone())),
-                args.workspace.as_ref(),
-            );
-            save_config(&config, Some(config_path.clone()));
-            print_onboard_ok(format!(
-                "Config refreshed at {} (existing values preserved)",
-                config_path.display()
-            ));
-            config
-        }
-    } else {
-        let config = apply_workspace_override(Config::default(), args.workspace.as_ref());
-        save_config(&config, Some(config_path.clone()));
-        print_onboard_ok(format!("Created config at {}", config_path.display()));
-        config
-    };
-
-    // Prefer the configured workspace path (including any --workspace override).
-    let workspace_path = config.workspace_path();
-    if !workspace_path.exists() {
-        ensure_dir(&workspace_path);
-        print_onboard_ok(format!(
-            "Created workspace at {}",
-            workspace_path.display()
-        ));
-    } else {
-        ensure_dir(&workspace_path);
-    }
-
-    if let Err(err @ TemplatesSyncError::TemplatesUnavailable { .. }) =
-        sync_workspace_templates(&workspace_path, false)
-    {
-        eprint_error(err);
-        exit_codes::exit(TEMPLATES_UNAVAILABLE);
-    }
-
-    println!();
-    println!("{LOGO} is ready!");
-    println!();
-    println!("Next steps:");
-    println!("  1. Add your API key to {}", config_path.display());
-    println!(
-        "  2. a) Chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
-        config_path.display()
-    );
-    println!(
-        "  2. b) API: rust-bot agent -c \"{}\"",
-        config_path.display()
-    );
-    Ok(())
-}
-
-
-
-fn confirm_overwrite() -> bool {
-    print!("Overwrite? [y/N]: ");
-    let _ = io::stdout().flush();
-    let mut input = String::new();
-    if io::stdin().read_line(&mut input).is_err() {
-        return false;
-    }
-    matches!(input.trim().to_ascii_lowercase().as_str(), "y" | "yes")
-}
-
-fn print_onboard_ok(message: impl fmt::Display) {
-    let green = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green)));
-    println!(
-        "{}✓{} {message}",
-        green.render(),
-        green.render_reset()
-    );
 }
 
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {

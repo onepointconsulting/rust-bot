@@ -4,15 +4,20 @@
 /// Shared snippets live under `agent/_snippets/` and are pulled in via
 /// `{% include 'agent/_snippets/....md' %}` — identical to the Python/Jinja2 setup.
 ///
-/// The templates root is resolved at runtime (see [`resolve_templates_root`]).
+/// The templates root is resolved at runtime (see [`resolve_templates_root`]). When no
+/// on-disk `templates/` directory can be found, templates are loaded from the
+/// compile-time embedded bundle instead (see [`crate::utils::embedded_templates`]), so a
+/// standalone binary always has prompts available.
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
 use tera::{Context, Tera};
 
+use crate::utils::embedded_templates;
+
 // ── templates root ────────────────────────────────────────────────────────────
 
-/// Resolve the `templates/` directory.
+/// Resolve the on-disk `templates/` directory, if one can be found.
 ///
 /// Strategy (first match wins):
 /// 1. `RUST_BOT_TEMPLATES_DIR` env var — explicit override for any layout.
@@ -22,9 +27,12 @@ use tera::{Context, Tera};
 ///    `prefix/bin/app` → `prefix/templates` if distributors nest that way.
 /// 3. `{current_working_directory}/templates` — last resort when launched from the project
 ///    root or another directory that contains a `templates/` folder.
-pub fn resolve_templates_root() -> PathBuf {
+///
+/// Returns `None` when no candidate directory exists on disk, in which case callers
+/// should fall back to the embedded bundle in [`crate::utils::embedded_templates`].
+pub fn resolve_templates_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("RUST_BOT_TEMPLATES_DIR") {
-        return PathBuf::from(dir);
+        return Some(PathBuf::from(dir));
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -35,15 +43,16 @@ pub fn resolve_templates_root() -> PathBuf {
             };
             let candidate = d.join("templates");
             if candidate.is_dir() {
-                return candidate;
+                return Some(candidate);
             }
             dir = d.parent().map(Path::to_path_buf);
         }
     }
 
-    std::env::current_dir()
+    let cwd_candidate = std::env::current_dir()
         .unwrap_or_else(|_| PathBuf::from("."))
-        .join("templates")
+        .join("templates");
+    cwd_candidate.is_dir().then_some(cwd_candidate)
 }
 
 // ── cached Tera environment ───────────────────────────────────────────────────
@@ -51,13 +60,35 @@ pub fn resolve_templates_root() -> PathBuf {
 static TERA: OnceLock<Result<Tera, String>> = OnceLock::new();
 
 fn environment() -> Result<&'static Tera, String> {
-    TERA.get_or_init(|| {
-        let root = resolve_templates_root();
-        let glob = format!("{}/**/*.md", root.to_string_lossy());
-        Tera::new(&glob).map_err(|e| format!("Failed to load templates from {:?}: {}", root, e))
-    })
-    .as_ref()
-    .map_err(|e| e.clone())
+    TERA.get_or_init(|| build_environment(resolve_templates_root().as_deref()))
+        .as_ref()
+        .map_err(|e| e.clone())
+}
+
+/// Build a Tera environment from an on-disk `templates/` root, or from the embedded
+/// bundle when `root` is `None`.
+fn build_environment(root: Option<&Path>) -> Result<Tera, String> {
+    match root {
+        Some(root) => {
+            let glob = format!("{}/**/*.md", root.to_string_lossy());
+            Tera::new(&glob)
+                .map_err(|e| format!("Failed to load templates from {:?}: {}", root, e))
+        }
+        None => {
+            let mut tera = Tera::default();
+            for path in embedded_templates::paths() {
+                if !path.ends_with(".md") {
+                    continue;
+                }
+                let content = embedded_templates::get(&path).ok_or_else(|| {
+                    format!("Embedded template '{path}' is not valid UTF-8")
+                })?;
+                tera.add_raw_template(&path, &content)
+                    .map_err(|e| format!("Failed to load embedded template '{path}': {e}"))?;
+            }
+            Ok(tera)
+        }
+    }
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -84,6 +115,22 @@ mod tests {
         Context::new()
     }
 
+    /// Render directly against a chosen root, bypassing runtime discovery and the
+    /// cached [`TERA`] instance — lets tests exercise the embedded-bundle branch
+    /// deterministically, regardless of where the test binary happens to live on disk.
+    fn render_with_root(
+        root: Option<&Path>,
+        name: &str,
+        context: &Context,
+        strip: bool,
+    ) -> Result<String, String> {
+        let tera = build_environment(root)?;
+        let text = tera
+            .render(name, context)
+            .map_err(|e| format!("Failed to render template '{}': {}", name, e))?;
+        Ok(if strip { text.trim_end().to_string() } else { text })
+    }
+
     // ── static / no-variable templates ───────────────────────────────────────
 
     #[test]
@@ -100,6 +147,30 @@ mod tests {
         let unstripped = render_template("agent/dream_phase1.md", &ctx(), false).unwrap();
         let stripped = render_template("agent/dream_phase1.md", &ctx(), true).unwrap();
         assert_eq!(stripped, unstripped.trim_end());
+    }
+
+    // ── embedded bundle fallback (no on-disk templates/ root) ────────────────
+
+    #[test]
+    fn test_render_from_embedded_bundle_without_disk_root() {
+        let result = render_with_root(None, "agent/dream_phase1.md", &ctx(), false);
+        assert!(result.is_ok(), "unexpected error: {:?}", result.err());
+        assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_embedded_bundle_includes_snippet() {
+        let mut ctx = Context::new();
+        ctx.insert("runtime", "test-runtime");
+        ctx.insert("workspace_path", "/tmp/ws");
+        ctx.insert("platform_policy", "");
+        ctx.insert("channel", "cli");
+        let result = render_with_root(None, "agent/identity.md", &ctx, true).unwrap();
+        assert!(
+            result.contains("untrusted external data"),
+            "snippet not included: {}",
+            result
+        );
     }
 
     // ── variable interpolation ────────────────────────────────────────────────

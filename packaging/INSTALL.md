@@ -1,12 +1,11 @@
 # Rust Bot - Installation
 
-This package contains a pre-built `rust-bot` binary, its prompt templates, and
-two sample configurations. Follow these steps to get started.
+This package contains a pre-built `rust-bot` binary and two sample
+configurations. Follow these steps to get started.
 
 ## 1. Unpack
 
-Extract the archive and keep the folder structure as-is - the `templates/`
-folder must stay next to the `rust-bot` (or `rust-bot.exe`) binary:
+Extract the archive:
 
 ```text
 rust-bot-<version>-<platform>/
@@ -18,9 +17,13 @@ rust-bot-<version>-<platform>/
     anthropic.json
 ```
 
-If you need to move the binary away from this folder, set the
-`RUST_BOT_TEMPLATES_DIR` environment variable to point at the `templates/`
-directory instead.
+The binary has its prompt templates and workspace seed files (`AGENTS.md`,
+`SOUL.md`, `TOOLS.md`, `USER.md`, …) compiled in, so it works standalone —
+you can move `rust-bot` (or `rust-bot.exe`) anywhere, including away from
+this folder. The bundled `templates/` folder is only needed if you want to
+customize those defaults: keep it next to the binary, or set
+`RUST_BOT_TEMPLATES_DIR` to point at it from elsewhere, and your copies will
+be used instead of the built-in ones.
 
 ## 2. Choose a sample configuration
 
@@ -78,7 +81,7 @@ Omit `-m/--message` to start the interactive console.
 If you want to create a new configuration though, you can run this command, that will create a new default configuration that you can edit yourself:
 
 ```bash
-rust-bot.exe onboard --config ./config.json
+rust-bot.exe onboard --config ./rust-bot/config.json
 ```
 
 ## 5. Next steps

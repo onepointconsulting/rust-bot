@@ -74,6 +74,8 @@ whatsapp-rust = { version = "0.6", default-features = false, features = [
 ] }
 whatsapp-rust-tokio-transport = "0.6"
 whatsapp-rust-ureq-http-client = "0.6"
+qrcode = {version = "0.14.1"}
+rust-embed = "8.11"
 
 [dev-dependencies]
 tempfile = "3"
@@ -85,6 +87,13 @@ rmcp = { version = "1.6.0", features = ["server", "macros", "schemars"] }
 # See https://github.com/crossterm-rs/crossterm/pull/1030
 [patch.crates-io]
 crossterm = { git = "https://github.com/eitsupi/crossterm", branch = "feature/windows-vt-input" }
+# whatsapp-rust 0.6.0 with the self-DM fanout fix backported from upstream
+# PR #634 ("fix: self-DM stops working"). Without it, every reply in the
+# WhatsApp self-chat encrypts each own device twice (LID + PN namespace),
+# logs "session with <lid> not found. Skipping." and the server rejects the
+# stanza, so replies never reach the phone. Drop this patch once a release
+# newer than 0.6.0 is published on crates.io.
+whatsapp-rust = { path = "vendor/whatsapp-rust" }
 
 [profile.release]
 opt-level = "z"

@@ -5,6 +5,7 @@ use anstyle::Style;
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, Password, Select, Text};
 
+use crate::cli::onboard::create_env_file;
 use crate::{
     cli::{CliError, commands::OnboardArgs, eprint_error},
     config::{
@@ -16,7 +17,10 @@ use crate::{
         },
     },
     providers::registry::providers,
-    utils::{helpers::expand_tilde_path, path::display_path},
+    utils::{
+        helpers::{ensure_dir, expand_tilde_path, sync_workspace_templates},
+        path::display_path,
+    },
 };
 
 const LLM_PROVIDER: &'static str = "LLM Provider";
@@ -73,7 +77,7 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
     let config_path = resolve_onboard_config_path(args.config);
     let mut config = apply_workspace_override(
         load_config(Some(config_path.clone())),
-        args.workspace.as_ref(),
+        args.workspace,
     );
     loop {
         let answer = Select::new(
@@ -108,6 +112,10 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
             }
             SAVE_AND_EXIT => {
                 save_config(&config, Some(config_path))?;
+                let workspace_path = config.workspace_path();
+                ensure_dir(&workspace_path);
+                sync_workspace_templates(&workspace_path, false);
+                create_env_file();
                 break;
             }
             EXIT_WITHOUT_SAVING => {
@@ -230,21 +238,18 @@ pub fn configure_extra_headers(
     Ok(config.clone())
 }
 
-pub fn resolve_onboard_config_path(config: Option<PathBuf>) -> PathBuf {
-    let config_path = if let Some(config) = config {
-        let expanded = PathBuf::from(expand_tilde_path(&config.to_string_lossy()).as_ref());
-        let config_path = if expanded.is_absolute() {
-            expanded
-        } else {
-            std::env::current_dir()
-                .unwrap_or_else(|_| PathBuf::from("."))
-                .join(expanded)
-        };
-        set_config_path(config_path.clone());
-        config_path
+pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
+    
+    let expanded = PathBuf::from(expand_tilde_path(&config_path.to_string_lossy()).as_ref());
+    let config_path = if expanded.is_absolute() {
+        expanded
     } else {
-        get_config_path()
+        std::env::current_dir()
+            .unwrap_or_else(|_| PathBuf::from("."))
+            .join(expanded)
     };
+    set_config_path(config_path.clone());
+    
     let dim = Style::new().dimmed();
     println!(
         "{}Using config: {}{}",
@@ -255,10 +260,9 @@ pub fn resolve_onboard_config_path(config: Option<PathBuf>) -> PathBuf {
     config_path
 }
 
-pub fn apply_workspace_override(mut config: Config, workspace: Option<&PathBuf>) -> Config {
-    if let Some(workspace) = workspace {
-        config.agents.workspace = workspace.to_string_lossy().into_owned();
-    }
+pub fn apply_workspace_override(mut config: Config, workspace: PathBuf) -> Config {
+    let expanded = PathBuf::from(expand_tilde_path(&workspace.to_string_lossy()).as_ref());
+    config.agents.workspace = expanded.to_string_lossy().into_owned();
     config
 }
 

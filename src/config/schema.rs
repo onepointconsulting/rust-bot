@@ -111,7 +111,7 @@ impl Default for ChannelsConfig {
         Self {
             send_progress: default_send_progress(),
             streaming: default_streaming(),
-            send_tool_hints: false,
+            send_tool_hints: true,
             send_max_retries: default_send_max_retries(),
             transcription_provider: default_transcription_provider(),
             extra: HashMap::new(),

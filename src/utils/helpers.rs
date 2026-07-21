@@ -1,6 +1,5 @@
 /// Utility functions for rust-bot.
 use std::collections::HashMap;
-use std::fmt;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -12,6 +11,7 @@ use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
 use crate::agent::context::BOOTSTRAP_FILES;
+use crate::utils::embedded_templates;
 use crate::utils::gitstore::GitStore;
 use crate::utils::logo::LOGO;
 use tiktoken_rs::{CoreBPE, cl100k_base};
@@ -427,12 +427,17 @@ pub fn maybe_persist_tool_result(
         }
     }
 
-    let preview = &text_payload[..text_payload.len().min(TOOL_RESULT_PREVIEW_CHARS)];
+    // Byte-index slicing panics mid-character (e.g. inside '─'); take Unicode scalars.
+    let char_count = text_payload.chars().count();
+    let preview: String = text_payload
+        .chars()
+        .take(TOOL_RESULT_PREVIEW_CHARS)
+        .collect();
     Value::String(render_tool_result_reference(
         &path,
-        text_payload.len(),
-        preview,
-        text_payload.len() > TOOL_RESULT_PREVIEW_CHARS,
+        char_count,
+        &preview,
+        char_count > TOOL_RESULT_PREVIEW_CHARS,
     ))
 }
 
@@ -622,34 +627,6 @@ pub fn build_status_content(
 
 // ── workspace template sync ───────────────────────────────────────────────────
 
-#[derive(Debug)]
-pub enum TemplatesSyncError {
-    TemplatesUnavailable { cwd: PathBuf, workspace: PathBuf },
-}
-
-impl fmt::Display for TemplatesSyncError {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Self::TemplatesUnavailable { cwd, workspace } => write!(
-                f,
-                "Templates unavailable: no templates/ in {} and workspace {} is not fully seeded \
-                 (requires AGENTS.md, SOUL.md, TOOLS.md, USER.md)",
-                cwd.display(),
-                workspace.display()
-            ),
-        }
-    }
-}
-
-impl std::error::Error for TemplatesSyncError {}
-
-/// Resolve the `templates/` directory relative to the current working directory.
-fn sync_templates_root() -> PathBuf {
-    std::env::current_dir()
-        .unwrap_or_else(|_| PathBuf::from("."))
-        .join("templates")
-}
-
 /// True when all bootstrap workspace files already exist.
 pub fn workspace_is_seeded(workspace: &Path) -> bool {
     BOOTSTRAP_FILES
@@ -680,57 +657,77 @@ fn write_dest_if_missing(
     }
 }
 
+/// Read a bootstrap template's content, preferring the on-disk `templates_root` and
+/// falling back to the compiled-in bundle when the file is missing there (covers both
+/// "no templates/ on disk at all" and explicit overrides that only ship a subset).
+///
+/// `rel_name` uses forward slashes (e.g. `"memory/MEMORY.md"`); `Path::join` accepts
+/// that on both Unix and Windows.
+fn read_bootstrap_file(templates_root: Option<&Path>, rel_name: &str) -> Option<String> {
+    if let Some(root) = templates_root {
+        if let Ok(content) = fs::read_to_string(root.join(rel_name)) {
+            return Some(content);
+        }
+    }
+    embedded_templates::get(rel_name)
+}
+
+/// Top-level bootstrap `.md` file names (e.g. `AGENTS.md`, `SOUL.md`, `HEARTBEAT.md`)
+/// available from `templates_root` (on disk) or the embedded bundle when `None`.
+fn top_level_bootstrap_names(templates_root: Option<&Path>) -> Vec<String> {
+    match templates_root {
+        Some(root) => fs::read_dir(root)
+            .map(|entries| {
+                entries
+                    .filter_map(|e| e.ok())
+                    .filter_map(|e| e.file_name().to_str().map(str::to_string))
+                    .filter(|name| name.ends_with(".md") && !name.starts_with('.'))
+                    .collect()
+            })
+            .unwrap_or_default(),
+        None => embedded_templates::paths()
+            .filter(|p| !p.contains('/') && p.ends_with(".md"))
+            .map(|p| p.into_owned())
+            .collect(),
+    }
+}
+
 /// Sync bundled templates to the workspace. Only creates missing files.
 ///
+/// Prefers the on-disk `templates/` root (see
+/// [`crate::utils::prompt_templates::resolve_templates_root`]) and falls back to the
+/// compiled-in bundle otherwise, so a standalone binary can always seed a fresh
+/// workspace.
+///
 /// Returns the list of relative paths that were created.
-pub fn sync_workspace_templates(
+pub fn sync_workspace_templates(workspace: &Path, silent: bool) -> Vec<String> {
+    sync_workspace_templates_with_root(
+        workspace,
+        silent,
+        crate::utils::prompt_templates::resolve_templates_root().as_deref(),
+    )
+}
+
+fn sync_workspace_templates_with_root(
     workspace: &Path,
     silent: bool,
-) -> Result<Vec<String>, TemplatesSyncError> {
-    let cwd = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
-    let templates_root = sync_templates_root();
-    let has_source = templates_root.is_dir();
-
-    if !has_source && !workspace_is_seeded(workspace) {
-        return Err(TemplatesSyncError::TemplatesUnavailable {
-            cwd,
-            workspace: workspace.to_path_buf(),
-        });
-    }
-
+    templates_root: Option<&Path>,
+) -> Vec<String> {
     let mut added: Vec<String> = Vec::new();
 
-    if has_source {
-        // Copy top-level .md files
-        if let Ok(entries) = fs::read_dir(&templates_root) {
-            for entry in entries.filter_map(|e| e.ok()) {
-                let src = entry.path();
-                let name = src
-                    .file_name()
-                    .unwrap_or_default()
-                    .to_string_lossy()
-                    .into_owned();
-                if name.ends_with(".md") && !name.starts_with('.') {
-                    let dest = workspace.join(&name);
-                    if let Ok(content) = fs::read_to_string(&src) {
-                        write_dest_if_missing(workspace, &dest, Some(&content), &mut added);
-                    }
-                }
-            }
+    for name in top_level_bootstrap_names(templates_root) {
+        if let Some(content) = read_bootstrap_file(templates_root, &name) {
+            write_dest_if_missing(workspace, &workspace.join(&name), Some(&content), &mut added);
         }
+    }
 
-        // Copy memory/MEMORY.md
-        let memory_src = templates_root.join("memory").join("MEMORY.md");
-        if memory_src.exists() {
-            if let Ok(content) = fs::read_to_string(&memory_src) {
-                write_dest_if_missing(
-                    workspace,
-                    &workspace.join("memory").join("MEMORY.md"),
-                    Some(&content),
-                    &mut added,
-                );
-            }
-        }
+    if let Some(content) = read_bootstrap_file(templates_root, "memory/MEMORY.md") {
+        write_dest_if_missing(
+            workspace,
+            &workspace.join("memory").join("MEMORY.md"),
+            Some(&content),
+            &mut added,
+        );
     }
 
     // Touch memory/history.jsonl
@@ -760,7 +757,7 @@ pub fn sync_workspace_templates(
     );
     let _ = git.init();
 
-    Ok(added)
+    added
 }
 
 pub fn expand_tilde_path(path: &str) -> std::borrow::Cow<'_, str> {
@@ -1211,28 +1208,10 @@ mod tests {
 
     // ── sync_workspace_templates ──────────────────────────────────────────────
 
-    struct RestoreCwd {
-        original: PathBuf,
-    }
-
-    impl RestoreCwd {
-        fn change_to(path: &Path) -> Self {
-            let original = std::env::current_dir().unwrap();
-            std::env::set_current_dir(path).unwrap();
-            Self { original }
-        }
-    }
-
-    impl Drop for RestoreCwd {
-        fn drop(&mut self) {
-            let _ = std::env::set_current_dir(&self.original);
-        }
-    }
-
     #[test]
     fn test_sync_workspace_templates_creates_files() {
         let tmp = tempdir().unwrap();
-        let added = sync_workspace_templates(tmp.path(), true).unwrap();
+        let added = sync_workspace_templates(tmp.path(), true);
         assert!(!added.is_empty(), "expected files to be created");
         assert!(tmp.path().join("memory").join("history.jsonl").exists());
         assert!(tmp.path().join("skills").is_dir());
@@ -1241,8 +1220,8 @@ mod tests {
     #[test]
     fn test_sync_workspace_templates_idempotent() {
         let tmp = tempdir().unwrap();
-        let first = sync_workspace_templates(tmp.path(), true).unwrap();
-        let second = sync_workspace_templates(tmp.path(), true).unwrap();
+        let first = sync_workspace_templates(tmp.path(), true);
+        let second = sync_workspace_templates(tmp.path(), true);
         assert!(!first.is_empty());
         assert!(
             second.is_empty(),
@@ -1254,38 +1233,51 @@ mod tests {
     #[test]
     fn test_sync_git_initialized() {
         let tmp = tempdir().unwrap();
-        sync_workspace_templates(tmp.path(), true).unwrap();
+        sync_workspace_templates(tmp.path(), true);
         assert!(tmp.path().join(".git").is_dir());
     }
 
+    /// With no on-disk `templates/` root at all (`root: None`), the workspace must
+    /// still be fully seeded from the compiled-in bundle — this is the scenario a
+    /// standalone binary hits with no sibling `templates/` folder.
     #[test]
-    fn test_sync_aborts_without_source_or_seed() {
-        let empty_cwd = tempdir().unwrap();
+    fn test_sync_seeds_from_embedded_bundle_without_disk_root() {
         let workspace = tempdir().unwrap();
-        let _guard = RestoreCwd::change_to(empty_cwd.path());
-
-        let err = sync_workspace_templates(workspace.path(), true).unwrap_err();
-        assert!(matches!(
-            err,
-            TemplatesSyncError::TemplatesUnavailable { .. }
-        ));
+        let added = sync_workspace_templates_with_root(workspace.path(), true, None);
+        assert!(
+            !added.is_empty(),
+            "expected embedded bootstrap files to be created"
+        );
+        for name in BOOTSTRAP_FILES {
+            assert!(
+                workspace.path().join(name).is_file(),
+                "expected {name} to be seeded from the embedded bundle"
+            );
+        }
+        assert!(workspace.path().join("memory").join("MEMORY.md").is_file());
+        assert!(workspace.path().join("memory").join("history.jsonl").is_file());
+        assert!(workspace.path().join(".git").is_dir());
     }
 
     #[test]
-    fn test_sync_ok_when_workspace_seeded() {
-        let empty_cwd = tempdir().unwrap();
+    fn test_sync_preserves_existing_files_without_disk_root() {
         let workspace = tempdir().unwrap();
         for name in BOOTSTRAP_FILES {
             fs::write(workspace.path().join(name), "# test").unwrap();
         }
 
-        let _guard = RestoreCwd::change_to(empty_cwd.path());
-        let added = sync_workspace_templates(workspace.path(), true).unwrap();
+        let added = sync_workspace_templates_with_root(workspace.path(), true, None);
         for name in &added {
             println!("Created {name}");
         }
+        // Pre-existing bootstrap files must be left untouched.
+        for name in BOOTSTRAP_FILES {
+            assert!(!added.contains(&name.to_string()));
+            assert_eq!(fs::read_to_string(workspace.path().join(name)).unwrap(), "# test");
+        }
         assert!(
-            added.contains(&"memory/history.jsonl".to_string()) || added.contains(&"memory\\history.jsonl".to_string()),
+            added.contains(&"memory/history.jsonl".to_string())
+                || added.contains(&"memory\\history.jsonl".to_string()),
             "expected history.jsonl to be created: {:?}",
             added
         );

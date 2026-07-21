@@ -3739,6 +3739,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e0c5ccf5294c6ccd63a74f1565028353830a9c2f5eb0c682c355c471726a6e3f"
 
 [[package]]
+name = "qrcode"
+version = "0.14.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d68782463e408eb1e668cf6152704bd856c78c5b6417adaee3203d8f4c1fc9ec"
+dependencies = [
+ "image",
+]
+
+[[package]]
 name = "quick-error"
 version = "2.0.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4320,12 +4329,14 @@ dependencies = [
  "mailparse",
  "native-tls",
  "png 0.17.16",
+ "qrcode",
  "rand 0.10.1",
  "rdocx",
  "reedline",
  "regex",
  "reqwest 0.12.28",
  "rmcp",
+ "rust-embed",
  "serde",
  "serde_json",
  "sha1",
@@ -6162,8 +6173,6 @@ checksum = "a28ac98ddc8b9274cb41bb4d9d4d5c425b6020c50c46f25559911905610b4a88"
 [[package]]
 name = "whatsapp-rust"
 version = "0.6.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "68e2491e3a5a4ae149d623da4dcaf05ee5feb7f0181b4be375e0980bb2247292"
 dependencies = [
  "anyhow",
  "async-channel 2.5.0",

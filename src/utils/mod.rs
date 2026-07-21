@@ -1,4 +1,5 @@
 pub mod helpers;
+pub mod embedded_templates;
 pub mod clipboard;
 pub mod gitstore;
 pub mod prompt_templates;

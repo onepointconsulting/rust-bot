@@ -618,6 +618,7 @@ impl OpenAICompatProvider {
         request.model(model_name);
         request.messages(chat_messages);
         request.max_tokens(max_tokens as u32);
+        log::info!("temperature: {}", temperature);
         request.temperature(temperature);
 
         // Prefer cache-annotated tools over the originals; deserialize from JSON.

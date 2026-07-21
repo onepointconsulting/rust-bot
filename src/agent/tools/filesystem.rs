@@ -1,5 +1,5 @@
 use async_trait::async_trait;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use similar::TextDiff;
 use super::base::Tool;
 use globwalk::GlobWalkerBuilder;
@@ -19,18 +19,104 @@ fn absolute_path(path: &Path) -> PathBuf {
     cwd.join(path)
 }
 
+/// Collapse `.` and `..` without touching the filesystem.
+///
+/// Unlike `canonicalize()`, this works for paths that do not exist yet. Without
+/// it, `Path::starts_with` treats `workspace/../outside` as still under
+/// `workspace` because `..` is just another component after the matching prefix.
+fn normalize_lexically(path: &Path) -> PathBuf {
+    let mut out = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::Prefix(_) | Component::RootDir => {
+                out.push(component.as_os_str());
+            }
+            Component::CurDir => {}
+            Component::ParentDir => match out.components().next_back() {
+                Some(Component::Normal(_)) => {
+                    out.pop();
+                }
+                Some(Component::ParentDir) | None => {
+                    out.push(Component::ParentDir.as_os_str());
+                }
+                // At a drive/root — ignore further `..`.
+                Some(Component::Prefix(_)) | Some(Component::RootDir) | Some(Component::CurDir) => {}
+            },
+            Component::Normal(c) => out.push(c),
+        }
+    }
+    if out.as_os_str().is_empty() {
+        PathBuf::from(".")
+    } else {
+        out
+    }
+}
+
+/// Windows `canonicalize()` returns `\\?\C:\...` / `\\?\UNC\...`. Strip that so
+/// resolved paths compare cleanly with plain absolute paths via `starts_with`.
+fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
+    #[cfg(windows)]
+    {
+        let s = path.to_string_lossy();
+        if let Some(rest) = s.strip_prefix(r"\\?\UNC\") {
+            return PathBuf::from(format!(r"\\{rest}"));
+        }
+        if let Some(rest) = s.strip_prefix(r"\\?\") {
+            return PathBuf::from(rest);
+        }
+    }
+    path
+}
+
+/// Resolve a path for sandbox checks.
+///
+/// Prefer `canonicalize()` when the path exists. For non-existent paths (e.g. a
+/// file about to be written), lexically normalize `..`/`.` then canonicalize the
+/// longest existing ancestor and re-join the remainder — matching Python's
+/// non-strict `Path.resolve()` closely enough to keep `..` from escaping.
+fn soft_resolve(path: &Path) -> PathBuf {
+    let abs = absolute_path(path);
+    if let Ok(canon) = abs.canonicalize() {
+        return strip_verbatim_prefix(canon);
+    }
+
+    let normalized = normalize_lexically(&abs);
+    if let Ok(canon) = normalized.canonicalize() {
+        return strip_verbatim_prefix(canon);
+    }
+
+    let mut remainder: Vec<std::ffi::OsString> = Vec::new();
+    let mut current = normalized.as_path();
+    loop {
+        match current.parent() {
+            Some(parent) if parent != current => {
+                if let Some(name) = current.file_name() {
+                    remainder.push(name.to_os_string());
+                    if let Ok(canon_parent) = parent.canonicalize() {
+                        let mut result = strip_verbatim_prefix(canon_parent);
+                        for part in remainder.iter().rev() {
+                            result.push(part);
+                        }
+                        return result;
+                    }
+                    current = parent;
+                    continue;
+                }
+            }
+            _ => break,
+        }
+        break;
+    }
+
+    normalized
+}
+
 // Equivalent to the Python:
 //   path.relative_to(directory.resolve())
 // returning True when `path` is under `directory`.
-//
-// Notes:
-// - Python's `resolve()` is non-strict by default; Rust's `canonicalize()` is strict (requires existence).
-// - We attempt `canonicalize()`; if it fails, we fall back to absolute paths without dereferencing/symlink resolution.
 fn _is_under(path: &Path, directory: &Path) -> bool {
-    let resolved_dir = directory
-        .canonicalize()
-        .unwrap_or_else(|_| absolute_path(directory));
-    let resolved_path = path.canonicalize().unwrap_or_else(|_| absolute_path(path));
+    let resolved_dir = soft_resolve(directory);
+    let resolved_path = soft_resolve(path);
     resolved_path.starts_with(&resolved_dir)
 }
 
@@ -56,13 +142,14 @@ fn _resolve_path(
             p = ws.join(&p);
         }
     }
-    // Rust equivalent of Python's p.resolve():
-    let resolved = p.canonicalize().unwrap_or_else(|_| absolute_path(&p));
+    // Soft-resolve so non-existent targets still collapse `..` before the
+    // allowed-dir check (strict canonicalize alone is not enough).
+    let resolved = soft_resolve(&p);
     if let Some(ref ws) = allowed_dir {
         match extra_allowed_dirs {
             Some(dirs) => {
                 for dir in dirs.iter().chain(std::iter::once(ws)) {
-                    if _is_under(&resolved, &dir) {
+                    if _is_under(&resolved, dir) {
                         return Result::Ok(resolved);
                     }
                 }
@@ -777,6 +864,71 @@ mod tests {
         let resolved = _resolve_path(allowed_path.to_str().unwrap(), None, Some(allowed_dir.clone()), Some(vec![extra_allowed_dir.clone()])).unwrap();
         assert!(resolved.starts_with(allowed_dir));
         assert!(resolved.ends_with("notes.txt"));
+    }
+
+    #[test]
+    fn test_normalize_lexically_collapses_parent_dirs() {
+        let base = PathBuf::from(if cfg!(windows) { r"C:\workspace" } else { "/workspace" });
+        let sneaky = base.join("..").join("outside").join("new_file.txt");
+        let normalized = normalize_lexically(&sneaky);
+        let expected = if cfg!(windows) {
+            PathBuf::from(r"C:\outside\new_file.txt")
+        } else {
+            PathBuf::from("/outside/new_file.txt")
+        };
+        assert_eq!(normalized, expected);
+        assert!(!normalized.starts_with(&base));
+    }
+
+    #[test]
+    fn test_resolve_rejects_parent_dir_escape_for_missing_file() {
+        let base = unique_temp_dir();
+        let workspace = base.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let result = _resolve_path(
+            "../outside/new_file.txt",
+            Some(workspace.clone()),
+            Some(workspace.clone()),
+            None,
+        );
+        assert!(
+            matches!(result, Err(ResolvePathError::NotUnderAllowedDir { .. })),
+            "expected NotUnderAllowedDir, got {result:?}"
+        );
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_resolve_allows_new_file_inside_allowed_dir() {
+        let base = unique_temp_dir();
+        let workspace = base.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let resolved = _resolve_path(
+            "new_file.txt",
+            Some(workspace.clone()),
+            Some(workspace.clone()),
+            None,
+        )
+        .expect("new file inside workspace should be allowed");
+        assert!(soft_resolve(&resolved).starts_with(&soft_resolve(&workspace)));
+        assert_eq!(resolved.file_name().and_then(|n| n.to_str()), Some("new_file.txt"));
+
+        let _ = fs::remove_dir_all(base);
+    }
+
+    #[test]
+    fn test_is_under_rejects_unnormalized_parent_escape() {
+        let base = unique_temp_dir();
+        let workspace = base.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+
+        let escaped = workspace.join("..").join("outside").join("new_file.txt");
+        assert!(!_is_under(&escaped, &workspace));
+
+        let _ = fs::remove_dir_all(base);
     }
 
     #[tokio::test]

@@ -283,6 +283,8 @@ pub struct AgentLoop {
     pub model: String,
     max_iterations: u32,
     max_tokens: u32,
+    temperature: f32,
+    reasoning_effort: Option<String>,
     pub context_window_tokens: u64,
     context_block_limit: Option<u32>,
     max_tool_result_chars: u32,
@@ -334,6 +336,8 @@ impl AgentLoop {
         model: Option<String>,
         max_iterations: Option<u32>,
         max_tokens: Option<u32>,
+        temperature: Option<f32>,
+        reasoning_effort: Option<String>,
         context_window_tokens: Option<u64>,
         context_block_limit: Option<u32>,
         max_tool_result_chars: Option<u32>,
@@ -378,6 +382,8 @@ impl AgentLoop {
         let max_tool_result_chars =
             max_tool_result_chars.unwrap_or(defaults.clone().max_tool_result_chars);
         let max_tokens = max_tokens.unwrap_or(defaults.clone().max_tokens);
+        let temperature = temperature.unwrap_or(defaults.clone().temperature);
+        let reasoning_effort = reasoning_effort.or_else(|| defaults.clone().reasoning_effort);
         let subagents = Arc::new(SubagentManager::new(
             provider.clone(),
             workspace.clone(),
@@ -432,6 +438,8 @@ impl AgentLoop {
             model: model.clone(),
             max_iterations: max_iterations.unwrap_or(defaults.clone().max_tool_iterations),
             max_tokens,
+            temperature,
+            reasoning_effort,
             context_window_tokens,
             context_block_limit: context_block_limit,
             max_tool_result_chars,
@@ -728,10 +736,10 @@ impl AgentLoop {
                 progress_callback: None,
                 checkpoint_callback,
                 fail_on_tool_error: false,
-                temperature: None,
+                temperature: Some(self.temperature),
                 max_iterations_message: None,
                 max_tokens: Some(self.max_tokens as usize),
-                reasoning_effort: None,
+                reasoning_effort: self.reasoning_effort.clone(),
             })
             .await;
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage.clone();
@@ -998,10 +1006,7 @@ impl AgentLoop {
         self: Arc<Self>,
         msg: InboundMessage,
     ) -> Option<OutboundMessage> {
-        let (channel, chat_id) = if msg.chat_id.contains(':') {
-            let mut splits = msg.chat_id.split(':');
-            let channel = splits.next().unwrap();
-            let chat_id = splits.next().unwrap();
+        let (channel, chat_id) = if let Some((channel, chat_id)) = msg.chat_id.split_once(':') {
             (channel, chat_id)
         } else {
             ("cli", msg.chat_id.as_str())
@@ -1899,6 +1904,8 @@ mod tests {
             None,
             None,
             None,
+            None,
+            None,
             Some(max_tool_result_chars),
             None,
             None,
@@ -1913,7 +1920,7 @@ mod tests {
             None,
             None,
             None,
-            None
+            None,
         ))
     }
 

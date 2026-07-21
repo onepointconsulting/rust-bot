@@ -8,10 +8,6 @@ pub const SUCCESS: i32 = 0;
 /// Config or general CLI error (missing config, load failure, API server start failure, etc.).
 pub const GENERAL_ERROR: i32 = 1;
 
-/// Workspace templates unavailable: no `templates/` in the CWD and the workspace is not
-/// fully seeded with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`.
-pub const TEMPLATES_UNAVAILABLE: i32 = 2;
-
 /// Invalid / unknown value in `agents.provider`.
 pub const INVALID_PROVIDER: i32 = 3;
 

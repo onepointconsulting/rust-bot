@@ -116,14 +116,16 @@ cargo run -- agent --help
 |------|----------|---------|
 | `0` | `SUCCESS` | Success (also used after spawning a restarted process on Windows) |
 | `1` | `GENERAL_ERROR` | Config or general CLI error |
-| `2` | `TEMPLATES_UNAVAILABLE` | Workspace templates unavailable (no `templates/` in the current working directory and the workspace is not fully seeded with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`) |
 | `3` | `INVALID_PROVIDER` | Invalid provider (unknown value in `agents.provider`) |
 | `4` | `GMAIL_CONFIG_ERROR` | Gmail tool credentials missing (OAuth client secret or token cache) |
 | `5` | `CHANNEL_ALLOW_FROM_EMPTY` | Channel has an empty `allowFrom` list (set `["*"]` or specific user IDs) |
 
 Constants live in `src/utils/exit_codes.rs`.
 
-Run from the project root (or any directory that contains `templates/`) so workspace seed files can be created on first use.
+Workspace seed files (`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, …) are compiled into the
+binary, so onboarding always works even without a sibling `templates/` folder. Drop a
+`templates/` directory next to the binary (or set `RUST_BOT_TEMPLATES_DIR`) to override the
+bundled defaults with your own.
 
 ### Examples
 
@@ -406,7 +408,7 @@ The agent reads its configuration from a JSON file passed via `--config`. Sample
 
 Typical keys: provider, model, API key / base URL (read from env), and channel settings. See `src/config/schema.rs` for the full schema.
 
-The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md` from `templates/`, plus the standard folder layout. Run the binary from the project root (or any directory containing `templates/`) so this seeding can happen.
+The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`, plus the standard folder layout. These come from the compiled-in template bundle by default; drop a `templates/` directory next to the binary (or set `RUST_BOT_TEMPLATES_DIR`) if you want to override them with your own copies.
 
 ---
 
@@ -428,7 +430,7 @@ rust-bot/
 │   ├── session/      # Session manager
 │   └── utils/        # Helpers (clipboard, restart, prompts, …)
 ├── configs/          # Sample provider configs
-├── templates/        # Workspace seed files
+├── templates/        # Workspace seed files (also embedded into the binary at build time)
 ├── tests/            # Unit and integration tests
 └── README.md
 ```
