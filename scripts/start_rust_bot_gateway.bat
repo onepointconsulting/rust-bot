@@ -1,5 +1,6 @@
 @echo off
 setlocal
+cd /d "%~dp0.."
 
 set RUST_LOG_FILE=./logs/rust-bot-gateway.log
 

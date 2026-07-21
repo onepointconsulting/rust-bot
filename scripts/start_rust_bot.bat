@@ -1,5 +1,7 @@
 @echo off
 setlocal
+rem Repo root = parent of scripts/ (works from any cwd when invoking this file)
+cd /d "%~dp0.."
 
 cargo build
 if errorlevel 1 exit /b %errorlevel%
@@ -13,5 +15,3 @@ if /I "%~1"=="--session" (
 )
 
 .\target\debug\rust-bot agent --config ./configs/openai-compat/config.json %SESSION_ARGS%
-
-
