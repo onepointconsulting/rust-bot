@@ -4,7 +4,7 @@ use std::io::{self, Write};
 use anstyle::{AnsiColor, Color, Style};
 
 use crate::cli::commands::{CliError, OnboardArgs};
-use crate::cli::wizard::{apply_workspace_override, resolve_onboard_config_path, wizard};
+use crate::cli::wizard::{apply_workspace_override, choose_providers, config_model, resolve_onboard_config_path, wizard};
 use crate::config::loader::{load_config, save_config};
 use crate::config::schema::Config;
 use crate::utils::helpers::{ensure_dir, sync_workspace_templates};
@@ -16,7 +16,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     }
     let config_path = resolve_onboard_config_path(args.config);
 
-    let config = if config_path.exists() {
+    let mut config = if config_path.exists() {
         let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
         let bold = Style::new().bold();
         println!(
@@ -54,7 +54,9 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
             config
         }
     } else {
-        let config = apply_workspace_override(Config::default(), args.workspace);
+        let mut config = apply_workspace_override(Config::default(), args.workspace);
+        choose_providers(&mut config)?;
+        config_model(&mut config.agents)?;
         save_config(&config, Some(config_path.clone()))?;
         print_onboard_ok(format!("Created config at {}", config_path.display()));
         config

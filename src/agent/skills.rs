@@ -280,10 +280,13 @@ impl SkillsLoader {
 
     /// Parse skill metadata JSON from frontmatter (supports nanobot and openclaw keys).
     fn parse_rustbot_metadata(&self, raw: &str) -> serde_json::Value {
+        if raw.is_empty() {
+            return serde_json::json!({});
+        }
         let parsed: serde_json::Value = match serde_json::from_str(raw) {
             Ok(v) => v,
             Err(e) => {
-                log::warn!("Failed to parse skill metadata: {}", e);
+                log::warn!("Failed to parse skill metadata: {}\nContent: {}", e, raw);
                 return serde_json::json!({});
             }
         };

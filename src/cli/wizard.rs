@@ -35,6 +35,7 @@ const SAVE_AND_EXIT: &'static str = "Save and Exit";
 const EXIT_WITHOUT_SAVING: &'static str = "Exit Without Saving";
 
 const PROVIDER_OPENROUTER: &'static str = "openrouter";
+const PROVIDER_EDENAI: &'static str = "edenai";
 const PROVIDER_ANTHROPIC: &'static str = "anthropic";
 
 const WIZARD_OPTIONS: [&str; 10] = [
@@ -134,7 +135,7 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
 
 //Configure LLM providers.
 pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
-    let provider_names = vec![PROVIDER_OPENROUTER, PROVIDER_ANTHROPIC];
+    let provider_names = vec![PROVIDER_OPENROUTER, PROVIDER_ANTHROPIC, PROVIDER_EDENAI];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
         provider_names.to_vec().clone(),
@@ -160,6 +161,9 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
         PROVIDER_ANTHROPIC => {
             config.providers.anthropic.api_key = api_key;
         }
+        PROVIDER_EDENAI => {
+            config.providers.custom.api_key = api_key;
+        }
         _ => {
             eprint_error("Invalid provider");
             return Err(CliError::Inquire(
@@ -173,7 +177,7 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
 pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
     let endpoint = Text::new("Enter endpoint")
         .with_help_message(if provider_name == PROVIDER_OPENROUTER {
-            "e.g. https://openrouter.ai/api/v1"
+            "e.g. https://openrouter.ai/api/v1, https://api.edenai.run/v3" 
         } else {
             ""
         })
@@ -184,6 +188,9 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
         }
         PROVIDER_ANTHROPIC => {
             config.providers.anthropic.api_base = Some(endpoint);
+        }
+        PROVIDER_EDENAI => {
+            config.providers.custom.api_base = Some(endpoint);
         }
         _ => {}
     }
@@ -227,6 +234,9 @@ pub fn configure_extra_headers(
         }
         PROVIDER_ANTHROPIC => {
             config.providers.anthropic.extra_headers = headers;
+        }
+        PROVIDER_EDENAI => {
+            config.providers.custom.extra_headers = headers;
         }
         _ => {
             eprint_error("Invalid provider");
@@ -445,11 +455,7 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         .with_help_message("Directory for agent files, memory, and credentials")
         .prompt()?;
 
-    let model = agents.model.clone();
-    agents.model = Text::new("Model")
-        .with_default(model.as_str())
-        .with_help_message("e.g. anthropic/claude-opus-4-6 or openai/gpt-5.2")
-        .prompt()?;
+    config_model(agents)?;
 
     let mut provider_choices = vec!["auto".to_string()];
     provider_choices.extend(providers().into_iter().map(|p| p.name));
@@ -542,6 +548,15 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
     configure_dream_settings(agents)?;
 
     Ok(config.clone())
+}
+
+pub fn config_model(agents: &mut AgentsConfig) -> Result<(), CliError> {
+    let model = agents.model.clone();
+    agents.model = Text::new("Model")
+        .with_default(model.as_str())
+        .with_help_message("e.g. anthropic/claude-opus-5 or openai/gpt-5.6")
+        .prompt()?;
+    Ok(())
 }
 
 fn configure_dream_settings(agents: &mut AgentsConfig) -> Result<(), CliError> {

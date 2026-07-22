@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
@@ -31,8 +32,9 @@ use anstyle::{AnsiColor, Color, Style};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use reedline::{
-    DefaultPrompt, EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Reedline,
-    ReedlineEvent, Signal, default_emacs_keybindings,
+    EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Prompt, PromptEditMode,
+    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal,
+    default_emacs_keybindings,
 };
 use serde_json::Value;
 use termimad::MadSkin;
@@ -1176,6 +1178,41 @@ fn replace_text_sentinels(line: &str, captures: &[String]) -> String {
         .to_string()
 }
 
+/// Interactive CLI prompt: `rust-bot$ `.
+struct CliPrompt;
+
+impl Prompt for CliPrompt {
+    fn render_prompt_left(&self) -> Cow<'_, str> {
+        Cow::Borrowed("rust-bot")
+    }
+
+    fn render_prompt_right(&self) -> Cow<'_, str> {
+        Cow::Borrowed("")
+    }
+
+    fn render_prompt_indicator(&self, _prompt_mode: PromptEditMode) -> Cow<'_, str> {
+        Cow::Borrowed("$ ")
+    }
+
+    fn render_prompt_multiline_indicator(&self) -> Cow<'_, str> {
+        Cow::Borrowed("::: ")
+    }
+
+    fn render_prompt_history_search_indicator(
+        &self,
+        history_search: PromptHistorySearch,
+    ) -> Cow<'_, str> {
+        let prefix = match history_search.status {
+            PromptHistorySearchStatus::Passing => "",
+            PromptHistorySearchStatus::Failing => "failing ",
+        };
+        Cow::Owned(format!(
+            "({}reverse-search: {}) ",
+            prefix, history_search.term
+        ))
+    }
+}
+
 async fn interactive_session(
     agent_loop: Arc<AgentLoop>,
     markdown: bool,
@@ -1187,7 +1224,7 @@ async fn interactive_session(
     let text_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let image_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let mut line_editor = init_prompt_session(text_captures.clone());
-    let prompt = DefaultPrompt::default();
+    let prompt = CliPrompt;
     loop {
         let sig = tokio::task::block_in_place(|| line_editor.read_line(&prompt))
             .map_err(|_| CliError::InteractiveNotImplemented)?;

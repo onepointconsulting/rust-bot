@@ -5,7 +5,7 @@ use whatsapp_rust::{
     bot::{Bot, BotHandle},
     proto_helpers::MessageExt,
     store::SqliteStore,
-    types::events::Event,
+    types::{events::Event, message::MessageInfo},
     waproto::whatsapp as wa,
 };
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
@@ -97,11 +97,13 @@ pub struct WhatsAppConfig {
     pub enabled: bool,
     pub session_db_path: String,
     pub allow_from: Vec<String>,
+    pub allowed_groups: Vec<String>,
     pub media_download_dir: String,
     pub group_policy: WhatsAppGroupPolicy,
     /// Prepended to outbound replies; inbound messages starting with this
     /// prefix are treated as agent echoes and ignored (self-chat loop guard).
     pub reply_prefix: String,
+    pub self_chat: bool,
 }
 
 impl Default for WhatsAppConfig {
@@ -110,9 +112,11 @@ impl Default for WhatsAppConfig {
             enabled: false,
             session_db_path: "~/rust-bot/data/whatsapp/whatsapp.db".to_string(),
             allow_from: vec![],
+            allowed_groups: vec![],
             media_download_dir: "~/rust-bot/data/whatsapp_media".to_string(),
             group_policy: WhatsAppGroupPolicy::Open,
             reply_prefix: DEFAULT_REPLY_PREFIX.to_string(),
+            self_chat: true,
         }
     }
 }
@@ -228,6 +232,152 @@ impl WhatsAppChannel {
     fn is_self_chat(chat: &Jid, own_users: &[String]) -> bool {
         let chat_user = chat.user.as_str();
         !chat_user.is_empty() && own_users.iter().any(|u| u == chat_user)
+    }
+
+    /// Group-JID allow-list check for Mode B. Empty list denies all groups
+    /// (fail closed). Entries match the full JID string or the bare group
+    /// user part (before `@g.us`).
+    fn group_allowed(chat: &Jid, allowed_groups: &[String]) -> bool {
+        if allowed_groups.is_empty() {
+            return false;
+        }
+        let chat_str = chat.to_string();
+        let chat_user = chat.user.as_str();
+        allowed_groups.iter().any(|entry| {
+            entry == &chat_str || (!chat_user.is_empty() && Self::jid_user_part(entry) == chat_user)
+        })
+    }
+
+    /// Message field names carrying an optional `context_info`, mirroring the
+    /// set wacore's `MessageExt` checks internally for mentions. That macro
+    /// isn't exported, so the field list is kept in sync here manually.
+    fn context_infos(msg: &wa::Message) -> Vec<&wa::ContextInfo> {
+        let mut out = Vec::new();
+        macro_rules! collect {
+            ($($field:ident),+ $(,)?) => {
+                $(
+                    if let Some(m) = msg.$field.as_ref() {
+                        if let Some(ctx) = m.context_info.as_ref() {
+                            out.push(ctx.as_ref());
+                        }
+                    }
+                )+
+            };
+        }
+        collect!(
+            extended_text_message,
+            image_message,
+            video_message,
+            audio_message,
+            document_message,
+            sticker_message,
+            location_message,
+            live_location_message,
+            contact_message,
+            contacts_array_message,
+            buttons_message,
+            buttons_response_message,
+            list_message,
+            list_response_message,
+            template_message,
+            template_button_reply_message,
+            interactive_message,
+            interactive_response_message,
+            poll_creation_message,
+            poll_creation_message_v2,
+            poll_creation_message_v3,
+            product_message,
+            order_message,
+            group_invite_message,
+            event_message,
+            sticker_pack_message,
+            newsletter_admin_invite_message,
+        );
+        out
+    }
+
+    /// `groupPolicy: "mention"` gate: true if the message structurally
+    /// mentions our own PN/LID, or mentions everyone via WhatsApp `@all`
+    /// (`ContextInfo.nonJidMentions`). Falls back to literal `@{user}` / `@all`
+    /// text only when there are no structured mentions — never matches a
+    /// bot-name string.
+    fn message_mentions_own(msg: &wa::Message, own_users: &[String]) -> bool {
+        if own_users.is_empty() {
+            return false;
+        }
+        let base = msg.get_base_message();
+        let contexts = Self::context_infos(base);
+
+        // @all / mention-everyone: WhatsApp sets non_jid_mentions instead of
+        // enumerating every participant in mentioned_jid.
+        if contexts
+            .iter()
+            .any(|ctx| ctx.non_jid_mentions.unwrap_or(0) > 0)
+        {
+            return true;
+        }
+
+        let mentioned_jids: Vec<&str> = contexts
+            .iter()
+            .flat_map(|ctx| ctx.mentioned_jid.iter().map(String::as_str))
+            .collect();
+        if !mentioned_jids.is_empty() {
+            return mentioned_jids
+                .iter()
+                .any(|jid| own_users.iter().any(|u| u == Self::jid_user_part(jid)));
+        }
+        let Some(text) = msg.text_content() else {
+            return false;
+        };
+        if Self::text_mentions_all(text) {
+            return true;
+        }
+        own_users
+            .iter()
+            .any(|u| !u.is_empty() && text.contains(&format!("@{u}")))
+    }
+
+    /// True when the message text contains a bare `@all` token (case-insensitive).
+    fn text_mentions_all(text: &str) -> bool {
+        text.split_whitespace().any(|tok| {
+            let cleaned =
+                tok.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '@'));
+            cleaned.eq_ignore_ascii_case("@all")
+        })
+    }
+
+    /// Mode-aware inbound gate. Mode A (self-chat) requires the "Message
+    /// yourself" chat; Mode B (group) requires an allowlisted group and
+    /// applies `groupPolicy`. Echo suppression (recently-sent id / reply
+    /// prefix) is applied separately by the caller once message text is known.
+    fn should_accept_inbound(
+        self_chat: bool,
+        allowed_groups: &[String],
+        group_policy: &WhatsAppGroupPolicy,
+        msg: &wa::Message,
+        info: &MessageInfo,
+        own_users: &[String],
+    ) -> bool {
+        let source = &info.source;
+        if Self::is_status_chat(&source.chat) {
+            return false;
+        }
+        if self_chat {
+            return source.is_from_me
+                && !source.is_group
+                && !own_users.is_empty()
+                && Self::is_self_chat(&source.chat, own_users);
+        }
+        // Mode B: allowlisted groups only. Owner messages (`is_from_me`) are
+        // still accepted here — echo suppression happens separately via
+        // recently-sent ids / reply prefix, not by dropping `is_from_me`.
+        if !source.is_group || !Self::group_allowed(&source.chat, allowed_groups) {
+            return false;
+        }
+        match group_policy {
+            WhatsAppGroupPolicy::Open => true,
+            WhatsAppGroupPolicy::Mention => Self::message_mentions_own(msg, own_users),
+        }
     }
 
     async fn refresh_own_identity(
@@ -497,6 +647,9 @@ impl BaseChannel for WhatsAppChannel {
         let own_reply_chat_id = Arc::clone(&self.own_reply_chat_id);
         let recently_sent_ids = Arc::clone(&self.recently_sent_ids);
         let reply_prefix = self.config.reply_prefix.clone();
+        let self_chat = self.config.self_chat;
+        let allowed_groups = self.config.allowed_groups.clone();
+        let group_policy = self.config.group_policy.clone();
 
         let mut bot = match Bot::builder()
             .with_backend(Arc::new(store))
@@ -510,28 +663,23 @@ impl BaseChannel for WhatsAppChannel {
                 let own_reply_chat_id = Arc::clone(&own_reply_chat_id);
                 let recently_sent_ids = Arc::clone(&recently_sent_ids);
                 let reply_prefix = reply_prefix.clone();
+                let allowed_groups = allowed_groups.clone();
+                let group_policy = group_policy.clone();
                 async move {
                     match &*event {
                         Event::Message(msg, info) => {
-                            // Self-chat mode: only process our own messages.
                             log::info!("WhatsApp message received ...");
-                            if !info.source.is_from_me {
+
+                            let own = own_jid_users.lock().unwrap().clone();
+                            if !Self::should_accept_inbound(
+                                self_chat,
+                                &allowed_groups,
+                                &group_policy,
+                                msg,
+                                info,
+                                &own,
+                            ) {
                                 return;
-                            }
-                            // Ignore groups and status broadcasts.
-                            if info.source.is_group
-                                || Self::is_status_chat(&info.source.chat)
-                            {
-                                return;
-                            }
-                            // Require "Message yourself" chat (chat == own PN/LID).
-                            {
-                                let own = own_jid_users.lock().unwrap();
-                                if own.is_empty()
-                                    || !Self::is_self_chat(&info.source.chat, &own)
-                                {
-                                    return;
-                                }
                             }
 
                             let Some(content) = msg.text_content() else {
@@ -542,7 +690,11 @@ impl BaseChannel for WhatsAppChannel {
                             }
                             log::info!("WhatsApp message received: {content}");
 
-                            // Suppress echoes of our own outbound replies.
+                            // Suppress echoes of our own outbound replies. In group
+                            // mode this is the *only* anti-retrigger — the linked
+                            // account owner's own messages in allowlisted groups
+                            // must still reach the agent, so we never gate on
+                            // `is_from_me` here.
                             let message_id = info.id.to_string();
                             if recently_sent_ids.lock().unwrap().contains(&message_id) {
                                 log::debug!(
@@ -562,12 +714,18 @@ impl BaseChannel for WhatsAppChannel {
                                 .sender_alt
                                 .as_ref()
                                 .map(|jid| jid.user.to_string());
-                            // Prefer LID chat id so replies stay in one wire namespace.
-                            let chat_id = own_reply_chat_id
-                                .lock()
-                                .unwrap()
-                                .clone()
-                                .unwrap_or_else(|| info.source.chat.to_string());
+                            // Self-chat: prefer the LID chat id so replies stay in
+                            // one wire namespace. Group mode: reply to the same
+                            // chat that received the message (no self-chat remap).
+                            let chat_id = if self_chat {
+                                own_reply_chat_id
+                                    .lock()
+                                    .unwrap()
+                                    .clone()
+                                    .unwrap_or_else(|| info.source.chat.to_string())
+                            } else {
+                                info.source.chat.to_string()
+                            };
                             let mut metadata = HashMap::new();
                             metadata.insert(
                                 "message_id".to_string(),
@@ -628,25 +786,54 @@ impl BaseChannel for WhatsAppChannel {
             return;
         }
 
-        Self::refresh_own_identity(&client, &self.own_jid_users, &self.own_reply_chat_id).await;
-        let own_users_summary = self.own_jid_users.lock().unwrap().join(", ");
-        let own_reply_chat = self.own_reply_chat_id.lock().unwrap().clone();
-        if own_users_summary.is_empty() || own_reply_chat.is_none() {
-            log::error!(
-                "WhatsApp connected but own PN/LID unavailable; self-chat filtering cannot work"
-            );
-            handle.abort();
-            client.disconnect().await;
+        let list_res = crate::utils::whatsapp::list_groups_ids(&client).await;
+        if let Err(e) = list_res {
+            log::error!("Failed to list groups: {e}");
             return;
         }
-        let own_reply_chat = own_reply_chat.expect("checked above");
-        log::info!(
-            "WhatsApp self-chat mode — only messages to yourself are processed (own users: {own_users_summary}; reply chat: {own_reply_chat})"
-        );
-        // Warm Signal sessions for our own devices so the first self-chat reply
-        // can encrypt to the phone instead of skipping it.
-        if let Ok(reply_jid) = Jid::from_str(&own_reply_chat) {
-            Self::warm_send_sessions(&client, &reply_jid).await;
+
+        Self::refresh_own_identity(&client, &self.own_jid_users, &self.own_reply_chat_id).await;
+        let own_users = self.own_jid_users.lock().unwrap().clone();
+        let own_users_summary = own_users.join(", ");
+        let own_reply_chat = self.own_reply_chat_id.lock().unwrap().clone();
+
+        if self.config.self_chat {
+            if own_users.is_empty() || own_reply_chat.is_none() {
+                log::error!(
+                    "WhatsApp connected but own PN/LID unavailable; self-chat filtering cannot work"
+                );
+                handle.abort();
+                client.disconnect().await;
+                return;
+            }
+            let own_reply_chat = own_reply_chat.expect("checked above");
+            log::info!(
+                "WhatsApp self-chat mode — only messages to yourself are processed (own users: {own_users_summary}; reply chat: {own_reply_chat})"
+            );
+            // Warm Signal sessions for our own devices so the first self-chat reply
+            // can encrypt to the phone instead of skipping it.
+            if let Ok(reply_jid) = Jid::from_str(&own_reply_chat) {
+                Self::warm_send_sessions(&client, &reply_jid).await;
+            }
+        } else {
+            if self.config.allowed_groups.is_empty() {
+                log::warn!(
+                    "WhatsApp group mode enabled but allowedGroups is empty; no messages will be processed"
+                );
+            }
+            if self.config.group_policy == WhatsAppGroupPolicy::Mention && own_users.is_empty() {
+                log::error!(
+                    "WhatsApp connected but own PN/LID unavailable; groupPolicy \"mention\" cannot detect mentions"
+                );
+                handle.abort();
+                client.disconnect().await;
+                return;
+            }
+            log::info!(
+                "WhatsApp group mode — listening to {} allowlisted group(s) with policy {:?} (own users: {own_users_summary})",
+                self.config.allowed_groups.len(),
+                self.config.group_policy
+            );
         }
 
         *self.bot_handle.lock().unwrap() = Some(handle);
@@ -770,5 +957,358 @@ impl BaseChannel for WhatsAppChannel {
             .remember(result.message_id);
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const OWNER: &str = "491701234567";
+    const OTHER_USER: &str = "491709999999";
+
+    fn own_users() -> Vec<String> {
+        vec![OWNER.to_string()]
+    }
+
+    fn group_jid(user: &str) -> Jid {
+        Jid::from_str(&format!("{user}@g.us")).expect("valid group jid")
+    }
+
+    fn dm_jid(user: &str) -> Jid {
+        Jid::from_str(&format!("{user}@s.whatsapp.net")).expect("valid dm jid")
+    }
+
+    fn text_message(text: &str) -> wa::Message {
+        wa::Message {
+            conversation: Some(text.to_string()),
+            ..Default::default()
+        }
+    }
+
+    fn mentioning_message(text: &str, mentioned: &[&str]) -> wa::Message {
+        wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text.to_string()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    mentioned_jid: mentioned.iter().map(|j| j.to_string()).collect(),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn mentioning_all_message(text: &str) -> wa::Message {
+        wa::Message {
+            extended_text_message: Some(Box::new(wa::message::ExtendedTextMessage {
+                text: Some(text.to_string()),
+                context_info: Some(Box::new(wa::ContextInfo {
+                    non_jid_mentions: Some(1),
+                    ..Default::default()
+                })),
+                ..Default::default()
+            })),
+            ..Default::default()
+        }
+    }
+
+    fn message_info(chat: Jid, sender: Jid, is_from_me: bool, is_group: bool) -> MessageInfo {
+        MessageInfo {
+            source: whatsapp_rust::types::message::MessageSource {
+                chat,
+                sender,
+                is_from_me,
+                is_group,
+                ..Default::default()
+            },
+            ..Default::default()
+        }
+    }
+
+    // --- group_allowed ---
+
+    #[test]
+    fn group_allowed_empty_list_denies_all() {
+        assert!(!WhatsAppChannel::group_allowed(&group_jid("123"), &[]));
+    }
+
+    #[test]
+    fn group_allowed_matches_full_jid() {
+        let allowed = vec!["123@g.us".to_string()];
+        assert!(WhatsAppChannel::group_allowed(&group_jid("123"), &allowed));
+    }
+
+    #[test]
+    fn group_allowed_matches_bare_user() {
+        let allowed = vec!["123".to_string()];
+        assert!(WhatsAppChannel::group_allowed(&group_jid("123"), &allowed));
+    }
+
+    #[test]
+    fn group_allowed_rejects_non_listed_group() {
+        let allowed = vec!["123@g.us".to_string()];
+        assert!(!WhatsAppChannel::group_allowed(&group_jid("456"), &allowed));
+    }
+
+    // --- message_mentions_own ---
+
+    #[test]
+    fn mentions_own_true_when_structurally_mentioned() {
+        let msg = mentioning_message("hi", &[&format!("{OWNER}@s.whatsapp.net")]);
+        assert!(WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_false_when_other_user_mentioned() {
+        let msg = mentioning_message("hi", &[&format!("{OTHER_USER}@s.whatsapp.net")]);
+        assert!(!WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_falls_back_to_text_when_no_structured_mentions() {
+        let msg = text_message(&format!("hey @{OWNER} can you help"));
+        assert!(WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_false_for_plain_text_without_mention() {
+        let msg = text_message("hey everyone");
+        assert!(!WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_never_matches_bot_name_string() {
+        let msg = text_message("hey @rust-bot can you help");
+        assert!(!WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_true_for_non_jid_mentions_all() {
+        let msg = mentioning_all_message("@all hello");
+        assert!(WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_true_for_text_all_token() {
+        let msg = text_message("@all hello");
+        assert!(WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    #[test]
+    fn mentions_own_false_when_all_is_not_a_token() {
+        let msg = text_message("call@all.com please");
+        assert!(!WhatsAppChannel::message_mentions_own(&msg, &own_users()));
+    }
+
+    // --- should_accept_inbound ---
+
+    #[test]
+    fn mode_a_accepts_own_self_chat_message() {
+        let chat = dm_jid(OWNER);
+        let info = message_info(chat.clone(), chat, true, false);
+        let msg = text_message("note to self");
+        assert!(WhatsAppChannel::should_accept_inbound(
+            true,
+            &[],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_a_rejects_group_message() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = text_message("hello group");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            true,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_a_rejects_dm_from_other_user() {
+        let chat = dm_jid(OTHER_USER);
+        let info = message_info(chat.clone(), chat, false, false);
+        let msg = text_message("hi");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            true,
+            &[],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_open_accepts_allowlisted_group_message() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = text_message("hello group");
+        assert!(WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_open_accepts_owner_authored_group_message() {
+        // The linked account owner writing in the group is `is_from_me` but
+        // must still be processed — only recently-sent ids / reply prefix
+        // suppress agent echoes, not `is_from_me` itself.
+        let chat = group_jid("123");
+        let sender = dm_jid(OWNER);
+        let info = message_info(chat, sender, true, true);
+        let msg = text_message("hello from my phone");
+        assert!(WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_rejects_non_allowlisted_group() {
+        let chat = group_jid("999");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = text_message("hello group");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_rejects_empty_allowed_groups() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = text_message("hello group");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            false,
+            &[],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_rejects_dm_chats() {
+        let chat = dm_jid(OTHER_USER);
+        let info = message_info(chat.clone(), chat, false, false);
+        let msg = text_message("hello");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_rejects_status_broadcast() {
+        let chat = Jid::from_str("status@broadcast").expect("valid status jid");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, false);
+        let msg = text_message("status update");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Open,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_mention_rejects_non_mentioning_message() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = text_message("hello everyone");
+        assert!(!WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Mention,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_mention_accepts_mentioning_message() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = mentioning_message("hey you", &[&format!("{OWNER}@s.whatsapp.net")]);
+        assert!(WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Mention,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_mention_accepts_all_mention() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OTHER_USER);
+        let info = message_info(chat, sender, false, true);
+        let msg = mentioning_all_message("@all ping");
+        assert!(WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Mention,
+            &msg,
+            &info,
+            &own_users(),
+        ));
+    }
+
+    #[test]
+    fn mode_b_mention_accepts_owner_mentioning_message() {
+        let chat = group_jid("123");
+        let sender = dm_jid(OWNER);
+        let info = message_info(chat, sender, true, true);
+        let msg = mentioning_message("hey bot", &[&format!("{OWNER}@s.whatsapp.net")]);
+        assert!(WhatsAppChannel::should_accept_inbound(
+            false,
+            &["123".to_string()],
+            &WhatsAppGroupPolicy::Mention,
+            &msg,
+            &info,
+            &own_users(),
+        ));
     }
 }
