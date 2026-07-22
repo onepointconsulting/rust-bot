@@ -10,7 +10,7 @@ use crate::{
     cli::{CliError, commands::OnboardArgs, eprint_error},
     config::{
         channels::EmailConfig,
-        loader::{get_config_path, load_config, save_config, set_config_path},
+        loader::{load_config, save_config, set_config_path},
         schema::{
             AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType, OcrProvider,
             ProviderRetryMode, ToolsConfig,
