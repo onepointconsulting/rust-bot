@@ -89,7 +89,6 @@ jobs:
 
           Copy-Item "target\x86_64-pc-windows-msvc\release\rust-bot.exe" -Destination "$stageName\rust-bot.exe"
           Copy-Item "packaging\INSTALL.md" -Destination "$stageName\INSTALL.md"
-          Copy-Item -Recurse "templates" -Destination "$stageName\templates"
           Copy-Item "packaging\samples\*" -Destination "$stageName\configuration\samples\"
 
           Compress-Archive -Path $stageName -DestinationPath $archiveName -Force
@@ -110,7 +109,7 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
-            Each package bundles the `rust-bot` binary, `templates/`, sample
+            Each package bundles the `rust-bot` binary, sample
             configurations under `configuration/samples/`, and an `INSTALL.md`
             with setup instructions.
           files: ${{ steps.package.outputs.archive }}
