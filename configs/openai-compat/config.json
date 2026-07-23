@@ -19,22 +19,63 @@
     }
   },
   "channels": {
+    "streaming": false,
     "sendProgress": true,
     "sendToolHints": true,
     "sendMaxRetries": 3,
-    "transcriptionProvider": "groq"
+    "transcriptionProvider": "groq",
+    "allowFrom": [
+      "*"
+    ]
   },
   "providers": {
+    "custom": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "azureOpenai": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "anthropic": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "openai": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
     "openrouter": {
       "apiKey": "${OPENAI_API_KEY}",
       "apiBase": "${OPENAI_API_BASE}",
+      "extraHeaders": null
+    },
+    "gemini": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "groq": {
+      "apiKey": "",
+      "apiBase": null,
       "extraHeaders": null
     }
   },
   "api": {
     "host": "127.0.0.1",
     "port": 8900,
-    "timeout": 120.0
+    "timeout": 120.0,
+    "jwt": {
+      "enabled": false,
+      "privateKeyPath": "C:\\development\\onepoint\\rust-bot\\.rust-bot\\credentials\\private_key.pem",
+      "publicKeyPath": "C:\\development\\onepoint\\rust-bot\\.rust-bot\\credentials\\public_key.pem",
+      "iss": "rust-bot",
+      "aud": ""
+    }
   },
   "gateway": {
     "host": "0.0.0.0",
@@ -63,20 +104,30 @@
       "pathAppend": "",
       "sandbox": ""
     },
-    "gmail": {
-      "enable": false,
-      "client_secret_path": "~/.rust-bot/workspace/credentials/client_secret.json",
-      "token_cache_path": "~/.rust-bot/workspace/credentials/token_cache.json",
-      "max_results": 20
-    },
     "restrictToWorkspace": false,
     "mcpServers": {},
     "ssrfWhitelist": [
       "100.64.0.0/10",
       "192.168.0.0/16"
-    ]
+    ],
+    "gmail": {
+      "enable": false,
+      "clientSecretPath": "~/.rust-bot/workspace/credentials/client_secret.json",
+      "tokenCachePath": "~/.rust-bot/workspace/credentials/token_cache.json",
+      "maxResults": 20
+    },
+    "docx": {
+      "enable": false
+    },
+    "ocr": {
+      "enable": false,
+      "model": "claude-sonnet-4-6",
+      "baseUrl": "https://api.anthropic.com",
+      "provider": "anthropic",
+      "apiKey": ""
+    }
   },
   "subagent": {
-    "fail_on_tool_error": false
+    "failOnToolError": false
   }
 }

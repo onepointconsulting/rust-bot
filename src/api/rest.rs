@@ -4,19 +4,28 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::{State},
-    http::StatusCode,
+    extract::State,
+    http::{Request, StatusCode, header::AUTHORIZATION},
+    middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
-use serde::Deserialize;
 use chrono::Utc;
+use serde::Deserialize;
 use tokio::net::TcpListener;
-use utoipa::OpenApi;
+use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
+use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
-use crate::{agent::agent_loop::AgentLoop, api::types::{ChatCommandRequest, ChatCommandResponse}, bus::events::OutboundMessage, command::types::ChatCommand};
+use crate::config::schema::JwtConfig;
+use crate::security::jwt::{validate_jwt_token, JwtValidationOpts};
+use crate::{
+    agent::agent_loop::AgentLoop,
+    api::types::{ChatCommandRequest, ChatCommandResponse},
+    bus::events::OutboundMessage,
+    command::types::ChatCommand,
+};
 
 use super::types::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
@@ -30,6 +39,7 @@ pub struct ApiServer {
     pub session_id: String,
     pub model_name: String,
     pub timeout: u64,
+    pub jwt: JwtConfig,
 }
 
 #[derive(Clone)]
@@ -38,15 +48,63 @@ struct AppState {
     session_id: String,
     model_name: String,
     timeout: Duration,
+    /// When `Some`, JWT auth is required on protected routes.
+    jwt_auth: Option<JwtAuthState>,
+}
+
+#[derive(Clone)]
+struct JwtAuthState {
+    public_key_pem: Arc<Vec<u8>>,
+    opts: JwtValidationOpts,
 }
 
 impl From<ApiServer> for AppState {
     fn from(server: ApiServer) -> Self {
+        let jwt_auth = if server.jwt.enabled {
+            let public_key_pem = std::fs::read(&server.jwt.public_key_path).unwrap_or_else(|e| {
+                panic!(
+                    "JWT enabled but failed to read public key '{}': {e}",
+                    server.jwt.public_key_path
+                );
+            });
+            if server.jwt.aud.trim().is_empty() {
+                panic!("JWT enabled but api.jwt.aud is empty");
+            }
+            Some(JwtAuthState {
+                public_key_pem: Arc::new(public_key_pem),
+                opts: JwtValidationOpts {
+                    iss: server.jwt.iss.clone(),
+                    aud: server.jwt.aud.clone(),
+                },
+            })
+        } else {
+            None
+        };
+
         Self {
             agent_loop: server.agent_loop,
             session_id: server.session_id,
             model_name: server.model_name,
             timeout: Duration::from_secs(server.timeout),
+            jwt_auth,
+        }
+    }
+}
+
+struct SecurityAddon;
+
+impl Modify for SecurityAddon {
+    fn modify(&self, openapi: &mut utoipa::openapi::OpenApi) {
+        if let Some(components) = openapi.components.as_mut() {
+            components.add_security_scheme(
+                "bearerAuth",
+                SecurityScheme::Http(
+                    HttpBuilder::new()
+                        .scheme(HttpAuthScheme::Bearer)
+                        .bearer_format("JWT")
+                        .build(),
+                ),
+            );
         }
     }
 }
@@ -67,6 +125,7 @@ impl From<ApiServer> for AppState {
         SessionSummary,
         SessionsListResponse,
     )),
+    modifiers(&SecurityAddon),
     tags((name = "chat", description = "OpenAI-compatible chat completions API"))
 )]
 struct ApiDoc;
@@ -86,6 +145,14 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
             error_type: None,
+        }
+    }
+
+    fn unauthorized(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::UNAUTHORIZED,
+            message: message.into(),
+            error_type: Some("unauthorized".to_string()),
         }
     }
 
@@ -125,6 +192,40 @@ fn error_json(status: u16, message: &str, err_type: Option<String>) -> serde_jso
     serde_json::json!({"error": {"message": message, "type": err_type, "code": status}})
 }
 
+async fn jwt_auth_middleware(
+    State(state): State<Arc<AppState>>,
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Result<Response, ApiError> {
+    let Some(jwt_auth) = state.jwt_auth.as_ref() else {
+        return Ok(next.run(request).await);
+    };
+
+    let auth_header = request
+        .headers()
+        .get(AUTHORIZATION)
+        .and_then(|v| v.to_str().ok())
+        .ok_or_else(|| ApiError::unauthorized("Missing Authorization header"))?;
+
+    let token = auth_header
+        .strip_prefix("Bearer ")
+        .or_else(|| auth_header.strip_prefix("bearer "))
+        .ok_or_else(|| {
+            ApiError::unauthorized("Authorization header must use Bearer scheme")
+        })?
+        .trim();
+
+    if token.is_empty() {
+        return Err(ApiError::unauthorized("Bearer token is empty"));
+    }
+
+    validate_jwt_token(token, jwt_auth.public_key_pem.as_slice(), &jwt_auth.opts).map_err(
+        |err| ApiError::unauthorized(format!("Invalid JWT: {err}")),
+    )?;
+
+    Ok(next.run(request).await)
+}
+
 #[utoipa::path(
     get,
     path = "/health",
@@ -141,9 +242,11 @@ async fn health() -> StatusCode {
     responses(
         (status = 200, description = "Chat completion response", body = ChatCompletionResponse),
         (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
         (status = 408, description = "Request timed out"),
         (status = 500, description = "Internal server error"),
     ),
+    security(("bearerAuth" = [])),
     tag = "chat"
 )]
 async fn chat_completions(
@@ -237,9 +340,11 @@ fn build_chat_completion_response(outbound: OutboundMessage, model: String) -> C
     responses(
         (status = 200, description = "Command response", body = ChatCommandResponse),
         (status = 400, description = "Invalid request"),
+        (status = 401, description = "Unauthorized"),
         (status = 408, description = "Request timed out"),
         (status = 500, description = "Internal server error"),
     ),
+    security(("bearerAuth" = [])),
     tag = "chat"
 )]
 async fn chat_commands(
@@ -281,7 +386,9 @@ async fn chat_commands(
     path = "/v1/sessions",
     responses(
         (status = 200, description = "List of persisted sessions", body = SessionsListResponse),
+        (status = 401, description = "Unauthorized"),
     ),
+    security(("bearerAuth" = [])),
     tag = "chat"
 )]
 async fn list_sessions(
@@ -307,21 +414,33 @@ async fn shutdown_signal() {
 pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     let addr = format!("{}:{}", server.host, server.port);
     let agent_loop = Arc::clone(&server.agent_loop);
+    let jwt_enabled = server.jwt.enabled;
 
     agent_loop.connect_mcp().await;
 
     let state = Arc::new(AppState::from(server));
-    let app = Router::new()
-        .route("/health", get(health))
+
+    let protected = Router::new()
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/commands", post(chat_commands))
         .route("/v1/sessions", get(list_sessions))
+        .layer(middleware::from_fn_with_state(
+            Arc::clone(&state),
+            jwt_auth_middleware,
+        ));
+
+    let app = Router::new()
+        .route("/health", get(health))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
+        .merge(protected)
         .with_state(state);
 
     let listener = TcpListener::bind(&addr).await?;
     log::info!("API server listening on http://{addr}");
     log::info!("Swagger UI available at http://{addr}/swagger-ui");
+    if jwt_enabled {
+        log::info!("JWT authentication enabled for /v1/* routes");
+    }
 
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())

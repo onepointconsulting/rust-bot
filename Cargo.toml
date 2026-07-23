@@ -76,6 +76,10 @@ whatsapp-rust-tokio-transport = "0.6"
 whatsapp-rust-ureq-http-client = "0.6"
 qrcode = {version = "0.14.1"}
 rust-embed = "8.11"
+jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
+ed25519-dalek = { version = "2.1", features = ["pem", "rand_core"] }
+rand_core = { version = "0.6", features = ["getrandom"] }
+pkcs8 = { version = "0.10", features = ["std"] }
 
 [dev-dependencies]
 tempfile = "3"

@@ -490,6 +490,88 @@ impl Default for HeartbeatConfig {
     }
 }
 
+// ── JwtConfig ──────────────────────────────────────────────────────────────────
+
+fn jwt_enabled() -> bool {
+    false
+}
+
+fn default_jwt_private_key_path() -> String {
+    "./.rust-bot/credentials/private_key.pem".to_string()
+}
+
+fn default_jwt_public_key_path() -> String {
+    "./.rust-bot/credentials/public_key.pem".to_string()
+}
+
+fn default_jwt_iss() -> String {
+    "rust-bot".to_string()
+}
+
+fn default_jwt_aud() -> String {
+    String::new()
+}
+
+fn validate_jwt_aud_when_enabled(value: &JwtConfig, _ctx: &()) -> garde::Result {
+    if value.enabled && value.aud.trim().is_empty() {
+        return Err(garde::Error::new(
+            "aud must be non-empty when JWT is enabled",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JwtConfig {
+    /// Whether the JWT service is active.
+    #[serde(alias = "enabled", default = "jwt_enabled")]
+    pub enabled: bool,
+
+    /// Path to the Ed25519 private key PEM (used for minting tokens).
+    #[serde(alias = "private_key_path")]
+    pub private_key_path: String,
+
+    /// Path to the Ed25519 public key PEM (used for validating tokens).
+    #[serde(alias = "public_key_path")]
+    pub public_key_path: String,
+
+    /// JWT issuer claim. Default: `rust-bot`.
+    #[serde(alias = "iss", default = "default_jwt_iss")]
+    pub iss: String,
+
+    /// JWT audience claim. Empty means omit on mint; required non-empty when enabled.
+    #[serde(alias = "aud", default = "default_jwt_aud")]
+    pub aud: String,
+}
+
+impl Default for JwtConfig {
+    fn default() -> Self {
+        Self {
+            enabled: jwt_enabled(),
+            private_key_path: default_jwt_private_key_path(),
+            public_key_path: default_jwt_public_key_path(),
+            iss: default_jwt_iss(),
+            aud: default_jwt_aud(),
+        }
+    }
+}
+
+impl Validate for JwtConfig {
+    type Context = ();
+
+    fn validate_into(
+        &self,
+        ctx: &Self::Context,
+        parent: &mut dyn FnMut() -> garde::Path,
+        report: &mut garde::Report,
+    ) {
+        if let Err(err) = validate_jwt_aud_when_enabled(self, ctx) {
+            report.append(parent().join("aud"), err);
+        }
+    }
+}
+
 // ── ApiConfig ─────────────────────────────────────────────────────────────────
 
 fn default_api_host() -> String {
@@ -520,6 +602,11 @@ pub struct ApiConfig {
     #[serde(alias = "timeout", default = "default_api_timeout")]
     #[garde(range(min = 0.0))]
     pub timeout: f64,
+
+    /// JWT service configuration.
+    #[serde(alias = "jwt")]
+    #[garde(dive)]
+    pub jwt: JwtConfig,
 }
 
 impl Default for ApiConfig {
@@ -528,6 +615,7 @@ impl Default for ApiConfig {
             host: default_api_host(),
             port: default_api_port(),
             timeout: default_api_timeout(),
+            jwt: JwtConfig::default(),
         }
     }
 }
@@ -1284,7 +1372,7 @@ mod tests {
     fn test_defaults() {
         let cfg = ChannelsConfig::default();
         assert!(cfg.send_progress);
-        assert!(!cfg.send_tool_hints);
+        assert!(cfg.send_tool_hints);
         assert_eq!(cfg.send_max_retries, 3);
         assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
         assert!(cfg.extra.is_empty());
@@ -1650,6 +1738,9 @@ mod tests {
         assert_eq!(cfg.host, "127.0.0.1");
         assert_eq!(cfg.port, 8900);
         assert_eq!(cfg.timeout, 120.0);
+        assert!(!cfg.jwt.enabled);
+        assert_eq!(cfg.jwt.iss, "rust-bot");
+        assert_eq!(cfg.jwt.aud, "");
         assert!(cfg.validate().is_ok());
     }
 
@@ -1693,6 +1784,59 @@ mod tests {
         let json = r#"{"timeout": -1.0}"#;
         let cfg: ApiConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.validate().is_err());
+    }
+
+    // ── JwtConfig ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_jwt_defaults() {
+        let cfg = JwtConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.private_key_path, "./.rust-bot/credentials/private_key.pem");
+        assert_eq!(cfg.public_key_path, "./.rust-bot/credentials/public_key.pem");
+        assert_eq!(cfg.iss, "rust-bot");
+        assert_eq!(cfg.aud, "");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_jwt_enabled_requires_non_empty_aud() {
+        let cfg = JwtConfig {
+            enabled: true,
+            aud: String::new(),
+            ..JwtConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_jwt_enabled_with_aud_ok() {
+        let cfg = JwtConfig {
+            enabled: true,
+            aud: "https://api.example.com".to_string(),
+            ..JwtConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_jwt_deserialize_nested_under_api() {
+        let json = r#"{
+            "jwt": {
+                "enabled": true,
+                "privateKeyPath": "/keys/private_key.pem",
+                "publicKeyPath": "/keys/public_key.pem",
+                "iss": "my-bot",
+                "aud": "https://api.example.com"
+            }
+        }"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.jwt.enabled);
+        assert_eq!(cfg.jwt.private_key_path, "/keys/private_key.pem");
+        assert_eq!(cfg.jwt.public_key_path, "/keys/public_key.pem");
+        assert_eq!(cfg.jwt.iss, "my-bot");
+        assert_eq!(cfg.jwt.aud, "https://api.example.com");
+        assert!(cfg.validate().is_ok());
     }
 
     // ── GatewayConfig ─────────────────────────────────────────────────────────

@@ -473,6 +473,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
         session_id,
         model_name,
         timeout,
+        jwt: config.api.jwt.clone(),
     })
     .await
     {
