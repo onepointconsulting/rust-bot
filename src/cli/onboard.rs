@@ -16,7 +16,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     }
     let config_path = resolve_onboard_config_path(args.config);
 
-    let mut config = if config_path.exists() {
+    let config = if config_path.exists() {
         let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
         let bold = Style::new().bold();
         println!(
