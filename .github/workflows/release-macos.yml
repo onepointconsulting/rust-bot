@@ -56,8 +56,8 @@ jobs:
         with:
           key: macos-aarch64-apple-darwin
 
-      - name: Build release binary
-        run: cargo build --release --bin rust-bot --target aarch64-apple-darwin
+      - name: Build release binaries
+        run: cargo build --release --bin rust-bot --bin generate-jwt --bin gmail-auth --target aarch64-apple-darwin
 
       - name: Assemble package
         id: package
@@ -69,9 +69,11 @@ jobs:
 
           mkdir -p "${stage_name}/configuration/samples"
           cp "target/aarch64-apple-darwin/release/rust-bot" "${stage_name}/rust-bot"
+          cp "target/aarch64-apple-darwin/release/generate-jwt" "${stage_name}/generate-jwt"
+          cp "target/aarch64-apple-darwin/release/gmail-auth" "${stage_name}/gmail-auth"
           cp "packaging/INSTALL.md" "${stage_name}/INSTALL.md"
           cp packaging/samples/* "${stage_name}/configuration/samples/"
-          chmod +x "${stage_name}/rust-bot"
+          chmod +x "${stage_name}/rust-bot" "${stage_name}/generate-jwt" "${stage_name}/gmail-auth"
 
           tar czf "$archive_name" "$stage_name"
 
@@ -91,9 +93,10 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
-            Each package bundles the `rust-bot` binary, sample
-            configurations under `configuration/samples/`, and an `INSTALL.md`
-            with setup instructions.
+            Each package bundles the `rust-bot`, `generate-jwt`, and
+            `gmail-auth` binaries, sample configurations under
+            `configuration/samples/`, and an `INSTALL.md` with setup
+            instructions.
           files: ${{ steps.package.outputs.archive }}
           fail_on_unmatched_files: true
         env:
