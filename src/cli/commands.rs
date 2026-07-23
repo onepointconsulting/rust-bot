@@ -1183,7 +1183,13 @@ struct CliPrompt;
 
 impl Prompt for CliPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
-        Cow::Borrowed("rust-bot")
+        let path = std::env::current_dir();
+        match path {
+            Ok(path) => {
+                Cow::Owned(format!("{}", path.to_string_lossy()))
+            }
+            Err(_) => Cow::Borrowed("rust-bot"),
+        }
     }
 
     fn render_prompt_right(&self) -> Cow<'_, str> {

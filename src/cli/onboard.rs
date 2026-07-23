@@ -82,9 +82,9 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     println!("{LOGO} is ready!");
     println!();
     println!("Next steps:");
-    println!("  1. Add your API key to {}", config_path.display());
+    println!("  1. Change the config file to your needs at {}", config_path.display());
     println!(
-        "  2. a) Chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
+        "  2. a) One message chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
         config_path.display()
     );
     println!(
@@ -93,6 +93,10 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     );
     println!(
         "  2. c) API: rust-bot api -c \"{}\"",
+        config_path.display()
+    );
+    println!(
+        "  2. d) Gateway: rust-bot gateway -c \"{}\"",
         config_path.display()
     );
     Ok(())
