@@ -74,6 +74,7 @@
     "web": {
       "enable": true,
       "proxy": null,
+      "timeout": 60,
       "search": {
         "provider": "duckduckgo",
         "apiKey": "",

@@ -2,6 +2,7 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
+use rust_bot::api::user_registry::{hash_password, JsonUserRegistry, User, UserRegistry};
 use rust_bot::config::loader::{load_config, save_config};
 use rust_bot::security::jwt::{
     generate_jwt_keypair, generate_jwt_token, DEFAULT_EXPIRES_IN_MONTHS,
@@ -49,6 +50,18 @@ enum Commands {
         /// Token lifetime in months (default: 6)
         #[arg(long, default_value_t = DEFAULT_EXPIRES_IN_MONTHS)]
         expires_in_months: u32,
+
+        /// The email of the user for whom the token is being generated
+        #[arg(long, required = true)]
+        user_email: String,
+
+        /// Optional password; stored as an Argon2id hash in the users file
+        #[arg(long)]
+        password: Option<String>,
+
+        /// Path to the JSON user registry file (email -> token map)
+        #[arg(long, required = true)]
+        users_file: PathBuf,
     },
 }
 
@@ -70,8 +83,19 @@ fn main() -> ExitCode {
             iss,
             aud,
             expires_in_months,
+            user_email,
+            password,
+            users_file,
         } => {
-            if let Err(err) = run_generate_token(config, iss, aud, expires_in_months) {
+            if let Err(err) = run_generate_token(
+                config,
+                iss,
+                aud,
+                expires_in_months,
+                user_email,
+                password,
+                users_file,
+            ) {
                 eprintln!("ERROR: {err}");
                 exit_codes::exit(GENERAL_ERROR);
             }
@@ -121,6 +145,9 @@ fn run_generate_token(
     iss_override: Option<String>,
     aud_override: Option<String>,
     expires_in_months: u32,
+    user_email: String,
+    password: Option<String>,
+    users_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
     let config = load_config(Some(config_path));
     let jwt = &config.api.jwt;
@@ -129,6 +156,13 @@ fn run_generate_token(
     let aud = aud_override.unwrap_or_else(|| jwt.aud.clone());
 
     let minted = generate_jwt_token(&jwt.private_key_path, iss, aud, expires_in_months)?;
+
+    let mut registry = JsonUserRegistry::open(users_file)?;
+    registry.register_user(&User {
+        email: user_email,
+        password_hash: hash_password(password)?,
+        token: minted.token.clone(),
+    })?;
 
     eprintln!("sub: {}", minted.claims.sub);
     eprintln!(

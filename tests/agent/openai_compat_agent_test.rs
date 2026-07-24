@@ -446,7 +446,7 @@ async fn test_web_search_tool() {
         api_key: std::env::var("BRAVE_API_KEY").unwrap_or_default(),
         ..WebSearchConfig::default()
     };
-    let web_search_tool = WebSearchTool::new(Some(config), None);
+    let web_search_tool = WebSearchTool::new(Some(config), None, None);
     let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(web_search_tool)]);
     let result = runner.run(spec).await;
     completion_message_check(&result);
@@ -465,8 +465,8 @@ async fn test_web_search_fetch_tool() {
         api_key: std::env::var("BRAVE_API_KEY").unwrap_or_default(),
         ..WebSearchConfig::default()
     };
-    let web_search_tool = WebSearchTool::new(Some(config), None);
-    let web_fetch_tool = WebFetchTool::new(None, None);
+    let web_search_tool = WebSearchTool::new(Some(config), None, None);
+    let web_fetch_tool = WebFetchTool::new(None, None, None);
     let workspace_path = prepare_workspace();
     let write_tool = WriteFileTool::new(Some(workspace_path.clone()), None, None);
     let tools: Vec<Box<dyn Tool>> = vec![

@@ -73,6 +73,7 @@
     "web": {
       "enable": true,
       "proxy": null,
+      "timeout": 60,
       "search": {
         "provider": "brave",
         "apiKey": "${BRAVE_API_KEY}",

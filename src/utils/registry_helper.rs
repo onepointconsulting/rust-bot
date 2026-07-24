@@ -65,11 +65,17 @@ pub fn register_filesystem_tools(
 pub fn register_web_tools(web_config: &WebToolsConfig, tools: &mut ToolRegistry) {
     if web_config.enable {
         log::debug!("Registering web tools");
+        let timeout_secs = Some(u64::from(web_config.timeout));
         tools.register(Box::new(WebSearchTool::new(
             Some(web_config.search.clone()),
             web_config.proxy.clone(),
+            timeout_secs,
         )));
-        tools.register(Box::new(WebFetchTool::new(None, web_config.proxy.clone())));
+        tools.register(Box::new(WebFetchTool::new(
+            None,
+            web_config.proxy.clone(),
+            timeout_secs,
+        )));
     }
 }
 

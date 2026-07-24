@@ -178,7 +178,12 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
     let endpoint = Text::new("Enter endpoint")
         .with_help_message(if provider_name == PROVIDER_OPENROUTER {
             "e.g. https://openrouter.ai/api/v1, https://api.edenai.run/v3" 
-        } else {
+        } else if provider_name == PROVIDER_EDENAI {
+            "e.g. https://api.edenai.run/v3"
+        } else if provider_name == PROVIDER_ANTHROPIC {
+            "e.g. https://api.anthropic.com/v1"
+        }
+        else {
             ""
         })
         .prompt()?;
@@ -762,6 +767,19 @@ fn configure_web_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
             Some(trimmed.to_string())
         }
     };
+
+    web.timeout = CustomType::<u32>::new("Web tools HTTP timeout (seconds)")
+        .with_default(web.timeout)
+        .with_help_message("Per-request timeout for web_search and web_fetch (≥ 1)")
+        .with_error_message("Please enter a positive integer")
+        .with_validator(|v: &u32| {
+            if *v >= 1 {
+                Ok(Validation::Valid)
+            } else {
+                Ok(Validation::Invalid("Must be at least 1".into()))
+            }
+        })
+        .prompt()?;
 
     let provider_idx = WEB_SEARCH_PROVIDERS
         .iter()

@@ -155,17 +155,36 @@ another directory, or `--force` to overwrite existing keys.
 
 ```bash
 # Windows
-.\generate-jwt.exe generate-jwt-token --config .\path\to\config.json
+.\generate-jwt.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json
 
 # Linux / macOS
-./generate-jwt generate-jwt-token --config ./path/to/config.json
+./generate-jwt generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json
 ```
 
-The JWT is printed to stdout. Optional flags: `--iss`, `--aud`, and
-`--expires-in-months` (default: 6). Send the token as
-`Authorization: Bearer <token>` when calling the API.
+The JWT is printed to stdout. `--user-email` and `--users-file` are
+required: the email identifies the user (it is not embedded in the token
+itself), and `--users-file` points to a JSON file mapping emails to their
+minted tokens. The file is created if it does not exist. Registration fails
+if the email is already present in the file. Optional flags: `--iss`,
+`--aud`, `--expires-in-months` (default: 6), and `--password`. Send the
+token as `Authorization: Bearer <token>` when calling the API.
 
-Keep private keys and minted tokens secret; do not commit them.
+Pass `--password` to also store a credential for the user:
+
+```bash
+# Windows
+.\generate-jwt.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json --password "correct horse battery staple"
+
+# Linux / macOS
+./generate-jwt generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json --password "correct horse battery staple"
+```
+
+The password is never stored or printed in plaintext; it is hashed with
+Argon2id before being written to the users file as `password_hash`. Users
+registered without `--password` simply omit that field.
+
+Keep private keys, minted tokens, and the users file secret; do not commit
+them.
 
 ## 6. Next steps
 

@@ -719,6 +719,10 @@ fn default_web_tools_enable() -> bool {
     true
 }
 
+fn default_web_tools_timeout() -> u32 {
+    60
+}
+
 /// Web tools configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
@@ -734,6 +738,12 @@ pub struct WebToolsConfig {
     #[garde(skip)]
     pub proxy: Option<String>,
 
+    /// Timeout for web requests in seconds. Default: 60.
+    /// Examples: `30`, `60`, `120`.
+    #[serde(alias = "timeout", default = "default_web_tools_timeout")]
+    #[garde(range(min = 1))]
+    pub timeout: u32,
+
     /// Web search backend configuration.
     #[serde(alias = "search")]
     #[garde(dive)]
@@ -745,6 +755,7 @@ impl Default for WebToolsConfig {
         Self {
             enable: default_web_tools_enable(),
             proxy: None,
+            timeout: default_web_tools_timeout(),
             search: WebSearchConfig::default(),
         }
     }
@@ -1969,6 +1980,7 @@ mod tests {
         let cfg = WebToolsConfig::default();
         assert!(cfg.enable);
         assert_eq!(cfg.proxy, None);
+        assert_eq!(cfg.timeout, 60);
         // nested search should carry WebSearchConfig defaults
         assert_eq!(cfg.search.provider, "duckduckgo");
         assert_eq!(cfg.search.max_results, 20);
@@ -1982,6 +1994,7 @@ mod tests {
         let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.enable);
         assert_eq!(cfg.proxy, None);
+        assert_eq!(cfg.timeout, 60);
         assert_eq!(cfg.search.provider, "duckduckgo");
         assert!(cfg.validate().is_ok());
     }
@@ -2001,6 +2014,21 @@ mod tests {
         let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
         assert_eq!(cfg.proxy, Some("socks5://127.0.0.1:1080".to_string()));
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_deserialize_timeout() {
+        let json = r#"{"timeout": 45}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.timeout, 45);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_validation_rejects_zero_timeout() {
+        let json = r#"{"timeout": 0}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]
