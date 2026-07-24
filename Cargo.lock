@@ -4602,7 +4602,7 @@ dependencies = [
 
 [[package]]
 name = "rust-bot"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "adk-anthropic",
  "anstyle",
