@@ -1,5 +1,5 @@
 use std::future::Future;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
@@ -11,15 +11,18 @@ use axum::{
     routing::{get, post},
 };
 use chrono::Utc;
-use serde::Deserialize;
 use tokio::net::TcpListener;
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
+use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
+use crate::api::user_registry::{verify_password, User, UserRegistry};
 use crate::config::schema::JwtConfig;
-use crate::security::jwt::{validate_jwt_token, JwtValidationOpts};
+use crate::security::jwt::{
+    generate_jwt_token, validate_jwt_token, JwtValidationOpts, DEFAULT_EXPIRES_IN_MONTHS,
+};
 use crate::{
     agent::agent_loop::AgentLoop,
     api::types::{ChatCommandRequest, ChatCommandResponse},
@@ -40,6 +43,7 @@ pub struct ApiServer {
     pub model_name: String,
     pub timeout: u64,
     pub jwt: JwtConfig,
+    pub user_registry: Arc<Mutex<dyn UserRegistry + Send>>,
 }
 
 #[derive(Clone)]
@@ -50,11 +54,13 @@ struct AppState {
     timeout: Duration,
     /// When `Some`, JWT auth is required on protected routes.
     jwt_auth: Option<JwtAuthState>,
+    pub user_registry: Arc<Mutex<dyn UserRegistry + Send>>,
 }
 
 #[derive(Clone)]
 struct JwtAuthState {
     public_key_pem: Arc<Vec<u8>>,
+    private_key_path: String,
     opts: JwtValidationOpts,
 }
 
@@ -70,8 +76,12 @@ impl From<ApiServer> for AppState {
             if server.jwt.aud.trim().is_empty() {
                 panic!("JWT enabled but api.jwt.aud is empty");
             }
+            if server.jwt.private_key_path.trim().is_empty() {
+                panic!("JWT enabled but api.jwt.private_key_path is empty");
+            }
             Some(JwtAuthState {
                 public_key_pem: Arc::new(public_key_pem),
+                private_key_path: server.jwt.private_key_path.clone(),
                 opts: JwtValidationOpts {
                     iss: server.jwt.iss.clone(),
                     aud: server.jwt.aud.clone(),
@@ -87,6 +97,7 @@ impl From<ApiServer> for AppState {
             model_name: server.model_name,
             timeout: Duration::from_secs(server.timeout),
             jwt_auth,
+            user_registry: server.user_registry,
         }
     }
 }
@@ -111,7 +122,7 @@ impl Modify for SecurityAddon {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, chat_completions, chat_commands, list_sessions),
+    paths(health, chat_completions, chat_commands, list_sessions, login),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,
@@ -124,14 +135,16 @@ impl Modify for SecurityAddon {
         ChatCommand,
         SessionSummary,
         SessionsListResponse,
+        ChatLoginRequest,
+        ChatLoginResponse,
     )),
     modifiers(&SecurityAddon),
-    tags((name = "chat", description = "OpenAI-compatible chat completions API"))
+    tags(
+        (name = "chat", description = "OpenAI-compatible chat completions API"),
+        (name = "security", description = "Authentication and token issuance"),
+    )
 )]
 struct ApiDoc;
-
-#[derive(Debug, Deserialize)]
-struct SessionsQuery;
 
 struct ApiError {
     status: StatusCode,
@@ -405,6 +418,85 @@ async fn list_sessions(
     ))
 }
 
+/// Authenticate with email/password, mint a fresh JWT, persist it in the
+/// user registry, and return it.
+#[utoipa::path(
+    post,
+    path = "/v1/login",
+    request_body = ChatLoginRequest,
+    responses(
+        (status = 200, description = "Freshly minted JWT for the user", body = ChatLoginResponse),
+        (status = 401, description = "Unauthorized"),
+        (status = 500, description = "Internal server error"),
+    ),
+    tag = "security"
+)]
+async fn login(
+    State(state): State<Arc<AppState>>,
+    Json(request): Json<ChatLoginRequest>,
+) -> Result<Json<ChatLoginResponse>, ApiError> {
+    let unauthorized = || ApiError::unauthorized("Invalid email or password");
+    let jwt = state
+        .jwt_auth
+        .as_ref()
+        .ok_or_else(|| ApiError::internal("JWT is not enabled; cannot mint login tokens"))?;
+
+    // Copy credentials out so Argon2 does not hold the registry lock.
+    let password_hash = {
+        let registry = state
+            .user_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let user = registry
+            .get_user_by_email(&request.email)
+            .map_err(|_| unauthorized())?;
+        user.password_hash.ok_or_else(unauthorized)?
+    };
+
+    let password = request.password.clone();
+    let password_hash_for_verify = password_hash.clone();
+    let valid = tokio::task::spawn_blocking(move || {
+        verify_password(&password, &password_hash_for_verify).unwrap_or(false)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Password verification task failed"))?;
+
+    if !valid {
+        return Err(unauthorized());
+    }
+
+    let private_key_path = jwt.private_key_path.clone();
+    let iss = jwt.opts.iss.clone();
+    let aud = jwt.opts.aud.clone();
+    let minted = tokio::task::spawn_blocking(move || {
+        generate_jwt_token(private_key_path, iss, aud, DEFAULT_EXPIRES_IN_MONTHS)
+    })
+    .await
+    .map_err(|_| ApiError::internal("Token minting task failed"))?
+    .map_err(|err| ApiError::internal(format!("Failed to mint JWT: {err}")))?;
+
+    {
+        let mut registry = state
+            .user_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        registry
+            .update_user(
+                &request.email,
+                &User {
+                    email: request.email.clone(),
+                    password_hash: Some(password_hash),
+                    token: minted.token.clone(),
+                },
+            )
+            .map_err(|err| ApiError::internal(format!("Failed to persist login token: {err}")))?;
+    }
+
+    Ok(Json(ChatLoginResponse {
+        token: minted.token,
+    }))
+}
+
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         log::info!("Shutdown signal received, stopping API server...");
@@ -431,6 +523,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
 
     let app = Router::new()
         .route("/health", get(health))
+        .route("/v1/login", post(login))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected)
         .with_state(state);
@@ -439,7 +532,9 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     log::info!("API server listening on http://{addr}");
     log::info!("Swagger UI available at http://{addr}/swagger-ui");
     if jwt_enabled {
-        log::info!("JWT authentication enabled for /v1/* routes");
+        log::info!(
+            "JWT authentication enabled for protected /v1/* routes (/v1/login remains public)"
+        );
     }
 
     axum::serve(listener, app)

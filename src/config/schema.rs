@@ -583,6 +583,9 @@ fn default_api_port() -> u16 {
 fn default_api_timeout() -> f64 {
     120.0
 }
+fn default_users_file() -> String {
+    "./.rust-bot/users.json".to_string()
+}
 
 /// OpenAI-compatible API server configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
@@ -607,6 +610,11 @@ pub struct ApiConfig {
     #[serde(alias = "jwt")]
     #[garde(dive)]
     pub jwt: JwtConfig,
+
+    /// User registry file path.
+    #[serde(alias = "users_file", default = "default_users_file")]
+    #[garde(skip)]
+    pub users_file: String,
 }
 
 impl Default for ApiConfig {
@@ -616,6 +624,7 @@ impl Default for ApiConfig {
             port: default_api_port(),
             timeout: default_api_timeout(),
             jwt: JwtConfig::default(),
+            users_file: default_users_file(),
         }
     }
 }

@@ -2,8 +2,9 @@
 //!
 //! The token itself never carries the email (see [`crate::security::jwt::Claims`]);
 //! this registry provides the out-of-band mapping so operators can look up which
-//! token was minted for a given user. An optional Argon2id password hash can be
-//! stored alongside the token for callers that also want a login credential.
+//! token is current for a given user. Tokens are minted by `generate-jwt` at
+//! registration time and refreshed on each successful `/v1/login`. An optional
+//! Argon2id password hash can be stored alongside the token for login.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -122,6 +123,14 @@ pub struct JsonUserRegistry {
 }
 
 impl JsonUserRegistry {
+
+    pub fn empty() -> Self {
+        Self {
+            path: PathBuf::new(),
+            users: HashMap::new(),
+        }
+    }
+
     /// Open the registry at `path`, loading existing entries if the file
     /// exists. A missing file is treated as an empty registry.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, UserRegistryError> {

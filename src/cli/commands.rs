@@ -12,6 +12,7 @@ use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
 use crate::api::rest::ApiServer;
 use crate::api::rest::create_api_server;
+use crate::api::user_registry::JsonUserRegistry;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
 use crate::channels::manager::ChannelManager;
@@ -146,18 +147,14 @@ pub struct ApiArgs {
     #[arg(long, default_value = "0.0.0.0")]
     pub host: Option<String>,
 
-    /// Workspace directory
-    #[arg(short, long)]
-    pub workspace: Option<PathBuf>,
-
     /// Timeout for API requests
-    #[arg(short, long, default_value = "30")]
+    #[arg(short, long, default_value = "60")]
     pub timeout: u64,
 
     #[arg(short, long, default_value = "api:default")]
     pub session: String,
 
-    /// JSON configuration file path
+    /// JSON configuration file path (workspace is taken from `agents.workspace`)
     #[arg(short, long)]
     pub config: PathBuf,
 }
@@ -458,13 +455,19 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
 
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     init_runtime_logging(true, None);
-    let (config, workspace) = prepare_workspace(args.config, args.workspace);
+    let (config, workspace) = prepare_workspace(args.config, None);
     let agent_loop = init_agent_loop(&config, workspace.clone());
     let host = args.host.unwrap_or_else(|| config.api.host.clone());
     let port = args.port.unwrap_or_else(|| config.api.port);
     let model_name = config.agents.model.clone();
     let session_id = args.session.clone();
     let timeout = args.timeout;
+    let users_file: PathBuf = config.api.users_file.clone().into();
+    let user_registry = if users_file.exists() {
+        JsonUserRegistry::open(users_file).unwrap()
+    } else {
+        JsonUserRegistry::empty()
+    };
     render_api_startup_message(&host, port, &model_name, &workspace, &session_id, &timeout);
     if let Err(err) = create_api_server(ApiServer {
         agent_loop: Arc::new(agent_loop),
@@ -474,6 +477,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
         model_name,
         timeout,
         jwt: config.api.jwt.clone(),
+        user_registry: Arc::new(StdMutex::new(user_registry)),
     })
     .await
     {

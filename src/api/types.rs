@@ -159,6 +159,17 @@ impl SessionSummary {
     }
 }
 
+#[derive(Debug, Deserialize, Serialize, ToSchema)]
+pub struct ChatLoginRequest {
+    pub email: String,
+    pub password: String,
+}
+
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ChatLoginResponse {
+    pub token: String,
+}
+
 pub fn content_as_string(content: &ChatMessageContent) -> Option<String> {
     match content {
         ChatMessageContent::Text(text) => Some(text.clone()),

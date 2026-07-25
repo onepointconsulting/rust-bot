@@ -149,7 +149,7 @@ fn run_generate_token(
     password: Option<String>,
     users_file: PathBuf,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    let config = load_config(Some(config_path));
+    let mut config = load_config(Some(config_path.clone()));
     let jwt = &config.api.jwt;
 
     let iss = iss_override.unwrap_or_else(|| jwt.iss.clone());
@@ -157,12 +157,15 @@ fn run_generate_token(
 
     let minted = generate_jwt_token(&jwt.private_key_path, iss, aud, expires_in_months)?;
 
-    let mut registry = JsonUserRegistry::open(users_file)?;
+    let mut registry = JsonUserRegistry::open(users_file.clone())?;
     registry.register_user(&User {
         email: user_email,
         password_hash: hash_password(password)?,
         token: minted.token.clone(),
     })?;
+    // Canonicalize after register_user so the file exists on disk.
+    config.api.users_file = path_for_config(users_file).display().to_string();
+    save_config(&config, Some(config_path.clone()))?;
 
     eprintln!("sub: {}", minted.claims.sub);
     eprintln!(
