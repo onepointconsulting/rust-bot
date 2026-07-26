@@ -208,11 +208,11 @@ mod tests {
 
         let mut config1 = Config::default();
         config1.agents.model = "model-v1".to_string();
-        save_config(&config1, Some(path.clone()));
+        let _ = save_config(&config1, Some(path.clone()));
 
         let mut config2 = Config::default();
         config2.agents.model = "model-v2".to_string();
-        save_config(&config2, Some(path.clone()));
+        let _ = save_config(&config2, Some(path.clone()));
 
         let loaded = load_config(Some(path));
         assert_eq!(loaded.agents.model, "model-v2");

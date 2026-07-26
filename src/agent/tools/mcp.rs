@@ -12,6 +12,7 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use crate::agent::tools::base::Tool;
+use crate::agent::tools::mcp_file_ref::{has_file_reference, FileRefResolver};
 use crate::config::schema::{McpServerConfig, McpTransportType};
 
 
@@ -422,6 +423,19 @@ pub async fn load_mcp_tools_from_config(
     config: &McpServerConfig,
     server_name: &str,
 ) -> Result<LoadedMcpTools, LoadMcpToolsError> {
+    load_mcp_tools_with_file_refs(config, server_name, None).await
+}
+
+/// Same as [`load_mcp_tools_from_config`], but every wrapped tool can expand
+/// `file://` / `$file` arguments through `file_refs`.
+///
+/// Pass the resolver built from the agent's workspace scope so file references
+/// obey the same sandbox as the filesystem tools. `None` disables expansion.
+pub async fn load_mcp_tools_with_file_refs(
+    config: &McpServerConfig,
+    server_name: &str,
+    file_refs: Option<FileRefResolver>,
+) -> Result<LoadedMcpTools, LoadMcpToolsError> {
     let client = connect_mcp_server(config).await.map_err(LoadMcpToolsError::Connect)?;
     let tools_result = client
         .peer
@@ -434,11 +448,12 @@ pub async fn load_mcp_tools_from_config(
         .tools
         .iter()
         .map(|tool_def| {
-            Box::new(MCPToolWrapper::new(
+            Box::new(MCPToolWrapper::with_file_refs(
                 peer.clone(),
                 server_name,
                 tool_def,
                 timeout,
+                file_refs.clone(),
             )) as Box<dyn Tool>
         })
         .collect();
@@ -453,6 +468,9 @@ pub struct MCPToolWrapper {
     description: String,
     parameters: Value,
     tool_timeout: Duration,
+    /// Expands `file://` / `$file` arguments just before dispatch. `None`
+    /// disables the feature, in which case sentinels are sent through verbatim.
+    file_refs: Option<FileRefResolver>,
 }
 
 impl MCPToolWrapper {
@@ -461,6 +479,20 @@ impl MCPToolWrapper {
         server_name: &str,
         tool_def: &McpToolDef,
         tool_timeout: Duration,
+    ) -> Self {
+        Self::with_file_refs(session, server_name, tool_def, tool_timeout, None)
+    }
+
+    /// Same as [`Self::new`] but with file-reference expansion enabled.
+    ///
+    /// The resolver carries the workspace sandbox, so references are subject to
+    /// the same path restrictions as the filesystem tools.
+    pub fn with_file_refs(
+        session: Peer<RoleClient>,
+        server_name: &str,
+        tool_def: &McpToolDef,
+        tool_timeout: Duration,
+        file_refs: Option<FileRefResolver>,
     ) -> Self {
         let original_name = tool_def.name.to_string();
         let name = format!("mcp_{}_{}", server_name, tool_def.name);
@@ -471,7 +503,15 @@ impl MCPToolWrapper {
             .to_string();
         let json_object = tool_def.input_schema.as_ref();
         let parameters = normalize_schema_for_openai(&Value::Object(json_object.clone()));
-        Self { session, original_name, name, description, parameters: parameters.clone(), tool_timeout }
+        Self {
+            session,
+            original_name,
+            name,
+            description,
+            parameters: parameters.clone(),
+            tool_timeout,
+            file_refs,
+        }
     }
 }
 
@@ -493,6 +533,29 @@ impl Tool for MCPToolWrapper {
     }
 
     async fn execute(&self, params: &serde_json::Value) -> String {
+        // Substitute any `file://` / `$file` reference with the real file
+        // content before dispatch, so binary payloads never have to be emitted
+        // as tokens by the model. Failures are returned as tool output rather
+        // than sent on, otherwise the server would receive the literal sentinel
+        // and reply with a confusing type error.
+        let expanded;
+        let params = match &self.file_refs {
+            Some(resolver) if has_file_reference(params) => match resolver.expand(params) {
+                Ok((value, notes)) => {
+                    for note in notes {
+                        log::info!("MCP tool '{}' expanded file reference: {}", self.name, note);
+                    }
+                    expanded = value;
+                    &expanded
+                }
+                Err(e) => {
+                    log::error!("MCP tool '{}' file reference failed: {}", self.name, e);
+                    return format!("(file reference error: {e})");
+                }
+            },
+            _ => params,
+        };
+
         let req = {
             let base = CallToolRequestParams::new(self.original_name.clone());
             match params.as_object().cloned() {
@@ -536,6 +599,49 @@ impl Tool for MCPToolWrapper {
         }
     }
     
+    /// MCP servers validate their own arguments and their advertised schemas are
+    /// often lossy (e.g. Java byte[] rendered as array-of-string while the server
+    /// also accepts base64). Do not pre-reject; let the server decide.
+    fn validate_params(&self, params: &serde_json::Value) -> Vec<String> {
+        mcp_validate_params(params)
+    }
+
+    /// Pass arguments through to the MCP server unchanged.
+    ///
+    /// The default [`Tool::cast_params`] coerces values to match the advertised
+    /// schema, which is actively harmful for MCP tools:
+    ///
+    /// * Remote schemas are frequently lossy or plain wrong. A Java `byte[]`
+    ///   parameter is rendered as `{"type":"array","items":{"type":"string"}}`,
+    ///   even though the server's Jackson deserializer also accepts a base64
+    ///   string and an array of raw numbers.
+    /// * The `"string"` branch of `_cast_value` uses `Value::to_string()`, which
+    ///   is *serialisation*, not display. Under an `items: {type: string}`
+    ///   schema an honest byte array `[255, 216]` is silently rewritten to
+    ///   `["255", "216"]`, and structured objects get stringified into JSON text
+    ///   that the server then rejects.
+    ///
+    /// The server is the authority on its own wire format, so we send exactly
+    /// what the model produced.
+    fn cast_params(&self, params: &serde_json::Value) -> serde_json::Value {
+        mcp_cast_params(params)
+    }
+}
+
+/// Argument validation for MCP tools: always accept.
+///
+/// Free function so the behaviour is unit-testable without a live MCP session.
+/// See [`MCPToolWrapper::validate_params`] for the rationale.
+fn mcp_validate_params(_params: &serde_json::Value) -> Vec<String> {
+    Vec::new()
+}
+
+/// Argument casting for MCP tools: identity.
+///
+/// Free function so the behaviour is unit-testable without a live MCP session.
+/// See [`MCPToolWrapper::cast_params`] for the rationale.
+fn mcp_cast_params(params: &serde_json::Value) -> serde_json::Value {
+    params.clone()
 }
 
 
@@ -837,6 +943,114 @@ mod tests {
         let child = &result["properties"]["node"]["properties"]["child"];
         assert!(child.get("$ref").is_none());
         assert_eq!(child["type"], "object");
+    }
+
+    // ── MCP argument passthrough ──────────────────────────────────────────────
+    //
+    // Regression coverage for binary/base64 uploads. A real MCP server (EMS,
+    // Spring/Jackson) advertises a Java `byte[]` parameter as
+    // `{"type":"array","items":{"type":"string"}}` while actually accepting a
+    // base64 string, an array of numbers, and an array of numeric strings.
+    // The default `Tool` behaviour rejected the base64 form outright and
+    // rewrote numeric arrays, so both overrides must stay in place.
+
+    /// Stub tool reproducing the lossy `saveEventImageForEventId` schema.
+    struct LossySchemaTool;
+
+    #[async_trait]
+    impl Tool for LossySchemaTool {
+        fn name(&self) -> String {
+            "mcp_ems_saveEventImageForEventId".to_string()
+        }
+        fn description(&self) -> String {
+            String::new()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            json!({
+                "type": "object",
+                "properties": {
+                    "eventId": {"type": "integer", "format": "int64"},
+                    "content": {"type": "array", "items": {"type": "string"}},
+                    "imagePos": {"type": "integer", "format": "int32"},
+                    "name": {"type": "string"}
+                },
+                "required": ["eventId", "content", "imagePos", "name"]
+            })
+        }
+        async fn execute(&self, _params: &serde_json::Value) -> String {
+            String::new()
+        }
+        // Deliberately inherits the default cast_params / validate_params.
+    }
+
+    /// The default trait impl is what broke base64 uploads: a plain string is
+    /// rejected against an `array` schema before the request ever leaves.
+    #[test]
+    fn test_default_validation_rejects_base64_string() {
+        let tool = LossySchemaTool;
+        let params = json!({
+            "eventId": 7255314,
+            "content": "/9j/4AAQSkZJRg==",
+            "imagePos": 4,
+            "name": "probe.jpg"
+        });
+        let errors = tool.validate_params(&params);
+        assert!(
+            errors.iter().any(|e| e.contains("should be array")),
+            "expected default impl to reject base64 string, got {errors:?}"
+        );
+    }
+
+    /// The default cast also mangles an honest byte array into strings.
+    #[test]
+    fn test_default_cast_mangles_numeric_byte_array() {
+        let tool = LossySchemaTool;
+        let params = json!({"content": [255, 216, 255, 217]});
+        let cast = tool.cast_params(&params);
+        assert_eq!(
+            cast["content"],
+            json!(["255", "216", "255", "217"]),
+            "default cast should stringify bytes (documents the bug being fixed)"
+        );
+    }
+
+    /// `MCPToolWrapper::validate_params` must accept every wire form the server
+    /// understands, including the base64 string the default impl rejected.
+    #[test]
+    fn test_mcp_validate_params_accepts_any_shape() {
+        for content in [
+            json!("/9j/4AAQSkZJRg=="),
+            json!([255, 216, 255, 217]),
+            json!(["255", "216"]),
+            json!(null),
+        ] {
+            let params = json!({"content": content});
+            // An empty error list means `ToolRegistry::prepare_call` proceeds
+            // to execute instead of failing the call up front.
+            let errors = mcp_validate_params(&params);
+            assert!(
+                errors.is_empty(),
+                "MCP wrapper must not pre-reject params: {params}"
+            );
+        }
+    }
+
+    /// `MCPToolWrapper::cast_params` must be an identity transform so binary
+    /// payloads reach the server byte-for-byte.
+    #[test]
+    fn test_mcp_cast_params_is_identity() {
+        let params = json!({
+            "eventId": 7255314,
+            "content": [255, 216, 255, 217],
+            "imagePos": 4,
+            "name": "probe.jpg"
+        });
+        // Identity contract: bytes stay numbers, integers stay integers.
+        let cast = mcp_cast_params(&params);
+        assert_eq!(cast, params);
+        assert_eq!(cast["content"][0], json!(255));
+        assert!(cast["content"][0].is_number());
+        assert!(cast["eventId"].is_number());
     }
 
     use crate::config::schema::McpServerConfig;

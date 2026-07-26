@@ -23,7 +23,8 @@ use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::FsToolConfig;
-use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_from_config};
+use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_with_file_refs};
+use crate::agent::tools::mcp_file_ref::FileRefResolver;
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
@@ -571,7 +572,7 @@ impl AgentLoop {
         // closes its connection when dropped. On success we keep the sessions
         // alive by storing them on `self`; on failure they are dropped here,
         // which is the equivalent of `await stack.aclose()`.
-        match Self::connect_mcp_servers(&self.mcp_servers).await {
+        match Self::connect_mcp_servers(&self.mcp_servers, self.mcp_file_ref_resolver()).await {
             Ok(mut sessions) => {
                 let mut mcp_tool_count = 0usize;
                 {
@@ -612,12 +613,31 @@ impl AgentLoop {
     /// sessions established so far are dropped as the error unwinds.
     async fn connect_mcp_servers(
         servers: &HashMap<String, McpServerConfig>,
+        file_refs: Option<FileRefResolver>,
     ) -> Result<Vec<LoadedMcpTools>, LoadMcpToolsError> {
         let mut sessions = Vec::with_capacity(servers.len());
         for (name, config) in servers {
-            sessions.push(load_mcp_tools_from_config(config, name).await?);
+            sessions
+                .push(load_mcp_tools_with_file_refs(config, name, file_refs.clone()).await?);
         }
         Ok(sessions)
+    }
+
+    /// Sandbox used when an MCP argument references a local file.
+    ///
+    /// Mirrors the filesystem tools' scope, so `restrictToWorkspace` applies to
+    /// `file://` arguments too and they cannot read outside the workspace.
+    fn mcp_file_ref_resolver(&self) -> Option<FileRefResolver> {
+        let (allowed_dir, extra_read) = filesystem_tool_scope(
+            &self.workspace,
+            self.restrict_to_workspace,
+            &self.exec_config.sandbox,
+        );
+        Some(FileRefResolver::with_scope(
+            Some(self.workspace.clone()),
+            allowed_dir,
+            extra_read,
+        ))
     }
 
     /// Connect to configured MCP servers if not already connected or connecting.
