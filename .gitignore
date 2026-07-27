@@ -1,4 +1,5 @@
 /target
+/web-chat/dist
 notes.txt
 .env
 

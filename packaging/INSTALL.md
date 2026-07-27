@@ -1,8 +1,8 @@
 # Rust Bot - Installation
 
 This package contains a pre-built `rust-bot` binary, helper tools
-(`generate-jwt` and `gmail-auth`), and two sample configurations. Follow
-these steps to get started.
+(`generate-jwt` and `gmail-auth`), the `web-chat` web UI assets, and two
+sample configurations. Follow these steps to get started.
 
 ## 1. Unpack
 
@@ -15,6 +15,11 @@ rust-bot-<version>-<platform>/
   gmail-auth[.exe]
   INSTALL.md
   templates/
+  web/
+    index.html
+    *.js
+    *.wasm
+    *.css
   configuration/samples/
     openai-compat.json
     anthropic.json
@@ -186,7 +191,30 @@ registered without `--password` simply omit that field.
 Keep private keys, minted tokens, and the users file secret; do not commit
 them.
 
-## 6. Next steps
+## 6. Web chat UI
+
+The package includes a pre-built `web-chat` UI (`web/index.html`, `*.js`,
+`*.wasm`) — a small login + chat interface for the REST API. It's served
+automatically by `rust-bot api` when a web root is configured.
+
+```bash
+# Windows
+.\rust-bot.exe api --config .\path\to\config.json --web-root .\web
+
+# Linux / macOS
+./rust-bot api --config ./path/to/config.json --web-root ./web
+```
+
+Then open `http://<host>:<port>/` in a browser (the default is
+`http://127.0.0.1:8900/`). You can also set `api.webRoot` in the config
+file instead of passing `--web-root` every time; if `./web` exists next to
+the binary and neither is set, it is used automatically.
+
+The UI needs `api.jwt.enabled: true` to log in (see "API JWT keys and
+tokens" above) and a user registered via `generate-jwt generate-jwt-token
+--password ...` so it has an email/password to sign in with.
+
+## 7. Next steps
 
 - Copy a sample config to a location of your choice and adjust it (workspace
   path, ports, tool settings) once you are up and running.

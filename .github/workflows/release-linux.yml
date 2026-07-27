@@ -54,12 +54,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          targets: x86_64-unknown-linux-gnu
+          targets: x86_64-unknown-linux-gnu,wasm32-unknown-unknown
 
       - name: Cache cargo registry and build artifacts
         uses: Swatinem/rust-cache@v2
         with:
           key: linux-x86_64-unknown-linux-gnu
+
+      - name: Install Trunk
+        run: cargo install trunk --locked
+
+      - name: Build web-chat (Leptos/WASM UI)
+        working-directory: web-chat
+        run: trunk build --release
 
       - name: Build release binaries
         run: cargo build --release --bin rust-bot --bin generate-jwt --bin gmail-auth --target x86_64-unknown-linux-gnu
@@ -78,6 +85,7 @@ jobs:
           cp "target/x86_64-unknown-linux-gnu/release/gmail-auth" "${stage_name}/gmail-auth"
           cp "packaging/INSTALL.md" "${stage_name}/INSTALL.md"
           cp packaging/samples/* "${stage_name}/configuration/samples/"
+          cp -r web-chat/dist "${stage_name}/web"
           chmod +x "${stage_name}/rust-bot" "${stage_name}/generate-jwt" "${stage_name}/gmail-auth"
 
           tar czf "$archive_name" "$stage_name"
@@ -99,9 +107,9 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
             Each package bundles the `rust-bot`, `generate-jwt`, and
-            `gmail-auth` binaries, sample configurations under
-            `configuration/samples/`, and an `INSTALL.md` with setup
-            instructions.
+            `gmail-auth` binaries, the web-chat UI assets under `web/`,
+            sample configurations under `configuration/samples/`, and an
+            `INSTALL.md` with setup instructions.
           files: ${{ steps.package.outputs.archive }}
           fail_on_unmatched_files: true
         env:

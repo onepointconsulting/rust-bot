@@ -432,8 +432,24 @@ rust-bot/
 ├── configs/          # Sample provider configs
 ├── templates/        # Workspace seed files (also embedded into the binary at build time)
 ├── tests/            # Unit and integration tests
+├── web-chat/         # Leptos (Rust + WASM) chat UI, independent workspace member — see web-chat/README.md
 └── README.md
 ```
+
+### Web chat UI
+
+`web-chat/` is a small Leptos + Tailwind chat UI (login + chat) that talks
+to the REST API over HTTP only — it shares no code with the rest of the
+crate. Build it with [Trunk](https://trunkrs.dev) and serve the output
+alongside the API:
+
+```bash
+cd web-chat && trunk build --release && cd ..
+cargo run -- api --config ./configs/simple1/config.json --web-root ./web-chat/dist
+```
+
+Then open `http://127.0.0.1:8900/`. See [`web-chat/README.md`](web-chat/README.md)
+for local development (`trunk serve`) instructions.
 
 ## License
 

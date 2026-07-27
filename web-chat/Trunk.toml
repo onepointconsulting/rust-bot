@@ -1,0 +1,23 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "index.html", "style", "tailwind.config.js"]
+
+[serve]
+address = "127.0.0.1"
+port = 8901
+open = false
+
+[[proxy]]
+backend = "http://127.0.0.1:8900/v1/"
+
+[[proxy]]
+backend = "http://127.0.0.1:8900/health"
+
+[[proxy]]
+backend = "http://127.0.0.1:8900/swagger-ui/"
+
+[[proxy]]
+backend = "http://127.0.0.1:8900/api-docs/"

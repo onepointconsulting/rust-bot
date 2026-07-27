@@ -587,6 +587,42 @@ fn default_users_file() -> String {
     "./.rust-bot/users.json".to_string()
 }
 
+fn cors_enabled() -> bool {
+    true
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+/// Cross-Origin Resource Sharing (CORS) settings for the API server.
+///
+/// When `enabled` is true, browsers on other origins can call the API.
+/// Use `origins: ["*"]` (the default) to allow any origin, or list specific
+/// origins such as `["https://app.example.com"]` for tighter control.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CorsConfig {
+    /// Whether CORS middleware is active. Default: `true`.
+    #[serde(alias = "enabled", default = "cors_enabled")]
+    #[garde(skip)]
+    pub enabled: bool,
+
+    /// Allowed origins. `"*"` (or an empty list) allows any origin.
+    #[serde(alias = "origins", default = "default_cors_origins")]
+    #[garde(skip)]
+    pub origins: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: cors_enabled(),
+            origins: default_cors_origins(),
+        }
+    }
+}
+
 /// OpenAI-compatible API server configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
@@ -615,6 +651,19 @@ pub struct ApiConfig {
     #[serde(alias = "users_file", default = "default_users_file")]
     #[garde(skip)]
     pub users_file: String,
+
+    /// CORS configuration for browser clients on other origins.
+    #[serde(alias = "cors")]
+    #[garde(dive)]
+    pub cors: CorsConfig,
+
+    /// Directory of pre-built web-chat static assets (`index.html`, JS,
+    /// WASM) to serve alongside the API. When unset, the CLI falls back
+    /// to `./web` if that directory exists; otherwise the API runs
+    /// without serving a web UI.
+    #[serde(alias = "web_root", default)]
+    #[garde(skip)]
+    pub web_root: Option<String>,
 }
 
 impl Default for ApiConfig {
@@ -625,6 +674,8 @@ impl Default for ApiConfig {
             timeout: default_api_timeout(),
             jwt: JwtConfig::default(),
             users_file: default_users_file(),
+            cors: CorsConfig::default(),
+            web_root: None,
         }
     }
 }
@@ -1842,6 +1893,46 @@ mod tests {
         assert!(!cfg.jwt.enabled);
         assert_eq!(cfg.jwt.iss, "rust-bot");
         assert_eq!(cfg.jwt.aud, "");
+        assert!(cfg.cors.enabled);
+        assert_eq!(cfg.cors.origins, vec!["*".to_string()]);
+        assert_eq!(cfg.web_root, None);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_web_root_deserialize() {
+        let json = r#"{"webRoot": "./web"}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.web_root, Some("./web".to_string()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_deserialize_nested_under_api() {
+        let json = r#"{
+            "cors": {
+                "enabled": true,
+                "origins": ["https://app.example.com", "http://localhost:5173"]
+            }
+        }"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.cors.enabled);
+        assert_eq!(
+            cfg.cors.origins,
+            vec![
+                "https://app.example.com".to_string(),
+                "http://localhost:5173".to_string()
+            ]
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_can_be_disabled() {
+        let json = r#"{"cors": {"enabled": false}}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.cors.enabled);
+        assert_eq!(cfg.cors.origins, vec!["*".to_string()]);
         assert!(cfg.validate().is_ok());
     }
 

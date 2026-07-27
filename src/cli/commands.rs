@@ -154,6 +154,12 @@ pub struct ApiArgs {
     #[arg(short, long, default_value = "api:default")]
     pub session: String,
 
+    /// Directory of pre-built web-chat static assets (index.html, *.js, *.wasm)
+    /// to serve alongside the API. Falls back to `api.webRoot` in the config
+    /// file, then to `./web` if that directory exists.
+    #[arg(long = "web-root")]
+    pub web_root: Option<PathBuf>,
+
     /// JSON configuration file path (workspace is taken from `agents.workspace`)
     #[arg(short, long)]
     pub config: PathBuf,
@@ -454,6 +460,21 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
     }
 }
 
+/// Resolve the web-chat static assets directory: CLI `--web-root` takes
+/// priority, then `api.webRoot` from the config file, then `./web` if that
+/// directory happens to exist. Returns `None` when nothing is configured
+/// and no default directory is present (the API then runs without a UI).
+fn resolve_web_root(cli_web_root: Option<PathBuf>, config_web_root: Option<String>) -> Option<PathBuf> {
+    if let Some(path) = cli_web_root {
+        return Some(path);
+    }
+    if let Some(path) = config_web_root {
+        return Some(PathBuf::from(path));
+    }
+    let default_path = PathBuf::from("./web");
+    default_path.exists().then_some(default_path)
+}
+
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     init_runtime_logging(true, None);
     let (config, workspace) = prepare_workspace(args.config, None);
@@ -463,13 +484,22 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     let model_name = config.agents.model.clone();
     let session_id = args.session.clone();
     let timeout = args.timeout;
+    let web_root = resolve_web_root(args.web_root, config.api.web_root.clone());
     let users_file: PathBuf = config.api.users_file.clone().into();
     let user_registry = if users_file.exists() {
         JsonUserRegistry::open(users_file).unwrap()
     } else {
         JsonUserRegistry::empty()
     };
-    render_api_startup_message(&host, port, &model_name, &workspace, &session_id, &timeout);
+    render_api_startup_message(
+        &host,
+        port,
+        &model_name,
+        &workspace,
+        &session_id,
+        &timeout,
+        web_root.as_deref(),
+    );
     if let Err(err) = create_api_server(ApiServer {
         agent_loop: Arc::new(agent_loop),
         host,
@@ -478,6 +508,8 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
         model_name,
         timeout,
         jwt: config.api.jwt.clone(),
+        cors: config.api.cors.clone(),
+        web_root,
         user_registry: Arc::new(StdMutex::new(user_registry)),
     })
     .await
@@ -887,6 +919,7 @@ fn render_api_startup_message(
     workspace: &PathBuf,
     session_id: &str,
     timeout: &u64,
+    web_root: Option<&std::path::Path>,
 ) {
     print_markdown(&format!("{} Starting OpenAI-compatible API server", LOGO));
     println!();
@@ -894,6 +927,15 @@ fn render_api_startup_message(
         "Endpoint: **http://{host}:{port}/v1/chat/completions**"
     ));
     print_markdown(&format!("Swagger UI: **http://{host}:{port}/swagger-ui**"));
+    match web_root {
+        Some(path) => print_markdown(&format!(
+            "Web UI: **http://{host}:{port}/** (serving `{}`)",
+            path.display()
+        )),
+        None => print_markdown(
+            "Web UI: **disabled** (pass `--web-root <dir>` or set `api.webRoot` to serve web-chat)",
+        ),
+    }
     print_markdown(&format!("Model: **{}**", model_name));
     print_markdown(&format!("Workspace: **{}**", workspace.display()));
     print_markdown(&format!("Session: **{}**", session_id));

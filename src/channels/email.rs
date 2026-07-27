@@ -207,21 +207,6 @@ pub struct EmailChannel {
 }
 
 impl EmailChannel {
-    const IMAP_RECONNECT_MARKERS: [&str; 6] = [
-        "disconnected for inactivity",
-        "eof occurred in violation of protocol",
-        "socket error",
-        "connection reset",
-        "broken pipe",
-        "bye",
-    ];
-    const IMAP_MISSING_MAILBOX_MARKERS: [&str; 5] = [
-        "mailbox doesn't exist",
-        "select failed",
-        "no such mailbox",
-        "can't open mailbox",
-        "does not exist",
-    ];
 
     const MAX_PROCESSED_UIDS: usize = 100000;
 

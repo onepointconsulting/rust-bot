@@ -1,17 +1,23 @@
 use std::future::Future;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use axum::{
     Json, Router,
     extract::State,
-    http::{Request, StatusCode, header::AUTHORIZATION},
+    http::{
+        HeaderValue, Method, Request, StatusCode,
+        header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
+    },
     middleware::{self, Next},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
 use chrono::Utc;
 use tokio::net::TcpListener;
+use tower_http::cors::{Any, CorsLayer};
+use tower_http::services::{ServeDir, ServeFile};
 use utoipa::openapi::security::{HttpAuthScheme, HttpBuilder, SecurityScheme};
 use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
@@ -19,7 +25,7 @@ use uuid::Uuid;
 
 use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
 use crate::api::user_registry::{verify_password, User, UserRegistry};
-use crate::config::schema::JwtConfig;
+use crate::config::schema::{CorsConfig, JwtConfig};
 use crate::security::jwt::{
     generate_jwt_token, validate_jwt_token, JwtValidationOpts, DEFAULT_EXPIRES_IN_MONTHS,
 };
@@ -43,6 +49,10 @@ pub struct ApiServer {
     pub model_name: String,
     pub timeout: u64,
     pub jwt: JwtConfig,
+    pub cors: CorsConfig,
+    /// Directory of pre-built web-chat static assets (`index.html`, JS,
+    /// WASM) to serve alongside the API. `None` disables web UI serving.
+    pub web_root: Option<PathBuf>,
     pub user_registry: Arc<Mutex<dyn UserRegistry + Send>>,
 }
 
@@ -503,10 +513,47 @@ async fn shutdown_signal() {
     }
 }
 
+/// Build a CORS layer from config.
+///
+/// - `enabled: false` → no CORS headers (empty layer).
+/// - `origins` empty or containing `"*"` → allow any origin.
+/// - otherwise → allow only the listed origins.
+fn build_cors_layer(cors: &CorsConfig) -> CorsLayer {
+    if !cors.enabled {
+        return CorsLayer::new();
+    }
+
+    let allow_any = cors.origins.is_empty()
+        || cors.origins.iter().any(|origin| origin.trim() == "*");
+
+    let layer = CorsLayer::new()
+        .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
+        .allow_headers([AUTHORIZATION, CONTENT_TYPE, ACCEPT]);
+
+    if allow_any {
+        layer.allow_origin(Any)
+    } else {
+        let origins: Vec<HeaderValue> = cors
+            .origins
+            .iter()
+            .filter_map(|origin| match origin.parse::<HeaderValue>() {
+                Ok(value) => Some(value),
+                Err(err) => {
+                    log::warn!("Ignoring invalid CORS origin '{origin}': {err}");
+                    None
+                }
+            })
+            .collect();
+        layer.allow_origin(origins)
+    }
+}
+
 pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     let addr = format!("{}:{}", server.host, server.port);
     let agent_loop = Arc::clone(&server.agent_loop);
     let jwt_enabled = server.jwt.enabled;
+    let cors = server.cors.clone();
+    let web_root = server.web_root.clone();
 
     agent_loop.connect_mcp().await;
 
@@ -521,16 +568,50 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
             jwt_auth_middleware,
         ));
 
-    let app = Router::new()
+    let mut app = Router::new()
         .route("/health", get(health))
         .route("/v1/login", post(login))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected)
-        .with_state(state);
+        .layer(build_cors_layer(&cors));
+
+    let web_ui_status = match &web_root {
+        Some(root) if root.is_dir() => {
+            let index_html = root.join("index.html");
+            app = app.fallback_service(ServeDir::new(root).not_found_service(ServeFile::new(index_html)));
+            Some(format!("serving `{}`", root.display()))
+        }
+        Some(root) => {
+            log::warn!(
+                "api.webRoot / --web-root points at '{}', which is not a directory; web UI serving is disabled",
+                root.display()
+            );
+            None
+        }
+        None => None,
+    };
+
+    let app = app.with_state(state);
 
     let listener = TcpListener::bind(&addr).await?;
     log::info!("API server listening on http://{addr}");
     log::info!("Swagger UI available at http://{addr}/swagger-ui");
+    match web_ui_status {
+        Some(status) => log::info!("Web UI available at http://{addr}/ ({status})"),
+        None => log::info!("Web UI disabled (no valid --web-root / api.webRoot configured)"),
+    }
+    if cors.enabled {
+        let origins = if cors.origins.is_empty()
+            || cors.origins.iter().any(|o| o.trim() == "*")
+        {
+            "*".to_string()
+        } else {
+            cors.origins.join(", ")
+        };
+        log::info!("CORS enabled for origins: {origins}");
+    } else {
+        log::info!("CORS disabled");
+    }
     if jwt_enabled {
         log::info!(
             "JWT authentication enabled for protected /v1/* routes (/v1/login remains public)"
