@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "rust-bot"
-version = "0.1.4"
+version = "0.1.5"
 edition = "2024"
 
 [dependencies]
@@ -87,6 +87,11 @@ ed25519-dalek = { version = "2.1", features = ["pem", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 pkcs8 = { version = "0.10", features = ["std"] }
 argon2 = "0.5.3"
+
+# On Linux, statically link OpenSSL so release binaries do not require libssl.so.3.
+# Windows/macOS use platform TLS (SChannel / Secure Transport), so this is Linux-only.
+[target.'cfg(target_os = "linux")'.dependencies]
+openssl = { version = "0.10", features = ["vendored"] }
 
 [dev-dependencies]
 tempfile = "3"
