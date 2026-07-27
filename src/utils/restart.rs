@@ -53,7 +53,7 @@ pub fn restart_with_notice(channel: &str, chat_id: &str) -> std::io::Result<()> 
     #[cfg(unix)]
     {
         use std::os::unix::process::CommandExt;
-        cmd.exec();
+        let _ = cmd.exec();
         return Err(std::io::Error::last_os_error());
     }
 
