@@ -22,4 +22,11 @@ gloo-net = { version = "0.6", features = ["http"] }
 gloo-storage = "0.3"
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 ammonia = "4"
-web-sys = { version = "0.3", features = ["HtmlElement", "Element", "ScrollBehavior", "ScrollIntoViewOptions"] }
+web-sys = { version = "0.3", features = [
+    "HtmlElement",
+    "HtmlTextAreaElement",
+    "Element",
+    "CssStyleDeclaration",
+    "ScrollBehavior",
+    "ScrollIntoViewOptions",
+] }
