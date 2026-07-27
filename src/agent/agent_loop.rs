@@ -34,14 +34,14 @@ use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    AgentDefaults, ChannelsConfig, DocxToolConfig, ExecToolConfig, GmailToolConfig, McpServerConfig, OcrToolConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig,
+    AgentDefaults, ChannelsConfig, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
-    filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_ocr_tools, register_web_tools,
+    filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
 };
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
@@ -348,6 +348,7 @@ impl AgentLoop {
         gmail_config: Option<GmailToolConfig>,
         ocr_config: Option<OcrToolConfig>,
         docx_config: Option<DocxToolConfig>,
+        image_generation_config: Option<ImageGenerationToolConfig>,
         subagent_config: Option<SubagentConfig>,
         cron_service: Option<Arc<CronService>>,
         restrict_to_workspace: Option<bool>,
@@ -364,6 +365,8 @@ impl AgentLoop {
         let gmail_config = gmail_config.unwrap_or(GmailToolConfig::default());
         let ocr_config = ocr_config.unwrap_or(OcrToolConfig::default());
         let docx_config = docx_config.unwrap_or(DocxToolConfig::default());
+        let image_generation_config =
+            image_generation_config.unwrap_or(ImageGenerationToolConfig::default());
         let subagent_config = subagent_config.unwrap_or(SubagentConfig::default());
         let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
@@ -396,6 +399,7 @@ impl AgentLoop {
             Some(gmail_config.clone()),
             Some(ocr_config.clone()),
             Some(docx_config.clone()),
+            Some(image_generation_config.clone()),
             Some(subagent_config.clone()),
             Some(restrict_to_workspace),
         ));
@@ -408,6 +412,7 @@ impl AgentLoop {
             &gmail_config,
             &ocr_config,
             &docx_config,
+            &image_generation_config,
             bus.clone(),
             &cron_service,
             &timezone,
@@ -503,6 +508,7 @@ impl AgentLoop {
         gmail_config: &GmailToolConfig,
         ocr_config: &OcrToolConfig,
         docx_config: &DocxToolConfig,
+        image_generation_config: &ImageGenerationToolConfig,
         bus: Arc<MessageBus>,
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
@@ -541,6 +547,7 @@ impl AgentLoop {
                 Some(workspace.clone()),
                  allowed_dir, Some(extra_read)), tools
         );
+        register_image_generation_tools(image_generation_config, workspace, tools);
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",
@@ -1927,6 +1934,7 @@ mod tests {
             None,
             None,
             Some(max_tool_result_chars),
+            None,
             None,
             None,
             None,

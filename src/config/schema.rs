@@ -880,6 +880,82 @@ impl Default for DocxToolConfig {
     }
 }
 
+// ── ImageGenerationToolConfig ───────────────────────────────────────────────────────────
+
+fn default_image_generation_tool_enable() -> bool {
+    false
+}
+
+fn default_image_generation_tool_model() -> String {
+    "openai/gpt-image-2".to_string()
+}
+
+fn default_image_generation_tool_api_key() -> String {
+    String::new()
+}
+
+fn default_image_generation_tool_base_url() -> String {
+    "https://openrouter.ai/api/v1/images".to_string()
+}
+
+fn default_image_generation_tool_size() -> String {
+    String::new()
+}
+
+fn default_image_generation_tool_quality() -> String {
+    String::new()
+}
+
+/// Image Generation Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImageGenerationToolConfig {
+    /// Enable or disable the Image Generation Tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_image_generation_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// Model to use for image generation. Default: `"openai/gpt-image-2"`.
+    #[serde(alias = "model", default = "default_image_generation_tool_model")]
+    #[garde(skip)]
+    pub model: String,
+
+    /// API key for the image generation tool. Falls back to `OPENROUTER_API_KEY` when empty. Default: `""`.
+    #[serde(alias = "api_key", default = "default_image_generation_tool_api_key")]
+    #[garde(skip)]
+    pub api_key: String,
+
+    /// API base URL for image generation requests. Default: `"https://openrouter.ai/api/v1/images"`.
+    #[serde(alias = "base_url", default = "default_image_generation_tool_base_url")]
+    #[garde(skip)]
+    pub base_url: String,
+
+    /// Default image size (tier such as `"1K"`/`"2K"` or explicit pixels such as `"1024x1024"`).
+    /// Empty means omit from the request. Default: `""`.
+    #[serde(alias = "size", default = "default_image_generation_tool_size")]
+    #[garde(skip)]
+    pub size: String,
+
+    /// Default rendering quality (`"auto"`, `"low"`, `"medium"`, or `"high"`).
+    /// Empty means omit from the request. Default: `""`.
+    #[serde(alias = "quality", default = "default_image_generation_tool_quality")]
+    #[garde(skip)]
+    pub quality: String,
+}
+
+impl Default for ImageGenerationToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_image_generation_tool_enable(),
+            model: default_image_generation_tool_model(),
+            api_key: default_image_generation_tool_api_key(),
+            base_url: default_image_generation_tool_base_url(),
+            size: default_image_generation_tool_size(),
+            quality: default_image_generation_tool_quality(),
+        }
+    }
+}
+
 // ── ExecToolConfig ────────────────────────────────────────────────────────────
 
 fn default_exec_tool_enable() -> bool {
@@ -1111,6 +1187,10 @@ pub struct ToolsConfig {
     #[serde(alias = "ocr")]
     #[garde(dive)]
     pub ocr: OcrToolConfig,
+
+    #[serde(alias = "image_generation")]
+    #[garde(dive)]
+    pub image_generation: ImageGenerationToolConfig,
 }
 
 impl Default for ToolsConfig {
@@ -1124,6 +1204,7 @@ impl Default for ToolsConfig {
             gmail: GmailToolConfig::default(),
             docx: DocxToolConfig::default(),
             ocr: OcrToolConfig::default(),
+            image_generation: ImageGenerationToolConfig::default(),
         }
     }
 }

@@ -3,9 +3,9 @@ use std::path::PathBuf;
 use crate::{
     agent::{
         skills::BUILTIN_SKILLS_DIR, tools::{
-            base::Tool, docx::DocxConversionTool, filesystem::{EditFileTool, FsToolConfig, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, ocr::OcrTool, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
+            base::Tool, docx::DocxConversionTool, filesystem::{EditFileTool, FsToolConfig, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, image_generation::ImageGenerationTool, ocr::OcrTool, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
         },
-    }, config::schema::{DocxToolConfig, GmailToolConfig, OcrToolConfig, WebToolsConfig},
+    }, config::schema::{DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, WebToolsConfig},
 };
 
 /// Workspace restriction and builtin-skills read path used by filesystem tools.
@@ -127,6 +127,19 @@ pub fn register_conversion_tools(
     log::debug!("Registering DOCX tool");
     let tool = DocxConversionTool::new(fs_tool_config.clone());
     tools.register(Box::new(tool))
+}
+
+pub fn register_image_generation_tools(
+    image_generation_config: &ImageGenerationToolConfig,
+    workspace: &PathBuf,
+    tools: &mut ToolRegistry,
+) {
+    if !image_generation_config.enable {
+        return;
+    }
+    log::debug!("Registering image generation tool");
+    let tool = ImageGenerationTool::new(image_generation_config.clone(), workspace.clone());
+    tools.register(Box::new(tool));
 }
 
 #[cfg(test)]

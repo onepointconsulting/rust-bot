@@ -13,3 +13,4 @@ pub mod message;
 pub mod gmail;
 pub mod ocr;
 pub mod docx;
+pub mod image_generation;

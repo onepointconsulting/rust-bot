@@ -65,8 +65,9 @@ const TOOL_EXEC: &'static str = "exec";
 const TOOL_OCR: &'static str = "ocr";
 const TOOL_DOCX: &'static str = "docx";
 const TOOL_MCP: &'static str = "mcp";
-const AVAILABLE_TOOLS: [&str; 6] = [
-    TOOL_GMAIL, TOOL_WEB, TOOL_EXEC, TOOL_OCR, TOOL_DOCX, TOOL_MCP,
+const TOOL_IMAGE_GENERATION: &'static str = "image_generation";
+const AVAILABLE_TOOLS: [&str; 7] = [
+    TOOL_GMAIL, TOOL_WEB, TOOL_EXEC, TOOL_OCR, TOOL_DOCX, TOOL_MCP, TOOL_IMAGE_GENERATION,
 ];
 
 const WEB_SEARCH_PROVIDERS: [&str; 5] = ["brave", "tavily", "duckduckgo", "searxng", "jina"];
@@ -695,6 +696,9 @@ fn configure_tools(config: &mut Config) -> Result<(), CliError> {
         TOOL_MCP => {
             configure_mcp_servers(tools)?;
         }
+        TOOL_IMAGE_GENERATION => {
+            configure_image_generation_tool(tools)?;
+        }
         _ => return Ok(()),
     }
     Ok(())
@@ -934,6 +938,51 @@ fn configure_docx_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
     docx.enable = Confirm::new("Enable DOCX conversion tool?")
         .with_default(docx.enable)
         .with_help_message("Convert DOCX documents (e.g. to PDF)")
+        .prompt()?;
+
+    Ok(())
+}
+
+fn configure_image_generation_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
+    let image_generation = &mut tools.image_generation;
+
+    image_generation.enable = Confirm::new("Enable image generation tool?")
+        .with_default(image_generation.enable)
+        .with_help_message("Generate images from a text prompt via an image generation API")
+        .prompt()?;
+
+    if !image_generation.enable {
+        return Ok(());
+    }
+
+    let api_key = image_generation.api_key.clone();
+    image_generation.api_key = Text::new("Image generation API key")
+        .with_default(api_key.as_str())
+        .with_help_message("Leave empty to use OPENROUTER_API_KEY at runtime")
+        .prompt()?;
+
+    let model = image_generation.model.clone();
+    image_generation.model = Text::new("Image generation model")
+        .with_default(model.as_str())
+        .with_help_message("Image generation model identifier")
+        .prompt()?;
+
+    let base_url = image_generation.base_url.clone();
+    image_generation.base_url = Text::new("Image generation API base URL")
+        .with_default(base_url.as_str())
+        .with_help_message("Provider API base URL")
+        .prompt()?;
+
+    let size = image_generation.size.clone();
+    image_generation.size = Text::new("Default image size")
+        .with_default(size.as_str())
+        .with_help_message("Optional: a tier (e.g. '1K', '2K') or explicit pixels (e.g. '1024x1024'); leave empty to omit")
+        .prompt()?;
+
+    let quality = image_generation.quality.clone();
+    image_generation.quality = Text::new("Default image quality")
+        .with_default(quality.as_str())
+        .with_help_message("Optional: 'auto', 'low', 'medium', or 'high'; leave empty to omit")
         .prompt()?;
 
     Ok(())

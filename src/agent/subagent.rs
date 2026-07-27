@@ -10,9 +10,9 @@ use chrono::Utc;
 use crate::{
     agent::{
         context::ContextBuilder, hook::{AgentHook, AgentHookContext}, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, skills::SkillsLoader, tools::{filesystem::FsToolConfig, registry::ToolRegistry, shell::ShellTool},
-    }, bus::{events::InboundMessage, queue::MessageBus}, config::schema::{DocxToolConfig, ExecToolConfig, GmailToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig}, providers::base::LLMProviderDyn, utils::{
+    }, bus::{events::InboundMessage, queue::MessageBus}, config::schema::{DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig}, providers::base::LLMProviderDyn, utils::{
         prompt_templates::render_template, registry_helper::{
-            filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_ocr_tools, register_web_tools,
+            filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
         },
     },
 };
@@ -55,6 +55,7 @@ pub struct SubagentManager {
     pub gmail_config: GmailToolConfig,
     pub ocr_config: OcrToolConfig,
     pub docx_config: DocxToolConfig,
+    pub image_generation_config: ImageGenerationToolConfig,
     pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
     pub runner: AgentRunner,
@@ -74,6 +75,7 @@ impl SubagentManager {
         gmail_config: Option<GmailToolConfig>,
         ocr_config: Option<OcrToolConfig>,
         docx_config: Option<DocxToolConfig>,
+        image_generation_config: Option<ImageGenerationToolConfig>,
         subagent_config: Option<SubagentConfig>,
         restrict_to_workspace: Option<bool>,
     ) -> Self {
@@ -88,6 +90,8 @@ impl SubagentManager {
             gmail_config: gmail_config.unwrap_or(GmailToolConfig::default()),
             ocr_config: ocr_config.unwrap_or(OcrToolConfig::default()),
             docx_config: docx_config.unwrap_or(DocxToolConfig::default()),
+            image_generation_config: image_generation_config
+                .unwrap_or(ImageGenerationToolConfig::default()),
             subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             runner: AgentRunner::new(provider),
@@ -107,6 +111,7 @@ impl SubagentManager {
             workspace,
             bus,
             max_tool_result_chars,
+            None,
             None,
             None,
             None,
@@ -269,6 +274,7 @@ impl SubagentManager {
             ), 
             &mut tools
         );
+        register_image_generation_tools(&self.image_generation_config, &self.workspace, &mut tools);
 
         let system_prompt = self.build_subagent_prompt();
         if system_prompt.is_empty() {

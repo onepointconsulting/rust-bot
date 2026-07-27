@@ -887,6 +887,7 @@ mod tests {
             None,
             None,
             None,
+            None,
         ));
         let ctx = CommandContext::with_options(
             InboundMessage {
@@ -996,6 +997,7 @@ mod tests {
             bus,
             provider,
             std::env::temp_dir(),
+            None,
             None,
             None,
             None,

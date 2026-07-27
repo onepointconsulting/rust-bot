@@ -89,6 +89,14 @@
         "pathAppend": "",
         "sandbox": ""
       },
+      "imageGeneration": {
+        "enable": false,
+        "model": "openai/gpt-image-2",
+        "apiKey": "",
+        "baseUrl": "https://openrouter.ai/api/v1/images",
+        "size": "",
+        "quality": ""
+      },
       "restrictToWorkspace": false,
       "mcpServers": {},
       "ssrfWhitelist": [
