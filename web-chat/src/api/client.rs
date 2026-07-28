@@ -41,7 +41,30 @@ struct LoginResponse {
 #[derive(Debug, Serialize)]
 struct ChatMessage<'a> {
     role: &'a str,
-    content: &'a str,
+    content: ChatMessageContent<'a>,
+}
+
+/// Mirrors the server's OpenAI-compatible multimodal content shape: either a
+/// plain string, or an array of `text` / `image_url` parts.
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum ChatMessageContent<'a> {
+    Text(&'a str),
+    Parts(Vec<ContentPart<'a>>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type")]
+enum ContentPart<'a> {
+    #[serde(rename = "text")]
+    Text { text: &'a str },
+    #[serde(rename = "image_url")]
+    ImageUrl { image_url: ImageUrlRef<'a> },
+}
+
+#[derive(Debug, Serialize)]
+struct ImageUrlRef<'a> {
+    url: &'a str,
 }
 
 #[derive(Debug, Serialize)]
@@ -115,16 +138,38 @@ pub async fn login(email: &str, password: &str) -> Result<String, ApiError> {
         .map_err(|e| ApiError::new(e.to_string()))
 }
 
-/// Send a chat message and return the assistant's reply text.
+/// Send a chat message (with optional image attachments) and return the
+/// assistant's reply text.
+///
+/// When `image_urls` is empty, `content` is serialized as a plain string for
+/// backwards compatibility. Otherwise it's serialized as a multimodal array
+/// of `text` / `image_url` parts (each `image_url` is either an `http(s)://`
+/// URL or a `data:image/...;base64,...` URL).
 pub async fn send_chat_message(
     token: &str,
     session_id: &str,
     message: &str,
+    image_urls: &[String],
 ) -> Result<String, ApiError> {
+    let content = if image_urls.is_empty() {
+        ChatMessageContent::Text(message)
+    } else {
+        let mut parts = Vec::with_capacity(image_urls.len() + 1);
+        if !message.trim().is_empty() {
+            parts.push(ContentPart::Text { text: message });
+        }
+        for url in image_urls {
+            parts.push(ContentPart::ImageUrl {
+                image_url: ImageUrlRef { url },
+            });
+        }
+        ChatMessageContent::Parts(parts)
+    };
+
     let request = ChatCompletionRequest {
         messages: vec![ChatMessage {
             role: "user",
-            content: message,
+            content,
         }],
         user: Some(session_id),
     };

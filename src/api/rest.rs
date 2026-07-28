@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use axum::{
     Json, Router,
-    extract::State,
+    extract::{DefaultBodyLimit, State},
     http::{
         HeaderValue, Method, Request, StatusCode,
         header::{ACCEPT, AUTHORIZATION, CONTENT_TYPE},
@@ -36,10 +36,18 @@ use crate::{
     command::types::ChatCommand,
 };
 
+use super::media::{materialize_image_urls, MAX_IMAGE_BYTES};
 use super::types::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-    ChatMessage, SessionSummary, SessionsListResponse, Usage, extract_last_user_message,
+    ChatMessage, SessionSummary, SessionsListResponse, Usage, extract_last_user_turn,
 };
+
+/// Axum's default request body limit is 2 MiB, far too small for a chat
+/// request carrying base64-encoded images. Size the limit generously above
+/// `MAX_IMAGE_BYTES` (per-image cap, checked again after decoding in
+/// `media::materialize_image_urls`) to comfortably fit several
+/// base64-encoded attachments (~1.34x their raw size) plus JSON overhead.
+const MAX_CHAT_REQUEST_BODY_BYTES: usize = MAX_IMAGE_BYTES * 4 + 1024 * 1024;
 
 pub struct ApiServer {
     pub agent_loop: Arc<AgentLoop>,
@@ -156,14 +164,15 @@ impl Modify for SecurityAddon {
 )]
 struct ApiDoc;
 
-struct ApiError {
+#[derive(Debug)]
+pub(crate) struct ApiError {
     status: StatusCode,
     message: String,
     error_type: Option<String>,
 }
 
 impl ApiError {
-    fn bad_request(message: impl Into<String>) -> Self {
+    pub(crate) fn bad_request(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,
             message: message.into(),
@@ -193,6 +202,19 @@ impl ApiError {
             message: message.into(),
             error_type: Some("server_error".to_string()),
         }
+    }
+
+    fn payload_too_large(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            message: message.into(),
+            error_type: Some("payload_too_large".to_string()),
+        }
+    }
+
+    #[cfg(test)]
+    pub(crate) fn message(&self) -> &str {
+        &self.message
     }
 }
 
@@ -249,6 +271,23 @@ async fn jwt_auth_middleware(
     Ok(next.run(request).await)
 }
 
+/// When a request body exceeds [`MAX_CHAT_REQUEST_BODY_BYTES`], axum's
+/// `Json` extractor rejects it with a plain-text `413` before our handler
+/// ever runs. The web-chat client can't parse that as JSON and falls back to
+/// a bare "Request failed with status 413" message. Rewrite it into the same
+/// `{"error": {...}}` shape as every other API error, with actionable text.
+async fn friendly_body_limit_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
+    let response = next.run(request).await;
+    if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        let limit_mb = MAX_CHAT_REQUEST_BODY_BYTES / (1024 * 1024);
+        return ApiError::payload_too_large(format!(
+            "Request is too large (limit {limit_mb} MB). Try a smaller image, fewer attachments, or a lower-resolution picture."
+        ))
+        .into_response();
+    }
+    response
+}
+
 #[utoipa::path(
     get,
     path = "/health",
@@ -282,9 +321,11 @@ async fn chat_completions(
         ));
     }
 
-    let content = extract_last_user_message(&request.messages).ok_or_else(|| {
+    let turn = extract_last_user_turn(&request.messages).ok_or_else(|| {
         ApiError::bad_request("Request must include at least one non-empty user message.")
     })?;
+
+    let media_paths = materialize_image_urls(&turn.image_urls).await?;
 
     let session_id = request
         .user
@@ -299,6 +340,8 @@ async fn chat_completions(
 
     let agent_loop = Arc::clone(&state.agent_loop);
     let timeout = state.timeout;
+    let content = turn.text.clone();
+    let media_for_agent = media_paths.clone();
     let process = async move {
         agent_loop
             .process_direct(
@@ -306,7 +349,7 @@ async fn chat_completions(
                 Some(session_id),
                 Some("api"),
                 Some(chat_id),
-                None,
+                Some(media_for_agent),
                 None,
                 None,
                 None,
@@ -314,7 +357,15 @@ async fn chat_completions(
             .await
     };
 
-    let outbound = await_agent_outbound(process, timeout).await?;
+    let result = await_agent_outbound(process, timeout).await;
+
+    for media_path in &media_paths {
+        if let Err(e) = std::fs::remove_file(media_path) {
+            log::debug!("Failed to delete temporary API media file {media_path}: {e}");
+        }
+    }
+
+    let outbound = result?;
     Ok(Json(build_chat_completion_response(outbound, model)))
 }
 
@@ -573,7 +624,9 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
         .route("/v1/login", post(login))
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected)
-        .layer(build_cors_layer(&cors));
+        .layer(build_cors_layer(&cors))
+        .layer(middleware::from_fn(friendly_body_limit_middleware))
+        .layer(DefaultBodyLimit::max(MAX_CHAT_REQUEST_BODY_BYTES));
 
     let web_ui_status = match &web_root {
         Some(root) if root.is_dir() => {
@@ -626,4 +679,53 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     log::info!("MCP connections closed.");
 
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    async fn accept_body(_body: String) -> StatusCode {
+        StatusCode::OK
+    }
+
+    /// Axum's built-in `413` rejection (triggered when a body exceeds
+    /// `DefaultBodyLimit`) is plain text and unparseable as JSON by the
+    /// web-chat client, which then shows a bare "Request failed with status
+    /// 413". `friendly_body_limit_middleware` should rewrite it into the
+    /// same `{"error": {...}}` shape used everywhere else in the API, with
+    /// actionable, non-technical wording.
+    #[tokio::test]
+    async fn oversized_body_gets_friendly_json_error() {
+        let tiny_limit = 16usize;
+        let app = Router::new()
+            .route("/echo", post(accept_body))
+            .layer(middleware::from_fn(friendly_body_limit_middleware))
+            .layer(DefaultBodyLimit::max(tiny_limit));
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind test listener");
+        let addr = listener.local_addr().expect("local addr");
+        tokio::spawn(async move {
+            let _ = axum::serve(listener, app).await;
+        });
+
+        let body = vec![0u8; tiny_limit + 1024];
+        let response = reqwest::Client::new()
+            .post(format!("http://{addr}/echo"))
+            .body(body)
+            .send()
+            .await
+            .expect("send oversized request");
+
+        assert_eq!(response.status().as_u16(), StatusCode::PAYLOAD_TOO_LARGE.as_u16());
+        let json: serde_json::Value = response.json().await.expect("parse JSON body");
+        let message = json["error"]["message"].as_str().expect("error.message present");
+        assert!(message.contains("too large"), "unexpected message: {message}");
+        assert!(
+            !message.to_lowercase().contains("length limit"),
+            "should not leak axum's internal wording: {message}"
+        );
+    }
 }

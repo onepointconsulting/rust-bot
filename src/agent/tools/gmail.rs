@@ -373,26 +373,17 @@ impl GmailToolCommon {
                 .persist_tokens_to_disk(self.token_cache_path.clone())
                 .build()
                 .await
-                .map_err(|_| {
-                    log::error!("Error: failed to read client secret JSON");
-                    "Error: failed to read client secret JSON".to_string()
-                })?;
+                .map_err(|_| "Error: failed to read client secret JSON".to_string())?;
 
         let token = auth
             .token(self.scopes.as_slice())
             .await
-            .map_err(|_| {
-                log::error!("Error: failed to get token");
-                "Error: failed to get token".to_string()
-            })?;
+            .map_err(|_| "Error: failed to get token".to_string())?;
 
         token
             .token()
             .map(str::to_string)
-            .ok_or_else(|| {
-                log::error!("Error: failed to get token");
-                "Error: failed to get token".to_string()
-            })
+            .ok_or_else(|| "Error: failed to get token".to_string())
     }
 }
 

@@ -10,7 +10,10 @@ use crate::command::types::ChatCommand;
     "messages": [
         {
             "role": "user",
-            "content": "What can you help me with?"
+            "content": [
+                { "type": "text", "text": "What's in this?" },
+                { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }
+            ]
         }
     ],
     "model": "default",
@@ -33,7 +36,10 @@ pub struct ChatCompletionRequest {
 #[derive(Debug, Deserialize, ToSchema)]
 #[schema(example = json!({
     "role": "user",
-    "content": "What can you help me with?"
+    "content": [
+        { "type": "text", "text": "What's in this?" },
+        { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } }
+    ]
 }))]
 pub struct ChatMessage {
     #[schema(example = "user")]
@@ -55,6 +61,15 @@ pub struct ContentPart {
     pub part_type: String,
     #[serde(default)]
     pub text: Option<String>,
+    #[serde(default)]
+    pub image_url: Option<ImageUrl>,
+}
+
+#[derive(Debug, Deserialize)]
+pub struct ImageUrl {
+    pub url: String,
+    #[serde(default)]
+    pub detail: Option<String>,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -170,31 +185,50 @@ pub struct ChatLoginResponse {
     pub token: String,
 }
 
-pub fn content_as_string(content: &ChatMessageContent) -> Option<String> {
+/// Text and image references extracted from a single user message.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct UserTurn {
+    pub text: String,
+    pub image_urls: Vec<String>,
+}
+
+fn turn_from_content(content: &ChatMessageContent) -> UserTurn {
     match content {
-        ChatMessageContent::Text(text) => Some(text.clone()),
+        ChatMessageContent::Text(text) => UserTurn {
+            text: text.clone(),
+            image_urls: Vec::new(),
+        },
         ChatMessageContent::Parts(parts) => {
             let texts: Vec<&str> = parts
                 .iter()
                 .filter(|part| part.part_type == "text")
                 .filter_map(|part| part.text.as_deref())
                 .collect();
-            if texts.is_empty() {
-                None
-            } else {
-                Some(texts.join("\n"))
+            let image_urls: Vec<String> = parts
+                .iter()
+                .filter(|part| part.part_type == "image_url")
+                .filter_map(|part| part.image_url.as_ref())
+                .map(|image_url| image_url.url.clone())
+                .collect();
+            UserTurn {
+                text: texts.join("\n"),
+                image_urls,
             }
         }
     }
 }
 
-pub fn extract_last_user_message(messages: &[ChatMessage]) -> Option<String> {
+/// Extract the text and image URLs from the last non-empty user message.
+///
+/// A turn is considered non-empty when it has non-blank text or at least one
+/// image reference (an image-only turn is valid).
+pub fn extract_last_user_turn(messages: &[ChatMessage]) -> Option<UserTurn> {
     messages
         .iter()
         .rev()
         .filter(|message| message.role == "user")
-        .find_map(|message| content_as_string(&message.content))
-        .filter(|content| !content.trim().is_empty())
+        .map(|message| turn_from_content(&message.content))
+        .find(|turn| !turn.text.trim().is_empty() || !turn.image_urls.is_empty())
 }
 
 #[cfg(test)]
@@ -227,5 +261,73 @@ mod tests {
         assert_eq!(response.sessions[1].key, "other");
         assert_eq!(response.sessions[1].created_at, "2026-01-02T00:00:00Z");
         assert_eq!(response.sessions[1].updated_at, "2026-06-02T00:00:00Z");
+    }
+
+    // ── multimodal content ─────────────────────────────────────────────────
+
+    fn user_message(content: serde_json::Value) -> ChatMessage {
+        serde_json::from_value(json!({ "role": "user", "content": content })).unwrap()
+    }
+
+    #[test]
+    fn chat_message_deserializes_plain_string_content() {
+        let msg = user_message(json!("hello"));
+        assert!(matches!(msg.content, ChatMessageContent::Text(ref t) if t == "hello"));
+    }
+
+    #[test]
+    fn chat_message_deserializes_multimodal_content() {
+        let msg = user_message(json!([
+            { "type": "text", "text": "What's in this?" },
+            { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+            { "type": "image_url", "image_url": { "url": "data:image/png;base64,AA==" } },
+        ]));
+        let turn = turn_from_content(&msg.content);
+        assert_eq!(turn.text, "What's in this?");
+        assert_eq!(
+            turn.image_urls,
+            vec![
+                "https://example.com/a.png".to_string(),
+                "data:image/png;base64,AA==".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn extract_last_user_turn_returns_text_only_message() {
+        let messages = vec![user_message(json!("hello there"))];
+        let turn = extract_last_user_turn(&messages).expect("turn");
+        assert_eq!(turn.text, "hello there");
+        assert!(turn.image_urls.is_empty());
+    }
+
+    #[test]
+    fn extract_last_user_turn_accepts_image_only_message() {
+        let messages = vec![user_message(json!([
+            { "type": "image_url", "image_url": { "url": "https://example.com/a.png" } },
+        ]))];
+        let turn = extract_last_user_turn(&messages).expect("turn");
+        assert_eq!(turn.text, "");
+        assert_eq!(turn.image_urls, vec!["https://example.com/a.png".to_string()]);
+    }
+
+    #[test]
+    fn extract_last_user_turn_ignores_blank_and_non_user_messages() {
+        let messages = vec![
+            user_message(json!("first message")),
+            serde_json::from_value::<ChatMessage>(
+                json!({ "role": "assistant", "content": "an answer" }),
+            )
+            .unwrap(),
+            user_message(json!("   ")),
+        ];
+        let turn = extract_last_user_turn(&messages).expect("turn");
+        assert_eq!(turn.text, "first message");
+    }
+
+    #[test]
+    fn extract_last_user_turn_returns_none_when_no_user_content() {
+        let messages = vec![user_message(json!("   "))];
+        assert!(extract_last_user_turn(&messages).is_none());
     }
 }

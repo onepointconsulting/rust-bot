@@ -15,7 +15,7 @@ Trigger phrases: "newsletter", "internal newsletter", "Onepoint newsletter", "dr
 
 ### Logo
 - File: `C:/Users/gilfe/.rust-bot/workspace/onepoint-mint.png`
-- URL fallback: `https://www.onepointltd.com/wp-content/uploads/2025/09/onepoint-mint.png`
+- URL fallback: `https://www.onepointltd.com/wp-content/uploads/2026/05/Vector-6.png`
 - Always place the logo at the top of the newsletter (header area), centred or left-aligned.
 
 ### Colours

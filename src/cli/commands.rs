@@ -912,6 +912,18 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+fn replace_host(host: &str) -> String {
+    let mut host = if host.is_empty() {
+        "0.0.0.0".to_string()
+    } else {
+        host.to_string()
+    };
+    if host == "0.0.0.0" {
+        host = "localhost".to_string();
+    }
+    host
+}
+
 fn render_api_startup_message(
     host: &str,
     port: u16,
@@ -923,6 +935,7 @@ fn render_api_startup_message(
 ) {
     print_markdown(&format!("{} Starting OpenAI-compatible API server", LOGO));
     println!();
+    let host = replace_host(host);
     print_markdown(&format!(
         "Endpoint: **http://{host}:{port}/v1/chat/completions**"
     ));
@@ -940,7 +953,7 @@ fn render_api_startup_message(
     print_markdown(&format!("Workspace: **{}**", workspace.display()));
     print_markdown(&format!("Session: **{}**", session_id));
     print_markdown(&format!("Timeout: **{timeout} seconds**"));
-    if is_all_interfaces_host(host) {
+    if is_all_interfaces_host(&host) {
         print_warning(
             "API is bound to all interfaces. Only do this behind a trusted network boundary, firewall, or reverse proxy.",
         );
