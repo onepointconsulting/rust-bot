@@ -14,7 +14,7 @@ use crate::utils::helpers::detect_image_mime;
 
 use super::rest::ApiError;
 
-pub(crate) const MAX_IMAGE_BYTES: usize = 10 * 1024 * 1024;
+pub(crate) const MAX_IMAGE_BYTES: usize = 2 * 1024 * 1024;
 const DOWNLOAD_TIMEOUT_SECS: u64 = 20;
 
 static HTTP_CLIENT: LazyLock<reqwest::Client> = LazyLock::new(|| {
