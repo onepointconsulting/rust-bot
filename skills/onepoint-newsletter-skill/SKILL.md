@@ -93,6 +93,7 @@ Every issue must contain these sections in this order:
 - Contact: info@onepointltd.com
 - Small print: *"This is an internal newsletter for Onepoint staff only."*
 - Social icons or links (LinkedIn): optional
+- LinkedIn page: https://www.linkedin.com/company/onepointconsulting/
 - Background: `#1A1A1A`, text: `#AAAAAA`
 
 ---

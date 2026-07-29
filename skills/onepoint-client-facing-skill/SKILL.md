@@ -223,7 +223,7 @@ Use this structure as the base template:
             <strong style="color:#FFFFFF;">Onepoint Consulting Limited</strong><br>
             <a href="https://www.onepointltd.com" style="color:#00D3BA;">www.onepointltd.com</a>
             &nbsp;|&nbsp; info@onepointltd.com
-            &nbsp;|&nbsp; <a href="https://www.linkedin.com/company/onepointltd" style="color:#00D3BA;">LinkedIn</a><br><br>
+            &nbsp;|&nbsp; <a href="https://www.linkedin.com/company/onepointconsulting/" style="color:#00D3BA;">LinkedIn</a><br><br>
             &copy; [Year] Onepoint Consulting Limited. All rights reserved.<br>
             You are receiving this newsletter because of your relationship with Onepoint.
             To unsubscribe, reply with &lsquo;Unsubscribe&rsquo; in the subject line.
