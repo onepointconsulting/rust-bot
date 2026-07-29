@@ -1451,14 +1451,16 @@ impl AgentLoop {
         if on_stream.is_some() {
             meta.insert("_streamed".into(), Value::Bool(true));
         }
-        Some(OutboundMessage {
+        let mut outbound = OutboundMessage {
             channel: msg.channel.clone(),
             chat_id: msg.chat_id.clone(),
             content: final_content,
             reply_to: None,
             media: vec![],
             metadata: meta,
-        })
+        };
+        Self::copy_token_usage_to_outbound(&mut outbound, result.usage);
+        Some(outbound)
     }
 
     /// Stable identity tuple for a message, used to detect overlap between the
@@ -1663,6 +1665,17 @@ impl AgentLoop {
         } else {
             "assistant"
         }
+    }
+
+    fn copy_token_usage_to_outbound(outbound: &mut OutboundMessage, usage: HashMap<String, u64>) {
+        if usage.is_empty() {
+            return;
+        }
+        let usage_obj = usage
+            .into_iter()
+            .map(|(key, value)| (key, Value::Number(serde_json::Number::from(value))))
+            .collect();
+        outbound.metadata.insert(OutboundMessage::TOKEN_USAGE_KEY.into(), usage_obj);
     }
 }
 

@@ -44,3 +44,7 @@ pub struct OutboundMessage {
     pub media: Vec<String>,
     pub metadata: HashMap<String, serde_json::Value>,
 }
+
+impl OutboundMessage {
+    pub const TOKEN_USAGE_KEY: &str = "token_usage";
+}

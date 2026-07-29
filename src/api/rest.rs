@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -388,6 +389,14 @@ async fn await_agent_outbound(
 }
 
 fn build_chat_completion_response(outbound: OutboundMessage, model: String) -> ChatCompletionResponse {
+    let empty_map = serde_json::Map::new();
+    let token_usage = outbound.metadata
+       .get(OutboundMessage::TOKEN_USAGE_KEY)
+       .and_then(|v| v.as_object())
+       .unwrap_or(&empty_map);
+    let prompt_tokens = token_usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let completion_tokens = token_usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let total_tokens = token_usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -402,9 +411,9 @@ fn build_chat_completion_response(outbound: OutboundMessage, model: String) -> C
             finish_reason: "stop".to_string(),
         }],
         usage: Usage {
-            prompt_tokens: 0,
-            completion_tokens: 0,
-            total_tokens: 0,
+            prompt_tokens,
+            completion_tokens,
+            total_tokens,
         },
     }
 }
