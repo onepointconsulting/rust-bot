@@ -126,7 +126,7 @@ Always ask the user to confirm the issue month/year if not specified.
 2. Collect or confirm content for each of the 6 sections. See "Email Handling Step" to know how to deal with emails.
 3. Generate the HTML newsletter with inline CSS
 4. Save to workspace as `onepoint_newsletter_YYYY-MM.html`
-5. Send the file to the user via the `message` tool with `media` parameter
+5. Send the file to the user using the gmail tool
 6. Offer to make revisions
 
 ## Email Handling Step

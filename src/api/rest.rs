@@ -31,6 +31,7 @@ use crate::security::jwt::{
 };
 use crate::{
     agent::agent_loop::AgentLoop,
+    agent::tools::message::MessageTool,
     api::types::{ChatCommandRequest, ChatCommandResponse},
     bus::events::OutboundMessage,
     command::types::ChatCommand,
@@ -359,7 +360,7 @@ async fn chat_completions(
             .await
     };
 
-    let result = await_agent_outbound(process, timeout).await;
+    let result = await_agent_outbound(process, timeout, &state.agent_loop).await;
 
     for media_path in &media_paths {
         if let Err(e) = std::fs::remove_file(media_path) {
@@ -372,19 +373,38 @@ async fn chat_completions(
 }
 
 /// Await an agent response with a timeout, translating bus/timeout failures into `ApiError`.
+///
+/// When the agent loop returns `None` because the `message` tool already delivered
+/// to the owning chat (to avoid a duplicate bus send), recover that outbound for
+/// synchronous API callers.
 async fn await_agent_outbound(
     process: impl Future<Output = Option<OutboundMessage>>,
     timeout: Duration,
+    agent_loop: &AgentLoop,
 ) -> Result<OutboundMessage, ApiError> {
-    tokio::time::timeout(timeout, process)
+    let result = tokio::time::timeout(timeout, process)
         .await
         .map_err(|_| {
             ApiError::request_timeout(format!(
                 "Request timed out after {} seconds.",
                 timeout.as_secs()
             ))
-        })?
-        .ok_or_else(|| ApiError::internal("Agent did not produce a response."))
+        })?;
+    if let Some(outbound) = result {
+        return Ok(outbound);
+    }
+    if let Some(outbound) = take_message_tool_delivered_outbound(agent_loop) {
+        return Ok(outbound);
+    }
+    Err(ApiError::internal("Agent did not produce a response."))
+}
+
+fn take_message_tool_delivered_outbound(agent_loop: &AgentLoop) -> Option<OutboundMessage> {
+    log::info!("Taking message tool delivered outbound message ...");
+    let tools = agent_loop.tools.lock().unwrap_or_else(|e| e.into_inner());
+    let tool = tools.get("message")?;
+    let message_tool = (tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()?;
+    message_tool.take_delivered_outbound()
 }
 
 fn build_chat_completion_response(outbound: OutboundMessage, model: String) -> ChatCompletionResponse {
@@ -458,7 +478,7 @@ async fn chat_commands(
             .await
     };
 
-    let outbound = await_agent_outbound(process, timeout).await?;
+    let outbound = await_agent_outbound(process, timeout, &state.agent_loop).await?;
     Ok(Json(ChatCommandResponse {
         command,
         response: outbound.content,

@@ -22,6 +22,8 @@ pub struct MessageTool {
     default_chat_id: Mutex<String>,
     default_message_id: Mutex<Option<String>>,
     pub sent_in_turn: Mutex<bool>,
+    /// Last outbound delivered back to the owning chat this turn (for sync callers).
+    last_owner_outbound: Mutex<Option<OutboundMessage>>,
 }
 
 impl MessageTool {
@@ -37,6 +39,7 @@ impl MessageTool {
             default_chat_id: Mutex::new(default_chat_id.into()),
             default_message_id: Mutex::new(default_message_id),
             sent_in_turn: Mutex::new(false),
+            last_owner_outbound: Mutex::new(None),
         }
     }
 
@@ -56,6 +59,18 @@ impl MessageTool {
     /// Reset per-turn send tracking.
     pub fn start_turn(&self) {
         *self.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) = false;
+        *self.last_owner_outbound.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    /// Outbound already delivered to the owning chat this turn, if any.
+    pub fn take_delivered_outbound(&self) -> Option<OutboundMessage> {
+        if !*self.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) {
+            return None;
+        }
+        self.last_owner_outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     pub fn create_send_callback(bus: Arc<MessageBus>) -> SendCallback {
@@ -199,9 +214,14 @@ impl Tool for MessageTool {
             metadata,
         };
 
+        let owner_outbound = going_back_to_owner.then(|| outbound.clone());
         callback(outbound).await;
 
-        if going_back_to_owner {
+        if let Some(owner_outbound) = owner_outbound {
+            *self
+                .last_owner_outbound
+                .lock()
+                .unwrap_or_else(|e| e.into_inner()) = Some(owner_outbound);
             *self.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) = true;
         }
 
@@ -292,8 +312,17 @@ mod tests {
     fn start_turn_resets_sent_in_turn() {
         let tool = MessageTool::new(None, "cli", "direct", None);
         *tool.sent_in_turn.lock().unwrap() = true;
+        *tool.last_owner_outbound.lock().unwrap() = Some(OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "direct".into(),
+            content: "stale".into(),
+            reply_to: None,
+            media: vec![],
+            metadata: HashMap::new(),
+        });
         tool.start_turn();
         assert!(!*tool.sent_in_turn.lock().unwrap());
+        assert!(tool.last_owner_outbound.lock().unwrap().is_none());
     }
 
     #[test]
@@ -348,6 +377,9 @@ mod tests {
             Some(&Value::String("owner-msg".to_string()))
         );
         assert!(*tool.sent_in_turn.lock().unwrap());
+        let delivered = tool.take_delivered_outbound().expect("owner outbound");
+        assert_eq!(delivered.content, "hello");
+        assert!(tool.take_delivered_outbound().is_none());
     }
 
     #[tokio::test]
@@ -383,6 +415,7 @@ mod tests {
         assert!(sent[0].metadata.get("message_id").is_none());
         // Not going back to the owner ⇒ sent_in_turn stays false.
         assert!(!*tool.sent_in_turn.lock().unwrap());
+        assert!(tool.take_delivered_outbound().is_none());
     }
 
     #[tokio::test]
