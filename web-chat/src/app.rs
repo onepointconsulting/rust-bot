@@ -121,6 +121,22 @@ pub fn App() -> impl IntoView {
     let entries = RwSignal::new(initial_entries);
     let chat_pending = RwSignal::new(false);
     let chat_error = RwSignal::new(None::<String>);
+    let example_prompts = RwSignal::new(Vec::<String>::new());
+    let composer_draft = RwSignal::new(String::new());
+
+    let load_example_prompts = move |jwt: String| {
+        spawn_local(async move {
+            if let Ok(prompts) = api::fetch_example_prompts(&jwt).await {
+                example_prompts.set(prompts);
+            }
+        });
+    };
+
+    // Session restored from a previous page load: fetch prompts up front so
+    // they're ready the moment the (empty) chat pane renders.
+    if let Some(jwt) = token.get_untracked() {
+        load_example_prompts(jwt);
+    }
 
     let push_entry = move |role: Role, content: String, attachments: Vec<ImageAttachment>| {
         let id = next_id.get();
@@ -151,6 +167,7 @@ pub fn App() -> impl IntoView {
                     clear_stored_entries();
                     entries.set(Vec::new());
                     next_id.set(0);
+                    load_example_prompts(jwt.clone());
                     token.set(Some(jwt));
                 }
                 Err(err) => login_error.set(Some(err.to_string())),
@@ -167,6 +184,8 @@ pub fn App() -> impl IntoView {
         token.set(None);
         entries.set(Vec::new());
         next_id.set(0);
+        example_prompts.set(Vec::new());
+        composer_draft.set(String::new());
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -228,6 +247,8 @@ pub fn App() -> impl IntoView {
                     entries=Signal::derive(move || entries.get())
                     pending=Signal::derive(move || chat_pending.get())
                     error=Signal::derive(move || chat_error.get())
+                    example_prompts=Signal::derive(move || example_prompts.get())
+                    draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat
                     on_logout=do_logout

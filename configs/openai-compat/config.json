@@ -130,5 +130,8 @@
   },
   "subagent": {
     "failOnToolError": false
-  }
+  },
+  "examplePrompts": [
+    "What is the current weather in London today?"
+  ]
 }

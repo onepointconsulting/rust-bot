@@ -114,15 +114,24 @@ fn AttachmentChip(
 #[component]
 pub fn ChatInput(
     #[prop(into)] pending: Signal<bool>,
+    draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
 ) -> impl IntoView {
-    let draft = RwSignal::new(String::new());
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
     let url_draft = RwSignal::new(String::new());
     let drag_over = RwSignal::new(false);
     let textarea_ref = NodeRef::<Textarea>::new();
     let file_input_ref = NodeRef::<Input>::new();
+
+    // When something outside the composer (e.g. an example-prompt click)
+    // sets `draft`, keep the textarea's auto-sized height in sync too.
+    Effect::new(move |_| {
+        let _ = draft.get();
+        if let Some(el) = textarea_ref.get() {
+            resize_textarea(&el);
+        }
+    });
 
     let send = move || {
         if pending.get() {

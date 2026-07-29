@@ -19,6 +19,7 @@ pub enum ChatCommand {
     Cleanup,
     #[serde(rename = "list-sessions", alias = "listsessions")]
     ListSessions,
+    ExamplePrompts,
 }
 
 impl Default for ChatCommand {
@@ -69,6 +70,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::Workspace => write!(f, "/workspace"),
             ChatCommand::Cleanup => write!(f, "/cleanup"),
             ChatCommand::ListSessions => write!(f, "/list-sessions"),
+            ChatCommand::ExamplePrompts => write!(f, "/example-prompts"),
         }
     }
 }

@@ -218,6 +218,11 @@ fn turn_from_content(content: &ChatMessageContent) -> UserTurn {
     }
 }
 
+#[derive(Debug, Serialize, ToSchema)]
+pub struct ExamplePromptsResponse {
+    pub prompts: Vec<String>,
+}
+
 /// Extract the text and image URLs from the last non-empty user message.
 ///
 /// A turn is considered non-empty when it has non-blank text or at least one

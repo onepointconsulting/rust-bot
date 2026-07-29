@@ -322,28 +322,9 @@ fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
         Arc::new(bus),
         provider,
         workspace,
-        Some(config.agents.model.clone()),
-        Some(config.agents.max_tool_iterations),
-        Some(config.agents.max_tokens),
-        Some(config.agents.temperature),
-        config.agents.reasoning_effort.clone(),
-        Some(config.agents.context_window_tokens),
-        config.agents.context_block_limit,
-        Some(config.agents.max_tool_result_chars),
-        Some(config.agents.provider_retry_mode),
-        Some(config.tools.web.clone()),
-        Some(config.tools.exec.clone()),
-        Some(config.tools.gmail.clone()),
-        Some(config.tools.ocr.clone()),
-        Some(config.tools.docx.clone()),
-        Some(config.tools.image_generation.clone()),
-        Some(config.subagent.clone()),
+        config.clone(),
         Some(cron_service),
-        Some(config.tools.restrict_to_workspace),
         None,
-        Some(config.tools.mcp_servers.clone()),
-        Some(config.channels.clone()),
-        Some(config.agents.timezone.clone()),
         None,
     );
     agent_loop
@@ -838,8 +819,8 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let mut cron_option: Option<Arc<CronService>> = None;
     if let Some(cron) = &cron {
         cron_option = Some(Arc::clone(cron));
-        let dream_cfg = agent_loop.defaults.dream.clone();
-        let timezone = agent_loop.defaults.timezone.clone();
+        let dream_cfg = agent_loop.config.agents.dream.clone();
+        let timezone = agent_loop.config.agents.timezone.clone();
         let now = now_ms();
         let schedule = dream_cfg.build_schedule(&timezone); 
         cron.register_system_job(crate::cron::types::CronJob {

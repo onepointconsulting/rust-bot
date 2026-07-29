@@ -34,7 +34,7 @@ use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    AgentDefaults, ChannelsConfig, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, ProviderRetryMode, SubagentConfig, WebToolsConfig,
+    ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
@@ -277,7 +277,7 @@ impl AgentHook for LoopHookChain {
 /// 5. Sends responses back
 ///
 pub struct AgentLoop {
-    pub defaults: AgentDefaults,
+    pub config: Config,
     bus: Arc<MessageBus>,
     pub provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
@@ -334,41 +334,36 @@ impl AgentLoop {
         bus: Arc<MessageBus>,
         provider: Arc<dyn LLMProviderDyn>,
         workspace: PathBuf,
-        model: Option<String>,
-        max_iterations: Option<u32>,
-        max_tokens: Option<u32>,
-        temperature: Option<f32>,
-        reasoning_effort: Option<String>,
-        context_window_tokens: Option<u64>,
-        context_block_limit: Option<u32>,
-        max_tool_result_chars: Option<u32>,
-        provider_retry_mode: Option<ProviderRetryMode>,
-        web_config: Option<WebToolsConfig>,
-        exec_config: Option<ExecToolConfig>,
-        gmail_config: Option<GmailToolConfig>,
-        ocr_config: Option<OcrToolConfig>,
-        docx_config: Option<DocxToolConfig>,
-        image_generation_config: Option<ImageGenerationToolConfig>,
-        subagent_config: Option<SubagentConfig>,
+        config: Config,
         cron_service: Option<Arc<CronService>>,
-        restrict_to_workspace: Option<bool>,
         session_manager: Option<Arc<Mutex<SessionManager>>>,
-        mcp_servers: Option<HashMap<String, McpServerConfig>>,
-        channels_config: Option<ChannelsConfig>,
-        timezone: Option<String>,
         hooks: Option<Vec<Arc<dyn AgentHook>>>,
     ) -> Self {
-        let defaults = AgentDefaults::default();
-        let model = model.unwrap_or(provider.clone().get_default_model());
-        let web_config = web_config.unwrap_or(WebToolsConfig::default());
-        let exec_config = exec_config.unwrap_or(ExecToolConfig::default());
-        let gmail_config = gmail_config.unwrap_or(GmailToolConfig::default());
-        let ocr_config = ocr_config.unwrap_or(OcrToolConfig::default());
-        let docx_config = docx_config.unwrap_or(DocxToolConfig::default());
-        let image_generation_config =
-            image_generation_config.unwrap_or(ImageGenerationToolConfig::default());
-        let subagent_config = subagent_config.unwrap_or(SubagentConfig::default());
-        let restrict_to_workspace = restrict_to_workspace.unwrap_or(false);
+        let agents_cfg = config.agents.clone();
+        let tools_cfg = config.tools.clone();
+        let subagent_config = config.subagent.clone();
+        let channels_config = Some(config.channels.clone());
+        let timezone = Some(agents_cfg.timezone.clone());
+
+        let model = agents_cfg.model.clone();
+        let web_config = tools_cfg.web.clone();
+        let exec_config = tools_cfg.exec.clone();
+        let gmail_config = tools_cfg.gmail.clone();
+        let ocr_config = tools_cfg.ocr.clone();
+        let docx_config = tools_cfg.docx.clone();
+        let image_generation_config = tools_cfg.image_generation.clone();
+        let restrict_to_workspace = tools_cfg.restrict_to_workspace;
+        let mcp_servers = tools_cfg.mcp_servers.clone();
+
+        let context_window_tokens = agents_cfg.context_window_tokens;
+        let max_tool_result_chars = agents_cfg.max_tool_result_chars;
+        let max_tokens = agents_cfg.max_tokens;
+        let temperature = agents_cfg.temperature;
+        let reasoning_effort = agents_cfg.reasoning_effort.clone();
+        let max_iterations = agents_cfg.max_tool_iterations;
+        let context_block_limit = agents_cfg.context_block_limit;
+        let provider_retry_mode = agents_cfg.provider_retry_mode.clone();
+
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
             .unwrap_or_else(|_| "3".to_string())
             .parse()
@@ -381,13 +376,6 @@ impl AgentLoop {
         };
         let session_manager = session_manager
             .unwrap_or_else(|| Arc::new(Mutex::new(SessionManager::new(workspace.clone()))));
-        let context_window_tokens =
-            context_window_tokens.unwrap_or(defaults.clone().context_window_tokens);
-        let max_tool_result_chars =
-            max_tool_result_chars.unwrap_or(defaults.clone().max_tool_result_chars);
-        let max_tokens = max_tokens.unwrap_or(defaults.clone().max_tokens);
-        let temperature = temperature.unwrap_or(defaults.clone().temperature);
-        let reasoning_effort = reasoning_effort.or_else(|| defaults.clone().reasoning_effort);
         let subagents = Arc::new(SubagentManager::new(
             provider.clone(),
             workspace.clone(),
@@ -435,38 +423,37 @@ impl AgentLoop {
             max_tool_result_chars as usize,
         ));
 
+        let dream_cfg = agents_cfg.dream.clone();
+
         let agent_loop = Self {
-            defaults: defaults.clone(),
             bus: bus.clone(),
             channels_config,
             provider: provider.clone(),
             workspace: workspace.clone(),
             model: model.clone(),
-            max_iterations: max_iterations.unwrap_or(defaults.clone().max_tool_iterations),
+            max_iterations,
             max_tokens,
             temperature,
             reasoning_effort,
             context_window_tokens,
-            context_block_limit: context_block_limit,
+            context_block_limit,
             max_tool_result_chars,
-            provider_retry_mode: provider_retry_mode
-                .unwrap_or(defaults.clone().provider_retry_mode)
-                .to_string(),
+            provider_retry_mode: provider_retry_mode.to_string(),
             web_config: web_config.clone(),
             exec_config: exec_config.clone(),
-            cron_service: cron_service,
-            restrict_to_workspace: restrict_to_workspace,
-            timezone: timezone,
+            cron_service,
+            restrict_to_workspace,
+            timezone,
             start_time: SystemTime::now(),
             last_usage: Mutex::new(HashMap::new()),
             extra_hooks: hooks.unwrap_or(Vec::new()),
             context: context.clone(),
             session_manager: session_manager.clone(),
-            tools: tools,
+            tools,
             runner: Arc::new(AgentRunner::new(provider.clone())),
             subagents,
             running: AtomicBool::new(false),
-            mcp_servers: mcp_servers.unwrap_or(HashMap::new()),
+            mcp_servers,
             mcp_connected: AtomicBool::new(false),
             mcp_connecting: AtomicBool::new(false),
             mcp_sessions: Mutex::new(Vec::new()),
@@ -475,19 +462,15 @@ impl AgentLoop {
             background_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             next_background_task_id: AtomicU64::new(0),
             session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
-            max: max,
-            concurrency_gate: concurrency_gate,
+            max,
+            concurrency_gate,
             consolidator,
             dream: Arc::new(Dream::new(
                 Arc::clone(&context.memory),
                 provider,
-                defaults
-                    .dream
-                    .model_override
-                    .as_deref()
-                    .unwrap_or(&model),
-                defaults.dream.max_batch_size as usize,
-                defaults.dream.max_iterations as usize,
+                dream_cfg.model_override.as_deref().unwrap_or(&model),
+                dream_cfg.max_batch_size as usize,
+                dream_cfg.max_iterations as usize,
                 max_tool_result_chars as usize,
             )),
             commands: {
@@ -495,6 +478,7 @@ impl AgentLoop {
                 register_builtin_commands(&mut router);
                 router
             },
+            config,
         };
         agent_loop
     }
@@ -1922,30 +1906,13 @@ mod tests {
         let provider: Arc<dyn LLMProviderDyn> = Arc::new(PlaceholderProvider {
             settings: GenerationSettings::new(),
         });
+        let mut config = Config::default();
+        config.agents.max_tool_result_chars = max_tool_result_chars;
         Arc::new(AgentLoop::new(
             bus,
             provider,
             std::env::temp_dir(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            Some(max_tool_result_chars),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            config,
             None,
             None,
             None,

@@ -577,12 +577,15 @@ impl Validate for JwtConfig {
 fn default_api_host() -> String {
     "127.0.0.1".to_string()
 }
+
 fn default_api_port() -> u16 {
     8900
 }
+
 fn default_api_timeout() -> f64 {
     120.0
 }
+
 fn default_users_file() -> String {
     "./.rust-bot/users.json".to_string()
 }
@@ -675,7 +678,7 @@ impl Default for ApiConfig {
             jwt: JwtConfig::default(),
             users_file: default_users_file(),
             cors: CorsConfig::default(),
-            web_root: None,
+            web_root: None
         }
     }
 }
@@ -1281,6 +1284,10 @@ impl Default for SubagentConfig {
 
 // ── Config ────────────────────────────────────────────────────────────────────
 
+fn default_example_prompts() -> Vec<String> {
+    vec![]
+}
+
 /// Root configuration for the bot.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
@@ -1318,6 +1325,11 @@ pub struct Config {
     #[serde(alias = "subagent")]
     #[garde(dive)]
     pub subagent: SubagentConfig,
+
+    /// Some example prompts to be displayed in the web chat.
+    #[serde(alias = "example_prompts", default = "default_example_prompts")]
+    #[garde(skip)]
+    pub example_prompts: Vec<String>,
 }
 
 impl Config {
@@ -1474,6 +1486,7 @@ impl Default for Config {
             gateway: GatewayConfig::default(),
             tools: ToolsConfig::default(),
             subagent: SubagentConfig::default(),
+            example_prompts: default_example_prompts(),
         }
     }
 }

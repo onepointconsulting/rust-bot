@@ -682,6 +682,21 @@ impl CommandHandler for CmdListSessions {
         reply_as_text(ctx, content)
     }
 }
+
+struct CmdExamplePrompts;
+
+#[async_trait]
+impl CommandHandler for CmdExamplePrompts {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/example-prompts");
+        };
+        let config = agent_loop.config.clone();
+        let prompts = config.example_prompts.join("\n");
+        reply_as_text(ctx, format!("Example prompts:\n{}", prompts))
+    }
+}
+
 /// Build canonical help text shared across channels.
 fn build_help_text() -> String {
     let lines = vec![
@@ -700,6 +715,7 @@ fn build_help_text() -> String {
         "/workspace — Display the current workspace directory",
         "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
         "/list-sessions — List available sessions in current workspace",
+        "/example-prompts — List example prompts",
     ];
     lines.join("\n")
 }
@@ -719,6 +735,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
     router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
     router.exact(ChatCommand::ListSessions.to_string(), Arc::new(CmdListSessions));
+    router.exact(ChatCommand::ExamplePrompts.to_string(), Arc::new(CmdExamplePrompts));
 }
 
 #[cfg(test)]
@@ -861,30 +878,13 @@ mod tests {
 
         let bus = Arc::new(crate::bus::queue::MessageBus::new());
         let provider: Arc<dyn LLMProviderDyn> = Arc::new(TestProvider);
+        let mut config = crate::config::schema::Config::default();
+        config.agents.model = "claude-sonnet-5".into();
         let loop_ = Arc::new(crate::agent::agent_loop::AgentLoop::new(
             bus,
             provider,
             std::env::temp_dir(),
-            Some("claude-sonnet-5".into()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            config,
             None,
             None,
             None,
@@ -997,26 +997,7 @@ mod tests {
             bus,
             provider,
             std::env::temp_dir(),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
+            crate::config::schema::Config::default(),
             None,
             None,
             None,

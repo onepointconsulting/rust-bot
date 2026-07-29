@@ -39,7 +39,8 @@ use crate::{
 use super::media::{materialize_image_urls, MAX_IMAGE_BYTES};
 use super::types::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
-    ChatMessage, SessionSummary, SessionsListResponse, Usage, extract_last_user_turn,
+    ChatMessage, ExamplePromptsResponse, SessionSummary, SessionsListResponse, Usage,
+    extract_last_user_turn,
 };
 
 /// Axum's default request body limit is 2 MiB, far too small for a chat
@@ -140,7 +141,7 @@ impl Modify for SecurityAddon {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, chat_completions, chat_commands, list_sessions, login),
+    paths(health, chat_completions, chat_commands, list_sessions, login, example_prompts),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,
@@ -155,6 +156,7 @@ impl Modify for SecurityAddon {
         SessionsListResponse,
         ChatLoginRequest,
         ChatLoginResponse,
+        ExamplePromptsResponse,
     )),
     modifiers(&SecurityAddon),
     tags(
@@ -479,6 +481,24 @@ async fn list_sessions(
     ))
 }
 
+#[utoipa::path(
+    get,
+    path = "/v1/example-prompts",
+    responses(
+        (status = 200, description = "Example prompts configured for the current agent", body = ExamplePromptsResponse),
+        (status = 401, description = "Unauthorized"),
+    ),
+    security(("bearerAuth" = [])),
+    tag = "chat"
+)]
+async fn example_prompts(
+    State(state): State<Arc<AppState>>,
+) -> Json<ExamplePromptsResponse> {
+    Json(ExamplePromptsResponse {
+        prompts: state.agent_loop.config.example_prompts.clone(),
+    })
+}
+
 /// Authenticate with email/password, mint a fresh JWT, persist it in the
 /// user registry, and return it.
 #[utoipa::path(
@@ -614,6 +634,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
         .route("/v1/chat/completions", post(chat_completions))
         .route("/v1/chat/commands", post(chat_commands))
         .route("/v1/sessions", get(list_sessions))
+        .route("/v1/example-prompts", get(example_prompts))
         .layer(middleware::from_fn_with_state(
             Arc::clone(&state),
             jwt_auth_middleware,

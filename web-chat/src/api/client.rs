@@ -102,6 +102,11 @@ struct ChatCommandResponse {
 }
 
 #[derive(Debug, Deserialize)]
+struct ExamplePromptsResponse {
+    prompts: Vec<String>,
+}
+
+#[derive(Debug, Deserialize)]
 struct ErrorBody {
     error: ErrorDetail,
 }
@@ -220,5 +225,24 @@ pub async fn start_new_session(token: &str, session_id: &str) -> Result<String, 
     resp.json::<ChatCommandResponse>()
         .await
         .map(|body| body.response)
+        .map_err(|e| ApiError::new(e.to_string()))
+}
+
+/// Fetch the example prompts configured for the current agent, shown as
+/// clickable suggestions in an empty chat session.
+pub async fn fetch_example_prompts(token: &str) -> Result<Vec<String>, ApiError> {
+    let resp = Request::get("/v1/example-prompts")
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+
+    if !resp.ok() {
+        return Err(error_from_response(resp).await);
+    }
+
+    resp.json::<ExamplePromptsResponse>()
+        .await
+        .map(|body| body.prompts)
         .map_err(|e| ApiError::new(e.to_string()))
 }

@@ -8,11 +8,14 @@ pub fn ChatShell(
     #[prop(into)] entries: Signal<Vec<ChatEntry>>,
     #[prop(into)] pending: Signal<bool>,
     #[prop(into)] error: Signal<Option<String>>,
+    #[prop(into)] example_prompts: Signal<Vec<String>>,
+    draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Copy,
     on_logout: impl Fn() + 'static + Copy,
     on_minimize: impl Fn() + 'static + Copy,
 ) -> impl IntoView {
+    let on_use_prompt = move |prompt: String| draft.set(prompt);
     view! {
         <div class="fixed bottom-6 right-6 z-50 flex h-[min(720px,calc(100vh-3rem))] w-[min(42rem,calc(100vw-3rem))] flex-col overflow-hidden rounded-2xl bg-slate-50 shadow-2xl ring-1 ring-slate-200">
             <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
@@ -65,8 +68,13 @@ pub fn ChatShell(
                 </p>
             </Show>
 
-            <MessageList entries=entries pending=pending />
-            <ChatInput pending=pending on_send=on_send />
+            <MessageList
+                entries=entries
+                pending=pending
+                example_prompts=example_prompts
+                on_use_prompt=on_use_prompt
+            />
+            <ChatInput pending=pending draft=draft on_send=on_send />
         </div>
     }
 }
