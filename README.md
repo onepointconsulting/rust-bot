@@ -64,6 +64,12 @@ cargo build -r --bin gmail-auth
 
 This produces `target/release/gmail-auth` (or `.\target\release\gmail-auth.exe` on Windows).
 
+To build both the CLI and the web-chat UI in one step (requires [Trunk](https://trunkrs.dev); see [Web chat UI](#web-chat-ui)):
+
+```bash
+./scripts/build_all.sh
+```
+
 ## Quick start
 
 ```bash
@@ -441,12 +447,23 @@ rust-bot/
 `web-chat/` is a small Leptos + Tailwind chat UI (login + chat) that talks
 to the REST API over HTTP only — it shares no code with the rest of the
 crate. Build it with [Trunk](https://trunkrs.dev) and serve the output
-alongside the API:
+alongside the API.
+
+Install the WASM target and [Trunk](https://trunkrs.dev) once:
+
+```bash
+rustup target add wasm32-unknown-unknown
+cargo install trunk --locked
+```
+
+Ensure `~/.cargo/bin` is on your `PATH` (it usually is if `cargo` works). Then build and run:
 
 ```bash
 cd web-chat && trunk build --release && cd ..
 cargo run -- api --config ./configs/simple1/config.json --web-root ./web-chat/dist
 ```
+
+Or use `./scripts/build_all.sh` to build the release CLI and web-chat together.
 
 Then open `http://127.0.0.1:8900/`. See [`web-chat/README.md`](web-chat/README.md)
 for local development (`trunk serve`) instructions.

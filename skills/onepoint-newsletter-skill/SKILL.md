@@ -39,7 +39,7 @@ Trigger phrases: "newsletter", "internal newsletter", "Onepoint newsletter", "dr
 Always produce the newsletter as a **self-contained HTML file** with inline CSS.
 
 - Filename pattern: `onepoint_newsletter_YYYY-MM.html` (e.g. `onepoint_newsletter_2026-07.html`)
-- Save to: `C:/Users/gilfe/.rust-bot/workspace/`
+- Save to the workspace folder.
 - Max width: 680px (email-safe), centred on page
 - Mobile-friendly: use `max-width: 100%` on images, fluid layout
 
@@ -156,7 +156,7 @@ Use this structure as the base template:
 
         <!-- HEADER -->
         <tr><td style="background:#000000;padding:30px 40px;text-align:center;">
-          <img src="https://www.onepointltd.com/wp-content/uploads/2025/09/onepoint-mint.png"
+          <img src="https://www.onepointltd.com/wp-content/uploads/2026/05/Vector-6.png"
                alt="Onepoint" style="max-height:60px;filter:brightness(0) invert(1);">
           <h1 style="color:#FFFFFF;font-size:28px;margin:16px 0 4px;">Onepoint Inside</h1>
           <p style="color:#FFFFFF;font-size:15px;margin:0;">[Month Year] &nbsp;|&nbsp; <em>Woven by Onepoint</em></p>
