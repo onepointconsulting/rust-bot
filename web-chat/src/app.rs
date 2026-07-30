@@ -112,6 +112,7 @@ pub fn App() -> impl IntoView {
     let login_error = RwSignal::new(None::<String>);
     let login_pending = RwSignal::new(false);
     let chat_open = RwSignal::new(false);
+    let expanded = RwSignal::new(false);
 
     let session_id = RwSignal::new(
         read_stored_session().unwrap_or_else(|| format!("web-{}", js_sys::Date::now() as u64)),
@@ -224,6 +225,7 @@ pub fn App() -> impl IntoView {
 
     let open_chat = move || chat_open.set(true);
     let close_chat = move || chat_open.set(false);
+    let toggle_expand = move || expanded.update(|value| *value = !*value);
 
     view! {
         <Show
@@ -253,6 +255,8 @@ pub fn App() -> impl IntoView {
                     on_new_chat=do_new_chat
                     on_logout=do_logout
                     on_minimize=close_chat
+                    expanded=Signal::derive(move || expanded.get())
+                    on_toggle_expand=toggle_expand
                 />
             </Show>
         </Show>
