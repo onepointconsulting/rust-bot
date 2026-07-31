@@ -203,6 +203,7 @@ mod tests {
                 reply_to: None,
                 media: vec![],
                 metadata: HashMap::new(),
+                event: None,
             };
             bus.publish_outbound(outbound).unwrap();
 

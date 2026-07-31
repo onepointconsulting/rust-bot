@@ -2,6 +2,8 @@ use chrono::{DateTime, Utc};
 use serde::Deserialize;
 use std::collections::HashMap;
 
+use super::outbound_events::OutboundEvent;
+
 /// Message received from a chat channel.
 #[derive(Debug, Clone, serde::Serialize, Deserialize)]
 pub struct InboundMessage {
@@ -35,6 +37,9 @@ impl InboundMessage {
 }
 
 /// Message to send to a chat channel.
+///
+/// Display text lives in `content`. Optional typed control/event data lives in
+/// `event`; channel-specific odds and ends stay in `metadata` for now.
 #[derive(Debug, Clone)]
 pub struct OutboundMessage {
     pub channel: String,
@@ -43,6 +48,7 @@ pub struct OutboundMessage {
     pub reply_to: Option<String>,
     pub media: Vec<String>,
     pub metadata: HashMap<String, serde_json::Value>,
+    pub event: Option<OutboundEvent>,
 }
 
 impl OutboundMessage {

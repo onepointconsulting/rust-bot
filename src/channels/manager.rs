@@ -185,6 +185,7 @@ impl ChannelManager {
             reply_to: None,
             media: Vec::new(),
             metadata: HashMap::new(),
+            event: None,
         };
         tokio::spawn(async move {
             Self::send_with_retry(channel.as_ref(), msg, max_attempts).await;
@@ -310,6 +311,8 @@ impl ChannelManager {
             metadata: final_metadata,
             media: vec![],
             reply_to: None,
+            // Preserve the first delta's event; metadata still carries `_stream_end` if seen.
+            event: first_msg.event.clone(),
         };
         (merged, non_matching)
     }
@@ -571,6 +574,7 @@ mod tests {
             reply_to: None,
             media: Vec::new(),
             metadata,
+            event: None,
         }
     }
 

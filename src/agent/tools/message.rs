@@ -212,6 +212,7 @@ impl Tool for MessageTool {
             reply_to: None,
             media: media.clone(),
             metadata,
+            event: None,
         };
 
         let owner_outbound = going_back_to_owner.then(|| outbound.clone());
@@ -319,6 +320,7 @@ mod tests {
             reply_to: None,
             media: vec![],
             metadata: HashMap::new(),
+            event: None,
         });
         tool.start_turn();
         assert!(!*tool.sent_in_turn.lock().unwrap());

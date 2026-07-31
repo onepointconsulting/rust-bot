@@ -1586,6 +1586,7 @@ mod tests {
             reply_to: None,
             media,
             metadata: HashMap::new(),
+            event: None,
         }
     }
 

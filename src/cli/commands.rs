@@ -614,6 +614,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                                     reply_to: None,
                                     media: vec![],
                                     metadata: HashMap::new(),
+                                    event: None,
                                 };
                                 let bus = agent_loop.bus();
                                 if let Err(e) = bus.publish_outbound(outbound) {
@@ -747,6 +748,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                     reply_to: None,
                     media: vec![],
                     metadata: HashMap::new(),
+                    event: None,
                 };
                 bus.publish_outbound(outbound).map_err(|e| e.to_string())
             }) as Pin<Box<dyn Future<Output = Result<(), String>> + Send>>

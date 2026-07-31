@@ -735,7 +735,7 @@ mod tests {
     #[tokio::test]
     async fn test_execute_volume_info() {
         let tool = ShellTool::new(10, None, None, None, false, None, None);
-        let result = tool.execute_command(if (IS_WINDOWS) {"vol"} else {"lsblk -f"}, None, None).await;
+        let result = tool.execute_command(if IS_WINDOWS {"vol"} else {"lsblk -f"}, None, None).await;
         println!("result: {result}");
         assert!(result.len() > 0, "result should not be empty");
     }

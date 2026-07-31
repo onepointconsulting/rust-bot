@@ -30,6 +30,10 @@ use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
 use crate::bus::events::{InboundMessage, OutboundMessage};
+use crate::bus::outbound_events::{
+    OutboundEvent, ProgressEvent, ProgressKind, StreamDeltaEvent, StreamEndEvent,
+    StreamedResponseEvent,
+};
 use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
@@ -909,7 +913,7 @@ impl AgentLoop {
                     Box::pin(async move {
                         let stream_id = format!("{base_id}:{}", segment.load(Ordering::Relaxed));
                         meta.insert("_stream_delta".into(), Value::Bool(true));
-                        meta.insert("_stream_id".into(), Value::String(stream_id));
+                        meta.insert("_stream_id".into(), Value::String(stream_id.clone()));
                         let _ = bus.publish_outbound(OutboundMessage {
                             channel,
                             chat_id,
@@ -917,6 +921,9 @@ impl AgentLoop {
                             reply_to: None,
                             media: vec![],
                             metadata: meta,
+                            event: Some(OutboundEvent::StreamDelta(StreamDeltaEvent {
+                                stream_id: Some(stream_id),
+                            })),
                         });
                     }) as Pin<Box<dyn Future<Output = ()> + Send>>
                 }) as StreamCallback
@@ -940,7 +947,7 @@ impl AgentLoop {
                         let stream_id = format!("{base_id}:{}", segment.load(Ordering::Relaxed));
                         meta.insert("_stream_end".into(), Value::Bool(true));
                         meta.insert("_resuming".into(), Value::Bool(resuming));
-                        meta.insert("_stream_id".into(), Value::String(stream_id));
+                        meta.insert("_stream_id".into(), Value::String(stream_id.clone()));
                         let _ = bus.publish_outbound(OutboundMessage {
                             channel,
                             chat_id,
@@ -948,6 +955,11 @@ impl AgentLoop {
                             reply_to: None,
                             media: vec![],
                             metadata: meta,
+                            event: Some(OutboundEvent::StreamEnd(StreamEndEvent {
+                                stream_id: Some(stream_id),
+                                resuming,
+                                merge_next: false,
+                            })),
                         });
                         // `nonlocal stream_segment += 1`
                         segment.fetch_add(1, Ordering::Relaxed);
@@ -984,6 +996,7 @@ impl AgentLoop {
                     reply_to: None,
                     media: vec![],
                     metadata: msg.metadata.clone(),
+                    event: None,
                 });
             }
             Ok(None) => {}
@@ -1002,6 +1015,7 @@ impl AgentLoop {
                     reply_to: None,
                     media: vec![],
                     metadata: HashMap::new(),
+                    event: None,
                 });
             }
         }
@@ -1114,6 +1128,7 @@ impl AgentLoop {
             reply_to: None,
             media: vec![],
             metadata: HashMap::new(),
+            event: None,
         })
     }
 
@@ -1375,6 +1390,11 @@ impl AgentLoop {
                 Box::pin(async move {
                     meta.insert("_progress".into(), Value::Bool(true));
                     meta.insert("_tool_hint".into(), Value::Bool(tool_hint));
+                    let kind = if tool_hint {
+                        ProgressKind::ToolHint
+                    } else {
+                        ProgressKind::Plain
+                    };
                     if let Err(e) = bus.publish_outbound(OutboundMessage {
                         channel,
                         chat_id,
@@ -1382,6 +1402,10 @@ impl AgentLoop {
                         reply_to: None,
                         media: vec![],
                         metadata: meta,
+                        event: Some(OutboundEvent::Progress(ProgressEvent {
+                            kind,
+                            ..ProgressEvent::default()
+                        })),
                     }) {
                         log::error!("Failed to publish progress message: {e}");
                     }
@@ -1448,9 +1472,12 @@ impl AgentLoop {
         );
 
         let mut meta = msg.metadata.clone();
-        if on_stream.is_some() {
+        let event = if on_stream.is_some() {
             meta.insert("_streamed".into(), Value::Bool(true));
-        }
+            Some(OutboundEvent::StreamedResponse(StreamedResponseEvent))
+        } else {
+            None
+        };
         let mut outbound = OutboundMessage {
             channel: msg.channel.clone(),
             chat_id: msg.chat_id.clone(),
@@ -1458,6 +1485,7 @@ impl AgentLoop {
             reply_to: None,
             media: vec![],
             metadata: meta,
+            event,
         };
         Self::copy_token_usage_to_outbound(&mut outbound, result.usage);
         Some(outbound)

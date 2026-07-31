@@ -20,6 +20,15 @@ use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
 use futures::StreamExt;
 use std::collections::HashMap;
 
+struct OpenAICombinedResponse {
+    response: CreateChatCompletionResponse,
+    raw_json: serde_json::Value,
+}
+
+fn maybe_mapping(value: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
+    value.as_object()
+}
+
 pub struct OpenAICompatProvider {
     api_key: Option<String>,
     api_base: Option<String>,
@@ -656,7 +665,7 @@ impl OpenAICompatProvider {
     async fn chat_raw(
         &self,
         request: &CreateChatCompletionRequest,
-    ) -> Result<CreateChatCompletionResponse, String> {
+    ) -> Result<OpenAICombinedResponse, String> {
         let body = serde_json::to_value(request).map_err(|e| e.to_string())?;
         let resp = self
             .http_client
@@ -680,10 +689,16 @@ impl OpenAICompatProvider {
             obj.remove("service_tier");
         }
 
-        serde_json::from_value(json).map_err(|e| format!("failed to deserialize api response: {e}"))
+        let response = serde_json::from_value(json.clone())
+            .map_err(|e| format!("failed to deserialize api response: {e}"))?;
+        Ok(OpenAICombinedResponse {
+            response,
+            raw_json: json,
+        })
     }
 
-    fn parse_response(response: CreateChatCompletionResponse) -> LLMResponse {
+    fn parse_response(combined_response: OpenAICombinedResponse) -> LLMResponse {
+        let response = combined_response.response;
         if response.choices.is_empty() {
             return LLMResponse {
                 content: Some("Error: API returned empty choices.".to_string()),
@@ -697,6 +712,8 @@ impl OpenAICompatProvider {
   
         let choice0 = &response.choices[0];
         let mut content = choice0.message.content.clone();
+        let reasoning_content = Self::extract_reasoning_content(&combined_response.raw_json);
+
         let mut finish_reason = choice0.finish_reason
             .map(|r| serde_json::to_value(r).ok()
                 .and_then(|v| v.as_str().map(str::to_string))
@@ -754,8 +771,89 @@ impl OpenAICompatProvider {
             tool_calls,
             finish_reason,
             usage: usage_map.clone(),
-            reasoning_content: None,
+            reasoning_content,
             thinking_blocks: None,
+        }
+    }
+
+    /// Extract `reasoning_content` from the raw API JSON.
+    ///
+    /// Mirrors the Python parse path: prefer `message.reasoning_content`, then
+    /// fall back to `message.reasoning` (via text extraction), then scan other choices.
+    fn extract_reasoning_content(raw_json: &serde_json::Value) -> Option<String> {
+        let response_map = maybe_mapping(raw_json)?;
+        let choices = response_map.get("choices")?.as_array()?;
+        if choices.is_empty() {
+            return None;
+        }
+
+        let empty_map = serde_json::Map::new();
+        let choice0 = maybe_mapping(&choices[0]).unwrap_or(&empty_map);
+        let msg0 = choice0
+            .get("message")
+            .and_then(maybe_mapping)
+            .unwrap_or(&empty_map);
+
+        let mut reasoning_content = msg0
+            .get("reasoning_content")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .map(|s| s.to_string());
+
+        if reasoning_content.is_none() {
+            if let Some(reasoning) = msg0.get("reasoning") {
+                reasoning_content = Self::extract_text_content(reasoning.clone())
+                    .filter(|s| !s.is_empty());
+            }
+        }
+
+        if reasoning_content.is_none() {
+            for ch in choices {
+                let ch_map = maybe_mapping(ch).unwrap_or(&empty_map);
+                let m = ch_map
+                    .get("message")
+                    .and_then(maybe_mapping)
+                    .unwrap_or(&empty_map);
+                if let Some(rc) = m
+                    .get("reasoning_content")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    reasoning_content = Some(rc.to_string());
+                    break;
+                }
+            }
+        }
+
+        if let Some(reasoning_content) = reasoning_content.clone() {
+            log::info!("reasoning_content: {}", reasoning_content);
+        }
+        reasoning_content
+    }
+
+    fn extract_text_content(value: serde_json::Value) -> Option<String> {
+        if value.is_string() {
+            Some(value.as_str().unwrap_or("").to_string())
+        } else if value.is_array() {
+            let mut parts :Vec<String> = vec![];
+            for item in value.as_array().unwrap() {
+                let item_map_option = maybe_mapping(item);
+                if let Some(item_map) = item_map_option {
+                    let text_option = item_map.get("text");
+                    if let Some(text) = text_option && text.is_string() {
+                        parts.push(text.as_str().unwrap_or("").to_string());
+                        continue;
+                    }
+                }
+                if item.is_string() {
+                    parts.push(item.as_str().unwrap_or("").to_string());
+                    continue;
+                }
+            }
+            Some(parts.join(""))
+        }
+        else {
+            None
         }
     }
 

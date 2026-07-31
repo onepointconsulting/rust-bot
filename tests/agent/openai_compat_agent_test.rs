@@ -36,7 +36,7 @@ fn create_agent_run_spec_with_write_tool(messages: Vec<Value>) -> AgentRunSpec {
         Some(workspace_path), 
         None, 
         None
-    ))])
+    ))], None)
 }
 
 fn create_agent_run_spec_with_write_and_list_dir_tool(messages: Vec<Value>) -> AgentRunSpec {
@@ -52,10 +52,14 @@ fn create_agent_run_spec_with_write_and_list_dir_tool(messages: Vec<Value>) -> A
         None, 
         None
     ));
-    create_agent_run_spec_with_tools(messages, vec![read_tool, list_dir_tool])
+    create_agent_run_spec_with_tools(messages, vec![read_tool, list_dir_tool], None)
 }
 
-fn create_agent_run_spec_with_tools(messages: Vec<Value>, tools: Vec<Box<dyn Tool>>) -> AgentRunSpec {
+fn create_agent_run_spec_with_tools(
+    messages: Vec<Value>, 
+    tools: Vec<Box<dyn Tool>>,
+    reasoning_effort: Option<String>,
+) -> AgentRunSpec {
     let (_openai_api_key, _openai_api_base, openai_api_model) = read_env();
     let mut tool_registry = ToolRegistry::new();
     for tool in tools {
@@ -66,6 +70,7 @@ fn create_agent_run_spec_with_tools(messages: Vec<Value>, tools: Vec<Box<dyn Too
         max_iterations: 30,
         initial_messages: messages,
         tools: tool_registry,
+        reasoning_effort,
         ..AgentRunSpec::default()   // everything else gets its default
     }
 }
@@ -79,7 +84,7 @@ fn create_agent_run_spec_with_shell_tool(messages: Vec<Value>) -> AgentRunSpec {
         None, 
         None
     ));
-    create_agent_run_spec_with_tools(messages, vec![shell_tool, write_tool])
+    create_agent_run_spec_with_tools(messages, vec![shell_tool, write_tool], None)
 }
 
 #[tokio::test]
@@ -121,7 +126,7 @@ fn create_agent_run_spec_with_read_and_write_tool(messages: Vec<Value>) -> Agent
     let workspace_path = prepare_workspace();
     let write_tool = Box::new(WriteFileTool::new(Some(workspace_path.clone()), None, None));
     let read_tool = Box::new(ReadFileTool::new(Some(workspace_path), None, None));
-    create_agent_run_spec_with_tools(messages, vec![write_tool, read_tool])
+    create_agent_run_spec_with_tools(messages, vec![write_tool, read_tool], None)
 }
 
 /// Two-turn conversation:
@@ -162,6 +167,9 @@ async fn test_write_poem_then_summarize() {
     let summary = result2.final_content.unwrap();
     assert!(!summary.is_empty(), "summary should not be empty");
     println!("Poem summary: {}", summary);
+    for (i, msg) in result2.messages.iter().enumerate() {
+        println!("{}: {}", i, msg);
+    }
 }
 
 #[tokio::test]
@@ -182,7 +190,7 @@ fn create_agent_run_spec_with_read_write_edit_tool(messages: Vec<Value>) -> Agen
     let write_tool = Box::new(WriteFileTool::new(Some(workspace_path.clone()), None, None));
     let read_tool = Box::new(ReadFileTool::new(Some(workspace_path.clone()), None, None));
     let edit_tool = Box::new(EditFileTool::new(Some(workspace_path), None, None));
-    create_agent_run_spec_with_tools(messages, vec![write_tool, read_tool, edit_tool])
+    create_agent_run_spec_with_tools(messages, vec![write_tool, read_tool, edit_tool], None)
 }
 
 /// Two-turn conversation:
@@ -387,7 +395,7 @@ async fn test_mcp_tool() {
         "content": "Please use the say_hello tool to greet 'World' and tell me what it responded with."
     })];
 
-    let spec = create_agent_run_spec_with_tools(messages, mcp_tools);
+    let spec = create_agent_run_spec_with_tools(messages, mcp_tools, None);
     let result = runner.run(spec).await;
     println!("result: {:?}", result);
     completion_message_check(&result);
@@ -426,7 +434,7 @@ async fn test_mcp_tool_with_mcp_config() {
         "role": "user",
         "content": mcp_test_prompt
     })];
-    let spec = create_agent_run_spec_with_tools(messages, mcp_tools);
+    let spec = create_agent_run_spec_with_tools(messages, mcp_tools, None);
     let result = runner.run(spec).await;
     assert!(result.final_content.is_some(), "result should have final content");
     println!("result: {:?}", result.final_content.clone().unwrap());
@@ -447,7 +455,9 @@ async fn test_web_search_tool() {
         ..WebSearchConfig::default()
     };
     let web_search_tool = WebSearchTool::new(Some(config), None, None);
-    let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(web_search_tool)]);
+    let spec = create_agent_run_spec_with_tools(
+        messages, vec![Box::new(web_search_tool)], None
+    );
     let result = runner.run(spec).await;
     completion_message_check(&result);
 }
@@ -474,7 +484,7 @@ async fn test_web_search_fetch_tool() {
         Box::new(web_fetch_tool),
         Box::new(write_tool)
     ];
-    let spec = create_agent_run_spec_with_tools(messages, tools);
+    let spec = create_agent_run_spec_with_tools(messages, tools, None);
     let result = runner.run(spec).await;
     completion_message_check(&result);
 }
@@ -491,7 +501,8 @@ async fn test_cron_tool() {
     let cron_service = CronService::new(store_path, None);
     let cron_tool = CronTool::new(cron_service, "UTC");
     cron_tool.set_context("cli", "test_cron_tool");
-    let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(cron_tool)]);
+    let spec = create_agent_run_spec_with_tools(
+        messages, vec![Box::new(cron_tool)], None);
     let result = runner.run(spec).await;
     completion_message_check(&result);
 }

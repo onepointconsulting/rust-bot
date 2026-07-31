@@ -20,6 +20,7 @@ fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
         reply_to: None,
         media: vec![],
         metadata: ctx.msg.metadata.clone(),
+        event: None,
     }
 }
 
@@ -33,6 +34,7 @@ fn reply_as_text(ctx: &CommandContext, content: impl Into<String>) -> OutboundMe
         reply_to: None,
         media: vec![],
         metadata,
+        event: None,
     }
 }
 
@@ -112,6 +114,7 @@ impl CommandHandler for CmdRestart {
                     reply_to: None,
                     media: vec![],
                     metadata: msg.metadata.clone(),
+                    event: None,
                 });
             }
         });
@@ -216,6 +219,7 @@ impl CommandHandler for CmdStatus {
             reply_to: None,
             media: vec![],
             metadata,
+            event: None,
         }
     }
 
@@ -268,6 +272,7 @@ impl CommandHandler for CmdDream {
                 reply_to: None,
                 media: vec![],
                 metadata: Default::default(),
+                event: None,
             });
         });
 

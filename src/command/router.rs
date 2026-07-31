@@ -219,6 +219,7 @@ mod tests {
                 reply_to: None,
                 media: vec![],
                 metadata: Default::default(),
+                event: None,
             }
         }
     }
@@ -235,6 +236,7 @@ mod tests {
                 reply_to: None,
                 media: vec![],
                 metadata: Default::default(),
+                event: None,
             }
         }
     }
