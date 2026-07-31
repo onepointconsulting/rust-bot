@@ -6,8 +6,21 @@ use log::LevelFilter;
 /// Crate-wide log target (Rust module path for `rust_bot::*`).
 const RUNTIME_LOG_TARGET: &str = "rust_bot";
 
-/// When set, runtime logs are written to this path instead of stderr.
+/// When set, selects the runtime log destination:
+/// - a file path: append logs to that file (parent dirs created if needed)
+/// - `stdout` or `-`: write logs to standard output
+/// - `stderr`: write logs to standard error
+///
+/// When unset or empty, logs go to standard output (useful for Docker / container logs).
 const RUST_LOG_FILE_ENV: &str = "RUST_LOG_FILE";
+
+/// Where runtime logs are written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LogDestination {
+    Stdout,
+    Stderr,
+    File(PathBuf),
+}
 
 fn rust_log_mentions_target_in(rust_log: &str, target: &str) -> bool {
     rust_log.split(',').any(|part| {
@@ -35,13 +48,20 @@ fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
         .open(path)
 }
 
-fn rust_log_file_path() -> Option<PathBuf> {
-    let path = std::env::var_os(RUST_LOG_FILE_ENV)?;
-    let path = path.to_string_lossy().trim().to_string();
-    if path.is_empty() {
-        return None;
+fn parse_log_destination(value: &str) -> LogDestination {
+    match value.trim() {
+        "" => LogDestination::Stdout,
+        "-" | "stdout" | "STDOUT" => LogDestination::Stdout,
+        "stderr" | "STDERR" => LogDestination::Stderr,
+        path => LogDestination::File(PathBuf::from(path)),
     }
-    Some(PathBuf::from(path))
+}
+
+fn rust_log_destination() -> LogDestination {
+    match std::env::var_os(RUST_LOG_FILE_ENV) {
+        Some(path) => parse_log_destination(&path.to_string_lossy()),
+        None => LogDestination::Stdout,
+    }
 }
 
 /// Initialize CLI runtime logging.
@@ -51,17 +71,19 @@ fn rust_log_file_path() -> Option<PathBuf> {
 ///
 /// When `RUST_LOG` is set and logging is enabled, its filters apply (e.g.
 /// `RUST_LOG=html5ever=warn` for debugging a dependency). With `--no-logs` and no
-/// `RUST_LOG_FILE`, all logging is suppressed, including third-party crates, even if
-/// `RUST_LOG` is set in the environment or `.env`.
+/// file destination via `RUST_LOG_FILE`, all logging is suppressed, including
+/// third-party crates, even if `RUST_LOG` is set in the environment or `.env`.
 ///
-/// When `RUST_LOG_FILE` is set to a file path, logging is enabled and output is
-/// appended to that file (parent directories are created if missing) instead of stderr.
-/// This works even without `--logs`, so agent chat stays clean while still writing
-/// a log file.
+/// Log destination is controlled by `RUST_LOG_FILE`:
+/// - unset / empty / `stdout` / `-`: write to standard output (Docker-friendly default)
+/// - `stderr`: write to standard error
+/// - any other value: treat as a file path; logging is enabled and output is
+///   appended to that file (parent directories are created if missing). This works
+///   even without `--logs`, so agent chat stays clean while still writing a log file.
 pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
-    let log_file = rust_log_file_path();
-    // File destination implies logging is wanted even when `--logs` is off (CLI chat).
-    let logs = logs || log_file.is_some();
+    let destination = rust_log_destination();
+    // A file destination implies logging is wanted even when `--logs` is off (CLI chat).
+    let logs = logs || matches!(destination, LogDestination::File(_));
     let has_rust_log = std::env::var_os("RUST_LOG").is_some();
     let mut builder = if logs && has_rust_log {
         env_logger::Builder::from_default_env()
@@ -87,8 +109,14 @@ pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
         builder.filter_module(RUNTIME_LOG_TARGET, LevelFilter::Off);
     }
 
-    if let Some(path) = log_file.as_deref() {
-        match open_log_file(path) {
+    match &destination {
+        LogDestination::Stdout => {
+            builder.target(env_logger::Target::Stdout);
+        }
+        LogDestination::Stderr => {
+            builder.target(env_logger::Target::Stderr);
+        }
+        LogDestination::File(path) => match open_log_file(path) {
             Ok(file) => {
                 println!("log file: {}", path.display());
                 builder.target(env_logger::Target::Pipe(Box::new(file)));
@@ -96,11 +124,12 @@ pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
             }
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to open {RUST_LOG_FILE_ENV} {}: {err}",
+                    "Warning: failed to open {RUST_LOG_FILE_ENV} {}: {err}; falling back to stdout",
                     path.display()
                 );
+                builder.target(env_logger::Target::Stdout);
             }
-        }
+        },
     }
 
     let _ = builder.try_init();
@@ -122,6 +151,21 @@ mod tests {
         assert!(rust_log_mentions_target_in(rust_log, "rust_bot::cli"));
         assert!(rust_log_mentions_target_in(rust_log, "hyper"));
         assert!(!rust_log_mentions_target_in(rust_log, "reqwest"));
+    }
+
+    #[test]
+    fn parse_log_destination_defaults_and_special_values() {
+        assert_eq!(parse_log_destination(""), LogDestination::Stdout);
+        assert_eq!(parse_log_destination("  "), LogDestination::Stdout);
+        assert_eq!(parse_log_destination("-"), LogDestination::Stdout);
+        assert_eq!(parse_log_destination("stdout"), LogDestination::Stdout);
+        assert_eq!(parse_log_destination("STDOUT"), LogDestination::Stdout);
+        assert_eq!(parse_log_destination("stderr"), LogDestination::Stderr);
+        assert_eq!(parse_log_destination("STDERR"), LogDestination::Stderr);
+        assert_eq!(
+            parse_log_destination("./logs/rust-bot.log"),
+            LogDestination::File(PathBuf::from("./logs/rust-bot.log"))
+        );
     }
 
     #[test]
