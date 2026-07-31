@@ -24,10 +24,10 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
-use crate::api::user_registry::{verify_password, User, UserRegistry};
+use crate::api::user_registry::{User, UserRegistry, verify_password};
 use crate::config::schema::{CorsConfig, JwtConfig};
 use crate::security::jwt::{
-    generate_jwt_token, validate_jwt_token, JwtValidationOpts, DEFAULT_EXPIRES_IN_MONTHS,
+    DEFAULT_EXPIRES_IN_MONTHS, JwtValidationOpts, generate_jwt_token, validate_jwt_token,
 };
 use crate::{
     agent::agent_loop::AgentLoop,
@@ -37,7 +37,7 @@ use crate::{
     command::types::ChatCommand,
 };
 
-use super::media::{materialize_image_urls, MAX_IMAGE_BYTES};
+use super::media::{MAX_IMAGE_BYTES, materialize_image_urls};
 use super::types::{
     AssistantMessage, ChatCompletionChoice, ChatCompletionRequest, ChatCompletionResponse,
     ChatMessage, ExamplePromptsResponse, SessionSummary, SessionsListResponse, Usage,
@@ -258,18 +258,15 @@ async fn jwt_auth_middleware(
     let token = auth_header
         .strip_prefix("Bearer ")
         .or_else(|| auth_header.strip_prefix("bearer "))
-        .ok_or_else(|| {
-            ApiError::unauthorized("Authorization header must use Bearer scheme")
-        })?
+        .ok_or_else(|| ApiError::unauthorized("Authorization header must use Bearer scheme"))?
         .trim();
 
     if token.is_empty() {
         return Err(ApiError::unauthorized("Bearer token is empty"));
     }
 
-    validate_jwt_token(token, jwt_auth.public_key_pem.as_slice(), &jwt_auth.opts).map_err(
-        |err| ApiError::unauthorized(format!("Invalid JWT: {err}")),
-    )?;
+    validate_jwt_token(token, jwt_auth.public_key_pem.as_slice(), &jwt_auth.opts)
+        .map_err(|err| ApiError::unauthorized(format!("Invalid JWT: {err}")))?;
 
     Ok(next.run(request).await)
 }
@@ -279,7 +276,10 @@ async fn jwt_auth_middleware(
 /// ever runs. The web-chat client can't parse that as JSON and falls back to
 /// a bare "Request failed with status 413" message. Rewrite it into the same
 /// `{"error": {...}}` shape as every other API error, with actionable text.
-async fn friendly_body_limit_middleware(request: Request<axum::body::Body>, next: Next) -> Response {
+async fn friendly_body_limit_middleware(
+    request: Request<axum::body::Body>,
+    next: Next,
+) -> Response {
     let response = next.run(request).await;
     if response.status() == StatusCode::PAYLOAD_TOO_LARGE {
         let limit_mb = MAX_CHAT_REQUEST_BODY_BYTES / (1024 * 1024);
@@ -330,10 +330,7 @@ async fn chat_completions(
 
     let media_paths = materialize_image_urls(&turn.image_urls).await?;
 
-    let session_id = request
-        .user
-        .as_deref()
-        .unwrap_or(state.session_id.as_str());
+    let session_id = request.user.as_deref().unwrap_or(state.session_id.as_str());
     let chat_id = request.user.as_deref().unwrap_or("default");
     let model = request
         .model
@@ -382,14 +379,12 @@ async fn await_agent_outbound(
     timeout: Duration,
     agent_loop: &AgentLoop,
 ) -> Result<OutboundMessage, ApiError> {
-    let result = tokio::time::timeout(timeout, process)
-        .await
-        .map_err(|_| {
-            ApiError::request_timeout(format!(
-                "Request timed out after {} seconds.",
-                timeout.as_secs()
-            ))
-        })?;
+    let result = tokio::time::timeout(timeout, process).await.map_err(|_| {
+        ApiError::request_timeout(format!(
+            "Request timed out after {} seconds.",
+            timeout.as_secs()
+        ))
+    })?;
     if let Some(outbound) = result {
         return Ok(outbound);
     }
@@ -407,15 +402,28 @@ fn take_message_tool_delivered_outbound(agent_loop: &AgentLoop) -> Option<Outbou
     message_tool.take_delivered_outbound()
 }
 
-fn build_chat_completion_response(outbound: OutboundMessage, model: String) -> ChatCompletionResponse {
+fn build_chat_completion_response(
+    outbound: OutboundMessage,
+    model: String,
+) -> ChatCompletionResponse {
     let empty_map = serde_json::Map::new();
-    let token_usage = outbound.metadata
-       .get(OutboundMessage::TOKEN_USAGE_KEY)
-       .and_then(|v| v.as_object())
-       .unwrap_or(&empty_map);
-    let prompt_tokens = token_usage.get("prompt_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let completion_tokens = token_usage.get("completion_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-    let total_tokens = token_usage.get("total_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+    let token_usage = outbound
+        .metadata
+        .get(OutboundMessage::TOKEN_USAGE_KEY)
+        .and_then(|v| v.as_object())
+        .unwrap_or(&empty_map);
+    let prompt_tokens = token_usage
+        .get("prompt_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let completion_tokens = token_usage
+        .get("completion_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
+    let total_tokens = token_usage
+        .get("total_tokens")
+        .and_then(|v| v.as_u64())
+        .unwrap_or(0);
     ChatCompletionResponse {
         id: format!("chatcmpl-{}", Uuid::new_v4()),
         object: "chat.completion".to_string(),
@@ -495,18 +503,14 @@ async fn chat_commands(
     security(("bearerAuth" = [])),
     tag = "chat"
 )]
-async fn list_sessions(
-    State(state): State<Arc<AppState>>,
-) -> Json<SessionsListResponse> {
+async fn list_sessions(State(state): State<Arc<AppState>>) -> Json<SessionsListResponse> {
     let session_manager = state
         .agent_loop
         .session_manager
         .lock()
         .unwrap_or_else(|e| e.into_inner());
     let entries = session_manager.list_sessions();
-    Json(SessionsListResponse::from_session_entries(
-        &entries
-    ))
+    Json(SessionsListResponse::from_session_entries(&entries))
 }
 
 #[utoipa::path(
@@ -519,16 +523,15 @@ async fn list_sessions(
     security(("bearerAuth" = [])),
     tag = "chat"
 )]
-async fn example_prompts(
-    State(state): State<Arc<AppState>>,
-) -> Json<ExamplePromptsResponse> {
+async fn example_prompts(State(state): State<Arc<AppState>>) -> Json<ExamplePromptsResponse> {
     Json(ExamplePromptsResponse {
         prompts: state.agent_loop.config.example_prompts.clone(),
     })
 }
 
-/// Authenticate with email/password, mint a fresh JWT, persist it in the
-/// user registry, and return it.
+/// Authenticate with email/password, mint a fresh JWT, best-effort persist it
+/// in the user registry, and return it. Persistence failures (e.g. read-only
+/// FS) are logged and do not fail the login.
 #[utoipa::path(
     post,
     path = "/v1/login",
@@ -589,16 +592,18 @@ async fn login(
             .user_registry
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        registry
-            .update_user(
-                &request.email,
-                &User {
-                    email: request.email.clone(),
-                    password_hash: Some(password_hash),
-                    token: minted.token.clone(),
-                },
-            )
-            .map_err(|err| ApiError::internal(format!("Failed to persist login token: {err}")))?;
+        if let Err(err) = registry.update_user(
+            &request.email,
+            &User {
+                email: request.email.clone(),
+                password_hash: Some(password_hash),
+                token: minted.token.clone(),
+            },
+        ) {
+            // Registry persistence is bookkeeping only; auth does not consult it.
+            // Read-only mounts (common in containers) should not fail login.
+            log::warn!("Failed to persist login token for {}: {err}", request.email);
+        }
     }
 
     Ok(Json(ChatLoginResponse {
@@ -622,8 +627,8 @@ fn build_cors_layer(cors: &CorsConfig) -> CorsLayer {
         return CorsLayer::new();
     }
 
-    let allow_any = cors.origins.is_empty()
-        || cors.origins.iter().any(|origin| origin.trim() == "*");
+    let allow_any =
+        cors.origins.is_empty() || cors.origins.iter().any(|origin| origin.trim() == "*");
 
     let layer = CorsLayer::new()
         .allow_methods([Method::GET, Method::POST, Method::OPTIONS])
@@ -680,7 +685,9 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     let web_ui_status = match &web_root {
         Some(root) if root.is_dir() => {
             let index_html = root.join("index.html");
-            app = app.fallback_service(ServeDir::new(root).not_found_service(ServeFile::new(index_html)));
+            app = app.fallback_service(
+                ServeDir::new(root).not_found_service(ServeFile::new(index_html)),
+            );
             Some(format!("serving `{}`", root.display()))
         }
         Some(root) => {
@@ -703,9 +710,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
         None => log::info!("Web UI disabled (no valid --web-root / api.webRoot configured)"),
     }
     if cors.enabled {
-        let origins = if cors.origins.is_empty()
-            || cors.origins.iter().any(|o| o.trim() == "*")
-        {
+        let origins = if cors.origins.is_empty() || cors.origins.iter().any(|o| o.trim() == "*") {
             "*".to_string()
         } else {
             cors.origins.join(", ")
@@ -768,10 +773,18 @@ mod tests {
             .await
             .expect("send oversized request");
 
-        assert_eq!(response.status().as_u16(), StatusCode::PAYLOAD_TOO_LARGE.as_u16());
+        assert_eq!(
+            response.status().as_u16(),
+            StatusCode::PAYLOAD_TOO_LARGE.as_u16()
+        );
         let json: serde_json::Value = response.json().await.expect("parse JSON body");
-        let message = json["error"]["message"].as_str().expect("error.message present");
-        assert!(message.contains("too large"), "unexpected message: {message}");
+        let message = json["error"]["message"]
+            .as_str()
+            .expect("error.message present");
+        assert!(
+            message.contains("too large"),
+            "unexpected message: {message}"
+        );
         assert!(
             !message.to_lowercase().contains("length limit"),
             "should not leak axum's internal wording: {message}"
