@@ -4,3 +4,4 @@ pub mod types;
 pub mod manager;
 pub mod registry;
 pub mod whatsapp;
+pub mod websocket;

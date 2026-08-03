@@ -521,7 +521,7 @@ fn validate_jwt_aud_when_enabled(value: &JwtConfig, _ctx: &()) -> garde::Result 
     Ok(())
 }
 
-#[derive(Debug, Deserialize, Serialize, Clone)]
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase", default)]
 pub struct JwtConfig {
     /// Whether the JWT service is active.

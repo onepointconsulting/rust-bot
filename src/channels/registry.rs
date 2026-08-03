@@ -12,8 +12,11 @@ use crate::{
     config::{channels::EmailConfig, schema::Config},
 };
 
+const CHANNEL_EMAIL: &str = "email";
+const CHANNEL_WHATSAPP: &str = "whatsapp";
+
 /// Built-in channel module names.
-const BUILTIN_CHANNELS: &[&str] = &["email", "whatsapp"];
+const BUILTIN_CHANNELS: &[&str] = &[CHANNEL_EMAIL, CHANNEL_WHATSAPP];
 
 /// Return all built-in channel module names.
 pub fn discover_channel_names() -> Vec<&'static str> {
@@ -27,11 +30,11 @@ pub fn discover_all(
     let mut channels: HashMap<&'static str, Box<dyn BaseChannel>> = HashMap::new();
     for &name in BUILTIN_CHANNELS {
         match name {
-            "email" => {
+            CHANNEL_EMAIL => {
                 let email_cfg = config
                     .channels
                     .extra
-                    .get("email")
+                    .get(CHANNEL_EMAIL)
                     .cloned()
                     .and_then(|v| serde_json::from_value::<EmailConfig>(v).ok())
                     .unwrap_or_default();
@@ -47,11 +50,11 @@ pub fn discover_all(
                     )),
                 );
             }
-            "whatsapp" => {
+            CHANNEL_WHATSAPP => {
                 let whatsapp_cfg = config
                     .channels
                     .extra
-                    .get("whatsapp")
+                    .get(CHANNEL_WHATSAPP)
                     .cloned()
                     .and_then(|v| serde_json::from_value::<WhatsAppConfig>(v).ok())
                     .unwrap_or_default();
