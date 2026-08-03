@@ -16,7 +16,8 @@
       "modelOverride": null,
       "maxBatchSize": 20,
       "maxIterations": 10
-    }
+    },
+    "modelPreset": "primary"
   },
   "channels": {
     "sendProgress": true,
@@ -70,5 +71,15 @@
       "100.64.0.0/10",
       "192.168.0.0/16"
     ]
+  },
+  "modelPresets": {
+    "primary": {
+      "model": "${OPENAI_API_MODEL}",
+      "provider": "openrouter",
+      "maxTokens": 16384,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "reasoningEffort": null
+    }
   }
 }

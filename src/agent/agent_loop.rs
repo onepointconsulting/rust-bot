@@ -19,6 +19,7 @@ use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE, RUNTIME_CONTEX
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
+use crate::agent::model_runtime::{ModelRuntime, ModelRuntimeResolver, SESSION_MODEL_PRESET_METADATA_KEY};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
@@ -38,7 +39,7 @@ use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, WebToolsConfig,
+    ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
@@ -283,14 +284,15 @@ impl AgentHook for LoopHookChain {
 pub struct AgentLoop {
     pub config: Config,
     bus: Arc<MessageBus>,
-    pub provider: Arc<dyn LLMProviderDyn>,
     workspace: PathBuf,
-    pub model: String,
+    /// Owns model-preset selection and resolves the runtime (provider, model,
+    /// generation settings) used for each turn. There is no fixed
+    /// provider/model captured once at startup: the main loop, subagents,
+    /// and Consolidator/Dream all resolve through this shared resolver,
+    /// keyed by session (see [`Self::model`]/[`Self::provider`] for the
+    /// process-wide default, and `run_agent_loop` for the per-session path).
+    pub runtime_resolver: Arc<ModelRuntimeResolver>,
     max_iterations: u32,
-    max_tokens: u32,
-    temperature: f32,
-    reasoning_effort: Option<String>,
-    pub context_window_tokens: u64,
     context_block_limit: Option<u32>,
     max_tool_result_chars: u32,
     provider_retry_mode: String,
@@ -312,7 +314,6 @@ pub struct AgentLoop {
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
     pub(crate) tools: Arc<Mutex<ToolRegistry>>,
-    runner: Arc<AgentRunner>,
     pub subagents: Arc<SubagentManager>,
     /// In-flight per-session tasks, keyed by session then by a unique task id so
     /// each task can remove itself on completion (the `add_done_callback` analog).
@@ -349,7 +350,6 @@ impl AgentLoop {
         let channels_config = Some(config.channels.clone());
         let timezone = Some(agents_cfg.timezone.clone());
 
-        let model = agents_cfg.model.clone();
         let web_config = tools_cfg.web.clone();
         let exec_config = tools_cfg.exec.clone();
         let gmail_config = tools_cfg.gmail.clone();
@@ -361,9 +361,6 @@ impl AgentLoop {
 
         let context_window_tokens = agents_cfg.context_window_tokens;
         let max_tool_result_chars = agents_cfg.max_tool_result_chars;
-        let max_tokens = agents_cfg.max_tokens;
-        let temperature = agents_cfg.temperature;
-        let reasoning_effort = agents_cfg.reasoning_effort.clone();
         let max_iterations = agents_cfg.max_tool_iterations;
         let context_block_limit = agents_cfg.context_block_limit;
         let provider_retry_mode = agents_cfg.provider_retry_mode.clone();
@@ -380,12 +377,13 @@ impl AgentLoop {
         };
         let session_manager = session_manager
             .unwrap_or_else(|| Arc::new(Mutex::new(SessionManager::new(workspace.clone()))));
+        let runtime_resolver = Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
         let subagents = Arc::new(SubagentManager::new(
-            provider.clone(),
+            runtime_resolver.clone(),
+            session_manager.clone(),
             workspace.clone(),
             bus.clone(),
             max_tool_result_chars as usize,
-            Some(model.clone()),
             Some(web_config.clone()),
             Some(exec_config.clone()),
             Some(gmail_config.clone()),
@@ -419,8 +417,7 @@ impl AgentLoop {
         ));
         let consolidator = Arc::new(Consolidator::new(
             Arc::clone(&context.memory),
-            provider.clone(),
-            model.clone(),
+            runtime_resolver.clone(),
             session_manager.clone(),
             context_window_tokens,
             Box::new(Arc::clone(&context)),
@@ -432,14 +429,9 @@ impl AgentLoop {
         let agent_loop = Self {
             bus: bus.clone(),
             channels_config,
-            provider: provider.clone(),
+            runtime_resolver: runtime_resolver.clone(),
             workspace: workspace.clone(),
-            model: model.clone(),
             max_iterations,
-            max_tokens,
-            temperature,
-            reasoning_effort,
-            context_window_tokens,
             context_block_limit,
             max_tool_result_chars,
             provider_retry_mode: provider_retry_mode.to_string(),
@@ -454,7 +446,6 @@ impl AgentLoop {
             context: context.clone(),
             session_manager: session_manager.clone(),
             tools,
-            runner: Arc::new(AgentRunner::new(provider.clone())),
             subagents,
             running: AtomicBool::new(false),
             mcp_servers,
@@ -471,8 +462,9 @@ impl AgentLoop {
             consolidator,
             dream: Arc::new(Dream::new(
                 Arc::clone(&context.memory),
-                provider,
-                dream_cfg.model_override.as_deref().unwrap_or(&model),
+                runtime_resolver.clone(),
+                dream_cfg.dream_model_preset.clone(),
+                dream_cfg.model_override.clone(),
                 dream_cfg.max_batch_size as usize,
                 dream_cfg.max_iterations as usize,
                 max_tool_result_chars as usize,
@@ -485,6 +477,71 @@ impl AgentLoop {
             config,
         };
         agent_loop
+    }
+
+    /// The process-wide default model (read-through onto the resolver's
+    /// current default; does not reflect any particular session's override).
+    pub fn model(&self) -> String {
+        self.runtime_resolver.current_default().model
+    }
+
+    /// The process-wide default provider (read-through onto the resolver's
+    /// current default; does not reflect any particular session's override).
+    pub fn provider(&self) -> Arc<dyn LLMProviderDyn> {
+        self.runtime_resolver.current_default().provider
+    }
+
+    /// The process-wide default context window (read-through onto the
+    /// resolver's current default).
+    pub fn context_window_tokens(&self) -> u64 {
+        self.runtime_resolver.current_default().context_window_tokens
+    }
+
+    /// Names available for `/model <name>`: `"default"` plus every configured preset.
+    pub fn available_model_presets(&self) -> Vec<String> {
+        self.runtime_resolver.available_preset_names()
+    }
+
+    /// Resolve the runtime a session would use right now (its stored preset
+    /// override, if any, else the process-wide default) without mutating
+    /// anything — used by `/model` with no arguments to report the active
+    /// model/preset for the calling session.
+    pub fn runtime_for_session(&self, session: Option<&Session>) -> ModelRuntime {
+        self.runtime_resolver.runtime_for_session(session)
+    }
+
+    /// Validate and persist one session's model-preset override.
+    ///
+    /// `name == "default"` clears the override, reverting the session to the
+    /// process-wide default on its next turn. This never mutates the
+    /// process-wide default itself — the switch is isolated to this session,
+    /// matching nanobot's `/model <preset>` semantics.
+    pub fn set_session_model_preset(
+        &self,
+        session_manager: &mut SessionManager,
+        session_key: &str,
+        name: &str,
+    ) -> Result<ModelRuntime, String> {
+        let runtime = if name == RESERVED_MODEL_PRESET_NAME {
+            self.runtime_resolver.current_default()
+        } else {
+            self.runtime_resolver.resolve_preset(name)?
+        };
+
+        let session = session_manager.get_or_create_session(session_key);
+        if name == RESERVED_MODEL_PRESET_NAME {
+            session.metadata.remove(SESSION_MODEL_PRESET_METADATA_KEY);
+        } else {
+            session.metadata.insert(
+                SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+                Value::String(name.to_string()),
+            );
+        }
+        let snapshot = session.clone();
+        session_manager
+            .save(snapshot)
+            .map_err(|e| format!("Failed to save session: {e}"))?;
+        Ok(runtime)
     }
 
     /// Register the default set of tools.
@@ -729,13 +786,23 @@ impl AgentLoop {
         
         let run_tools = self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone();
         log::info!("Running agent loop with {} tools", run_tools.len());
-        log::info!("Max Tokens: {}", self.max_tokens);
-        let result = self
-            .runner
+
+        // Resolve the runtime for this specific session (its stored preset
+        // override, if any, else the process-wide default) — no fixed
+        // provider/model here; see `ModelRuntimeResolver`.
+        let runtime = self.runtime_resolver.runtime_for_session(session.as_ref());
+        log::info!(
+            "Running turn with model={} (preset={}), max_tokens={}",
+            runtime.model,
+            runtime.preset_name,
+            runtime.max_tokens
+        );
+        let runner = AgentRunner::new(runtime.provider.clone());
+        let result = runner
             .run(AgentRunSpec {
                 initial_messages,
                 tools: run_tools,
-                model: self.model.clone(),
+                model: runtime.model.clone(),
                 max_iterations: self.max_iterations as usize,
                 max_tool_result_chars: self.max_tool_result_chars as usize,
                 hook: Some(hook),
@@ -745,16 +812,16 @@ impl AgentLoop {
                 concurrent_tools: true,
                 workspace: Some(self.workspace.clone()),
                 session_key,
-                context_window_tokens: Some(self.context_window_tokens),
+                context_window_tokens: Some(runtime.context_window_tokens),
                 context_block_limit: self.context_block_limit,
                 provider_retry_mode: self.provider_retry_mode.clone(),
                 progress_callback: None,
                 checkpoint_callback,
                 fail_on_tool_error: false,
-                temperature: Some(self.temperature),
+                temperature: Some(runtime.temperature),
                 max_iterations_message: None,
-                max_tokens: Some(self.max_tokens as usize),
-                reasoning_effort: self.reasoning_effort.clone(),
+                max_tokens: Some(runtime.max_tokens as usize),
+                reasoning_effort: runtime.reasoning_effort.clone(),
             })
             .await;
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage.clone();
@@ -1076,7 +1143,8 @@ impl AgentLoop {
         };
 
         let history = snapshot.get_history(Some(0));
-        let current_role = Self::subagent_announce_role(&self.model);
+        let turn_runtime = self.runtime_resolver.runtime_for_session(Some(&snapshot));
+        let current_role = Self::subagent_announce_role(&turn_runtime.model);
         let messages = self.context.build_messages(
             history.as_slice(),
             msg.content.as_str(),

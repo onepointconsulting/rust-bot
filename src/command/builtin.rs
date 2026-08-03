@@ -203,15 +203,16 @@ impl CommandHandler for CmdStatus {
             .unwrap_or_default()
             .as_secs_f64();
 
+        let current_model = agent_loop.model();
         OutboundMessage {
             channel: ctx.msg.channel.clone(),
             chat_id: ctx.msg.chat_id.clone(),
             content: build_status_content(
                 PKG_VERSION,
-                agent_loop.model.as_str(),
+                current_model.as_str(),
                 start_time_secs,
                 &last_usage,
-                agent_loop.context_window_tokens,
+                agent_loop.context_window_tokens(),
                 session_msg_count,
                 ctx_est,
                 Some(search_usage_text.as_str()),
@@ -292,15 +293,56 @@ impl CommandHandler for CmdHelp {
 
 struct CmdModel;
 
-/// Show the LLM model currently configured for this session.
+/// Show or switch the LLM model preset used by this chat session.
+///
+/// `/model` (no args) reports the session's currently active model/preset.
+/// `/model <name>` switches this session (only) to that named preset for
+/// future turns; `/model default` clears back to the implicit default
+/// preset. The switch is session-scoped — it never touches the process-wide
+/// default, and other sessions are unaffected.
 #[async_trait]
 impl CommandHandler for CmdModel {
     async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/model");
         };
-        let provider_name = agent_loop.provider.api_base().map(|base| base.to_string()).unwrap_or_else(|| "Unknown".to_string());
-        reply_as_text(ctx, format!("Model: {}\nProvider base url: {}", agent_loop.model, provider_name))
+        let requested = ctx.args.trim();
+
+        if requested.is_empty() {
+            let (_session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+            let runtime = agent_loop.runtime_for_session(Some(&session));
+            let provider_name = runtime
+                .provider
+                .api_base()
+                .map(|base| base.to_string())
+                .unwrap_or_else(|| "Unknown".to_string());
+            return reply_as_text(
+                ctx,
+                format!(
+                    "Model: {} (preset: {})\nProvider base url: {}",
+                    runtime.model, runtime.preset_name, provider_name
+                ),
+            );
+        }
+
+        let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+        let session_key = session.key.clone();
+        match agent_loop.set_session_model_preset(&mut session_manager, &session_key, requested) {
+            Ok(runtime) => reply_as_text(
+                ctx,
+                format!(
+                    "Model preset set to '{}' for this session (model: {}).",
+                    runtime.preset_name, runtime.model
+                ),
+            ),
+            Err(_) => {
+                let available = agent_loop.available_model_presets().join(", ");
+                reply_as_text(
+                    ctx,
+                    format!("Unknown model preset '{requested}'. Available presets: {available}"),
+                )
+            }
+        }
     }
 }
 
@@ -734,7 +776,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::DreamLog.to_string(), Arc::new(CmdDreamLog));
     router.exact(ChatCommand::DreamRestore.to_string(), Arc::new(CmdDreamRestore));
     router.exact(ChatCommand::Help.to_string(), Arc::new(CmdHelp));
-    router.exact(ChatCommand::Model.to_string(), Arc::new(CmdModel));
+    router.prefix(ChatCommand::Model.to_string(), Arc::new(CmdModel));
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
@@ -913,6 +955,182 @@ mod tests {
         );
         let out = CmdModel.handle(&ctx).await;
         assert!(out.content.contains("Model: "));
+        assert!(
+            out.content.contains("(preset: default)"),
+            "expected default preset label, got: {}",
+            out.content
+        );
+    }
+
+    use crate::providers::base::LLMProviderDyn;
+
+    struct ModelCmdTestProvider;
+    #[async_trait]
+    impl LLMProviderDyn for ModelCmdTestProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &crate::providers::base::GenerationSettings {
+            static SETTINGS: std::sync::OnceLock<crate::providers::base::GenerationSettings> =
+                std::sync::OnceLock::new();
+            SETTINGS.get_or_init(crate::providers::base::GenerationSettings::new)
+        }
+        fn generation_settings_mut(&mut self) -> &mut crate::providers::base::GenerationSettings {
+            unimplemented!()
+        }
+        fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            "test".into()
+        }
+        async fn chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> crate::providers::base::LLMResponse {
+            crate::providers::base::LLMResponse::new()
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> crate::providers::base::LLMResponse {
+            crate::providers::base::LLMResponse::new()
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> crate::providers::base::LLMResponse {
+            crate::providers::base::LLMResponse::new()
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<crate::providers::base::BoxedStreamCallback>,
+        ) -> crate::providers::base::LLMResponse {
+            crate::providers::base::LLMResponse::new()
+        }
+    }
+
+    fn model_cmd_test_loop_with_preset() -> Arc<crate::agent::agent_loop::AgentLoop> {
+        let bus = Arc::new(crate::bus::queue::MessageBus::new());
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(ModelCmdTestProvider);
+        let mut config = crate::config::schema::Config::default();
+        config.agents.model = "claude-sonnet-5".into();
+        config.providers.anthropic.api_key = "test-key".to_string();
+        config.model_presets.insert(
+            "fast".to_string(),
+            crate::config::schema::ModelPresetConfig {
+                model: "claude-haiku".to_string(),
+                provider: "anthropic".to_string(),
+                ..Default::default()
+            },
+        );
+        Arc::new(crate::agent::agent_loop::AgentLoop::new(
+            bus,
+            provider,
+            std::env::temp_dir(),
+            config,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    fn model_cmd_ctx(agent_loop: Arc<crate::agent::agent_loop::AgentLoop>, args: &str) -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: format!("/model {args}").trim().to_string(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "model-cmd-session",
+            "/model",
+            args,
+            Some(agent_loop),
+        )
+    }
+
+    #[tokio::test]
+    async fn model_command_with_valid_preset_name_confirms_switch() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let ctx = model_cmd_ctx(loop_, "fast");
+        let out = CmdModel.handle(&ctx).await;
+        assert!(out.content.contains("fast"), "got: {}", out.content);
+        assert!(out.content.contains("claude-haiku"), "got: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn model_command_with_invalid_preset_name_lists_available() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let ctx = model_cmd_ctx(loop_, "not-a-real-preset");
+        let out = CmdModel.handle(&ctx).await;
+        assert!(out.content.contains("Unknown model preset"), "got: {}", out.content);
+        assert!(out.content.contains("default"), "got: {}", out.content);
+        assert!(out.content.contains("fast"), "got: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn model_command_default_keyword_clears_session_override() {
+        let loop_ = model_cmd_test_loop_with_preset();
+
+        // First switch to "fast" ...
+        let switch_ctx = model_cmd_ctx(loop_.clone(), "fast");
+        let switched = CmdModel.handle(&switch_ctx).await;
+        assert!(switched.content.contains("fast"));
+
+        // ... then confirm the no-args view reflects it before clearing.
+        let show_ctx = model_cmd_ctx(loop_.clone(), "");
+        let shown = CmdModel.handle(&show_ctx).await;
+        assert!(shown.content.contains("(preset: fast)"), "got: {}", shown.content);
+
+        // ... then clear back to "default" for the same session.
+        let default_ctx = model_cmd_ctx(loop_.clone(), "default");
+        let cleared = CmdModel.handle(&default_ctx).await;
+        assert!(cleared.content.contains("default"), "got: {}", cleared.content);
+
+        let show_after_ctx = model_cmd_ctx(loop_, "");
+        let shown_after = CmdModel.handle(&show_after_ctx).await;
+        assert!(
+            shown_after.content.contains("(preset: default)"),
+            "got: {}",
+            shown_after.content
+        );
     }
 
     #[tokio::test]

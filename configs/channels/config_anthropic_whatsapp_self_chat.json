@@ -16,18 +16,23 @@
       "modelOverride": null,
       "maxBatchSize": 20,
       "maxIterations": 10
-    }
+    },
+    "modelPreset": "primary"
   },
   "channels": {
     "sendProgress": false,
     "sendToolHints": false,
     "sendMaxRetries": 3,
     "transcriptionProvider": "groq",
-    "allowFrom": ["*"],
+    "allowFrom": [
+      "*"
+    ],
     "whatsapp": {
       "enabled": true,
       "sessionDbPath": "~/.rust-bot/workspace-whatsapp-gateway/session.db",
-      "allowFrom": ["*"],
+      "allowFrom": [
+        "*"
+      ],
       "mediaDownloadDir": "~/.rust-bot/workspace-whatsapp-gateway/media",
       "selfChat": true,
       "allowedGroups": [],
@@ -99,5 +104,15 @@
   },
   "subagent": {
     "fail_on_tool_error": false
+  },
+  "modelPresets": {
+    "primary": {
+      "model": "${ANTHROPIC_API_MODEL}",
+      "provider": "anthropic",
+      "maxTokens": 32768,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "reasoningEffort": null
+    }
   }
 }

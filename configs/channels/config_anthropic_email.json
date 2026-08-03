@@ -16,14 +16,17 @@
       "modelOverride": null,
       "maxBatchSize": 20,
       "maxIterations": 10
-    }
+    },
+    "modelPreset": "primary"
   },
   "channels": {
     "sendProgress": false,
     "sendToolHints": false,
     "sendMaxRetries": 3,
     "transcriptionProvider": "groq",
-    "allowFrom": ["*"],
+    "allowFrom": [
+      "*"
+    ],
     "email": {
       "enabled": true,
       "consentGranted": true,
@@ -113,5 +116,15 @@
   },
   "subagent": {
     "fail_on_tool_error": false
+  },
+  "modelPresets": {
+    "primary": {
+      "model": "${ANTHROPIC_API_MODEL}",
+      "provider": "anthropic",
+      "maxTokens": 32768,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "reasoningEffort": null
+    }
   }
 }

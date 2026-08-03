@@ -158,10 +158,18 @@ pub struct DreamConfig {
     pub cron: Option<String>,
 
     /// Optional Dream-specific model override. Accepts `modelOverride`,
-    /// `model`, or `model_override` as JSON keys.
+    /// `model`, or `model_override` as JSON keys. A raw model string, applied
+    /// directly — unrelated to named presets. See `dream_model_preset` for
+    /// selecting a named `model_presets` entry instead.
     #[serde(alias = "model", alias = "model_override")]
     #[garde(skip)]
     pub model_override: Option<String>,
+
+    /// Name of a `model_presets` entry Dream should use instead of the
+    /// process-wide default. Takes precedence over `model_override` when set.
+    #[serde(alias = "dream_model_preset")]
+    #[garde(skip)]
+    pub dream_model_preset: Option<String>,
 
     /// Maximum history entries processed per consolidation run. Must be ≥ 1.
     #[serde(alias = "max_batch_size", default = "default_dream_max_batch_size")]
@@ -180,6 +188,7 @@ impl Default for DreamConfig {
             interval_h: default_dream_interval_h(),
             cron: None,
             model_override: None,
+            dream_model_preset: None,
             max_batch_size: default_dream_max_batch_size(),
             max_iterations: default_dream_max_iterations(),
         }
@@ -276,6 +285,72 @@ fn default_agent_timezone() -> String {
 fn default_agent_dream_config() -> DreamConfig {
     DreamConfig::default()
 }
+fn default_model_preset_provider() -> String {
+    "auto".to_string()
+}
+
+/// A named, reusable bundle of model + provider + generation settings.
+///
+/// Selected as the process-wide default via `AgentsConfig::model_preset`, or
+/// switched per chat session on the fly via `/model <name>`. The name
+/// `"default"` is reserved: it always means "use `AgentsConfig`'s own flat
+/// `model`/`provider`/... fields," for backward compatibility with configs
+/// that predate presets, and must not be defined as an entry in
+/// `Config::model_presets` (enforced by `validate_model_presets`).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelPresetConfig {
+    /// Optional human-readable display label.
+    #[serde(alias = "label")]
+    #[garde(skip)]
+    pub label: Option<String>,
+
+    /// Model identifier, e.g. `"anthropic/claude-opus-4-6"`. Emptiness is
+    /// checked by `validate_model_presets` rather than by garde, since the
+    /// container-level `#[serde(default)]` attribute silently produces an
+    /// empty string for a missing key rather than failing to parse.
+    #[serde(alias = "model")]
+    #[garde(skip)]
+    pub model: String,
+
+    /// Provider name (e.g. `"anthropic"`, `"openrouter"`) or `"auto"`.
+    #[serde(alias = "provider", default = "default_model_preset_provider")]
+    #[garde(skip)]
+    pub provider: String,
+
+    #[serde(alias = "max_tokens", default = "default_agent_max_tokens")]
+    #[garde(range(min = 1))]
+    pub max_tokens: u32,
+
+    #[serde(
+        alias = "context_window_tokens",
+        default = "default_agent_context_window_tokens"
+    )]
+    #[garde(range(min = 1))]
+    pub context_window_tokens: u64,
+
+    #[serde(alias = "temperature", default = "default_agent_temperature")]
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub temperature: f32,
+
+    #[serde(alias = "reasoning_effort", default = "default_agent_reasoning_effort")]
+    #[garde(skip)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for ModelPresetConfig {
+    fn default() -> Self {
+        Self {
+            label: None,
+            model: String::new(),
+            provider: default_model_preset_provider(),
+            max_tokens: default_agent_max_tokens(),
+            context_window_tokens: default_agent_context_window_tokens(),
+            temperature: default_agent_temperature(),
+            reasoning_effort: None,
+        }
+    }
+}
 
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
@@ -346,6 +421,14 @@ pub struct AgentsConfig {
     #[serde(alias = "dream", default = "default_agent_dream_config")]
     #[garde(skip)]
     pub dream: DreamConfig,
+
+    /// Name of a `model_presets` entry to use as the process-wide default.
+    /// `None` or `"default"` both mean: use this struct's own flat
+    /// `model`/`provider`/... fields (the implicit, backward-compatible
+    /// `"default"` preset).
+    #[serde(alias = "model_preset")]
+    #[garde(skip)]
+    pub model_preset: Option<String>,
 }
 
 impl Default for AgentsConfig {
@@ -364,6 +447,7 @@ impl Default for AgentsConfig {
             reasoning_effort: None,
             timezone: default_agent_timezone(),
             dream: default_agent_dream_config(),
+            model_preset: None,
         }
     }
 }
@@ -1330,6 +1414,14 @@ pub struct Config {
     #[serde(alias = "example_prompts", default = "default_example_prompts")]
     #[garde(skip)]
     pub example_prompts: Vec<String>,
+
+    /// Named model+provider+generation-setting bundles, selectable via
+    /// `agents.modelPreset` (process-wide default) or per-session via
+    /// `/model <name>`. The reserved name `"default"` must not appear as a
+    /// key here — see `validate_model_presets`.
+    #[serde(alias = "model_presets")]
+    #[garde(dive)]
+    pub model_presets: HashMap<String, ModelPresetConfig>,
 }
 
 impl Config {
@@ -1487,8 +1579,59 @@ impl Default for Config {
             tools: ToolsConfig::default(),
             subagent: SubagentConfig::default(),
             example_prompts: default_example_prompts(),
+            model_presets: HashMap::new(),
         }
     }
+}
+
+/// Reserved `model_presets` key: always means "use `AgentsConfig`'s own flat
+/// `model`/`provider`/... fields," never a real entry in `model_presets`.
+pub const RESERVED_MODEL_PRESET_NAME: &str = "default";
+
+/// Cross-field checks for `model_presets` that garde's per-struct
+/// `#[derive(Validate)]` can't express (they span sibling fields of `Config`
+/// itself): the reserved name, per-preset emptiness, and that any preset
+/// name referenced elsewhere (`agents.modelPreset`, `agents.dream.dreamModelPreset`)
+/// actually exists. Mirrors nanobot's pydantic `model_validator(mode="after")`
+/// on `Config`. Called from `load_config()`.
+pub fn validate_model_presets(config: &Config) -> Result<(), String> {
+    if config.model_presets.contains_key(RESERVED_MODEL_PRESET_NAME) {
+        return Err(format!(
+            "model_presets: the name '{RESERVED_MODEL_PRESET_NAME}' is reserved (it is \
+             synthesized automatically from agents.model/provider/... for backward \
+             compatibility) and must not be defined explicitly"
+        ));
+    }
+
+    for (name, preset) in &config.model_presets {
+        if preset.model.trim().is_empty() {
+            return Err(format!("model_presets.{name}: 'model' must not be empty"));
+        }
+        if let Err(e) = preset.validate() {
+            return Err(format!("model_presets.{name}: {e}"));
+        }
+    }
+
+    if let Some(selected) = &config.agents.model_preset {
+        if selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
+            return Err(format!(
+                "agents.modelPreset references unknown preset '{selected}'; known presets: {:?}",
+                config.model_presets.keys().collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    if let Some(selected) = &config.agents.dream.dream_model_preset {
+        if selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
+            return Err(format!(
+                "agents.dream.dreamModelPreset references unknown preset '{selected}'; \
+                 known presets: {:?}",
+                config.model_presets.keys().collect::<Vec<_>>()
+            ));
+        }
+    }
+
+    Ok(())
 }
 
 /// Default agent configuration.
@@ -2559,5 +2702,109 @@ mod tests {
         assert!(name.is_some());
         assert_eq!(ssrf_whitelist, vec!["100.64.0.0/10", "192.168.0.0/16"]);
         println!("provider: {:?}", name.unwrap());
+    }
+
+    #[test]
+    fn test_model_preset_config_defaults() {
+        let cfg = ModelPresetConfig::default();
+        assert_eq!(cfg.model, "");
+        assert_eq!(cfg.provider, "auto");
+        assert_eq!(cfg.max_tokens, default_agent_max_tokens());
+        assert_eq!(cfg.context_window_tokens, default_agent_context_window_tokens());
+        assert_eq!(cfg.temperature, default_agent_temperature());
+        assert_eq!(cfg.reasoning_effort, None);
+        assert_eq!(cfg.label, None);
+    }
+
+    #[test]
+    fn test_model_preset_config_deserializes_camel_case_and_defaults() {
+        let json = r#"{"model": "anthropic/claude-opus-4-6", "provider": "anthropic", "temperature": 0.5}"#;
+        let cfg: ModelPresetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.model, "anthropic/claude-opus-4-6");
+        assert_eq!(cfg.provider, "anthropic");
+        assert_eq!(cfg.temperature, 0.5);
+        assert_eq!(cfg.max_tokens, default_agent_max_tokens());
+        assert_eq!(cfg.context_window_tokens, default_agent_context_window_tokens());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_rejects_reserved_default_preset_name() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert(
+            RESERVED_MODEL_PRESET_NAME.to_string(),
+            ModelPresetConfig {
+                model: "some-model".to_string(),
+                ..ModelPresetConfig::default()
+            },
+        );
+        assert!(validate_model_presets(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_empty_model_in_preset() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert("fast".to_string(), ModelPresetConfig::default());
+        let err = validate_model_presets(&cfg).unwrap_err();
+        assert!(err.contains("fast"));
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_referenced_preset() {
+        let mut cfg = Config::default();
+        cfg.agents.model_preset = Some("nope".to_string());
+        let err = validate_model_presets(&cfg).unwrap_err();
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_referenced_dream_preset() {
+        let mut cfg = Config::default();
+        cfg.agents.dream.dream_model_preset = Some("nope".to_string());
+        let err = validate_model_presets(&cfg).unwrap_err();
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn test_config_accepts_valid_preset_with_flat_fallback() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert(
+            "fast".to_string(),
+            ModelPresetConfig {
+                model: "openai/gpt-4.1-mini".to_string(),
+                provider: "openai".to_string(),
+                ..ModelPresetConfig::default()
+            },
+        );
+        // agents.model_preset left None -> falls back to implicit "default"; still valid.
+        assert!(validate_model_presets(&cfg).is_ok());
+
+        cfg.agents.model_preset = Some("fast".to_string());
+        assert!(validate_model_presets(&cfg).is_ok());
+
+        cfg.agents.model_preset = Some(RESERVED_MODEL_PRESET_NAME.to_string());
+        assert!(validate_model_presets(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_config_dive_validates_preset_numeric_ranges() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert(
+            "bad".to_string(),
+            ModelPresetConfig {
+                model: "openai/gpt-4.1-mini".to_string(),
+                temperature: 5.0,
+                ..ModelPresetConfig::default()
+            },
+        );
+        assert!(validate_model_presets(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_config_model_presets_empty_by_default_is_noop() {
+        let cfg = Config::default();
+        assert!(cfg.model_presets.is_empty());
+        assert!(validate_model_presets(&cfg).is_ok());
     }
 }

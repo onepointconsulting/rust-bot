@@ -8,7 +8,7 @@ use regex::Regex;
 
 
 use crate::cli::CliError;
-use crate::config::schema::Config;
+use crate::config::schema::{validate_model_presets, Config};
 use crate::security::network::configure_ssrf_whitelist;
 use crate::utils::helpers::expand_tilde_path;
 
@@ -49,6 +49,9 @@ pub fn load_config(path_option: Option<PathBuf>) -> Config {
         config = serde_json::from_reader(reader).unwrap_or_else(|e| {
             panic!("Failed to parse config file '{}': {e}", path.display());
         });
+    }
+    if let Err(e) = validate_model_presets(&config) {
+        panic!("Invalid config file '{}': {e}", path.display());
     }
     // Apply ssrf whitelist
     apply_ssrf_whitelist(&config);
@@ -159,6 +162,23 @@ mod tests {
         println!("config_path: {:?}", config_path);
         assert_eq!(config_path, simple1_config);
         assert!(config_path.is_file());
+    }
+
+    #[test]
+    fn test_simple1_config_migrated_to_model_presets() {
+        let simple1_config =
+            PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("configs/simple1/config.json");
+        let config = load_config(Some(simple1_config));
+        assert_eq!(config.agents.model_preset, Some("primary".to_string()));
+        let preset = config
+            .model_presets
+            .get("primary")
+            .expect("migrated config should define a 'primary' preset");
+        assert_eq!(preset.model, config.agents.model);
+        assert_eq!(preset.provider, config.agents.provider);
+        assert_eq!(preset.max_tokens, config.agents.max_tokens);
+        assert_eq!(preset.context_window_tokens, config.agents.context_window_tokens);
+        assert_eq!(preset.temperature, config.agents.temperature);
     }
 
     // ── save_config ───────────────────────────────────────────────────────────
@@ -279,5 +299,49 @@ mod tests {
 
         let resolved = resolve_config_env_vars(&config).unwrap();
         assert_eq!(resolved.agents.max_tokens, original_max_tokens);
+    }
+
+    // ── model_presets validation ─────────────────────────────────────────────
+
+    #[test]
+    fn test_load_config_with_no_model_presets_is_unaffected() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let config = Config::default();
+        save_config(&config, Some(path.clone()));
+
+        let loaded = load_config(Some(path));
+        assert!(loaded.model_presets.is_empty());
+    }
+
+    #[test]
+    fn test_load_config_with_valid_model_preset_reference() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.model_presets.insert(
+            "fast".to_string(),
+            crate::config::schema::ModelPresetConfig {
+                model: "openai/gpt-4.1-mini".to_string(),
+                ..Default::default()
+            },
+        );
+        config.agents.model_preset = Some("fast".to_string());
+        save_config(&config, Some(path.clone()));
+
+        let loaded = load_config(Some(path));
+        assert_eq!(loaded.agents.model_preset, Some("fast".to_string()));
+    }
+
+    #[test]
+    #[should_panic(expected = "Invalid config file")]
+    fn test_load_config_with_unknown_model_preset_reference_panics() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut config = Config::default();
+        config.agents.model_preset = Some("nope".to_string());
+        save_config(&config, Some(path.clone()));
+
+        load_config(Some(path));
     }
 }

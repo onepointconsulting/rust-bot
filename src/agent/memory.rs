@@ -6,10 +6,11 @@ use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
 
 use crate::agent::context::{SOUL_FILE, USER_FILE};
+use crate::agent::model_runtime::{ModelRuntime, ModelRuntimeResolver};
 use crate::agent::runner::{AgentRunSpec, AgentRunner};
 use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
 use crate::agent::tools::registry::ToolRegistry;
-use crate::providers::base::{LLMProviderDyn, LLMResponse};
+use crate::providers::base::LLMResponse;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
@@ -683,8 +684,10 @@ pub trait MessageBuilder: Send + Sync {
 
 pub struct Consolidator {
     pub store: Arc<MemoryStore>,
-    provider: Arc<dyn LLMProviderDyn>,
-    model: String,
+    /// Resolves the summarization call's provider/model per session (its
+    /// stored preset override, if any, else the process-wide default) — no
+    /// fixed provider/model is held here.
+    runtime_resolver: Arc<ModelRuntimeResolver>,
     sessions: Arc<Mutex<SessionManager>>,
     context_window_tokens: u64,
     message_builder: Box<dyn MessageBuilder>,
@@ -698,8 +701,7 @@ impl Consolidator {
 
     pub fn new(
         store: Arc<MemoryStore>,
-        provider: Arc<dyn LLMProviderDyn>,
-        model: String,
+        runtime_resolver: Arc<ModelRuntimeResolver>,
         sessions: Arc<Mutex<SessionManager>>,
         context_window_tokens: u64,
         message_builder: Box<dyn MessageBuilder>,
@@ -707,8 +709,7 @@ impl Consolidator {
     ) -> Self {
         Self {
             store: store,
-            provider,
-            model,
+            runtime_resolver,
             sessions,
             context_window_tokens,
             message_builder,
@@ -770,7 +771,7 @@ impl Consolidator {
 
     /// Summarize messages via LLM and append to history.jsonl.
     /// Returns True on success (or degraded success), False if nothing to do.
-    pub async fn archive(&self, messages: &Vec<serde_json::Value>) -> bool {
+    pub async fn archive(&self, messages: &Vec<serde_json::Value>, session_key: &str) -> bool {
         if messages.is_empty() {
             return false;
         }
@@ -783,7 +784,10 @@ impl Consolidator {
                 }
             };
         let formatted = MemoryStore::format_messages(messages);
-        let response = self
+        let runtime = self
+            .runtime_resolver
+            .resolve_for_session_key(&self.sessions, session_key);
+        let response = runtime
             .provider
             .chat_with_retry(
                 vec![
@@ -797,7 +801,7 @@ impl Consolidator {
                     }),
                 ],
                 None,
-                Some(self.model.clone()),
+                Some(runtime.model.clone()),
                 None,
                 None,
                 None,
@@ -902,7 +906,7 @@ impl Consolidator {
                 return;
             };
 
-            if !self.archive(&chunk).await {
+            if !self.archive(&chunk, session_key).await {
                 return;
             }
 
@@ -945,20 +949,25 @@ impl Consolidator {
 /// LLM can make targeted, incremental edits instead of replacing entire files.
 pub struct Dream {
     pub store: Arc<MemoryStore>,
-    pub provider: Arc<dyn LLMProviderDyn>,
-    pub model: String,
+    /// Resolves each Dream cycle's provider/model — no fixed provider/model
+    /// is held here; see [`Self::resolve_runtime`].
+    runtime_resolver: Arc<ModelRuntimeResolver>,
+    /// Name of a `model_presets` entry Dream should use, if configured.
+    dream_model_preset: Option<String>,
+    /// Raw model-string override, used when `dream_model_preset` is unset.
+    model_override: Option<String>,
     pub max_batch_size: usize,
     pub max_iterations: usize,
     pub max_tool_result_chars: usize,
-    pub runner: AgentRunner,
     tools: ToolRegistry,
 }
 
 impl Dream {
     pub fn new(
         store: Arc<MemoryStore>,
-        provider: Arc<dyn LLMProviderDyn>,
-        model: &str,
+        runtime_resolver: Arc<ModelRuntimeResolver>,
+        dream_model_preset: Option<String>,
+        model_override: Option<String>,
         max_batch_size: usize,
         max_iterations: usize,
         max_tool_result_chars: usize,
@@ -973,23 +982,47 @@ impl Dream {
         tools.register(Box::new(EditFileTool::new(Some(workspace), None, None)));
         Dream {
             store,
-            provider: provider.clone(),
-            model: model.to_string(),
+            runtime_resolver,
+            dream_model_preset,
+            model_override,
             max_batch_size,
             max_iterations,
             max_tool_result_chars,
-            runner: AgentRunner::new(provider),
-            tools: tools,
+            tools,
         }
+    }
+
+    /// Resolve this Dream cycle's runtime: `dream_model_preset` (a named
+    /// preset) takes precedence; else `model_override` (a raw model string)
+    /// is layered onto the process-wide default's provider; else the
+    /// process-wide default is used unchanged. Resolved fresh on every
+    /// `run()` — Dream never holds a fixed provider/model from construction.
+    fn resolve_runtime(&self) -> ModelRuntime {
+        if let Some(name) = &self.dream_model_preset {
+            match self.runtime_resolver.resolve_preset(name) {
+                Ok(runtime) => return runtime,
+                Err(e) => log::warn!(
+                    "agents.dream.dreamModelPreset '{name}' failed to resolve ({e}); \
+                     falling back to modelOverride/process default"
+                ),
+            }
+        }
+        let mut runtime = self.runtime_resolver.current_default();
+        if let Some(model) = &self.model_override {
+            runtime.model = model.clone();
+        }
+        runtime
     }
 
     fn finish_reason_fail(phase1_response: &LLMResponse) -> bool {
         phase1_response.finish_reason == "error" || phase1_response.content.is_none()
     }
 
-    /// Process unprocessed history entries. Returns True if work was done.    
+    /// Process unprocessed history entries. Returns True if work was done.
     pub async fn run(&self) -> bool {
         log::info!("Dream: running");
+        let runtime = self.resolve_runtime();
+        log::info!("Dream run using model={} (preset={})", runtime.model, runtime.preset_name);
         let last_cursor = self.store.get_last_dream_cursor();
         let entries = self.store.read_unprocessed_history(last_cursor);
         if entries.is_empty() {
@@ -1048,7 +1081,7 @@ impl Dream {
                 return false;
             }
         };
-        let phase1_response = self.provider.chat_with_retry(
+        let phase1_response = runtime.provider.chat_with_retry(
                 vec![serde_json::json!({
                     "role": "system",
                     "content": phase1_system,
@@ -1057,7 +1090,7 @@ impl Dream {
                     "content": phase1_prompt,
                 })],
                 None,
-            Some(self.model.clone()),
+            Some(runtime.model.clone()),
             None,
             None,
             None,
@@ -1097,12 +1130,12 @@ impl Dream {
                 "content": phase2_prompt,
             }),
         ];
-        let phase2_response = self
-            .runner
+        let runner = AgentRunner::new(runtime.provider.clone());
+        let phase2_response = runner
             .run(AgentRunSpec {
                 initial_messages: messages,
                 tools: self.tools.clone(),
-                model: self.model.clone(),
+                model: runtime.model.clone(),
                 max_iterations: self.max_iterations,
                 max_tool_result_chars: self.max_tool_result_chars,
                 fail_on_tool_error: false,
@@ -1180,6 +1213,7 @@ mod tests {
     use std::sync::Arc;
     use tempfile::TempDir;
 
+    use crate::config::schema::Config;
     use crate::providers::base::{
         BoxedStreamCallback, GenerationSettings, LLMProviderDyn, LLMResponse,
     };
@@ -1309,11 +1343,14 @@ mod tests {
         }
     }
 
+    fn test_runtime_resolver(provider: Arc<dyn LLMProviderDyn>) -> Arc<ModelRuntimeResolver> {
+        Arc::new(ModelRuntimeResolver::new(Config::default(), provider))
+    }
+
     fn test_consolidator(tmp: &TempDir, provider: Arc<dyn LLMProviderDyn>) -> Consolidator {
         Consolidator::new(
             Arc::new(make_store(tmp)),
-            provider,
-            "test-model".into(),
+            test_runtime_resolver(provider),
             Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf()))),
             65_536,
             Box::new(StubArchiveMessageBuilder),
@@ -1329,8 +1366,7 @@ mod tests {
     ) -> Consolidator {
         Consolidator::new(
             Arc::new(make_store(tmp)),
-            provider,
-            "test-model".into(),
+            test_runtime_resolver(provider),
             Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf()))),
             context_window_tokens,
             Box::new(StubArchiveMessageBuilder),
@@ -1353,8 +1389,7 @@ mod tests {
             .unwrap();
         let c = Consolidator::new(
             Arc::new(make_store(&tmp)),
-            ArchiveTestProvider::arc(resp),
-            "test-model".into(),
+            test_runtime_resolver(ArchiveTestProvider::arc(resp)),
             sessions,
             65_536,
             Box::new(StubArchiveMessageBuilder),
@@ -1387,8 +1422,7 @@ mod tests {
             .unwrap();
         let c = Consolidator::new(
             Arc::new(make_store(&tmp)),
-            ArchiveTestProvider::arc(resp),
-            "test-model".into(),
+            test_runtime_resolver(ArchiveTestProvider::arc(resp)),
             sessions,
             0,
             Box::new(StubArchiveMessageBuilder),
@@ -1423,8 +1457,7 @@ mod tests {
             .unwrap();
         let c = Consolidator::new(
             Arc::new(make_store(&tmp)),
-            ArchiveTestProvider::arc(resp),
-            "test-model".into(),
+            test_runtime_resolver(ArchiveTestProvider::arc(resp)),
             sessions,
             65_536,
             Box::new(StubArchiveMessageBuilder),
@@ -1475,8 +1508,7 @@ mod tests {
 
         let c = Consolidator::new(
             Arc::new(make_store(&tmp)),
-            ArchiveTestProvider::arc(resp),
-            "test-model".into(),
+            test_runtime_resolver(ArchiveTestProvider::arc(resp)),
             sessions.clone(),
             65_536,
             Box::new(StubArchiveMessageBuilder),
@@ -1522,8 +1554,7 @@ mod tests {
             .unwrap();
         let c = Consolidator::new(
             Arc::new(make_store(&tmp)),
-            ArchiveTestProvider::arc(resp),
-            "test-model".into(),
+            test_runtime_resolver(ArchiveTestProvider::arc(resp)),
             sessions,
             65_536,
             Box::new(StubArchiveMessageBuilder),
@@ -1540,7 +1571,7 @@ mod tests {
         let mut resp = LLMResponse::new();
         resp.content = Some("should-not-be-used".into());
         let c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
-        assert!(!c.archive(&vec![]).await);
+        assert!(!c.archive(&vec![], "test-session").await);
         assert!(
             !c.store.history_file.exists()
                 || fs::metadata(&c.store.history_file).unwrap().len() == 0
@@ -1558,7 +1589,7 @@ mod tests {
             "content": "hello archive",
             "timestamp": "2026-01-01T12:00:00Z",
         })];
-        assert!(c.archive(&messages).await);
+        assert!(c.archive(&messages, "test-session").await);
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
@@ -1579,7 +1610,7 @@ mod tests {
             "content": "fall back",
             "timestamp": "2026-02-02T15:00:00Z",
         })];
-        assert!(c.archive(&messages).await);
+        assert!(c.archive(&messages, "test-session").await);
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
@@ -1616,7 +1647,7 @@ mod tests {
             "content": "only whitespace summary",
             "timestamp": "2026-03-03T10:00:00Z",
         })];
-        assert!(c.archive(&messages).await);
+        assert!(c.archive(&messages, "test-session").await);
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
@@ -2669,5 +2700,78 @@ mod tests {
         for entry in entries {
             println!("entry: {}", serde_json::to_string(&entry).unwrap());
         }
+    }
+
+    // ── Dream::resolve_runtime ────────────────────────────────────────────────
+
+    fn test_dream(tmp: &TempDir, resolver: Arc<ModelRuntimeResolver>) -> Dream {
+        Dream::new(
+            Arc::new(make_store(tmp)),
+            resolver,
+            None,
+            None,
+            20,
+            10,
+            8192,
+        )
+    }
+
+    #[test]
+    fn dream_resolves_named_preset_when_configured() {
+        use crate::config::schema::ModelPresetConfig;
+
+        let mut config = Config::default();
+        config.providers.anthropic.api_key = "test-key".to_string();
+        config.model_presets.insert(
+            "dream-preset".to_string(),
+            ModelPresetConfig {
+                model: "claude-haiku".to_string(),
+                provider: "anthropic".to_string(),
+                ..Default::default()
+            },
+        );
+        let resolver = Arc::new(ModelRuntimeResolver::new(
+            config,
+            ArchiveTestProvider::arc(LLMResponse::new()),
+        ));
+        let tmp = TempDir::new().unwrap();
+        let mut dream = test_dream(&tmp, resolver);
+        dream.dream_model_preset = Some("dream-preset".to_string());
+
+        let runtime = dream.resolve_runtime();
+        assert_eq!(runtime.model, "claude-haiku");
+        assert_eq!(runtime.preset_name, "dream-preset");
+    }
+
+    #[test]
+    fn dream_falls_back_to_model_override_raw_string() {
+        let config = Config::default();
+        let resolver = Arc::new(ModelRuntimeResolver::new(
+            config,
+            ArchiveTestProvider::arc(LLMResponse::new()),
+        ));
+        let tmp = TempDir::new().unwrap();
+        let mut dream = test_dream(&tmp, resolver.clone());
+        dream.model_override = Some("raw-override-model".to_string());
+
+        let runtime = dream.resolve_runtime();
+        assert_eq!(runtime.model, "raw-override-model");
+        // Provider is still the process default's — only the model string is overridden.
+        assert!(Arc::ptr_eq(&runtime.provider, &resolver.current_default().provider));
+    }
+
+    #[test]
+    fn dream_uses_process_default_when_no_override_configured() {
+        let config = Config::default();
+        let resolver = Arc::new(ModelRuntimeResolver::new(
+            config,
+            ArchiveTestProvider::arc(LLMResponse::new()),
+        ));
+        let tmp = TempDir::new().unwrap();
+        let dream = test_dream(&tmp, resolver.clone());
+
+        let runtime = dream.resolve_runtime();
+        assert_eq!(runtime.model, resolver.current_default().model);
+        assert_eq!(runtime.preset_name, "default");
     }
 }

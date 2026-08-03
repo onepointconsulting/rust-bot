@@ -267,5 +267,25 @@ mod tests {
         assert_eq!(ctx.args, "hello");
         assert_eq!(out.content, "hello");
     }
+
+    #[tokio::test]
+    async fn dispatch_model_prefix_sets_args_from_raw_suffix() {
+        // `/model` must be registered via `prefix`, not `exact` — `exact` only
+        // matches when the whole trimmed/lowercased message equals the
+        // registered string, so `/model <preset>` would never reach the
+        // handler and no argument would ever be parsed.
+        let mut router = CommandRouter::new();
+        router.prefix("/model", Arc::new(ArgsEchoHandler));
+
+        let mut ctx = CommandContext::new(sample_msg(), None, "model", "/model claude-fast");
+        let out = router.dispatch(&mut ctx).await.unwrap();
+        assert_eq!(ctx.args.trim(), "claude-fast");
+        assert_eq!(out.content.trim(), "claude-fast");
+
+        let mut bare_ctx = CommandContext::new(sample_msg(), None, "model", "/model");
+        let bare_out = router.dispatch(&mut bare_ctx).await.unwrap();
+        assert_eq!(bare_ctx.args.trim(), "");
+        assert_eq!(bare_out.content.trim(), "");
+    }
 }
 

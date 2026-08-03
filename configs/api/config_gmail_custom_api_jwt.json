@@ -1,11 +1,11 @@
 {
   "agents": {
-    "workspace": ".\\.rust-bot\\workspace",
-    "model": "moonshot/kimi-k3",
-    "provider": "custom",
-    "maxTokens": 16384,
+    "workspace": "${AGENTS_WORKSPACE}",
+    "model": "${AGENTS_MODEL}",
+    "provider": "auto",
+    "maxTokens": 32768,
     "contextWindowTokens": 65536,
-    "temperature": 1,
+    "temperature": 0.1,
     "maxToolIterations": 100,
     "maxToolResultChars": 16000,
     "providerRetryMode": "standard",
@@ -31,7 +31,7 @@
   },
   "providers": {
     "custom": {
-      "apiKey": "${EDEN_AI_API_KEY}",
+      "apiKey": "${PROVIDER_CUSTOM_API_KEY}",
       "apiBase": "https://api.edenai.run/v3",
       "extraHeaders": null
     },
@@ -67,9 +67,24 @@
     }
   },
   "api": {
-    "host": "127.0.0.1",
+    "host": "0.0.0.0",
     "port": 8900,
-    "timeout": 120.0
+    "timeout": 120.0,
+    "jwt": {
+      "enabled": true,
+      "privateKeyPath": ".rust-bot/credentials/private_key.pem",
+      "publicKeyPath": ".rust-bot/credentials/public_key.pem",
+      "iss": "rust-bot",
+      "aud": "onepoint-newsletter"
+    },
+    "usersFile": ".rust-bot/users.json",
+    "cors": {
+      "enabled": true,
+      "origins": [
+        "*"
+      ]
+    },
+    "webRoot": null
   },
   "gateway": {
     "host": "0.0.0.0",
@@ -86,8 +101,8 @@
       "proxy": null,
       "timeout": 60,
       "search": {
-        "provider": "duckduckgo",
-        "apiKey": "",
+        "provider": "brave",
+        "apiKey": "${BRAVE_API_KEY}",
         "baseUrl": "",
         "maxResults": 20,
         "timeout": 30
@@ -103,9 +118,9 @@
     "mcpServers": {},
     "ssrfWhitelist": [],
     "gmail": {
-      "enable": false,
-      "clientSecretPath": "~/.rust-bot/credentials/client_secret.json",
-      "tokenCachePath": "~/.rust-bot/credentials/token_cache.json",
+      "enable": true,
+      "clientSecretPath": ".rust-bot/workspace/credentials/client_secret.json",
+      "tokenCachePath": ".rust-bot/workspace/credentials/token_cache.json",
       "maxResults": 20
     },
     "docx": {
@@ -117,18 +132,30 @@
       "baseUrl": "https://api.anthropic.com",
       "provider": "anthropic",
       "apiKey": ""
+    },
+    "imageGeneration": {
+      "enable": false,
+      "model": "openai/gpt-image-2",
+      "apiKey": "",
+      "baseUrl": "https://openrouter.ai/api/v1/images",
+      "size": "",
+      "quality": ""
     }
   },
   "subagent": {
     "failOnToolError": true
   },
+  "examplePrompts": [
+    "Can you please use the onepoint-newsletter-skill to generate a draft message and send it to gil.fernandes@onepointltd.com. Please use all of the relevant emails in the mailbox from the current month. By relevant I mean those that are related to the activities of Onepoint Consulting and its employees.",
+    "Can you please use the onepoint-client-facing-skill to generate a draft message and send it to gil.fernandes@onepointltd.com. Please use all of the relevant emails in the mailbox from the current month. By relevant I mean those that are related to the activities of Onepoint Consulting and its employees."
+  ],
   "modelPresets": {
     "primary": {
-      "model": "moonshot/kimi-k3",
-      "provider": "custom",
-      "maxTokens": 16384,
+      "model": "${AGENTS_MODEL}",
+      "provider": "auto",
+      "maxTokens": 32768,
       "contextWindowTokens": 65536,
-      "temperature": 1,
+      "temperature": 0.1,
       "reasoningEffort": null
     }
   }

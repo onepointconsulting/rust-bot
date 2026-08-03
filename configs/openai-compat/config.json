@@ -16,7 +16,8 @@
       "modelOverride": null,
       "maxBatchSize": 20,
       "maxIterations": 10
-    }
+    },
+    "modelPreset": "primary"
   },
   "channels": {
     "streaming": false,
@@ -133,5 +134,23 @@
   },
   "examplePrompts": [
     "What is the current weather in London today?"
-  ]
+  ],
+  "modelPresets": {
+    "primary": {
+      "model": "${OPENAI_API_MODEL}",
+      "provider": "openrouter",
+      "maxTokens": 32768,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "reasoningEffort": null
+    },
+    "secondary": {
+      "model": "anthropic/claude-opus-4-6",
+      "provider": "openrouter",
+      "maxTokens": 32768,
+      "contextWindowTokens": 65536,
+      "temperature": 0.1,
+      "reasoningEffort": null
+    }
+  }
 }

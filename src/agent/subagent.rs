@@ -9,8 +9,8 @@ use chrono::Utc;
 
 use crate::{
     agent::{
-        context::ContextBuilder, hook::{AgentHook, AgentHookContext}, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, skills::SkillsLoader, tools::{filesystem::FsToolConfig, registry::ToolRegistry, shell::ShellTool},
-    }, bus::{events::InboundMessage, queue::MessageBus}, config::schema::{DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig}, providers::base::LLMProviderDyn, utils::{
+        context::ContextBuilder, hook::{AgentHook, AgentHookContext}, model_runtime::ModelRuntimeResolver, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, skills::SkillsLoader, tools::{filesystem::FsToolConfig, registry::ToolRegistry, shell::ShellTool},
+    }, bus::{events::InboundMessage, queue::MessageBus}, config::schema::{Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig}, providers::base::LLMProviderDyn, session::manager::SessionManager, utils::{
         prompt_templates::render_template, registry_helper::{
             filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
         },
@@ -49,7 +49,11 @@ pub struct SubagentManager {
     pub workspace: PathBuf,
     pub bus: Arc<MessageBus>,
     pub max_tool_result_chars: usize,
-    pub model: String,
+    /// Resolves each subagent run's provider/model/generation settings — by
+    /// the spawning session's stored preset override when known, else the
+    /// process-wide default. No fixed provider/model is held here.
+    pub runtime_resolver: Arc<ModelRuntimeResolver>,
+    sessions: Arc<Mutex<SessionManager>>,
     pub web_config: WebToolsConfig,
     pub exec_config: ExecToolConfig,
     pub gmail_config: GmailToolConfig,
@@ -58,18 +62,17 @@ pub struct SubagentManager {
     pub image_generation_config: ImageGenerationToolConfig,
     pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
-    pub runner: AgentRunner,
     running_tasks: Arc<Mutex<HashMap<String, std::thread::JoinHandle<()>>>>,
     session_tasks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
 
 impl SubagentManager {
     pub fn new(
-        provider: Arc<dyn LLMProviderDyn>,
+        runtime_resolver: Arc<ModelRuntimeResolver>,
+        sessions: Arc<Mutex<SessionManager>>,
         workspace: PathBuf,
         bus: Arc<MessageBus>,
         max_tool_result_chars: usize,
-        model: Option<String>,
         web_config: Option<WebToolsConfig>,
         exec_config: Option<ExecToolConfig>,
         gmail_config: Option<GmailToolConfig>,
@@ -79,12 +82,12 @@ impl SubagentManager {
         subagent_config: Option<SubagentConfig>,
         restrict_to_workspace: Option<bool>,
     ) -> Self {
-        let model = model.unwrap_or_else(|| provider.get_default_model());
         Self {
             workspace,
             bus,
             max_tool_result_chars,
-            model,
+            runtime_resolver,
+            sessions,
             web_config: web_config.unwrap_or(WebToolsConfig::default()),
             exec_config: exec_config.unwrap_or(ExecToolConfig::default()),
             gmail_config: gmail_config.unwrap_or(GmailToolConfig::default()),
@@ -94,24 +97,28 @@ impl SubagentManager {
                 .unwrap_or(ImageGenerationToolConfig::default()),
             subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
-            runner: AgentRunner::new(provider),
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             session_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
+    /// Convenience constructor for tests/tools that don't care about presets
+    /// or a shared session store: builds a private resolver (from
+    /// `Config::default()`) and a private session manager around `provider`.
     pub fn new_simple(
         provider: Arc<dyn LLMProviderDyn>,
         workspace: PathBuf,
         bus: Arc<MessageBus>,
         max_tool_result_chars: usize,
     ) -> Self {
+        let runtime_resolver = Arc::new(ModelRuntimeResolver::new(Config::default(), provider));
+        let sessions = Arc::new(Mutex::new(SessionManager::new(workspace.clone())));
         SubagentManager::new(
-            provider,
+            runtime_resolver,
+            sessions,
             workspace,
             bus,
             max_tool_result_chars,
-            None,
             None,
             None,
             None,
@@ -165,7 +172,13 @@ impl SubagentManager {
                 .block_on(async move {
                     log::info!("Running subagent task: {}", task_id_bg);
                     manager
-                        .run_subagent(&task_id_bg, &task_owned, &display_label, &origin)
+                        .run_subagent(
+                            &task_id_bg,
+                            &task_owned,
+                            &display_label,
+                            &origin,
+                            session_key_owned.as_deref(),
+                        )
                         .await;
                     log::info!("Completed: {}", task_id_bg);
                     running_tasks.lock().unwrap().remove(&task_id_bg);
@@ -204,9 +217,10 @@ impl SubagentManager {
         task: &str,
         label: &str,
         origin: &HashMap<String, String>,
+        session_key: Option<&str>,
     ) {
         if let Err(e) = self
-            .run_subagent_inner(task_id, task, label, origin)
+            .run_subagent_inner(task_id, task, label, origin, session_key)
             .await
         {
             log::error!("Subagent [{task_id}] failed: {e}");
@@ -222,6 +236,7 @@ impl SubagentManager {
         task: &str,
         label: &str,
         origin: &HashMap<String, String>,
+        session_key: Option<&str>,
     ) -> Result<(), String> {
         log::info!("Subagent [{}] starting task: {}", task_id, label);
         // Build subagent tools (no message tool, no spawn tool)
@@ -285,12 +300,16 @@ impl SubagentManager {
             serde_json::json!({"role": "system", "content": system_prompt}),
             serde_json::json!({"role": "user", "content": task}),
         ];
-        let result = self
-            .runner
+        let runtime = match session_key {
+            Some(key) => self.runtime_resolver.resolve_for_session_key(&self.sessions, key),
+            None => self.runtime_resolver.current_default(),
+        };
+        let runner = AgentRunner::new(runtime.provider.clone());
+        let result = runner
             .run(AgentRunSpec {
                 initial_messages: messages,
                 tools: tools,
-                model: self.model.clone(),
+                model: runtime.model.clone(),
                 max_iterations: 15,
                 max_tool_result_chars: self.max_tool_result_chars,
                 hook: Some(Arc::new(SubagentHook::new(task_id.to_string()))),
@@ -1019,7 +1038,7 @@ mod tests {
         );
         let origin = origin("cli", "direct");
         let result = manager
-            .run_subagent_inner("task-1", task, label, &origin)
+            .run_subagent_inner("task-1", task, label, &origin, None)
             .await;
         drop(manager);
         let bus = match Arc::try_unwrap(bus) {
@@ -1098,5 +1117,66 @@ mod tests {
         assert!(result.is_ok());
         assert!(msg.content.contains("completed successfully"));
         assert!(msg.content.contains("couldn't produce a final answer"));
+    }
+
+    #[test]
+    fn resolves_runtime_per_session_key_instead_of_a_fixed_provider() {
+        use crate::agent::model_runtime::ModelRuntimeResolver;
+        use crate::config::schema::{Config, ModelPresetConfig};
+        use crate::session::manager::SessionManager;
+
+        let mut config = Config::default();
+        config.providers.anthropic.api_key = "test-key".to_string();
+        config.model_presets.insert(
+            "fast".to_string(),
+            ModelPresetConfig {
+                model: "claude-haiku".to_string(),
+                provider: "anthropic".to_string(),
+                ..Default::default()
+            },
+        );
+        let initial_provider = TestProvider::arc();
+        let runtime_resolver = Arc::new(ModelRuntimeResolver::new(config, initial_provider));
+
+        let tmp = TempDir::new().unwrap();
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        {
+            let mut manager = sessions.lock().unwrap();
+            let session = manager.get_or_create_session("preset-session");
+            session.metadata.insert(
+                "model_preset".to_string(),
+                serde_json::Value::String("fast".to_string()),
+            );
+            let snapshot = session.clone();
+            manager.save(snapshot).unwrap();
+        }
+
+        let subagent_manager = SubagentManager::new(
+            runtime_resolver,
+            sessions,
+            tmp.path().to_path_buf(),
+            Arc::new(MessageBus::new()),
+            4096,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+            None,
+        );
+
+        let default_runtime = subagent_manager.runtime_resolver.current_default();
+        let session_runtime = subagent_manager
+            .runtime_resolver
+            .resolve_for_session_key(&subagent_manager.sessions, "preset-session");
+        let other_session_runtime = subagent_manager
+            .runtime_resolver
+            .resolve_for_session_key(&subagent_manager.sessions, "no-override-session");
+
+        assert_eq!(session_runtime.model, "claude-haiku");
+        assert_ne!(session_runtime.model, default_runtime.model);
+        assert_eq!(other_session_runtime.model, default_runtime.model);
     }
 }

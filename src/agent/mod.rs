@@ -3,6 +3,7 @@ pub mod cron_context;
 pub mod context;
 pub mod memory;
 pub mod hook;
+pub mod model_runtime;
 pub mod runner;
 pub mod skills;
 pub mod subagent;

@@ -54,10 +54,8 @@ use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
 use crate::config::schema::{ChannelsConfig, Config};
 use crate::cron::{CronJob, CronService};
-use crate::providers::anthropic_provider::AnthropicProvider;
-use crate::providers::base::{LLMProvider, LLMProviderDyn};
-use crate::providers::openai_compat_provider::OpenAICompatProvider;
-use crate::providers::registry::find_by_name;
+use crate::providers::base::LLMProviderDyn;
+use crate::providers::factory::create_provider_for;
 use crate::utils::clipboard::IMAGE_PASTE_COMMAND_REGEX;
 use crate::utils::clipboard::try_get_clipboard_text;
 use crate::utils::clipboard::{IMAGE_PASTE_COMMAND, try_get_clipboard_image};
@@ -602,8 +600,8 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                             let should_notify = evaluate_response(
                                 &response.content,
                                 &reminder_note,
-                                Arc::clone(&agent_loop.provider),
-                                &agent_loop.model,
+                                agent_loop.provider(),
+                                &agent_loop.model(),
                             )
                             .await;
                             if should_notify {
@@ -758,8 +756,8 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let hb_cfg = &config.gateway.heartbeat;
     let heartbeat = Arc::new(HeartbeatService::new(
         workspace.clone(),
-        Arc::clone(&agent_loop.provider),
-        agent_loop.model.clone(),
+        agent_loop.provider(),
+        agent_loop.model(),
         Some(Arc::new(on_heartbeat_execute)),
         Some(Arc::new(on_heartbeat_notify)),
         hb_cfg.interval_s,
@@ -1076,110 +1074,20 @@ fn load_runtime_config(config: PathBuf, workspace: Option<PathBuf>) -> Config {
     }
 }
 
+/// Build the process-wide startup provider from `config.agents.model`/`.provider`.
+///
+/// Thin wrapper around [`create_provider_for`], which holds the actual
+/// provider-selection logic shared with [`ModelRuntimeResolver`]
+/// (`agent::model_runtime`) so named model presets resolve identically.
 fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
     let model = config.agents.model.clone();
     let provider_name = config.agents.provider.clone();
     log::info!("Provider Name: {:?}", provider_name);
     log::info!("Model: {:?}", model);
-    match provider_name.as_str() {
-        "openai" | "custom" | "openrouter" | "auto" => {
-            let provider_name_str = provider_name.as_str();
-            let (api_key, api_base, extra_headers) = 
-            if provider_name_str == "openai" {
-                (
-                    Some(config.providers.openai.api_key.clone()),
-                    config.providers.openai.api_base.clone(),
-                    config.providers.openai.extra_headers.clone(),
-                )
-            } else if provider_name_str == "custom" {
-                (
-                    Some(config.providers.custom.api_key.clone()),
-                    config.providers.custom.api_base.clone(),
-                    config.providers.custom.extra_headers.clone(),
-                )
-            } else if provider_name_str == "openrouter" {
-                (
-                    Some(config.providers.openrouter.api_key.clone()),
-                    config.providers.openrouter.api_base.clone(),
-                    config.providers.openrouter.extra_headers.clone(),
-                )
-            } else if provider_name_str == "auto" {
-                let (provider_name, api_key, api_base, extra_headers) = 
-                    get_auto_provider(config);
-                if provider_name == "anthropic" {
-                    return Arc::new(AnthropicProvider::new(
-                        api_key,
-                        api_base,
-                        Some(model),
-                        extra_headers,
-                        find_by_name(&provider_name),
-                    ));
-                }
-                return Arc::new(OpenAICompatProvider::new(
-                    api_key,
-                    api_base,
-                    Some(model),
-                    extra_headers,
-                    find_by_name(&provider_name),
-                ));
-            } else {
-                unreachable!("Invalid provider: {provider_name}");
-            };
-            Arc::new(OpenAICompatProvider::new(
-                api_key,
-                api_base,
-                Some(model),
-                extra_headers,
-                find_by_name(&provider_name),
-            ))
-        },
-        "anthropic" => Arc::new(AnthropicProvider::new(
-            Some(config.providers.anthropic.api_key.clone()),
-            config.providers.anthropic.api_base.clone(),
-            Some(model),
-            config.providers.anthropic.extra_headers.clone(),
-            find_by_name("anthropic"),
-        )),
-        _ => {
-            eprint_error(format!("Invalid provider: {provider_name}"));
-            exit_codes::exit(INVALID_PROVIDER);
-        }
-    }
-}
-
-fn get_auto_provider(config: &Config) -> (String, Option<String>, Option<String>, Option<HashMap<String, String>>) {
-    if !config.providers.openai.api_key.is_empty() {
-        return (
-            "openai".to_string(),
-            Some(config.providers.openai.api_key.clone()),
-            config.providers.openai.api_base.clone(),
-            config.providers.openai.extra_headers.clone(),
-        );
-    } else if !config.providers.openrouter.api_key.is_empty() {
-        return (
-            "openrouter".to_string(),
-            Some(config.providers.openrouter.api_key.clone()),
-            config.providers.openrouter.api_base.clone(),
-            config.providers.openrouter.extra_headers.clone(),
-        );
-    } else if !config.providers.custom.api_key.is_empty() {
-        return (
-            "custom".to_string(),
-            Some(config.providers.custom.api_key.clone()),
-            config.providers.custom.api_base.clone(),
-            config.providers.custom.extra_headers.clone(),
-        );
-    } else if !config.providers.anthropic.api_key.is_empty() {
-        return (
-            "anthropic".to_string(),
-            Some(config.providers.anthropic.api_key.clone()),
-            config.providers.anthropic.api_base.clone(),
-            config.providers.anthropic.extra_headers.clone(),
-        );
-    } else {
-        eprint_error(format!("Could not resolve auto provider, please set a provider (custom, openai, openrouter, anthropic) in the config"));
+    create_provider_for(config, &model, &provider_name).unwrap_or_else(|e| {
+        eprint_error(e);
         exit_codes::exit(INVALID_PROVIDER);
-    }
+    })
 }
 
 fn extract_images(
