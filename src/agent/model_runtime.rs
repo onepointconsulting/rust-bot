@@ -175,6 +175,40 @@ impl ModelRuntimeResolver {
         Ok(runtime)
     }
 
+    /// Overwrite the process-wide default's model, without touching the
+    /// preset catalog or reconstructing the provider. `preset_name` is reset
+    /// to [`RESERVED_MODEL_PRESET_NAME`] since the runtime is no longer tied
+    /// to any configured preset. Mirrors nanobot's
+    /// `RuntimeResolver.select_model`.
+    pub fn select_model(&self, model: &str) -> Result<ModelRuntime, String> {
+        let model = model.trim();
+        if model.is_empty() {
+            return Err("select_model: model must not be empty".to_string());
+        }
+        let mut guard = self.default_runtime.lock().unwrap_or_else(|e| e.into_inner());
+        guard.model = model.to_string();
+        guard.preset_name = RESERVED_MODEL_PRESET_NAME.to_string();
+        Ok(guard.clone())
+    }
+
+    /// The process-wide default model name.
+    ///
+    /// Does not reflect any session-scoped preset override (after
+    /// `/model <preset>`). For that, use [`Self::runtime_for_session`] or
+    /// [`Self::resolve_for_session_key`] and read `.model`.
+    pub fn get_model(&self) -> String {
+        self.current_default().model
+    }
+
+    /// Overwrite the process-wide default's context-window budget, without
+    /// touching any other field. Mirrors nanobot's
+    /// `RuntimeResolver.select_context_window`.
+    pub fn select_context_window(&self, tokens: u64) -> ModelRuntime {
+        let mut guard = self.default_runtime.lock().unwrap_or_else(|e| e.into_inner());
+        guard.context_window_tokens = tokens;
+        guard.clone()
+    }
+
     /// The current process-wide default runtime.
     pub fn current_default(&self) -> ModelRuntime {
         self.default_runtime
@@ -330,6 +364,82 @@ mod tests {
 
         resolver.select_preset("fast").unwrap();
         assert_eq!(resolver.current_default().model, "claude-haiku");
+    }
+
+    #[test]
+    fn select_model_overwrites_default_model_and_resets_preset_name() {
+        let config = config_with_anthropic_preset("fast", "claude-haiku");
+        let resolver = build_resolver(config);
+        resolver.select_preset("fast").unwrap();
+        assert_eq!(resolver.current_default().preset_name, "fast");
+
+        let runtime = resolver.select_model("claude-opus-4-6").unwrap();
+        assert_eq!(runtime.model, "claude-opus-4-6");
+        assert_eq!(runtime.preset_name, RESERVED_MODEL_PRESET_NAME);
+        assert_eq!(resolver.current_default().model, "claude-opus-4-6");
+        assert_eq!(resolver.current_default().preset_name, RESERVED_MODEL_PRESET_NAME);
+    }
+
+    #[test]
+    fn select_model_rejects_blank_input() {
+        let config = config_with_anthropic_preset("fast", "claude-haiku");
+        let resolver = build_resolver(config);
+        let before = resolver.current_default();
+
+        assert!(resolver.select_model("").is_err());
+        assert!(resolver.select_model("   ").is_err());
+        assert_eq!(resolver.current_default().model, before.model);
+    }
+
+    #[test]
+    fn get_model_returns_process_default_model() {
+        let config = config_with_anthropic_preset("fast", "claude-haiku");
+        let resolver = build_resolver(config);
+
+        assert_eq!(resolver.get_model(), resolver.current_default().model);
+
+        resolver.select_model("claude-opus-4-6").unwrap();
+        assert_eq!(resolver.get_model(), "claude-opus-4-6");
+    }
+
+    #[test]
+    fn select_model_trims_input_and_leaves_other_fields_untouched() {
+        let config = config_with_anthropic_preset("fast", "claude-haiku");
+        let resolver = build_resolver(config);
+        let before = resolver.current_default();
+
+        let runtime = resolver.select_model("  claude-opus-4-6  ").unwrap();
+        assert_eq!(runtime.model, "claude-opus-4-6");
+        assert_eq!(runtime.max_tokens, before.max_tokens);
+        assert_eq!(runtime.temperature, before.temperature);
+        assert_eq!(runtime.context_window_tokens, before.context_window_tokens);
+        assert!(Arc::ptr_eq(&runtime.provider, &before.provider));
+    }
+
+    #[test]
+    fn select_context_window_overwrites_only_that_field() {
+        let config = config_with_anthropic_preset("fast", "claude-haiku");
+        let resolver = build_resolver(config);
+        let before = resolver.current_default();
+
+        let runtime = resolver.select_context_window(123_456);
+        assert_eq!(runtime.context_window_tokens, 123_456);
+        assert_eq!(runtime.model, before.model);
+        assert_eq!(runtime.preset_name, before.preset_name);
+        assert_eq!(resolver.current_default().context_window_tokens, 123_456);
+    }
+
+    #[test]
+    fn select_model_and_select_context_window_are_independent() {
+        let config = config_with_anthropic_preset("fast", "claude-haiku");
+        let resolver = build_resolver(config);
+
+        resolver.select_model("claude-opus-4-6").unwrap();
+        resolver.select_context_window(50_000);
+
+        let runtime = resolver.current_default();
+        assert_eq!(runtime.model, "claude-opus-4-6");
+        assert_eq!(runtime.context_window_tokens, 50_000);
     }
 
     #[test]

@@ -1,5 +1,9 @@
 use crate::{
-    PKG_VERSION, agent::context::BOOTSTRAP_FILES, bus::events::OutboundMessage, command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand}, utils::{
+    PKG_VERSION,
+    agent::context::BOOTSTRAP_FILES,
+    bus::events::OutboundMessage,
+    command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
+    utils::{
         cli::convert_text_to_markdown,
         gitstore::{CommitInfo, GitStore},
         helpers::build_status_content,
@@ -9,7 +13,13 @@ use crate::{
 };
 use async_trait::async_trait;
 use futures::FutureExt;
-use std::{fs, io, panic::AssertUnwindSafe, path::{Path, PathBuf}, sync::Arc, time::Instant};
+use std::{
+    fs, io,
+    panic::AssertUnwindSafe,
+    path::{Path, PathBuf},
+    sync::Arc,
+    time::Instant,
+};
 
 /// Build an outbound reply addressed back to the inbound message's channel/chat.
 fn reply(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
@@ -237,7 +247,6 @@ impl CommandHandler for CmdStatus {
             event: None,
         }
     }
-
 }
 
 struct CmdDream;
@@ -307,18 +316,39 @@ impl CommandHandler for CmdHelp {
 
 struct CmdModel;
 
-/// Show or switch the LLM model preset used by this chat session.
-///
-/// `/model` (no args) reports the session's currently active model/preset.
-/// `/model <name>` switches this session (only) to that named preset for
-/// future turns; `/model default` clears back to the implicit default
-/// preset. The switch is session-scoped — it never touches the process-wide
-/// default, and other sessions are unaffected.
 #[async_trait]
 impl CommandHandler for CmdModel {
     async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/model");
+        };
+        let requested = ctx.args.trim();
+        if requested.is_empty() {
+            let model = agent_loop.runtime_resolver.get_model();
+            return reply_as_text(ctx, format!("Model: {}", model));
+        }
+        let runtime = agent_loop.set_runtime_model(requested);
+        match runtime {
+            Ok(runtime) => reply_as_text(ctx, format!("Model: {}", runtime.model)),
+            Err(e) => reply_as_text(ctx, format!("Error: {e}")),
+        }
+    }
+}
+
+struct CmdModelPreset;
+
+/// Show or switch the LLM model preset used by this chat session.
+///
+/// `/model-preset` (no args) reports the session's currently active
+/// model/preset. `/model-preset <name>` switches this session (only) to that
+/// named preset for future turns; `/model-preset default` clears back to the
+/// process-wide default. The switch is session-scoped — it never touches the
+/// process-wide default, and other sessions are unaffected.
+#[async_trait]
+impl CommandHandler for CmdModelPreset {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/model-preset");
         };
         let requested = ctx.args.trim();
 
@@ -429,7 +459,11 @@ impl CmdDreamLog {
         }
     }
 
-    fn format_dream_log_content(commit: &CommitInfo, diff: &str, requested_sha: Option<&str>) -> String {
+    fn format_dream_log_content(
+        commit: &CommitInfo,
+        diff: &str,
+        requested_sha: Option<&str>,
+    ) -> String {
         let files_line = Self::format_changed_files(diff);
         let intro = if requested_sha.is_none() {
             "Here is the latest Dream memory change."
@@ -491,9 +525,7 @@ impl CommandHandler for CmdDreamLog {
         let content = if !args.is_empty() {
             let sha = args.split_whitespace().next().unwrap_or("");
             match git.show_commit_diff(sha) {
-                Some((commit, diff)) => {
-                    Self::format_dream_log_content(&commit, &diff, Some(sha))
-                }
+                Some((commit, diff)) => Self::format_dream_log_content(&commit, &diff, Some(sha)),
                 None => format!(
                     "Couldn't find Dream change `{sha}`.\n\n\
                      Use `/dream-restore` to list recent versions, \
@@ -601,10 +633,7 @@ impl CommandHandler for CmdTools {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/tools");
         };
-        let registry = agent_loop
-            .tools
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let registry = agent_loop.tools.lock().unwrap_or_else(|e| e.into_inner());
         let mut names = registry.tool_names();
         names.sort();
         let content = if names.is_empty() {
@@ -768,9 +797,14 @@ impl CommandHandler for CmdModelPresets {
         };
         let config = agent_loop.config.clone();
         let presets = config.model_presets.clone();
-        let content = format!("Model presets:\n{}", 
-            presets.iter().map(|(name, preset)| format!("* **{name}** — {preset:?}"))
-                .collect::<Vec<String>>().join("\n"));
+        let content = format!(
+            "Model presets:\n{}",
+            presets
+                .iter()
+                .map(|(name, preset)| format!("* **{name}** — {preset:?}"))
+                .collect::<Vec<String>>()
+                .join("\n")
+        );
         reply_as_markdown(ctx, &content)
     }
 }
@@ -783,7 +817,8 @@ fn build_help_text() -> String {
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
-        "/model — Show the current preset's model and provider",
+        "/model — Show the current model",
+        "/model-preset — Show the current preset's model and provider or switch to a different preset",
         "/model-presets — List available model presets",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
@@ -806,16 +841,32 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::New.to_string(), Arc::new(CmdNew));
     router.exact(ChatCommand::Dream.to_string(), Arc::new(CmdDream));
     router.exact(ChatCommand::DreamLog.to_string(), Arc::new(CmdDreamLog));
-    router.exact(ChatCommand::DreamRestore.to_string(), Arc::new(CmdDreamRestore));
+    router.exact(
+        ChatCommand::DreamRestore.to_string(),
+        Arc::new(CmdDreamRestore),
+    );
     router.exact(ChatCommand::Help.to_string(), Arc::new(CmdHelp));
     router.prefix(ChatCommand::Model.to_string(), Arc::new(CmdModel));
-    router.exact(ChatCommand::ModelPresets.to_string(), Arc::new(CmdModelPresets));
+    router.prefix(
+        ChatCommand::ModelPreset.to_string(),
+        Arc::new(CmdModelPreset),
+    );
+    router.exact(
+        ChatCommand::ModelPresets.to_string(),
+        Arc::new(CmdModelPresets),
+    );
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
     router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
-    router.exact(ChatCommand::ListSessions.to_string(), Arc::new(CmdListSessions));
-    router.exact(ChatCommand::ExamplePrompts.to_string(), Arc::new(CmdExamplePrompts));
+    router.exact(
+        ChatCommand::ListSessions.to_string(),
+        Arc::new(CmdListSessions),
+    );
+    router.exact(
+        ChatCommand::ExamplePrompts.to_string(),
+        Arc::new(CmdExamplePrompts),
+    );
 }
 
 #[cfg(test)]
@@ -872,7 +923,10 @@ mod tests {
             None,
         );
         let out = CmdDream.handle(&ctx).await;
-        assert_eq!(out.content, "No agent available to execute command: /dream.");
+        assert_eq!(
+            out.content,
+            "No agent available to execute command: /dream."
+        );
     }
 
     #[tokio::test]
@@ -986,7 +1040,7 @@ mod tests {
             "",
             Some(loop_),
         );
-        let out = CmdModel.handle(&ctx).await;
+        let out = CmdModelPreset.handle(&ctx).await;
         assert!(out.content.contains("Model: "));
         assert!(
             out.content.contains("(preset: default)"),
@@ -1099,7 +1153,10 @@ mod tests {
         ))
     }
 
-    fn model_cmd_ctx(agent_loop: Arc<crate::agent::agent_loop::AgentLoop>, args: &str) -> CommandContext {
+    fn model_cmd_ctx(
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+        args: &str,
+    ) -> CommandContext {
         CommandContext::with_options(
             InboundMessage {
                 channel: "cli".into(),
@@ -1123,7 +1180,7 @@ mod tests {
     async fn model_command_with_valid_preset_name_confirms_switch() {
         let loop_ = model_cmd_test_loop_with_preset();
         let ctx = model_cmd_ctx(loop_, "fast");
-        let out = CmdModel.handle(&ctx).await;
+        let out = CmdModelPreset.handle(&ctx).await;
         assert!(out.content.contains("fast"), "got: {}", out.content);
         assert!(out.content.contains("claude-haiku"), "got: {}", out.content);
     }
@@ -1132,8 +1189,12 @@ mod tests {
     async fn model_command_with_invalid_preset_name_lists_available() {
         let loop_ = model_cmd_test_loop_with_preset();
         let ctx = model_cmd_ctx(loop_, "not-a-real-preset");
-        let out = CmdModel.handle(&ctx).await;
-        assert!(out.content.contains("Unknown model preset"), "got: {}", out.content);
+        let out = CmdModelPreset.handle(&ctx).await;
+        assert!(
+            out.content.contains("Unknown model preset"),
+            "got: {}",
+            out.content
+        );
         assert!(out.content.contains("default"), "got: {}", out.content);
         assert!(out.content.contains("fast"), "got: {}", out.content);
     }
@@ -1144,21 +1205,29 @@ mod tests {
 
         // First switch to "fast" ...
         let switch_ctx = model_cmd_ctx(loop_.clone(), "fast");
-        let switched = CmdModel.handle(&switch_ctx).await;
+        let switched = CmdModelPreset.handle(&switch_ctx).await;
         assert!(switched.content.contains("fast"));
 
         // ... then confirm the no-args view reflects it before clearing.
         let show_ctx = model_cmd_ctx(loop_.clone(), "");
-        let shown = CmdModel.handle(&show_ctx).await;
-        assert!(shown.content.contains("(preset: fast)"), "got: {}", shown.content);
+        let shown = CmdModelPreset.handle(&show_ctx).await;
+        assert!(
+            shown.content.contains("(preset: fast)"),
+            "got: {}",
+            shown.content
+        );
 
         // ... then clear back to "default" for the same session.
         let default_ctx = model_cmd_ctx(loop_.clone(), "default");
-        let cleared = CmdModel.handle(&default_ctx).await;
-        assert!(cleared.content.contains("default"), "got: {}", cleared.content);
+        let cleared = CmdModelPreset.handle(&default_ctx).await;
+        assert!(
+            cleared.content.contains("default"),
+            "got: {}",
+            cleared.content
+        );
 
         let show_after_ctx = model_cmd_ctx(loop_, "");
-        let shown_after = CmdModel.handle(&show_after_ctx).await;
+        let shown_after = CmdModelPreset.handle(&show_after_ctx).await;
         assert!(
             shown_after.content.contains("(preset: default)"),
             "got: {}",
@@ -1292,7 +1361,9 @@ mod tests {
 
         assert!(content.contains("Here is the selected Dream memory change."));
         assert!(content.contains("No tracked memory files changed."));
-        assert!(content.contains("Dream recorded this version, but there is no file diff to display."));
+        assert!(
+            content.contains("Dream recorded this version, but there is no file diff to display.")
+        );
         assert!(!content.contains("```diff"));
     }
 
@@ -1327,10 +1398,7 @@ mod tests {
 
     #[test]
     fn format_mcp_list_single_url_server() {
-        let servers = vec![(
-            "ems".to_string(),
-            "https://ems.example.org/mcp".to_string(),
-        )];
+        let servers = vec![("ems".to_string(), "https://ems.example.org/mcp".to_string())];
         let content = format_mcp_list(&servers);
         assert_eq!(
             content,
@@ -1341,10 +1409,7 @@ mod tests {
     #[test]
     fn format_mcp_list_multiple_servers_including_stdio() {
         let servers = vec![
-            (
-                "ems".to_string(),
-                "https://ems.example.org/mcp".to_string(),
-            ),
+            ("ems".to_string(), "https://ems.example.org/mcp".to_string()),
             (
                 "filesystem".to_string(),
                 "npx -y @modelcontextprotocol/server-filesystem".to_string(),
@@ -1353,9 +1418,7 @@ mod tests {
         let content = format_mcp_list(&servers);
         assert!(content.contains("MCP servers (2 connected):"));
         assert!(content.contains("- ems — https://ems.example.org/mcp"));
-        assert!(content.contains(
-            "- filesystem — npx -y @modelcontextprotocol/server-filesystem"
-        ));
+        assert!(content.contains("- filesystem — npx -y @modelcontextprotocol/server-filesystem"));
     }
 
     #[tokio::test]
@@ -1378,7 +1441,10 @@ mod tests {
             None,
         );
         let out = CmdMcpList.handle(&ctx).await;
-        assert!(out.content.contains("No agent available to execute command: /mcp-list"));
+        assert!(
+            out.content
+                .contains("No agent available to execute command: /mcp-list")
+        );
     }
 
     #[test]
@@ -1394,7 +1460,11 @@ mod tests {
         fs::write(root.join("AGENTS.md"), "keep").unwrap();
         fs::write(root.join("HEARTBEAT.md"), "keep").unwrap();
         fs::write(root.join("scratch.txt"), "remove").unwrap();
-        fs::write(root.join(".rust-bot/tool-results/default/abc.txt"), "remove").unwrap();
+        fs::write(
+            root.join(".rust-bot/tool-results/default/abc.txt"),
+            "remove",
+        )
+        .unwrap();
 
         let cleanable = CmdCleanup::list_cleanable_files(root, root).unwrap();
         let rel_paths: Vec<String> = cleanable

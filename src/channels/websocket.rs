@@ -1,3 +1,4 @@
+use garde::{Path, Report, Validate};
 use serde::{Deserialize, Deserializer, Serialize};
 
 use crate::config::schema::JwtConfig;
@@ -29,6 +30,22 @@ where
         return Err(serde::de::Error::custom(r#"path must start with "/""#));
     }
     Ok(normalize_config_path(&value))
+}
+
+/// When JWT is enabled, `jwt.aud` must equal the normalized WebSocket `path`.
+/// Empty `aud` is left to [`JwtConfig`]'s own validator.
+fn validate_jwt_aud_matches_path(cfg: &WebSocketConfig) -> garde::Result {
+    if !cfg.jwt.enabled || cfg.jwt.aud.trim().is_empty() {
+        return Ok(());
+    }
+    // `path` is already normalized by `deserialize_path`.
+    if normalize_config_path(&cfg.jwt.aud) != cfg.path {
+        return Err(garde::Error::new(format!(
+            "jwt.aud ({}) must match path ({})",
+            cfg.jwt.aud, cfg.path
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -68,6 +85,24 @@ impl Default for WebSocketConfig {
     }
 }
 
+impl Validate for WebSocketConfig {
+    type Context = ();
+
+    fn validate_into(
+        &self,
+        ctx: &Self::Context,
+        parent: &mut dyn FnMut() -> Path,
+        report: &mut Report,
+    ) {
+        self.jwt
+            .validate_into(ctx, &mut || parent().join("jwt"), report);
+
+        if let Err(err) = validate_jwt_aud_matches_path(self) {
+            report.append(parent().join("jwt").join("aud"), err);
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +128,53 @@ mod tests {
         let cfg: WebSocketConfig =
             serde_json::from_str(r#"{"path":"/ws/"}"#).expect("valid path should deserialize");
         assert_eq!(cfg.path, "/ws");
+    }
+
+    #[test]
+    fn jwt_aud_must_match_path_when_enabled() {
+        let mut cfg = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+        cfg.jwt.enabled = true;
+        cfg.jwt.aud = "/other".to_string();
+
+        let report = cfg.validate();
+        assert!(report.is_err(), "mismatched aud should fail validation");
+        let err = report.unwrap_err().to_string();
+        assert!(
+            err.contains("must match path"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn jwt_aud_matching_path_ok_when_enabled() {
+        let mut cfg = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+        cfg.jwt.enabled = true;
+        cfg.jwt.aud = "/ws/".to_string(); // trailing slash normalized in compare
+
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn jwt_enabled_requires_non_empty_aud() {
+        let mut cfg = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+        cfg.jwt.enabled = true;
+        cfg.jwt.aud = String::new();
+
+        let report = cfg.validate();
+        assert!(report.is_err(), "empty aud with jwt.enabled should fail");
+        let err = report.unwrap_err().to_string();
+        assert!(
+            err.contains("aud must be non-empty when JWT is enabled"),
+            "unexpected error: {err}"
+        );
     }
 }

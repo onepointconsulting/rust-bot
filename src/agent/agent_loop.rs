@@ -482,7 +482,7 @@ impl AgentLoop {
     /// The process-wide default model (read-through onto the resolver's
     /// current default; does not reflect any particular session's override).
     pub fn model(&self) -> String {
-        self.runtime_resolver.current_default().model
+        self.runtime_resolver.get_model()
     }
 
     /// The process-wide default provider (read-through onto the resolver's
@@ -495,6 +495,21 @@ impl AgentLoop {
     /// resolver's current default).
     pub fn context_window_tokens(&self) -> u64 {
         self.runtime_resolver.current_default().context_window_tokens
+    }
+
+    /// Change the process-wide default model without reconstructing any
+    /// downstream consumer (subagents, Dream, Consolidator all read through
+    /// the shared resolver). Delegates to
+    /// [`ModelRuntimeResolver::select_model`]; see its doc comment for why
+    /// this resets `preset_name` to `"default"`.
+    pub fn set_runtime_model(&self, model: &str) -> Result<ModelRuntime, String> {
+        self.runtime_resolver.select_model(model)
+    }
+
+    /// Change the process-wide default context-window budget. Delegates to
+    /// [`ModelRuntimeResolver::select_context_window`].
+    pub fn set_runtime_context_window(&self, tokens: u64) -> ModelRuntime {
+        self.runtime_resolver.select_context_window(tokens)
     }
 
     /// Names available for `/model <name>`: `"default"` plus every configured preset.

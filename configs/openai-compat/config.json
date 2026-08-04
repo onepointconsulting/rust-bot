@@ -1,6 +1,6 @@
 {
   "agents": {
-    "workspace": "~/.rust-bot/workspace",
+    "workspace": "~/.rust-bot/workspace-2026-08-04",
     "model": "${OPENAI_API_MODEL}",
     "provider": "openrouter",
     "maxTokens": 32768,
@@ -145,7 +145,7 @@
       "reasoningEffort": null
     },
     "secondary": {
-      "model": "anthropic/claude-opus-4-6",
+      "model": "qwen/qwen3.8-max",
       "provider": "openrouter",
       "maxTokens": 32768,
       "contextWindowTokens": 65536,
