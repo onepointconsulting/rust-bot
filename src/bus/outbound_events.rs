@@ -1,6 +1,8 @@
 use std::collections::HashMap;
 use serde_json::Value;
 
+use crate::bus::events::OutboundMessage;
+
 /// Discriminant for progress updates. Variants are mutually exclusive —
 /// unlike the previous independent bool flags.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
@@ -107,6 +109,25 @@ pub enum OutboundEvent {
     SessionUpdated(SessionUpdatedEvent),
     RuntimeModelUpdated(RuntimeModelUpdatedEvent),
     TurnModelUpdated(TurnModelUpdatedEvent),
+}
+
+/// Build an :class:`OutboundMessage` for a typed event.
+pub fn outbound_message_for_event(
+    channel: &str,
+    chat_id: &str,
+    event: OutboundEvent,
+    content: Option<&str>,
+    metadata: Option<HashMap<String, Value>>,
+) -> OutboundMessage {
+    OutboundMessage {
+        channel: channel.to_string(),
+        chat_id: chat_id.to_string(),
+        content: content.map(|c| c.to_string()).unwrap_or_default(),
+        event: Some(event),
+        metadata: metadata.unwrap_or_default(),
+        media: Vec::new(),
+        reply_to: None,
+    }
 }
 
 #[cfg(test)]

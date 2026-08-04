@@ -86,6 +86,16 @@ impl<T> AsyncQueue<T> {
         self.tx.send(msg)
     }
 
+    /// Put a message into the queue without blocking. Alias for [`Self::send`],
+    /// named to match Python's `asyncio.Queue.put_nowait` so call sites ported
+    /// from nanobot (e.g. `bus.outbound.put_nowait(...)`) read the same here.
+    /// The queue is unbounded, so this never raises `QueueFull` the way the
+    /// Python method can; the `Result` can only be `Err` if the receiver has
+    /// been dropped.
+    pub fn put_nowait(&self, msg: T) -> Result<(), mpsc::error::SendError<T>> {
+        self.send(msg)
+    }
+
     /// Receive the next message (like `queue.get()`). Returns `None` when the channel is closed.
     pub async fn recv(&self) -> Option<T> {
         self.rx.lock().await.recv().await
@@ -210,6 +220,29 @@ mod tests {
             // Read it from the outbound queue
             let received_outbound = bus.consume_outbound().await.unwrap();
             assert_eq!(received_outbound.content, "hi back");
+        });
+    }
+
+    #[test]
+    fn put_nowait_delivers_message_like_send() {
+        let rt = tokio::runtime::Runtime::new().unwrap();
+        rt.block_on(async {
+            let bus = MessageBus::new();
+
+            let outbound = OutboundMessage {
+                channel: "test".to_string(),
+                chat_id: "chat1".to_string(),
+                content: "put_nowait works".to_string(),
+                reply_to: None,
+                media: vec![],
+                metadata: HashMap::new(),
+                event: None,
+            };
+            bus.outbound.put_nowait(outbound).unwrap();
+            assert_eq!(bus.outbound_size(), 1);
+
+            let received = bus.consume_outbound().await.unwrap();
+            assert_eq!(received.content, "put_nowait works");
         });
     }
 }

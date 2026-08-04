@@ -1,7 +1,9 @@
+use std::sync::Arc;
+
 use garde::{Path, Report, Validate};
 use serde::{Deserialize, Deserializer, Serialize};
 
-use crate::config::schema::JwtConfig;
+use crate::{bus::{outbound_events::{OutboundEvent::RuntimeModelUpdated, RuntimeModelUpdatedEvent, outbound_message_for_event}, queue::MessageBus}, config::schema::JwtConfig};
 
 /// Strip a trailing `/`, keeping root `"/"` unchanged.
 fn strip_trailing_slash(path: &str) -> String {
@@ -100,6 +102,29 @@ impl Validate for WebSocketConfig {
         if let Err(err) = validate_jwt_aud_matches_path(self) {
             report.append(parent().join("jwt").join("aud"), err);
         }
+    }
+}
+
+/// Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel).
+pub fn publish_runtime_model_update(
+    bus: Arc<MessageBus>,
+    model: &str,
+    model_preset: Option<&str>,
+) {
+    let res = bus.outbound.put_nowait(
+        outbound_message_for_event(
+            "websocket",
+            "*",
+            RuntimeModelUpdated(RuntimeModelUpdatedEvent {
+                model: Some(model.to_string()),
+                model_preset: model_preset.map(|p| p.to_string()),
+            }),
+            None,
+            None,
+        )
+    );
+    if let Err(e) = res {
+        log::error!("Error publishing runtime model update: {e}");
     }
 }
 
