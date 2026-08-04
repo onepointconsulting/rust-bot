@@ -10,6 +10,7 @@ pub enum ChatCommand {
     Restart,
     Status,
     Model,
+    ModelPresets,
     Dream,
     DreamLog,
     DreamRestore,
@@ -40,6 +41,7 @@ impl std::str::FromStr for ChatCommand {
             "restart" => Ok(ChatCommand::Restart),
             "status" => Ok(ChatCommand::Status),
             "model" => Ok(ChatCommand::Model),
+            "model-presets" => Ok(ChatCommand::ModelPresets),
             "dream" => Ok(ChatCommand::Dream),
             "dream-log" => Ok(ChatCommand::DreamLog),
             "dream-restore" => Ok(ChatCommand::DreamRestore),
@@ -71,6 +73,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::Cleanup => write!(f, "/cleanup"),
             ChatCommand::ListSessions => write!(f, "/list-sessions"),
             ChatCommand::ExamplePrompts => write!(f, "/example-prompts"),
+            ChatCommand::ModelPresets => write!(f, "/model-presets"),
         }
     }
 }

@@ -38,6 +38,20 @@ fn reply_as_text(ctx: &CommandContext, content: impl Into<String>) -> OutboundMe
     }
 }
 
+fn reply_as_markdown(ctx: &CommandContext, content: impl Into<String>) -> OutboundMessage {
+    let mut metadata = ctx.msg.metadata.clone();
+    metadata.insert("render_as".to_string(), "markdown".into());
+    OutboundMessage {
+        channel: ctx.msg.channel.clone(),
+        chat_id: ctx.msg.chat_id.clone(),
+        content: content.into(),
+        reply_to: None,
+        media: vec![],
+        metadata,
+        event: None,
+    }
+}
+
 fn reply_no_loop(ctx: &CommandContext, command: &str) -> OutboundMessage {
     reply(
         ctx,
@@ -744,6 +758,23 @@ impl CommandHandler for CmdExamplePrompts {
     }
 }
 
+struct CmdModelPresets;
+
+#[async_trait]
+impl CommandHandler for CmdModelPresets {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/model-presets");
+        };
+        let config = agent_loop.config.clone();
+        let presets = config.model_presets.clone();
+        let content = format!("Model presets:\n{}", 
+            presets.iter().map(|(name, preset)| format!("* **{name}** — {preset:?}"))
+                .collect::<Vec<String>>().join("\n"));
+        reply_as_markdown(ctx, &content)
+    }
+}
+
 /// Build canonical help text shared across channels.
 fn build_help_text() -> String {
     let lines = vec![
@@ -752,7 +783,8 @@ fn build_help_text() -> String {
         "/stop — Stop the current task",
         "/restart — Restart the bot",
         "/status — Show bot status",
-        "/model — Show the current LLM model",
+        "/model — Show the current preset's model and provider",
+        "/model-presets — List available model presets",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -777,6 +809,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::DreamRestore.to_string(), Arc::new(CmdDreamRestore));
     router.exact(ChatCommand::Help.to_string(), Arc::new(CmdHelp));
     router.prefix(ChatCommand::Model.to_string(), Arc::new(CmdModel));
+    router.exact(ChatCommand::ModelPresets.to_string(), Arc::new(CmdModelPresets));
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
