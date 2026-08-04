@@ -17,6 +17,7 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
 use crate::channels::manager::ChannelManager;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
+use crate::cli::cancel::wait_for_escape_cancel;
 use crate::cli::onboard::run_onboard;
 use crate::cli::wizard::resolve_onboard_config_path;
 use crate::cron::CronJobState;
@@ -1021,8 +1022,12 @@ async fn message_session(
         Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
     let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
     let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
-    let response = agent_loop
-        .process_direct(
+    // Esc cancels the in-flight turn instead of exiting the process (unlike
+    // Ctrl+C, which `cmd.exe` intercepts as a batch-job kill when launched via
+    // scripts/start_rust_bot.bat). Losing the race just drops `process_direct`,
+    // which is already the agent loop's intended cancellation path.
+    let response = tokio::select! {
+        response = agent_loop.process_direct(
             &message,
             Some(&session_id),
             None,
@@ -1031,8 +1036,13 @@ async fn message_session(
             Some(on_progress),
             if stream { Some(on_stream) } else { None },
             if stream { Some(on_stream_end) } else { None },
-        )
-        .await;
+        ) => response,
+        _ = wait_for_escape_cancel() => {
+            renderer.lock().await.close().await;
+            println!("Cancelled.");
+            return Ok(());
+        }
+    };
     let (streamed, header_printed) = {
         let locked_renderer = renderer.lock().await;
         (locked_renderer.streamed, locked_renderer.header_printed)
@@ -1271,8 +1281,9 @@ async fn interactive_session(
 fn interactive_welcome_text(markdown: bool) -> String {
     if markdown {
         format!(
-            "{LOGO} Interactive mode \n{}\n{}\n{}\n{}\n{}\n{}",
+            "{LOGO} Interactive mode \n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             "type **exit** or **Ctrl+D** to quit",
+            "**Esc** to cancel the current turn",
             "**Ctrl+O** for a new line",
             "**Ctrl+W** or **Alt+Backspace** to delete word",
             "**Alt+I** or **Ctrl+Tab** to paste image",
@@ -1281,8 +1292,9 @@ fn interactive_welcome_text(markdown: bool) -> String {
         )
     } else {
         format!(
-            "{LOGO} Interactive mode \n{}\n{}\n{}\n{}\n{}\n{}",
+            "{LOGO} Interactive mode \n{}\n{}\n{}\n{}\n{}\n{}\n{}",
             "type exit or Ctrl+D to quit",
+            "Esc to cancel the current turn",
             "Ctrl+O for a new line",
             "Ctrl+W or Alt+Backspace to delete word",
             "Alt+I or Ctrl+Tab to paste image",
