@@ -151,6 +151,14 @@
       "contextWindowTokens": 65536,
       "temperature": 0.1,
       "reasoningEffort": null
+    },
+    "cheap": {
+      "model": "deepseek/deepseek-v4-flash",
+      "provider": "openrouter",
+      "maxTokens": 32768,
+      "contextWindowTokens": 65536,
+      "temperature": 1,
+      "reasoningEffort": null
     }
   }
 }

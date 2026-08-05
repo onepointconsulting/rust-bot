@@ -57,7 +57,7 @@ adk-anthropic = "1.0.0"
 utoipa = { version = "5.5.0", features = ["axum_extras"] }
 utoipa-axum = "0.2.0"
 utoipa-swagger-ui = { version = "9.0.2", features = ["axum"] }
-axum = "0.8.9"
+axum = { version = "0.8.9", features = ["ws"] }
 tower-http = { version = "0.6", features = ["cors", "fs"] }
 rdocx = "0.1.2"
 async-imap = { version = "0.11.2", default-features = false, features = ["runtime-tokio"] }

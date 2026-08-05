@@ -12,8 +12,9 @@ use crate::{
         channels::EmailConfig,
         loader::{load_config, save_config, set_config_path},
         schema::{
-            AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType, OcrProvider,
-            ProviderRetryMode, ToolsConfig,
+            AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType,
+            ModelPresetConfig, OcrProvider, ProviderRetryMode, RESERVED_MODEL_PRESET_NAME,
+            ToolsConfig,
         },
     },
     providers::registry::providers,
@@ -26,6 +27,7 @@ use crate::{
 const LLM_PROVIDER: &'static str = "LLM Provider";
 const CHAT_CHANNELS: &'static str = "Chat Channels";
 const AGENT_SETTINGS: &'static str = "Agent Settings";
+const MODEL_PRESETS: &'static str = "Model Presets";
 const API: &'static str = "API";
 const GATEWAY: &'static str = "Gateway";
 const TOOLS: &'static str = "Tools";
@@ -38,10 +40,11 @@ const PROVIDER_OPENROUTER: &'static str = "openrouter";
 const PROVIDER_EDENAI: &'static str = "edenai";
 const PROVIDER_ANTHROPIC: &'static str = "anthropic";
 
-const WIZARD_OPTIONS: [&str; 10] = [
+const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
     CHAT_CHANNELS,
     AGENT_SETTINGS,
+    MODEL_PRESETS,
     API,
     GATEWAY,
     TOOLS,
@@ -50,6 +53,11 @@ const WIZARD_OPTIONS: [&str; 10] = [
     SAVE_AND_EXIT,
     EXIT_WITHOUT_SAVING,
 ];
+
+const CREATE_MODEL_PRESET: &'static str = "Create model preset";
+const SET_DEFAULT_MODEL_PRESET: &'static str = "Set default model preset";
+const MODEL_PRESETS_MENU: [&str; 2] = [CREATE_MODEL_PRESET, SET_DEFAULT_MODEL_PRESET];
+const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
 
 const CHANNEL_EMAIL: &'static str = "email";
 const CHANNEL_OPTIONS_CHOICE: &'static str = "Channel Options";
@@ -96,6 +104,9 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
             }
             AGENT_SETTINGS => {
                 configure_agent_settings(&mut config)?;
+            }
+            MODEL_PRESETS => {
+                configure_model_presets_menu(&mut config)?;
             }
             API => {
                 configure_api(&mut config)?;
@@ -529,13 +540,12 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         _ => ProviderRetryMode::Standard,
     };
 
-    let effort_choices = vec!["none", "low", "medium", "high", "adaptive"];
     let current_effort = agents.reasoning_effort.as_deref().unwrap_or("none");
-    let effort_idx = effort_choices
+    let effort_idx = REASONING_EFFORT_CHOICES
         .iter()
         .position(|e| *e == current_effort)
         .unwrap_or(0);
-    let effort = Select::new("Reasoning effort", effort_choices)
+    let effort = Select::new("Reasoning effort", REASONING_EFFORT_CHOICES.to_vec())
         .with_starting_cursor(effort_idx)
         .with_help_message("Provider-specific thinking mode; none disables it")
         .prompt()?;
@@ -606,6 +616,175 @@ fn configure_dream_settings(agents: &mut AgentsConfig) -> Result<(), CliError> {
         .with_help_message("Max tool calls allowed during Dream Phase 2")
         .with_error_message("Please enter a positive integer")
         .prompt()?;
+
+    Ok(())
+}
+
+fn configure_model_presets_menu(config: &mut Config) -> Result<(), CliError> {
+    let selected = Select::new("Model presets menu", MODEL_PRESETS_MENU.to_vec()).prompt()?;
+    match selected {
+        CREATE_MODEL_PRESET => create_model_presets(config)?,
+        SET_DEFAULT_MODEL_PRESET => set_default_model_preset(config)?,
+        _ => {}
+    }
+    Ok(())
+}
+
+fn create_model_presets(config: &mut Config) -> Result<(), CliError> {
+    if !config.model_presets.is_empty() {
+        let names: Vec<&str> = config.model_presets.keys().map(|s| s.as_str()).collect();
+        println!("Current model presets: {}", names.join(", "));
+    }
+
+    let mut provider_choices = vec!["auto".to_string()];
+    provider_choices.extend(providers().into_iter().map(|p| p.name));
+
+    loop {
+        let add_more = Confirm::new("Add a model preset?")
+            .with_default(config.model_presets.is_empty())
+            .with_help_message("y to add a preset, n when finished")
+            .prompt()?;
+        if !add_more {
+            break;
+        }
+
+        let name = Text::new("Preset name")
+            .with_help_message("Short key used to select this preset, e.g. fast or primary")
+            .prompt()?;
+        let name = name.trim().to_string();
+        if name.is_empty() {
+            eprint_error("Preset name cannot be empty");
+            continue;
+        }
+        if name == RESERVED_MODEL_PRESET_NAME {
+            eprint_error(format!(
+                "'{RESERVED_MODEL_PRESET_NAME}' is reserved and cannot be used as a preset name"
+            ));
+            continue;
+        }
+        if config.model_presets.contains_key(&name) {
+            let overwrite = Confirm::new(&format!("Preset '{name}' already exists. Overwrite?"))
+                .with_default(false)
+                .prompt()?;
+            if !overwrite {
+                continue;
+            }
+        }
+
+        let mut preset: ModelPresetConfig = config
+            .model_presets
+            .get(&name)
+            .cloned()
+            .unwrap_or_default();
+
+        let current_label = preset.label.clone().unwrap_or_default();
+        let label = Text::new("Label")
+            .with_default(current_label.as_str())
+            .with_help_message("Optional human-readable display label; leave empty to omit")
+            .prompt()?;
+        preset.label = {
+            let trimmed = label.trim();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed.to_string())
+            }
+        };
+
+        preset.model = Text::new("Model")
+            .with_default(preset.model.as_str())
+            .with_help_message("e.g. anthropic/claude-opus-5 or openai/gpt-5.6")
+            .with_validator(|v: &str| {
+                if v.trim().is_empty() {
+                    Ok(Validation::Invalid("Model cannot be empty".into()))
+                } else {
+                    Ok(Validation::Valid)
+                }
+            })
+            .prompt()?;
+
+        let provider_idx = provider_choices
+            .iter()
+            .position(|p| p == &preset.provider)
+            .unwrap_or(0);
+        preset.provider = Select::new("Provider", provider_choices.clone())
+            .with_starting_cursor(provider_idx)
+            .with_help_message("auto detects from model / API key")
+            .prompt()?;
+
+        preset.max_tokens = CustomType::<u32>::new("Max tokens")
+            .with_default(preset.max_tokens)
+            .with_help_message("Maximum completion tokens per response")
+            .with_error_message("Please enter a positive integer")
+            .prompt()?;
+
+        preset.context_window_tokens = CustomType::<u64>::new("Context window tokens")
+            .with_default(preset.context_window_tokens)
+            .with_help_message("Total context window size for the model")
+            .with_error_message("Please enter a positive integer")
+            .prompt()?;
+
+        preset.temperature = CustomType::<f32>::new("Temperature")
+            .with_default(preset.temperature)
+            .with_help_message("0.0 = deterministic, 1.0 = more creative")
+            .with_error_message("Please enter a number between 0.0 and 1.0")
+            .with_validator(|v: &f32| {
+                if (0.0..=1.0).contains(v) {
+                    Ok(Validation::Valid)
+                } else {
+                    Ok(Validation::Invalid(
+                        "Temperature must be between 0.0 and 1.0".into(),
+                    ))
+                }
+            })
+            .prompt()?;
+
+        let current_effort = preset.reasoning_effort.as_deref().unwrap_or("none");
+        let effort_idx = REASONING_EFFORT_CHOICES
+            .iter()
+            .position(|e| *e == current_effort)
+            .unwrap_or(0);
+        let effort = Select::new("Reasoning effort", REASONING_EFFORT_CHOICES.to_vec())
+            .with_starting_cursor(effort_idx)
+            .with_help_message("Provider-specific thinking mode; none disables it")
+            .prompt()?;
+        preset.reasoning_effort = if effort == "none" {
+            None
+        } else {
+            Some(effort.to_string())
+        };
+
+        config.model_presets.insert(name, preset);
+    }
+
+    Ok(())
+}
+
+fn set_default_model_preset(config: &mut Config) -> Result<(), CliError> {
+    let mut choices: Vec<String> = vec![RESERVED_MODEL_PRESET_NAME.to_string()];
+    let mut preset_names: Vec<String> = config.model_presets.keys().cloned().collect();
+    preset_names.sort();
+    choices.extend(preset_names);
+
+    let current = config
+        .agents
+        .model_preset
+        .clone()
+        .unwrap_or_else(|| RESERVED_MODEL_PRESET_NAME.to_string());
+    let current_idx = choices.iter().position(|c| c == &current).unwrap_or(0);
+
+    let selected = Select::new("Default model preset", choices)
+        .with_starting_cursor(current_idx)
+        .with_help_message(
+            "'default' uses Agent Settings' own model/provider fields; named presets must be created first",
+        )
+        .prompt()?;
+
+    config.agents.model_preset = if selected == RESERVED_MODEL_PRESET_NAME {
+        None
+    } else {
+        Some(selected)
+    };
 
     Ok(())
 }
@@ -1259,6 +1438,7 @@ fn view_configuration_summary(config: &Config) -> Result<(), CliError> {
     println!("LLM Provider:\n{}", pretty(&config.providers)?);
     println!("Chat Channels:\n{}", pretty(&config.channels)?);
     println!("Agent Settings:\n{}", pretty(&config.agents)?);
+    println!("Model Presets:\n{}", pretty(&config.model_presets)?);
     println!("API:\n{}", pretty(&config.api)?);
     println!("Gateway:\n{}", pretty(&config.gateway)?);
     println!("Tools:\n{}", pretty(&config.tools)?);

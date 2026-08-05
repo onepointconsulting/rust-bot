@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 
@@ -6,7 +7,7 @@ use anstyle::{AnsiColor, Color, Style};
 use crate::cli::commands::{CliError, OnboardArgs};
 use crate::cli::wizard::{apply_workspace_override, choose_providers, config_model, resolve_onboard_config_path, wizard};
 use crate::config::loader::{load_config, save_config};
-use crate::config::schema::Config;
+use crate::config::schema::{Config, ModelPresetConfig};
 use crate::utils::helpers::{ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
 
@@ -57,6 +58,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
         let mut config = apply_workspace_override(Config::default(), args.workspace);
         choose_providers(&mut config)?;
         config_model(&mut config.agents)?;
+        create_default_model_presets(&mut config);
         save_config(&config, Some(config_path.clone()))?;
         print_onboard_ok(format!("Created config at {}", config_path.display()));
         config
@@ -156,4 +158,23 @@ fn print_onboard_err(message: impl fmt::Display) {
         red.render(),
         red.render_reset()
     );
+}
+
+fn create_default_model_presets(config: &mut Config) {
+    if config.agents.model.is_empty() || config.agents.provider.is_empty() {
+        return;
+    }
+    config.model_presets.insert(
+        "primary".to_string(),
+        ModelPresetConfig {
+            label: None,
+            model: config.agents.model.clone(),
+            provider: config.agents.provider.clone(),
+            max_tokens: config.agents.max_tokens,
+            context_window_tokens: config.agents.context_window_tokens,
+            temperature: config.agents.temperature,
+            reasoning_effort: config.agents.reasoning_effort.clone(),
+        },
+    );
+    config.agents.model_preset = Some("primary".to_string());
 }
