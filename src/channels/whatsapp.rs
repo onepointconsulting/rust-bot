@@ -248,6 +248,18 @@ impl WhatsAppChannel {
         })
     }
 
+    /// Whether an inbound message is a direct message, derived from the
+    /// `is_group` flag stashed in `metadata` at receive time (see the
+    /// `Event::Message` handler below). Missing/malformed metadata is
+    /// treated as not-a-group (i.e. a DM), matching `unwrap_or(false)`.
+    fn is_dm_message(metadata: &Option<HashMap<String, serde_json::Value>>) -> bool {
+        !metadata
+            .as_ref()
+            .and_then(|m| m.get("is_group"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false)
+    }
+
     /// Message field names carrying an optional `context_info`, mirroring the
     /// set wacore's `MessageExt` checks internally for mentions. That macro
     /// isn't exported, so the field list is kept in sync here manually.
@@ -857,12 +869,15 @@ impl BaseChannel for WhatsAppChannel {
                                 );
                                 continue;
                             }
+                            let is_dm = Self::is_dm_message(&msg.metadata);
                             self.handle_message(
                                 &msg.sender_id,
                                 &msg.chat_id,
                                 &msg.content,
                                 msg.media,
                                 msg.metadata,
+                                None,
+                                is_dm,
                                 None,
                             )
                             .await;
@@ -1050,6 +1065,33 @@ mod tests {
     fn group_allowed_rejects_non_listed_group() {
         let allowed = vec!["123@g.us".to_string()];
         assert!(!WhatsAppChannel::group_allowed(&group_jid("456"), &allowed));
+    }
+
+    // --- is_dm_message ---
+
+    #[test]
+    fn is_dm_message_true_when_is_group_false() {
+        let mut metadata = HashMap::new();
+        metadata.insert("is_group".to_string(), serde_json::json!(false));
+        assert!(WhatsAppChannel::is_dm_message(&Some(metadata)));
+    }
+
+    #[test]
+    fn is_dm_message_false_when_is_group_true() {
+        let mut metadata = HashMap::new();
+        metadata.insert("is_group".to_string(), serde_json::json!(true));
+        assert!(!WhatsAppChannel::is_dm_message(&Some(metadata)));
+    }
+
+    #[test]
+    fn is_dm_message_true_when_metadata_missing() {
+        assert!(WhatsAppChannel::is_dm_message(&None));
+    }
+
+    #[test]
+    fn is_dm_message_true_when_is_group_key_absent() {
+        let metadata = HashMap::new();
+        assert!(WhatsAppChannel::is_dm_message(&Some(metadata)));
     }
 
     // --- message_mentions_own ---

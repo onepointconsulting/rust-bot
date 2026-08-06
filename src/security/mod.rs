@@ -1,6 +1,7 @@
 pub mod network;
 pub mod jwt;
 pub mod workspace_access;
+pub mod workspace_requests;
 
 pub use jwt::{
     generate_jwt_keypair, generate_jwt_token, validate_jwt_token, validate_jwt_token_from_path,
@@ -13,4 +14,9 @@ pub use workspace_access::{
     workspace_scope_from_metadata, workspace_sandbox_status, ToolWorkspace, WorkspaceAccessMode,
     WorkspaceScope, WorkspaceScopeError, WorkspaceScopeResolver, WorkspaceSandboxStatus,
     WORKSPACE_SCOPE_METADATA_KEY,
+};
+pub use workspace_requests::{
+    default_scope_for_webui, read_webui_default_access_mode, webui_workspace_state_path,
+    workspaces_payload, write_webui_default_access_mode, DefaultAccessMode,
+    WorkspaceRequestHandler,
 };

@@ -1099,7 +1099,7 @@ Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
                 let metadata = item.get("metadata").and_then(|v| {
                     serde_json::from_value::<HashMap<String, serde_json::Value>>(v.clone()).ok()
                 });
-                self.handle_message(sender, sender, content, media, metadata, None)
+                self.handle_message(sender, sender, content, media, metadata, None, false, None)
                     .await;
             }
             tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)).await;

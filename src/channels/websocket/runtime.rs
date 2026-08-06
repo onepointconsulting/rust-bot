@@ -26,6 +26,7 @@ use tokio::{
 };
 use uuid::Uuid;
 
+use crate::channels::base::handle_message;
 use crate::{
     bus::{
         events::{InboundMessage, OutboundMessage},
@@ -141,11 +142,7 @@ impl Validate for WebSocketConfig {
 }
 
 /// Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel).
-pub fn publish_runtime_model_update(
-    bus: Arc<MessageBus>,
-    model: &str,
-    model_preset: Option<&str>,
-) {
+pub fn publish_runtime_model_update(bus: Arc<MessageBus>, model: &str, model_preset: Option<&str>) {
     let res = bus.outbound.put_nowait(outbound_message_for_event(
         "websocket",
         "*",
@@ -162,7 +159,7 @@ pub fn publish_runtime_model_update(
 }
 
 /// Return a typed envelope dict if the frame is a new-style JSON envelope, else None.
-/// 
+///
 /// A frame qualifies when it parses as a JSON object with a string ``type`` field.
 /// Legacy frames (plain text, or ``{"content": ...}`` without ``type``) return None;
 /// callers should fall back to :func:`_parse_inbound_payload` for those.
@@ -177,7 +174,9 @@ fn parse_envelope(raw: &str) -> Option<HashMap<String, serde_json::Value>> {
     let serde_json::Value::Object(envelope) = value else {
         return None;
     };
-    if let Some(t) = envelope.get("type") && t.is_string() {
+    if let Some(t) = envelope.get("type")
+        && t.is_string()
+    {
         return Some(envelope.into_iter().collect());
     }
     None
@@ -217,7 +216,8 @@ fn parse_inbound_payload(raw: &str) -> Option<String> {
 /// Accept UUIDs and short scoped keys like "unified:default". Keeps the
 /// capability namespace small enough to rule out path traversal / quote
 /// injection tricks. Mirrors nanobot's `_CHAT_ID_RE`.
-static CHAT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_:-]{1,64}$").unwrap());
+static CHAT_ID_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_:-]{1,64}$").unwrap());
 
 /// Mirrors nanobot's `_is_valid_chat_id`. The connect path always generates
 /// its own chat_id (a UUID, always valid by construction) — this exists for
@@ -248,14 +248,26 @@ struct ConnectionRegistry {
 impl ConnectionRegistry {
     /// Idempotently subscribe `connection_id` to `chat_id`. Mirrors `_attach`.
     fn attach(&mut self, connection_id: &str, chat_id: &str) {
-        self.subs.entry(chat_id.to_string()).or_default().insert(connection_id.to_string());
-        self.conn_chats.entry(connection_id.to_string()).or_default().insert(chat_id.to_string());
+        self.subs
+            .entry(chat_id.to_string())
+            .or_default()
+            .insert(connection_id.to_string());
+        self.conn_chats
+            .entry(connection_id.to_string())
+            .or_default()
+            .insert(chat_id.to_string());
     }
 
     /// Record a newly-opened connection's sender and default chat_id, then attach it.
-    fn register(&mut self, connection_id: &str, default_chat_id: &str, sender: mpsc::UnboundedSender<Message>) {
+    fn register(
+        &mut self,
+        connection_id: &str,
+        default_chat_id: &str,
+        sender: mpsc::UnboundedSender<Message>,
+    ) {
         self.senders.insert(connection_id.to_string(), sender);
-        self.conn_default.insert(connection_id.to_string(), default_chat_id.to_string());
+        self.conn_default
+            .insert(connection_id.to_string(), default_chat_id.to_string());
         self.attach(connection_id, default_chat_id);
     }
 
@@ -309,11 +321,13 @@ type ConnectionRegistryHandle = Arc<AsyncMutex<ConnectionRegistry>>;
 /// once per connection is fine.
 #[derive(Clone)]
 struct WsShared {
+    name: &'static str,
     bus: Arc<MessageBus>,
     channels_config: ChannelsConfig,
     jwt: JwtConfig,
     jwt_public_key_pem: Option<Arc<Vec<u8>>>,
     connections: ConnectionRegistryHandle,
+    supports_streaming: bool,
 }
 
 /// Query params accepted on the WebSocket upgrade request, mirroring nanobot's
@@ -336,7 +350,10 @@ fn sender_allowed(channels_config: &ChannelsConfig, sender_id: &str) -> bool {
         log::warn!("No allow list configured for channel websocket");
         return false;
     }
-    channels_config.allow_from.iter().any(|s| s == "*" || s == sender_id)
+    channels_config
+        .allow_from
+        .iter()
+        .any(|s| s == "*" || s == sender_id)
 }
 
 /// Reject the upgrade with 401 when JWT auth is enabled and the token is
@@ -345,7 +362,9 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
     let Some(public_key_pem) = shared.jwt_public_key_pem.as_ref() else {
         return Ok(());
     };
-    let token = token.filter(|t| !t.trim().is_empty()).ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = token
+        .filter(|t| !t.trim().is_empty())
+        .ok_or(StatusCode::UNAUTHORIZED)?;
     let opts = JwtValidationOpts {
         iss: shared.jwt.iss.clone(),
         aud: shared.jwt.aud.clone(),
@@ -373,7 +392,11 @@ async fn ws_upgrade_handler(
         return status.into_response();
     }
 
-    let client_id = match query.client_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+    let client_id = match query
+        .client_id
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    {
         Some(raw) if raw.chars().count() > 128 => {
             log::warn!(
                 "WebSocket channel: client_id too long ({} chars), truncating",
@@ -418,7 +441,11 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, client_id: String) {
     if sink.send(Message::text(ready.to_string())).await.is_err() {
         return;
     }
-    shared.connections.lock().await.register(&connection_id, &chat_id, tx);
+    shared
+        .connections
+        .lock()
+        .await
+        .register(&connection_id, &chat_id, tx);
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -438,35 +465,37 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, client_id: String) {
         };
         match msg {
             Message::Text(text) => {
-                let Some(content) = parse_inbound_payload(text.as_str()) else {
+                let raw = text.as_str();
+                if let Some(envelope) = parse_envelope(raw) {
                     continue;
                 };
-                if !sender_allowed(&shared.channels_config, &client_id) {
-                    log::warn!(
-                        "Sender {client_id} is not allowed to send messages to channel websocket"
-                    );
+                let Some(content) = parse_inbound_payload(raw) else {
                     continue;
-                }
-                let inbound = InboundMessage {
-                    channel: "websocket".to_string(),
-                    sender_id: client_id.clone(),
-                    chat_id: chat_id.clone(),
-                    content,
-                    timestamp: Utc::now(),
-                    media: Vec::new(),
-                    metadata: HashMap::new(),
-                    session_key_override: None,
                 };
-                if let Err(e) = shared.bus.publish_inbound(inbound) {
-                    log::error!("WebSocket channel: failed to publish inbound message: {e}");
-                }
+                handle_message(
+                    &client_id,
+                    &chat_id,
+                    &content,
+                    None,
+                    None,
+                    None,
+                    sender_allowed(&shared.channels_config, &client_id),
+                    shared.supports_streaming,
+                    shared.name,
+                    &shared.bus,
+                )
+                .await;
             }
             Message::Close(_) => break,
             _ => {}
         }
     }
 
-    shared.connections.lock().await.cleanup_connection(&connection_id);
+    shared
+        .connections
+        .lock()
+        .await
+        .cleanup_connection(&connection_id);
     writer.abort();
 }
 
@@ -492,7 +521,11 @@ pub struct WebSocketChannel {
 }
 
 impl WebSocketChannel {
-    pub fn new(config: WebSocketConfig, bus: Arc<MessageBus>, channels_config: ChannelsConfig) -> Self {
+    pub fn new(
+        config: WebSocketConfig,
+        bus: Arc<MessageBus>,
+        channels_config: ChannelsConfig,
+    ) -> Self {
         let jwt_public_key_pem = if config.jwt.enabled {
             if config.jwt.public_key_path.trim().is_empty() {
                 panic!("WebSocket channel: jwt.enabled is true but jwt.public_key_path is empty");
@@ -524,11 +557,13 @@ impl WebSocketChannel {
 
     fn shared(&self) -> WsShared {
         WsShared {
+            name: self.name(),
             bus: Arc::clone(&self.base.bus),
             channels_config: self.channels_config.clone(),
             jwt: self.config.jwt.clone(),
             jwt_public_key_pem: self.jwt_public_key_pem.clone(),
             connections: Arc::clone(&self.connections),
+            supports_streaming: BaseChannel::supports_streaming(self),
         }
     }
 
@@ -584,7 +619,10 @@ impl BaseChannel for WebSocketChannel {
         };
 
         self.base.running.store(true, Ordering::Relaxed);
-        log::info!("WebSocket channel listening on ws://{addr}{}", self.config.path);
+        log::info!(
+            "WebSocket channel listening on ws://{addr}{}",
+            self.config.path
+        );
 
         let app = self.router();
         let shutdown_signal = Arc::clone(&self.shutdown);
@@ -622,7 +660,10 @@ impl BaseChannel for WebSocketChannel {
         // `_safe_send_to` loop.
         let recipients = self.connections.lock().await.senders_for_chat(&msg.chat_id);
         if recipients.is_empty() {
-            return Err(format!("No open WebSocket connection for chat_id '{}'", msg.chat_id));
+            return Err(format!(
+                "No open WebSocket connection for chat_id '{}'",
+                msg.chat_id
+            ));
         }
 
         let mut delivered = 0usize;
@@ -631,7 +672,10 @@ impl BaseChannel for WebSocketChannel {
                 delivered += 1;
             } else {
                 log::warn!("WebSocket channel: connection '{connection_id}' gone, cleaning up");
-                self.connections.lock().await.cleanup_connection(&connection_id);
+                self.connections
+                    .lock()
+                    .await
+                    .cleanup_connection(&connection_id);
             }
         }
 
@@ -687,10 +731,7 @@ mod tests {
         let report = cfg.validate();
         assert!(report.is_err(), "mismatched aud should fail validation");
         let err = report.unwrap_err().to_string();
-        assert!(
-            err.contains("must match path"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("must match path"), "unexpected error: {err}");
     }
 
     #[test]
@@ -879,7 +920,10 @@ mod tests {
 
         let recipients = registry.senders_for_chat("chat-1");
         let ids: std::collections::HashSet<_> = recipients.into_iter().map(|(id, _)| id).collect();
-        assert_eq!(ids, std::collections::HashSet::from(["conn-1".to_string(), "conn-2".to_string()]));
+        assert_eq!(
+            ids,
+            std::collections::HashSet::from(["conn-1".to_string(), "conn-2".to_string()])
+        );
     }
 
     #[test]

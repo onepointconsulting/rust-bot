@@ -17,6 +17,42 @@ use crate::{
     },
 };
 
+pub async fn handle_message(
+    sender_id: &str,
+    chat_id: &str,
+    content: &str,
+    media: Option<Vec<String>>,
+    metadata: Option<HashMap<String, serde_json::Value>>,
+    session_key: Option<String>,
+    is_allowed: bool,
+    supports_streaming: bool,
+    channel_name: &str,
+    bus: &MessageBus,
+) {
+    if !is_allowed {
+        log::warn!("Sender {} is not allowed to send messages to channel {}", sender_id, channel_name);
+        return;
+    }
+
+    let mut meta = metadata.unwrap_or_default();
+    if supports_streaming {
+        meta.insert("_wants_stream".to_string(), serde_json::json!(true));
+    }
+    let message = InboundMessage {
+        channel: channel_name.to_string(),
+        sender_id: sender_id.to_string(),
+        chat_id: chat_id.to_string(),
+        content: content.to_string(),
+        timestamp: Utc::now(),
+        media: media.unwrap_or_default(),
+        metadata: meta,
+        session_key_override: session_key,
+    };
+    if let Err(e) = bus.publish_inbound(message) {
+        log::error!("Failed to publish inbound message to bus: {}", e);
+    }
+}
+
 /// Abstract base class for chat channel implementations.
 /// Each channel (Telegram, Discord, etc.) should implement this interface
 /// to integrate with the nanobot message bus.
@@ -176,6 +212,14 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     /// * `media` — Optional list of media URLs.
     /// * `metadata` — Optional channel-specific metadata.
     /// * `session_key` — Optional session key override (e.g. thread-scoped sessions).
+    /// * `is_dm` — Whether this message arrived as a direct message. When the
+    ///   sender is rejected and this is `true`, a pairing code is generated
+    ///   and sent back instead of a silent log warning.
+    /// * `authorization_id` — Identity to authorize instead of `sender_id`
+    ///   (e.g. a group/room), without changing the sender's recorded
+    ///   identity. `None` authorizes by sender, as before.
+    ///
+    /// Mirrors nanobot's `_handle_message` (`nanobot/channels/base.py:230-286`).
     async fn handle_message(
         &self,
         sender_id: &str,
@@ -184,29 +228,52 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         media: Option<Vec<String>>,
         metadata: Option<HashMap<String, serde_json::Value>>,
         session_key: Option<String>,
+        is_dm: bool,
+        authorization_id: Option<&str>,
     ) {
-        if !self.is_allowed(sender_id) {
-            log::warn!("Sender {} is not allowed to send messages to channel {}", sender_id, self.name());
+        let permission_id = authorization_id.unwrap_or(sender_id);
+        if !self.is_allowed(permission_id) {
+            if is_dm {
+                let code = crate::pairing::generate_code(self.name(), sender_id);
+                let reply = OutboundMessage {
+                    channel: self.name().to_string(),
+                    chat_id: chat_id.to_string(),
+                    content: crate::pairing::format_pairing_reply(&code),
+                    reply_to: None,
+                    media: Vec::new(),
+                    metadata: HashMap::from([(
+                        crate::pairing::PAIRING_CODE_META_KEY.to_string(),
+                        serde_json::json!(code),
+                    )]),
+                    event: None,
+                };
+                match self.send(reply).await {
+                    Ok(()) => log::info!(
+                        "Sent pairing code {code} to sender {sender_id} in chat {chat_id}"
+                    ),
+                    Err(e) => log::error!("Failed to send pairing reply: {e}"),
+                }
+            } else {
+                log::warn!(
+                    "Access denied for sender {sender_id}. Add them to allowFrom list in config to grant access."
+                );
+            }
             return;
         }
 
-        let mut meta = metadata.unwrap_or_default();
-        if self.supports_streaming() {
-            meta.insert("_wants_stream".to_string(), serde_json::json!(true));
-        }
-        let message = InboundMessage {
-            channel: self.name().to_string(),
-            sender_id: sender_id.to_string(),
-            chat_id: chat_id.to_string(),
-            content: content.to_string(),
-            timestamp: Utc::now(),
-            media: media.unwrap_or_default(),
-            metadata: meta,
-            session_key_override: session_key,
-        };
-        if let Err(e) = self.bus().publish_inbound(message) {
-            log::error!("Failed to publish inbound message to bus: {}", e);
-        }
+        handle_message(
+            sender_id,
+            chat_id,
+            content,
+            media,
+            metadata,
+            session_key,
+            true, // already confirmed allowed above
+            self.supports_streaming(),
+            self.name(),
+            self.bus(),
+        )
+        .await;
     }
 
     fn default_config(&self) -> HashMap<String, serde_json::Value> {

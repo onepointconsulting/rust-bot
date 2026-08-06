@@ -290,6 +290,10 @@ pub fn validate_workspace_scope_payload(
     default_restrict_to_workspace: bool,
     source_channel: Option<&str>,
 ) -> Result<WorkspaceScope, WorkspaceScopeError> {
+    if !raw.is_null() && !raw.is_object() {
+        return Err(WorkspaceScopeError::new(400, "workspace_scope must be an object"));
+    }
+
     let project_path_str = raw
         .get("project_path")
         .and_then(Value::as_str)
@@ -410,6 +414,23 @@ mod tests {
         let scope =
             validate_workspace_scope_payload(&json!({}), default_dir.path(), false, None).unwrap();
         assert_eq!(scope.project_path, default_dir.path());
+    }
+
+    #[test]
+    fn validate_workspace_scope_payload_rejects_non_object_raw() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let err = validate_workspace_scope_payload(
+            &json!("not an object"),
+            default_dir.path(),
+            false,
+            None,
+        )
+        .unwrap_err();
+        assert_eq!(err.status, 400);
+
+        let err = validate_workspace_scope_payload(&json!([1, 2, 3]), default_dir.path(), false, None)
+            .unwrap_err();
+        assert_eq!(err.status, 400);
     }
 
     #[test]

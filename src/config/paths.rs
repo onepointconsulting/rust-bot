@@ -15,6 +15,11 @@ pub fn get_data_dir() -> PathBuf {
     ensure_dir(data_dir)
 }
 
+/// Return the directory for WebUI-only persisted display threads (JSON).
+pub fn get_webui_dir() -> PathBuf {
+    get_runtime_subdir("webui")
+}
+
 /// Return a named runtime subdirectory under the instance data dir.
 pub fn get_runtime_subdir(name: &str) -> PathBuf {
     ensure_dir(get_data_dir().join(name))
@@ -141,6 +146,16 @@ mod tests {
         assert!(media.is_dir());
         assert_eq!(media.file_name().unwrap(), "telegram");
         assert_eq!(media.parent().unwrap().file_name().unwrap(), "media");
+    }
+
+    // ── get_webui_dir ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_get_webui_dir_creates_directory() {
+        let _dir = setup_temp_config();
+        let webui = get_webui_dir();
+        assert!(webui.is_dir());
+        assert_eq!(webui.file_name().unwrap(), "webui");
     }
 
     // ── get_cron_dir / get_logs_dir ───────────────────────────────────────────

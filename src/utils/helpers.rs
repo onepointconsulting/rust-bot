@@ -344,7 +344,7 @@ fn cleanup_tool_result_buckets(root: &Path, current_bucket: &Path) {
     }
 }
 
-fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
+pub(crate) fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
     let tmp_name = format!(".{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple());
     let tmp = path.with_file_name(tmp_name);
     fs::write(&tmp, content)?;
