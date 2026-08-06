@@ -333,6 +333,7 @@ impl SessionManager {
         let path = self.get_session_path(&session.key);
 
         let mut file = File::create(&path)?;
+        log::info!("Saving session to {}", path.display());
 
         let metadata_line = json!({
             "_type": "metadata",

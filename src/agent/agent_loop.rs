@@ -30,6 +30,9 @@ use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::workspace_context::{
+    bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
+};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::bus::outbound_events::{
     OutboundEvent, ProgressEvent, ProgressKind, StreamDeltaEvent, StreamEndEvent,
@@ -43,6 +46,10 @@ use crate::config::schema::{
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
+use crate::security::workspace_access::{
+    validate_workspace_scope_payload, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
+    WorkspaceScopeResolver, WORKSPACE_SCOPE_METADATA_KEY,
+};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
@@ -300,6 +307,10 @@ pub struct AgentLoop {
     exec_config: ExecToolConfig,
     pub cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
+    /// Resolves the effective per-turn workspace scope (see
+    /// `security::workspace_access`), from a session's persisted override
+    /// if any, else this loop's fixed `workspace`/`restrict_to_workspace`.
+    workspace_scopes: WorkspaceScopeResolver,
     pub session_manager: Arc<Mutex<SessionManager>>,
     mcp_servers: HashMap<String, McpServerConfig>,
     mcp_connected: AtomicBool,
@@ -357,6 +368,7 @@ impl AgentLoop {
         let docx_config = tools_cfg.docx.clone();
         let image_generation_config = tools_cfg.image_generation.clone();
         let restrict_to_workspace = tools_cfg.restrict_to_workspace;
+        let workspace_scopes = WorkspaceScopeResolver::new(workspace.clone(), restrict_to_workspace);
         let mcp_servers = tools_cfg.mcp_servers.clone();
 
         let context_window_tokens = agents_cfg.context_window_tokens;
@@ -439,6 +451,7 @@ impl AgentLoop {
             exec_config: exec_config.clone(),
             cron_service,
             restrict_to_workspace,
+            workspace_scopes,
             timezone,
             start_time: SystemTime::now(),
             last_usage: Mutex::new(HashMap::new()),
@@ -557,6 +570,56 @@ impl AgentLoop {
             .save(snapshot)
             .map_err(|e| format!("Failed to save session: {e}"))?;
         Ok(runtime)
+    }
+
+    /// Resolve the workspace scope a session would use right now (its
+    /// stored override, if any, else the process-wide default) without
+    /// mutating anything — used by `/workspace` with no arguments.
+    pub fn workspace_scope_for_session(&self, session: Option<&Session>) -> WorkspaceScope {
+        self.workspace_scopes.for_session(session.map(|s| &s.metadata))
+    }
+
+    /// Validate and persist one session's workspace-scope override.
+    ///
+    /// Never mutates the process-wide default workspace — the switch is
+    /// isolated to this session's tool calls on subsequent turns, matching
+    /// nanobot's per-session `workspace_scope` semantics and mirroring
+    /// [`Self::set_session_model_preset`]'s shape.
+    pub fn set_session_workspace_scope(
+        &self,
+        session_manager: &mut SessionManager,
+        session_key: &str,
+        project_path: &std::path::Path,
+        access_mode: WorkspaceAccessMode,
+    ) -> Result<WorkspaceScope, WorkspaceScopeError> {
+        let scope = validate_workspace_scope_payload(
+            &serde_json::json!({
+                "project_path": project_path.display().to_string(),
+                "access_mode": access_mode.as_str(),
+            }),
+            &self.workspace,
+            self.restrict_to_workspace,
+            None,
+        )?;
+
+        let session = session_manager.get_or_create_session(session_key);
+        session.metadata.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
+        let snapshot = session.clone();
+        session_manager
+            .save(snapshot)
+            .map_err(|e| WorkspaceScopeError::new(500, format!("Failed to save session: {e}")))?;
+        Ok(scope)
+    }
+
+    /// Clear a session's workspace-scope override, reverting to the
+    /// process-wide default on its next turn.
+    pub fn clear_session_workspace_scope(&self, session_manager: &mut SessionManager, session_key: &str) {
+        let session = session_manager.get_or_create_session(session_key);
+        session.metadata.remove(WORKSPACE_SCOPE_METADATA_KEY);
+        let snapshot = session.clone();
+        if let Err(e) = session_manager.save(snapshot) {
+            log::error!("Failed to save session after clearing workspace scope: {e}");
+        }
     }
 
     /// Register the default set of tools.
@@ -812,6 +875,9 @@ impl AgentLoop {
             runtime.preset_name,
             runtime.max_tokens
         );
+        let scope = self.workspace_scopes.for_session(session.as_ref().map(|s| &s.metadata));
+        let workspace_scope_token = bind_workspace_scope(scope);
+
         let runner = AgentRunner::new(runtime.provider.clone());
         let result = runner
             .run(AgentRunSpec {
@@ -839,6 +905,7 @@ impl AgentLoop {
                 reasoning_effort: runtime.reasoning_effort.clone(),
             })
             .await;
+        reset_workspace_scope(workspace_scope_token);
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage.clone();
         if result.stop_reason == "max_iterations" {
             log::warn!("Max iterations ({}) reached", self.max_iterations);
@@ -1109,7 +1176,17 @@ impl AgentLoop {
     ///
     /// Kept separate from [`Self::process_message`] so spawned `dispatch`
     /// tasks stay `Send` (consolidation calls the `?Send` LLM provider).
+    /// Establishes a fresh ambient workspace-scope stack for this turn (see
+    /// `agent::workspace_context`), then runs
+    /// [`Self::process_system_message_inner`].
     pub async fn process_system_message(
+        self: Arc<Self>,
+        msg: InboundMessage,
+    ) -> Option<OutboundMessage> {
+        with_workspace_scope_stack(move || self.process_system_message_inner(msg)).await
+    }
+
+    async fn process_system_message_inner(
         self: Arc<Self>,
         msg: InboundMessage,
     ) -> Option<OutboundMessage> {
@@ -1353,7 +1430,25 @@ impl AgentLoop {
 
     /// Process a single inbound message and return the response.
     /// The type of this message should not be "system".
+    /// Establishes a fresh ambient workspace-scope stack for this turn (see
+    /// `agent::workspace_context`), then runs [`Self::process_message_inner`].
+    /// Mirrors how `cli::commands::run_gateway` wraps each cron job body in
+    /// `with_cron_context_stack`.
     async fn process_message(
+        self: Arc<Self>,
+        msg: InboundMessage,
+        session_key: &str,
+        on_progress: Option<ProgressCallback>,
+        on_stream: Option<StreamCallback>,
+        on_stream_end: Option<StreamEndCallback>,
+    ) -> Option<OutboundMessage> {
+        with_workspace_scope_stack(move || {
+            self.process_message_inner(msg, session_key, on_progress, on_stream, on_stream_end)
+        })
+        .await
+    }
+
+    async fn process_message_inner(
         self: Arc<Self>,
         msg: InboundMessage,
         session_key: &str,
@@ -2110,5 +2205,89 @@ mod tests {
         }
 
         assert!(session.updated_at >= before);
+    }
+
+    // ── workspace scope ──────────────────────────────────────────────────────
+
+    #[test]
+    fn set_session_workspace_scope_persists_metadata_and_returns_scope() {
+        let loop_ = make_save_turn_loop(1000);
+        let dir = tempfile::tempdir().unwrap();
+
+        let scope = {
+            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            loop_
+                .set_session_workspace_scope(
+                    &mut manager,
+                    "test:workspace_scope",
+                    dir.path(),
+                    WorkspaceAccessMode::Restricted,
+                )
+                .unwrap()
+        };
+        assert_eq!(scope.project_path, dir.path());
+        assert_eq!(scope.access_mode, WorkspaceAccessMode::Restricted);
+
+        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session("test:workspace_scope");
+        let stored = session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).unwrap();
+        assert_eq!(stored, &scope.metadata());
+    }
+
+    #[test]
+    fn set_session_workspace_scope_rejects_relative_path() {
+        let loop_ = make_save_turn_loop(1000);
+        let err = {
+            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            loop_
+                .set_session_workspace_scope(
+                    &mut manager,
+                    "test:workspace_scope_relative",
+                    std::path::Path::new("relative/dir"),
+                    WorkspaceAccessMode::Restricted,
+                )
+                .unwrap_err()
+        };
+        assert_eq!(err.status, 400);
+
+        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session("test:workspace_scope_relative");
+        assert!(session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).is_none());
+    }
+
+    #[test]
+    fn clear_session_workspace_scope_removes_metadata_key() {
+        let loop_ = make_save_turn_loop(1000);
+        let dir = tempfile::tempdir().unwrap();
+
+        {
+            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            loop_
+                .set_session_workspace_scope(
+                    &mut manager,
+                    "test:workspace_scope_clear",
+                    dir.path(),
+                    WorkspaceAccessMode::Full,
+                )
+                .unwrap();
+        }
+        {
+            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            loop_.clear_session_workspace_scope(&mut manager, "test:workspace_scope_clear");
+        }
+
+        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session("test:workspace_scope_clear");
+        assert!(session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).is_none());
+    }
+
+    #[test]
+    fn workspace_scopes_resolver_constructed_from_agent_loop_defaults() {
+        let loop_ = make_save_turn_loop(1000);
+        assert_eq!(loop_.workspace_scopes.default_workspace, loop_.workspace);
+        assert_eq!(
+            loop_.workspace_scopes.default_restrict_to_workspace,
+            loop_.restrict_to_workspace
+        );
     }
 }

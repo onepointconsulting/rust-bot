@@ -1,5 +1,6 @@
 pub mod tools;
 pub mod cron_context;
+pub mod workspace_context;
 pub mod context;
 pub mod memory;
 pub mod hook;

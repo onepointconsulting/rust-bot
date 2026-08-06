@@ -3,6 +3,7 @@ use crate::{
     agent::context::BOOTSTRAP_FILES,
     bus::events::OutboundMessage,
     command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
+    security::workspace_access::WorkspaceAccessMode,
     utils::{
         cli::convert_text_to_markdown,
         gitstore::{CommitInfo, GitStore},
@@ -655,15 +656,78 @@ impl CommandHandler for CmdTools {
 
 struct CmdWorkspace;
 
+/// Show or switch the workspace scope (project directory + access mode)
+/// used by filesystem/shell tools during this chat session.
+///
+/// `/workspace` (no args) reports the session's currently effective scope.
+/// `/workspace <path> [restricted|full]` switches this session (only) to
+/// that project directory for future turns (`restricted` is the default
+/// access mode when omitted). `/workspace default` clears back to the
+/// process-wide default. The switch is session-scoped — it never touches
+/// the process-wide default, and other sessions are unaffected.
 #[async_trait]
 impl CommandHandler for CmdWorkspace {
     async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
         let Some(agent_loop) = &ctx.agent_loop else {
-            return reply_no_loop(ctx, "/tools");
+            return reply_no_loop(ctx, "/workspace");
         };
-        let store = &agent_loop.consolidator.store;
-        let workspace = store.workspace.clone();
-        reply_as_text(ctx, format!("Workspace: {}", workspace.display()))
+        let requested = ctx.args.trim();
+
+        if requested.is_empty() {
+            let (_session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+            let scope = agent_loop.workspace_scope_for_session(Some(&session));
+            return reply_as_text(
+                ctx,
+                format!(
+                    "Workspace: {} (access: {})",
+                    scope.project_path.display(),
+                    scope.access_mode.as_str()
+                ),
+            );
+        }
+
+        if requested.eq_ignore_ascii_case("default") {
+            let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+            agent_loop.clear_session_workspace_scope(&mut session_manager, &session.key);
+            return reply_as_text(ctx, "Workspace override cleared; using the process default.");
+        }
+
+        let mut parts = requested.splitn(2, char::is_whitespace);
+        let path_arg = parts.next().unwrap_or("");
+        let mode_arg = parts
+            .next()
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .unwrap_or("restricted");
+        let access_mode = match mode_arg.parse::<WorkspaceAccessMode>() {
+            Ok(mode) => mode,
+            Err(e) => return reply_as_text(ctx, format!("Error: {e}")),
+        };
+
+        let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+        let project_path = PathBuf::from(path_arg);
+        if !project_path.exists() {
+            let create_result = std::fs::create_dir_all(&project_path);
+            if let Err(e) = create_result {
+                return reply_as_text(ctx, format!("Error creating workspace directory: {e}"));
+            }
+        }
+        match agent_loop.set_session_workspace_scope(
+            &mut session_manager,
+            &session.key,
+            &project_path,
+            access_mode,
+        ) {
+            Ok(scope) => reply_as_text(
+                ctx,
+                format!(
+                    "Workspace set to {} ({}) for this session.",
+                    scope.project_path.display(),
+                    scope.access_mode.as_str()
+                ),
+            ),
+            Err(e) => reply_as_text(ctx, format!("Error: {e}")),
+        }
     }
 }
 
@@ -826,7 +890,7 @@ fn build_help_text() -> String {
         "/help — Show available commands",
         "/mcp-list — List available MCP servers",
         "/tools — List available tools",
-        "/workspace — Display the current workspace directory",
+        "/workspace — Show the session's workspace scope, or switch it: /workspace <path> [restricted|full], /workspace default to clear",
         "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
         "/list-sessions — List available sessions in current workspace",
         "/example-prompts — List example prompts",
@@ -857,7 +921,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     );
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
-    router.exact(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
+    router.prefix(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
     router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
     router.exact(
         ChatCommand::ListSessions.to_string(),
@@ -1233,6 +1297,90 @@ mod tests {
             "got: {}",
             shown_after.content
         );
+    }
+
+    fn workspace_cmd_ctx(
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+        args: &str,
+    ) -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: format!("/workspace {args}").trim().to_string(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "workspace-cmd-session",
+            "/workspace",
+            args,
+            Some(agent_loop),
+        )
+    }
+
+    #[tokio::test]
+    async fn cmd_workspace_reports_process_default_with_no_args() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let ctx = workspace_cmd_ctx(loop_, "");
+        let out = CmdWorkspace.handle(&ctx).await;
+        assert!(out.content.starts_with("Workspace: "), "got: {}", out.content);
+        assert!(out.content.contains("(access: "), "got: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn cmd_workspace_switches_session_scope_and_reports_it_back() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let dir = tempfile::tempdir().unwrap();
+
+        let switch_ctx = workspace_cmd_ctx(loop_.clone(), dir.path().to_str().unwrap());
+        let switched = CmdWorkspace.handle(&switch_ctx).await;
+        assert!(
+            switched.content.contains(dir.path().to_str().unwrap()),
+            "got: {}",
+            switched.content
+        );
+        assert!(switched.content.contains("(restricted)"), "got: {}", switched.content);
+
+        let show_ctx = workspace_cmd_ctx(loop_, "");
+        let shown = CmdWorkspace.handle(&show_ctx).await;
+        assert!(
+            shown.content.contains(dir.path().to_str().unwrap()),
+            "got: {}",
+            shown.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_workspace_default_clears_override() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let dir = tempfile::tempdir().unwrap();
+
+        let switch_ctx = workspace_cmd_ctx(loop_.clone(), dir.path().to_str().unwrap());
+        CmdWorkspace.handle(&switch_ctx).await;
+
+        let clear_ctx = workspace_cmd_ctx(loop_.clone(), "default");
+        let cleared = CmdWorkspace.handle(&clear_ctx).await;
+        assert!(cleared.content.contains("cleared"), "got: {}", cleared.content);
+
+        let show_ctx = workspace_cmd_ctx(loop_, "");
+        let shown = CmdWorkspace.handle(&show_ctx).await;
+        assert!(
+            !shown.content.contains(dir.path().to_str().unwrap()),
+            "got: {}",
+            shown.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_workspace_rejects_relative_or_missing_path_with_error_reply() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let ctx = workspace_cmd_ctx(loop_, "relative/dir");
+        let out = CmdWorkspace.handle(&ctx).await;
+        assert!(out.content.starts_with("Error:"), "got: {}", out.content);
     }
 
     #[tokio::test]

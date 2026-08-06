@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use crate::agent::tools::base::Tool;
 use crate::agent::tools::sandbox::wrap_command;
+use crate::agent::workspace_context::current_tool_workspace;
 use crate::config::paths::get_media_dir;
 use regex::Regex;
 use std::collections::HashMap;
@@ -86,10 +87,15 @@ impl ShellTool {
         working_dir: Option<PathBuf>,
         timeout: Option<u64>,
     ) -> String {
+        let tw = current_tool_workspace(
+            self.working_dir.clone(),
+            self.restrict_to_workspace,
+            self.sandbox.is_some(),
+        );
         let mut cwd = working_dir
-            .or(self.working_dir.clone())
+            .or_else(|| tw.project_path.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap());
-        let guard_error = self.guard_command(command, cwd.to_str().unwrap());
+        let guard_error = self.guard_command(command, cwd.to_str().unwrap(), tw.restrict_to_workspace);
         if let Some(error) = guard_error {
             return error;
         }
@@ -103,8 +109,8 @@ impl ShellTool {
                     sandbox.to_string()
                 )
             } else {
-                let workspace = self
-                    .working_dir
+                let workspace = tw
+                    .project_path
                     .clone()
                     .unwrap_or_else(|| std::env::current_dir().unwrap());
                 let command_result = wrap_command(
@@ -316,7 +322,7 @@ impl ShellTool {
     /// Note: the Python implementation also calls `contains_internal_url` from
     /// an external security module.  That check is omitted here; add it at the
     /// call site if needed.
-    fn guard_command(&self, command: &str, cwd: &str) -> Option<String> {
+    fn guard_command(&self, command: &str, cwd: &str, restrict_to_workspace: bool) -> Option<String> {
         let cmd = command.trim();
         let lower = cmd.to_lowercase();
 
@@ -349,7 +355,7 @@ impl ShellTool {
         }
 
         // ── 3. Workspace restriction ──────────────────────────────────────────
-        if self.restrict_to_workspace {
+        if restrict_to_workspace {
             if cmd.contains("..\\") || cmd.contains("../") {
                 return Some(
                     "Error: Command blocked by safety guard (path traversal detected)".to_string(),
@@ -615,6 +621,10 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
 #[cfg(test)]
 mod tests {
     use crate::agent::tools::shell::{IS_WINDOWS, ShellTool};
+    use crate::agent::workspace_context::{
+        bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
+    };
+    use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
 
     #[test]
     fn test_extract_absolute_paths() {
@@ -715,7 +725,7 @@ mod tests {
     fn test_guard_command_dangerous_pattern() {
         let tool = ShellTool::new(60, None, None, None, false, None, None);
         let command = "echo Hello, world! > ~/notes.txt && rm -rf ~/notes.txt";
-        let result = tool.guard_command(command, ".");
+        let result = tool.guard_command(command, ".", tool.restrict_to_workspace);
         assert!(result.is_some());
         assert!(
             result
@@ -738,5 +748,75 @@ mod tests {
         let result = tool.execute_command(if IS_WINDOWS {"vol"} else {"lsblk -f"}, None, None).await;
         println!("result: {result}");
         assert!(result.len() > 0, "result should not be empty");
+    }
+
+    // --- ambient workspace-scope consultation ---
+
+    #[test]
+    fn guard_command_blocks_path_outside_restricted_root() {
+        let tool = ShellTool::new(60, None, None, None, false, None, None);
+        let dir = tempfile::tempdir().unwrap();
+        let outside = std::env::temp_dir().join("rust-bot-shell-guard-outside-dir");
+        let command = format!("cat {}", outside.display());
+        let result = tool.guard_command(&command, dir.path().to_str().unwrap(), true);
+        assert!(result.is_some());
+        assert!(result.unwrap().contains("path outside working dir"));
+    }
+
+    #[test]
+    fn guard_command_allows_any_path_when_unrestricted() {
+        let tool = ShellTool::new(60, None, None, None, false, None, None);
+        let dir = tempfile::tempdir().unwrap();
+        let outside = std::env::temp_dir().join("rust-bot-shell-guard-outside-dir-2");
+        let command = format!("cat {}", outside.display());
+        let result = tool.guard_command(&command, dir.path().to_str().unwrap(), false);
+        assert!(result.is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_command_cwd_falls_back_to_working_dir_when_no_ambient_scope() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new(10, Some(dir.path().to_path_buf()), None, None, false, None, None);
+        let command = if IS_WINDOWS { "cd" } else { "pwd" };
+        let result = tool.execute_command(command, None, None).await;
+        let canon = dir.path().canonicalize().unwrap();
+        assert!(
+            result.contains(canon.file_name().unwrap().to_str().unwrap()),
+            "expected cwd to contain '{}', got: {result}",
+            canon.display()
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_command_cwd_uses_ambient_scope_project_path_when_bound() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let scoped_dir = tempfile::tempdir().unwrap();
+        let tool = ShellTool::new(
+            10,
+            Some(default_dir.path().to_path_buf()),
+            None,
+            None,
+            true,
+            None,
+            None,
+        );
+        let command = if IS_WINDOWS { "cd" } else { "pwd" };
+
+        with_workspace_scope_stack(|| async {
+            let scope =
+                build_workspace_scope(scoped_dir.path(), WorkspaceAccessMode::Restricted, None);
+            let token = bind_workspace_scope(scope);
+
+            let result = tool.execute_command(command, None, None).await;
+            let canon = scoped_dir.path().canonicalize().unwrap();
+            assert!(
+                result.contains(canon.file_name().unwrap().to_str().unwrap()),
+                "expected cwd to contain '{}', got: {result}",
+                canon.display()
+            );
+
+            reset_workspace_scope(token);
+        })
+        .await;
     }
 }

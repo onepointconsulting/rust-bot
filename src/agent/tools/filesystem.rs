@@ -3,6 +3,7 @@ use std::path::{Component, Path, PathBuf};
 use similar::TextDiff;
 use super::base::Tool;
 use globwalk::GlobWalkerBuilder;
+use crate::agent::workspace_context::current_tool_workspace;
 
 #[derive(Debug)]
 pub enum ResolvePathError {
@@ -219,13 +220,25 @@ impl FsToolConfig {
     }
 
     /// Equivalent to `self._resolve(path)` in the Python base class.
+    ///
+    /// Consults the ambient per-turn workspace scope (see
+    /// `agent::workspace_context::current_tool_workspace`) only when
+    /// `allowed_dir` is unset or equals `workspace` — i.e. only in the
+    /// "whole-workspace restriction" case. Some tools are constructed with
+    /// a narrower, unrelated `allowed_dir` as a fixed capability boundary
+    /// (e.g. a tool scoped to a `docs/` subdirectory regardless of the
+    /// process workspace); a session-level scope switch must never loosen
+    /// or move that.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, ResolvePathError> {
-        _resolve_path(
-            path,
-            self.workspace.clone(),
-            self.allowed_dir.clone(),
-            self.extra_allowed_dirs.clone(),
-        )
+        let scope_applies = self.allowed_dir.is_none() || self.allowed_dir == self.workspace;
+        let (workspace, allowed_dir) = if scope_applies {
+            let tw = current_tool_workspace(self.workspace.clone(), self.allowed_dir.is_some(), false);
+            let allowed = tw.allowed_root();
+            (tw.project_path, allowed)
+        } else {
+            (self.workspace.clone(), self.allowed_dir.clone())
+        };
+        _resolve_path(path, workspace, allowed_dir, self.extra_allowed_dirs.clone())
     }
 }
 
@@ -1096,6 +1109,121 @@ mod tests {
         assert!(result.contains("agent/tools/mod.rs"));
         assert!(result.split("\n").count() <= limit);
     }
-    
+
+    // --- ambient workspace-scope consultation ---
+
+    #[tokio::test]
+    async fn resolve_uses_ambient_scope_when_allowed_dir_equals_workspace() {
+        use crate::agent::workspace_context::{
+            bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
+        };
+        use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+
+        let dir_a = unique_temp_dir();
+        fs::create_dir_all(&dir_a).unwrap();
+        let dir_b = unique_temp_dir();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        let fs_config = FsToolConfig::new(Some(dir_a.clone()), Some(dir_a.clone()), None);
+
+        with_workspace_scope_stack(|| async {
+            let scope = build_workspace_scope(&dir_b, WorkspaceAccessMode::Restricted, None);
+            let token = bind_workspace_scope(scope);
+
+            let resolved = fs_config.resolve("f.txt").unwrap();
+            assert!(resolved.starts_with(&dir_b));
+
+            reset_workspace_scope(token);
+        })
+        .await;
+
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[tokio::test]
+    async fn resolve_ignores_ambient_scope_when_allowed_dir_differs_from_workspace() {
+        use crate::agent::workspace_context::{
+            bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
+        };
+        use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+
+        let dir_a = unique_temp_dir();
+        let sub_a = dir_a.join("narrow");
+        fs::create_dir_all(&sub_a).unwrap();
+        let dir_b = unique_temp_dir();
+        fs::create_dir_all(&dir_b).unwrap();
+
+        // allowed_dir is deliberately narrower than / unrelated to workspace.
+        // Use an absolute query path so resolution doesn't depend on joining
+        // onto `workspace` at all — isolates the containment check itself.
+        let fs_config = FsToolConfig::new(Some(dir_a.clone()), Some(sub_a.clone()), None);
+        let absolute_query = sub_a.join("f.txt");
+
+        with_workspace_scope_stack(|| async {
+            let scope = build_workspace_scope(&dir_b, WorkspaceAccessMode::Restricted, None);
+            let token = bind_workspace_scope(scope);
+
+            let resolved = fs_config.resolve(absolute_query.to_str().unwrap()).unwrap();
+            assert!(resolved.starts_with(&sub_a));
+            assert!(!resolved.starts_with(&dir_b));
+
+            reset_workspace_scope(token);
+        })
+        .await;
+
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
+
+    #[tokio::test]
+    async fn resolve_falls_back_to_static_config_outside_any_turn() {
+        let dir_a = unique_temp_dir();
+        fs::create_dir_all(&dir_a).unwrap();
+        let fs_config = FsToolConfig::new(Some(dir_a.clone()), Some(dir_a.clone()), None);
+
+        // No `with_workspace_scope_stack` at all — matches every pre-existing
+        // test in this file.
+        let resolved = fs_config.resolve("f.txt").unwrap();
+        assert!(resolved.starts_with(&dir_a));
+
+        let _ = fs::remove_dir_all(&dir_a);
+    }
+
+    #[tokio::test]
+    async fn read_file_tool_reads_from_switched_scope_root_without_reconstruction() {
+        use crate::agent::workspace_context::{
+            bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
+        };
+        use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+
+        let dir_a = unique_temp_dir();
+        fs::create_dir_all(&dir_a).unwrap();
+        fs::write(dir_a.join("marker.txt"), b"from A").unwrap();
+
+        let dir_b = unique_temp_dir();
+        fs::create_dir_all(&dir_b).unwrap();
+        fs::write(dir_b.join("marker.txt"), b"from B").unwrap();
+
+        // A single tool instance, constructed once — never reconstructed below.
+        let tool = ReadFileTool::new(Some(dir_a.clone()), Some(dir_a.clone()), None);
+
+        let result_a = tool.execute(&serde_json::json!({ "path": "marker.txt" })).await;
+        assert!(result_a.contains("from A"));
+
+        with_workspace_scope_stack(|| async {
+            let scope = build_workspace_scope(&dir_b, WorkspaceAccessMode::Restricted, None);
+            let token = bind_workspace_scope(scope);
+
+            let result_b = tool.execute(&serde_json::json!({ "path": "marker.txt" })).await;
+            assert!(result_b.contains("from B"));
+
+            reset_workspace_scope(token);
+        })
+        .await;
+
+        let _ = fs::remove_dir_all(&dir_a);
+        let _ = fs::remove_dir_all(&dir_b);
+    }
 }
 
