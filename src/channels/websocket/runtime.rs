@@ -1,6 +1,6 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{
-    Arc,
+    Arc, LazyLock,
     atomic::{AtomicBool, Ordering},
 };
 
@@ -18,6 +18,7 @@ use axum::{
 use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use garde::{Path, Report, Validate};
+use regex::Regex;
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::{
     net::TcpListener,
@@ -213,10 +214,91 @@ fn parse_inbound_payload(raw: &str) -> Option<String> {
     None
 }
 
-/// Registry of open connections, keyed by `chat_id`, so [`WebSocketChannel::send`]
-/// can route an outbound message to the right socket. Shared (via `Arc`) between
-/// the channel itself and every per-connection task spawned by axum.
-type ConnectionRegistry = Arc<AsyncMutex<HashMap<String, mpsc::UnboundedSender<Message>>>>;
+/// Accept UUIDs and short scoped keys like "unified:default". Keeps the
+/// capability namespace small enough to rule out path traversal / quote
+/// injection tricks. Mirrors nanobot's `_CHAT_ID_RE`.
+static CHAT_ID_RE: LazyLock<Regex> = LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_:-]{1,64}$").unwrap());
+
+/// Mirrors nanobot's `_is_valid_chat_id`. The connect path always generates
+/// its own chat_id (a UUID, always valid by construction) — this exists for
+/// the future envelope-dispatch layer, which will need to validate
+/// client-supplied chat_ids (e.g. `attach`/`message` envelopes).
+fn is_valid_chat_id(value: &str) -> bool {
+    CHAT_ID_RE.is_match(value)
+}
+
+/// Many-to-many chat_id↔connection subscription registry, mirroring
+/// nanobot's `_subs`/`_conn_chats`/`_conn_default`. One connection may be
+/// attached to several chat_ids (e.g. several open chats sharing one
+/// socket); one chat_id may have several connections attached (e.g. the
+/// same conversation open in two tabs). Shared (via `Arc`) between the
+/// channel itself and every per-connection task spawned by axum.
+#[derive(Default)]
+struct ConnectionRegistry {
+    /// chat_id -> connection_ids subscribed to it (fan-out target).
+    subs: HashMap<String, HashSet<String>>,
+    /// connection_id -> chat_ids it is subscribed to (O(1) cleanup on disconnect).
+    conn_chats: HashMap<String, HashSet<String>>,
+    /// connection_id -> its default chat_id, for legacy frames that omit routing.
+    conn_default: HashMap<String, String>,
+    /// connection_id -> outbound sender, so [`Self::senders_for_chat`] can reach it.
+    senders: HashMap<String, mpsc::UnboundedSender<Message>>,
+}
+
+impl ConnectionRegistry {
+    /// Idempotently subscribe `connection_id` to `chat_id`. Mirrors `_attach`.
+    fn attach(&mut self, connection_id: &str, chat_id: &str) {
+        self.subs.entry(chat_id.to_string()).or_default().insert(connection_id.to_string());
+        self.conn_chats.entry(connection_id.to_string()).or_default().insert(chat_id.to_string());
+    }
+
+    /// Record a newly-opened connection's sender and default chat_id, then attach it.
+    fn register(&mut self, connection_id: &str, default_chat_id: &str, sender: mpsc::UnboundedSender<Message>) {
+        self.senders.insert(connection_id.to_string(), sender);
+        self.conn_default.insert(connection_id.to_string(), default_chat_id.to_string());
+        self.attach(connection_id, default_chat_id);
+    }
+
+    /// Remove `connection_id` from every subscription set; safe to call
+    /// multiple times. Mirrors `_cleanup_connection`.
+    fn cleanup_connection(&mut self, connection_id: &str) {
+        if let Some(chat_ids) = self.conn_chats.remove(connection_id) {
+            for chat_id in chat_ids {
+                if let Some(subs) = self.subs.get_mut(&chat_id) {
+                    subs.remove(connection_id);
+                    if subs.is_empty() {
+                        self.subs.remove(&chat_id);
+                    }
+                }
+            }
+        }
+        self.conn_default.remove(connection_id);
+        self.senders.remove(connection_id);
+    }
+
+    /// Snapshot the senders currently subscribed to `chat_id`. Mirrors
+    /// `list(self._subs.get(chat_id, ()))` in nanobot's `send()`/`send_*` helpers.
+    fn senders_for_chat(&self, chat_id: &str) -> Vec<(String, mpsc::UnboundedSender<Message>)> {
+        let Some(conn_ids) = self.subs.get(chat_id) else {
+            return Vec::new();
+        };
+        conn_ids
+            .iter()
+            .filter_map(|id| self.senders.get(id).map(|tx| (id.clone(), tx.clone())))
+            .collect()
+    }
+
+    /// Drop all state. Mirrors nanobot's `stop()` clearing `_subs`/`_conn_chats`/etc.
+    fn clear(&mut self) {
+        self.subs.clear();
+        self.conn_chats.clear();
+        self.conn_default.clear();
+        self.senders.clear();
+    }
+}
+
+/// Shared handle to the many-to-many chat_id/connection registry.
+type ConnectionRegistryHandle = Arc<AsyncMutex<ConnectionRegistry>>;
 
 /// State handed to axum's per-connection handlers.
 ///
@@ -231,7 +313,7 @@ struct WsShared {
     channels_config: ChannelsConfig,
     jwt: JwtConfig,
     jwt_public_key_pem: Option<Arc<Vec<u8>>>,
-    connections: ConnectionRegistry,
+    connections: ConnectionRegistryHandle,
 }
 
 /// Query params accepted on the WebSocket upgrade request, mirroring nanobot's
@@ -278,6 +360,10 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
 
 /// Axum handler for the WebSocket upgrade route: authorize, then hand off to
 /// [`handle_socket`] for the connection's lifetime.
+///
+/// The query-string `client_id` is purely a sender identity (allow-list
+/// check, `InboundMessage.sender_id`) — it is never used as a chat_id.
+/// Mirrors nanobot's `_connection_loop` (`runtime.py:557-563`).
 async fn ws_upgrade_handler(
     State(shared): State<WsShared>,
     Query(query): Query<WsUpgradeQuery>,
@@ -287,25 +373,52 @@ async fn ws_upgrade_handler(
         return status.into_response();
     }
 
-    let chat_id = query.client_id.unwrap_or_else(|| {
-        let generated = Uuid::new_v4().to_string();
-        log::info!("WebSocket channel: no client_id supplied, generated '{generated}'");
-        generated
-    });
+    let client_id = match query.client_id.map(|s| s.trim().to_string()).filter(|s| !s.is_empty()) {
+        Some(raw) if raw.chars().count() > 128 => {
+            log::warn!(
+                "WebSocket channel: client_id too long ({} chars), truncating",
+                raw.chars().count()
+            );
+            raw.chars().take(128).collect()
+        }
+        Some(raw) => raw,
+        None => format!("anon-{}", &Uuid::new_v4().simple().to_string()[..12]),
+    };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, shared, chat_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, shared, client_id))
 }
 
-/// Drive one connection for its lifetime: register an outbound sender, forward
+/// Drive one connection for its lifetime: mint a fresh `chat_id` for it,
+/// announce it via a `ready` frame, register an outbound sender, forward
 /// inbound text frames to the bus, and clean up the registry entry on close.
+///
+/// The chat_id is always server-generated here — never taken from the
+/// client — mirroring nanobot's `default_chat_id` (`runtime.py:565`).
+/// Envelope dispatch (which would let a connection attach to additional,
+/// possibly client-named, chat_ids) is not implemented yet; every plain-text
+/// frame on this connection routes to this one default chat_id.
 ///
 /// Ping/pong keep-alive is handled by axum/tokio-tungstenite automatically
 /// (server auto-replies to client pings); `ping_interval_s`/`ping_timeout_s`
 /// (server-initiated liveness probing) are not wired yet.
-async fn handle_socket(socket: WebSocket, shared: WsShared, chat_id: String) {
+async fn handle_socket(socket: WebSocket, shared: WsShared, client_id: String) {
+    let connection_id = Uuid::new_v4().to_string();
+    let chat_id = Uuid::new_v4().to_string();
     let (mut sink, mut stream) = socket.split();
     let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-    shared.connections.lock().await.insert(chat_id.clone(), tx);
+
+    // Send `ready` before registering, so a reply can never race ahead of
+    // the client learning its own chat_id (mirrors nanobot's ordering
+    // comment at runtime.py:578).
+    let ready = serde_json::json!({
+        "event": "ready",
+        "chat_id": chat_id,
+        "client_id": client_id,
+    });
+    if sink.send(Message::text(ready.to_string())).await.is_err() {
+        return;
+    }
+    shared.connections.lock().await.register(&connection_id, &chat_id, tx);
 
     let writer = tokio::spawn(async move {
         while let Some(msg) = rx.recv().await {
@@ -319,7 +432,7 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, chat_id: String) {
         let msg = match frame {
             Ok(msg) => msg,
             Err(e) => {
-                log::warn!("WebSocket channel: connection '{chat_id}' error: {e}");
+                log::warn!("WebSocket channel: connection '{connection_id}' error: {e}");
                 break;
             }
         };
@@ -328,15 +441,15 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, chat_id: String) {
                 let Some(content) = parse_inbound_payload(text.as_str()) else {
                     continue;
                 };
-                if !sender_allowed(&shared.channels_config, &chat_id) {
+                if !sender_allowed(&shared.channels_config, &client_id) {
                     log::warn!(
-                        "Sender {chat_id} is not allowed to send messages to channel websocket"
+                        "Sender {client_id} is not allowed to send messages to channel websocket"
                     );
                     continue;
                 }
                 let inbound = InboundMessage {
                     channel: "websocket".to_string(),
-                    sender_id: chat_id.clone(),
+                    sender_id: client_id.clone(),
                     chat_id: chat_id.clone(),
                     content,
                     timestamp: Utc::now(),
@@ -353,7 +466,7 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, chat_id: String) {
         }
     }
 
-    shared.connections.lock().await.remove(&chat_id);
+    shared.connections.lock().await.cleanup_connection(&connection_id);
     writer.abort();
 }
 
@@ -370,7 +483,7 @@ pub struct WebSocketChannel {
     base: BaseChannelCommon,
     channels_config: ChannelsConfig,
     config: WebSocketConfig,
-    connections: ConnectionRegistry,
+    connections: ConnectionRegistryHandle,
     jwt_public_key_pem: Option<Arc<Vec<u8>>>,
     /// `Arc`-wrapped so [`Self::start`] can move an owned clone into the
     /// `'static` shutdown future `axum::serve` requires, rather than
@@ -403,7 +516,7 @@ impl WebSocketChannel {
             },
             channels_config,
             config,
-            connections: Arc::new(AsyncMutex::new(HashMap::new())),
+            connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             jwt_public_key_pem,
             shutdown: Arc::new(Notify::new()),
         }
@@ -483,6 +596,10 @@ impl BaseChannel for WebSocketChannel {
             log::error!("WebSocket channel: server error: {e}");
         }
 
+        // Mirrors nanobot's `stop()` clearing `_subs`/`_conn_chats`/etc. once
+        // the server task is confirmed stopped, so a later `start()` (e.g.
+        // after a restart) never inherits stale registry entries.
+        self.connections.lock().await.clear();
         self.base.running.store(false, Ordering::Relaxed);
     }
 
@@ -498,13 +615,36 @@ impl BaseChannel for WebSocketChannel {
             "content": msg.content,
             "metadata": msg.metadata,
         });
+        let text = payload.to_string();
 
-        let connections = self.connections.lock().await;
-        let tx = connections
-            .get(&msg.chat_id)
-            .ok_or_else(|| format!("No open WebSocket connection for chat_id '{}'", msg.chat_id))?;
-        tx.send(Message::text(payload.to_string()))
-            .map_err(|e| e.to_string())
+        // Fan out to every connection subscribed to this chat_id, mirroring
+        // nanobot's `conns = list(self._subs.get(chat_id, ()))` + per-connection
+        // `_safe_send_to` loop.
+        let recipients = self.connections.lock().await.senders_for_chat(&msg.chat_id);
+        if recipients.is_empty() {
+            return Err(format!("No open WebSocket connection for chat_id '{}'", msg.chat_id));
+        }
+
+        let mut delivered = 0usize;
+        for (connection_id, tx) in recipients {
+            if tx.send(Message::text(text.clone())).is_ok() {
+                delivered += 1;
+            } else {
+                log::warn!("WebSocket channel: connection '{connection_id}' gone, cleaning up");
+                self.connections.lock().await.cleanup_connection(&connection_id);
+            }
+        }
+
+        // Only fail when nobody received it — a partial failure must not
+        // trigger a retry that would re-deliver duplicate content to
+        // recipients that already succeeded.
+        if delivered == 0 {
+            return Err(format!(
+                "All WebSocket connections for chat_id '{}' were closed",
+                msg.chat_id
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -673,5 +813,131 @@ mod tests {
         };
         assert!(sender_allowed(&cfg, "client-1"));
         assert!(!sender_allowed(&cfg, "client-2"));
+    }
+
+    // --- is_valid_chat_id ---
+
+    #[test]
+    fn is_valid_chat_id_accepts_uuid_and_scoped_key() {
+        assert!(is_valid_chat_id("550e8400-e29b-41d4-a716-446655440000"));
+        assert!(is_valid_chat_id("unified:default"));
+    }
+
+    #[test]
+    fn is_valid_chat_id_rejects_empty() {
+        assert!(!is_valid_chat_id(""));
+    }
+
+    #[test]
+    fn is_valid_chat_id_rejects_too_long() {
+        let too_long = "a".repeat(65);
+        assert!(!is_valid_chat_id(&too_long));
+        let max_len = "a".repeat(64);
+        assert!(is_valid_chat_id(&max_len));
+    }
+
+    #[test]
+    fn is_valid_chat_id_rejects_disallowed_characters() {
+        assert!(!is_valid_chat_id("has space"));
+        assert!(!is_valid_chat_id("has\"quote"));
+        assert!(!is_valid_chat_id("has;semicolon"));
+    }
+
+    // --- ConnectionRegistry ---
+
+    fn dummy_sender() -> mpsc::UnboundedSender<Message> {
+        let (tx, _rx) = mpsc::unbounded_channel::<Message>();
+        tx
+    }
+
+    #[test]
+    fn register_attaches_connection_to_its_default_chat() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+
+        let recipients = registry.senders_for_chat("chat-1");
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].0, "conn-1");
+    }
+
+    #[test]
+    fn attach_allows_one_connection_to_subscribe_to_multiple_chats() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+        registry.attach("conn-1", "chat-2");
+
+        assert_eq!(registry.senders_for_chat("chat-1").len(), 1);
+        assert_eq!(registry.senders_for_chat("chat-2").len(), 1);
+    }
+
+    #[test]
+    fn attach_allows_one_chat_to_have_multiple_connections() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+        registry.register("conn-2", "chat-2", dummy_sender());
+        registry.attach("conn-2", "chat-1");
+
+        let recipients = registry.senders_for_chat("chat-1");
+        let ids: std::collections::HashSet<_> = recipients.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, std::collections::HashSet::from(["conn-1".to_string(), "conn-2".to_string()]));
+    }
+
+    #[test]
+    fn cleanup_connection_removes_it_from_every_subscribed_chat() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+        registry.attach("conn-1", "chat-2");
+
+        registry.cleanup_connection("conn-1");
+
+        assert!(registry.senders_for_chat("chat-1").is_empty());
+        assert!(registry.senders_for_chat("chat-2").is_empty());
+        assert!(!registry.subs.contains_key("chat-1"));
+        assert!(!registry.subs.contains_key("chat-2"));
+    }
+
+    #[test]
+    fn cleanup_connection_is_idempotent() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+
+        registry.cleanup_connection("conn-1");
+        registry.cleanup_connection("conn-1");
+
+        assert!(registry.senders_for_chat("chat-1").is_empty());
+    }
+
+    #[test]
+    fn cleanup_connection_does_not_affect_other_connections_sharing_a_chat() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+        registry.register("conn-2", "chat-2", dummy_sender());
+        registry.attach("conn-2", "chat-1");
+
+        registry.cleanup_connection("conn-1");
+
+        let recipients = registry.senders_for_chat("chat-1");
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].0, "conn-2");
+    }
+
+    #[test]
+    fn senders_for_chat_returns_empty_for_unknown_chat_id() {
+        let registry = ConnectionRegistry::default();
+        assert!(registry.senders_for_chat("no-such-chat").is_empty());
+    }
+
+    #[test]
+    fn clear_removes_all_state() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+
+        registry.clear();
+
+        assert!(registry.senders_for_chat("chat-1").is_empty());
+        assert!(registry.subs.is_empty());
+        assert!(registry.conn_chats.is_empty());
+        assert!(registry.conn_default.is_empty());
+        assert!(registry.senders.is_empty());
     }
 }
