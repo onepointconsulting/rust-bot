@@ -9,6 +9,7 @@ pub mod search;
 pub mod web;
 pub mod spawn;
 pub mod cron;
+pub mod goal;
 pub mod message;
 pub mod gmail;
 pub mod ocr;

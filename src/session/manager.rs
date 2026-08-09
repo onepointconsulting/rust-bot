@@ -1202,13 +1202,13 @@ mod tests {
         assert_eq!(format_sessions_list(&[], None), "No sessions available.");
     }
 
-    // ── read_session_payload ──────────────────────────────────────────────────
+    // ── read_session_file ──────────────────────────────────────────────────
 
     #[test]
     fn read_session_payload_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::new(dir.path().join("ws"));
-        assert!(mgr.read_session_payload("missing").is_none());
+        assert!(mgr.read_session_file("missing").is_none());
     }
 
     #[test]
@@ -1226,7 +1226,7 @@ mod tests {
         );
         fs::write(&path, body).unwrap();
 
-        let payload = mgr.read_session_payload("r1").expect("payload");
+        let payload = mgr.read_session_file("r1").expect("payload");
         assert_eq!(payload.key, "r1");
         assert_eq!(payload.created_at.as_deref(), Some("2026-01-10T08:00:00"));
         assert_eq!(payload.updated_at.as_deref(), Some("2026-01-11T09:00:00"));
@@ -1250,7 +1250,7 @@ mod tests {
         )
         .unwrap();
 
-        let payload = mgr.read_session_payload("fallback-key").expect("payload");
+        let payload = mgr.read_session_file("fallback-key").expect("payload");
         assert_eq!(payload.key, "fallback-key");
     }
 
@@ -1273,7 +1273,7 @@ mod tests {
         )
         .unwrap();
 
-        let payload = mgr.read_session_payload("corrupt").expect("repaired");
+        let payload = mgr.read_session_file("corrupt").expect("repaired");
         assert_eq!(payload.key, "corrupt");
         assert_eq!(payload.messages.len(), 1);
         assert_eq!(

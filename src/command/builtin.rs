@@ -4,6 +4,7 @@ use crate::{
     bus::events::OutboundMessage,
     command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
     security::workspace_access::WorkspaceAccessMode,
+    session::goal_state::{self, GoalUpdateAction},
     utils::{
         cli::convert_text_to_markdown,
         gitstore::{CommitInfo, GitStore},
@@ -163,6 +164,7 @@ impl CommandHandler for CmdNew {
             .get(session.last_consolidated..)
             .map(<[_]>::to_vec);
         session.clear();
+        session.metadata.remove(goal_state::GOAL_STATE_KEY);
         if let Err(e) = session_manager.save(session) {
             log::error!("Failed to save session: {e}");
         }
@@ -731,6 +733,67 @@ impl CommandHandler for CmdWorkspace {
     }
 }
 
+struct CmdGoal;
+
+/// Start, check, or cancel a sustained goal — an objective the agent tracks
+/// across many turns (persisted in session metadata, echoed back into the
+/// model's own prompt context every turn; see `session::goal_state`).
+///
+/// `/goal <objective>` starts a new goal for this session immediately (this
+/// executes directly rather than nanobot's tag-and-let-the-model-decide
+/// design — see the port plan). `/goal` with no args reports the active
+/// goal's status, if any. `/goal cancel` (or `/goal clear`) force-clears an
+/// active goal — the manual escape hatch for when the model never calls its
+/// own `update_goal` tool. The model can also complete/cancel/block/replace
+/// the goal itself via that tool during later turns.
+#[async_trait]
+impl CommandHandler for CmdGoal {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/goal");
+        };
+        let requested = ctx.args.trim();
+
+        if requested.is_empty() {
+            let (_session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+            if !goal_state::sustained_goal_active(&session.metadata) {
+                return reply_as_text(
+                    ctx,
+                    "Usage: /goal <long-running task description> (or /goal cancel to clear an active goal)",
+                );
+            }
+            let objective = session
+                .metadata
+                .get(goal_state::GOAL_STATE_KEY)
+                .and_then(|g| g.get("objective"))
+                .and_then(|v| v.as_str())
+                .unwrap_or("(no objective text stored)");
+            return reply_as_text(ctx, format!("Goal (active): {objective}"));
+        }
+
+        if requested.eq_ignore_ascii_case("cancel") || requested.eq_ignore_ascii_case("clear") {
+            let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+            return match agent_loop.update_session_goal(
+                &mut session_manager,
+                &session.key,
+                GoalUpdateAction::Cancel,
+                Some("Cancelled via /goal cancel"),
+                None,
+                None,
+            ) {
+                Ok(message) => reply_as_text(ctx, message),
+                Err(e) => reply_as_text(ctx, format!("Error: {e}")),
+            };
+        }
+
+        let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+        match agent_loop.create_session_goal(&mut session_manager, &session.key, requested, None) {
+            Ok(()) => reply_as_text(ctx, format!("Goal started: {requested}")),
+            Err(e) => reply_as_text(ctx, format!("Error: {e}")),
+        }
+    }
+}
+
 struct CmdCleanup;
 
 /// Workspace subtrees that must never be touched by `/cleanup`.
@@ -891,6 +954,7 @@ fn build_help_text() -> String {
         "/mcp-list — List available MCP servers",
         "/tools — List available tools",
         "/workspace — Show the session's workspace scope, or switch it: /workspace <path> [restricted|full], /workspace default to clear",
+        "/goal <task> — Start a sustained goal for this session; /goal to check status, /goal cancel to clear it",
         "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
         "/list-sessions — List available sessions in current workspace",
         "/example-prompts — List example prompts",
@@ -922,6 +986,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.prefix(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
+    router.prefix(ChatCommand::Goal.to_string(), Arc::new(CmdGoal));
     router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
     router.exact(
         ChatCommand::ListSessions.to_string(),
@@ -1381,6 +1446,140 @@ mod tests {
         let ctx = workspace_cmd_ctx(loop_, "relative/dir");
         let out = CmdWorkspace.handle(&ctx).await;
         assert!(out.content.starts_with("Error:"), "got: {}", out.content);
+    }
+
+    fn goal_cmd_ctx(
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+        args: &str,
+    ) -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: format!("/goal {args}").trim().to_string(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "goal-cmd-session",
+            "/goal",
+            args,
+            Some(agent_loop),
+        )
+    }
+
+    #[tokio::test]
+    async fn cmd_goal_reports_usage_with_no_active_goal_and_no_args() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let ctx = goal_cmd_ctx(loop_, "");
+        let out = CmdGoal.handle(&ctx).await;
+        assert!(out.content.starts_with("Usage:"), "got: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn cmd_goal_start_status_and_cancel_round_trip() {
+        let loop_ = model_cmd_test_loop_with_preset();
+
+        let start_ctx = goal_cmd_ctx(loop_.clone(), "ship the feature");
+        let started = CmdGoal.handle(&start_ctx).await;
+        assert!(started.content.contains("ship the feature"), "got: {}", started.content);
+
+        let status_ctx = goal_cmd_ctx(loop_.clone(), "");
+        let status = CmdGoal.handle(&status_ctx).await;
+        assert!(status.content.contains("ship the feature"), "got: {}", status.content);
+
+        let cancel_ctx = goal_cmd_ctx(loop_.clone(), "cancel");
+        let cancelled = CmdGoal.handle(&cancel_ctx).await;
+        assert!(cancelled.content.contains("cancelled"), "got: {}", cancelled.content);
+
+        let after_ctx = goal_cmd_ctx(loop_, "");
+        let after = CmdGoal.handle(&after_ctx).await;
+        assert!(after.content.starts_with("Usage:"), "got: {}", after.content);
+    }
+
+    #[tokio::test]
+    async fn cmd_goal_refuses_second_goal_while_one_is_active() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        CmdGoal.handle(&goal_cmd_ctx(loop_.clone(), "first objective")).await;
+        let out = CmdGoal.handle(&goal_cmd_ctx(loop_, "second objective")).await;
+        assert!(out.content.starts_with("Error:"), "got: {}", out.content);
+    }
+
+    #[tokio::test]
+    async fn cmd_new_clears_active_goal_but_keeps_other_metadata() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let session_key = "new-cmd-goal-session";
+        let new_ctx = |args: &str| {
+            CommandContext::with_options(
+                InboundMessage {
+                    channel: "cli".into(),
+                    sender_id: "user".into(),
+                    chat_id: "direct".into(),
+                    content: "/new".to_string(),
+                    timestamp: Utc::now(),
+                    media: vec![],
+                    metadata: Default::default(),
+                    session_key_override: None,
+                },
+                None,
+                session_key,
+                "/new",
+                args,
+                Some(loop_.clone()),
+            )
+        };
+
+        CmdGoal.handle(&goal_cmd_ctx_with_key(loop_.clone(), session_key, "an active goal")).await;
+        {
+            let mut session_manager = loop_.session_manager.lock().unwrap();
+            let session = session_manager.get_or_create_session(session_key);
+            session.metadata.insert("unrelated".to_string(), serde_json::json!("keep-me"));
+            let snapshot = session.clone();
+            session_manager.save(snapshot).unwrap();
+        }
+        assert!(
+            crate::session::goal_state::sustained_goal_active(
+                &loop_.session_manager.lock().unwrap().get_or_create_session(session_key).metadata
+            ),
+            "goal should be active before /new"
+        );
+
+        CmdNew.handle(&new_ctx("")).await;
+
+        let mut session_manager = loop_.session_manager.lock().unwrap();
+        let session = session_manager.get_or_create_session(session_key);
+        assert!(
+            !crate::session::goal_state::sustained_goal_active(&session.metadata),
+            "goal should be cleared by /new"
+        );
+        assert_eq!(session.metadata.get("unrelated"), Some(&serde_json::json!("keep-me")));
+    }
+
+    fn goal_cmd_ctx_with_key(
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+        session_key: &str,
+        args: &str,
+    ) -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: format!("/goal {args}").trim().to_string(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            session_key,
+            "/goal",
+            args,
+            Some(agent_loop),
+        )
     }
 
     #[tokio::test]

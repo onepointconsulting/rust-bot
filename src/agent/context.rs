@@ -352,10 +352,18 @@ impl MessageBuilder for ContextBuilder {
         media: Option<&[String]>,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
         current_role: &str,
     ) -> Vec<serde_json::Value> {
-        let runtime_ctx =
+        let mut runtime_ctx =
             ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
+        if let Some(metadata) = session_metadata {
+            let goal_lines = crate::session::goal_state::goal_state_runtime_lines(metadata);
+            if !goal_lines.is_empty() {
+                runtime_ctx.push('\n');
+                runtime_ctx.push_str(&goal_lines.join("\n"));
+            }
+        }
         let user_content = self.build_user_content(current_message, media);
 
         // Merge runtime context block and user content into a single value so
@@ -414,6 +422,7 @@ impl MessageBuilder for Arc<ContextBuilder> {
         media: Option<&[String]>,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
         current_role: &str,
     ) -> Vec<serde_json::Value> {
         self.as_ref().build_messages(
@@ -423,6 +432,7 @@ impl MessageBuilder for Arc<ContextBuilder> {
             media,
             channel,
             chat_id,
+            session_metadata,
             current_role,
         )
     }
@@ -1009,7 +1019,7 @@ mod tests {
     // ── build_messages ───────────────────────────────────────────────────────
 
     fn bm(b: &ContextBuilder, text: &str) -> Vec<serde_json::Value> {
-        b.build_messages(&[], text, None, None, None, None, "user")
+        b.build_messages(&[], text, None, None, None, None, None, "user")
     }
 
     #[test]
@@ -1041,7 +1051,7 @@ mod tests {
             serde_json::json!({"role": "user", "content": "prev question"}),
             serde_json::json!({"role": "assistant", "content": "prev answer"}),
         ];
-        let msgs = b.build_messages(&history, "new question", None, None, None, None, "user");
+        let msgs = b.build_messages(&history, "new question", None, None, None, None, None, "user");
         assert_eq!(msgs.len(), 4, "system + 2 history + 1 new user");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["content"], "prev question");
@@ -1057,7 +1067,7 @@ mod tests {
         let history = vec![
             serde_json::json!({"role": "user", "content": "earlier user msg"}),
         ];
-        let msgs = b.build_messages(&history, "continuation", None, None, None, None, "user");
+        let msgs = b.build_messages(&history, "continuation", None, None, None, None, None, "user");
         // system + merged-user (no extra message appended)
         assert_eq!(msgs.len(), 2, "should merge, not append");
         assert_eq!(msgs[1]["role"], "user");
@@ -1074,7 +1084,7 @@ mod tests {
         let history = vec![
             serde_json::json!({"role": "assistant", "content": "assistant turn"}),
         ];
-        let msgs = b.build_messages(&history, "next user", None, None, None, None, "user");
+        let msgs = b.build_messages(&history, "next user", None, None, None, None, None, "user");
         // system + assistant history + new user
         assert_eq!(msgs.len(), 3, "should not merge across different roles");
         assert_eq!(msgs[2]["role"], "user");
@@ -1086,7 +1096,7 @@ mod tests {
         write_skill_md(&tmp, "my-skill", "description: My skill\n", "# Skill content here");
         let b = make_builder(&tmp);
         let skill_names = vec!["my-skill".to_string()];
-        let msgs = b.build_messages(&[], "hi", Some(&skill_names), None, None, None, "user");
+        let msgs = b.build_messages(&[], "hi", Some(&skill_names), None, None, None, None, "user");
         let system = msgs[0]["content"].as_str().unwrap();
         assert!(system.contains("Skill content here"), "requested skill should be in system prompt");
     }
@@ -1095,7 +1105,7 @@ mod tests {
     fn build_messages_channel_appears_in_user_content_and_system() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let msgs = b.build_messages(&[], "msg", None, None, Some("telegram"), Some("99"), "user");
+        let msgs = b.build_messages(&[], "msg", None, None, Some("telegram"), Some("99"), None, "user");
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(user_content.contains("Channel: telegram"), "channel missing from runtime ctx");
         assert!(user_content.contains("Chat ID: 99"), "chat_id missing from runtime ctx");
@@ -1108,8 +1118,39 @@ mod tests {
     fn build_messages_custom_role() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let msgs = b.build_messages(&[], "tool output", None, None, None, None, "tool");
+        let msgs = b.build_messages(&[], "tool output", None, None, None, None, None, "tool");
         assert_eq!(msgs[1]["role"], "tool");
+    }
+
+    #[test]
+    fn build_messages_injects_active_goal_into_runtime_context() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_builder(&tmp);
+        let mut session = crate::session::manager::Session::new("test".to_string());
+        crate::session::goal_state::create_goal(&mut session, "refactor the auth module", None)
+            .unwrap();
+
+        let msgs = b.build_messages(
+            &[], "hi", None, None, None, None, Some(&session.metadata), "user",
+        );
+        let user_content = msgs[1]["content"].as_str().unwrap();
+        assert!(
+            user_content.contains("refactor the auth module"),
+            "goal objective missing from runtime context: {user_content}"
+        );
+    }
+
+    #[test]
+    fn build_messages_omits_goal_lines_when_none_active() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_builder(&tmp);
+        let session = crate::session::manager::Session::new("test".to_string());
+
+        let msgs = b.build_messages(
+            &[], "hi", None, None, None, None, Some(&session.metadata), "user",
+        );
+        let user_content = msgs[1]["content"].as_str().unwrap();
+        assert!(!user_content.contains("Goal"), "unexpected goal text: {user_content}");
     }
 
     // ── add_assistant_message ────────────────────────────────────────────────

@@ -675,6 +675,7 @@ pub trait MessageBuilder: Send + Sync {
         media: Option<&[String]>,
         channel: Option<&str>,
         chat_id: Option<&str>,
+        session_metadata: Option<&HashMap<String, serde_json::Value>>,
         current_role: &str,
     ) -> Vec<serde_json::Value>;
 
@@ -760,6 +761,7 @@ impl Consolidator {
             None,
             channel,
             chat_id,
+            None,
             "user",
         );
         let (estimated, source) = estimate_prompt_tokens_chain(
@@ -1244,6 +1246,7 @@ mod tests {
             _media: Option<&[String]>,
             _channel: Option<&str>,
             _chat_id: Option<&str>,
+            _session_metadata: Option<&HashMap<String, serde_json::Value>>,
             _current_role: &str,
         ) -> Vec<serde_json::Value> {
             vec![]

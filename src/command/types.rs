@@ -18,6 +18,7 @@ pub enum ChatCommand {
     McpList,
     Tools,
     Workspace,
+    Goal,
     Cleanup,
     #[serde(rename = "list-sessions", alias = "listsessions")]
     ListSessions,
@@ -50,6 +51,7 @@ impl std::str::FromStr for ChatCommand {
             "mcp-list" => Ok(ChatCommand::McpList),
             "tools" => Ok(ChatCommand::Tools),
             "workspace" => Ok(ChatCommand::Workspace),
+            "goal" => Ok(ChatCommand::Goal),
             "cleanup" => Ok(ChatCommand::Cleanup),
             "list-sessions" => Ok(ChatCommand::ListSessions),
             _ => Err(()),
@@ -73,6 +75,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::McpList => write!(f, "/mcp-list"),
             ChatCommand::Tools => write!(f, "/tools"),
             ChatCommand::Workspace => write!(f, "/workspace"),
+            ChatCommand::Goal => write!(f, "/goal"),
             ChatCommand::Cleanup => write!(f, "/cleanup"),
             ChatCommand::ListSessions => write!(f, "/list-sessions"),
             ChatCommand::ExamplePrompts => write!(f, "/example-prompts"),

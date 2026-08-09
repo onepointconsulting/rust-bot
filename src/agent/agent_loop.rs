@@ -24,6 +24,7 @@ use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::FsToolConfig;
+use crate::agent::tools::goal::UpdateGoalTool;
 use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_with_file_refs};
 use crate::agent::tools::mcp_file_ref::FileRefResolver;
 use crate::agent::tools::message::MessageTool;
@@ -51,6 +52,7 @@ use crate::security::workspace_access::{
     WorkspaceScopeResolver, WORKSPACE_SCOPE_METADATA_KEY,
 };
 use crate::security::workspace_requests::WorkspaceRequestHandler;
+use crate::session::goal_state;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
@@ -59,7 +61,7 @@ use crate::utils::registry_helper::{
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
 
-const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron"];
+const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron", "update_goal"];
 
 // Match Python's optional async callbacks (`tool_hint=True` keyword in Python).
 pub type ProgressCallback =
@@ -420,6 +422,7 @@ impl AgentLoop {
             &cron_service,
             &timezone,
             &workspace,
+            session_manager.clone(),
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
         let tools = Arc::new(Mutex::new(tools));
@@ -630,6 +633,33 @@ impl AgentLoop {
         }
     }
 
+    /// Start a new sustained goal for this session. Thin delegator to
+    /// [`goal_state::create_session_goal`] — kept as an `AgentLoop` method so
+    /// command handlers find it alongside [`Self::set_session_workspace_scope`].
+    pub fn create_session_goal(
+        &self,
+        session_manager: &mut SessionManager,
+        session_key: &str,
+        objective: &str,
+        ui_summary: Option<&str>,
+    ) -> Result<(), goal_state::GoalError> {
+        goal_state::create_session_goal(session_manager, session_key, objective, ui_summary)
+    }
+
+    /// Complete/cancel/block/replace this session's active goal. Thin
+    /// delegator to [`goal_state::update_session_goal`].
+    pub fn update_session_goal(
+        &self,
+        session_manager: &mut SessionManager,
+        session_key: &str,
+        action: goal_state::GoalUpdateAction,
+        recap: Option<&str>,
+        objective: Option<&str>,
+        ui_summary: Option<&str>,
+    ) -> Result<String, goal_state::GoalError> {
+        goal_state::update_session_goal(session_manager, session_key, action, recap, objective, ui_summary)
+    }
+
     /// Register the default set of tools.
     fn register_default_tools(
         tools: &mut ToolRegistry,
@@ -644,6 +674,7 @@ impl AgentLoop {
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
         workspace: &PathBuf,
+        session_manager: Arc<Mutex<SessionManager>>,
     ) {
         log::info!("Registering default tools");
         let (allowed_dir, extra_read) = filesystem_tool_scope(
@@ -691,6 +722,7 @@ impl AgentLoop {
                 timezone.clone().unwrap_or("UTC".to_string()),
             )));
         }
+        tools.register(Box::new(UpdateGoalTool::new(session_manager)));
     }
 
     /// Connect to configured MCP servers (one-time, lazy).
@@ -1252,6 +1284,7 @@ impl AgentLoop {
             None,
             Some(channel),
             Some(chat_id),
+            Some(&snapshot.metadata),
             current_role,
         );
         let agent_run_result = self
@@ -1560,6 +1593,7 @@ impl AgentLoop {
             media,
             Some(msg.channel.as_str()),
             Some(msg.chat_id.as_str()),
+            Some(&session.metadata),
             DEFAULT_CURRENT_ROLE,
         );
 
