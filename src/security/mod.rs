@@ -3,11 +3,13 @@ pub mod jwt;
 pub mod workspace_access;
 pub mod workspace_requests;
 pub mod ingress_policy;
+pub mod attachment_ingress;
 
 pub use ingress_policy::{
     AttachmentIngressLimits, MessageIngressLimits, WebUIIngressPolicy,
     DEFAULT_WEBUI_INGRESS_POLICY, MESSAGE_TOO_LARGE,
 };
+pub use attachment_ingress::{store_inbound_attachments, AttachmentIngressResult, AttachmentRejection};
 pub use jwt::{
     generate_jwt_keypair, generate_jwt_token, validate_jwt_token, validate_jwt_token_from_path,
     Claims, GeneratedKeypair, GeneratedToken, JwtError, JwtValidationOpts,

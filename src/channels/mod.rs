@@ -5,3 +5,4 @@ pub mod manager;
 pub mod registry;
 pub mod whatsapp;
 pub mod websocket;
+pub mod gateway_services;

@@ -14,3 +14,4 @@ pub mod cli;
 pub mod exit_codes;
 pub mod evaluator;
 pub mod whatsapp;
+pub mod media_decode;

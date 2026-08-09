@@ -23,6 +23,7 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::channels::base::handle_message;
+use crate::channels::gateway_services::GatewayServices;
 use crate::channels::types::{Envelope, EnvelopeType};
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::{
@@ -35,7 +36,9 @@ use crate::{
         queue::MessageBus,
     },
     channels::base::{BaseChannel, BaseChannelCommon},
+    config::paths::get_media_dir,
     config::schema::{ChannelsConfig, JwtConfig},
+    security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
     session::manager::SessionManager,
@@ -251,6 +254,7 @@ struct WsShared {
     jwt_public_key_pem: Option<Arc<Vec<u8>>>,
     connections: ConnectionRegistryHandle,
     supports_streaming: bool,
+    gateway_services: Arc<GatewayServices>,
     session_manager: Arc<StdMutex<SessionManager>>,
     workspace_request_handler: WorkspaceRequestHandler,
     runtime_surface: String,
@@ -328,14 +332,26 @@ fn workspace_controls_available(shared: &WsShared, remote_addr: SocketAddr) -> b
 
 /// Send a control event (`error`, `attached`, ...) to one connection, or
 /// silently drop it if the connection is already gone. Mirrors nanobot's
-/// `_send_event` (`channels/websocket/runtime.py:377-392`); `fields` is
-/// merged into the payload alongside `"event"`, mirroring `**fields: Any`.
-async fn send_event(shared: &WsShared, connection_id: &str, event: &str, fields: serde_json::Value) {
+/// `_send_event` (`channels/websocket/runtime.py:377-392`).
+///
+/// `base_fields` (e.g. `chat_id` / `turn_id` rejection context) and `fields`
+/// are both merged into the payload alongside `"event"`, mirroring
+/// `_send_event(..., detail=..., **rejection_fields)`.
+async fn send_event(
+    shared: &WsShared,
+    connection_id: &str,
+    event: &str,
+    base_fields: Option<&serde_json::Map<String, serde_json::Value>>,
+    fields: serde_json::Value,
+) {
     let sender = shared.connections.lock().await.sender_for(connection_id);
     let Some(sender) = sender else { return };
 
     let mut payload = serde_json::Map::new();
     payload.insert("event".to_string(), serde_json::Value::String(event.to_string()));
+    if let Some(base) = base_fields {
+        payload.extend(base.clone());
+    }
     if let serde_json::Value::Object(map) = fields {
         payload.extend(map);
     }
@@ -523,6 +539,7 @@ async fn handle_envelope_message<'a>(
             shared,
             connection_id,
             "error",
+            None,
             serde_json::json!({"detail": "invalid chat_id"}),
         )
         .await;
@@ -542,28 +559,100 @@ async fn handle_envelope_message<'a>(
     // Reject the exact application turn before hydration, transcript
     // persistence, or an acceptance ACK — mirrors runtime.py:701-712.
     if !sender_allowed(&shared.channels_config, client_id) {
-        let mut fields = rejection_fields.clone();
-        fields.insert("detail".to_string(), serde_json::Value::String("access_denied".to_string()));
-        send_event(shared, connection_id, "error", serde_json::Value::Object(fields)).await;
+        send_event(
+            shared,
+            connection_id,
+            "error",
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
         return;
     }
 
     let Some(content) = envelope.get("content").and_then(|v| v.as_str()) else {
-        let mut fields = rejection_fields.clone();
-        fields.insert("detail".to_string(), serde_json::Value::String("missing content".to_string()));
-        send_event(shared, connection_id, "error", serde_json::Value::Object(fields)).await;
+        send_event(
+            shared,
+            connection_id,
+            "error",
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing content"}),
+        )
+        .await;
         return;
     };
 
+    if let Some(message_rejection) = shared.gateway_services.ingress.validate_text(content) {
+        send_event(
+            shared,
+            connection_id,
+            "error",
+            Some(&rejection_fields),
+            serde_json::json!({
+                "detail": "message_rejected",
+                "reason": message_rejection,
+            }),
+        )
+        .await;
+        return;
+    }
+
+    let mut media_paths: Vec<String> = Vec::new();
+    if let Some(raw_media) = envelope.get("media") {
+        let Some(media_array) = raw_media.as_array() else {
+            send_event(
+                shared,
+                connection_id,
+                "error",
+                Some(&rejection_fields),
+                serde_json::json!({"detail": "attachment_rejected", "reason": "malformed"}),
+            )
+            .await;
+            return;
+        };
+        let media_dir = get_media_dir(Some("websocket"));
+        match store_inbound_attachments(media_array, &media_dir, shared.gateway_services.ingress.attachments) {
+            Ok(paths) => media_paths = paths,
+            Err(reason) => {
+                send_event(
+                    shared,
+                    connection_id,
+                    "error",
+                    Some(&rejection_fields),
+                    serde_json::json!({"detail": "attachment_rejected", "reason": reason.as_str()}),
+                )
+                .await;
+                return;
+            }
+        }
+    }
+
+    // Allow media-only turns (content may be empty when attachments are present).
+    if content.trim().is_empty() && media_paths.is_empty() {
+        send_event(
+            shared,
+            connection_id,
+            "error",
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing content"}),
+        )
+        .await;
+        return;
+    }
+
+    // Auto-attach on first use so clients can one-shot without a separate
+    // `attach` envelope — mirrors runtime.py:765.
+    shared.connections.lock().await.attach(connection_id, cid);
+
     // Still missing before this can actually admit a turn (mirrors
-    // runtime.py:721-849) — see the review notes for what each piece needs:
-    // ingress text validation, media/attachment storage, the
-    // empty-content-and-no-media rejection, attach/hydrate-after-subscribe,
-    // WorkspaceRequestHandler::scope_for_message (+ error-to-send_event
-    // wrapping), transcript persistence, cli_apps/mcp_presets/quoted-context
-    // normalization, turn registration, the handle_message(...) call itself,
-    // and the final `message_accepted` ack.
-    let _ = content;
+    // runtime.py:766-849) — hydrate-after-subscribe (replaying recent
+    // history to this connection; no transcript/history-replay module
+    // exists yet), WorkspaceRequestHandler::scope_for_message (+
+    // error-to-send_event wrapping), transcript persistence,
+    // cli_apps/mcp_presets/quoted-context normalization, turn registration,
+    // the handle_message(...) call itself, and the final `message_accepted`
+    // ack.
+    let _ = media_paths;
 }
 
 /// WebSocket server channel: rust-bot acts as a WebSocket server, serving
@@ -581,6 +670,9 @@ pub struct WebSocketChannel {
     config: WebSocketConfig,
     connections: ConnectionRegistryHandle,
     jwt_public_key_pem: Option<Arc<Vec<u8>>>,
+    /// Built once at channel construction and shared (via `Arc::clone`) into
+    /// every [`WsShared`] snapshot — see [`Self::shared`].
+    gateway_services: Arc<GatewayServices>,
     /// `Arc`-wrapped so [`Self::start`] can move an owned clone into the
     /// `'static` shutdown future `axum::serve` requires, rather than
     /// borrowing `&self` (which cannot outlive this method).
@@ -616,6 +708,7 @@ impl WebSocketChannel {
             config,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             jwt_public_key_pem,
+            gateway_services: Arc::new(GatewayServices::default()),
             shutdown: Arc::new(Notify::new()),
         }
     }
@@ -632,6 +725,7 @@ impl WebSocketChannel {
             session_manager: Arc::clone(&self.base.session_manager),
             workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
+            gateway_services: Arc::clone(&self.gateway_services),
         }
     }
 
@@ -973,6 +1067,7 @@ mod tests {
                 true,
             ),
             runtime_surface: runtime_surface.to_string(),
+            gateway_services: Arc::new(GatewayServices::default()),
         }
     }
 
