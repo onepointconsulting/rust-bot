@@ -31,5 +31,5 @@ fn test_create_mcp_server_config() {
         "rust-bot-mcp-config-{}.json",
         uuid::Uuid::new_v4()
     ));
-    save_config(&cfg, Some(temp_path));
+    let _ = save_config(&cfg, Some(temp_path));
 }

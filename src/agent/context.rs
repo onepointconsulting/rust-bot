@@ -311,12 +311,6 @@ impl ContextBuilder {
         return parts.join("\n\n");
     }
 
-    /// Add a tool result to the message list.
-    fn add_tool_result(mut messages: Vec<serde_json::Value>, tool_call_id: &str, tool_name: &str, result: serde_json::Value) -> Vec<serde_json::Value> {
-        messages.push(serde_json::json!({ "role": "tool", "tool_call_id": tool_call_id, "name": tool_name, "content": result }));
-        return messages;
-    }
-
     /// Append an assistant turn to `messages` and return the updated list.
     pub fn add_assistant_message(
         &self,

@@ -189,7 +189,7 @@ mod tests {
         let path = dir.path().join("config.json");
         let config = Config::default();
 
-        save_config(&config, Some(path.clone()));
+        let _ = save_config(&config, Some(path.clone()));
 
         assert!(path.is_file());
         let content = std::fs::read_to_string(&path).unwrap();
@@ -203,7 +203,7 @@ mod tests {
         let path = dir.path().join("nested").join("deep").join("config.json");
         let config = Config::default();
 
-        save_config(&config, Some(path.clone()));
+        let _ = save_config(&config, Some(path.clone()));
 
         assert!(path.is_file());
     }
@@ -215,7 +215,7 @@ mod tests {
         let mut config = Config::default();
         config.agents.model = "test-model".to_string();
 
-        save_config(&config, Some(path.clone()));
+        let _ = save_config(&config, Some(path.clone()));
         let loaded = load_config(Some(path));
 
         assert_eq!(loaded.agents.model, "test-model");
@@ -308,7 +308,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.json");
         let config = Config::default();
-        save_config(&config, Some(path.clone()));
+        let _ = save_config(&config, Some(path.clone()));
 
         let loaded = load_config(Some(path));
         assert!(loaded.model_presets.is_empty());
@@ -327,7 +327,7 @@ mod tests {
             },
         );
         config.agents.model_preset = Some("fast".to_string());
-        save_config(&config, Some(path.clone()));
+        let _ = save_config(&config, Some(path.clone()));
 
         let loaded = load_config(Some(path));
         assert_eq!(loaded.agents.model_preset, Some("fast".to_string()));
@@ -340,7 +340,7 @@ mod tests {
         let path = dir.path().join("config.json");
         let mut config = Config::default();
         config.agents.model_preset = Some("nope".to_string());
-        save_config(&config, Some(path.clone()));
+        let _ = save_config(&config, Some(path.clone()));
 
         load_config(Some(path));
     }

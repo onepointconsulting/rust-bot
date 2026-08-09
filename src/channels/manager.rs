@@ -40,8 +40,8 @@ pub struct ChannelManager {
     config: Arc<Config>,
     bus: Arc<MessageBus>,
     channels: HashMap<String, SharedChannel>,
-    session_manager: Arc<StdMutex<SessionManager>>,
-    workspace_request_handler: WorkspaceRequestHandler,
+    _session_manager: Arc<StdMutex<SessionManager>>,
+    _workspace_request_handler: WorkspaceRequestHandler,
     /// Python: `self._dispatch_task = asyncio.create_task(...)`
     ///
     /// Wrapped in a `tokio::sync::Mutex` (rather than stored by value) so
@@ -76,8 +76,8 @@ impl ChannelManager {
             config,
             bus,
             channels,
-            session_manager,
-            workspace_request_handler,
+            _session_manager: session_manager,
+            _workspace_request_handler: workspace_request_handler,
             dispatch_task: Mutex::new(None),
         }
     }

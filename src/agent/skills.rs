@@ -47,7 +47,7 @@ fn escape_xml(text: &str) -> String {
 /// Skills are markdown files (SKILL.md) that teach the agent how to use
 /// specific tools or perform certain tasks.
 pub struct SkillsLoader {
-    workspace: PathBuf,
+    _workspace: PathBuf,
     workspace_skills: PathBuf,
     builtin_skills: PathBuf,
 }
@@ -55,7 +55,7 @@ pub struct SkillsLoader {
 impl SkillsLoader {
     pub fn new(workspace: &PathBuf, builtin_skills_dir: Option<PathBuf>) -> Self {
         Self {
-            workspace: workspace.clone(),
+            _workspace: workspace.clone(),
             workspace_skills: workspace.join("skills"),
             builtin_skills: builtin_skills_dir.unwrap_or(BUILTIN_SKILLS_DIR.clone()),
         }

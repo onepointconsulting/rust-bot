@@ -255,8 +255,8 @@ struct WsShared {
     connections: ConnectionRegistryHandle,
     supports_streaming: bool,
     gateway_services: Arc<GatewayServices>,
-    session_manager: Arc<StdMutex<SessionManager>>,
-    workspace_request_handler: WorkspaceRequestHandler,
+    _session_manager: Arc<StdMutex<SessionManager>>,
+    _workspace_request_handler: WorkspaceRequestHandler,
     runtime_surface: String,
 }
 
@@ -281,6 +281,11 @@ struct EnvelopeDispatchContext<'a> {
 
 impl<'a> EnvelopeDispatchContext<'a> {
     /// See [`workspace_controls_available`].
+    ///
+    /// Not yet called: workspace-scope escalation over the websocket envelope
+    /// dispatcher isn't wired up yet, but the gating logic is implemented and
+    /// unit-tested ahead of that integration.
+    #[allow(dead_code)]
     fn workspace_controls_available(&self) -> bool {
         workspace_controls_available(self.shared, self.remote_addr)
     }
@@ -326,6 +331,7 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
 /// Mirrors nanobot's `_workspace_controls_available` / `ws_http.workspace_controls_available`
 /// (`webui/ws_http.py:229`): workspace-scope escalation is allowed for the native app shell
 /// (never facing an untrusted network) or for a loopback client on the browser-served surface.
+#[allow(dead_code)]
 fn workspace_controls_available(shared: &WsShared, remote_addr: SocketAddr) -> bool {
     shared.runtime_surface == "native" || remote_addr.ip().is_loopback()
 }
@@ -519,7 +525,7 @@ async fn dispatch_envelope<'a>(
         EnvelopeType::Message => {
             handle_envelope_message(envelope_dispatch_context).await;
         }
-        EnvelopeType::Unrecognized(t) => {
+        EnvelopeType::Unrecognized(_t) => {
             // reply with nanobot's `f"unknown type: {t!r}"` equivalent
         }
     }
@@ -722,8 +728,8 @@ impl WebSocketChannel {
             jwt_public_key_pem: self.jwt_public_key_pem.clone(),
             connections: Arc::clone(&self.connections),
             supports_streaming: BaseChannel::supports_streaming(self),
-            session_manager: Arc::clone(&self.base.session_manager),
-            workspace_request_handler: self.base.workspace_request_handler.clone(),
+            _session_manager: Arc::clone(&self.base.session_manager),
+            _workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
             gateway_services: Arc::clone(&self.gateway_services),
         }
@@ -1061,8 +1067,8 @@ mod tests {
             jwt_public_key_pem: None,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
-            session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
-            workspace_request_handler: WorkspaceRequestHandler::new(
+            _session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            _workspace_request_handler: WorkspaceRequestHandler::new(
                 tempfile::tempdir().unwrap().keep(),
                 true,
             ),

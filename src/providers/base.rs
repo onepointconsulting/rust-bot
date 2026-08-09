@@ -1112,13 +1112,13 @@ mod tests {
 
         async fn chat(
             &self,
-            messages: Vec<serde_json::Value>,
-            tools: Option<Vec<serde_json::Value>>,
-            model: Option<String>,
-            max_tokens: usize,
-            temperature: f32,
-            reasoning_effort: Option<String>,
-            tool_choice: Option<serde_json::Value>,
+            _messages: Vec<serde_json::Value>,
+            _tools: Option<Vec<serde_json::Value>>,
+            _model: Option<String>,
+            _max_tokens: usize,
+            _temperature: f32,
+            _reasoning_effort: Option<String>,
+            _tool_choice: Option<serde_json::Value>,
         ) -> LLMResponse {
             LLMResponse {
                 content: Some("Hello, world!".to_string()),
@@ -1136,13 +1136,13 @@ mod tests {
 
         async fn chat_stream<F, Fut>(
             &self,
-            messages: Vec<serde_json::Value>,
-            tools: Option<Vec<serde_json::Value>>,
-            model: Option<String>,
-            max_tokens: usize,
-            temperature: f32,
-            reasoning_effort: Option<String>,
-            tool_choice: Option<serde_json::Value>,
+            _messages: Vec<serde_json::Value>,
+            _tools: Option<Vec<serde_json::Value>>,
+            _model: Option<String>,
+            _max_tokens: usize,
+            _temperature: f32,
+            _reasoning_effort: Option<String>,
+            _tool_choice: Option<serde_json::Value>,
             on_content_delta: &Option<F>,
         ) -> LLMResponse
         where

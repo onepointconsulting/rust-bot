@@ -496,10 +496,6 @@ impl AgentRunner {
             .await
     }
 
-    fn usage_dict(usage: Option<HashMap<String, u64>>) -> HashMap<String, u64> {
-        usage.unwrap_or_default()
-    }
-
     fn accumulate_usage(target: &mut HashMap<String, u64>, addition: &HashMap<String, u64>) {
         for (key, value) in addition {
             *target.entry(key.clone()).or_insert(0) += value;
@@ -1063,13 +1059,6 @@ impl AgentRunner {
         })
     }
 
-    fn merge_usage(left: &HashMap<String, u64>, right: &HashMap<String, u64>) -> HashMap<String, u64> {
-        let mut merged = left.clone();
-        for (key, value) in right.iter() {
-            merged.insert(key.clone(), merged.get(key).unwrap_or(&0u64) + value);
-        }
-        merged
-    }
 }
 
 /// No-op fallback hook used when `AgentRunSpec::hook` is `None`.
@@ -1081,16 +1070,8 @@ impl AgentHook for NoopHook {}
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tools::filesystem::ListDirTool;
     use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
     use crate::providers::registry::ProviderSpec;
-
-    fn create_dummy_spec() -> AgentRunSpec {
-        AgentRunSpec {
-            max_tool_result_chars: 1000,
-            ..Default::default()
-        }
-    }
 
     /// Minimal provider that satisfies `LLMProviderDyn` for tests that don't
     /// exercise the provider (e.g. `normalize_tool_result`).
@@ -1189,13 +1170,6 @@ mod tests {
 
     fn make_runner() -> AgentRunner {
         AgentRunner::new(StubProvider::new())
-    }
-
-    fn make_list_dir_tool() -> ListDirTool {
-        // Create temp directory as workspace
-        let workspace = tempfile::tempdir().unwrap();
-        let workspace_path = workspace.path().to_path_buf();
-        ListDirTool::new(Some(workspace_path), None, None)
     }
 
     #[test]
@@ -2017,11 +1991,4 @@ mod tests {
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
 
-    #[test]
-    fn test_merge_usage() {
-        let left = HashMap::from([("a".to_string(), 1), ("b".to_string(), 2)]);
-        let right = HashMap::from([("a".to_string(), 3), ("c".to_string(), 4)]);
-        let result = AgentRunner::merge_usage(&left, &right);
-        assert_eq!(result, HashMap::from([("a".to_string(), 4), ("b".to_string(), 2), ("c".to_string(), 4)]));
-    }
 }

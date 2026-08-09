@@ -41,7 +41,7 @@ pub fn webui_workspace_state_path() -> PathBuf {
 /// The WebUI-wide default access mode toggle — a *different* two-state
 /// concept than [`WorkspaceAccessMode`]: `Default` means "defer to the
 /// process config," not "restricted."
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum DefaultAccessMode {
     Default,
@@ -64,6 +64,18 @@ impl DefaultAccessMode {
             "full" => Some(Self::Full),
             _ => None,
         }
+    }
+}
+
+impl<'de> Deserialize<'de> for DefaultAccessMode {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        let raw = String::deserialize(deserializer)?;
+        Self::parse_with_legacy_remap(&raw).ok_or_else(|| {
+            serde::de::Error::custom(format!("invalid default access mode: {raw}"))
+        })
     }
 }
 

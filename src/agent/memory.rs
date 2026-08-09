@@ -76,7 +76,7 @@ impl MemoryStore {
         let cursor_file = memory_dir.join(CURSOR_FILE);
         let dream_cursor_file = memory_dir.join(DREAM_CURSOR_FILE);
         let git = GitStore::new(workspace, vec![]);
-        Self {
+        let store = Self {
             workspace: cloned_workspace,
             max_history_entries: max_history_entries.unwrap_or(DEFAULT_MAX_HISTORY),
             memory_dir,
@@ -88,7 +88,9 @@ impl MemoryStore {
             cursor_file,
             dream_cursor_file,
             git: git,
-        }
+        };
+        store.maybe_migrate_legacy_history();
+        store
     }
 
     /* Migration related methods */
@@ -1361,21 +1363,6 @@ mod tests {
         )
     }
 
-    fn test_consolidator_with_ctx(
-        tmp: &TempDir,
-        provider: Arc<dyn LLMProviderDyn>,
-        context_window_tokens: u64,
-        max_completion_tokens: usize,
-    ) -> Consolidator {
-        Consolidator::new(
-            Arc::new(make_store(tmp)),
-            test_runtime_resolver(provider),
-            Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf()))),
-            context_window_tokens,
-            Box::new(StubArchiveMessageBuilder),
-            max_completion_tokens,
-        )
-    }
 
     // ── maybe_consolidate_by_tokens tests ─────────────────────────────────────
 

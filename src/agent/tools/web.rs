@@ -113,62 +113,9 @@ async fn validate_url_safe(url: &str) -> (bool, String) {
     return validate_url_target(url).await;
 }
 
-/// Validate URL scheme/domain. Does NOT check resolved IPs (use `validate_url_target` for that).
-fn validate_url(url: &str) -> (bool, String) {
-    let parsed = match Url::parse(url) {
-        Ok(p) => p,
-        Err(e) => {
-            if is_missing_netloc(url) {
-                return (false, "Missing domain".to_string());
-            }
-            return (false, e.to_string());
-        }
-    };
 
-    if parsed.scheme() != "http" && parsed.scheme() != "https" {
-        let scheme = parsed.scheme();
-        let label = if scheme.is_empty() { "none" } else { scheme };
-        return (false, format!("Only http/https allowed, got '{label}'"));
-    }
 
-    if !has_netloc(url, &parsed) {
-        return (false, "Missing domain".to_string());
-    }
 
-    (true, String::new())
-}
-
-/// Whether the URL has a non-empty netloc, matching Python's `urlparse(...).netloc`.
-fn has_netloc(url: &str, parsed: &Url) -> bool {
-    let prefix = format!("{}://", parsed.scheme());
-    let Some(rest) = url.get(prefix.len()..) else {
-        return false;
-    };
-    netloc_from_rest(rest).is_some()
-}
-
-fn netloc_from_rest(rest: &str) -> Option<&str> {
-    if rest.starts_with('/') {
-        return None;
-    }
-    let netloc_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let netloc = &rest[..netloc_end];
-    if netloc.is_empty() {
-        None
-    } else {
-        Some(netloc)
-    }
-}
-
-fn is_missing_netloc(url: &str) -> bool {
-    let Some((scheme, rest)) = url.split_once("://") else {
-        return false;
-    };
-    if scheme != "http" && scheme != "https" {
-        return false;
-    }
-    netloc_from_rest(rest).is_none()
-}
 
 /// Format provider results into shared plaintext output.
 fn format_results(query: &str, items: &[Value], n: usize) -> String {
@@ -779,38 +726,6 @@ mod tests {
         assert_eq!(normalize("\n\n\n"), "\n\n");
         assert_eq!(normalize("\n\n\n\n"), "\n\n");
         assert_eq!(normalize("\t\t\t"), " ");
-    }
-
-    #[test]
-    fn validate_url_rejects_non_http_schemes() {
-        let (ok, msg) = validate_url("ftp://example.com/file");
-        assert!(!ok);
-        assert!(msg.contains("Only http/https allowed"), "got: {msg}");
-    }
-
-    #[test]
-    fn validate_url_rejects_missing_domain() {
-        let (ok, msg) = validate_url("http:///path");
-        assert!(!ok);
-        assert_eq!(msg, "Missing domain");
-
-        let (ok, msg) = validate_url("https://");
-        assert!(!ok);
-        assert_eq!(msg, "Missing domain");
-    }
-
-    #[test]
-    fn validate_url_accepts_https_with_domain() {
-        let (ok, msg) = validate_url("https://example.com/page");
-        assert!(ok);
-        assert!(msg.is_empty());
-    }
-
-    #[test]
-    fn validate_url_rejects_unparseable_input() {
-        let (ok, msg) = validate_url("not a url at all");
-        assert!(!ok);
-        assert!(!msg.is_empty());
     }
 
     #[test]

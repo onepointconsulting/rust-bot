@@ -321,8 +321,8 @@ pub struct AgentLoop {
     /// Live MCP sessions. Holding these keeps the connections open; dropping
     /// them closes the connections (RAII equivalent of Python's AsyncExitStack).
     mcp_sessions: Mutex<Vec<LoadedMcpTools>>,
-    channels_config: Option<ChannelsConfig>,
-    timezone: Option<String>,
+    _channels_config: Option<ChannelsConfig>,
+    _timezone: Option<String>,
     pub start_time: SystemTime,
     pub last_usage: Mutex<HashMap<String, u64>>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
@@ -338,7 +338,7 @@ pub struct AgentLoop {
     /// Monotonic source of task ids for `background_tasks`.
     next_background_task_id: AtomicU64,
     session_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
-    max: usize,
+    _max: usize,
     running: AtomicBool,
     concurrency_gate: Option<Arc<Semaphore>>,
     pub consolidator: Arc<Consolidator>,
@@ -444,7 +444,7 @@ impl AgentLoop {
 
         let agent_loop = Self {
             bus: bus.clone(),
-            channels_config,
+            _channels_config: channels_config,
             runtime_resolver: runtime_resolver.clone(),
             workspace: workspace.clone(),
             max_iterations,
@@ -456,7 +456,7 @@ impl AgentLoop {
             cron_service,
             restrict_to_workspace,
             workspace_scopes,
-            timezone,
+            _timezone: timezone,
             start_time: SystemTime::now(),
             last_usage: Mutex::new(HashMap::new()),
             extra_hooks: hooks.unwrap_or(Vec::new()),
@@ -474,7 +474,7 @@ impl AgentLoop {
             background_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             next_background_task_id: AtomicU64::new(0),
             session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
-            max,
+            _max: max,
             concurrency_gate,
             consolidator,
             dream: Arc::new(Dream::new(
@@ -2015,49 +2015,6 @@ mod tests {
 
     fn make_ctx() -> AgentHookContext {
         AgentHookContext::new(1, vec![])
-    }
-
-    fn recording_stream_callback() -> (StreamCallback, Arc<Mutex<Vec<String>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_cb = Arc::clone(&received);
-        let callback: StreamCallback = Arc::new(move |chunk| {
-            let received = Arc::clone(&received_cb);
-            Box::pin(async move {
-                received.lock().unwrap().push(chunk);
-            })
-        });
-        (callback, received)
-    }
-
-    fn recording_stream_end_callback() -> (StreamEndCallback, Arc<Mutex<Vec<bool>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_cb = Arc::clone(&received);
-        let callback: StreamEndCallback = Arc::new(move |resuming| {
-            let received = Arc::clone(&received_cb);
-            Box::pin(async move {
-                received.lock().unwrap().push(resuming);
-            })
-        });
-        (callback, received)
-    }
-
-    fn recording_progress_callback() -> (ProgressCallback, Arc<Mutex<Vec<(String, bool)>>>) {
-        let received = Arc::new(Mutex::new(Vec::new()));
-        let received_cb = Arc::clone(&received);
-        let callback: ProgressCallback = Arc::new(move |message, tool_hint| {
-            let received = Arc::clone(&received_cb);
-            Box::pin(async move {
-                received.lock().unwrap().push((message, tool_hint));
-            })
-        });
-        (callback, received)
-    }
-
-    fn stream_buf_snapshot(hook: &LoopHook) -> String {
-        hook.stream_buf
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone()
     }
 
     // ── LoopHookChain ─────────────────────────────────────────────────────────
