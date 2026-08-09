@@ -8,7 +8,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc, LazyLock, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
     },
 };
 
@@ -21,6 +21,8 @@ use crate::{
         types::MessageBytes,
     },
     config::{channels::EmailConfig, paths::get_media_dir, schema::ChannelsConfig},
+    security::workspace_requests::WorkspaceRequestHandler,
+    session::manager::SessionManager,
     utils::helpers::{detect_image_mime, safe_filename},
 };
 
@@ -210,13 +212,15 @@ impl EmailChannel {
 
     const MAX_PROCESSED_UIDS: usize = 100000;
 
-    pub fn new(config: EmailConfig, bus: Arc<MessageBus>, channels_config: ChannelsConfig) -> Self {
+    pub fn new(
+        config: EmailConfig,
+        bus: Arc<MessageBus>,
+        channels_config: ChannelsConfig,
+        session_manager: Arc<Mutex<SessionManager>>,
+        workspace_request_handler: WorkspaceRequestHandler,
+    ) -> Self {
         Self {
-            base: BaseChannelCommon {
-                bus,
-                running: AtomicBool::new(false),
-                transcription_api_key: String::new(),
-            },
+            base: BaseChannelCommon::new(bus, session_manager, workspace_request_handler),
             channels_config,
             config: config,
             last_subject_by_chat_id: Mutex::new(HashMap::new()),
@@ -1512,6 +1516,15 @@ mod tests {
         ));
     }
 
+    fn test_session_manager() -> Arc<Mutex<SessionManager>> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(Mutex::new(SessionManager::new(dir.keep())))
+    }
+
+    fn test_workspace_request_handler() -> WorkspaceRequestHandler {
+        WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true)
+    }
+
     fn channel_with_prefix(prefix: &str) -> EmailChannel {
         EmailChannel::new(
             EmailConfig {
@@ -1520,6 +1533,8 @@ mod tests {
             },
             Arc::new(MessageBus::new()),
             ChannelsConfig::default(),
+            test_session_manager(),
+            test_workspace_request_handler(),
         )
     }
 

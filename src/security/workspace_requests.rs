@@ -190,6 +190,7 @@ pub fn workspaces_payload(
 /// dispatcher) is. Takes `&mut SessionManager` per call rather than owning
 /// one, matching every other session-touching method in this codebase
 /// (`AgentLoop::set_session_model_preset`, `set_session_workspace_scope`).
+#[derive(Clone)]
 pub struct WorkspaceRequestHandler {
     default_workspace: PathBuf,
     default_restrict_to_workspace: bool,

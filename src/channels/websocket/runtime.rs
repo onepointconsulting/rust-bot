@@ -1,21 +1,17 @@
-use std::collections::{HashMap, HashSet};
-use std::sync::{
-    Arc, LazyLock,
-    atomic::{AtomicBool, Ordering},
-};
+use std::net::SocketAddr;
+use std::sync::{Arc, LazyLock, Mutex as StdMutex, atomic::Ordering};
 
 use async_trait::async_trait;
 use axum::{
     Router,
     extract::{
-        Query, State,
+        ConnectInfo, Query, State,
         ws::{Message, WebSocket, WebSocketUpgrade},
     },
     http::StatusCode,
     response::{IntoResponse, Response},
     routing::get,
 };
-use chrono::Utc;
 use futures::{SinkExt, StreamExt};
 use garde::{Path, Report, Validate};
 use regex::Regex;
@@ -27,9 +23,11 @@ use tokio::{
 use uuid::Uuid;
 
 use crate::channels::base::handle_message;
+use crate::channels::types::{Envelope, EnvelopeType};
+use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::{
     bus::{
-        events::{InboundMessage, OutboundMessage},
+        events::OutboundMessage,
         outbound_events::{
             OutboundEvent::RuntimeModelUpdated, RuntimeModelUpdatedEvent,
             outbound_message_for_event,
@@ -39,6 +37,8 @@ use crate::{
     channels::base::{BaseChannel, BaseChannelCommon},
     config::schema::{ChannelsConfig, JwtConfig},
     security::jwt::{JwtValidationOpts, validate_jwt_token},
+    security::workspace_requests::WorkspaceRequestHandler,
+    session::manager::SessionManager,
 };
 
 /// Strip a trailing `/`, keeping root `"/"` unchanged.
@@ -102,6 +102,10 @@ pub struct WebSocketConfig {
     pub ping_timeout_s: u64,
     pub ssl_certfile: String,
     pub ssl_keyfile: String,
+    /// `"native"` (the app shell, never facing an untrusted network) or `"browser"` (served
+    /// over the network, so workspace-scope escalation additionally requires a loopback
+    /// client). Mirrors nanobot's `webui_runtime_surface` (`cli/gateway_runtime.py:211`).
+    pub runtime_surface: String,
 }
 
 impl Default for WebSocketConfig {
@@ -119,6 +123,7 @@ impl Default for WebSocketConfig {
             ping_timeout_s: 30,
             ssl_certfile: "".to_string(),
             ssl_keyfile: "".to_string(),
+            runtime_surface: "browser".to_string(),
         }
     }
 }
@@ -163,7 +168,7 @@ pub fn publish_runtime_model_update(bus: Arc<MessageBus>, model: &str, model_pre
 /// A frame qualifies when it parses as a JSON object with a string ``type`` field.
 /// Legacy frames (plain text, or ``{"content": ...}`` without ``type``) return None;
 /// callers should fall back to :func:`_parse_inbound_payload` for those.
-fn parse_envelope(raw: &str) -> Option<HashMap<String, serde_json::Value>> {
+fn parse_envelope(raw: &str) -> Option<Envelope> {
     let text = raw.trim();
     if !text.starts_with('{') {
         return None;
@@ -227,88 +232,6 @@ fn is_valid_chat_id(value: &str) -> bool {
     CHAT_ID_RE.is_match(value)
 }
 
-/// Many-to-many chat_id↔connection subscription registry, mirroring
-/// nanobot's `_subs`/`_conn_chats`/`_conn_default`. One connection may be
-/// attached to several chat_ids (e.g. several open chats sharing one
-/// socket); one chat_id may have several connections attached (e.g. the
-/// same conversation open in two tabs). Shared (via `Arc`) between the
-/// channel itself and every per-connection task spawned by axum.
-#[derive(Default)]
-struct ConnectionRegistry {
-    /// chat_id -> connection_ids subscribed to it (fan-out target).
-    subs: HashMap<String, HashSet<String>>,
-    /// connection_id -> chat_ids it is subscribed to (O(1) cleanup on disconnect).
-    conn_chats: HashMap<String, HashSet<String>>,
-    /// connection_id -> its default chat_id, for legacy frames that omit routing.
-    conn_default: HashMap<String, String>,
-    /// connection_id -> outbound sender, so [`Self::senders_for_chat`] can reach it.
-    senders: HashMap<String, mpsc::UnboundedSender<Message>>,
-}
-
-impl ConnectionRegistry {
-    /// Idempotently subscribe `connection_id` to `chat_id`. Mirrors `_attach`.
-    fn attach(&mut self, connection_id: &str, chat_id: &str) {
-        self.subs
-            .entry(chat_id.to_string())
-            .or_default()
-            .insert(connection_id.to_string());
-        self.conn_chats
-            .entry(connection_id.to_string())
-            .or_default()
-            .insert(chat_id.to_string());
-    }
-
-    /// Record a newly-opened connection's sender and default chat_id, then attach it.
-    fn register(
-        &mut self,
-        connection_id: &str,
-        default_chat_id: &str,
-        sender: mpsc::UnboundedSender<Message>,
-    ) {
-        self.senders.insert(connection_id.to_string(), sender);
-        self.conn_default
-            .insert(connection_id.to_string(), default_chat_id.to_string());
-        self.attach(connection_id, default_chat_id);
-    }
-
-    /// Remove `connection_id` from every subscription set; safe to call
-    /// multiple times. Mirrors `_cleanup_connection`.
-    fn cleanup_connection(&mut self, connection_id: &str) {
-        if let Some(chat_ids) = self.conn_chats.remove(connection_id) {
-            for chat_id in chat_ids {
-                if let Some(subs) = self.subs.get_mut(&chat_id) {
-                    subs.remove(connection_id);
-                    if subs.is_empty() {
-                        self.subs.remove(&chat_id);
-                    }
-                }
-            }
-        }
-        self.conn_default.remove(connection_id);
-        self.senders.remove(connection_id);
-    }
-
-    /// Snapshot the senders currently subscribed to `chat_id`. Mirrors
-    /// `list(self._subs.get(chat_id, ()))` in nanobot's `send()`/`send_*` helpers.
-    fn senders_for_chat(&self, chat_id: &str) -> Vec<(String, mpsc::UnboundedSender<Message>)> {
-        let Some(conn_ids) = self.subs.get(chat_id) else {
-            return Vec::new();
-        };
-        conn_ids
-            .iter()
-            .filter_map(|id| self.senders.get(id).map(|tx| (id.clone(), tx.clone())))
-            .collect()
-    }
-
-    /// Drop all state. Mirrors nanobot's `stop()` clearing `_subs`/`_conn_chats`/etc.
-    fn clear(&mut self) {
-        self.subs.clear();
-        self.conn_chats.clear();
-        self.conn_default.clear();
-        self.senders.clear();
-    }
-}
-
 /// Shared handle to the many-to-many chat_id/connection registry.
 type ConnectionRegistryHandle = Arc<AsyncMutex<ConnectionRegistry>>;
 
@@ -328,6 +251,9 @@ struct WsShared {
     jwt_public_key_pem: Option<Arc<Vec<u8>>>,
     connections: ConnectionRegistryHandle,
     supports_streaming: bool,
+    session_manager: Arc<StdMutex<SessionManager>>,
+    workspace_request_handler: WorkspaceRequestHandler,
+    runtime_surface: String,
 }
 
 /// Query params accepted on the WebSocket upgrade request, mirroring nanobot's
@@ -338,6 +264,22 @@ struct WsUpgradeQuery {
     client_id: Option<String>,
     #[serde(default)]
     token: Option<String>,
+}
+
+#[derive(Clone, Copy)]
+struct EnvelopeDispatchContext<'a> {
+    envelope: &'a Envelope,
+    connection_id: &'a str,
+    client_id: &'a str,
+    shared: &'a WsShared,
+    remote_addr: SocketAddr,
+}
+
+impl<'a> EnvelopeDispatchContext<'a> {
+    /// See [`workspace_controls_available`].
+    fn workspace_controls_available(&self) -> bool {
+        workspace_controls_available(self.shared, self.remote_addr)
+    }
 }
 
 /// Check *sender_id* against the shared allow list.
@@ -377,6 +319,38 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
         })
 }
 
+/// Mirrors nanobot's `_workspace_controls_available` / `ws_http.workspace_controls_available`
+/// (`webui/ws_http.py:229`): workspace-scope escalation is allowed for the native app shell
+/// (never facing an untrusted network) or for a loopback client on the browser-served surface.
+fn workspace_controls_available(shared: &WsShared, remote_addr: SocketAddr) -> bool {
+    shared.runtime_surface == "native" || remote_addr.ip().is_loopback()
+}
+
+/// Send a control event (`error`, `attached`, ...) to one connection, or
+/// silently drop it if the connection is already gone. Mirrors nanobot's
+/// `_send_event` (`channels/websocket/runtime.py:377-392`); `fields` is
+/// merged into the payload alongside `"event"`, mirroring `**fields: Any`.
+async fn send_event(shared: &WsShared, connection_id: &str, event: &str, fields: serde_json::Value) {
+    let sender = shared.connections.lock().await.sender_for(connection_id);
+    let Some(sender) = sender else { return };
+
+    let mut payload = serde_json::Map::new();
+    payload.insert("event".to_string(), serde_json::Value::String(event.to_string()));
+    if let serde_json::Value::Object(map) = fields {
+        payload.extend(map);
+    }
+
+    if sender
+        .send(Message::text(serde_json::Value::Object(payload).to_string()))
+        .is_err()
+    {
+        log::warn!(
+            "WebSocket channel: connection '{connection_id}' closed while sending '{event}' event"
+        );
+        shared.connections.lock().await.cleanup_connection(connection_id);
+    }
+}
+
 /// Axum handler for the WebSocket upgrade route: authorize, then hand off to
 /// [`handle_socket`] for the connection's lifetime.
 ///
@@ -386,6 +360,7 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
 async fn ws_upgrade_handler(
     State(shared): State<WsShared>,
     Query(query): Query<WsUpgradeQuery>,
+    ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> Response {
     if let Err(status) = authorize(&shared, query.token.as_deref()) {
@@ -408,7 +383,7 @@ async fn ws_upgrade_handler(
         None => format!("anon-{}", &Uuid::new_v4().simple().to_string()[..12]),
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, shared, client_id))
+    ws.on_upgrade(move |socket| handle_socket(socket, shared, client_id, remote_addr))
 }
 
 /// Drive one connection for its lifetime: mint a fresh `chat_id` for it,
@@ -424,7 +399,12 @@ async fn ws_upgrade_handler(
 /// Ping/pong keep-alive is handled by axum/tokio-tungstenite automatically
 /// (server auto-replies to client pings); `ping_interval_s`/`ping_timeout_s`
 /// (server-initiated liveness probing) are not wired yet.
-async fn handle_socket(socket: WebSocket, shared: WsShared, client_id: String) {
+async fn handle_socket(
+    socket: WebSocket,
+    shared: WsShared,
+    client_id: String,
+    remote_addr: SocketAddr,
+) {
     let connection_id = Uuid::new_v4().to_string();
     let chat_id = Uuid::new_v4().to_string();
     let (mut sink, mut stream) = socket.split();
@@ -467,6 +447,14 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, client_id: String) {
             Message::Text(text) => {
                 let raw = text.as_str();
                 if let Some(envelope) = parse_envelope(raw) {
+                    let envelope_dispatch_context = EnvelopeDispatchContext {
+                        envelope: &envelope,
+                        connection_id: &connection_id,
+                        client_id: &client_id,
+                        shared: &shared,
+                        remote_addr,
+                    };
+                    dispatch_envelope(envelope_dispatch_context).await;
                     continue;
                 };
                 let Some(content) = parse_inbound_payload(raw) else {
@@ -499,6 +487,85 @@ async fn handle_socket(socket: WebSocket, shared: WsShared, client_id: String) {
     writer.abort();
 }
 
+async fn dispatch_envelope<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let type_str = envelope_dispatch_context.envelope
+        .get("type")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    match EnvelopeType::from(type_str) {
+        EnvelopeType::NewChat => { /* ... */ }
+        EnvelopeType::ForkChat => { /* ... */ }
+        EnvelopeType::Attach => { /* ... */ }
+        EnvelopeType::SetWorkspaceScope => { /* ... */ }
+        EnvelopeType::TranscribeAudio => { /* ... */ }
+        EnvelopeType::Message => {
+            handle_envelope_message(envelope_dispatch_context).await;
+        }
+        EnvelopeType::Unrecognized(t) => {
+            // reply with nanobot's `f"unknown type: {t!r}"` equivalent
+        }
+    }
+}
+
+async fn handle_envelope_message<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let envelope = envelope_dispatch_context.envelope;
+    let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
+    let shared = envelope_dispatch_context.shared;
+
+    let cid = envelope.get("chat_id").and_then(|v| v.as_str()).unwrap_or_default();
+    if !is_valid_chat_id(cid) {
+        send_event(
+            shared,
+            connection_id,
+            "error",
+            serde_json::json!({"detail": "invalid chat_id"}),
+        )
+        .await;
+        return;
+    }
+
+    let raw_turn_id = envelope.get("turn_id").and_then(|v| v.as_str());
+    let turn_id = raw_turn_id.filter(|t| !t.is_empty());
+
+    let mut rejection_fields = serde_json::Map::new();
+    rejection_fields.insert("chat_id".to_string(), serde_json::Value::String(cid.to_string()));
+    if let Some(turn_id) = turn_id {
+        rejection_fields.insert("turn_id".to_string(), serde_json::Value::String(turn_id.to_string()));
+    }
+
+    // The allowlist can change while an authenticated websocket stays open.
+    // Reject the exact application turn before hydration, transcript
+    // persistence, or an acceptance ACK — mirrors runtime.py:701-712.
+    if !sender_allowed(&shared.channels_config, client_id) {
+        let mut fields = rejection_fields.clone();
+        fields.insert("detail".to_string(), serde_json::Value::String("access_denied".to_string()));
+        send_event(shared, connection_id, "error", serde_json::Value::Object(fields)).await;
+        return;
+    }
+
+    let Some(content) = envelope.get("content").and_then(|v| v.as_str()) else {
+        let mut fields = rejection_fields.clone();
+        fields.insert("detail".to_string(), serde_json::Value::String("missing content".to_string()));
+        send_event(shared, connection_id, "error", serde_json::Value::Object(fields)).await;
+        return;
+    };
+
+    // Still missing before this can actually admit a turn (mirrors
+    // runtime.py:721-849) — see the review notes for what each piece needs:
+    // ingress text validation, media/attachment storage, the
+    // empty-content-and-no-media rejection, attach/hydrate-after-subscribe,
+    // WorkspaceRequestHandler::scope_for_message (+ error-to-send_event
+    // wrapping), transcript persistence, cli_apps/mcp_presets/quoted-context
+    // normalization, turn registration, the handle_message(...) call itself,
+    // and the final `message_accepted` ack.
+    let _ = content;
+}
+
 /// WebSocket server channel: rust-bot acts as a WebSocket server, serving
 /// connected clients over `axum`'s `ws` feature (a thin wrapper around
 /// `tokio-tungstenite`).
@@ -525,6 +592,8 @@ impl WebSocketChannel {
         config: WebSocketConfig,
         bus: Arc<MessageBus>,
         channels_config: ChannelsConfig,
+        session_manager: Arc<StdMutex<SessionManager>>,
+        workspace_request_handler: WorkspaceRequestHandler,
     ) -> Self {
         let jwt_public_key_pem = if config.jwt.enabled {
             if config.jwt.public_key_path.trim().is_empty() {
@@ -542,11 +611,7 @@ impl WebSocketChannel {
         };
 
         Self {
-            base: BaseChannelCommon {
-                bus,
-                running: AtomicBool::new(false),
-                transcription_api_key: String::new(),
-            },
+            base: BaseChannelCommon::new(bus, session_manager, workspace_request_handler),
             channels_config,
             config,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
@@ -564,6 +629,9 @@ impl WebSocketChannel {
             jwt_public_key_pem: self.jwt_public_key_pem.clone(),
             connections: Arc::clone(&self.connections),
             supports_streaming: BaseChannel::supports_streaming(self),
+            session_manager: Arc::clone(&self.base.session_manager),
+            workspace_request_handler: self.base.workspace_request_handler.clone(),
+            runtime_surface: self.config.runtime_surface.clone(),
         }
     }
 
@@ -627,9 +695,12 @@ impl BaseChannel for WebSocketChannel {
         let app = self.router();
         let shutdown_signal = Arc::clone(&self.shutdown);
         let shutdown = async move { shutdown_signal.notified().await };
-        if let Err(e) = axum::serve(listener, app)
-            .with_graceful_shutdown(shutdown)
-            .await
+        if let Err(e) = axum::serve(
+            listener,
+            app.into_make_service_with_connect_info::<SocketAddr>(),
+        )
+        .with_graceful_shutdown(shutdown)
+        .await
         {
             log::error!("WebSocket channel: server error: {e}");
         }
@@ -884,104 +955,48 @@ mod tests {
         assert!(!is_valid_chat_id("has;semicolon"));
     }
 
-    // --- ConnectionRegistry ---
+    // --- workspace_controls_available ---
 
-    fn dummy_sender() -> mpsc::UnboundedSender<Message> {
-        let (tx, _rx) = mpsc::unbounded_channel::<Message>();
-        tx
+    fn test_shared(runtime_surface: &str) -> WsShared {
+        let dir = tempfile::tempdir().unwrap();
+        WsShared {
+            name: "websocket",
+            bus: Arc::new(MessageBus::new()),
+            channels_config: ChannelsConfig::default(),
+            jwt: JwtConfig::default(),
+            jwt_public_key_pem: None,
+            connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
+            supports_streaming: false,
+            session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            workspace_request_handler: WorkspaceRequestHandler::new(
+                tempfile::tempdir().unwrap().keep(),
+                true,
+            ),
+            runtime_surface: runtime_surface.to_string(),
+        }
+    }
+
+    fn addr(ip: &str) -> SocketAddr {
+        SocketAddr::new(ip.parse().unwrap(), 12345)
     }
 
     #[test]
-    fn register_attaches_connection_to_its_default_chat() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-
-        let recipients = registry.senders_for_chat("chat-1");
-        assert_eq!(recipients.len(), 1);
-        assert_eq!(recipients[0].0, "conn-1");
+    fn workspace_controls_available_true_for_native_surface_regardless_of_address() {
+        let shared = test_shared("native");
+        assert!(workspace_controls_available(&shared, addr("203.0.113.5")));
+        assert!(workspace_controls_available(&shared, addr("127.0.0.1")));
     }
 
     #[test]
-    fn attach_allows_one_connection_to_subscribe_to_multiple_chats() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-        registry.attach("conn-1", "chat-2");
-
-        assert_eq!(registry.senders_for_chat("chat-1").len(), 1);
-        assert_eq!(registry.senders_for_chat("chat-2").len(), 1);
+    fn workspace_controls_available_true_for_loopback_on_browser_surface() {
+        let shared = test_shared("browser");
+        assert!(workspace_controls_available(&shared, addr("127.0.0.1")));
+        assert!(workspace_controls_available(&shared, addr("::1")));
     }
 
     #[test]
-    fn attach_allows_one_chat_to_have_multiple_connections() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-        registry.register("conn-2", "chat-2", dummy_sender());
-        registry.attach("conn-2", "chat-1");
-
-        let recipients = registry.senders_for_chat("chat-1");
-        let ids: std::collections::HashSet<_> = recipients.into_iter().map(|(id, _)| id).collect();
-        assert_eq!(
-            ids,
-            std::collections::HashSet::from(["conn-1".to_string(), "conn-2".to_string()])
-        );
-    }
-
-    #[test]
-    fn cleanup_connection_removes_it_from_every_subscribed_chat() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-        registry.attach("conn-1", "chat-2");
-
-        registry.cleanup_connection("conn-1");
-
-        assert!(registry.senders_for_chat("chat-1").is_empty());
-        assert!(registry.senders_for_chat("chat-2").is_empty());
-        assert!(!registry.subs.contains_key("chat-1"));
-        assert!(!registry.subs.contains_key("chat-2"));
-    }
-
-    #[test]
-    fn cleanup_connection_is_idempotent() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-
-        registry.cleanup_connection("conn-1");
-        registry.cleanup_connection("conn-1");
-
-        assert!(registry.senders_for_chat("chat-1").is_empty());
-    }
-
-    #[test]
-    fn cleanup_connection_does_not_affect_other_connections_sharing_a_chat() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-        registry.register("conn-2", "chat-2", dummy_sender());
-        registry.attach("conn-2", "chat-1");
-
-        registry.cleanup_connection("conn-1");
-
-        let recipients = registry.senders_for_chat("chat-1");
-        assert_eq!(recipients.len(), 1);
-        assert_eq!(recipients[0].0, "conn-2");
-    }
-
-    #[test]
-    fn senders_for_chat_returns_empty_for_unknown_chat_id() {
-        let registry = ConnectionRegistry::default();
-        assert!(registry.senders_for_chat("no-such-chat").is_empty());
-    }
-
-    #[test]
-    fn clear_removes_all_state() {
-        let mut registry = ConnectionRegistry::default();
-        registry.register("conn-1", "chat-1", dummy_sender());
-
-        registry.clear();
-
-        assert!(registry.senders_for_chat("chat-1").is_empty());
-        assert!(registry.subs.is_empty());
-        assert!(registry.conn_chats.is_empty());
-        assert!(registry.conn_default.is_empty());
-        assert!(registry.senders.is_empty());
+    fn workspace_controls_available_false_for_non_loopback_on_browser_surface() {
+        let shared = test_shared("browser");
+        assert!(!workspace_controls_available(&shared, addr("203.0.113.5")));
     }
 }

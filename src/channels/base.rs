@@ -3,6 +3,7 @@ use std::{
     sync::{
         Arc,
         atomic::AtomicBool,
+        Mutex as StdMutex,
     },
 };
 
@@ -15,6 +16,8 @@ use crate::{
         OPENAI_DEFAULT_API_URL, OPENAI_DEFAULT_MODEL, OpenAITranscriptionProvider, PathLike,
         TranscriptionProvider,
     },
+    security::workspace_requests::WorkspaceRequestHandler,
+    session::manager::SessionManager,
 };
 
 pub async fn handle_message(
@@ -292,4 +295,22 @@ pub struct BaseChannelCommon {
     pub bus: Arc<MessageBus>,
     pub running: AtomicBool,
     pub transcription_api_key: String,
+    pub session_manager: Arc<StdMutex<SessionManager>>,
+    pub workspace_request_handler: WorkspaceRequestHandler,
+}
+
+impl BaseChannelCommon {
+    pub fn new(
+        bus: Arc<MessageBus>,
+        session_manager: Arc<StdMutex<SessionManager>>,
+        workspace_request_handler: WorkspaceRequestHandler,
+    ) -> Self {
+        Self {
+            bus,
+            running: AtomicBool::new(false),
+            transcription_api_key: String::new(),
+            session_manager,
+            workspace_request_handler,
+        }
+    }
 }

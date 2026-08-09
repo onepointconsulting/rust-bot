@@ -26,6 +26,7 @@ use crate::cron::CronPayloadKind;
 use crate::cron::compute_next_run;
 use crate::cron::service::now_ms;
 use crate::heartbeat::service::HeartbeatService;
+use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::manager::SessionManager;
 use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
 use crate::utils::evaluator::evaluate_response;
@@ -402,6 +403,14 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
 
     let channel_name = args.channel.trim().to_ascii_lowercase();
     let bus = Arc::new(MessageBus::new());
+    // Login never touches sessions or workspace scope — it only calls
+    // `channel.login(force)` — so these throwaway values exist solely to
+    // satisfy the (now-uniform) channel constructor signature.
+    let session_manager = Arc::new(StdMutex::new(SessionManager::new(config.workspace_path())));
+    let workspace_request_handler = WorkspaceRequestHandler::new(
+        config.workspace_path(),
+        config.tools.restrict_to_workspace,
+    );
     let channel: Arc<dyn BaseChannel> = match channel_name.as_str() {
         "whatsapp" => {
             let whatsapp_cfg = config
@@ -415,6 +424,8 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
                 whatsapp_cfg,
                 Arc::clone(&bus),
                 config.channels.clone(),
+                session_manager,
+                workspace_request_handler,
             ))
         }
         other => {
@@ -638,6 +649,8 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let channels = Arc::new(ChannelManager::new(
         Arc::clone(&config),
         Arc::clone(&agent_loop.bus()),
+        Arc::clone(&session_manager),
+        agent_loop.workspace_request_handler(),
     ));
 
     /// Pick a routable channel/chat target for heartbeat-triggered messages.

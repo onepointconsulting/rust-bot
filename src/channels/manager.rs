@@ -1,6 +1,6 @@
 use std::{
     collections::{HashMap, VecDeque},
-    sync::Arc,
+    sync::{Arc, Mutex as StdMutex},
     time::Duration,
 };
 
@@ -14,6 +14,8 @@ use crate::{
     bus::{events::OutboundMessage, queue::MessageBus},
     channels::{base::BaseChannel, registry::discover_all},
     config::schema::Config,
+    security::workspace_requests::WorkspaceRequestHandler,
+    session::manager::SessionManager,
     utils::{
         exit_codes::{self, CHANNEL_ALLOW_FROM_EMPTY},
         restart::{consume_restart_notice_from_env, format_restart_completed_message},
@@ -38,6 +40,8 @@ pub struct ChannelManager {
     config: Arc<Config>,
     bus: Arc<MessageBus>,
     channels: HashMap<String, SharedChannel>,
+    session_manager: Arc<StdMutex<SessionManager>>,
+    workspace_request_handler: WorkspaceRequestHandler,
     /// Python: `self._dispatch_task = asyncio.create_task(...)`
     ///
     /// Wrapped in a `tokio::sync::Mutex` (rather than stored by value) so
@@ -51,8 +55,18 @@ pub struct ChannelManager {
 
 impl ChannelManager {
     /// Discover enabled built-in channels and attach them to the shared bus.
-    pub fn new(config: Arc<Config>, bus: Arc<MessageBus>) -> Self {
-        let channels = Self::init_channels(config.as_ref(), Arc::clone(&bus));
+    pub fn new(
+        config: Arc<Config>,
+        bus: Arc<MessageBus>,
+        session_manager: Arc<StdMutex<SessionManager>>,
+        workspace_request_handler: WorkspaceRequestHandler,
+    ) -> Self {
+        let channels = Self::init_channels(
+            config.as_ref(),
+            Arc::clone(&bus),
+            Arc::clone(&session_manager),
+            workspace_request_handler.clone(),
+        );
         if let Err(name) = Self::validate_allow_from(&channels) {
             log::error!("Channel {name} has no allow list configured");
             log::error!("Set [\"*\"] to allow everyone, or add specific user IDs.");
@@ -62,6 +76,8 @@ impl ChannelManager {
             config,
             bus,
             channels,
+            session_manager,
+            workspace_request_handler,
             dispatch_task: Mutex::new(None),
         }
     }
@@ -78,13 +94,23 @@ impl ChannelManager {
         }
     }
 
-    fn init_channels(config: &Config, bus: Arc<MessageBus>) -> HashMap<String, SharedChannel> {
+    fn init_channels(
+        config: &Config,
+        bus: Arc<MessageBus>,
+        session_manager: Arc<StdMutex<SessionManager>>,
+        workspace_request_handler: WorkspaceRequestHandler,
+    ) -> HashMap<String, SharedChannel> {
         let transcription_key = Self::resolve_transcription_key(
             config,
             config.channels.transcription_provider.as_deref(),
         );
         let mut channels = HashMap::new();
-        for (name, mut channel) in discover_all(config, Arc::clone(&bus)) {
+        for (name, mut channel) in discover_all(
+            config,
+            Arc::clone(&bus),
+            Arc::clone(&session_manager),
+            workspace_request_handler.clone(),
+        ) {
             channel.set_transcription_api_key(transcription_key.clone());
             // Box → Arc after last `&mut` setup (transcription key).
             channels.insert(name.to_string(), Arc::from(channel));
@@ -431,6 +457,15 @@ mod tests {
         config
     }
 
+    fn test_session_manager() -> Arc<StdMutex<SessionManager>> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(StdMutex::new(SessionManager::new(dir.keep())))
+    }
+
+    fn test_workspace_request_handler() -> WorkspaceRequestHandler {
+        WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true)
+    }
+
     #[test]
     fn resolve_transcription_key_groq_and_openai() {
         let config = config_with_email(false);
@@ -463,7 +498,9 @@ mod tests {
     fn init_channels_skips_disabled_email() {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
-        let channels = ChannelManager::init_channels(&config, bus);
+        let channels = ChannelManager::init_channels(
+            &config, bus, test_session_manager(), test_workspace_request_handler(),
+        );
         assert!(channels.is_empty());
     }
 
@@ -471,7 +508,9 @@ mod tests {
     fn init_channels_registers_enabled_email_with_transcription_key() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let channels = ChannelManager::init_channels(&config, Arc::clone(&bus));
+        let channels = ChannelManager::init_channels(
+            &config, Arc::clone(&bus), test_session_manager(), test_workspace_request_handler(),
+        );
         assert!(channels.contains_key("email"));
         assert_eq!(
             channels.get("email").unwrap().transcription_api_key(),
@@ -483,7 +522,9 @@ mod tests {
     fn new_attaches_shared_bus() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(Arc::new(config), Arc::clone(&bus));
+        let manager = ChannelManager::new(
+            Arc::new(config), Arc::clone(&bus), test_session_manager(), test_workspace_request_handler(),
+        );
         // Same Arc allocation (pointer equality).
         assert!(Arc::ptr_eq(&manager.bus, &bus));
         assert_eq!(
@@ -496,7 +537,9 @@ mod tests {
     fn validate_allow_from_ok_with_default_star() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let channels = ChannelManager::init_channels(&config, bus);
+        let channels = ChannelManager::init_channels(
+            &config, bus, test_session_manager(), test_workspace_request_handler(),
+        );
         assert!(ChannelManager::validate_allow_from(&channels).is_ok());
     }
 
@@ -505,7 +548,9 @@ mod tests {
         let mut config = config_with_email(true);
         config.channels.allow_from.clear();
         let bus = Arc::new(MessageBus::new());
-        let channels = ChannelManager::init_channels(&config, bus);
+        let channels = ChannelManager::init_channels(
+            &config, bus, test_session_manager(), test_workspace_request_handler(),
+        );
         assert_eq!(
             ChannelManager::validate_allow_from(&channels),
             Err("email".to_string())
@@ -522,7 +567,9 @@ mod tests {
     async fn start_channel_missing_is_noop() {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(Arc::new(config), bus);
+        let manager = ChannelManager::new(
+            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+        );
         manager.start_channel("does-not-exist").await;
         assert!(manager.channels.is_empty());
     }
@@ -531,7 +578,9 @@ mod tests {
     fn new_with_disabled_channels_succeeds() {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(Arc::new(config), bus);
+        let manager = ChannelManager::new(
+            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+        );
         assert!(manager.channels.is_empty());
         assert_eq!(
             manager.config.channels.transcription_provider,
@@ -544,7 +593,9 @@ mod tests {
         let mut config = config_with_email(true);
         config.channels.transcription_provider = Some("openai".to_string());
         let bus = Arc::new(MessageBus::new());
-        let channels = ChannelManager::init_channels(&config, bus);
+        let channels = ChannelManager::init_channels(
+            &config, bus, test_session_manager(), test_workspace_request_handler(),
+        );
         assert_eq!(
             channels.get("email").unwrap().transcription_api_key(),
             "test-openai-key"
@@ -788,7 +839,9 @@ mod tests {
     fn get_status_reports_all_channels() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(Arc::new(config), bus);
+        let manager = ChannelManager::new(
+            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+        );
         let status = manager.get_status();
         assert_eq!(
             status.get("email"),
@@ -800,7 +853,9 @@ mod tests {
     fn get_channel_returns_registered_channel() {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = ChannelManager::new(Arc::new(config), bus);
+        let manager = ChannelManager::new(
+            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+        );
         assert!(manager.get_channel("email").is_some());
         assert!(manager.get_channel("missing").is_none());
     }
@@ -816,7 +871,9 @@ mod tests {
         // instead of trying real network I/O.
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
-        let manager = Arc::new(ChannelManager::new(Arc::new(config), bus));
+        let manager = Arc::new(ChannelManager::new(
+            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+        ));
 
         let manager_for_start = Arc::clone(&manager);
         let start_handle = tokio::spawn(async move {

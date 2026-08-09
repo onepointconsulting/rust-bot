@@ -50,6 +50,7 @@ use crate::security::workspace_access::{
     validate_workspace_scope_payload, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
     WorkspaceScopeResolver, WORKSPACE_SCOPE_METADATA_KEY,
 };
+use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
@@ -577,6 +578,13 @@ impl AgentLoop {
     /// mutating anything — used by `/workspace` with no arguments.
     pub fn workspace_scope_for_session(&self, session: Option<&Session>) -> WorkspaceScope {
         self.workspace_scopes.for_session(session.map(|s| &s.metadata))
+    }
+
+    /// Builds a fresh `WorkspaceRequestHandler` for this loop's default workspace/restriction —
+    /// cheap (two fields, no shared state), so callers just call this once at the point they
+    /// need one rather than storing a long-lived reference back into `AgentLoop`.
+    pub fn workspace_request_handler(&self) -> WorkspaceRequestHandler {
+        WorkspaceRequestHandler::new(self.workspace.clone(), self.restrict_to_workspace)
     }
 
     /// Validate and persist one session's workspace-scope override.

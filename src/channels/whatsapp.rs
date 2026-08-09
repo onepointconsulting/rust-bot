@@ -16,7 +16,7 @@ use std::{
     str::FromStr,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, Ordering},
+        atomic::Ordering,
     },
     time::Duration,
 };
@@ -25,6 +25,8 @@ use crate::{
     bus::{events::OutboundMessage, queue::MessageBus},
     channels::base::{BaseChannel, BaseChannelCommon},
     config::schema::ChannelsConfig,
+    security::workspace_requests::WorkspaceRequestHandler,
+    session::manager::SessionManager,
     utils::helpers::expand_tilde_path,
 };
 
@@ -145,13 +147,11 @@ impl WhatsAppChannel {
         config: WhatsAppConfig,
         bus: Arc<MessageBus>,
         channels_config: ChannelsConfig,
+        session_manager: Arc<Mutex<SessionManager>>,
+        workspace_request_handler: WorkspaceRequestHandler,
     ) -> Self {
         Self {
-            base: BaseChannelCommon {
-                bus,
-                running: AtomicBool::new(false),
-                transcription_api_key: String::new(),
-            },
+            base: BaseChannelCommon::new(bus, session_manager, workspace_request_handler),
             channels_config,
             config,
             bot_handle: Mutex::new(None),

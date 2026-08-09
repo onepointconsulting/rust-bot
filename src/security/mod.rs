@@ -2,7 +2,12 @@ pub mod network;
 pub mod jwt;
 pub mod workspace_access;
 pub mod workspace_requests;
+pub mod ingress_policy;
 
+pub use ingress_policy::{
+    AttachmentIngressLimits, MessageIngressLimits, WebUIIngressPolicy,
+    DEFAULT_WEBUI_INGRESS_POLICY, MESSAGE_TOO_LARGE,
+};
 pub use jwt::{
     generate_jwt_keypair, generate_jwt_token, validate_jwt_token, validate_jwt_token_from_path,
     Claims, GeneratedKeypair, GeneratedToken, JwtError, JwtValidationOpts,
