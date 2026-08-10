@@ -13,16 +13,28 @@
 //! `is_valid_chat_id`/`WorkspaceRequestHandler` before their callers existed.
 
 use std::collections::HashMap;
-use std::time::Instant;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use uuid::Uuid;
+
+/// Wall-clock seconds since the Unix epoch — matches nanobot's `time.time()`
+/// exactly. Deliberately not `std::time::Instant`: `started_at` is sent
+/// as-is to the browser (`send_goal_status`'s `started_at` field) so it can
+/// render "running since ..."; `Instant` is monotonic-only and has no epoch,
+/// so it can't produce a value like that.
+fn now_wall_clock_secs() -> f64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
 
 /// One owner's record of an in-flight WebSocket turn for a chat. Mirrors
 /// nanobot's `_WebsocketTurn` (`session/webui_turns.py:64-68`).
 #[derive(Clone)]
 struct OwnedTurn {
     owner: String,
-    started_at: Instant,
+    started_at: f64,
     turn_id: Option<String>,
     transcript_persistence_failed: bool,
 }
@@ -32,7 +44,7 @@ struct OwnedTurn {
 /// relies on via `next(reversed(turns))`. A `Vec`, not a map: per-chat owner
 /// counts are always tiny (usually 1, rarely 2-3), so no ordered-map
 /// dependency is warranted.
-#[derive(Default)]
+#[derive(Default, Clone)]
 struct ChatTurns(Vec<OwnedTurn>);
 
 impl ChatTurns {
@@ -64,7 +76,7 @@ impl ChatTurns {
 /// convention (e.g. `channels::websocket::registry::ConnectionRegistry`)
 /// rather than nanobot's module-level dicts. Entirely in-process,
 /// non-persistent state, dropped on restart, exactly like the Python source.
-#[derive(Default)]
+#[derive(Default, Clone)]
 pub struct WebsocketTurnRegistry {
     turns: HashMap<String, ChatTurns>,
 }
@@ -78,7 +90,7 @@ impl WebsocketTurnRegistry {
     pub fn start_turn(&mut self, chat_id: &str, owner: &str, turn_id: Option<&str>) {
         self.turns.entry(chat_id.to_string()).or_default().upsert_latest(OwnedTurn {
             owner: owner.to_string(),
-            started_at: Instant::now(),
+            started_at: now_wall_clock_secs(),
             turn_id: turn_id.map(str::to_string),
             transcript_persistence_failed: false,
         });
@@ -107,7 +119,7 @@ impl WebsocketTurnRegistry {
     /// `.is_some()` for a `chat_running` boolean — exactly nanobot's own
     /// `websocket_turn_wall_started_at(cid) is not None` idiom, so no
     /// separate boolean wrapper is added here.
-    pub fn websocket_turn_wall_started_at(&self, chat_id: &str) -> Option<Instant> {
+    pub fn websocket_turn_wall_started_at(&self, chat_id: &str) -> Option<f64> {
         self.turns.get(chat_id).and_then(ChatTurns::latest).map(|t| t.started_at)
     }
 

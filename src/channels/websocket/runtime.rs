@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, atomic::Ordering};
 
@@ -13,9 +14,7 @@ use axum::{
     routing::get,
 };
 use futures::{SinkExt, StreamExt};
-use garde::{Path, Report, Validate};
 use regex::Regex;
-use serde::{Deserialize, Deserializer, Serialize};
 use tokio::{
     net::TcpListener,
     sync::{Mutex as AsyncMutex, Notify, mpsc},
@@ -24,8 +23,12 @@ use uuid::Uuid;
 
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
-use crate::channels::types::{Envelope, EnvelopeType};
 use crate::channels::websocket::registry::ConnectionRegistry;
+use crate::channels::websocket::types::{
+    ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
+    WsOutboundEvent, WsShared, WsUpgradeQuery,
+};
+use crate::session::goal_state::goal_state_ws_blob;
 use crate::{
     bus::{
         events::OutboundMessage,
@@ -37,117 +40,12 @@ use crate::{
     },
     channels::base::{BaseChannel, BaseChannelCommon},
     config::paths::get_media_dir,
-    config::schema::{ChannelsConfig, JwtConfig},
+    config::schema::ChannelsConfig,
     security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
     session::manager::SessionManager,
 };
-
-/// Strip a trailing `/`, keeping root `"/"` unchanged.
-fn strip_trailing_slash(path: &str) -> String {
-    if path.len() > 1 && path.ends_with('/') {
-        path.trim_end_matches('/').to_string()
-    } else if path.is_empty() {
-        "/".to_string()
-    } else {
-        path.to_string()
-    }
-}
-
-/// Normalize a WebSocket config path for consistent routing.
-fn normalize_config_path(path: &str) -> String {
-    strip_trailing_slash(path)
-}
-
-/// Serde equivalent of a Pydantic `@field_validator("path")`:
-/// require a leading `/`, then normalize trailing slashes.
-fn deserialize_path<'de, D>(deserializer: D) -> Result<String, D::Error>
-where
-    D: Deserializer<'de>,
-{
-    let value = String::deserialize(deserializer)?;
-    if !value.starts_with('/') {
-        return Err(serde::de::Error::custom(r#"path must start with "/""#));
-    }
-    Ok(normalize_config_path(&value))
-}
-
-/// When JWT is enabled, `jwt.aud` must equal the normalized WebSocket `path`.
-/// Empty `aud` is left to [`JwtConfig`]'s own validator.
-fn validate_jwt_aud_matches_path(cfg: &WebSocketConfig) -> garde::Result {
-    if !cfg.jwt.enabled || cfg.jwt.aud.trim().is_empty() {
-        return Ok(());
-    }
-    // `path` is already normalized by `deserialize_path`.
-    if normalize_config_path(&cfg.jwt.aud) != cfg.path {
-        return Err(garde::Error::new(format!(
-            "jwt.aud ({}) must match path ({})",
-            cfg.jwt.aud, cfg.path
-        )));
-    }
-    Ok(())
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-#[serde(rename_all = "camelCase", default)]
-pub struct WebSocketConfig {
-    pub enabled: bool,
-    pub host: String,
-    pub port: u16,
-    #[serde(deserialize_with = "deserialize_path")]
-    pub path: String,
-    pub jwt: JwtConfig,
-    pub allow_from: Vec<String>,
-    pub streaming: bool,
-    pub max_message_bytes: usize,
-    pub ping_interval_s: u64,
-    pub ping_timeout_s: u64,
-    pub ssl_certfile: String,
-    pub ssl_keyfile: String,
-    /// `"native"` (the app shell, never facing an untrusted network) or `"browser"` (served
-    /// over the network, so workspace-scope escalation additionally requires a loopback
-    /// client). Mirrors nanobot's `webui_runtime_surface` (`cli/gateway_runtime.py:211`).
-    pub runtime_surface: String,
-}
-
-impl Default for WebSocketConfig {
-    fn default() -> Self {
-        Self {
-            enabled: true,
-            host: "127.0.0.1".to_string(),
-            port: 8765,
-            path: "/".to_string(),
-            jwt: JwtConfig::default(),
-            allow_from: vec![],
-            streaming: false,
-            max_message_bytes: 1024 * 1024 * 32,
-            ping_interval_s: 30,
-            ping_timeout_s: 30,
-            ssl_certfile: "".to_string(),
-            ssl_keyfile: "".to_string(),
-            runtime_surface: "browser".to_string(),
-        }
-    }
-}
-
-impl Validate for WebSocketConfig {
-    type Context = ();
-
-    fn validate_into(
-        &self,
-        ctx: &Self::Context,
-        parent: &mut dyn FnMut() -> Path,
-        report: &mut Report,
-    ) {
-        self.jwt
-            .validate_into(ctx, &mut || parent().join("jwt"), report);
-
-        if let Err(err) = validate_jwt_aud_matches_path(self) {
-            report.append(parent().join("jwt").join("aud"), err);
-        }
-    }
-}
 
 /// Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel).
 pub fn publish_runtime_model_update(bus: Arc<MessageBus>, model: &str, model_preset: Option<&str>) {
@@ -235,50 +133,6 @@ fn is_valid_chat_id(value: &str) -> bool {
     CHAT_ID_RE.is_match(value)
 }
 
-/// Shared handle to the many-to-many chat_id/connection registry.
-type ConnectionRegistryHandle = Arc<AsyncMutex<ConnectionRegistry>>;
-
-/// State handed to axum's per-connection handlers.
-///
-/// Kept separate from [`WebSocketChannel`] (rather than reaching for `Arc<Self>`)
-/// because axum's `State<S>` extractor requires an owned, `'static` `S: Clone`,
-/// while [`BaseChannel::start`] only hands us `&self`. Every field here is
-/// itself cheap to clone (an `Arc`, or plain config data), so cloning `WsShared`
-/// once per connection is fine.
-#[derive(Clone)]
-struct WsShared {
-    name: &'static str,
-    bus: Arc<MessageBus>,
-    channels_config: ChannelsConfig,
-    jwt: JwtConfig,
-    jwt_public_key_pem: Option<Arc<Vec<u8>>>,
-    connections: ConnectionRegistryHandle,
-    supports_streaming: bool,
-    gateway_services: Arc<GatewayServices>,
-    _session_manager: Arc<StdMutex<SessionManager>>,
-    _workspace_request_handler: WorkspaceRequestHandler,
-    runtime_surface: String,
-}
-
-/// Query params accepted on the WebSocket upgrade request, mirroring nanobot's
-/// `ws://{host}:{port}{path}?client_id=...&token=...`.
-#[derive(Debug, Deserialize)]
-struct WsUpgradeQuery {
-    #[serde(default)]
-    client_id: Option<String>,
-    #[serde(default)]
-    token: Option<String>,
-}
-
-#[derive(Clone, Copy)]
-struct EnvelopeDispatchContext<'a> {
-    envelope: &'a Envelope,
-    connection_id: &'a str,
-    client_id: &'a str,
-    shared: &'a WsShared,
-    remote_addr: SocketAddr,
-}
-
 impl<'a> EnvelopeDispatchContext<'a> {
     /// See [`workspace_controls_available`].
     ///
@@ -346,7 +200,7 @@ fn workspace_controls_available(shared: &WsShared, remote_addr: SocketAddr) -> b
 async fn send_event(
     shared: &WsShared,
     connection_id: &str,
-    event: &str,
+    event: WsOutboundEvent,
     base_fields: Option<&serde_json::Map<String, serde_json::Value>>,
     fields: serde_json::Value,
 ) {
@@ -354,7 +208,7 @@ async fn send_event(
     let Some(sender) = sender else { return };
 
     let mut payload = serde_json::Map::new();
-    payload.insert("event".to_string(), serde_json::Value::String(event.to_string()));
+    payload.insert("event".to_string(), serde_json::Value::String(event.as_str().to_string()));
     if let Some(base) = base_fields {
         payload.extend(base.clone());
     }
@@ -367,7 +221,8 @@ async fn send_event(
         .is_err()
     {
         log::warn!(
-            "WebSocket channel: connection '{connection_id}' closed while sending '{event}' event"
+            "WebSocket channel: connection '{connection_id}' closed while sending '{}' event",
+            event.as_str()
         );
         shared.connections.lock().await.cleanup_connection(connection_id);
     }
@@ -436,7 +291,7 @@ async fn handle_socket(
     // the client learning its own chat_id (mirrors nanobot's ordering
     // comment at runtime.py:578).
     let ready = serde_json::json!({
-        "event": "ready",
+        "event": WsOutboundEvent::Ready.as_str(),
         "chat_id": chat_id,
         "client_id": client_id,
     });
@@ -544,7 +399,7 @@ async fn handle_envelope_message<'a>(
         send_event(
             shared,
             connection_id,
-            "error",
+            WsOutboundEvent::Error,
             None,
             serde_json::json!({"detail": "invalid chat_id"}),
         )
@@ -568,7 +423,7 @@ async fn handle_envelope_message<'a>(
         send_event(
             shared,
             connection_id,
-            "error",
+            WsOutboundEvent::Error,
             Some(&rejection_fields),
             serde_json::json!({"detail": "access_denied"}),
         )
@@ -580,7 +435,7 @@ async fn handle_envelope_message<'a>(
         send_event(
             shared,
             connection_id,
-            "error",
+            WsOutboundEvent::Error,
             Some(&rejection_fields),
             serde_json::json!({"detail": "missing content"}),
         )
@@ -592,7 +447,7 @@ async fn handle_envelope_message<'a>(
         send_event(
             shared,
             connection_id,
-            "error",
+            WsOutboundEvent::Error,
             Some(&rejection_fields),
             serde_json::json!({
                 "detail": "message_rejected",
@@ -609,7 +464,7 @@ async fn handle_envelope_message<'a>(
             send_event(
                 shared,
                 connection_id,
-                "error",
+                WsOutboundEvent::Error,
                 Some(&rejection_fields),
                 serde_json::json!({"detail": "attachment_rejected", "reason": "malformed"}),
             )
@@ -623,7 +478,7 @@ async fn handle_envelope_message<'a>(
                 send_event(
                     shared,
                     connection_id,
-                    "error",
+                    WsOutboundEvent::Error,
                     Some(&rejection_fields),
                     serde_json::json!({"detail": "attachment_rejected", "reason": reason.as_str()}),
                 )
@@ -638,7 +493,7 @@ async fn handle_envelope_message<'a>(
         send_event(
             shared,
             connection_id,
-            "error",
+            WsOutboundEvent::Error,
             Some(&rejection_fields),
             serde_json::json!({"detail": "missing content"}),
         )
@@ -649,7 +504,7 @@ async fn handle_envelope_message<'a>(
     // Auto-attach on first use so clients can one-shot without a separate
     // `attach` envelope — mirrors runtime.py:765.
     shared.connections.lock().await.attach(connection_id, cid);
-
+    hydrate_after_subscribe(cid, shared).await;
     // Still missing before this can actually admit a turn (mirrors
     // runtime.py:766-849) — hydrate-after-subscribe (replaying recent
     // history to this connection; no transcript/history-replay module
@@ -659,6 +514,122 @@ async fn handle_envelope_message<'a>(
     // the handle_message(...) call itself, and the final `message_accepted`
     // ack.
     let _ = media_paths;
+}
+
+/// Replay persisted or actively running per-chat state after subscribe.
+/// Mirrors nanobot's `_hydrate_after_subscribe`
+/// (`channels/websocket/runtime.py:372-375`).
+async fn hydrate_after_subscribe(chat_id: &str, ws_shared: &WsShared) {
+    maybe_push_active_goal_state(chat_id, ws_shared).await;
+    maybe_push_turn_run_wall_clock(chat_id, ws_shared).await;
+}
+
+async fn maybe_push_active_goal_state(chat_id: &str, ws_shared: &WsShared) {
+    // Scoped so the (synchronous) lock is dropped before `send_goal_state`'s
+    // `.await` below — holding a `std::sync::MutexGuard` across an await
+    // point risks blocking the executor thread for as long as the send takes.
+    let row_option = {
+        let session_manager = ws_shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.read_session_file(format!("websocket:{chat_id}").as_str())
+    };
+    let row_data = if let Some(row) = row_option {
+        row.metadata
+    } else {
+        HashMap::new()
+    };
+    let blob = goal_state_ws_blob(&row_data);
+    let active = blob.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+    if !active {
+        return;
+    }
+    send_goal_state(chat_id, blob, ws_shared).await;
+}
+
+/// Push a persisted goal-state snapshot to every connection subscribed to
+/// `chat_id` (multi-chat isolation). Mirrors nanobot's `send_goal_state`
+/// (`channels/websocket/runtime.py:1270-1278`); fan-out + cleanup-on-failure
+/// follows the same pattern as [`WebSocketChannel::send`] below.
+async fn send_goal_state(chat_id: &str, blob: serde_json::Value, ws_shared: &WsShared) {
+    let recipients = ws_shared.connections.lock().await.senders_for_chat(chat_id);
+    if recipients.is_empty() {
+        return;
+    }
+    let body = serde_json::json!({
+        "event": WsOutboundEvent::GoalState.as_str(),
+        "chat_id": chat_id,
+        "goal_state": blob,
+    });
+    let raw = body.to_string();
+    for (connection_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            log::warn!(
+                "WebSocket channel: connection '{connection_id}' gone while sending goal_state, cleaning up"
+            );
+            ws_shared.connections.lock().await.cleanup_connection(&connection_id);
+        }
+    }
+}
+
+/// Replay ``goal_status: running`` when a turn is still active (same-process refresh).
+/// Replay `goal_status: running` when a turn is still active (same-process
+/// refresh). Mirrors nanobot's `_maybe_push_turn_run_wall_clock`
+/// (`channels/websocket/runtime.py:360-370`).
+async fn maybe_push_turn_run_wall_clock(chat_id: &str, ws_shared: &WsShared) {
+    // Scoped so the lock is dropped before `send_goal_status`'s `.await`
+    // below — same reasoning as `maybe_push_active_goal_state`.
+    let (t0, turn_id) = {
+        let turn_registry = ws_shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let Some(t0) = turn_registry.websocket_turn_wall_started_at(chat_id) else {
+            return;
+        };
+        (t0, turn_registry.websocket_turn_id(chat_id))
+    };
+    send_goal_status(chat_id, "running", Some(t0), turn_id, ws_shared).await;
+}
+
+/// Notify subscribed clients that a turn started or finished (wall-clock
+/// hint). Mirrors nanobot's `send_goal_status`
+/// (`channels/websocket/runtime.py:1280-1303`).
+async fn send_goal_status(
+    chat_id: &str,
+    status: &str,
+    started_at: Option<f64>,
+    turn_id: Option<String>,
+    ws_shared: &WsShared,
+) {
+    let recipients = ws_shared.connections.lock().await.senders_for_chat(chat_id);
+    if recipients.is_empty() {
+        return;
+    }
+    let mut body = serde_json::json!({
+        "event": WsOutboundEvent::GoalStatus.as_str(),
+        "chat_id": chat_id,
+        "status": status,
+    });
+    if status == "running"
+        && let Some(started_at) = started_at
+    {
+        body["started_at"] = serde_json::json!(started_at);
+    }
+    if let Some(turn_id) = turn_id.filter(|t| !t.is_empty()) {
+        body["turn_id"] = serde_json::json!(turn_id);
+    }
+    let raw = body.to_string();
+    for (connection_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            log::warn!(
+                "WebSocket channel: connection '{connection_id}' gone while sending goal_status, cleaning up"
+            );
+            ws_shared.connections.lock().await.cleanup_connection(&connection_id);
+        }
+    }
 }
 
 /// WebSocket server channel: rust-bot acts as a WebSocket server, serving
@@ -728,7 +699,7 @@ impl WebSocketChannel {
             jwt_public_key_pem: self.jwt_public_key_pem.clone(),
             connections: Arc::clone(&self.connections),
             supports_streaming: BaseChannel::supports_streaming(self),
-            _session_manager: Arc::clone(&self.base.session_manager),
+            session_manager: Arc::clone(&self.base.session_manager),
             _workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
             gateway_services: Arc::clone(&self.gateway_services),
@@ -866,74 +837,7 @@ impl BaseChannel for WebSocketChannel {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn normalize_config_path_strips_trailing_slash() {
-        assert_eq!(normalize_config_path("/ws/"), "/ws");
-        assert_eq!(normalize_config_path("/"), "/");
-    }
-
-    #[test]
-    fn path_must_start_with_slash() {
-        let err = serde_json::from_str::<WebSocketConfig>(r#"{"path":"bad"}"#)
-            .expect_err("path without leading slash should fail");
-        assert!(
-            err.to_string().contains(r#"path must start with "/""#),
-            "unexpected error: {err}"
-        );
-    }
-
-    #[test]
-    fn path_is_normalized_on_deserialize() {
-        let cfg: WebSocketConfig =
-            serde_json::from_str(r#"{"path":"/ws/"}"#).expect("valid path should deserialize");
-        assert_eq!(cfg.path, "/ws");
-    }
-
-    #[test]
-    fn jwt_aud_must_match_path_when_enabled() {
-        let mut cfg = WebSocketConfig {
-            path: "/ws".to_string(),
-            ..WebSocketConfig::default()
-        };
-        cfg.jwt.enabled = true;
-        cfg.jwt.aud = "/other".to_string();
-
-        let report = cfg.validate();
-        assert!(report.is_err(), "mismatched aud should fail validation");
-        let err = report.unwrap_err().to_string();
-        assert!(err.contains("must match path"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn jwt_aud_matching_path_ok_when_enabled() {
-        let mut cfg = WebSocketConfig {
-            path: "/ws".to_string(),
-            ..WebSocketConfig::default()
-        };
-        cfg.jwt.enabled = true;
-        cfg.jwt.aud = "/ws/".to_string(); // trailing slash normalized in compare
-
-        assert!(cfg.validate().is_ok());
-    }
-
-    #[test]
-    fn jwt_enabled_requires_non_empty_aud() {
-        let mut cfg = WebSocketConfig {
-            path: "/ws".to_string(),
-            ..WebSocketConfig::default()
-        };
-        cfg.jwt.enabled = true;
-        cfg.jwt.aud = String::new();
-
-        let report = cfg.validate();
-        assert!(report.is_err(), "empty aud with jwt.enabled should fail");
-        let err = report.unwrap_err().to_string();
-        assert!(
-            err.contains("aud must be non-empty when JWT is enabled"),
-            "unexpected error: {err}"
-        );
-    }
+    use crate::config::schema::JwtConfig;
 
     // --- parse_inbound_payload ---
 
@@ -1067,7 +971,7 @@ mod tests {
             jwt_public_key_pem: None,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
-            _session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
             _workspace_request_handler: WorkspaceRequestHandler::new(
                 tempfile::tempdir().unwrap().keep(),
                 true,
@@ -1099,5 +1003,165 @@ mod tests {
     fn workspace_controls_available_false_for_non_loopback_on_browser_surface() {
         let shared = test_shared("browser");
         assert!(!workspace_controls_available(&shared, addr("203.0.113.5")));
+    }
+
+    // --- send_goal_state / maybe_push_active_goal_state ---
+
+    #[tokio::test]
+    async fn send_goal_state_delivers_to_subscribed_connections() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        send_goal_state("chat-1", serde_json::json!({"active": true, "objective": "ship it"}), &shared).await;
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let text = msg.into_text().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&text).unwrap();
+        assert_eq!(body["event"], "goal_state");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["goal_state"]["objective"], "ship it");
+    }
+
+    #[tokio::test]
+    async fn send_goal_state_noop_when_no_subscribers() {
+        let shared = test_shared("browser");
+        // Must not panic even though nothing is subscribed to "chat-1".
+        send_goal_state("chat-1", serde_json::json!({"active": true}), &shared).await;
+    }
+
+    #[tokio::test]
+    async fn send_goal_state_cleans_up_a_connection_that_is_gone() {
+        let shared = test_shared("browser");
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        drop(rx); // simulate the connection's writer task having already exited
+
+        send_goal_state("chat-1", serde_json::json!({"active": true}), &shared).await;
+
+        assert!(shared.connections.lock().await.sender_for("conn-1").is_none());
+    }
+
+    #[tokio::test]
+    async fn maybe_push_active_goal_state_noop_when_no_session_file_exists() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        maybe_push_active_goal_state("chat-1", &shared).await;
+
+        assert!(rx.try_recv().is_err(), "expected no frame to be pushed");
+    }
+
+    #[tokio::test]
+    async fn maybe_push_active_goal_state_pushes_when_a_goal_is_active() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared.session_manager.lock().unwrap();
+            crate::session::goal_state::create_session_goal(
+                &mut session_manager,
+                "websocket:chat-1",
+                "ship the feature",
+                None,
+            )
+            .unwrap();
+        }
+
+        maybe_push_active_goal_state("chat-1", &shared).await;
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "goal_state");
+        assert_eq!(body["goal_state"]["objective"], "ship the feature");
+    }
+
+    // --- send_goal_status / maybe_push_turn_run_wall_clock ---
+
+    #[tokio::test]
+    async fn send_goal_status_includes_started_at_only_when_running() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        send_goal_status("chat-1", "running", Some(123.5), None, &shared).await;
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "goal_status");
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["started_at"], 123.5);
+        assert!(body.get("turn_id").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_goal_status_omits_started_at_when_not_running() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        send_goal_status("chat-1", "idle", Some(123.5), None, &shared).await;
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["status"], "idle");
+        assert!(body.get("started_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_goal_status_includes_turn_id_when_present_and_non_empty() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        send_goal_status("chat-1", "running", Some(1.0), Some("turn-1".to_string()), &shared).await;
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["turn_id"], "turn-1");
+
+        send_goal_status("chat-1", "running", Some(1.0), Some(String::new()), &shared).await;
+        let msg = rx.try_recv().expect("expected a second delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert!(body.get("turn_id").is_none(), "empty turn_id should be omitted");
+    }
+
+    #[tokio::test]
+    async fn send_goal_status_noop_when_no_subscribers() {
+        let shared = test_shared("browser");
+        send_goal_status("chat-1", "running", Some(1.0), None, &shared).await;
+    }
+
+    #[tokio::test]
+    async fn maybe_push_turn_run_wall_clock_noop_when_chat_not_running() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        maybe_push_turn_run_wall_clock("chat-1", &shared).await;
+
+        assert!(rx.try_recv().is_err(), "expected no frame to be pushed");
+    }
+
+    #[tokio::test]
+    async fn maybe_push_turn_run_wall_clock_pushes_running_status_when_active() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap()
+            .start_turn("chat-1", "owner-1", Some("turn-1"));
+
+        maybe_push_turn_run_wall_clock("chat-1", &shared).await;
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "goal_status");
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["turn_id"], "turn-1");
+        assert!(body["started_at"].is_number());
     }
 }
