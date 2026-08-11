@@ -1,6 +1,27 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub enum CommandLifecycle {
+    SideChannel,
+    FinalizeActiveTurn,
+    StopActiveTurn,
+    AgentTurn,
+    AgentTurnWithArgs,
+}
+
+impl std::fmt::Display for CommandLifecycle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            CommandLifecycle::SideChannel => write!(f, "side_channel"),
+            CommandLifecycle::FinalizeActiveTurn => write!(f, "finalize_active_turn"),
+            CommandLifecycle::StopActiveTurn => write!(f, "stop_active_turn"),
+            CommandLifecycle::AgentTurn => write!(f, "agent_turn"),
+            CommandLifecycle::AgentTurnWithArgs => write!(f, "agent_turn_with_args"),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
 pub enum ChatCommand {
@@ -82,6 +103,30 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::ListSessions => write!(f, "/list-sessions"),
             ChatCommand::ExamplePrompts => write!(f, "/example-prompts"),
             ChatCommand::ModelPresets => write!(f, "/model-presets"),
+        }
+    }
+}
+
+impl ChatCommand {
+    pub const fn lifecycle(self) -> Option<CommandLifecycle> {
+        match self {
+            ChatCommand::New => Some(CommandLifecycle::FinalizeActiveTurn),
+            ChatCommand::Stop => Some(CommandLifecycle::StopActiveTurn),
+            ChatCommand::Goal => Some(CommandLifecycle::AgentTurnWithArgs),
+            _ => None,
+        }
+    }
+
+    pub const fn accepts_args(self) -> bool {
+        match self {
+            ChatCommand::Model
+            | ChatCommand::ModelPreset
+            | ChatCommand::DreamLog
+            | ChatCommand::DreamRestore
+            | ChatCommand::McpPreset
+            | ChatCommand::Workspace
+            | ChatCommand::Goal => true,
+            _ => false,
         }
     }
 }

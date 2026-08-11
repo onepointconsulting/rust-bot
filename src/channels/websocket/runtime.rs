@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet};
+use std::str::FromStr;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -30,7 +31,10 @@ use crate::channels::websocket::types::{
     ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
     WsOutboundEvent, WsShared, WsUpgradeQuery,
 };
+use crate::channels::websocket::webui::metadata::WEBSOCKET_TURN_OWNER_METADATA_KEY;
 use crate::channels::websocket::webui::transcript::client_turn_metadata;
+use crate::command::normalize_command_text;
+use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::{
@@ -586,7 +590,9 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
         "remote".to_string(),
         serde_json::json!(envelope_dispatch_context.remote_addr.to_string()),
     );
-    if envelope.get("webui").is_some() {
+    // Mirror Python's `envelope.get("webui") is True` — only a JSON boolean
+    // true counts; presence of other values must not set the webui flag.
+    if envelope.get("webui").and_then(|v| v.as_bool()) == Some(true) {
         metadata.insert(
             "webui".to_string(),
             serde_json::json!(true),
@@ -609,6 +615,31 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
         );
     }
     metadata.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
+    {
+        // Recover from a poisoned mutex rather than panicking the WS handler —
+        // same pattern as the scope resolver above.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        shared
+            ._workspace_request_handler
+            .persist_scope(&mut session_manager, cid, &scope);
+    }
+
+    let is_webui = metadata.get("webui").and_then(|v| v.as_bool()) == Some(true);
+    let mut queued_owner_metadata: Option<String> = None;
+    if is_webui && builtin_command_starts_agent_turn(content) {
+        let mut turn_registry = shared.gateway_services.turn_registry.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(queued_owner) = turn_registry.register_queued_turn_if_idle(cid, turn_id) {
+            metadata.insert(WEBSOCKET_TURN_OWNER_METADATA_KEY.to_string(), serde_json::json!(queued_owner));
+            queued_owner_metadata = Some(queued_owner);
+        }
+    }
+    let accepted = false;
+    if is_webui {
+        
+    }
 }
 
 /// Mirrors nanobot's `_CLI_APP_NAME_RE` (`webui/cli_apps_api.py:15`).
@@ -1052,6 +1083,25 @@ impl BaseChannel for WebSocketChannel {
     }
 }
 
+/// Return whether WebUI ingress should expect a normal agent lifecycle.
+fn builtin_command_starts_agent_turn(text: &str) -> bool {
+    let normalized = normalize_command_text(text);
+    let (command, separator, args) = match normalized.split_once(' ') {
+        Some((before, after)) => (before, " ", after),
+        None => (normalized.as_str(), "", ""),
+    };
+    let command_name = command.strip_prefix('/').unwrap_or(command).to_lowercase();
+    let spec = ChatCommand::from_str(&command_name).ok();
+    if spec.is_none() || (!separator.is_empty() && !spec.unwrap().accepts_args()) {
+        return true;
+    }
+    match spec.unwrap().lifecycle() {
+        Some(CommandLifecycle::AgentTurn) => true,
+        Some(CommandLifecycle::AgentTurnWithArgs) => !args.trim().is_empty(),
+        _ => false,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1117,6 +1167,53 @@ mod tests {
     #[test]
     fn parse_inbound_payload_blank_recognized_field_is_none() {
         assert_eq!(parse_inbound_payload(r#"{"content": "   "}"#), None);
+    }
+
+    // --- builtin_command_starts_agent_turn ---
+
+    #[test]
+    fn builtin_command_starts_agent_turn_unknown_command_is_true() {
+        assert!(builtin_command_starts_agent_turn("/nope"));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_plain_text_is_true() {
+        assert!(builtin_command_starts_agent_turn("hello there"));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_matches_regardless_of_case() {
+        // Mirrors nanobot's `command.lower()` comparison
+        // (`nanobot/command/builtin.py:192`).
+        assert!(!builtin_command_starts_agent_turn("/STOP"));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_args_on_no_args_command_is_true() {
+        // `/stop` doesn't accept args, so trailing args make it fall back to
+        // the default agent-turn lifecycle.
+        assert!(builtin_command_starts_agent_turn("/stop now"));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_side_channel_command_is_false() {
+        assert!(!builtin_command_starts_agent_turn("/stop"));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_with_args_and_no_args_is_false() {
+        // `/goal` alone (no goal text) is side-channel usage.
+        assert!(!builtin_command_starts_agent_turn("/goal"));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_with_args_and_blank_args_is_false() {
+        assert!(!builtin_command_starts_agent_turn("/goal    "));
+    }
+
+    #[test]
+    fn builtin_command_starts_agent_turn_with_args_and_args_is_true() {
+        assert!(builtin_command_starts_agent_turn("/goal ship the feature"));
     }
 
     // --- normalize_cli_app_mentions ---

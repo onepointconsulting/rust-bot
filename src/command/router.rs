@@ -1,11 +1,48 @@
 use std::collections::HashMap;
-use std::sync::{Arc, MutexGuard};
+use std::sync::{Arc, LazyLock, MutexGuard};
 
 use async_trait::async_trait;
+use regex::Regex;
 
 use crate::agent::agent_loop::AgentLoop;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::session::manager::{Session, SessionManager};
+
+/// Telegram / Discord bot mention suffix on the command token (`/cmd@BotName`).
+static BOT_SUFFIX_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"^[A-Za-z0-9_]+$").expect("valid BOT_SUFFIX_RE"));
+
+/// Normalize slash-command transport variants before routing.
+///
+/// Telegram and Discord-style command dispatch can produce `/cmd@bot args`.
+/// The bot suffix belongs to the transport, not the command name, so strip it
+/// once at the router boundary while preserving user arguments verbatim.
+pub fn normalize_command_text(text: &str) -> String {
+    let stripped = text.trim();
+    if !stripped.starts_with('/') {
+        return stripped.to_string();
+    }
+    let (first, sep, rest) = match stripped.split_once(' ') {
+        Some((first, rest)) => (first, " ", rest),
+        None => (stripped, "", ""),
+    };
+    if !first.contains('@') {
+        return stripped.to_string();
+    }
+    let Some((command, suffix)) = first.rsplit_once('@') else {
+        return stripped.to_string();
+    };
+    if !command.is_empty() && !suffix.is_empty() && BOT_SUFFIX_RE.is_match(suffix) {
+        if sep.is_empty() {
+            command.to_string()
+        } else {
+            format!("{command}{sep}{rest}")
+        }
+    } else {
+        stripped.to_string()
+    }
+}
+
 #[async_trait]
 pub trait CommandHandler: Send + Sync {
     async fn handle(&self, ctx: &CommandContext) -> OutboundMessage;
@@ -169,6 +206,62 @@ impl Default for CommandRouter {
 mod tests {
     use super::*;
     use chrono::Utc;
+
+    #[test]
+    fn normalize_strips_whitespace() {
+        assert_eq!(normalize_command_text("  /help  "), "/help");
+        assert_eq!(normalize_command_text("  hello  "), "hello");
+    }
+
+    #[test]
+    fn normalize_leaves_non_slash_text() {
+        assert_eq!(normalize_command_text("help"), "help");
+        assert_eq!(normalize_command_text("help@bot"), "help@bot");
+    }
+
+    #[test]
+    fn normalize_leaves_commands_without_bot_suffix() {
+        assert_eq!(normalize_command_text("/help"), "/help");
+        assert_eq!(normalize_command_text("/model claude-fast"), "/model claude-fast");
+    }
+
+    #[test]
+    fn normalize_strips_telegram_style_bot_suffix() {
+        assert_eq!(normalize_command_text("/help@MyBot"), "/help");
+        assert_eq!(normalize_command_text("/stop@nanobot_bot"), "/stop");
+        assert_eq!(
+            normalize_command_text("/dream@MyBot log"),
+            "/dream log"
+        );
+    }
+
+    #[test]
+    fn normalize_preserves_arguments_verbatim() {
+        assert_eq!(
+            normalize_command_text("/model@Bot Claude Fast"),
+            "/model Claude Fast"
+        );
+        // partition only on the first space — leading spaces in the rest stay
+        assert_eq!(
+            normalize_command_text("/cmd@Bot  spaced"),
+            "/cmd  spaced"
+        );
+    }
+
+    #[test]
+    fn normalize_rejects_invalid_bot_suffixes() {
+        // hyphen is not in [A-Za-z0-9_]
+        assert_eq!(normalize_command_text("/help@my-bot"), "/help@my-bot");
+        // empty suffix
+        assert_eq!(normalize_command_text("/help@"), "/help@");
+        // command before @ is `/` (truthy) so the suffix still strips
+        assert_eq!(normalize_command_text("/@bot"), "/");
+    }
+
+    #[test]
+    fn normalize_uses_rightmost_at_for_suffix() {
+        assert_eq!(normalize_command_text("/cmd@foo@Bot"), "/cmd@foo");
+    }
 
     fn sample_msg() -> InboundMessage {
         InboundMessage {
