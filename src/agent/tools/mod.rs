@@ -4,7 +4,6 @@ pub mod registry;
 pub mod shell;
 pub mod sandbox;
 pub mod mcp;
-pub mod mcp_file_ref;
 pub mod search;
 pub mod web;
 pub mod spawn;

@@ -26,7 +26,7 @@ use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::FsToolConfig;
 use crate::agent::tools::goal::UpdateGoalTool;
 use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_with_file_refs};
-use crate::agent::tools::mcp_file_ref::FileRefResolver;
+use crate::agent::tools::mcp::mcp_file_ref::FileRefResolver;
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;

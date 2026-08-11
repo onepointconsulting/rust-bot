@@ -1285,6 +1285,10 @@ impl Default for McpServerConfig {
 
 // ── ToolsConfig ───────────────────────────────────────────────────────────────
 
+fn default_mcp_presets_path() -> String {
+    "~/.rust-bot/mcp_presets.json".to_string()
+}
+
 /// Tools configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
@@ -1308,6 +1312,11 @@ pub struct ToolsConfig {
     #[serde(alias = "mcp_servers")]
     #[garde(dive)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    /// The file path to the MCP presets configuration. Default: `~/.rust-bot/mcp_presets.json`.
+    #[serde(alias = "mcp_presets_path", default = "default_mcp_presets_path")]
+    #[garde(skip)]
+    pub mcp_presets_path: String,
 
     /// CIDR ranges exempt from SSRF blocking (e.g. `["100.64.0.0/10"]` for Tailscale).
     #[serde(alias = "ssrf_whitelist")]
@@ -1343,6 +1352,7 @@ impl Default for ToolsConfig {
             docx: DocxToolConfig::default(),
             ocr: OcrToolConfig::default(),
             image_generation: ImageGenerationToolConfig::default(),
+            mcp_presets_path: default_mcp_presets_path(),
         }
     }
 }

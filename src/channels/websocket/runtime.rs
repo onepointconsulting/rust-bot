@@ -1,5 +1,7 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::future::Future;
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, atomic::Ordering};
 
 use async_trait::async_trait;
@@ -28,6 +30,8 @@ use crate::channels::websocket::types::{
     ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
     WsOutboundEvent, WsShared, WsUpgradeQuery,
 };
+use crate::channels::websocket::webui::transcript::client_turn_metadata;
+use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::{
     bus::{
@@ -185,7 +189,6 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
 /// Mirrors nanobot's `_workspace_controls_available` / `ws_http.workspace_controls_available`
 /// (`webui/ws_http.py:229`): workspace-scope escalation is allowed for the native app shell
 /// (never facing an untrusted network) or for a loopback client on the browser-served surface.
-#[allow(dead_code)]
 fn workspace_controls_available(shared: &WsShared, remote_addr: SocketAddr) -> bool {
     shared.runtime_surface == "native" || remote_addr.ip().is_loopback()
 }
@@ -208,7 +211,10 @@ async fn send_event(
     let Some(sender) = sender else { return };
 
     let mut payload = serde_json::Map::new();
-    payload.insert("event".to_string(), serde_json::Value::String(event.as_str().to_string()));
+    payload.insert(
+        "event".to_string(),
+        serde_json::Value::String(event.as_str().to_string()),
+    );
     if let Some(base) = base_fields {
         payload.extend(base.clone());
     }
@@ -217,14 +223,20 @@ async fn send_event(
     }
 
     if sender
-        .send(Message::text(serde_json::Value::Object(payload).to_string()))
+        .send(Message::text(
+            serde_json::Value::Object(payload).to_string(),
+        ))
         .is_err()
     {
         log::warn!(
             "WebSocket channel: connection '{connection_id}' closed while sending '{}' event",
             event.as_str()
         );
-        shared.connections.lock().await.cleanup_connection(connection_id);
+        shared
+            .connections
+            .lock()
+            .await
+            .cleanup_connection(connection_id);
     }
 }
 
@@ -364,10 +376,9 @@ async fn handle_socket(
     writer.abort();
 }
 
-async fn dispatch_envelope<'a>(
-    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
-) {
-    let type_str = envelope_dispatch_context.envelope
+async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let type_str = envelope_dispatch_context
+        .envelope
         .get("type")
         .and_then(|v| v.as_str())
         .unwrap_or_default();
@@ -386,15 +397,16 @@ async fn dispatch_envelope<'a>(
     }
 }
 
-async fn handle_envelope_message<'a>(
-    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
-) {
+async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let envelope = envelope_dispatch_context.envelope;
     let connection_id = envelope_dispatch_context.connection_id;
     let client_id = envelope_dispatch_context.client_id;
     let shared = envelope_dispatch_context.shared;
 
-    let cid = envelope.get("chat_id").and_then(|v| v.as_str()).unwrap_or_default();
+    let cid = envelope
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
     if !is_valid_chat_id(cid) {
         send_event(
             shared,
@@ -411,9 +423,15 @@ async fn handle_envelope_message<'a>(
     let turn_id = raw_turn_id.filter(|t| !t.is_empty());
 
     let mut rejection_fields = serde_json::Map::new();
-    rejection_fields.insert("chat_id".to_string(), serde_json::Value::String(cid.to_string()));
+    rejection_fields.insert(
+        "chat_id".to_string(),
+        serde_json::Value::String(cid.to_string()),
+    );
     if let Some(turn_id) = turn_id {
-        rejection_fields.insert("turn_id".to_string(), serde_json::Value::String(turn_id.to_string()));
+        rejection_fields.insert(
+            "turn_id".to_string(),
+            serde_json::Value::String(turn_id.to_string()),
+        );
     }
 
     // The allowlist can change while an authenticated websocket stays open.
@@ -472,7 +490,11 @@ async fn handle_envelope_message<'a>(
             return;
         };
         let media_dir = get_media_dir(Some("websocket"));
-        match store_inbound_attachments(media_array, &media_dir, shared.gateway_services.ingress.attachments) {
+        match store_inbound_attachments(
+            media_array,
+            &media_dir,
+            shared.gateway_services.ingress.attachments,
+        ) {
             Ok(paths) => media_paths = paths,
             Err(reason) => {
                 send_event(
@@ -505,15 +527,200 @@ async fn handle_envelope_message<'a>(
     // `attach` envelope — mirrors runtime.py:765.
     shared.connections.lock().await.attach(connection_id, cid);
     hydrate_after_subscribe(cid, shared).await;
-    // Still missing before this can actually admit a turn (mirrors
-    // runtime.py:766-849) — hydrate-after-subscribe (replaying recent
-    // history to this connection; no transcript/history-replay module
-    // exists yet), WorkspaceRequestHandler::scope_for_message (+
-    // error-to-send_event wrapping), transcript persistence,
-    // cli_apps/mcp_presets/quoted-context normalization, turn registration,
-    // the handle_message(...) call itself, and the final `message_accepted`
-    // ack.
-    let _ = media_paths;
+
+    // Resolve after hydration so a concurrent downgrade cannot be overwritten.
+    let resolver = {
+        let cid = cid.to_string();
+        let ws_shared = shared.clone();
+        let envelope = envelope.clone();
+        // Capture a bool — not `EnvelopeDispatchContext` — so the `Arc<dyn Fn… + 'static>`
+        // closure doesn't inherit the handler's short lifetime.
+        let controls_available = envelope_dispatch_context.workspace_controls_available();
+        Arc::new(move || {
+            // Run the sync work (and drop `MutexGuard`s) *before* boxing the future:
+            // `std::sync::MutexGuard` is `!Send` and can't live inside a `Send` future.
+            let result = {
+                let mut session_manager = ws_shared
+                    .session_manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let turn_registry = ws_shared
+                    .gateway_services
+                    .turn_registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                ws_shared._workspace_request_handler.scope_for_message(
+                    &mut session_manager,
+                    &envelope,
+                    &cid,
+                    turn_registry.websocket_turn_wall_started_at(&cid).is_some(),
+                    controls_available,
+                )
+            };
+            Box::pin(async move { result })
+                as Pin<Box<dyn Future<Output = Result<WorkspaceScope, WorkspaceScopeError>> + Send>>
+        })
+    };
+    let Some(scope) = workspace_scope_or_error(shared, cid, turn_id, connection_id, resolver).await
+    else {
+        return;
+    };
+
+    // Hydration and scope resolution can yield. Re-check immediately
+    // before transcript/bus mutation so a mid-flight revocation cannot
+    // fall through BaseChannel's silent deny and still receive an ACK.
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let mut metadata: HashMap<String, serde_json::Value> = HashMap::new();
+    metadata.insert(
+        "remote".to_string(),
+        serde_json::json!(envelope_dispatch_context.remote_addr.to_string()),
+    );
+    if envelope.get("webui").is_some() {
+        metadata.insert(
+            "webui".to_string(),
+            serde_json::json!(true),
+        );
+        metadata.extend(client_turn_metadata(envelope.get("turn_id")));
+    }
+    let cli_apps_raw = envelope.get("cli_apps");
+    let cli_apps = normalize_cli_app_mentions(cli_apps_raw);
+    if !cli_apps.is_empty() {
+        metadata.insert(
+            "cli_apps".to_string(),
+            serde_json::json!(cli_apps),
+        );
+    }
+    let mcp_presets = crate::agent::tools::mcp::mcp_presets_api::normalize_mcp_preset_mentions(envelope.get("mcp_presets"));
+    if !mcp_presets.is_empty() {
+        metadata.insert(
+            "mcp_presets".to_string(),
+            serde_json::json!(mcp_presets),
+        );
+    }
+    metadata.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
+}
+
+/// Mirrors nanobot's `_CLI_APP_NAME_RE` (`webui/cli_apps_api.py:15`).
+static CLI_APP_NAME_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"(?i)^[a-z0-9][a-z0-9_-]{0,63}$").unwrap());
+
+/// Attribute keys (besides `name`, handled separately) copied from a
+/// client-supplied CLI app mention, each with its own clip length. Mirrors
+/// nanobot's `_CLI_APP_ATTACHMENT_KEYS[1:]` (`webui/cli_apps_api.py:16-23`)
+/// paired with the `512 if field == "logo_url" else 160` clip rule
+/// (`webui/cli_apps_api.py:77-80`).
+const CLI_APP_ATTACHMENT_FIELDS: &[(&str, usize)] = &[
+    ("display_name", 160),
+    ("category", 160),
+    ("entry_point", 160),
+    ("logo_url", 512),
+    ("brand_color", 160),
+];
+
+/// Trim a string value and clip it to `limit` *characters*; `None` for
+/// non-string, missing, empty, or whitespace-only input. Mirrors nanobot's
+/// `_clip_ws_string` (`webui/cli_apps_api.py:48-54`).
+fn clip_ws_string(value: Option<&serde_json::Value>, limit: usize) -> Option<String> {
+    let text = value?.as_str()?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    Some(text.chars().take(limit).collect())
+}
+
+/// Sanitize structured CLI app mentions sent by the WebUI. Mirrors nanobot's
+/// `normalize_cli_app_mentions` (`webui/cli_apps_api.py:57-84`).
+fn normalize_cli_app_mentions(raw: Option<&serde_json::Value>) -> Vec<HashMap<String, String>> {
+    let Some(serde_json::Value::Array(items)) = raw else {
+        return vec![];
+    };
+
+    let mut out = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for item in items.iter().take(8) {
+        let Some(app_data) = item.as_object() else {
+            continue;
+        };
+        let Some(name) = clip_ws_string(app_data.get("name"), 64) else {
+            continue;
+        };
+        if !CLI_APP_NAME_RE.is_match(&name) {
+            continue;
+        }
+        let key = name.to_lowercase();
+        if !seen.insert(key.clone()) {
+            continue;
+        }
+        let mut row = HashMap::new();
+        row.insert("name".to_string(), key);
+        for (field, limit) in CLI_APP_ATTACHMENT_FIELDS {
+            if let Some(value) = clip_ws_string(app_data.get(*field), *limit) {
+                row.insert(field.to_string(), value);
+            }
+        }
+        out.push(row);
+    }
+    out
+}
+
+/// A [`WorkspaceScope`] resolver deferred behind a closure so callers can
+/// build it from state (a session lock, an envelope) captured at construction
+/// time, while `workspace_scope_or_error` stays agnostic to what kind of
+/// scope decision it's resolving.
+type ScopeResolver = Arc<
+    dyn Fn() -> Pin<Box<dyn Future<Output = Result<WorkspaceScope, WorkspaceScopeError>> + Send>>
+        + Send
+        + Sync,
+>;
+
+/// Resolve a workspace scope, or send the client a `workspace_scope_rejected`
+/// error and return `None`. Mirrors nanobot's `_workspace_scope_or_error`
+/// (`channels/websocket/runtime.py:852-871`).
+async fn workspace_scope_or_error(
+    shared: &WsShared,
+    cid: &str,
+    turn_id: Option<&str>,
+    connection_id: &str,
+    resolver: ScopeResolver,
+) -> Option<WorkspaceScope> {
+    let err = match resolver().await {
+        Ok(scope) => return Some(scope),
+        Err(err) => err,
+    };
+    let mut base_fields = serde_json::Map::new();
+    base_fields.insert(
+        "chat_id".to_string(),
+        serde_json::Value::String(cid.to_string()),
+    );
+    if let Some(turn_id) = turn_id {
+        base_fields.insert(
+            "turn_id".to_string(),
+            serde_json::Value::String(turn_id.to_string()),
+        );
+    }
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Error,
+        Some(&base_fields),
+        serde_json::json!({
+            "detail": "workspace_scope_rejected",
+            "reason": err.message,
+        }),
+    )
+    .await;
+    None
 }
 
 /// Replay persisted or actively running per-chat state after subscribe.
@@ -541,7 +748,10 @@ async fn maybe_push_active_goal_state(chat_id: &str, ws_shared: &WsShared) {
         HashMap::new()
     };
     let blob = goal_state_ws_blob(&row_data);
-    let active = blob.get("active").and_then(|v| v.as_bool()).unwrap_or(false);
+    let active = blob
+        .get("active")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
     if !active {
         return;
     }
@@ -568,7 +778,11 @@ async fn send_goal_state(chat_id: &str, blob: serde_json::Value, ws_shared: &WsS
             log::warn!(
                 "WebSocket channel: connection '{connection_id}' gone while sending goal_state, cleaning up"
             );
-            ws_shared.connections.lock().await.cleanup_connection(&connection_id);
+            ws_shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&connection_id);
         }
     }
 }
@@ -627,7 +841,11 @@ async fn send_goal_status(
             log::warn!(
                 "WebSocket channel: connection '{connection_id}' gone while sending goal_status, cleaning up"
             );
-            ws_shared.connections.lock().await.cleanup_connection(&connection_id);
+            ws_shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&connection_id);
         }
     }
 }
@@ -901,6 +1119,76 @@ mod tests {
         assert_eq!(parse_inbound_payload(r#"{"content": "   "}"#), None);
     }
 
+    // --- normalize_cli_app_mentions ---
+
+    #[test]
+    fn normalize_cli_app_mentions_returns_empty_for_non_list_input() {
+        assert_eq!(normalize_cli_app_mentions(None), vec![]);
+        let not_a_list = serde_json::json!({"name": "codex"});
+        assert_eq!(normalize_cli_app_mentions(Some(&not_a_list)), vec![]);
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_skips_non_object_items() {
+        let raw = serde_json::json!(["not-an-object", 42, ["nested"]]);
+        assert_eq!(normalize_cli_app_mentions(Some(&raw)), vec![]);
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_rejects_missing_or_malformed_names() {
+        let raw = serde_json::json!([
+            {"display_name": "No Name"},
+            {"name": ""},
+            {"name": "   "},
+            {"name": "-leading-hyphen"},
+            {"name": "has space"},
+        ]);
+        assert_eq!(normalize_cli_app_mentions(Some(&raw)), vec![]);
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_keeps_a_valid_entry_with_lowercased_name() {
+        let raw = serde_json::json!([{"name": "Codex", "category": "  agent  "}]);
+        let out = normalize_cli_app_mentions(Some(&raw));
+        assert_eq!(out.len(), 1);
+        assert_eq!(out[0].get("name"), Some(&"codex".to_string()));
+        assert_eq!(out[0].get("category"), Some(&"agent".to_string()));
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_dedupes_case_insensitively() {
+        let raw = serde_json::json!([{"name": "Codex"}, {"name": "codex"}, {"name": "CODEX"}]);
+        assert_eq!(normalize_cli_app_mentions(Some(&raw)).len(), 1);
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_caps_at_eight_entries() {
+        let items: Vec<serde_json::Value> =
+            (0..12).map(|i| serde_json::json!({"name": format!("app{i}")})).collect();
+        let raw = serde_json::Value::Array(items);
+        assert_eq!(normalize_cli_app_mentions(Some(&raw)).len(), 8);
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_ignores_non_string_attribute_values() {
+        let raw = serde_json::json!([{"name": "codex", "brand_color": 12345}]);
+        let out = normalize_cli_app_mentions(Some(&raw));
+        assert_eq!(out.len(), 1);
+        assert!(!out[0].contains_key("brand_color"));
+    }
+
+    #[test]
+    fn normalize_cli_app_mentions_clips_attribute_lengths_per_field() {
+        let raw = serde_json::json!([{
+            "name": "codex",
+            "category": "y".repeat(200),
+            "logo_url": "z".repeat(600),
+        }]);
+        let out = normalize_cli_app_mentions(Some(&raw));
+        assert_eq!(out[0].get("category").unwrap().len(), 160);
+        assert_eq!(out[0].get("logo_url").unwrap().len(), 512);
+    }
+
     // --- sender_allowed ---
 
     #[test]
@@ -1011,9 +1299,18 @@ mod tests {
     async fn send_goal_state_delivers_to_subscribed_connections() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
-        send_goal_state("chat-1", serde_json::json!({"active": true, "objective": "ship it"}), &shared).await;
+        send_goal_state(
+            "chat-1",
+            serde_json::json!({"active": true, "objective": "ship it"}),
+            &shared,
+        )
+        .await;
 
         let msg = rx.try_recv().expect("expected a delivered frame");
         let text = msg.into_text().unwrap();
@@ -1034,19 +1331,83 @@ mod tests {
     async fn send_goal_state_cleans_up_a_connection_that_is_gone() {
         let shared = test_shared("browser");
         let (tx, rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         drop(rx); // simulate the connection's writer task having already exited
 
         send_goal_state("chat-1", serde_json::json!({"active": true}), &shared).await;
 
-        assert!(shared.connections.lock().await.sender_for("conn-1").is_none());
+        assert!(
+            shared
+                .connections
+                .lock()
+                .await
+                .sender_for("conn-1")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_scope_or_error_returns_scope_on_success() {
+        let shared = test_shared("browser");
+        let dir = tempfile::tempdir().unwrap();
+        let scope = crate::security::build_workspace_scope(
+            dir.path(),
+            crate::security::WorkspaceAccessMode::Full,
+            None,
+        );
+        let resolver: ScopeResolver = {
+            let scope = scope.clone();
+            Arc::new(move || {
+                let scope = scope.clone();
+                Box::pin(async move { Ok(scope) })
+            })
+        };
+
+        let resolved =
+            workspace_scope_or_error(&shared, "chat-1", Some("turn-1"), "conn-1", resolver).await;
+
+        assert_eq!(resolved, Some(scope));
+    }
+
+    #[tokio::test]
+    async fn workspace_scope_or_error_sends_rejection_detail_and_reason_on_failure() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let resolver: ScopeResolver = Arc::new(|| {
+            Box::pin(async { Err(WorkspaceScopeError::new(403, "workspace escalation denied")) })
+        });
+
+        let resolved =
+            workspace_scope_or_error(&shared, "chat-1", Some("turn-1"), "conn-1", resolver).await;
+
+        assert!(resolved.is_none());
+        let msg = rx.try_recv().expect("expected a rejection frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["turn_id"], "turn-1");
+        assert_eq!(body["detail"], "workspace_scope_rejected");
+        assert_eq!(body["reason"], "workspace escalation denied");
     }
 
     #[tokio::test]
     async fn maybe_push_active_goal_state_noop_when_no_session_file_exists() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         maybe_push_active_goal_state("chat-1", &shared).await;
 
@@ -1057,7 +1418,11 @@ mod tests {
     async fn maybe_push_active_goal_state_pushes_when_a_goal_is_active() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         {
             let mut session_manager = shared.session_manager.lock().unwrap();
             crate::session::goal_state::create_session_goal(
@@ -1083,7 +1448,11 @@ mod tests {
     async fn send_goal_status_includes_started_at_only_when_running() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         send_goal_status("chat-1", "running", Some(123.5), None, &shared).await;
 
@@ -1099,7 +1468,11 @@ mod tests {
     async fn send_goal_status_omits_started_at_when_not_running() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         send_goal_status("chat-1", "idle", Some(123.5), None, &shared).await;
 
@@ -1113,9 +1486,20 @@ mod tests {
     async fn send_goal_status_includes_turn_id_when_present_and_non_empty() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
-        send_goal_status("chat-1", "running", Some(1.0), Some("turn-1".to_string()), &shared).await;
+        send_goal_status(
+            "chat-1",
+            "running",
+            Some(1.0),
+            Some("turn-1".to_string()),
+            &shared,
+        )
+        .await;
         let msg = rx.try_recv().expect("expected a delivered frame");
         let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
         assert_eq!(body["turn_id"], "turn-1");
@@ -1123,7 +1507,10 @@ mod tests {
         send_goal_status("chat-1", "running", Some(1.0), Some(String::new()), &shared).await;
         let msg = rx.try_recv().expect("expected a second delivered frame");
         let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
-        assert!(body.get("turn_id").is_none(), "empty turn_id should be omitted");
+        assert!(
+            body.get("turn_id").is_none(),
+            "empty turn_id should be omitted"
+        );
     }
 
     #[tokio::test]
@@ -1136,7 +1523,11 @@ mod tests {
     async fn maybe_push_turn_run_wall_clock_noop_when_chat_not_running() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         maybe_push_turn_run_wall_clock("chat-1", &shared).await;
 
@@ -1147,7 +1538,11 @@ mod tests {
     async fn maybe_push_turn_run_wall_clock_pushes_running_status_when_active() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "chat-1", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         shared
             .gateway_services
             .turn_registry

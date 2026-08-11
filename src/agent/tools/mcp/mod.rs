@@ -12,8 +12,12 @@ use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
 use crate::agent::tools::base::Tool;
-use crate::agent::tools::mcp_file_ref::{has_file_reference, FileRefResolver};
 use crate::config::schema::{McpServerConfig, McpTransportType};
+
+pub mod mcp_file_ref;
+pub mod mcp_presets_api;
+
+use mcp_file_ref::{has_file_reference, FileRefResolver};
 
 
 /// Return the single non-null branch for nullable unions.
