@@ -19,6 +19,8 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
   - [Image paste](#image-paste)
   - [Multi-line input](#multi-line-input)
   - [Leaving the console](#leaving-the-console)
+- [Chat commands](#chat-commands)
+  - [`/mcp-preset`](#mcp-preset)
 - [Gmail support](#gmail-support)
   - [Google Cloud setup](#google-cloud-setup)
   - [OAuth helper (`gmail-auth`)](#oauth-helper-gmail-auth)
@@ -284,6 +286,69 @@ Any of the following will exit the console:
 - Send an interrupt (the binary is still long-running after the console returns, so this only closes the prompt, not the process).
 
 The console always prints the banner on entry — that's the easiest way to confirm you've launched interactive mode rather than one-shot mode.
+
+---
+
+## Chat commands
+
+These are typed directly into a running conversation (the interactive console, or
+any connected channel) — distinct from the `rust-bot <subcommand>` process
+launchers documented under [Command line](#command-line).
+
+| Command | Description |
+|---|---|
+| `/new` | Start a new conversation |
+| `/stop` | Stop the current task |
+| `/restart` | Restart the bot |
+| `/status` | Show bot status |
+| `/model` | Show the current model |
+| `/model-preset` | Show the current preset's model and provider, or switch: `/model-preset <name>` |
+| `/model-presets` | List available model presets |
+| `/dream` | Manually trigger Dream consolidation |
+| `/dream-log` | Show what the last Dream changed |
+| `/dream-restore` | Revert memory to a previous state |
+| `/help` | Show available commands |
+| `/mcp-list` | List connected MCP servers |
+| `/mcp-preset` | Manage built-in MCP server presets — see [below](#mcp-preset) |
+| `/tools` | List available tools |
+| `/workspace` | Show or switch the session's workspace scope |
+| `/goal` | Start/check/cancel a sustained session goal |
+| `/cleanup` | Remove stray files from the workspace |
+| `/list-sessions` | List available sessions in the current workspace |
+| `/example-prompts` | List example prompts |
+
+### `/mcp-preset`
+
+Enable, disable, test, or list built-in MCP server presets (GitHub, Playwright,
+Brave Search, etc.) without hand-editing `config.json`. The catalog is loaded
+from the bundled defaults, merged with any overrides/extras at the path in
+`tools.mcpPresetsPath` (default `~/.rust-bot/mcp_presets.json`) — a user entry
+with the same name as a bundled preset overrides it; new names are pure
+additions.
+
+```bash
+/mcp-preset list
+/mcp-preset enable github github_token=ghp_xxx
+/mcp-preset test github
+/mcp-preset disable github
+```
+
+- **`list`** — shows every preset with its status (`configured`,
+  `missing_credentials`, `missing_dependency`, `not_installed`), plus any
+  custom (non-preset) MCP servers already in `config.json`.
+- **`enable <name> [field=value ...]`** — materializes the preset into a full
+  MCP server config and writes it into `config.json`. Any field a preset needs
+  (an API key, a token) can be supplied inline as `field=value`; if omitted, an
+  already-configured value is reused, and failing that, a matching environment
+  variable is referenced as `${VAR_NAME}` in the saved config (the secret
+  itself is never copied into `config.json` if it's only set as an env var).
+  **Requires a restart** — the running process only reads its MCP server list
+  once at startup.
+- **`disable <name>`** — removes the server from `config.json`. Also requires
+  a restart.
+- **`test <name>`** — connects to an already-enabled server right away (no
+  restart needed) and reports how many tools it exposes, or why the connection
+  failed.
 
 ---
 

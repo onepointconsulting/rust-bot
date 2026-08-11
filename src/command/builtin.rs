@@ -1,8 +1,12 @@
 use crate::{
-    PKG_VERSION,
     agent::context::BOOTSTRAP_FILES,
+    agent::tools::mcp::{load_mcp_tools_from_config, mcp_presets_api},
     bus::events::OutboundMessage,
-    command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
+    command::{types::ChatCommand, CommandContext, CommandHandler, CommandRouter},
+    config::{
+        loader::{load_config, resolve_config_env_vars, save_config},
+        schema::McpServerConfig,
+    },
     security::workspace_access::WorkspaceAccessMode,
     session::goal_state::{self, GoalUpdateAction},
     utils::{
@@ -12,15 +16,17 @@ use crate::{
         restart::restart_with_notice,
         searchusage::fetch_search_usage,
     },
+    PKG_VERSION,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
 use std::{
+    collections::{HashMap, HashSet},
     fs, io,
     panic::AssertUnwindSafe,
     path::{Path, PathBuf},
     sync::Arc,
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 /// Build an outbound reply addressed back to the inbound message's channel/chat.
@@ -424,6 +430,201 @@ impl CommandHandler for CmdMcpList {
     }
 }
 
+struct CmdMcpPreset;
+
+/// Parse trailing `key=value` tokens (whitespace-separated, first `=` per token)
+/// into field-name → value overrides for `/mcp-preset enable`.
+fn parse_field_overrides(rest: &str) -> HashMap<String, String> {
+    rest.split_whitespace()
+        .filter_map(|tok| tok.split_once('='))
+        .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
+        .filter(|(k, v)| !k.is_empty() && !v.is_empty())
+        .collect()
+}
+
+/// Render the preset catalog plus any custom (non-preset) MCP servers already
+/// configured, each with its readiness status.
+fn format_preset_list(
+    presets: &[mcp_presets_api::McpPreset],
+    configured: &HashMap<String, McpServerConfig>,
+) -> String {
+    let known: HashSet<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+    let mut lines = vec!["MCP presets:".to_string()];
+    for preset in presets {
+        let cfg = configured.get(&preset.name);
+        let status = mcp_presets_api::status_for(preset, cfg);
+        lines.push(format!(
+            "- {} ({}) — {}",
+            preset.name,
+            preset.display_name,
+            status.as_str()
+        ));
+    }
+    let mut custom: Vec<&String> = configured
+        .keys()
+        .filter(|n| !known.contains(n.as_str()))
+        .collect();
+    custom.sort();
+    if !custom.is_empty() {
+        lines.push("Custom (non-preset) MCP servers:".to_string());
+        for name in custom {
+            lines.push(format!("- {name} — configured"));
+        }
+    }
+    lines.join("\n")
+}
+
+fn handle_mcp_preset_list(ctx: &CommandContext) -> OutboundMessage {
+    let config = load_config(None);
+    let presets = match mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path) {
+        Ok(presets) => presets,
+        Err(e) => return reply_as_text(ctx, format!("Error loading MCP presets: {e}")),
+    };
+    reply_as_text(ctx, format_preset_list(&presets, &config.tools.mcp_servers))
+}
+
+fn handle_mcp_preset_enable(ctx: &CommandContext, rest: &str) -> OutboundMessage {
+    let (name, field_args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
+    let name = name.trim();
+    if name.is_empty() {
+        return reply_as_text(ctx, "Usage: /mcp-preset enable <name> [field=value ...]");
+    }
+    if !mcp_presets_api::MCP_PRESET_NAME_RE.is_match(name) {
+        return reply_as_text(ctx, format!("Error: invalid MCP preset name '{name}'."));
+    }
+    let mut config = load_config(None);
+    let presets = match mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path) {
+        Ok(presets) => presets,
+        Err(e) => return reply_as_text(ctx, format!("Error loading MCP presets: {e}")),
+    };
+    let Some(preset) = presets
+        .into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+    else {
+        return reply_as_text(ctx, format!("Error: unknown MCP preset '{name}'."));
+    };
+    let overrides = parse_field_overrides(field_args);
+    let existing = config.tools.mcp_servers.get(&preset.name).cloned();
+    let server_cfg =
+        match mcp_presets_api::materialize_preset_server(&preset, &overrides, existing.as_ref()) {
+            Ok(cfg) => cfg,
+            Err(e) => return reply_as_text(ctx, format!("Error: {e}")),
+        };
+    config
+        .tools
+        .mcp_servers
+        .insert(preset.name.clone(), server_cfg);
+    if let Err(e) = save_config(&config, None) {
+        return reply_as_text(ctx, format!("Error saving config: {e}"));
+    }
+    reply_as_text(
+        ctx,
+        format!(
+            "Enabled MCP preset '{}'. Restart rust-bot for the change to take effect.",
+            preset.display_name
+        ),
+    )
+}
+
+fn handle_mcp_preset_disable(ctx: &CommandContext, name: &str) -> OutboundMessage {
+    let name = name.trim();
+    if name.is_empty() {
+        return reply_as_text(ctx, "Usage: /mcp-preset disable <name>");
+    }
+    if !mcp_presets_api::MCP_PRESET_NAME_RE.is_match(name) {
+        return reply_as_text(ctx, format!("Error: invalid MCP preset name '{name}'."));
+    }
+    let mut config = load_config(None);
+    if config.tools.mcp_servers.remove(name).is_none() {
+        return reply_as_text(ctx, format!("'{name}' is not an enabled MCP server."));
+    }
+    if let Err(e) = save_config(&config, None) {
+        return reply_as_text(ctx, format!("Error saving config: {e}"));
+    }
+    reply_as_text(
+        ctx,
+        format!("Disabled MCP server '{name}'. Restart rust-bot for the change to take effect."),
+    )
+}
+
+/// Connect to an already-enabled MCP server right away (no restart needed) and
+/// report its tool surface. Resolves `${ENV_VAR}` placeholders the same way a
+/// real startup connection would, via [`resolve_config_env_vars`].
+async fn handle_mcp_preset_test(ctx: &CommandContext, name: &str) -> OutboundMessage {
+    let name = name.trim();
+    if name.is_empty() {
+        return reply_as_text(ctx, "Usage: /mcp-preset test <name>");
+    }
+    if !mcp_presets_api::MCP_PRESET_NAME_RE.is_match(name) {
+        return reply_as_text(ctx, format!("Error: invalid MCP preset name '{name}'."));
+    }
+    let config = match resolve_config_env_vars(&load_config(None)) {
+        Ok(config) => config,
+        Err(e) => return reply_as_text(ctx, format!("Error resolving config env vars: {e}")),
+    };
+    let Some(server_cfg) = config.tools.mcp_servers.get(name) else {
+        return reply_as_text(ctx, format!("'{name}' is not an enabled MCP server."));
+    };
+    let timeout_secs = server_cfg.tool_timeout.clamp(5, 20);
+    match tokio::time::timeout(
+        Duration::from_secs(u64::from(timeout_secs)),
+        load_mcp_tools_from_config(server_cfg, name),
+    )
+    .await
+    {
+        Ok(Ok(loaded)) => {
+            let tool_names: Vec<String> = loaded.tools.iter().map(|t| t.name()).collect();
+            if tool_names.is_empty() {
+                reply_as_text(ctx, format!("'{name}' connected, but reported no tools."))
+            } else {
+                reply_as_text(
+                    ctx,
+                    format!(
+                        "'{name}' connected with {} tools: {}",
+                        tool_names.len(),
+                        tool_names.join(", ")
+                    ),
+                )
+            }
+        }
+        Ok(Err(e)) => reply_as_text(ctx, format!("'{name}' could not connect: {e}")),
+        Err(_) => reply_as_text(ctx, format!("'{name}' test timed out.")),
+    }
+}
+
+/// Manage built-in MCP server presets: list the catalog, enable/disable a preset
+/// (persisted to `config.json`; requires a restart to take effect), or test an
+/// already-enabled preset's connection immediately.
+#[async_trait]
+impl CommandHandler for CmdMcpPreset {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        if ctx.agent_loop.is_none() {
+            return reply_no_loop(ctx, "/mcp-preset");
+        }
+        let trimmed = ctx.args.trim();
+        let (sub, rest) = match trimmed.split_once(char::is_whitespace) {
+            Some((sub, rest)) => (sub, rest.trim()),
+            None => (trimmed, ""),
+        };
+        match sub {
+            "list" => handle_mcp_preset_list(ctx),
+            "enable" => handle_mcp_preset_enable(ctx, rest),
+            "disable" => handle_mcp_preset_disable(ctx, rest),
+            "test" => handle_mcp_preset_test(ctx, rest).await,
+            "" => reply_as_text(
+                ctx,
+                "Usage: /mcp-preset <list|enable|disable|test> [name] [key=value ...]",
+            ),
+            other => reply_as_text(
+                ctx,
+                format!(
+                    "Unknown /mcp-preset subcommand '{other}'. Use list, enable, disable, or test."
+                ),
+            ),
+        }
+    }
+}
+
 struct CmdDreamLog;
 
 impl CmdDreamLog {
@@ -691,7 +892,10 @@ impl CommandHandler for CmdWorkspace {
         if requested.eq_ignore_ascii_case("default") {
             let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
             agent_loop.clear_session_workspace_scope(&mut session_manager, &session.key);
-            return reply_as_text(ctx, "Workspace override cleared; using the process default.");
+            return reply_as_text(
+                ctx,
+                "Workspace override cleared; using the process default.",
+            );
         }
 
         let mut parts = requested.splitn(2, char::is_whitespace);
@@ -952,6 +1156,7 @@ fn build_help_text() -> String {
         "/dream-restore — Revert memory to a previous state",
         "/help — Show available commands",
         "/mcp-list — List available MCP servers",
+        "/mcp-preset <list|enable|disable|test> [name] [key=value ...] — Manage MCP server presets (e.g. github, playwright); enable/disable require a restart to take effect",
         "/tools — List available tools",
         "/workspace — Show the session's workspace scope, or switch it: /workspace <path> [restricted|full], /workspace default to clear",
         "/goal <task> — Start a sustained goal for this session; /goal to check status, /goal cancel to clear it",
@@ -984,6 +1189,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
         Arc::new(CmdModelPresets),
     );
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
+    router.prefix(ChatCommand::McpPreset.to_string(), Arc::new(CmdMcpPreset));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.prefix(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
     router.prefix(ChatCommand::Goal.to_string(), Arc::new(CmdGoal));
@@ -1392,7 +1598,11 @@ mod tests {
         let loop_ = model_cmd_test_loop_with_preset();
         let ctx = workspace_cmd_ctx(loop_, "");
         let out = CmdWorkspace.handle(&ctx).await;
-        assert!(out.content.starts_with("Workspace: "), "got: {}", out.content);
+        assert!(
+            out.content.starts_with("Workspace: "),
+            "got: {}",
+            out.content
+        );
         assert!(out.content.contains("(access: "), "got: {}", out.content);
     }
 
@@ -1408,7 +1618,11 @@ mod tests {
             "got: {}",
             switched.content
         );
-        assert!(switched.content.contains("(restricted)"), "got: {}", switched.content);
+        assert!(
+            switched.content.contains("(restricted)"),
+            "got: {}",
+            switched.content
+        );
 
         let show_ctx = workspace_cmd_ctx(loop_, "");
         let shown = CmdWorkspace.handle(&show_ctx).await;
@@ -1429,7 +1643,11 @@ mod tests {
 
         let clear_ctx = workspace_cmd_ctx(loop_.clone(), "default");
         let cleared = CmdWorkspace.handle(&clear_ctx).await;
-        assert!(cleared.content.contains("cleared"), "got: {}", cleared.content);
+        assert!(
+            cleared.content.contains("cleared"),
+            "got: {}",
+            cleared.content
+        );
 
         let show_ctx = workspace_cmd_ctx(loop_, "");
         let shown = CmdWorkspace.handle(&show_ctx).await;
@@ -1474,6 +1692,8 @@ mod tests {
     #[tokio::test]
     async fn cmd_goal_reports_usage_with_no_active_goal_and_no_args() {
         let loop_ = model_cmd_test_loop_with_preset();
+        let ctx_clear = goal_cmd_ctx(Arc::clone(&loop_), "clear");
+        let _out = CmdGoal.handle(&ctx_clear).await;
         let ctx = goal_cmd_ctx(loop_, "");
         let out = CmdGoal.handle(&ctx).await;
         assert!(out.content.starts_with("Usage:"), "got: {}", out.content);
@@ -1485,26 +1705,46 @@ mod tests {
 
         let start_ctx = goal_cmd_ctx(loop_.clone(), "ship the feature");
         let started = CmdGoal.handle(&start_ctx).await;
-        assert!(started.content.contains("ship the feature"), "got: {}", started.content);
+        assert!(
+            started.content.contains("ship the feature"),
+            "got: {}",
+            started.content
+        );
 
         let status_ctx = goal_cmd_ctx(loop_.clone(), "");
         let status = CmdGoal.handle(&status_ctx).await;
-        assert!(status.content.contains("ship the feature"), "got: {}", status.content);
+        assert!(
+            status.content.contains("ship the feature"),
+            "got: {}",
+            status.content
+        );
 
         let cancel_ctx = goal_cmd_ctx(loop_.clone(), "cancel");
         let cancelled = CmdGoal.handle(&cancel_ctx).await;
-        assert!(cancelled.content.contains("cancelled"), "got: {}", cancelled.content);
+        assert!(
+            cancelled.content.contains("cancelled"),
+            "got: {}",
+            cancelled.content
+        );
 
         let after_ctx = goal_cmd_ctx(loop_, "");
         let after = CmdGoal.handle(&after_ctx).await;
-        assert!(after.content.starts_with("Usage:"), "got: {}", after.content);
+        assert!(
+            after.content.starts_with("Usage:"),
+            "got: {}",
+            after.content
+        );
     }
 
     #[tokio::test]
     async fn cmd_goal_refuses_second_goal_while_one_is_active() {
         let loop_ = model_cmd_test_loop_with_preset();
-        CmdGoal.handle(&goal_cmd_ctx(loop_.clone(), "first objective")).await;
-        let out = CmdGoal.handle(&goal_cmd_ctx(loop_, "second objective")).await;
+        CmdGoal
+            .handle(&goal_cmd_ctx(loop_.clone(), "first objective"))
+            .await;
+        let out = CmdGoal
+            .handle(&goal_cmd_ctx(loop_, "second objective"))
+            .await;
         assert!(out.content.starts_with("Error:"), "got: {}", out.content);
     }
 
@@ -1532,17 +1772,30 @@ mod tests {
             )
         };
 
-        CmdGoal.handle(&goal_cmd_ctx_with_key(loop_.clone(), session_key, "an active goal")).await;
+        CmdGoal
+            .handle(&goal_cmd_ctx_with_key(
+                loop_.clone(),
+                session_key,
+                "an active goal",
+            ))
+            .await;
         {
             let mut session_manager = loop_.session_manager.lock().unwrap();
             let session = session_manager.get_or_create_session(session_key);
-            session.metadata.insert("unrelated".to_string(), serde_json::json!("keep-me"));
+            session
+                .metadata
+                .insert("unrelated".to_string(), serde_json::json!("keep-me"));
             let snapshot = session.clone();
             session_manager.save(snapshot).unwrap();
         }
         assert!(
             crate::session::goal_state::sustained_goal_active(
-                &loop_.session_manager.lock().unwrap().get_or_create_session(session_key).metadata
+                &loop_
+                    .session_manager
+                    .lock()
+                    .unwrap()
+                    .get_or_create_session(session_key)
+                    .metadata
             ),
             "goal should be active before /new"
         );
@@ -1555,7 +1808,10 @@ mod tests {
             !crate::session::goal_state::sustained_goal_active(&session.metadata),
             "goal should be cleared by /new"
         );
-        assert_eq!(session.metadata.get("unrelated"), Some(&serde_json::json!("keep-me")));
+        assert_eq!(
+            session.metadata.get("unrelated"),
+            Some(&serde_json::json!("keep-me"))
+        );
     }
 
     fn goal_cmd_ctx_with_key(
@@ -1788,10 +2044,68 @@ mod tests {
             None,
         );
         let out = CmdMcpList.handle(&ctx).await;
-        assert!(
-            out.content
-                .contains("No agent available to execute command: /mcp-list")
+        assert!(out
+            .content
+            .contains("No agent available to execute command: /mcp-list"));
+    }
+
+    #[tokio::test]
+    async fn mcp_preset_without_agent_loop_returns_no_loop_message() {
+        let ctx = CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: "/mcp-preset list".into(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "mcp-preset",
+            "/mcp-preset list",
+            "list",
+            None,
         );
+        let out = CmdMcpPreset.handle(&ctx).await;
+        assert!(out
+            .content
+            .contains("No agent available to execute command: /mcp-preset"));
+    }
+
+    #[test]
+    fn parse_field_overrides_splits_key_value_pairs() {
+        let overrides = parse_field_overrides("github_token=ghp_abc other_field=value2");
+        assert_eq!(overrides.get("github_token"), Some(&"ghp_abc".to_string()));
+        assert_eq!(overrides.get("other_field"), Some(&"value2".to_string()));
+        assert_eq!(overrides.len(), 2);
+    }
+
+    #[test]
+    fn parse_field_overrides_ignores_malformed_tokens() {
+        let overrides = parse_field_overrides("no_equals_sign =empty_key key_only= trailing");
+        assert!(overrides.is_empty());
+    }
+
+    #[test]
+    fn parse_field_overrides_empty_string_yields_empty_map() {
+        assert!(parse_field_overrides("").is_empty());
+    }
+
+    #[test]
+    fn format_preset_list_shows_status_and_custom_servers() {
+        let presets = vec![mcp_presets_api::load_mcp_presets("/no/such/file")
+            .unwrap()
+            .into_iter()
+            .find(|p| p.name == "github")
+            .unwrap()];
+        let mut configured = HashMap::new();
+        configured.insert("my-custom-server".to_string(), McpServerConfig::default());
+        let content = format_preset_list(&presets, &configured);
+        assert!(content.contains("- github (GitHub) — not_installed"));
+        assert!(content.contains("Custom (non-preset) MCP servers:"));
+        assert!(content.contains("- my-custom-server — configured"));
     }
 
     #[test]

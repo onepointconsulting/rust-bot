@@ -16,6 +16,7 @@ pub enum ChatCommand {
     DreamLog,
     DreamRestore,
     McpList,
+    McpPreset,
     Tools,
     Workspace,
     Goal,
@@ -32,7 +33,6 @@ impl Default for ChatCommand {
 }
 
 impl std::str::FromStr for ChatCommand {
-
     type Err = ();
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
@@ -49,6 +49,7 @@ impl std::str::FromStr for ChatCommand {
             "dream-log" => Ok(ChatCommand::DreamLog),
             "dream-restore" => Ok(ChatCommand::DreamRestore),
             "mcp-list" => Ok(ChatCommand::McpList),
+            "mcp-preset" => Ok(ChatCommand::McpPreset),
             "tools" => Ok(ChatCommand::Tools),
             "workspace" => Ok(ChatCommand::Workspace),
             "goal" => Ok(ChatCommand::Goal),
@@ -73,6 +74,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::DreamLog => write!(f, "/dream-log"),
             ChatCommand::DreamRestore => write!(f, "/dream-restore"),
             ChatCommand::McpList => write!(f, "/mcp-list"),
+            ChatCommand::McpPreset => write!(f, "/mcp-preset"),
             ChatCommand::Tools => write!(f, "/tools"),
             ChatCommand::Workspace => write!(f, "/workspace"),
             ChatCommand::Goal => write!(f, "/goal"),
