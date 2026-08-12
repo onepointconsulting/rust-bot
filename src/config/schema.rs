@@ -81,6 +81,11 @@ pub struct ChannelsConfig {
     #[garde(skip)]
     pub send_tool_hints: bool,
 
+    /// Surface model reasoning/thinking content when a channel implements it.
+    #[serde(alias = "show_reasoning")]
+    #[garde(skip)]
+    pub show_reasoning: bool,
+
     /// Max delivery attempts, including the initial send. Range: 0–10.
     #[serde(alias = "send_max_retries", default = "default_send_max_retries")]
     #[garde(range(min = 0, max = 10))]
@@ -112,6 +117,7 @@ impl Default for ChannelsConfig {
             send_progress: default_send_progress(),
             streaming: default_streaming(),
             send_tool_hints: true,
+            show_reasoning: true,
             send_max_retries: default_send_max_retries(),
             transcription_provider: default_transcription_provider(),
             extra: HashMap::new(),
@@ -1691,6 +1697,7 @@ mod tests {
         let cfg = ChannelsConfig::default();
         assert!(cfg.send_progress);
         assert!(cfg.send_tool_hints);
+        assert!(cfg.show_reasoning);
         assert_eq!(cfg.send_max_retries, 3);
         assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
         assert!(cfg.extra.is_empty());
@@ -1698,10 +1705,11 @@ mod tests {
 
     #[test]
     fn test_deserialize_camel_case() {
-        let json = r#"{"sendProgress": false, "sendMaxRetries": 5}"#;
+        let json = r#"{"sendProgress": false, "sendMaxRetries": 5, "showReasoning": false}"#;
         let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.send_progress);
         assert_eq!(cfg.send_max_retries, 5);
+        assert!(!cfg.show_reasoning);
         assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
         assert!(cfg.validate().is_ok());
     }

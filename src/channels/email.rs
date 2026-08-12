@@ -15,7 +15,7 @@ use std::{
 use futures::TryStreamExt;
 
 use crate::{
-    bus::{events::OutboundMessage, queue::MessageBus},
+    bus::{events::OutboundMessage, outbound_events::OutboundEvent, queue::MessageBus},
     channels::{
         base::{BaseChannel, BaseChannelCommon},
         types::MessageBytes,
@@ -924,6 +924,14 @@ impl BaseChannel for EmailChannel {
             return Err("Email channel SMTP host not configured".to_string());
         }
 
+        // Skip progress messages to prevent sending an empty email after each
+        // tool call. Mirrors nanobot's `isinstance(msg.event, ProgressEvent)`
+        // guard (`channels/email/runtime.py:223-226`).
+        if matches!(msg.event, Some(OutboundEvent::Progress(_))) {
+            log::debug!("Skip progress message to {}", msg.chat_id);
+            return Ok(());
+        }
+
         let to_addr = msg.chat_id.to_string();
         if to_addr.trim().is_empty() {
             log::warn!("Email channel missing recipient address.");
@@ -1103,8 +1111,11 @@ Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
                 let metadata = item.get("metadata").and_then(|v| {
                     serde_json::from_value::<HashMap<String, serde_json::Value>>(v.clone()).ok()
                 });
-                self.handle_message(sender, sender, content, media, metadata, None, false, None)
+                let res = self.handle_message(sender, sender, content, media, metadata, None, false, None)
                     .await;
+                if let Err(e) = res {
+                    log::error!("Error handling email message: {e}");
+                }
             }
             tokio::time::sleep(std::time::Duration::from_secs(poll_seconds)).await;
         }
@@ -1536,6 +1547,33 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
         )
+    }
+
+    /// Cleared for `consent_granted`/`smtp_host`, so `send()` reaches the
+    /// progress-skip guard instead of bailing out earlier.
+    fn channel_ready_to_send() -> EmailChannel {
+        EmailChannel::new(
+            EmailConfig {
+                consent_granted: true,
+                smtp_host: "smtp.example.com".to_string(),
+                ..EmailConfig::default()
+            },
+            Arc::new(MessageBus::new()),
+            ChannelsConfig::default(),
+            test_session_manager(),
+            test_workspace_request_handler(),
+        )
+    }
+
+    #[tokio::test]
+    async fn send_skips_progress_events_without_attempting_smtp() {
+        let channel = channel_ready_to_send();
+        let mut msg = outbound_with_media("tool call in progress", vec![]);
+        msg.event = Some(crate::bus::outbound_events::OutboundEvent::Progress(
+            crate::bus::outbound_events::ProgressEvent::default(),
+        ));
+        // Would fail (no real SMTP server) if the guard didn't short-circuit first.
+        assert_eq!(channel.send(msg).await, Ok(()));
     }
 
     #[test]

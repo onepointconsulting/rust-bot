@@ -42,8 +42,8 @@ use crate::{
     bus::{
         events::OutboundMessage,
         outbound_events::{
-            OutboundEvent::RuntimeModelUpdated, RuntimeModelUpdatedEvent,
-            outbound_message_for_event,
+            FileEditEvent, OutboundEvent, OutboundEvent::RuntimeModelUpdated, ProgressKind,
+            RuntimeModelUpdatedEvent, outbound_message_for_event,
         },
         queue::MessageBus,
     },
@@ -176,6 +176,12 @@ fn sender_allowed(channels_config: &ChannelsConfig, sender_id: &str) -> bool {
 /// by [`authorize`]; mint one via `generate-jwt generate-jwt-token --purpose
 /// webui` — see `security::jwt::Claims::purpose`.
 const WEBUI_JWT_PURPOSE: &str = "webui";
+
+/// Outbound metadata key carrying an opaque WebUI-rendered "agent UI" blob to
+/// echo verbatim onto the wire message. Mirrors nanobot's
+/// `OUTBOUND_META_AGENT_UI` (`bus/events.py:13`). Not populated by any
+/// current agent-loop call site — forward-compatible plumbing only.
+const OUTBOUND_META_AGENT_UI: &str = "_agent_ui";
 
 /// Reject the upgrade with 401 when JWT auth is enabled and the token is
 /// missing/invalid. No-op (always `Ok`) when JWT is disabled.
@@ -1018,6 +1024,10 @@ pub struct WebSocketChannel {
     /// `'static` shutdown future `axum::serve` requires, rather than
     /// borrowing `&self` (which cannot outlive this method).
     shutdown: Arc<Notify>,
+    /// Accumulated delta text per `(chat_id, stream_id)`, so `send_delta`
+    /// can reconstruct the full message on `stream_end`. Mirrors nanobot's
+    /// `self._stream_text_buffers` (`channels/websocket/runtime.py:1188-1198`).
+    stream_buffers: StdMutex<HashMap<(String, String), Vec<String>>>,
 }
 
 impl WebSocketChannel {
@@ -1051,7 +1061,62 @@ impl WebSocketChannel {
             jwt_public_key_pem,
             gateway_services: Arc::new(GatewayServices::default()),
             shutdown: Arc::new(Notify::new()),
+            stream_buffers: StdMutex::new(HashMap::new()),
         }
+    }
+
+    /// Fan a raw wire-protocol JSON string out to every connection currently
+    /// subscribed to `chat_id`, cleaning up any connection whose sender is
+    /// gone. Returns the number of connections it was actually sent to.
+    /// Mirrors nanobot's `conns = list(self._subs.get(chat_id, ()))` +
+    /// per-connection `_safe_send_to` loop, shared by `send`/`send_delta`/
+    /// `send_reasoning_delta`/`send_reasoning_end`/`send_file_edit_events`.
+    async fn fan_out_to_chat(&self, chat_id: &str, raw: &str) -> usize {
+        let recipients = self.connections.lock().await.senders_for_chat(chat_id);
+        let mut delivered = 0usize;
+        for (connection_id, tx) in recipients {
+            if tx.send(Message::text(raw.to_string())).is_ok() {
+                delivered += 1;
+            } else {
+                log::warn!("WebSocket channel: connection '{connection_id}' gone, cleaning up");
+                self.connections
+                    .lock()
+                    .await
+                    .cleanup_connection(&connection_id);
+            }
+        }
+        delivered
+    }
+
+    /// Build the common `{"event": "message", "chat_id", "text"}` payload
+    /// plus the optional `media`/`reply_to`/`latency_ms`/`agent_ui` fields
+    /// nanobot's `send()` includes whenever present, regardless of whether
+    /// this is a plain message or a progress/tool-hint event. Mirrors
+    /// `runtime.py:997-1029` (excluding the progress-only `kind`/`tool_events`
+    /// fields, added by the caller for `ProgressEvent`s).
+    fn build_message_payload(msg: &OutboundMessage) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "event": "message",
+            "chat_id": msg.chat_id,
+            "text": msg.content,
+        });
+        if !msg.media.is_empty() {
+            payload["media"] = serde_json::json!(msg.media);
+        }
+        if let Some(reply_to) = &msg.reply_to {
+            payload["reply_to"] = serde_json::json!(reply_to);
+        }
+        let latency_ms = msg
+            .metadata
+            .get("latency_ms")
+            .and_then(|v| v.as_i64().or_else(|| v.as_f64().map(|f| f as i64)));
+        if let Some(latency_ms) = latency_ms {
+            payload["latency_ms"] = serde_json::json!(latency_ms);
+        }
+        if let Some(agent_ui) = msg.metadata.get(OUTBOUND_META_AGENT_UI) {
+            payload["agent_ui"] = agent_ui.clone();
+        }
+        payload
     }
 
     fn shared(&self) -> WsShared {
@@ -1152,48 +1217,215 @@ impl BaseChannel for WebSocketChannel {
     }
 
     async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
-        // Placeholder wire format: the real WebUI multiplex protocol
-        // (`outbound_event_from_message` in nanobot) still needs porting.
-        let payload = serde_json::json!({
-            "chatId": msg.chat_id,
-            "content": msg.content,
-            "metadata": msg.metadata,
-        });
-        let text = payload.to_string();
-
-        // Fan out to every connection subscribed to this chat_id, mirroring
-        // nanobot's `conns = list(self._subs.get(chat_id, ()))` + per-connection
-        // `_safe_send_to` loop.
-        let recipients = self.connections.lock().await.senders_for_chat(&msg.chat_id);
-        if recipients.is_empty() {
-            return Err(format!(
-                "No open WebSocket connection for chat_id '{}'",
-                msg.chat_id
-            ));
-        }
-
-        let mut delivered = 0usize;
-        for (connection_id, tx) in recipients {
-            if tx.send(Message::text(text.clone())).is_ok() {
-                delivered += 1;
-            } else {
-                log::warn!("WebSocket channel: connection '{connection_id}' gone, cleaning up");
-                self.connections
-                    .lock()
-                    .await
-                    .cleanup_connection(&connection_id);
+        // Mirrors nanobot's `send()` (`channels/websocket/runtime.py:946-1084`)
+        // for the subset of event kinds actually reachable here:
+        // `ChannelManager::send_once` already routes `_stream_delta`/
+        // `_stream_end`-flagged messages to `send_delta` instead of `send`,
+        // and reasoning-kind `Progress` events to `send_reasoning_delta`/
+        // `send_reasoning_end` — so `send` only ever sees a plain `Progress`
+        // event or no typed event at all. Other `OutboundEvent` variants
+        // (goal state/status already go through the separate
+        // `send_goal_state`/`send_goal_status` free functions; the rest are
+        // unused by any current publisher — see the module-level plan notes)
+        // fail safe with a logged skip rather than reusing the wrong shape.
+        let payload = match &msg.event {
+            Some(OutboundEvent::Progress(progress_event)) => {
+                if let Some(edits) = progress_event
+                    .file_edit_events
+                    .clone()
+                    .filter(|edits| !edits.is_empty())
+                {
+                    return self
+                        .send_file_edit_events(&msg.chat_id, edits, Some(msg.metadata.clone()))
+                        .await;
+                }
+                let mut payload = Self::build_message_payload(&msg);
+                if let Some(tool_events) = progress_event
+                    .tool_events
+                    .as_ref()
+                    .filter(|events| !events.is_empty())
+                {
+                    payload["tool_events"] =
+                        serde_json::to_value(tool_events).unwrap_or(serde_json::Value::Null);
+                }
+                payload["kind"] = serde_json::json!(
+                    if progress_event.kind == ProgressKind::ToolHint {
+                        "tool_hint"
+                    } else {
+                        "progress"
+                    }
+                );
+                payload
             }
-        }
+            None => Self::build_message_payload(&msg),
+            Some(other) => {
+                log::warn!(
+                    "WebSocket channel: no wire mapping yet for {other:?} event \
+                     (chat_id '{}'); skipping",
+                    msg.chat_id
+                );
+                return Ok(());
+            }
+        };
 
+        let raw = payload.to_string();
+        let delivered = self.fan_out_to_chat(&msg.chat_id, &raw).await;
         // Only fail when nobody received it — a partial failure must not
         // trigger a retry that would re-deliver duplicate content to
         // recipients that already succeeded.
         if delivered == 0 {
             return Err(format!(
-                "All WebSocket connections for chat_id '{}' were closed",
+                "No open WebSocket connection for chat_id '{}'",
                 msg.chat_id
             ));
         }
+        Ok(())
+    }
+
+    async fn send_delta(
+        &self,
+        chat_id: &str,
+        delta: &str,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        // Mirrors nanobot's `send_delta` (`channels/websocket/runtime.py:1174-1225`).
+        // The trait signature carries `stream_id`/`stream_end`/`resuming`/
+        // `merge_next` inside `metadata` rather than as separate parameters
+        // (matching `ChannelManager::send_once`, which passes the whole
+        // metadata map through unchanged) — read them out under the same
+        // `_stream_id`/`_stream_end`/`_resuming`/`_merge_next` keys
+        // `agent_loop.rs`'s stream callbacks set.
+        let meta = metadata.unwrap_or_default();
+        let stream_id = meta
+            .get("_stream_id")
+            .and_then(|v| v.as_str())
+            .map(str::to_string);
+        let stream_end = meta
+            .get("_stream_end")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let resuming = meta
+            .get("_resuming")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let merge_next = meta
+            .get("_merge_next")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        let stream_key = (chat_id.to_string(), stream_id.clone().unwrap_or_default());
+
+        let mut payload = if stream_end {
+            // `merge_next` peeks (keeps the buffer alive for a following
+            // segment); otherwise the buffer is drained for this stream.
+            let full_text = {
+                let mut buffers = self.stream_buffers.lock().unwrap_or_else(|e| e.into_inner());
+                if merge_next {
+                    let buffer = buffers.entry(stream_key.clone()).or_default();
+                    if !delta.is_empty() {
+                        buffer.push(delta.to_string());
+                    }
+                    buffer.join("")
+                } else {
+                    let mut buffer = buffers.remove(&stream_key).unwrap_or_default();
+                    if !delta.is_empty() {
+                        buffer.push(delta.to_string());
+                    }
+                    buffer.join("")
+                }
+            };
+            let mut payload = serde_json::json!({"event": "stream_end", "chat_id": chat_id});
+            // No `rewrite_local_markdown_images` equivalent exists in
+            // rust-bot (see module-level plan notes) — nanobot's
+            // `rewritten != full_text` disjunct never fires here, so this
+            // simplifies to "only a non-empty delta warrants echoing text".
+            if !delta.is_empty() {
+                payload["text"] = serde_json::json!(full_text);
+            }
+            payload
+        } else {
+            self.stream_buffers
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(stream_key)
+                .or_default()
+                .push(delta.to_string());
+            serde_json::json!({"event": "delta", "chat_id": chat_id, "text": delta})
+        };
+        if let Some(stream_id) = &stream_id {
+            payload["stream_id"] = serde_json::json!(stream_id);
+        }
+        if stream_end && resuming {
+            payload["resuming"] = serde_json::json!(true);
+        }
+        if stream_end && merge_next {
+            payload["merge_next"] = serde_json::json!(true);
+        }
+
+        self.fan_out_to_chat(chat_id, &payload.to_string()).await;
+        Ok(())
+    }
+
+    fn implements_send_delta(&self) -> bool {
+        true
+    }
+
+    async fn send_reasoning_delta(
+        &self,
+        chat_id: &str,
+        delta: &str,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        // Mirrors `send_reasoning_delta` (`channels/websocket/runtime.py:1086-1120`).
+        if delta.is_empty() {
+            return Ok(());
+        }
+        let stream_id = metadata
+            .as_ref()
+            .and_then(|m| m.get("_stream_id"))
+            .and_then(|v| v.as_str());
+        let mut payload = serde_json::json!({
+            "event": "reasoning_delta",
+            "chat_id": chat_id,
+            "text": delta,
+        });
+        if let Some(stream_id) = stream_id {
+            payload["stream_id"] = serde_json::json!(stream_id);
+        }
+        self.fan_out_to_chat(chat_id, &payload.to_string()).await;
+        Ok(())
+    }
+
+    async fn send_reasoning_end(
+        &self,
+        chat_id: &str,
+        metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        // Mirrors `send_reasoning_end` (`channels/websocket/runtime.py:1122-1148`).
+        let stream_id = metadata
+            .as_ref()
+            .and_then(|m| m.get("_stream_id"))
+            .and_then(|v| v.as_str());
+        let mut payload = serde_json::json!({"event": "reasoning_end", "chat_id": chat_id});
+        if let Some(stream_id) = stream_id {
+            payload["stream_id"] = serde_json::json!(stream_id);
+        }
+        self.fan_out_to_chat(chat_id, &payload.to_string()).await;
+        Ok(())
+    }
+
+    async fn send_file_edit_events(
+        &self,
+        chat_id: &str,
+        edits: Vec<FileEditEvent>,
+        _metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        // Mirrors `send_file_edit_events` (`channels/websocket/runtime.py:1150-1172`).
+        let payload = serde_json::json!({
+            "event": "file_edit",
+            "chat_id": chat_id,
+            "edits": edits,
+        });
+        self.fan_out_to_chat(chat_id, &payload.to_string()).await;
         Ok(())
     }
 }
@@ -1220,6 +1452,7 @@ fn builtin_command_starts_agent_turn(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::bus::outbound_events::ProgressEvent;
     use crate::config::schema::JwtConfig;
 
     // --- parse_inbound_payload ---
@@ -1858,5 +2091,272 @@ mod tests {
         assert_eq!(body["status"], "running");
         assert_eq!(body["turn_id"], "turn-1");
         assert!(body["started_at"].is_number());
+    }
+
+    // --- send / send_delta / send_reasoning_delta / send_reasoning_end / send_file_edit_events ---
+
+    fn test_channel() -> WebSocketChannel {
+        let dir = tempfile::tempdir().unwrap();
+        WebSocketChannel::new(
+            WebSocketConfig::default(),
+            Arc::new(MessageBus::new()),
+            ChannelsConfig::default(),
+            Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true),
+        )
+    }
+
+    fn outbound(chat_id: &str, content: &str, event: Option<OutboundEvent>) -> OutboundMessage {
+        OutboundMessage {
+            channel: "websocket".to_string(),
+            chat_id: chat_id.to_string(),
+            content: content.to_string(),
+            reply_to: None,
+            media: Vec::new(),
+            metadata: HashMap::new(),
+            event,
+        }
+    }
+
+    #[tokio::test]
+    async fn send_plain_message_has_no_kind_field() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        BaseChannel::send(&channel, outbound("chat-1", "hi", None))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "message");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["text"], "hi");
+        assert!(body.get("kind").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_tool_hint_progress_sets_kind_tool_hint() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let event = Some(OutboundEvent::Progress(ProgressEvent {
+            kind: ProgressKind::ToolHint,
+            tool_events: Some(vec![]),
+            ..Default::default()
+        }));
+
+        BaseChannel::send(&channel, outbound("chat-1", "read_file(...)", event))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["kind"], "tool_hint");
+    }
+
+    #[tokio::test]
+    async fn send_plain_progress_sets_kind_progress_and_includes_tool_events() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let event = Some(OutboundEvent::Progress(ProgressEvent {
+            kind: ProgressKind::Plain,
+            tool_events: Some(vec![crate::bus::outbound_events::ToolEvent {
+                name: "read_file".to_string(),
+                status: "ok".to_string(),
+                detail: None,
+            }]),
+            ..Default::default()
+        }));
+
+        BaseChannel::send(&channel, outbound("chat-1", "working...", event))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["kind"], "progress");
+        assert_eq!(body["tool_events"][0]["name"], "read_file");
+    }
+
+    #[tokio::test]
+    async fn send_progress_with_file_edit_events_delegates_instead_of_sending_message() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let mut edit = FileEditEvent::new();
+        edit.insert("path".to_string(), "foo.rs".to_string());
+        let event = Some(OutboundEvent::Progress(ProgressEvent {
+            file_edit_events: Some(vec![edit]),
+            ..Default::default()
+        }));
+
+        BaseChannel::send(&channel, outbound("chat-1", "", event))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "file_edit");
+        assert_eq!(body["edits"][0]["path"], "foo.rs");
+    }
+
+    #[tokio::test]
+    async fn send_unmapped_event_kind_is_skipped_without_erroring() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let event = Some(OutboundEvent::TurnEnd(Default::default()));
+
+        let result = BaseChannel::send(&channel, outbound("chat-1", "", event)).await;
+
+        assert_eq!(result, Ok(()));
+        assert!(rx.try_recv().is_err(), "no frame should have been sent");
+    }
+
+    #[tokio::test]
+    async fn send_no_recipients_is_an_error() {
+        let channel = test_channel();
+        let result = BaseChannel::send(&channel, outbound("chat-1", "hi", None)).await;
+        assert!(result.is_err());
+    }
+
+    #[tokio::test]
+    async fn send_delta_non_end_sends_delta_event_and_buffers() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let mut meta = HashMap::new();
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+
+        BaseChannel::send_delta(&channel, "chat-1", "Hello", Some(meta))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "delta");
+        assert_eq!(body["text"], "Hello");
+        assert_eq!(body["stream_id"], "s1");
+    }
+
+    #[tokio::test]
+    async fn send_delta_stream_end_flushes_buffered_text() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let mut meta = HashMap::new();
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+        BaseChannel::send_delta(&channel, "chat-1", "Hello ", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+        BaseChannel::send_delta(&channel, "chat-1", "world", Some(meta))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "stream_end");
+        assert_eq!(body["text"], "Hello world");
+    }
+
+    #[tokio::test]
+    async fn send_delta_stream_end_with_empty_delta_omits_text_when_buffer_already_sent() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let mut meta = HashMap::new();
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+        BaseChannel::send_delta(&channel, "chat-1", "Hello", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+        BaseChannel::send_delta(&channel, "chat-1", "", Some(meta))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "stream_end");
+        assert!(body.get("text").is_none());
+    }
+
+    #[tokio::test]
+    async fn send_delta_merge_next_keeps_buffer_for_next_segment() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        let mut meta = HashMap::new();
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+        meta.insert("_merge_next".to_string(), serde_json::json!(true));
+        BaseChannel::send_delta(&channel, "chat-1", "Hello", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        // A following segment under the same stream_id should still see the
+        // earlier buffered text, since merge_next peeked rather than popped.
+        meta.remove("_stream_end");
+        meta.remove("_merge_next");
+        BaseChannel::send_delta(&channel, "chat-1", " world", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+        BaseChannel::send_delta(&channel, "chat-1", "!", Some(meta))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["text"], "Hello world!");
+    }
+
+    #[tokio::test]
+    async fn send_reasoning_delta_skips_empty_delta() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        BaseChannel::send_reasoning_delta(&channel, "chat-1", "", None)
+            .await
+            .unwrap();
+
+        assert!(rx.try_recv().is_err(), "empty delta must not be sent");
+    }
+
+    #[tokio::test]
+    async fn send_reasoning_delta_and_end_wire_shapes() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        BaseChannel::send_reasoning_delta(&channel, "chat-1", "thinking", None)
+            .await
+            .unwrap();
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "reasoning_delta");
+        assert_eq!(body["text"], "thinking");
+
+        BaseChannel::send_reasoning_end(&channel, "chat-1", None)
+            .await
+            .unwrap();
+        let msg = rx.try_recv().expect("expected a second delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "reasoning_end");
+    }
+
+    #[tokio::test]
+    async fn implements_send_delta_is_true() {
+        assert!(BaseChannel::implements_send_delta(&test_channel()));
     }
 }

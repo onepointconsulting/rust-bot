@@ -12,7 +12,13 @@ use chrono::Utc;
 use tokio::sync::mpsc::error::SendError;
 
 use crate::{
-    bus::{events::{InboundMessage, OutboundMessage}, queue::MessageBus}, config::schema::ChannelsConfig, providers::transcription::{
+    bus::{
+        events::{InboundMessage, OutboundMessage},
+        outbound_events::FileEditEvent,
+        queue::MessageBus,
+    },
+    config::schema::ChannelsConfig,
+    providers::transcription::{
         GROQ_DEFAULT_API_URL, GROQ_DEFAULT_MODEL, GroqTranscriptionProvider,
         OPENAI_DEFAULT_API_URL, OPENAI_DEFAULT_MODEL, OpenAITranscriptionProvider, PathLike,
         TranscriptionProvider,
@@ -188,6 +194,48 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     /// Override to return `true` in channels that implement streaming delivery.
     fn implements_send_delta(&self) -> bool {
         false
+    }
+
+    /// Stream a chunk of model reasoning/thinking content.
+    ///
+    /// Default is no-op. Channels with a native low-emphasis primitive
+    /// (a subordinate trace that updates in place as the model thinks)
+    /// override to render it. Streaming contract mirrors [`Self::send_delta`]:
+    /// stateful implementations should key buffers by a stream id carried in
+    /// `metadata` rather than by `chat_id` alone.
+    async fn send_reasoning_delta(
+        &self,
+        _chat_id: &str,
+        _delta: &str,
+        _metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Mark the end of a reasoning stream segment.
+    ///
+    /// Default is no-op. Channels that buffer [`Self::send_reasoning_delta`]
+    /// chunks for in-place updates use this signal to flush and freeze the
+    /// rendered group; one-shot channels can ignore it entirely.
+    async fn send_reasoning_end(
+        &self,
+        _chat_id: &str,
+        _metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        Ok(())
+    }
+
+    /// Deliver structured live file-edit events.
+    ///
+    /// Default is no-op. Channels with a rich activity surface can override
+    /// this to render editing progress without receiving empty text messages.
+    async fn send_file_edit_events(
+        &self,
+        _chat_id: &str,
+        _edits: Vec<FileEditEvent>,
+        _metadata: Option<HashMap<String, serde_json::Value>>,
+    ) -> Result<(), String> {
+        Ok(())
     }
 
     /// True when config enables streaming AND this channel implements [`send_delta`].

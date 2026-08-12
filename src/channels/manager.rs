@@ -11,7 +11,11 @@ use tokio::{
 };
 
 use crate::{
-    bus::{events::OutboundMessage, queue::MessageBus},
+    bus::{
+        events::OutboundMessage,
+        outbound_events::{OutboundEvent, ProgressKind},
+        queue::MessageBus,
+    },
     channels::{base::BaseChannel, registry::discover_all},
     config::schema::Config,
     security::workspace_requests::WorkspaceRequestHandler,
@@ -29,6 +33,54 @@ const SEND_RETRY_DELAYS_SECS: &[u64] = &[1, 2, 4];
 /// Shared channel handle. `Arc` lets the dispatcher and each channel's listen
 /// task hold the same instance (Python shares `self.channels` across tasks).
 type SharedChannel = Arc<dyn BaseChannel>;
+
+/// Per-channel resolved `send_progress`/`send_tool_hints`/`show_reasoning`,
+/// computed once at `start_all` time. Mirrors nanobot's `_build_channel`
+/// setting these as per-instance attributes (`channels/manager.py:190-197`)
+/// rather than applying one global value to every channel uniformly.
+#[derive(Debug, Clone, Copy)]
+struct ProgressOverrides {
+    send_progress: bool,
+    send_tool_hints: bool,
+    show_reasoning: bool,
+}
+
+impl Default for ProgressOverrides {
+    /// Permissive fallback for a channel name somehow missing from the
+    /// resolved map — shouldn't happen in practice (the map is built from
+    /// the same channel set `dispatch_outbound` looks up), but a defensive
+    /// default should never be `false`, which would silently and
+    /// unrecoverably swallow messages for whatever channel hit it.
+    fn default() -> Self {
+        Self {
+            send_progress: true,
+            send_tool_hints: true,
+            show_reasoning: true,
+        }
+    }
+}
+
+/// Return `key_snake` (falling back to its camelCase alias `key_camel`) from
+/// `channel_name`'s raw config section in `extra`, or `default` if the
+/// section is missing, the key is absent from both spellings, or the value
+/// isn't a JSON boolean. Mirrors nanobot's `_resolve_bool_override`
+/// (`channels/manager.py:322-338`).
+fn resolve_bool_override(
+    extra: &HashMap<String, serde_json::Value>,
+    channel_name: &str,
+    key_snake: &str,
+    key_camel: &str,
+    default: bool,
+) -> bool {
+    let Some(section) = extra.get(channel_name).and_then(|v| v.as_object()) else {
+        return default;
+    };
+    section
+        .get(key_snake)
+        .or_else(|| section.get(key_camel))
+        .and_then(|v| v.as_bool())
+        .unwrap_or(default)
+}
 
 /// Manages chat channels and coordinates message routing.
 ///
@@ -119,6 +171,41 @@ impl ChannelManager {
         channels
     }
 
+    /// Resolve `send_progress`/`send_tool_hints`/`show_reasoning` once per
+    /// channel, checking that channel's own `extra` config section before
+    /// falling back to the global `config.channels.*` default. Mirrors
+    /// `_build_channel`'s per-instance attribute assignment
+    /// (`channels/manager.py:190-197`) — "mechanism only" scope: no
+    /// dedicated `EmailConfig`/`WhatsAppConfig` fields are added, so any
+    /// channel without a matching key in `extra` (all of them today) keeps
+    /// resolving to the same global default it already uses.
+    fn resolve_progress_overrides(
+        channels: &HashMap<String, SharedChannel>,
+        config: &Config,
+    ) -> HashMap<String, ProgressOverrides> {
+        let extra = &config.channels.extra;
+        channels
+            .keys()
+            .map(|name| {
+                let overrides = ProgressOverrides {
+                    send_progress: resolve_bool_override(
+                        extra, name, "send_progress", "sendProgress",
+                        config.channels.send_progress,
+                    ),
+                    send_tool_hints: resolve_bool_override(
+                        extra, name, "send_tool_hints", "sendToolHints",
+                        config.channels.send_tool_hints,
+                    ),
+                    show_reasoning: resolve_bool_override(
+                        extra, name, "show_reasoning", "showReasoning",
+                        config.channels.show_reasoning,
+                    ),
+                };
+                (name.clone(), overrides)
+            })
+            .collect()
+    }
+
     /// Returns `Err(channel_name)` when that channel has an empty `allowFrom` list.
     fn validate_allow_from(channels: &HashMap<String, SharedChannel>) -> Result<(), String> {
         for (name, channel) in channels {
@@ -159,18 +246,10 @@ impl ChannelManager {
         // Spawn dispatcher in the background (does not block start_all).
         let bus = Arc::clone(&self.bus);
         let channels = self.channels.clone();
-        let send_progress = self.config.channels.send_progress;
-        let send_tool_hints = self.config.channels.send_tool_hints;
+        let progress_overrides = Self::resolve_progress_overrides(&self.channels, &self.config);
         let send_max_retries = self.config.channels.send_max_retries;
         let dispatch_task = tokio::spawn(async move {
-            Self::dispatch_outbound(
-                bus,
-                channels,
-                send_progress,
-                send_tool_hints,
-                send_max_retries,
-            )
-            .await;
+            Self::dispatch_outbound(bus, channels, progress_overrides, send_max_retries).await;
         });
         *self.dispatch_task.lock().await = Some(dispatch_task);
 
@@ -241,8 +320,7 @@ impl ChannelManager {
     async fn dispatch_outbound(
         bus: Arc<MessageBus>,
         channels: HashMap<String, SharedChannel>,
-        send_progress: bool,
-        send_tool_hints: bool,
+        progress_overrides: HashMap<String, ProgressOverrides>,
         send_max_retries: u8,
     ) {
         log::info!("Outbound dispatcher started.");
@@ -265,12 +343,49 @@ impl ChannelManager {
                 }
             };
 
+            // Resolved once per channel at `start_all` time; looking the
+            // channel up here (rather than at the end, as before) lets the
+            // progress/reasoning filters below use its own override instead
+            // of one global flag applied to every channel. Simplification
+            // vs. nanobot: any message — progress or not — to an unknown
+            // channel is warned about and dropped right here, rather than
+            // nanobot's split behavior (debug-only for progress messages via
+            // `_should_send_progress`'s `channel is None` branch, warning for
+            // everything else).
+            let Some(channel) = channels.get(&msg.channel) else {
+                log::warn!("Unknown channel: {}", msg.channel);
+                continue;
+            };
+            let overrides = progress_overrides
+                .get(&msg.channel)
+                .copied()
+                .unwrap_or_default();
+
+            // Reasoning-kind progress events route to their own dedicated
+            // dispatch (via `send_once`'s reasoning branch), gated on
+            // `show_reasoning` rather than `send_progress`/`send_tool_hints`.
+            // Mirrors `manager.py:680-693`.
+            if let Some(OutboundEvent::Progress(progress_event)) = &msg.event
+                && matches!(
+                    progress_event.kind,
+                    ProgressKind::ReasoningDelta
+                        | ProgressKind::ReasoningEnd
+                        | ProgressKind::Reasoning
+                )
+            {
+                if overrides.show_reasoning {
+                    let max_attempts = std::cmp::max(send_max_retries, 1);
+                    Self::send_with_retry(channel.as_ref(), msg, max_attempts).await;
+                }
+                continue;
+            }
+
             let metadata = msg.metadata.clone();
             if metadata.get("_progress").is_some() {
-                if metadata.get("_tool_hint").is_some() && !send_tool_hints {
+                if metadata.get("_tool_hint").is_some() && !overrides.send_tool_hints {
                     continue;
                 }
-                if metadata.get("_tool_hint").is_none() && !send_progress {
+                if metadata.get("_tool_hint").is_none() && !overrides.send_progress {
                     continue;
                 }
             }
@@ -284,11 +399,7 @@ impl ChannelManager {
             }
 
             let max_attempts = std::cmp::max(send_max_retries, 1);
-            if let Some(channel) = channels.get(&msg.channel) {
-                Self::send_with_retry(channel.as_ref(), msg, max_attempts).await;
-            } else {
-                log::warn!("Unknown channel: {}", msg.channel);
-            }
+            Self::send_with_retry(channel.as_ref(), msg, max_attempts).await;
         }
     }
 
@@ -394,6 +505,48 @@ impl ChannelManager {
     /// the content at all (e.g. if streaming was requested but the channel
     /// silently doesn't support it, or config/state drifts).
     async fn send_once(channel: &dyn BaseChannel, msg: OutboundMessage) -> Result<(), String> {
+        // Reasoning-kind progress events dispatch to their own methods
+        // rather than the generic `send`/`send_delta` path. Checked first —
+        // `show_reasoning` gating already happened in `dispatch_outbound`
+        // before this was called. Mirrors nanobot's per-subtype dispatch in
+        // `_send_once` (`channels/manager.py:800-823`); the one-shot
+        // `Reasoning` kind reuses the delta+end pair the way nanobot's
+        // default `send_reasoning` convenience method does (`base.py:176-198`)
+        // rather than adding a fourth trait method for it.
+        if let Some(OutboundEvent::Progress(progress_event)) = &msg.event {
+            match progress_event.kind {
+                ProgressKind::ReasoningDelta => {
+                    return channel
+                        .send_reasoning_delta(
+                            msg.chat_id.as_str(),
+                            msg.content.as_str(),
+                            Some(msg.metadata.clone()),
+                        )
+                        .await;
+                }
+                ProgressKind::ReasoningEnd => {
+                    return channel
+                        .send_reasoning_end(msg.chat_id.as_str(), Some(msg.metadata.clone()))
+                        .await;
+                }
+                ProgressKind::Reasoning => {
+                    if !msg.content.is_empty() {
+                        channel
+                            .send_reasoning_delta(
+                                msg.chat_id.as_str(),
+                                msg.content.as_str(),
+                                Some(msg.metadata.clone()),
+                            )
+                            .await?;
+                        channel
+                            .send_reasoning_end(msg.chat_id.as_str(), Some(msg.metadata.clone()))
+                            .await?;
+                    }
+                    return Ok(());
+                }
+                ProgressKind::Plain | ProgressKind::ToolHint => {}
+            }
+        }
         if msg.metadata.get("_stream_delta").is_some()
             || msg.metadata.get("_stream_end").is_some()
         {
@@ -719,6 +872,9 @@ mod tests {
         implements_delta: bool,
         send_calls: std::sync::Mutex<Vec<OutboundMessage>>,
         send_delta_calls: std::sync::Mutex<Vec<(String, String)>>,
+        send_reasoning_delta_calls: std::sync::Mutex<Vec<(String, String)>>,
+        send_reasoning_end_calls: std::sync::Mutex<Vec<String>>,
+        send_file_edit_events_calls: std::sync::Mutex<Vec<(String, usize)>>,
     }
 
     impl MockChannel {
@@ -729,6 +885,9 @@ mod tests {
                 implements_delta,
                 send_calls: std::sync::Mutex::new(Vec::new()),
                 send_delta_calls: std::sync::Mutex::new(Vec::new()),
+                send_reasoning_delta_calls: std::sync::Mutex::new(Vec::new()),
+                send_reasoning_end_calls: std::sync::Mutex::new(Vec::new()),
+                send_file_edit_events_calls: std::sync::Mutex::new(Vec::new()),
             }
         }
     }
@@ -774,6 +933,189 @@ mod tests {
         fn implements_send_delta(&self) -> bool {
             self.implements_delta
         }
+
+        async fn send_reasoning_delta(
+            &self,
+            chat_id: &str,
+            delta: &str,
+            _metadata: Option<HashMap<String, serde_json::Value>>,
+        ) -> Result<(), String> {
+            self.send_reasoning_delta_calls
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), delta.to_string()));
+            Ok(())
+        }
+
+        async fn send_reasoning_end(
+            &self,
+            chat_id: &str,
+            _metadata: Option<HashMap<String, serde_json::Value>>,
+        ) -> Result<(), String> {
+            self.send_reasoning_end_calls
+                .lock()
+                .unwrap()
+                .push(chat_id.to_string());
+            Ok(())
+        }
+
+        async fn send_file_edit_events(
+            &self,
+            chat_id: &str,
+            edits: Vec<crate::bus::outbound_events::FileEditEvent>,
+            _metadata: Option<HashMap<String, serde_json::Value>>,
+        ) -> Result<(), String> {
+            self.send_file_edit_events_calls
+                .lock()
+                .unwrap()
+                .push((chat_id.to_string(), edits.len()));
+            Ok(())
+        }
+    }
+
+    fn progress_msg(kind: ProgressKind, content: &str) -> OutboundMessage {
+        OutboundMessage {
+            event: Some(OutboundEvent::Progress(crate::bus::outbound_events::ProgressEvent {
+                kind,
+                ..Default::default()
+            })),
+            ..outbound_msg("mock", "chat1", content, HashMap::new())
+        }
+    }
+
+    #[tokio::test]
+    async fn send_once_routes_reasoning_delta_to_send_reasoning_delta() {
+        let bus = Arc::new(MessageBus::new());
+        let channel = MockChannel::new(Arc::clone(&bus), true);
+        let msg = progress_msg(ProgressKind::ReasoningDelta, "thinking...");
+
+        let result = ChannelManager::send_once(&channel, msg).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            channel.send_reasoning_delta_calls.lock().unwrap().as_slice(),
+            &[("chat1".to_string(), "thinking...".to_string())]
+        );
+        assert!(channel.send_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_once_routes_reasoning_end_to_send_reasoning_end() {
+        let bus = Arc::new(MessageBus::new());
+        let channel = MockChannel::new(Arc::clone(&bus), true);
+        let msg = progress_msg(ProgressKind::ReasoningEnd, "");
+
+        let result = ChannelManager::send_once(&channel, msg).await;
+
+        assert!(result.is_ok());
+        assert_eq!(
+            channel.send_reasoning_end_calls.lock().unwrap().as_slice(),
+            &["chat1".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn send_once_reasoning_kind_sends_delta_then_end() {
+        let bus = Arc::new(MessageBus::new());
+        let channel = MockChannel::new(Arc::clone(&bus), true);
+        let msg = progress_msg(ProgressKind::Reasoning, "full reasoning block");
+
+        let result = ChannelManager::send_once(&channel, msg).await;
+
+        assert!(result.is_ok());
+        assert_eq!(channel.send_reasoning_delta_calls.lock().unwrap().len(), 1);
+        assert_eq!(channel.send_reasoning_end_calls.lock().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_once_reasoning_kind_skips_empty_content() {
+        let bus = Arc::new(MessageBus::new());
+        let channel = MockChannel::new(Arc::clone(&bus), true);
+        let msg = progress_msg(ProgressKind::Reasoning, "");
+
+        let result = ChannelManager::send_once(&channel, msg).await;
+
+        assert!(result.is_ok());
+        assert!(channel.send_reasoning_delta_calls.lock().unwrap().is_empty());
+        assert!(channel.send_reasoning_end_calls.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_once_plain_and_tool_hint_progress_still_go_through_send() {
+        let bus = Arc::new(MessageBus::new());
+        let channel = MockChannel::new(Arc::clone(&bus), true);
+        let msg = progress_msg(ProgressKind::ToolHint, "read_file(...)");
+
+        let result = ChannelManager::send_once(&channel, msg).await;
+
+        assert!(result.is_ok());
+        assert_eq!(channel.send_calls.lock().unwrap().len(), 1);
+        assert!(channel.send_reasoning_delta_calls.lock().unwrap().is_empty());
+    }
+
+    // --- resolve_bool_override / resolve_progress_overrides ---
+
+    #[test]
+    fn resolve_bool_override_falls_back_to_default_when_section_missing() {
+        let extra = HashMap::new();
+        assert!(resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+        assert!(!resolve_bool_override(&extra, "email", "send_progress", "sendProgress", false));
+    }
+
+    #[test]
+    fn resolve_bool_override_reads_snake_case_key() {
+        let mut extra = HashMap::new();
+        extra.insert("email".to_string(), json!({"send_progress": false}));
+        assert!(!resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+    }
+
+    #[test]
+    fn resolve_bool_override_falls_back_to_camel_case_alias() {
+        let mut extra = HashMap::new();
+        extra.insert("email".to_string(), json!({"sendProgress": false}));
+        assert!(!resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+    }
+
+    #[test]
+    fn resolve_bool_override_ignores_non_bool_value() {
+        let mut extra = HashMap::new();
+        extra.insert("email".to_string(), json!({"send_progress": "nope"}));
+        assert!(resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+    }
+
+    #[test]
+    fn resolve_progress_overrides_falls_back_to_global_for_channels_without_a_section() {
+        let bus = Arc::new(MessageBus::new());
+        let mut channels: HashMap<String, SharedChannel> = HashMap::new();
+        channels.insert("email".to_string(), Arc::new(MockChannel::new(bus, true)));
+        let mut config = Config::default();
+        config.channels.send_progress = false;
+        config.channels.send_tool_hints = true;
+        config.channels.show_reasoning = false;
+
+        let overrides = ChannelManager::resolve_progress_overrides(&channels, &config);
+
+        let email = overrides.get("email").unwrap();
+        assert!(!email.send_progress);
+        assert!(email.send_tool_hints);
+        assert!(!email.show_reasoning);
+    }
+
+    #[test]
+    fn resolve_progress_overrides_per_channel_section_wins_over_global() {
+        let bus = Arc::new(MessageBus::new());
+        let mut channels: HashMap<String, SharedChannel> = HashMap::new();
+        channels.insert("websocket".to_string(), Arc::new(MockChannel::new(bus, true)));
+        let mut config = Config::default();
+        config.channels.send_progress = true;
+        config
+            .channels
+            .extra
+            .insert("websocket".to_string(), json!({"sendProgress": false}));
+
+        let overrides = ChannelManager::resolve_progress_overrides(&channels, &config);
+
+        assert!(!overrides.get("websocket").unwrap().send_progress);
     }
 
     #[tokio::test]

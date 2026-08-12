@@ -870,7 +870,7 @@ impl BaseChannel for WhatsAppChannel {
                                 continue;
                             }
                             let is_dm = Self::is_dm_message(&msg.metadata);
-                            self.handle_message(
+                            let res = self.handle_message(
                                 &msg.sender_id,
                                 &msg.chat_id,
                                 &msg.content,
@@ -881,6 +881,9 @@ impl BaseChannel for WhatsAppChannel {
                                 None,
                             )
                             .await;
+                            if let Err(e) = res {
+                                log::error!("Error handling WhatsApp message: {e}");
+                            }
                         }
                         None => {
                             // Event handler dropped — stop listening.

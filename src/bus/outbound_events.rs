@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use serde::Serialize;
 use serde_json::Value;
 
 use crate::bus::events::OutboundMessage;
@@ -16,7 +17,7 @@ pub enum ProgressKind {
 }
 
 /// Telemetry entry aligned with `AgentRunResult::tool_events` (`name`/`status`/`detail`).
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct ToolEvent {
     pub name: String,
     pub status: String,
