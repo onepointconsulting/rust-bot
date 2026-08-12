@@ -10,12 +10,16 @@ use std::sync::{Arc, Mutex as StdMutex};
 use crate::agent::cron_context::with_cron_context_stack;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
+use crate::api::login::{GatewayApiDoc, LoginState, jwt_auth_state_from_config, login};
 use crate::api::rest::ApiServer;
+use crate::api::rest::build_cors_layer;
 use crate::api::rest::create_api_server;
 use crate::api::user_registry::JsonUserRegistry;
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
 use crate::channels::manager::ChannelManager;
+use crate::channels::websocket::runtime::WebSocketChannel;
+use crate::channels::websocket::types::WebSocketConfig;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
 use crate::cli::cancel::wait_for_escape_cancel;
 use crate::cli::onboard::run_onboard;
@@ -32,8 +36,13 @@ use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
 use crate::utils::evaluator::evaluate_response;
 
 use anstyle::{AnsiColor, Color, Style};
+use axum::Router;
+use axum::routing::post;
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
+use tokio::net::TcpListener;
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 use reedline::{
     EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Prompt, PromptEditMode,
     PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal,
@@ -178,6 +187,18 @@ pub struct GatewayArgs {
     /// JSON configuration file path
     #[arg(short, long)]
     pub config: PathBuf,
+
+    /// Bind address for the combined login + WebSocket gateway server.
+    /// Overrides `gateway.host`. Only relevant when a `"websocket"` channel
+    /// is declared in the config — otherwise nothing binds this port.
+    #[arg(long)]
+    pub host: Option<String>,
+
+    /// Port for the combined login + WebSocket gateway server. Overrides
+    /// `gateway.port`. Only relevant when a `"websocket"` channel is
+    /// declared in the config — otherwise nothing binds this port.
+    #[arg(long)]
+    pub port: Option<u16>,
 }
 
 #[derive(Debug, Parser)]
@@ -511,8 +532,113 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// `None` when `channels.websocket` is absent, malformed, or `enabled: false`
+/// — [`run_gateway`]'s combined login+WebSocket server only starts when this
+/// returns `Some`. `WebSocketConfig::default().enabled` is `true`, so the
+/// check has to be "is the `websocket` key present in `extra` at all" (mirrors
+/// `registry::discover_all`'s own `.get(name)` pattern for email/whatsapp),
+/// not merely "is it disabled" — a config that never mentions `websocket`
+/// must not silently start a server nobody asked for.
+///
+/// Not routed through `discover_all`/`BUILTIN_CHANNELS`: that function
+/// returns type-erased `Box<dyn BaseChannel>`, but `run_gateway` needs the
+/// *concrete* `WebSocketChannel` to call its inherent `.router()` method.
+fn resolve_websocket_channel(
+    config: &Config,
+    bus: Arc<MessageBus>,
+    session_manager: Arc<StdMutex<SessionManager>>,
+    workspace_request_handler: WorkspaceRequestHandler,
+) -> Option<Arc<WebSocketChannel>> {
+    let raw = config.channels.extra.get("websocket")?.clone();
+    let cfg: WebSocketConfig = serde_json::from_value(raw)
+        .inspect_err(|err| log::error!("Invalid \"websocket\" channel config: {err}"))
+        .ok()?;
+    if !cfg.enabled {
+        return None;
+    }
+    Some(Arc::new(WebSocketChannel::new(
+        cfg,
+        bus,
+        config.channels.clone(),
+        session_manager,
+        workspace_request_handler,
+    )))
+}
+
+/// Wait for the given channel's shutdown signal — the same `Arc<Notify>`
+/// [`BaseChannel::stop`] fires — so the combined server's `axum::serve(...)`
+/// can shut down gracefully alongside the rest of the gateway.
+async fn wait_for_websocket_shutdown(ws_channel: Arc<WebSocketChannel>) {
+    ws_channel.shutdown_signal().notified().await;
+}
+
+/// Build and serve the combined login + WebSocket gateway server on one
+/// port: `POST /v1/login` (documented via its own minimal Swagger doc) plus
+/// `ws_channel`'s upgrade route, sharing one `axum::serve` call. Every
+/// minted token carries `purpose: "webui"` unconditionally — this server's
+/// only real client is the forthcoming websockets-chat UI.
+///
+/// Reuses `ws_channel`'s own `WebSocketConfig.jwt` for minting (already
+/// validated at config-load time to have `aud == path`, so a token minted
+/// here satisfies the same channel's `authorize()` check with no new JWT
+/// config section) and `config.api.users_file` for credentials, so
+/// websockets-chat and web-chat share one user base.
+async fn serve_combined_login_and_gateway(
+    config: &Config,
+    ws_channel: &Arc<WebSocketChannel>,
+    host: &str,
+    port: u16,
+) -> std::io::Result<()> {
+    let login_state = Arc::new(LoginState {
+        jwt_auth: jwt_auth_state_from_config(&ws_channel_jwt(ws_channel)),
+        user_registry: Arc::new(StdMutex::new(open_or_empty_user_registry(
+            &config.api.users_file,
+        ))),
+        token_purpose: "webui".to_string(),
+    });
+    let login_router = Router::new()
+        .route("/v1/login", post(login))
+        .with_state(login_state);
+
+    let app: Router = login_router
+        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", GatewayApiDoc::openapi()))
+        .layer(build_cors_layer(&config.api.cors))
+        .merge(ws_channel.router());
+
+    let addr = format!("{host}:{port}");
+    let listener = TcpListener::bind(&addr).await?;
+    log::info!("Gateway login + WebSocket server listening on http://{addr}");
+    log::info!("Swagger UI available at http://{addr}/swagger-ui");
+
+    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
+        .with_graceful_shutdown(wait_for_websocket_shutdown(Arc::clone(ws_channel)))
+        .await
+}
+
+/// `ws_channel`'s `WebSocketConfig.jwt` isn't exposed directly (only via the
+/// `WsShared` snapshot built per-router-call) — reading it through `shared()`
+/// keeps this file from needing a dedicated accessor on `WebSocketChannel`
+/// just for this one field.
+fn ws_channel_jwt(ws_channel: &Arc<WebSocketChannel>) -> crate::config::schema::JwtConfig {
+    ws_channel.shared().jwt
+}
+
+/// Mirrors `run_api`'s own open-or-empty fallback so the combined gateway
+/// server's login shares the exact same credential-file semantics as the
+/// REST API's `/v1/login`.
+fn open_or_empty_user_registry(users_file: &str) -> JsonUserRegistry {
+    let path: PathBuf = users_file.into();
+    if path.exists() {
+        JsonUserRegistry::open(path).unwrap()
+    } else {
+        JsonUserRegistry::empty()
+    }
+}
+
 async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     init_runtime_logging(true, Some(args.verbose));
+    let host_override = args.host.clone();
+    let port_override = args.port;
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
     let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone()));
     let session_manager = agent_loop.session_manager.clone();
@@ -646,12 +772,25 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
 
     // Create the channel manager
     let config = Arc::new(config);
-    let channels = Arc::new(ChannelManager::new(
+    // `None` unless a `"websocket"` section is actually declared in config —
+    // see `resolve_websocket_channel`'s doc comment.
+    let ws_channel = resolve_websocket_channel(
+        &config,
+        Arc::clone(&agent_loop.bus()),
+        Arc::clone(&session_manager),
+        agent_loop.workspace_request_handler(),
+    );
+    let mut channel_manager = ChannelManager::new(
         Arc::clone(&config),
         Arc::clone(&agent_loop.bus()),
         Arc::clone(&session_manager),
         agent_loop.workspace_request_handler(),
-    ));
+    );
+    if let Some(ws_channel) = &ws_channel {
+        channel_manager = channel_manager
+            .register_channel("websocket", Arc::clone(ws_channel) as Arc<dyn BaseChannel>);
+    }
+    let channels = Arc::new(channel_manager);
 
     /// Pick a routable channel/chat target for heartbeat-triggered messages.
     async fn pick_heartbeat_target(
@@ -782,6 +921,9 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let green = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green)));
     let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
 
+    let gateway_host = host_override.unwrap_or_else(|| config.gateway.host.clone());
+    let gateway_port = port_override.unwrap_or(config.gateway.port);
+
     let enabled = channels.get_enabled_channels();
     if !enabled.is_empty() {
         println!(
@@ -862,6 +1004,24 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         );
     }
 
+    // Combined login + WebSocket REST server (only when channels.websocket is present).
+    if ws_channel.is_some() {
+        let display_host = replace_host(&gateway_host);
+        let base_url = format!("http://{display_host}:{gateway_port}");
+        println!(
+            "{}✓{} Gateway: {}",
+            green.render(),
+            green.render_reset(),
+            base_url
+        );
+        println!(
+            "{}✓{} Swagger UI: {}/swagger-ui",
+            green.render(),
+            green.render_reset(),
+            base_url
+        );
+    }
+
     // Python: async def run() / try / gather / finally shutdown
     let red = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red)));
 
@@ -873,8 +1033,31 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let mut gather = tokio::spawn({
         let agent_loop = Arc::clone(&agent_loop);
         let channels = Arc::clone(&channels);
+        let config = Arc::clone(&config);
+        let ws_channel = ws_channel.clone();
         async move {
-            tokio::join!(agent_loop.run(), channels.start_all());
+            // A no-op, never-resolving branch when no `"websocket"` channel
+            // was declared — keeps this a fixed 3-way join (so the
+            // select!/abort shutdown handling below doesn't change shape)
+            // without binding a port nobody asked for.
+            let maybe_serve = async move {
+                match &ws_channel {
+                    Some(ws_channel) => {
+                        if let Err(err) = serve_combined_login_and_gateway(
+                            &config,
+                            ws_channel,
+                            &gateway_host,
+                            gateway_port,
+                        )
+                        .await
+                        {
+                            log::error!("Combined login + WebSocket gateway server failed: {err}");
+                        }
+                    }
+                    None => std::future::pending::<()>().await,
+                }
+            };
+            tokio::join!(agent_loop.run(), channels.start_all(), maybe_serve);
         }
     });
 
@@ -1465,5 +1648,96 @@ mod tests {
         let captures = vec!["content".to_string()];
         let text = replace_text_sentinels(&line, &captures);
         assert_eq!(text, "a content b");
+    }
+
+    // --- resolve_websocket_channel ---
+    // Covers the three declaration states this plan turn was specifically
+    // about: key absent (never start), key present but disabled (never
+    // start), key present and enabled (start).
+
+    fn test_bus() -> Arc<MessageBus> {
+        Arc::new(MessageBus::new())
+    }
+
+    fn test_session_manager() -> Arc<StdMutex<SessionManager>> {
+        let dir = tempfile::tempdir().unwrap();
+        Arc::new(StdMutex::new(SessionManager::new(dir.keep())))
+    }
+
+    fn test_workspace_request_handler() -> WorkspaceRequestHandler {
+        WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true)
+    }
+
+    #[test]
+    fn resolve_websocket_channel_is_none_when_key_absent() {
+        let config = Config::default();
+        assert!(config.channels.extra.get("websocket").is_none());
+
+        let resolved = resolve_websocket_channel(
+            &config,
+            test_bus(),
+            test_session_manager(),
+            test_workspace_request_handler(),
+        );
+
+        assert!(
+            resolved.is_none(),
+            "a config that never mentions \"websocket\" must not start the combined server, \
+             even though WebSocketConfig::default().enabled is true"
+        );
+    }
+
+    #[test]
+    fn resolve_websocket_channel_is_none_when_present_but_disabled() {
+        let mut config = Config::default();
+        config
+            .channels
+            .extra
+            .insert("websocket".to_string(), serde_json::json!({"enabled": false}));
+
+        let resolved = resolve_websocket_channel(
+            &config,
+            test_bus(),
+            test_session_manager(),
+            test_workspace_request_handler(),
+        );
+
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_websocket_channel_is_some_when_present_and_enabled() {
+        let mut config = Config::default();
+        config
+            .channels
+            .extra
+            .insert("websocket".to_string(), serde_json::json!({"enabled": true}));
+
+        let resolved = resolve_websocket_channel(
+            &config,
+            test_bus(),
+            test_session_manager(),
+            test_workspace_request_handler(),
+        );
+
+        assert!(resolved.is_some());
+    }
+
+    #[test]
+    fn resolve_websocket_channel_is_none_when_malformed() {
+        let mut config = Config::default();
+        config
+            .channels
+            .extra
+            .insert("websocket".to_string(), serde_json::json!({"port": "not-a-number"}));
+
+        let resolved = resolve_websocket_channel(
+            &config,
+            test_bus(),
+            test_session_manager(),
+            test_workspace_request_handler(),
+        );
+
+        assert!(resolved.is_none());
     }
 }

@@ -134,6 +134,23 @@ impl ChannelManager {
         }
     }
 
+    /// Register an additional channel for *outbound* dispatch only, beyond
+    /// whatever [`Self::new`] discovered via [`discover_all`]. Builder-style
+    /// (`mut self -> Self`) so callers chain it right after `new(...)`
+    /// before wrapping the manager in an `Arc`.
+    ///
+    /// Exists because [`discover_all`] returns type-erased `Box<dyn
+    /// BaseChannel>`, which loses the concrete type some channels need
+    /// downstream (e.g. `WebSocketChannel::router()`, an inherent method
+    /// outside the `BaseChannel` trait). Callers that need the concrete type
+    /// construct the channel themselves and register it here instead of
+    /// going through `discover_all`/`BUILTIN_CHANNELS` — generic over any
+    /// channel, not websocket-specific.
+    pub fn register_channel(mut self, name: impl Into<String>, channel: SharedChannel) -> Self {
+        self.channels.insert(name.into(), channel);
+        self
+    }
+
     fn resolve_transcription_key(config: &Config, provider: Option<&str>) -> String {
         match provider {
             Some("groq") => config.providers.groq.api_key.clone(),
@@ -1200,6 +1217,35 @@ mod tests {
         );
         assert!(manager.get_channel("email").is_some());
         assert!(manager.get_channel("missing").is_none());
+    }
+
+    #[test]
+    fn register_channel_adds_to_existing_discovered_set() {
+        let config = config_with_email(true);
+        let bus = Arc::new(MessageBus::new());
+        let manager = ChannelManager::new(
+            Arc::new(config), Arc::clone(&bus), test_session_manager(), test_workspace_request_handler(),
+        )
+        .register_channel("websocket", Arc::new(MockChannel::new(bus, true)));
+
+        assert!(manager.get_channel("email").is_some());
+        assert!(manager.get_channel("websocket").is_some());
+    }
+
+    #[test]
+    fn register_channel_overwrites_existing_name() {
+        let config = config_with_email(true);
+        let bus = Arc::new(MessageBus::new());
+        let replacement = Arc::new(MockChannel::new(Arc::clone(&bus), true));
+        let manager = ChannelManager::new(
+            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+        )
+        .register_channel("email", Arc::clone(&replacement) as Arc<dyn BaseChannel>);
+
+        assert!(Arc::ptr_eq(
+            &manager.get_channel("email").unwrap(),
+            &(replacement as Arc<dyn BaseChannel>)
+        ));
     }
 
     #[tokio::test]

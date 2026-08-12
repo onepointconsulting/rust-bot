@@ -23,12 +23,13 @@ use utoipa::{Modify, OpenApi};
 use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
-use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
-use crate::api::user_registry::{User, UserRegistry, verify_password};
-use crate::config::schema::{CorsConfig, JwtConfig};
-use crate::security::jwt::{
-    DEFAULT_EXPIRES_IN_MONTHS, JwtValidationOpts, generate_jwt_token, validate_jwt_token,
+use crate::api::login::{
+    JwtAuthState, LoginState, __path_login, jwt_auth_state_from_config, login,
 };
+use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
+use crate::api::user_registry::UserRegistry;
+use crate::config::schema::{CorsConfig, JwtConfig};
+use crate::security::jwt::validate_jwt_token;
 use crate::{
     agent::agent_loop::AgentLoop,
     agent::tools::message::MessageTool,
@@ -72,52 +73,20 @@ struct AppState {
     session_id: String,
     model_name: String,
     timeout: Duration,
-    /// When `Some`, JWT auth is required on protected routes.
+    /// When `Some`, JWT auth is required on protected routes. `login`
+    /// (mounted separately via its own `LoginState`) doesn't read this —
+    /// only `jwt_auth_middleware`'s bearer-token *validation* does.
     jwt_auth: Option<JwtAuthState>,
-    pub user_registry: Arc<Mutex<dyn UserRegistry + Send>>,
-}
-
-#[derive(Clone)]
-struct JwtAuthState {
-    public_key_pem: Arc<Vec<u8>>,
-    private_key_path: String,
-    opts: JwtValidationOpts,
 }
 
 impl From<ApiServer> for AppState {
     fn from(server: ApiServer) -> Self {
-        let jwt_auth = if server.jwt.enabled {
-            let public_key_pem = std::fs::read(&server.jwt.public_key_path).unwrap_or_else(|e| {
-                panic!(
-                    "JWT enabled but failed to read public key '{}': {e}",
-                    server.jwt.public_key_path
-                );
-            });
-            if server.jwt.aud.trim().is_empty() {
-                panic!("JWT enabled but api.jwt.aud is empty");
-            }
-            if server.jwt.private_key_path.trim().is_empty() {
-                panic!("JWT enabled but api.jwt.private_key_path is empty");
-            }
-            Some(JwtAuthState {
-                public_key_pem: Arc::new(public_key_pem),
-                private_key_path: server.jwt.private_key_path.clone(),
-                opts: JwtValidationOpts {
-                    iss: server.jwt.iss.clone(),
-                    aud: server.jwt.aud.clone(),
-                },
-            })
-        } else {
-            None
-        };
-
         Self {
+            jwt_auth: jwt_auth_state_from_config(&server.jwt),
             agent_loop: server.agent_loop,
             session_id: server.session_id,
             model_name: server.model_name,
             timeout: Duration::from_secs(server.timeout),
-            jwt_auth,
-            user_registry: server.user_registry,
         }
     }
 }
@@ -183,7 +152,7 @@ impl ApiError {
         }
     }
 
-    fn unauthorized(message: impl Into<String>) -> Self {
+    pub(crate) fn unauthorized(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::UNAUTHORIZED,
             message: message.into(),
@@ -199,7 +168,7 @@ impl ApiError {
         }
     }
 
-    fn internal(message: impl Into<String>) -> Self {
+    pub(crate) fn internal(message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             message: message.into(),
@@ -529,88 +498,6 @@ async fn example_prompts(State(state): State<Arc<AppState>>) -> Json<ExampleProm
     })
 }
 
-/// Authenticate with email/password, mint a fresh JWT, best-effort persist it
-/// in the user registry, and return it. Persistence failures (e.g. read-only
-/// FS) are logged and do not fail the login.
-#[utoipa::path(
-    post,
-    path = "/v1/login",
-    request_body = ChatLoginRequest,
-    responses(
-        (status = 200, description = "Freshly minted JWT for the user", body = ChatLoginResponse),
-        (status = 401, description = "Unauthorized"),
-        (status = 500, description = "Internal server error"),
-    ),
-    tag = "security"
-)]
-async fn login(
-    State(state): State<Arc<AppState>>,
-    Json(request): Json<ChatLoginRequest>,
-) -> Result<Json<ChatLoginResponse>, ApiError> {
-    let unauthorized = || ApiError::unauthorized("Invalid email or password");
-    let jwt = state
-        .jwt_auth
-        .as_ref()
-        .ok_or_else(|| ApiError::internal("JWT is not enabled; cannot mint login tokens"))?;
-
-    // Copy credentials out so Argon2 does not hold the registry lock.
-    let password_hash = {
-        let registry = state
-            .user_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let user = registry
-            .get_user_by_email(&request.email)
-            .map_err(|_| unauthorized())?;
-        user.password_hash.ok_or_else(unauthorized)?
-    };
-
-    let password = request.password.clone();
-    let password_hash_for_verify = password_hash.clone();
-    let valid = tokio::task::spawn_blocking(move || {
-        verify_password(&password, &password_hash_for_verify).unwrap_or(false)
-    })
-    .await
-    .map_err(|_| ApiError::internal("Password verification task failed"))?;
-
-    if !valid {
-        return Err(unauthorized());
-    }
-
-    let private_key_path = jwt.private_key_path.clone();
-    let iss = jwt.opts.iss.clone();
-    let aud = jwt.opts.aud.clone();
-    let minted = tokio::task::spawn_blocking(move || {
-        generate_jwt_token(private_key_path, iss, aud, "", DEFAULT_EXPIRES_IN_MONTHS)
-    })
-    .await
-    .map_err(|_| ApiError::internal("Token minting task failed"))?
-    .map_err(|err| ApiError::internal(format!("Failed to mint JWT: {err}")))?;
-
-    {
-        let mut registry = state
-            .user_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        if let Err(err) = registry.update_user(
-            &request.email,
-            &User {
-                email: request.email.clone(),
-                password_hash: Some(password_hash),
-                token: minted.token.clone(),
-            },
-        ) {
-            // Registry persistence is bookkeeping only; auth does not consult it.
-            // Read-only mounts (common in containers) should not fail login.
-            log::warn!("Failed to persist login token for {}: {err}", request.email);
-        }
-    }
-
-    Ok(Json(ChatLoginResponse {
-        token: minted.token,
-    }))
-}
-
 async fn shutdown_signal() {
     if tokio::signal::ctrl_c().await.is_ok() {
         log::info!("Shutdown signal received, stopping API server...");
@@ -622,7 +509,7 @@ async fn shutdown_signal() {
 /// - `enabled: false` → no CORS headers (empty layer).
 /// - `origins` empty or containing `"*"` → allow any origin.
 /// - otherwise → allow only the listed origins.
-fn build_cors_layer(cors: &CorsConfig) -> CorsLayer {
+pub(crate) fn build_cors_layer(cors: &CorsConfig) -> CorsLayer {
     if !cors.enabled {
         return CorsLayer::new();
     }
@@ -661,6 +548,21 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
 
     agent_loop.connect_mcp().await;
 
+    // Login gets its own, independently-`with_state`'d sub-router (mirrors
+    // how `SwaggerUi::new(...)` below is already merged in fully-stated,
+    // ahead of the outer router's own deferred `.with_state(state)`) so the
+    // `login` handler itself stays state-shape-agnostic and is reusable
+    // as-is by the combined gateway server (`cli::commands::run_gateway`),
+    // which has no `AppState` at all.
+    let login_state = Arc::new(LoginState {
+        jwt_auth: jwt_auth_state_from_config(&server.jwt),
+        user_registry: Arc::clone(&server.user_registry),
+        token_purpose: String::new(),
+    });
+    let login_router = Router::new()
+        .route("/v1/login", post(login))
+        .with_state(login_state);
+
     let state = Arc::new(AppState::from(server));
 
     let protected = Router::new()
@@ -675,7 +577,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
 
     let mut app = Router::new()
         .route("/health", get(health))
-        .route("/v1/login", post(login))
+        .merge(login_router)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected)
         .layer(build_cors_layer(&cors))

@@ -18,10 +18,7 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
-use tokio::{
-    net::TcpListener,
-    sync::{Mutex as AsyncMutex, Notify, mpsc},
-};
+use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use uuid::Uuid;
 
 use crate::channels::base::handle_message;
@@ -1006,11 +1003,13 @@ async fn send_goal_status(
 /// connected clients over `axum`'s `ws` feature (a thin wrapper around
 /// `tokio-tungstenite`).
 ///
+/// This channel's inbound HTTP serving is owned externally by
+/// `cli::commands::run_gateway` (see [`Self::start`]'s doc comment) rather
+/// than by this struct's own `start()`, so that login and live WS traffic
+/// can share one port.
+///
 /// Not yet wired: `unix_socket_path`-style local-socket serving, TLS via
-/// `ssl_certfile`/`ssl_keyfile` (would need `axum-server`'s TLS acceptor),
-/// streaming deltas (`send_delta`), and the typed JSON envelope protocol
-/// nanobot layers on top of [`parse_inbound_payload`] for non-chat control
-/// messages.
+/// `ssl_certfile`/`ssl_keyfile` (would need `axum-server`'s TLS acceptor).
 pub struct WebSocketChannel {
     base: BaseChannelCommon,
     channels_config: ChannelsConfig,
@@ -1119,7 +1118,11 @@ impl WebSocketChannel {
         payload
     }
 
-    fn shared(&self) -> WsShared {
+    /// Snapshot of shared state for axum handlers. `pub(crate)` so the
+    /// combined login+gateway server (`cli::commands::run_gateway`) can
+    /// build its own router around [`Self::router`] without needing this
+    /// channel to own the listener — see [`Self::start`]'s doc comment.
+    pub(crate) fn shared(&self) -> WsShared {
         WsShared {
             name: self.name(),
             bus: Arc::clone(&self.base.bus),
@@ -1135,10 +1138,21 @@ impl WebSocketChannel {
         }
     }
 
-    fn router(&self) -> Router {
+    /// The `/ws`-style upgrade route, fully `with_state`'d (`Router<()>`) so
+    /// it can be `.merge()`d directly into another server's router — see
+    /// [`Self::start`]'s doc comment for why this channel doesn't bind its
+    /// own listener when run via the combined gateway server.
+    pub(crate) fn router(&self) -> Router {
         Router::new()
             .route(&self.config.path, get(ws_upgrade_handler))
             .with_state(self.shared())
+    }
+
+    /// Clone of the shutdown signal [`BaseChannel::stop`] fires, so an
+    /// externally-owned `axum::serve(...)` (built around [`Self::router`])
+    /// can wait on the same signal this channel's own `start()` does.
+    pub(crate) fn shutdown_signal(&self) -> Arc<Notify> {
+        Arc::clone(&self.shutdown)
     }
 }
 
@@ -1172,39 +1186,24 @@ impl BaseChannel for WebSocketChannel {
         self.base.transcription_api_key = key;
     }
 
+    /// Registered with `ChannelManager` purely for *outbound* dispatch
+    /// (`send`/`send_delta`/etc., routed by `ChannelManager::dispatch_outbound`
+    /// looking this channel up by name) — it does **not** bind a listener or
+    /// serve HTTP itself. Unlike every other `BaseChannel` implementor, the
+    /// actual inbound HTTP/WS serving for this channel is owned externally:
+    /// `cli::commands::run_gateway` builds one combined `axum` server (this
+    /// channel's [`Self::router`] merged with the gateway's login route) and
+    /// calls `axum::serve` exactly once, so login and live WS traffic share
+    /// one port. This method just marks the channel running and waits for
+    /// [`BaseChannel::stop`]'s shutdown signal, matching the "long-running
+    /// task per channel" shape `ChannelManager::start_all`'s `JoinSet`
+    /// expects from every registered channel.
     async fn start(&self) {
         if !self.config.enabled {
             return;
         }
-
-        let addr = format!("{}:{}", self.config.host, self.config.port);
-        let listener = match TcpListener::bind(&addr).await {
-            Ok(listener) => listener,
-            Err(e) => {
-                log::error!("WebSocket channel: failed to bind {addr}: {e}");
-                return;
-            }
-        };
-
         self.base.running.store(true, Ordering::Relaxed);
-        log::info!(
-            "WebSocket channel listening on ws://{addr}{}",
-            self.config.path
-        );
-
-        let app = self.router();
-        let shutdown_signal = Arc::clone(&self.shutdown);
-        let shutdown = async move { shutdown_signal.notified().await };
-        if let Err(e) = axum::serve(
-            listener,
-            app.into_make_service_with_connect_info::<SocketAddr>(),
-        )
-        .with_graceful_shutdown(shutdown)
-        .await
-        {
-            log::error!("WebSocket channel: server error: {e}");
-        }
-
+        self.shutdown.notified().await;
         // Mirrors nanobot's `stop()` clearing `_subs`/`_conn_chats`/etc. once
         // the server task is confirmed stopped, so a later `start()` (e.g.
         // after a restart) never inherits stale registry entries.
@@ -2358,5 +2357,64 @@ mod tests {
     #[tokio::test]
     async fn implements_send_delta_is_true() {
         assert!(BaseChannel::implements_send_delta(&test_channel()));
+    }
+
+    // --- start() / stop() / shutdown_signal() / router() ---
+    // `start()` no longer binds a `TcpListener` (that's owned externally by
+    // `cli::commands::run_gateway`), so it's testable here without a real
+    // socket: it should mark the channel running, block until `stop()`'s
+    // shutdown signal fires, then mark it not-running again.
+
+    #[tokio::test]
+    async fn start_waits_for_shutdown_signal_then_stops_and_clears_connections() {
+        let channel = Arc::new(test_channel());
+        let (tx, _rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+
+        assert!(!BaseChannel::running(channel.as_ref()));
+
+        let channel_for_start = Arc::clone(&channel);
+        let start_handle = tokio::spawn(async move {
+            BaseChannel::start(channel_for_start.as_ref()).await;
+        });
+
+        // Poll briefly until `start()` has flipped `running` to true (it does
+        // so before awaiting the shutdown signal).
+        for _ in 0..100 {
+            if BaseChannel::running(channel.as_ref()) {
+                break;
+            }
+            tokio::task::yield_now().await;
+        }
+        assert!(BaseChannel::running(channel.as_ref()));
+
+        BaseChannel::stop(channel.as_ref()).await;
+        start_handle.await.unwrap();
+
+        assert!(!BaseChannel::running(channel.as_ref()));
+        assert!(
+            channel.connections.lock().await.senders_for_chat("chat-1").is_empty(),
+            "connections must be cleared once start() observes shutdown"
+        );
+    }
+
+    #[test]
+    fn shutdown_signal_shares_the_same_notify_stop_uses() {
+        let channel = test_channel();
+        // Same `Arc<Notify>` allocation as `self.shutdown` — pointer equality
+        // confirms an externally-owned `axum::serve` shutdown future waiting
+        // on this accessor observes the exact signal `BaseChannel::stop` fires.
+        assert!(Arc::ptr_eq(&channel.shutdown_signal(), &channel.shutdown));
+    }
+
+    #[test]
+    fn router_mounts_the_configured_path() {
+        let channel = test_channel();
+        let router = channel.router();
+        // `Router` doesn't expose its route table for direct inspection, but
+        // building it at all (with `.with_state` already applied, i.e.
+        // `Router<()>`) is what `run_gateway` needs to `.merge()` it into the
+        // combined server — this is a compile-and-construct smoke test.
+        let _: Router = router;
     }
 }

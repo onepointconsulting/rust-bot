@@ -38,3 +38,5 @@ credentials/
 Python
 .rust-bot/
 *.py
+
+workspace

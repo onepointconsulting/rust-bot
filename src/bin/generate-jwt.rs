@@ -2,15 +2,19 @@ use std::path::PathBuf;
 use std::process::ExitCode;
 
 use clap::{Parser, Subcommand};
-use rust_bot::api::user_registry::{hash_password, JsonUserRegistry, User, UserRegistry};
+use rust_bot::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_password};
+use rust_bot::channels::websocket::types::WebSocketConfig;
 use rust_bot::config::loader::{load_config, save_config};
 use rust_bot::security::jwt::{
-    generate_jwt_keypair, generate_jwt_token, DEFAULT_EXPIRES_IN_MONTHS,
+    DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_keypair, generate_jwt_token,
 };
 use rust_bot::utils::exit_codes::{self, GENERAL_ERROR};
 
 #[derive(Debug, Parser)]
-#[command(name = "generate-jwt", about = "Generate Ed25519 JWT keypairs and tokens")]
+#[command(
+    name = "generate-jwt",
+    about = "Generate Ed25519 JWT keypairs and tokens"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -140,10 +144,7 @@ fn run_generate_keypair(
 
     eprintln!("Wrote private key: {}", private_key_path.display());
     eprintln!("Wrote public key:  {}", public_key_path.display());
-    eprintln!(
-        "Updated api.jwt key paths in {}",
-        config_path.display()
-    );
+    eprintln!("Updated api.jwt key paths in {}", config_path.display());
     Ok(())
 }
 
@@ -178,13 +179,39 @@ fn run_generate_token(
     })?;
     // Canonicalize after register_user so the file exists on disk.
     config.api.users_file = path_for_config(users_file).display().to_string();
+
+    let websocket_config = WebSocketConfig::default();
+    if !config.channels.extra.contains_key("websocket") {
+        config.channels.extra.insert(
+            "websocket".to_string(),
+            serde_json::json!({
+                "enabled": websocket_config.enabled,
+                "host": websocket_config.host,
+                "port": websocket_config.port,
+                "path": websocket_config.path,
+                "jwt": serde_json::json!({
+                    "enabled": true,
+                    "privateKeyPath": config.api.jwt.private_key_path,
+                    "publicKeyPath": config.api.jwt.public_key_path,
+                    "iss": config.api.jwt.iss,
+                    "aud": websocket_config.path,
+                }),
+                "allowFrom": websocket_config.allow_from,
+                "streaming": websocket_config.streaming,
+                "maxMessageBytes": websocket_config.max_message_bytes,
+                "pingIntervalS": websocket_config.ping_interval_s,
+                "pingTimeoutS": websocket_config.ping_timeout_s,
+                "sslCertfile": websocket_config.ssl_certfile,
+            }),
+        );
+    }
+
+    eprintln!("Updated websocket config in {}", config_path.display());
+    
     save_config(&config, Some(config_path.clone()))?;
 
     eprintln!("sub: {}", minted.claims.sub);
-    eprintln!(
-        "exp: {} (unix)",
-        minted.claims.exp
-    );
+    eprintln!("exp: {} (unix)", minted.claims.exp);
     if let Some(aud) = &minted.claims.aud {
         eprintln!("aud: {aud}");
     } else {
