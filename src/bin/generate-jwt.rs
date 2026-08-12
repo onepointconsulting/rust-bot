@@ -47,6 +47,11 @@ enum Commands {
         #[arg(long)]
         aud: Option<String>,
 
+        /// Purpose claim marking what this token was minted for (e.g. "webui"
+        /// for a WebSocket-connecting WebUI frontend); omitted when unset
+        #[arg(long)]
+        purpose: Option<String>,
+
         /// Token lifetime in months (default: 6)
         #[arg(long, default_value_t = DEFAULT_EXPIRES_IN_MONTHS)]
         expires_in_months: u32,
@@ -82,6 +87,7 @@ fn main() -> ExitCode {
             config,
             iss,
             aud,
+            purpose,
             expires_in_months,
             user_email,
             password,
@@ -91,6 +97,7 @@ fn main() -> ExitCode {
                 config,
                 iss,
                 aud,
+                purpose,
                 expires_in_months,
                 user_email,
                 password,
@@ -140,10 +147,15 @@ fn run_generate_keypair(
     Ok(())
 }
 
+// One parameter per CLI flag by design (mirrors `Commands::GenerateJwtToken`'s
+// own field list) — a params struct would just move the sprawl elsewhere for
+// a function called from exactly one place.
+#[allow(clippy::too_many_arguments)]
 fn run_generate_token(
     config_path: PathBuf,
     iss_override: Option<String>,
     aud_override: Option<String>,
+    purpose: Option<String>,
     expires_in_months: u32,
     user_email: String,
     password: Option<String>,
@@ -154,8 +166,9 @@ fn run_generate_token(
 
     let iss = iss_override.unwrap_or_else(|| jwt.iss.clone());
     let aud = aud_override.unwrap_or_else(|| jwt.aud.clone());
+    let purpose = purpose.unwrap_or_default();
 
-    let minted = generate_jwt_token(&jwt.private_key_path, iss, aud, expires_in_months)?;
+    let minted = generate_jwt_token(&jwt.private_key_path, iss, aud, purpose, expires_in_months)?;
 
     let mut registry = JsonUserRegistry::open(users_file.clone())?;
     registry.register_user(&User {
@@ -176,6 +189,11 @@ fn run_generate_token(
         eprintln!("aud: {aud}");
     } else {
         eprintln!("aud: (omitted)");
+    }
+    if let Some(purpose) = &minted.claims.purpose {
+        eprintln!("purpose: {purpose}");
+    } else {
+        eprintln!("purpose: (omitted)");
     }
     println!("{}", minted.token);
     Ok(())

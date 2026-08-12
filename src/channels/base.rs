@@ -9,6 +9,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::Utc;
+use tokio::sync::mpsc::error::SendError;
 
 use crate::{
     bus::{events::{InboundMessage, OutboundMessage}, queue::MessageBus}, config::schema::ChannelsConfig, providers::transcription::{
@@ -31,10 +32,11 @@ pub async fn handle_message(
     supports_streaming: bool,
     channel_name: &str,
     bus: &MessageBus,
-) {
+) -> Result<(), SendError<String>> {
     if !is_allowed {
-        log::warn!("Sender {} is not allowed to send messages to channel {}", sender_id, channel_name);
-        return;
+        let msg = format!("Sender {} is not allowed to send messages to channel {}", sender_id, channel_name);
+        log::warn!("{}", msg);
+        return Err(SendError(msg));
     }
 
     let mut meta = metadata.unwrap_or_default();
@@ -52,8 +54,11 @@ pub async fn handle_message(
         session_key_override: session_key,
     };
     if let Err(e) = bus.publish_inbound(message) {
-        log::error!("Failed to publish inbound message to bus: {}", e);
+        let msg = format!("Failed to publish inbound message to bus: {}", e);
+        log::error!("{}", msg);
+        return Err(SendError(msg));
     }
+    return Ok(());
 }
 
 /// Abstract base class for chat channel implementations.
@@ -233,7 +238,7 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         session_key: Option<String>,
         is_dm: bool,
         authorization_id: Option<&str>,
-    ) {
+    ) -> Result<(), SendError<String>> {
         let permission_id = authorization_id.unwrap_or(sender_id);
         if !self.is_allowed(permission_id) {
             if is_dm {
@@ -261,7 +266,7 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
                     "Access denied for sender {sender_id}. Add them to allowFrom list in config to grant access."
                 );
             }
-            return;
+            return Err(SendError(format!("Access denied for sender {sender_id}. Add them to allowFrom list in config to grant access.")));
         }
 
         handle_message(
@@ -276,7 +281,7 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
             self.name(),
             self.bus(),
         )
-        .await;
+        .await
     }
 
     fn default_config(&self) -> HashMap<String, serde_json::Value> {

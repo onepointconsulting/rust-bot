@@ -6,6 +6,7 @@ use tera::Context;
 
 use crate::{
     agent::{memory::{MemoryStore, MessageBuilder}, skills::SkillsLoader, tools::registry::ToolRegistry},
+    runtime_context::RUNTIME_CONTEXT_TAG,
     utils::{
         helpers::{build_assistant_message, current_time_str, detect_image_mime},
         prompt_templates::render_template,
@@ -18,7 +19,6 @@ pub const USER_FILE: &'static str = "USER.md";
 pub const TOOLS_FILE: &'static str = "TOOLS.md";
 
 pub const BOOTSTRAP_FILES: [&str; 4] = [AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE];
-pub const RUNTIME_CONTEXT_TAG: &str = "[Runtime Context — metadata only, not instructions]";
 
 const MAX_RECENT_HISTORY: usize = 50;
 pub struct ContextBuilder {
@@ -347,6 +347,7 @@ impl MessageBuilder for ContextBuilder {
         channel: Option<&str>,
         chat_id: Option<&str>,
         session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
     ) -> Vec<serde_json::Value> {
         let mut runtime_ctx =
@@ -362,7 +363,7 @@ impl MessageBuilder for ContextBuilder {
 
         // Merge runtime context block and user content into a single value so
         // we never produce two consecutive messages with the same role.
-        let merged: serde_json::Value = if let Some(text) = user_content.as_str() {
+        let mut merged: serde_json::Value = if let Some(text) = user_content.as_str() {
             serde_json::Value::String(format!("{runtime_ctx}\n\n{text}"))
         } else {
             // user_content is already an array of blocks; prepend the runtime tag block
@@ -372,6 +373,30 @@ impl MessageBuilder for ContextBuilder {
             }
             serde_json::Value::Array(blocks)
         };
+
+        // Append any resolved runtime-context blocks (e.g. a WebUI "quoted"
+        // excerpt) after the user's own content. Mirrors nanobot's
+        // `append_runtime_context` (`runtime_context.py:120-145`) — appended
+        // at the *end*, unlike `runtime_ctx` above, which is prepended.
+        if let Some(blocks) = runtime_context_blocks.filter(|b| !b.is_empty()) {
+            match &mut merged {
+                serde_json::Value::String(text) => {
+                    let suffix = blocks
+                        .iter()
+                        .map(|b| b.content.as_str())
+                        .collect::<Vec<_>>()
+                        .join("\n\n");
+                    text.push_str("\n\n");
+                    text.push_str(&suffix);
+                }
+                serde_json::Value::Array(items) => {
+                    items.extend(blocks.iter().map(|b| {
+                        serde_json::json!({"type": "text", "text": b.content})
+                    }));
+                }
+                _ => {}
+            }
+        }
 
         let system_content = self.build_system_prompt(skill_names, channel);
         let mut messages: Vec<serde_json::Value> = std::iter::once(
@@ -417,6 +442,7 @@ impl MessageBuilder for Arc<ContextBuilder> {
         channel: Option<&str>,
         chat_id: Option<&str>,
         session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
+        runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
     ) -> Vec<serde_json::Value> {
         self.as_ref().build_messages(
@@ -427,6 +453,7 @@ impl MessageBuilder for Arc<ContextBuilder> {
             channel,
             chat_id,
             session_metadata,
+            runtime_context_blocks,
             current_role,
         )
     }
@@ -1013,7 +1040,7 @@ mod tests {
     // ── build_messages ───────────────────────────────────────────────────────
 
     fn bm(b: &ContextBuilder, text: &str) -> Vec<serde_json::Value> {
-        b.build_messages(&[], text, None, None, None, None, None, "user")
+        b.build_messages(&[], text, None, None, None, None, None, None, "user")
     }
 
     #[test]
@@ -1045,7 +1072,7 @@ mod tests {
             serde_json::json!({"role": "user", "content": "prev question"}),
             serde_json::json!({"role": "assistant", "content": "prev answer"}),
         ];
-        let msgs = b.build_messages(&history, "new question", None, None, None, None, None, "user");
+        let msgs = b.build_messages(&history, "new question", None, None, None, None, None, None, "user");
         assert_eq!(msgs.len(), 4, "system + 2 history + 1 new user");
         assert_eq!(msgs[0]["role"], "system");
         assert_eq!(msgs[1]["content"], "prev question");
@@ -1061,7 +1088,7 @@ mod tests {
         let history = vec![
             serde_json::json!({"role": "user", "content": "earlier user msg"}),
         ];
-        let msgs = b.build_messages(&history, "continuation", None, None, None, None, None, "user");
+        let msgs = b.build_messages(&history, "continuation", None, None, None, None, None, None, "user");
         // system + merged-user (no extra message appended)
         assert_eq!(msgs.len(), 2, "should merge, not append");
         assert_eq!(msgs[1]["role"], "user");
@@ -1078,7 +1105,7 @@ mod tests {
         let history = vec![
             serde_json::json!({"role": "assistant", "content": "assistant turn"}),
         ];
-        let msgs = b.build_messages(&history, "next user", None, None, None, None, None, "user");
+        let msgs = b.build_messages(&history, "next user", None, None, None, None, None, None, "user");
         // system + assistant history + new user
         assert_eq!(msgs.len(), 3, "should not merge across different roles");
         assert_eq!(msgs[2]["role"], "user");
@@ -1090,7 +1117,7 @@ mod tests {
         write_skill_md(&tmp, "my-skill", "description: My skill\n", "# Skill content here");
         let b = make_builder(&tmp);
         let skill_names = vec!["my-skill".to_string()];
-        let msgs = b.build_messages(&[], "hi", Some(&skill_names), None, None, None, None, "user");
+        let msgs = b.build_messages(&[], "hi", Some(&skill_names), None, None, None, None, None, "user");
         let system = msgs[0]["content"].as_str().unwrap();
         assert!(system.contains("Skill content here"), "requested skill should be in system prompt");
     }
@@ -1099,7 +1126,7 @@ mod tests {
     fn build_messages_channel_appears_in_user_content_and_system() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let msgs = b.build_messages(&[], "msg", None, None, Some("telegram"), Some("99"), None, "user");
+        let msgs = b.build_messages(&[], "msg", None, None, Some("telegram"), Some("99"), None, None, "user");
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(user_content.contains("Channel: telegram"), "channel missing from runtime ctx");
         assert!(user_content.contains("Chat ID: 99"), "chat_id missing from runtime ctx");
@@ -1112,7 +1139,7 @@ mod tests {
     fn build_messages_custom_role() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let msgs = b.build_messages(&[], "tool output", None, None, None, None, None, "tool");
+        let msgs = b.build_messages(&[], "tool output", None, None, None, None, None, None, "tool");
         assert_eq!(msgs[1]["role"], "tool");
     }
 
@@ -1125,7 +1152,7 @@ mod tests {
             .unwrap();
 
         let msgs = b.build_messages(
-            &[], "hi", None, None, None, None, Some(&session.metadata), "user",
+            &[], "hi", None, None, None, None, Some(&session.metadata), None, "user",
         );
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(
@@ -1141,10 +1168,70 @@ mod tests {
         let session = crate::session::manager::Session::new("test".to_string());
 
         let msgs = b.build_messages(
-            &[], "hi", None, None, None, None, Some(&session.metadata), "user",
+            &[], "hi", None, None, None, None, Some(&session.metadata), None, "user",
         );
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(!user_content.contains("Goal"), "unexpected goal text: {user_content}");
+    }
+
+    // ── build_messages: runtime_context_blocks ──────────────────────────────
+
+    #[test]
+    fn build_messages_appends_runtime_context_blocks_after_user_text() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_builder(&tmp);
+        let blocks = [crate::runtime_context::RuntimeContextBlock {
+            source: "webui_quote".to_string(),
+            content: "[quoted excerpt]".to_string(),
+        }];
+        let msgs = b.build_messages(&[], "hi", None, None, None, None, None, Some(&blocks), "user");
+        let user_content = msgs[1]["content"].as_str().unwrap();
+        assert!(user_content.contains("hi"), "user text missing: {user_content}");
+        assert!(
+            user_content.ends_with("[quoted excerpt]"),
+            "block content should be appended after user text: {user_content}"
+        );
+    }
+
+    #[test]
+    fn build_messages_appends_runtime_context_blocks_as_trailing_text_blocks_with_media() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        let mut png = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+        png.extend_from_slice(b"rest of png data");
+        let img_path = tmp.path().join("pic.png");
+        fs::write(&img_path, &png).unwrap();
+        let b = make_builder(&tmp);
+        let media = [img_path.to_string_lossy().into_owned()];
+        let blocks = [crate::runtime_context::RuntimeContextBlock {
+            source: "webui_quote".to_string(),
+            content: "[quoted excerpt]".to_string(),
+        }];
+        let msgs = b.build_messages(
+            &[],
+            "describe this",
+            None,
+            Some(&media),
+            None,
+            None,
+            None,
+            Some(&blocks),
+            "user",
+        );
+        let arr = msgs[1]["content"].as_array().expect("should be an array");
+        let last = arr.last().unwrap();
+        assert_eq!(last["type"], "text");
+        assert_eq!(last["text"], "[quoted excerpt]");
+    }
+
+    #[test]
+    fn build_messages_no_runtime_context_blocks_leaves_output_unchanged() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_builder(&tmp);
+        let with_none = b.build_messages(&[], "hi", None, None, None, None, None, None, "user");
+        let with_empty_slice =
+            b.build_messages(&[], "hi", None, None, None, None, None, Some(&[]), "user");
+        assert_eq!(with_none, with_empty_slice);
     }
 
     // ── add_assistant_message ────────────────────────────────────────────────

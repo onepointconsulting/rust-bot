@@ -247,6 +247,14 @@ pub struct EnvelopeDispatchContext<'a> {
     pub client_id: &'a str,
     pub shared: &'a WsShared,
     pub remote_addr: SocketAddr,
+    /// Whether this connection's JWT proves it was minted for the WebUI
+    /// frontend specifically (`purpose == "webui"`), as opposed to the
+    /// client-supplied, self-declared `envelope["webui"]` flag. Set once per
+    /// connection at upgrade time (`channels::websocket::runtime::authorize`)
+    /// and copied into every envelope's dispatch context for that
+    /// connection's lifetime. Mirrors nanobot's `connection in
+    /// self._webui_connections` (`channels/websocket/runtime.py:824`).
+    pub webui_authenticated: bool,
 }
 
 #[cfg(test)]

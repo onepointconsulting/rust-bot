@@ -15,9 +15,10 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
-use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE, RUNTIME_CONTEXT_TAG};
+use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
+use crate::runtime_context::RUNTIME_CONTEXT_TAG;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::model_runtime::{ModelRuntime, ModelRuntimeResolver, SESSION_MODEL_PRESET_METADATA_KEY};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
@@ -1277,6 +1278,8 @@ impl AgentLoop {
         let history = snapshot.get_history(Some(0));
         let turn_runtime = self.runtime_resolver.runtime_for_session(Some(&snapshot));
         let current_role = Self::subagent_announce_role(&turn_runtime.model);
+        let runtime_context_blocks =
+            crate::runtime_context::runtime_context_blocks_from_metadata(&msg.metadata);
         let messages = self.context.build_messages(
             history.as_slice(),
             msg.content.as_str(),
@@ -1285,6 +1288,7 @@ impl AgentLoop {
             Some(channel),
             Some(chat_id),
             Some(&snapshot.metadata),
+            (!runtime_context_blocks.is_empty()).then_some(runtime_context_blocks.as_slice()),
             current_role,
         );
         let agent_run_result = self
@@ -1586,6 +1590,8 @@ impl AgentLoop {
             None
         };
         log::info!("Building messages with media: {}", media.is_some());
+        let runtime_context_blocks =
+            crate::runtime_context::runtime_context_blocks_from_metadata(&msg.metadata);
         let initial_messages = self.context.build_messages(
             history.as_slice(),
             msg.content.as_str(),
@@ -1594,6 +1600,7 @@ impl AgentLoop {
             Some(msg.channel.as_str()),
             Some(msg.chat_id.as_str()),
             Some(&session.metadata),
+            (!runtime_context_blocks.is_empty()).then_some(runtime_context_blocks.as_slice()),
             DEFAULT_CURRENT_ROLE,
         );
 

@@ -669,6 +669,7 @@ impl MemoryStore {
 
 pub trait MessageBuilder: Send + Sync {
     /// Build the complete message list for an LLM call
+    #[allow(clippy::too_many_arguments)]
     fn build_messages(
         &self,
         history: &[serde_json::Value],
@@ -678,6 +679,12 @@ pub trait MessageBuilder: Send + Sync {
         channel: Option<&str>,
         chat_id: Option<&str>,
         session_metadata: Option<&HashMap<String, serde_json::Value>>,
+        // The current turn's ephemeral, pre-extracted runtime-context blocks
+        // (e.g. a WebUI "quoted" excerpt) — distinct from `session_metadata`
+        // (the persisted Session's own metadata, read only for goal-state
+        // lines). Mirrors nanobot's `runtime_context_blocks_from_metadata`
+        // being resolved once per request, ahead of context assembly.
+        runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
     ) -> Vec<serde_json::Value>;
 
@@ -763,6 +770,7 @@ impl Consolidator {
             None,
             channel,
             chat_id,
+            None,
             None,
             "user",
         );
@@ -1249,6 +1257,7 @@ mod tests {
             _channel: Option<&str>,
             _chat_id: Option<&str>,
             _session_metadata: Option<&HashMap<String, serde_json::Value>>,
+            _runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
             _current_role: &str,
         ) -> Vec<serde_json::Value> {
             vec![]

@@ -26,6 +26,14 @@ pub struct Claims {
     pub aud: Option<String>,
     pub exp: i64,
     pub iat: i64,
+    /// Custom claim marking what this token was minted for (e.g. `"webui"`),
+    /// distinct from `aud` (which, for the WebSocket channel, is already
+    /// pinned to the route path — see `validate_jwt_aud_matches_path`). Set
+    /// via `generate_jwt_token`'s `purpose` argument (empty omits the claim,
+    /// same convention as `aud`); the `generate-jwt` CLI exposes it as
+    /// `--purpose`. Checked by `channels::websocket::runtime::authorize`.
+    #[serde(skip_serializing_if = "Option::is_none", default)]
+    pub purpose: Option<String>,
 }
 
 #[derive(Debug)]
@@ -145,11 +153,12 @@ pub fn generate_jwt_keypair(
 
 /// Mint an EdDSA JWT signed with the private key at `private_key_path`.
 ///
-/// Empty `aud` omits the audience claim.
+/// Empty `aud`/`purpose` omit their respective claims.
 pub fn generate_jwt_token(
     private_key_path: impl AsRef<Path>,
     iss: impl Into<String>,
     aud: impl Into<String>,
+    purpose: impl Into<String>,
     expires_in_months: u32,
 ) -> Result<GeneratedToken, JwtError> {
     let private_pem = fs::read(private_key_path.as_ref()).map_err(|e| {
@@ -166,6 +175,12 @@ pub fn generate_jwt_token(
     } else {
         Some(aud_raw)
     };
+    let purpose_raw = purpose.into();
+    let purpose = if purpose_raw.trim().is_empty() {
+        None
+    } else {
+        Some(purpose_raw)
+    };
 
     let now = Utc::now();
     let iat = now.timestamp();
@@ -181,6 +196,7 @@ pub fn generate_jwt_token(
         aud,
         exp,
         iat,
+        purpose,
     };
 
     let header = Header::new(Algorithm::EdDSA);
@@ -246,6 +262,7 @@ mod tests {
             &keys.private_key_path,
             "rust-bot",
             "https://api.example.com",
+            "",
             DEFAULT_EXPIRES_IN_MONTHS,
         )
         .unwrap();
@@ -263,12 +280,90 @@ mod tests {
     }
 
     #[test]
+    fn generate_jwt_token_mints_without_purpose_by_default() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "aud-1",
+            "",
+            DEFAULT_EXPIRES_IN_MONTHS,
+        )
+        .unwrap();
+        assert!(minted.claims.purpose.is_none());
+    }
+
+    #[test]
+    fn generate_jwt_token_sets_purpose_claim_when_given() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "webui",
+            DEFAULT_EXPIRES_IN_MONTHS,
+        )
+        .unwrap();
+        assert_eq!(minted.claims.purpose.as_deref(), Some("webui"));
+    }
+
+    #[test]
+    fn purpose_claim_round_trips_through_validation() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "webui",
+            DEFAULT_EXPIRES_IN_MONTHS,
+        )
+        .unwrap();
+
+        let validated = validate_jwt_token_from_path(
+            &minted.token,
+            &keys.public_key_path,
+            &opts("rust-bot", ""),
+        )
+        .unwrap();
+        assert_eq!(validated.purpose.as_deref(), Some("webui"));
+    }
+
+    #[test]
+    fn missing_purpose_claim_deserializes_to_none() {
+        // Tokens minted without a purpose (e.g. /v1/login, or the
+        // `generate-jwt` CLI without `--purpose`) must still validate, with
+        // `purpose: None` — backward compatible.
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "",
+            DEFAULT_EXPIRES_IN_MONTHS,
+        )
+        .unwrap();
+        let validated =
+            validate_jwt_token_from_path(&minted.token, &keys.public_key_path, &opts("rust-bot", ""))
+                .unwrap();
+        assert!(validated.purpose.is_none());
+    }
+
+    #[test]
     fn empty_aud_omits_claim_and_skips_aud_validation() {
         let dir = tempdir().unwrap();
         let keys = generate_jwt_keypair(dir.path(), false).unwrap();
-        let minted =
-            generate_jwt_token(&keys.private_key_path, "rust-bot", "", DEFAULT_EXPIRES_IN_MONTHS)
-                .unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "",
+            DEFAULT_EXPIRES_IN_MONTHS,
+        )
+        .unwrap();
 
         assert!(minted.claims.aud.is_none());
 
@@ -298,6 +393,7 @@ mod tests {
             &keys.private_key_path,
             "rust-bot",
             "aud-1",
+            "",
             DEFAULT_EXPIRES_IN_MONTHS,
         )
         .unwrap();
@@ -318,6 +414,7 @@ mod tests {
             &keys.private_key_path,
             "rust-bot",
             "aud-1",
+            "",
             DEFAULT_EXPIRES_IN_MONTHS,
         )
         .unwrap();
@@ -346,6 +443,7 @@ mod tests {
             &keys.private_key_path,
             "rust-bot",
             "aud-1",
+            "",
             DEFAULT_EXPIRES_IN_MONTHS,
         )
         .unwrap();

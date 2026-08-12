@@ -35,6 +35,7 @@ use crate::channels::websocket::webui::metadata::WEBSOCKET_TURN_OWNER_METADATA_K
 use crate::channels::websocket::webui::transcript::client_turn_metadata;
 use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
+use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
 use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::{
@@ -169,11 +170,24 @@ fn sender_allowed(channels_config: &ChannelsConfig, sender_id: &str) -> bool {
         .any(|s| s == "*" || s == sender_id)
 }
 
+/// Custom JWT claim value marking a token as minted for the WebUI frontend
+/// specifically, distinct from `aud` (which, for this channel, is already
+/// pinned to the route path — see `validate_jwt_aud_matches_path`). Checked
+/// by [`authorize`]; mint one via `generate-jwt generate-jwt-token --purpose
+/// webui` — see `security::jwt::Claims::purpose`.
+const WEBUI_JWT_PURPOSE: &str = "webui";
+
 /// Reject the upgrade with 401 when JWT auth is enabled and the token is
 /// missing/invalid. No-op (always `Ok`) when JWT is disabled.
-fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
+///
+/// Returns whether the connection's JWT proves it was minted for the WebUI
+/// frontend (`purpose == "webui"`) — `false` whenever there's no JWT to make
+/// that claim from (JWT disabled), not just when validation fails. Mirrors
+/// nanobot's `_webui_connections` gate (`channels/websocket/runtime.py:458-462`),
+/// which is only ever populated by a token issued specifically for webui use.
+fn authorize(shared: &WsShared, token: Option<&str>) -> Result<bool, StatusCode> {
     let Some(public_key_pem) = shared.jwt_public_key_pem.as_ref() else {
-        return Ok(());
+        return Ok(false);
     };
     let token = token
         .filter(|t| !t.trim().is_empty())
@@ -183,11 +197,22 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<(), StatusCode> {
         aud: shared.jwt.aud.clone(),
     };
     validate_jwt_token(token, public_key_pem.as_slice(), &opts)
-        .map(|_claims| ())
+        .map(|claims| claims.purpose.as_deref() == Some(WEBUI_JWT_PURPOSE))
         .map_err(|e| {
             log::warn!("WebSocket channel: rejected connection with invalid JWT: {e}");
             StatusCode::UNAUTHORIZED
         })
+}
+
+/// Whether the current turn may inject the WebUI "quoted context" into the
+/// model prompt: requires both the client's self-declared `is_webui` flag
+/// *and* the stronger, connection-level `webui_authenticated` signal from
+/// [`authorize`] — neither alone is sufficient. Mirrors nanobot's `is_webui
+/// and connection in self._webui_connections` (`channels/websocket/runtime.py:824`),
+/// the one place in this function where client-supplied text becomes
+/// model-visible context, so the bare client-declared flag isn't trusted.
+fn webui_quote_allowed(is_webui: bool, webui_authenticated: bool) -> bool {
+    is_webui && webui_authenticated
 }
 
 /// Mirrors nanobot's `_workspace_controls_available` / `ws_http.workspace_controls_available`
@@ -256,9 +281,10 @@ async fn ws_upgrade_handler(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    if let Err(status) = authorize(&shared, query.token.as_deref()) {
-        return status.into_response();
-    }
+    let webui_authenticated = match authorize(&shared, query.token.as_deref()) {
+        Ok(webui_authenticated) => webui_authenticated,
+        Err(status) => return status.into_response(),
+    };
 
     let client_id = match query
         .client_id
@@ -276,7 +302,9 @@ async fn ws_upgrade_handler(
         None => format!("anon-{}", &Uuid::new_v4().simple().to_string()[..12]),
     };
 
-    ws.on_upgrade(move |socket| handle_socket(socket, shared, client_id, remote_addr))
+    ws.on_upgrade(move |socket| {
+        handle_socket(socket, shared, client_id, remote_addr, webui_authenticated)
+    })
 }
 
 /// Drive one connection for its lifetime: mint a fresh `chat_id` for it,
@@ -297,6 +325,7 @@ async fn handle_socket(
     shared: WsShared,
     client_id: String,
     remote_addr: SocketAddr,
+    webui_authenticated: bool,
 ) {
     let connection_id = Uuid::new_v4().to_string();
     let chat_id = Uuid::new_v4().to_string();
@@ -346,6 +375,7 @@ async fn handle_socket(
                         client_id: &client_id,
                         shared: &shared,
                         remote_addr,
+                        webui_authenticated,
                     };
                     dispatch_envelope(envelope_dispatch_context).await;
                     continue;
@@ -353,7 +383,7 @@ async fn handle_socket(
                 let Some(content) = parse_inbound_payload(raw) else {
                     continue;
                 };
-                handle_message(
+                if let Err(e) = handle_message(
                     &client_id,
                     &chat_id,
                     &content,
@@ -365,7 +395,12 @@ async fn handle_socket(
                     shared.name,
                     &shared.bus,
                 )
-                .await;
+                .await
+                {
+                    log::warn!(
+                        "WebSocket channel: failed to publish message for chat '{chat_id}': {e}"
+                    );
+                }
             }
             Message::Close(_) => break,
             _ => {}
@@ -395,8 +430,15 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::Message => {
             handle_envelope_message(envelope_dispatch_context).await;
         }
-        EnvelopeType::Unrecognized(_t) => {
-            // reply with nanobot's `f"unknown type: {t!r}"` equivalent
+        EnvelopeType::Unrecognized(t) => {
+            send_event(
+                envelope_dispatch_context.shared,
+                envelope_dispatch_context.connection_id,
+                WsOutboundEvent::Error,
+                None,
+                serde_json::json!({"detail": format!("unknown type: {t:?}")}),
+            )
+            .await;
         }
     }
 }
@@ -481,7 +523,13 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     }
 
     let mut media_paths: Vec<String> = Vec::new();
-    if let Some(raw_media) = envelope.get("media") {
+    // A JSON `null` is treated the same as an absent key — mirrors Python's
+    // `if raw_media is not None:` (`runtime.py:734`), where `envelope.get("media")`
+    // already returns `None` for both. `envelope.get("media")` alone doesn't:
+    // it returns `Some(&Value::Null)` for an explicit `"media": null`, which
+    // would otherwise fall into the `as_array()` mismatch below and get
+    // rejected as malformed.
+    if let Some(raw_media) = envelope.get("media").filter(|v| !v.is_null()) {
         let Some(media_array) = raw_media.as_array() else {
             send_event(
                 shared,
@@ -628,6 +676,7 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     }
 
     let is_webui = metadata.get("webui").and_then(|v| v.as_bool()) == Some(true);
+    let webui_quote_allowed = webui_quote_allowed(is_webui, envelope_dispatch_context.webui_authenticated);
     let mut queued_owner_metadata: Option<String> = None;
     if is_webui && builtin_command_starts_agent_turn(content) {
         let mut turn_registry = shared.gateway_services.turn_registry.lock().unwrap_or_else(|e| e.into_inner());
@@ -636,9 +685,75 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
             queued_owner_metadata = Some(queued_owner);
         }
     }
-    let accepted = false;
     if is_webui {
-        
+        // Recover from a poisoned mutex rather than panicking the WS handler —
+        // same pattern as the turn registry lock above.
+        let mut transcripts = shared
+            .gateway_services
+            .transcripts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        transcripts.append_user_message(
+            cid,
+            content,
+            &metadata,
+            (!media_paths.is_empty()).then_some(media_paths.as_slice()),
+            (!cli_apps.is_empty()).then_some(cli_apps.as_slice()),
+            (!mcp_presets.is_empty()).then_some(mcp_presets.as_slice()),
+        );
+        if webui_quote_allowed
+            && let Some(block) = webui_quote_runtime_context(envelope.get("quoted_context"))
+        {
+            metadata.insert(
+                RUNTIME_CONTEXT_INPUT_META.to_string(),
+                serde_json::to_value([block]).unwrap_or(serde_json::Value::Null),
+            );
+        }
+    }
+    let send_result = handle_message(
+        client_id,
+        cid,
+        content,
+        (!media_paths.is_empty()).then_some(media_paths),
+        Some(metadata),
+        None,
+        sender_allowed(&shared.channels_config, client_id),
+        shared.supports_streaming,
+        shared.name,
+        &shared.bus,
+    )
+    .await;
+    if let Err(e) = &send_result {
+        // Mirrors nanobot's `_handle_message` exception propagating out of
+        // the `try` block (`runtime.py:830-841`): unlike a raised exception,
+        // a `Result::Err` here doesn't log itself anywhere up the call
+        // chain, so without this the failure would be entirely silent.
+        log::warn!("WebSocket channel: failed to publish message for chat '{cid}': {e}");
+        if let Some(queued_owner) = &queued_owner_metadata {
+            let mut turn_registry = shared
+                .gateway_services
+                .turn_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            turn_registry.clear_turn_if_current(cid, Some(queued_owner.as_str()), false);
+        }
+    }
+    // Mirrors nanobot's `if is_webui and turn_id:` (`runtime.py:842`) — sent
+    // only when the publish above actually succeeded (a raised exception in
+    // Python skips this line entirely on its way out of the function) *and*
+    // the client supplied a turn_id to acknowledge.
+    if is_webui
+        && send_result.is_ok()
+        && let Some(turn_id) = turn_id
+    {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::MessageAccepted,
+            None,
+            serde_json::json!({"chat_id": cid, "turn_id": turn_id}),
+        )
+        .await;
     }
 }
 
@@ -1362,12 +1477,100 @@ mod tests {
                 true,
             ),
             runtime_surface: runtime_surface.to_string(),
-            gateway_services: Arc::new(GatewayServices::default()),
+            gateway_services: Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep())),
         }
     }
 
     fn addr(ip: &str) -> SocketAddr {
         SocketAddr::new(ip.parse().unwrap(), 12345)
+    }
+
+    // --- authorize ---
+
+    /// Build a `WsShared` with JWT enabled against a fresh keypair, returning
+    /// the shared config plus the private key path so each test can mint
+    /// whatever token shape it needs.
+    fn shared_with_jwt_enabled() -> (WsShared, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let keys = crate::security::jwt::generate_jwt_keypair(dir.keep(), false).unwrap();
+        let mut shared = test_shared("browser");
+        shared.jwt = JwtConfig {
+            enabled: true,
+            iss: "rust-bot".to_string(),
+            aud: String::new(),
+            ..JwtConfig::default()
+        };
+        shared.jwt_public_key_pem =
+            Some(Arc::new(std::fs::read(&keys.public_key_path).unwrap()));
+        (shared, keys.private_key_path)
+    }
+
+    fn mint_token_with_purpose(private_key_path: &std::path::Path, purpose: Option<&str>) -> String {
+        let private_pem = std::fs::read(private_key_path).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::security::jwt::Claims {
+            iss: "rust-bot".to_string(),
+            sub: Uuid::new_v4().to_string(),
+            aud: None,
+            exp: now + 3600,
+            iat: now,
+            purpose: purpose.map(str::to_string),
+        };
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(&private_pem).unwrap();
+        jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap()
+    }
+
+    #[test]
+    fn authorize_false_when_jwt_disabled() {
+        let shared = test_shared("browser");
+        assert_eq!(authorize(&shared, None), Ok(false));
+    }
+
+    #[test]
+    fn authorize_true_for_webui_purpose_token() {
+        let (shared, private_key_path) = shared_with_jwt_enabled();
+        let token = mint_token_with_purpose(&private_key_path, Some(WEBUI_JWT_PURPOSE));
+        assert_eq!(authorize(&shared, Some(&token)), Ok(true));
+    }
+
+    #[test]
+    fn authorize_false_for_token_without_purpose() {
+        let (shared, private_key_path) = shared_with_jwt_enabled();
+        let token = mint_token_with_purpose(&private_key_path, None);
+        assert_eq!(authorize(&shared, Some(&token)), Ok(false));
+    }
+
+    #[test]
+    fn authorize_false_for_token_with_different_purpose() {
+        let (shared, private_key_path) = shared_with_jwt_enabled();
+        let token = mint_token_with_purpose(&private_key_path, Some("client"));
+        assert_eq!(authorize(&shared, Some(&token)), Ok(false));
+    }
+
+    #[test]
+    fn authorize_rejects_missing_token_when_jwt_enabled() {
+        let (shared, _private_key_path) = shared_with_jwt_enabled();
+        assert_eq!(authorize(&shared, None), Err(StatusCode::UNAUTHORIZED));
+    }
+
+    #[test]
+    fn authorize_rejects_invalid_token() {
+        let (shared, _private_key_path) = shared_with_jwt_enabled();
+        assert_eq!(
+            authorize(&shared, Some("not-a-real-token")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    // --- webui_quote_allowed ---
+
+    #[test]
+    fn webui_quote_allowed_requires_both_flags() {
+        assert!(!webui_quote_allowed(false, true));
+        assert!(!webui_quote_allowed(true, false));
+        assert!(!webui_quote_allowed(false, false));
+        assert!(webui_quote_allowed(true, true));
     }
 
     #[test]

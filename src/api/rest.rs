@@ -581,7 +581,7 @@ async fn login(
     let iss = jwt.opts.iss.clone();
     let aud = jwt.opts.aud.clone();
     let minted = tokio::task::spawn_blocking(move || {
-        generate_jwt_token(private_key_path, iss, aud, DEFAULT_EXPIRES_IN_MONTHS)
+        generate_jwt_token(private_key_path, iss, aud, "", DEFAULT_EXPIRES_IN_MONTHS)
     })
     .await
     .map_err(|_| ApiError::internal("Token minting task failed"))?
