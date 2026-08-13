@@ -41,6 +41,7 @@ use axum::routing::post;
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use tokio::net::TcpListener;
+use tower_http::services::{ServeDir, ServeFile};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 use reedline::{
@@ -199,6 +200,12 @@ pub struct GatewayArgs {
     /// declared in the config — otherwise nothing binds this port.
     #[arg(long)]
     pub port: Option<u16>,
+
+    /// Directory of pre-built web-chat static assets (index.html, *.js, *.wasm)
+    /// to serve alongside the API. Falls back to `gateway.webRoot` in the config
+    /// file, then to `./web` if that directory exists.
+    #[arg(long = "web-root")]
+    pub web_root: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -233,6 +240,7 @@ pub struct LoginArgs {
 
 #[derive(Debug)]
 pub enum CliError {
+    FailedToCreateWebRootDirectory(std::io::Error),
     InteractiveNotImplemented,
     Inquire(inquire::InquireError),
 }
@@ -248,6 +256,9 @@ impl fmt::Display for CliError {
             }
             Self::Inquire(err) => {
                 write!(f, "Inquire error: {err}")
+            }
+            Self::FailedToCreateWebRootDirectory(err) => {
+                write!(f, "Failed to create web root directory: {err}")
             }
         }
     }
@@ -487,6 +498,13 @@ fn resolve_web_root(cli_web_root: Option<PathBuf>, config_web_root: Option<Strin
     default_path.exists().then_some(default_path)
 }
 
+/// True when `web_root` is a directory that contains the static bundle's
+/// `index.html`. An empty directory (including one just created because the
+/// configured path was missing) is treated as "no UI".
+fn web_root_has_ui(web_root: &std::path::Path) -> bool {
+    web_root.is_dir() && web_root.join("index.html").is_file()
+}
+
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     init_runtime_logging(true, None);
     let (config, workspace) = prepare_workspace(args.config, None);
@@ -573,10 +591,12 @@ async fn wait_for_websocket_shutdown(ws_channel: Arc<WebSocketChannel>) {
 }
 
 /// Build and serve the combined login + WebSocket gateway server on one
-/// port: `POST /v1/login` (documented via its own minimal Swagger doc) plus
-/// `ws_channel`'s upgrade route, sharing one `axum::serve` call. Every
-/// minted token carries `purpose: "webui"` unconditionally — this server's
-/// only real client is the forthcoming websockets-chat UI.
+/// port: `POST /v1/login` (documented via its own minimal Swagger doc),
+/// `ws_channel`'s upgrade route, and — when `web_root` points at a real
+/// directory — the websockets-chat static bundle as a fallback service,
+/// sharing one `axum::serve` call. Every minted token carries
+/// `purpose: "webui"` unconditionally — this server's only real client is
+/// the websockets-chat UI.
 ///
 /// Reuses `ws_channel`'s own `WebSocketConfig.jwt` for minting (already
 /// validated at config-load time to have `aud == path`, so a token minted
@@ -588,6 +608,7 @@ async fn serve_combined_login_and_gateway(
     ws_channel: &Arc<WebSocketChannel>,
     host: &str,
     port: u16,
+    web_root: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
     let login_state = Arc::new(LoginState {
         jwt_auth: jwt_auth_state_from_config(&ws_channel_jwt(ws_channel)),
@@ -600,15 +621,46 @@ async fn serve_combined_login_and_gateway(
         .route("/v1/login", post(login))
         .with_state(login_state);
 
-    let app: Router = login_router
+    let mut app: Router = login_router
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", GatewayApiDoc::openapi()))
         .layer(build_cors_layer(&config.api.cors))
         .merge(ws_channel.router());
+
+    // Mirrors `create_api_server`'s own web-root fallback wiring exactly —
+    // `ServeDir` serves the bundle, falling back to `index.html` for
+    // client-side routed paths, without shadowing `/v1/login`, `/swagger-ui`,
+    // or the WebSocket upgrade route above (all matched before the fallback).
+    let web_ui_status = match web_root {
+        Some(root) if web_root_has_ui(root) => {
+            let index_html = root.join("index.html");
+            app = app.fallback_service(ServeDir::new(root).not_found_service(ServeFile::new(index_html)));
+            Some(format!("serving `{}`", root.display()))
+        }
+        Some(root) if root.is_dir() => {
+            log::warn!(
+                "gateway.webRoot / --web-root points at '{}', which has no index.html; web UI serving is disabled",
+                root.display()
+            );
+            None
+        }
+        Some(root) => {
+            log::warn!(
+                "gateway.webRoot / --web-root points at '{}', which is not a directory; web UI serving is disabled",
+                root.display()
+            );
+            None
+        }
+        None => None,
+    };
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).await?;
     log::info!("Gateway login + WebSocket server listening on http://{addr}");
     log::info!("Swagger UI available at http://{addr}/swagger-ui");
+    match web_ui_status {
+        Some(status) => log::info!("Web UI available at http://{addr}/ ({status})"),
+        None => log::info!("Web UI disabled (no valid --web-root / gateway.webRoot configured)"),
+    }
 
     axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
         .with_graceful_shutdown(wait_for_websocket_shutdown(Arc::clone(ws_channel)))
@@ -639,6 +691,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     init_runtime_logging(true, Some(args.verbose));
     let host_override = args.host.clone();
     let port_override = args.port;
+    let web_root_override = args.web_root.clone();
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
     let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone()));
     let session_manager = agent_loop.session_manager.clone();
@@ -923,6 +976,13 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
 
     let gateway_host = host_override.unwrap_or_else(|| config.gateway.host.clone());
     let gateway_port = port_override.unwrap_or(config.gateway.port);
+    let web_root = resolve_web_root(web_root_override, config.gateway.web_root.clone());
+    if let Some(web_root) = &web_root {
+        if !web_root.exists() {
+            std::fs::create_dir_all(web_root)
+                .map_err(CliError::FailedToCreateWebRootDirectory)?;
+        }
+    }
 
     let enabled = channels.get_enabled_channels();
     if !enabled.is_empty() {
@@ -1020,6 +1080,32 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             green.render_reset(),
             base_url
         );
+        match &web_root {
+            Some(root) if web_root_has_ui(root) => println!(
+                "{}✓{} Web UI: {}/ (serving `{}`)",
+                green.render(),
+                green.render_reset(),
+                base_url,
+                root.display()
+            ),
+            Some(root) if root.is_dir() => println!(
+                "{}Warning: gateway.webRoot / --web-root '{}' has no index.html; web UI disabled{}",
+                yellow.render(),
+                root.display(),
+                yellow.render_reset()
+            ),
+            Some(root) => println!(
+                "{}Warning: gateway.webRoot / --web-root '{}' is not a directory; web UI disabled{}",
+                yellow.render(),
+                root.display(),
+                yellow.render_reset()
+            ),
+            None => println!(
+                "{}✗{} Web UI: disabled (pass --web-root <dir> or set gateway.webRoot)",
+                yellow.render(),
+                yellow.render_reset()
+            ),
+        }
     }
 
     // Python: async def run() / try / gather / finally shutdown
@@ -1035,6 +1121,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         let channels = Arc::clone(&channels);
         let config = Arc::clone(&config);
         let ws_channel = ws_channel.clone();
+        let web_root = web_root.clone();
         async move {
             // A no-op, never-resolving branch when no `"websocket"` channel
             // was declared — keeps this a fixed 3-way join (so the
@@ -1048,6 +1135,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                             ws_channel,
                             &gateway_host,
                             gateway_port,
+                            web_root.as_deref(),
                         )
                         .await
                         {
@@ -1739,5 +1827,89 @@ mod tests {
         );
 
         assert!(resolved.is_none());
+    }
+
+    // --- resolve_web_root ---
+    // Shared by `run_api` (CLI `--web-root` / `api.webRoot`) and `run_gateway`
+    // (CLI `--web-root` / `gateway.webRoot`) — generic over the source config
+    // field, so these tests exercise the function directly rather than
+    // duplicating them per caller.
+
+    #[test]
+    fn resolve_web_root_cli_override_wins_over_config() {
+        let resolved = resolve_web_root(
+            Some(PathBuf::from("/from/cli")),
+            Some("/from/config".to_string()),
+        );
+        assert_eq!(resolved, Some(PathBuf::from("/from/cli")));
+    }
+
+    #[test]
+    fn resolve_web_root_falls_back_to_config_when_no_cli_override() {
+        let resolved = resolve_web_root(None, Some("/from/config".to_string()));
+        assert_eq!(resolved, Some(PathBuf::from("/from/config")));
+    }
+
+    #[test]
+    fn resolve_web_root_is_none_when_neither_given_and_default_dir_absent() {
+        // `./web` relative to the test process's cwd (the crate root) is not
+        // expected to exist; if it ever does, this test's assumption (and
+        // the "no UI" fallback behavior it guards) would need revisiting.
+        let default_dir_exists = PathBuf::from("./web").exists();
+        let resolved = resolve_web_root(None, None);
+        if default_dir_exists {
+            assert_eq!(resolved, Some(PathBuf::from("./web")));
+        } else {
+            assert_eq!(resolved, None);
+        }
+    }
+
+    #[test]
+    fn gateway_args_parses_web_root_flag() {
+        let args = GatewayArgs::try_parse_from([
+            "rust-bot",
+            "--config",
+            "config.json",
+            "--web-root",
+            "./websockets-chat-web",
+        ])
+        .unwrap();
+        assert_eq!(args.web_root, Some(PathBuf::from("./websockets-chat-web")));
+    }
+
+    #[test]
+    fn gateway_args_web_root_defaults_to_none() {
+        let args = GatewayArgs::try_parse_from(["rust-bot", "--config", "config.json"]).unwrap();
+        assert_eq!(args.web_root, None);
+    }
+
+    // --- web_root_has_ui ---
+
+    #[test]
+    fn web_root_has_ui_is_false_for_empty_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!web_root_has_ui(dir.path()));
+    }
+
+    #[test]
+    fn web_root_has_ui_is_false_when_other_files_exist_but_index_html_does_not() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("readme.txt"), "not a bundle").unwrap();
+        assert!(!web_root_has_ui(dir.path()));
+    }
+
+    #[test]
+    fn web_root_has_ui_is_true_when_index_html_is_present() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+        assert!(web_root_has_ui(dir.path()));
+    }
+
+    #[test]
+    fn web_root_has_ui_is_false_when_path_is_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("not-a-dir");
+        fs::write(&file, "x").unwrap();
+        assert!(!web_root_has_ui(&file));
     }
 }

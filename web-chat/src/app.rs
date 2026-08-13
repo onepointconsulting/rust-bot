@@ -2,9 +2,12 @@ use gloo_storage::{SessionStorage, Storage};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
+use chat_ui::api::login;
+use chat_ui::components::LoginForm;
+use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role};
+
 use crate::api;
-use crate::components::{ChatShell, LoginForm};
-use crate::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role};
+use crate::components::ChatShell;
 
 const TOKEN_STORAGE_KEY: &str = "rust-bot-web-chat-token";
 const SESSION_STORAGE_KEY: &str = "rust-bot-web-chat-session";
@@ -148,6 +151,9 @@ pub fn App() -> impl IntoView {
                 role,
                 content,
                 attachments,
+                streaming: false,
+                tool_events: None,
+                reasoning: None,
             });
             *list = trim_to_max_turns(std::mem::take(list), MAX_STORED_TURNS);
         });
@@ -158,7 +164,7 @@ pub fn App() -> impl IntoView {
         login_error.set(None);
         login_pending.set(true);
         spawn_local(async move {
-            match api::login(&email, &password).await {
+            match login(&email, &password).await {
                 Ok(jwt) => {
                     let _ = SessionStorage::set(TOKEN_STORAGE_KEY, &jwt);
                     persist_email(&email);

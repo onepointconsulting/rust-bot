@@ -800,6 +800,15 @@ pub struct GatewayConfig {
     #[serde(alias = "heartbeat")]
     #[garde(dive)]
     pub heartbeat: HeartbeatConfig,
+
+    /// Directory of pre-built websockets-chat static assets (`index.html`,
+    /// JS, WASM) to serve alongside the combined login + WebSocket gateway
+    /// server. When unset, the CLI falls back to `./web` if that directory
+    /// exists; otherwise the gateway runs without serving a web UI. Mirrors
+    /// `ApiConfig::web_root`, just scoped to the gateway server instead.
+    #[serde(alias = "web_root", default)]
+    #[garde(skip)]
+    pub web_root: Option<String>,
 }
 
 impl Default for GatewayConfig {
@@ -808,6 +817,7 @@ impl Default for GatewayConfig {
             host: default_gateway_host(),
             port: default_gateway_port(),
             heartbeat: HeartbeatConfig::default(),
+            web_root: None,
         }
     }
 }
@@ -2216,7 +2226,23 @@ mod tests {
         assert!(cfg.heartbeat.enabled);
         assert_eq!(cfg.heartbeat.interval_s, 30 * 60);
         assert_eq!(cfg.heartbeat.keep_recent_messages, 8);
+        assert_eq!(cfg.web_root, None);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_web_root_deserialize() {
+        let json = r#"{"webRoot": "./websockets-chat-web"}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.web_root, Some("./websockets-chat-web".to_string()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_web_root_deserialize_snake_case_alias() {
+        let json = r#"{"web_root": "./websockets-chat-web"}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.web_root, Some("./websockets-chat-web".to_string()));
     }
 
     #[test]

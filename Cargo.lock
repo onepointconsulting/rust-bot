@@ -698,6 +698,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "chat-ui"
+version = "0.1.0"
+dependencies = [
+ "ammonia",
+ "gloo-net",
+ "js-sys",
+ "leptos",
+ "pulldown-cmark",
+ "serde",
+ "serde_json",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
+]
+
+[[package]]
 name = "chrono"
 version = "0.4.45"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2409,6 +2425,18 @@ dependencies = [
  "thiserror 1.0.69",
  "wasm-bindgen",
  "web-sys",
+]
+
+[[package]]
+name = "gloo-timers"
+version = "0.3.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "bbb143cf96099802033e0d4f4963b19fd2e0b728bcf076cd9cf7f6634f092994"
+dependencies = [
+ "futures-channel",
+ "futures-core",
+ "js-sys",
+ "wasm-bindgen",
 ]
 
 [[package]]
@@ -4644,7 +4672,7 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b570b25f7617e43d59005d0990ccb79e950a423952cea19671b7a876da390adf"
 dependencies = [
  "anyhow",
- "itertools 0.13.0",
+ "itertools 0.14.0",
  "proc-macro2",
  "quote",
  "syn",
@@ -7462,7 +7490,7 @@ dependencies = [
 name = "web-chat"
 version = "0.1.0"
 dependencies = [
- "ammonia",
+ "chat-ui",
  "console_error_panic_hook",
  "console_log",
  "gloo-net",
@@ -7470,7 +7498,6 @@ dependencies = [
  "js-sys",
  "leptos",
  "log",
- "pulldown-cmark",
  "serde",
  "serde_json",
  "wasm-bindgen",
@@ -7517,6 +7544,28 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "7dcd9d09a39985f5344844e66b0c530a33843579125f23e21e9f0f220850f22a"
 dependencies = [
  "rustls-pki-types",
+]
+
+[[package]]
+name = "websockets-chat"
+version = "0.1.0"
+dependencies = [
+ "chat-ui",
+ "console_error_panic_hook",
+ "console_log",
+ "futures",
+ "gloo-net",
+ "gloo-storage",
+ "gloo-timers",
+ "js-sys",
+ "leptos",
+ "log",
+ "serde",
+ "serde_json",
+ "uuid",
+ "wasm-bindgen",
+ "wasm-bindgen-futures",
+ "web-sys",
 ]
 
 [[package]]

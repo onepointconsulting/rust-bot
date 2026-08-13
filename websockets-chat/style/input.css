@@ -1,0 +1,95 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * `chat-ui/style/shared.css` (the `.markdown`/`.streaming-cursor` rules) is
+ * NOT imported here — the standalone Tailwind CLI Trunk fetches for
+ * `rel="tailwind-css"` builds doesn't resolve local `@import`s. It's loaded
+ * as its own independent stylesheet from index.html instead (see the
+ * `rel="css"` link there), since it's plain CSS with no `@apply`/Tailwind
+ * syntax and therefore needs no Tailwind processing.
+ */
+
+@layer components {
+  /* Connection-status dot in ChatShell's header (components/chat_shell.rs). */
+  .connection-dot {
+    display: inline-block;
+    height: 0.5rem;
+    width: 0.5rem;
+    border-radius: 9999px;
+  }
+  .connection-dot--connected {
+    background-color: #16a34a; /* green-600 */
+  }
+  .connection-dot--pending {
+    background-color: #f59e0b; /* amber-500 */
+    animation: ws-chat-pulse 1.4s ease-in-out infinite;
+  }
+  .connection-dot--disconnected {
+    background-color: #dc2626; /* red-600 */
+  }
+
+  /* Tool-activity chips (components/tool_activity.rs). */
+  .tool-chip {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.3rem;
+    border-radius: 9999px;
+    padding: 0.125rem 0.625rem;
+    font-size: 0.7rem;
+    line-height: 1.25rem;
+  }
+  .tool-chip--running {
+    background-color: #fef3c7; /* amber-100 */
+    color: #92400e; /* amber-800 */
+    animation: ws-chat-pulse 1.4s ease-in-out infinite;
+  }
+  .tool-chip--done {
+    background-color: #dcfce7; /* green-100 */
+    color: #166534; /* green-800 */
+  }
+  .tool-chip--failed {
+    background-color: #fee2e2; /* red-100 */
+    color: #991b1b; /* red-800 */
+  }
+  .tool-chip__name {
+    font-weight: 600;
+  }
+  .tool-chip__detail {
+    opacity: 0.85;
+  }
+
+  /* Collapsible reasoning panel (components/reasoning_panel.rs). */
+  .reasoning-panel {
+    border-radius: 0.75rem;
+    border: 1px dashed #cbd5e1; /* slate-300 */
+    background-color: #f8fafc; /* slate-50 */
+    padding: 0.375rem 0.75rem;
+  }
+  .reasoning-panel__toggle {
+    font-size: 0.7rem;
+    font-weight: 600;
+    color: #64748b; /* slate-500 */
+  }
+  .reasoning-panel__toggle:hover {
+    color: #334155; /* slate-700 */
+  }
+  .reasoning-panel__text {
+    margin-top: 0.375rem;
+    font-size: 0.75rem;
+    font-style: italic;
+    color: #64748b; /* slate-500 */
+    white-space: pre-wrap;
+  }
+}
+
+@keyframes ws-chat-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.35;
+  }
+}

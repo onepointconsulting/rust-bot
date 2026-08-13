@@ -20,27 +20,12 @@ serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 gloo-net = { version = "0.6", features = ["http"] }
 gloo-storage = "0.3"
-pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
-ammonia = "4"
+chat-ui = { path = "../chat-ui" }
 web-sys = { version = "0.3", features = [
     "HtmlElement",
-    "HtmlTextAreaElement",
-    "HtmlInputElement",
     "Element",
     "CssStyleDeclaration",
     "ScrollBehavior",
     "ScrollIntoViewOptions",
     "Window",
-    "Navigator",
-    "Clipboard",
-    "File",
-    "FileList",
-    "FileReader",
-    "Blob",
-    "ProgressEvent",
-    "DataTransfer",
-    "DataTransferItem",
-    "DataTransferItemList",
-    "DragEvent",
-    "ClipboardEvent",
 ] }

@@ -148,6 +148,46 @@ fn run_generate_keypair(
     Ok(())
 }
 
+/// Resolves the `aud` claim for a minted token.
+///
+/// Precedence, checked in order:
+/// 1. An explicit `--aud` override always wins — the caller knows best.
+/// 2. `purpose == "webui"` mints a token meant to authenticate a WebUI
+///    frontend's *WebSocket* connection, not a REST API call — so it must
+///    carry the WebSocket channel's own audience, or
+///    `validate_jwt_aud_matches_path` (`channels::websocket::types`) will
+///    401 it at WS upgrade since that channel checks incoming tokens'
+///    `aud` against its own `path`, not `api.jwt.aud`. That audience is:
+///    - `existing_websocket_config.jwt.aud` if a `websocket` entry already
+///      exists in `channels.extra` and its `jwt.aud` is non-empty; else
+///    - that same existing entry's `path`; else, if no `websocket` entry
+///      exists yet,
+///    - `WebSocketConfig::default().path` — the value `run_generate_token`
+///      is about to write into a freshly created entry, so the minted token
+///      and the config it's paired with always agree.
+/// 3. Any other purpose (or none) keeps the REST API's own audience,
+///    `api_jwt_aud` (i.e. `api.jwt.aud`) — unchanged from prior behavior.
+fn resolve_aud(
+    aud_override: Option<&str>,
+    purpose: Option<&str>,
+    api_jwt_aud: &str,
+    existing_websocket_config: Option<&WebSocketConfig>,
+) -> String {
+    if let Some(explicit) = aud_override {
+        return explicit.to_string();
+    }
+
+    if purpose == Some("webui") {
+        return match existing_websocket_config {
+            Some(cfg) if !cfg.jwt.aud.trim().is_empty() => cfg.jwt.aud.clone(),
+            Some(cfg) => cfg.path.clone(),
+            None => WebSocketConfig::default().path,
+        };
+    }
+
+    api_jwt_aud.to_string()
+}
+
 // One parameter per CLI flag by design (mirrors `Commands::GenerateJwtToken`'s
 // own field list) — a params struct would just move the sprawl elsewhere for
 // a function called from exactly one place.
@@ -166,7 +206,25 @@ fn run_generate_token(
     let jwt = &config.api.jwt;
 
     let iss = iss_override.unwrap_or_else(|| jwt.iss.clone());
-    let aud = aud_override.unwrap_or_else(|| jwt.aud.clone());
+
+    // Deserialize the existing `websocket` entry (if any) so `resolve_aud`
+    // can mirror the audience the gateway will actually validate against,
+    // rather than always falling back to the REST API's own `api.jwt.aud`.
+    // A malformed existing entry (fails to deserialize as `WebSocketConfig`)
+    // is treated as absent — `resolve_aud` then falls back to the default
+    // WebSocket path, the same value used when writing a fresh entry below.
+    let existing_websocket_config: Option<WebSocketConfig> = config
+        .channels
+        .extra
+        .get("websocket")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+
+    let aud = resolve_aud(
+        aud_override.as_deref(),
+        purpose.as_deref(),
+        &jwt.aud,
+        existing_websocket_config.as_ref(),
+    );
     let purpose = purpose.unwrap_or_default();
 
     let minted = generate_jwt_token(&jwt.private_key_path, iss, aud, purpose, expires_in_months)?;
@@ -207,7 +265,7 @@ fn run_generate_token(
     }
 
     eprintln!("Updated websocket config in {}", config_path.display());
-    
+
     save_config(&config, Some(config_path.clone()))?;
 
     eprintln!("sub: {}", minted.claims.sub);
@@ -224,4 +282,105 @@ fn run_generate_token(
     }
     println!("{}", minted.token);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `purpose = "webui"`, no `--aud` override, no existing `websocket`
+    /// entry in `channels.extra` yet: falls back to
+    /// `WebSocketConfig::default().path`, matching what `run_generate_token`
+    /// is about to write into a freshly created entry.
+    #[test]
+    fn webui_purpose_with_no_existing_websocket_config_uses_default_path() {
+        let aud = resolve_aud(None, Some("webui"), "https://api.example.com", None);
+        assert_eq!(aud, WebSocketConfig::default().path);
+    }
+
+    /// `purpose = "webui"`, no `--aud` override, an existing `websocket`
+    /// entry whose `jwt.aud` is already set: that existing `jwt.aud` wins,
+    /// not the default path.
+    #[test]
+    fn webui_purpose_with_existing_jwt_aud_uses_that_aud() {
+        let existing = WebSocketConfig {
+            path: "/ws".to_string(),
+            jwt: rust_bot::config::schema::JwtConfig {
+                aud: "/ws".to_string(),
+                ..Default::default()
+            },
+            ..WebSocketConfig::default()
+        };
+
+        let aud = resolve_aud(
+            None,
+            Some("webui"),
+            "https://api.example.com",
+            Some(&existing),
+        );
+        assert_eq!(aud, "/ws");
+    }
+
+    /// `purpose = "webui"`, no `--aud` override, an existing `websocket`
+    /// entry whose `path` was customized but `jwt.aud` is left empty: falls
+    /// back to that existing entry's `path`, not the global default.
+    #[test]
+    fn webui_purpose_with_existing_config_and_empty_jwt_aud_uses_existing_path() {
+        let existing = WebSocketConfig {
+            path: "/custom-ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+        assert!(existing.jwt.aud.trim().is_empty(), "test assumes empty aud");
+
+        let aud = resolve_aud(
+            None,
+            Some("webui"),
+            "https://api.example.com",
+            Some(&existing),
+        );
+        assert_eq!(aud, "/custom-ws");
+    }
+
+    /// An explicit `--aud` override always wins, even for `purpose = "webui"`
+    /// and even when an existing `websocket` config entry would otherwise
+    /// resolve to a different audience.
+    #[test]
+    fn explicit_override_wins_even_for_webui_purpose() {
+        let existing = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+
+        let aud = resolve_aud(
+            Some("explicit-aud"),
+            Some("webui"),
+            "https://api.example.com",
+            Some(&existing),
+        );
+        assert_eq!(aud, "explicit-aud");
+    }
+
+    /// No purpose (or some other purpose) keeps the prior behavior: fall
+    /// back to `api.jwt.aud`, regardless of any existing `websocket` config.
+    #[test]
+    fn non_webui_purpose_falls_back_to_api_jwt_aud() {
+        let existing = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+
+        assert_eq!(
+            resolve_aud(None, None, "https://api.example.com", Some(&existing)),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            resolve_aud(
+                None,
+                Some("some-other-purpose"),
+                "https://api.example.com",
+                Some(&existing)
+            ),
+            "https://api.example.com"
+        );
+    }
 }

@@ -1,42 +1,17 @@
 //! Thin client for the rust-bot OpenAPI REST surface
-//! (`/v1/login`, `/v1/chat/completions`, `/v1/chat/commands`).
+//! (`/v1/chat/completions`, `/v1/chat/commands`, `/v1/example-prompts`).
 //!
-//! Requests are relative (e.g. `/v1/login`) so the app works unmodified
-//! whether it's served by `rust-bot api --web-root` (same origin) or
-//! proxied during `trunk serve` (see `Trunk.toml`).
+//! Requests are relative (e.g. `/v1/chat/completions`) so the app works
+//! unmodified whether it's served by `rust-bot api --web-root` (same origin)
+//! or proxied during `trunk serve` (see `Trunk.toml`).
+//!
+//! `login()` and the shared `ApiError` type live in `chat_ui::api` since both
+//! `web-chat` and `websockets-chat` authenticate against the same
+//! `POST /v1/login` shape.
 
+use chat_ui::api::{error_from_response, ApiError};
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
-
-#[derive(Debug, Clone)]
-pub struct ApiError {
-    pub message: String,
-}
-
-impl ApiError {
-    fn new(message: impl Into<String>) -> Self {
-        Self {
-            message: message.into(),
-        }
-    }
-}
-
-impl std::fmt::Display for ApiError {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
-    }
-}
-
-#[derive(Debug, Serialize)]
-struct LoginRequest<'a> {
-    email: &'a str,
-    password: &'a str,
-}
-
-#[derive(Debug, Deserialize)]
-struct LoginResponse {
-    token: String,
-}
 
 #[derive(Debug, Serialize)]
 struct ChatMessage<'a> {
@@ -104,43 +79,6 @@ struct ChatCommandResponse {
 #[derive(Debug, Deserialize)]
 struct ExamplePromptsResponse {
     prompts: Vec<String>,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorBody {
-    error: ErrorDetail,
-}
-
-#[derive(Debug, Deserialize)]
-struct ErrorDetail {
-    message: String,
-}
-
-async fn error_from_response(resp: gloo_net::http::Response) -> ApiError {
-    let status = resp.status();
-    match resp.json::<ErrorBody>().await {
-        Ok(body) => ApiError::new(body.error.message),
-        Err(_) => ApiError::new(format!("Request failed with status {status}")),
-    }
-}
-
-/// Authenticate with email/password and return a freshly minted JWT.
-pub async fn login(email: &str, password: &str) -> Result<String, ApiError> {
-    let resp = Request::post("/v1/login")
-        .json(&LoginRequest { email, password })
-        .map_err(|e| ApiError::new(e.to_string()))?
-        .send()
-        .await
-        .map_err(|e| ApiError::new(e.to_string()))?;
-
-    if !resp.ok() {
-        return Err(error_from_response(resp).await);
-    }
-
-    resp.json::<LoginResponse>()
-        .await
-        .map(|body| body.token)
-        .map_err(|e| ApiError::new(e.to_string()))
 }
 
 /// Send a chat message (with optional image attachments) and return the

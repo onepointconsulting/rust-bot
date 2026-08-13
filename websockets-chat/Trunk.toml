@@ -1,0 +1,20 @@
+[build]
+target = "index.html"
+dist = "dist"
+
+[watch]
+watch = ["src", "index.html", "style", "tailwind.config.js", "../chat-ui/src", "../chat-ui/style"]
+
+[serve]
+address = "127.0.0.1"
+port = 8902
+open = false
+
+# Login POST only (`chat_ui::api::login`, `/v1/login`) — proxied so
+# `trunk serve` can be used without CORS headaches. The WebSocket itself
+# connects DIRECTLY to the gateway (see app.rs::build_gateway_ws_url and the
+# `?wsBase=` dev override), not through this proxy: cross-origin `ws://`
+# connections aren't subject to CORS preflight, and the gateway's CORS layer
+# defaults to allow-any-origin.
+[[proxy]]
+backend = "http://127.0.0.1:18790/v1/"

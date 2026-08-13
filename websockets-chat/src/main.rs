@@ -1,6 +1,8 @@
 mod api;
 mod app;
 mod components;
+mod protocol;
+mod state;
 
 use app::App;
 use leptos::mount::mount_to;
@@ -12,6 +14,8 @@ fn main() {
     console_error_panic_hook::set_once();
     let _ = console_log::init_with_level(log::Level::Warn);
 
+    // Same `#rust-bot-chat` mount id as `web-chat`, intentionally: this app
+    // is a drop-in swap for it in any host page.
     let el = document()
         .get_element_by_id("rust-bot-chat")
         .expect("missing #rust-bot-chat")

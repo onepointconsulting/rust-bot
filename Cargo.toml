@@ -1,5 +1,5 @@
 [workspace]
-members = [".", "web-chat"]
+members = [".", "web-chat", "chat-ui", "websockets-chat"]
 default-members = ["."]
 resolver = "2"
 
