@@ -6,7 +6,7 @@ use crate::bus::events::OutboundMessage;
 
 /// Discriminant for progress updates. Variants are mutually exclusive —
 /// unlike the previous independent bool flags.
-#[derive(Debug, Clone, Default, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ProgressKind {
     #[default]
     Plain,

@@ -64,9 +64,13 @@ use crate::utils::tool_hints::format_tool_hints;
 
 const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron", "update_goal"];
 
-// Match Python's optional async callbacks (`tool_hint=True` keyword in Python).
+// Match Python's optional async callbacks (`tool_hint=True` keyword in
+// Python). The `ProgressKind` discriminant tells sinks what kind of update
+// this is — today only `Plain`/`ToolHint` are produced here, but the type
+// already covers `Reasoning*` for when that gets wired through this same
+// callback.
 pub type ProgressCallback =
-    Arc<dyn Fn(String, bool) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+    Arc<dyn Fn(String, ProgressKind) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 pub type StreamCallback =
     Arc<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
@@ -194,13 +198,13 @@ impl AgentHook for LoopHook {
                 };
                 let thought = safe_strip_think(content.as_deref());
                 if let Some(thought) = thought {
-                    on_progress(thought, false).await;
+                    on_progress(thought, ProgressKind::Plain).await;
                 }
             }
             let tool_hint =
                 safe_strip_think(Some(format_tool_hints(context.tool_calls.clone()).as_str()));
             if let Some(tool_hint) = tool_hint {
-                on_progress(tool_hint, true).await;
+                on_progress(tool_hint, ProgressKind::ToolHint).await;
             }
         }
         for tc in &context.tool_calls {
@@ -1609,19 +1613,34 @@ impl AgentLoop {
             let channel = msg.channel.clone();
             let chat_id = msg.chat_id.clone();
             let base_meta = msg.metadata.clone();
-            Arc::new(move |content: String, tool_hint: bool| {
+            Arc::new(move |content: String, kind: ProgressKind| {
                 let bus = Arc::clone(&bus);
                 let channel = channel.clone();
                 let chat_id = chat_id.clone();
                 let mut meta = base_meta.clone();
                 Box::pin(async move {
+                    // `Reasoning*` isn't published through this bus path yet —
+                    // nothing upstream produces it here, so treat it as a
+                    // tripwire rather than silently wiring up the wrong
+                    // dispatch (reasoning has its own send path in
+                    // `ChannelManager::send_once`).
+                    if matches!(
+                        kind,
+                        ProgressKind::Reasoning
+                            | ProgressKind::ReasoningDelta
+                            | ProgressKind::ReasoningEnd
+                    ) {
+                        log::warn!(
+                            "bus_progress: ignoring unsupported {kind:?} progress event \
+                             (reasoning is not yet wired through this callback)"
+                        );
+                        return;
+                    }
                     meta.insert("_progress".into(), Value::Bool(true));
-                    meta.insert("_tool_hint".into(), Value::Bool(tool_hint));
-                    let kind = if tool_hint {
-                        ProgressKind::ToolHint
-                    } else {
-                        ProgressKind::Plain
-                    };
+                    meta.insert(
+                        "_tool_hint".into(),
+                        Value::Bool(kind == ProgressKind::ToolHint),
+                    );
                     if let Err(e) = bus.publish_outbound(OutboundMessage {
                         channel,
                         chat_id,

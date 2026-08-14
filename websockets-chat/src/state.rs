@@ -163,7 +163,7 @@ pub fn finish_orphaned_entries(entries: &mut [ChatEntry]) {
 /// "running" chip gets closed out once the turn ends).
 pub fn synthesize_tool_hint_event(text: &str) -> ToolEvent {
     ToolEvent {
-        name: text.to_string(),
+        name: format!("⚙ {text}"),
         status: "running".to_string(),
         detail: None,
     }
@@ -172,11 +172,11 @@ pub fn synthesize_tool_hint_event(text: &str) -> ToolEvent {
 /// Wrap a free-text `progress` (non-tool-hint) narration line as a single
 /// synthetic [`ToolEvent`], for the same reason [`synthesize_tool_hint_event`]
 /// exists: `agent_loop.rs`'s `before_execute_tools` hook also fires
-/// `on_progress(thought, false)` — the model's in-between "thinking out
-/// loud" text, shown as `↳ ...` lines in the CLI — whenever no `on_stream`
-/// callback is wired up (true here, since `channels.websocket.streaming` is
-/// `false` in this deployment), and that too arrives with `tool_events` left
-/// `None`.
+/// `on_progress(thought, ProgressKind::Plain)` — the model's in-between
+/// "thinking out loud" text, shown as `↳ ...` lines in the CLI — whenever no
+/// `on_stream` callback is wired up (true here, since
+/// `channels.websocket.streaming` is `false` in this deployment), and that
+/// too arrives with `tool_events` left `None`.
 ///
 /// Deliberately given the status `"note"` rather than `"running"`: unlike a
 /// tool call, a narration line isn't a stateful in-flight operation with a
@@ -186,7 +186,7 @@ pub fn synthesize_tool_hint_event(text: &str) -> ToolEvent {
 /// `"note"` contains none of `Running`'s `"run"`/`"progress"` substrings).
 pub fn synthesize_progress_note_event(text: &str) -> ToolEvent {
     ToolEvent {
-        name: text.to_string(),
+        name: format!("⏳ {text}"),
         status: "note".to_string(),
         detail: None,
     }
@@ -625,7 +625,7 @@ mod tests {
     fn synthesize_tool_hint_event_wraps_text_as_a_running_chip() {
         let event = synthesize_tool_hint_event(r#"web_search("London weather")"#);
 
-        assert_eq!(event.name, r#"web_search("London weather")"#);
+        assert_eq!(event.name, r#"⚙ web_search("London weather")"#);
         assert_eq!(event.status, "running");
         assert_eq!(event.detail, None);
     }

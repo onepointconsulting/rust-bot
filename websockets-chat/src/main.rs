@@ -3,6 +3,7 @@ mod app;
 mod components;
 mod protocol;
 mod state;
+mod storage_keys;
 
 use app::App;
 use leptos::mount::mount_to;

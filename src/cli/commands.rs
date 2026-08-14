@@ -897,7 +897,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                 )
                 .await;
                 // Suppress progress publishing during heartbeat (matches Python `_silent`).
-                let silent: ProgressCallback = Arc::new(|_message, _tool_hint| {
+                let silent: ProgressCallback = Arc::new(|_message, _kind| {
                     Box::pin(async {})
                 });
                 let resp = Arc::clone(&agent_loop)

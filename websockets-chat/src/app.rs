@@ -28,6 +28,8 @@ use crate::api::{self, WsSender};
 use crate::components::ChatShell;
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, ConnectionStatus};
+use crate::storage_keys::CHAT_OPEN_STORAGE_KEY;
+use crate::storage_keys::EXPANDED_STORAGE_KEY;
 
 const TOKEN_STORAGE_KEY: &str = "rust-bot-websockets-chat-token";
 const ENTRIES_STORAGE_KEY: &str = "rust-bot-websockets-chat-entries";
@@ -561,8 +563,12 @@ pub fn App() -> impl IntoView {
     let token = RwSignal::new(read_stored_token());
     let login_error = RwSignal::new(None::<String>);
     let login_pending = RwSignal::new(false);
-    let chat_open = RwSignal::new(false);
-    let expanded = RwSignal::new(false);
+    let chat_open = RwSignal::new(
+        BrowserLocalStorage::get::<bool>(CHAT_OPEN_STORAGE_KEY).unwrap_or(false),
+    );
+    let expanded = RwSignal::new(
+        BrowserLocalStorage::get::<bool>(EXPANDED_STORAGE_KEY).unwrap_or(false),
+    );
 
     let client_id = RwSignal::new(read_or_create_client_id());
     let chat_id = RwSignal::new(None::<String>);
@@ -735,9 +741,18 @@ pub fn App() -> impl IntoView {
 
     let do_retry = move || manual_retry(ws_context);
 
-    let open_chat = move || chat_open.set(true);
-    let close_chat = move || chat_open.set(false);
-    let toggle_expand = move || expanded.update(|value| *value = !*value);
+    let open_chat = move || {
+        chat_open.set(true);
+        let _ = BrowserLocalStorage::set(CHAT_OPEN_STORAGE_KEY, &chat_open.get());
+    };
+    let close_chat = move || {
+        chat_open.set(false);
+        let _ = BrowserLocalStorage::set(CHAT_OPEN_STORAGE_KEY, &chat_open.get());
+    };
+    let toggle_expand = move || {
+        expanded.update(|value| *value = !*value);
+        let _ = BrowserLocalStorage::set(EXPANDED_STORAGE_KEY, &expanded.get());
+    };
 
     let pending = Signal::derive(move || entries.get().iter().any(|entry| entry.streaming));
 

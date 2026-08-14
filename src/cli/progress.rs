@@ -4,6 +4,7 @@ use anstyle::Style;
 use futures::lock::Mutex;
 
 use crate::agent::agent_loop::ProgressCallback;
+use crate::bus::outbound_events::ProgressKind;
 use crate::cli::stream::StreamRenderer;
 use crate::config::schema::ChannelsConfig;
 
@@ -58,19 +59,33 @@ pub(crate) fn create_on_progress(
     channels: ChannelsConfig,
     renderer: Arc<Mutex<StreamRenderer>>,
 ) -> ProgressCallback {
-    Arc::new(move |content, tool_hint| {
+    Arc::new(move |content, kind| {
         let renderer = Arc::clone(&renderer);
         Box::pin(async move {
-            let progress_type = if tool_hint {
-                if !channels.send_tool_hints {
+            let progress_type = match kind {
+                ProgressKind::ToolHint => {
+                    if !channels.send_tool_hints {
+                        return;
+                    }
+                    ProgressType::ToolHint
+                }
+                ProgressKind::Plain => {
+                    if !channels.send_progress {
+                        return;
+                    }
+                    ProgressType::Progress
+                }
+                // Reasoning isn't wired through this callback yet — nothing
+                // upstream produces it here. Warn instead of inventing a
+                // CLI line for a kind this sink doesn't render.
+                ProgressKind::Reasoning
+                | ProgressKind::ReasoningDelta
+                | ProgressKind::ReasoningEnd => {
+                    log::warn!(
+                        "create_on_progress: ignoring unsupported {kind:?} progress event"
+                    );
                     return;
                 }
-                ProgressType::ToolHint
-            } else {
-                if !channels.send_progress {
-                    return;
-                }
-                ProgressType::Progress
             };
             let mut renderer_guard = renderer.lock().await;
             print_cli_progress_line(&mut renderer_guard, &content, progress_type);
