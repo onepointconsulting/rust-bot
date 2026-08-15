@@ -1152,6 +1152,12 @@ impl AgentLoop {
                             event: Some(OutboundEvent::StreamEnd(StreamEndEvent {
                                 stream_id: Some(stream_id),
                                 resuming,
+                                // `merge_next` keeps the channel's per-`stream_id`
+                                // buffer. Each stream_end increments
+                                // `stream_segment`, so the next deltas use a new
+                                // id. Setting this true would leak the old buffer
+                                // without helping the next segment. Clients keep
+                                // the chat turn open via `resuming` instead.
                                 merge_next: false,
                             })),
                         });

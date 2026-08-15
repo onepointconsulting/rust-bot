@@ -310,6 +310,15 @@ async fn ws_upgrade_handler(
     })
 }
 
+fn ready_event(chat_id: &str, client_id: &str, streaming: bool) -> serde_json::Value {
+    serde_json::json!({
+        "event": WsOutboundEvent::Ready.as_str(),
+        "chat_id": chat_id,
+        "client_id": client_id,
+        "streaming": streaming,
+    })
+}
+
 /// Drive one connection for its lifetime: mint a fresh `chat_id` for it,
 /// announce it via a `ready` frame, register an outbound sender, forward
 /// inbound text frames to the bus, and clean up the registry entry on close.
@@ -337,12 +346,9 @@ async fn handle_socket(
 
     // Send `ready` before registering, so a reply can never race ahead of
     // the client learning its own chat_id (mirrors nanobot's ordering
-    // comment at runtime.py:578).
-    let ready = serde_json::json!({
-        "event": WsOutboundEvent::Ready.as_str(),
-        "chat_id": chat_id,
-        "client_id": client_id,
-    });
+    // comment at runtime.py:578). `streaming` tells the WebUI whether this
+    // channel will emit `delta` frames or a single final `message`.
+    let ready = ready_event(&chat_id, &client_id, shared.supports_streaming);
     if sink.send(Message::text(ready.to_string())).await.is_err() {
         return;
     }
@@ -425,7 +431,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         .and_then(|v| v.as_str())
         .unwrap_or_default();
     match EnvelopeType::from(type_str) {
-        EnvelopeType::NewChat => { /* ... */ }
+        EnvelopeType::NewChat => {
+            handle_envelope_new_chat(envelope_dispatch_context).await;
+        }
         EnvelopeType::ForkChat => { /* ... */ }
         EnvelopeType::Attach => { /* ... */ }
         EnvelopeType::SetWorkspaceScope => { /* ... */ }
@@ -444,6 +452,68 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
             .await;
         }
     }
+}
+
+async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let shared = envelope_dispatch_context.shared;
+    let connection_id = envelope_dispatch_context.connection_id;
+
+    let new_id = Uuid::new_v4().to_string();
+    let scope_for_new_chat = {
+        let ws_shared = shared.clone();
+        let envelope = envelope_dispatch_context.envelope.clone();
+        // Capture a bool — not `EnvelopeDispatchContext` — so the `Arc<dyn Fn… + 'static>`
+        // closure doesn't inherit the handler's short lifetime.
+        let controls_available = envelope_dispatch_context.workspace_controls_available();
+        Arc::new(move || {
+            let result = {
+                let mut session_manager = ws_shared
+                    .session_manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                ws_shared._workspace_request_handler.scope_for_new_chat(
+                    &mut session_manager,
+                    &envelope,
+                    controls_available,
+                )
+            };
+            Box::pin(async move { result })
+                as Pin<Box<dyn Future<Output = Result<WorkspaceScope, WorkspaceScopeError>> + Send>>
+        })
+    };
+    // `None` here (not `Some(&new_id)`): mirrors nanobot's `new_chat` handler,
+    // which omits `chat_id` from a rejected new-chat's scope error — the
+    // chat was never attached to anything, so there is no id worth reporting.
+    let scope = workspace_scope_or_error(shared, None, None, connection_id, scope_for_new_chat).await;
+    let Some(scope) = scope else {
+        return;
+    };
+    {
+        // Run the sync work (and drop the `MutexGuard`) *before* the `.await`s
+        // below: `std::sync::MutexGuard` is `!Send` and can't live across an
+        // await point inside this connection's `Send` future — same pattern
+        // as `handle_envelope_message`'s own `persist_scope` call.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        shared._workspace_request_handler.persist_scope(&mut session_manager, &new_id, &scope);
+    }
+    shared.connections.lock().await.attach(connection_id, &new_id);
+    send_event(shared, connection_id, WsOutboundEvent::Attached, None, serde_json::json!({"chat_id": new_id})).await;
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::SessionUpdated,
+        None,
+        serde_json::json!({
+            "chat_id": new_id,
+            "scope": "metadata",
+            "workspace_scope": scope.payload(),
+        }),
+    )
+    .await;
+    hydrate_after_subscribe(&new_id, shared).await;
 }
 
 async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
@@ -616,7 +686,7 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
                 as Pin<Box<dyn Future<Output = Result<WorkspaceScope, WorkspaceScopeError>> + Send>>
         })
     };
-    let Some(scope) = workspace_scope_or_error(shared, cid, turn_id, connection_id, resolver).await
+    let Some(scope) = workspace_scope_or_error(shared, Some(cid), turn_id, connection_id, resolver).await
     else {
         return;
     };
@@ -836,9 +906,15 @@ type ScopeResolver = Arc<
 /// Resolve a workspace scope, or send the client a `workspace_scope_rejected`
 /// error and return `None`. Mirrors nanobot's `_workspace_scope_or_error`
 /// (`channels/websocket/runtime.py:852-871`).
+///
+/// `cid` is `Option<&str>`, not `&str`, because the Python reference's
+/// `chat_id` parameter defaults to (and, for `new_chat`, is always called
+/// with) `None` — a rejected new-chat scope was never attached to any chat
+/// id, so there is nothing to report and the field is omitted entirely
+/// rather than naming an id the client was never told about.
 async fn workspace_scope_or_error(
     shared: &WsShared,
-    cid: &str,
+    cid: Option<&str>,
     turn_id: Option<&str>,
     connection_id: &str,
     resolver: ScopeResolver,
@@ -848,10 +924,12 @@ async fn workspace_scope_or_error(
         Err(err) => err,
     };
     let mut base_fields = serde_json::Map::new();
-    base_fields.insert(
-        "chat_id".to_string(),
-        serde_json::Value::String(cid.to_string()),
-    );
+    if let Some(cid) = cid {
+        base_fields.insert(
+            "chat_id".to_string(),
+            serde_json::Value::String(cid.to_string()),
+        );
+    }
     if let Some(turn_id) = turn_id {
         base_fields.insert(
             "turn_id".to_string(),
@@ -1691,6 +1769,18 @@ mod tests {
         assert!(!is_valid_chat_id("has;semicolon"));
     }
 
+    #[test]
+    fn ready_event_advertises_streaming() {
+        let body = ready_event("chat-1", "client-1", true);
+        assert_eq!(body["event"], "ready");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["client_id"], "client-1");
+        assert_eq!(body["streaming"], true);
+
+        let body = ready_event("chat-1", "client-1", false);
+        assert_eq!(body["streaming"], false);
+    }
+
     // --- workspace_controls_available ---
 
     fn test_shared(runtime_surface: &str) -> WsShared {
@@ -1900,7 +1990,7 @@ mod tests {
         };
 
         let resolved =
-            workspace_scope_or_error(&shared, "chat-1", Some("turn-1"), "conn-1", resolver).await;
+            workspace_scope_or_error(&shared, Some("chat-1"), Some("turn-1"), "conn-1", resolver).await;
 
         assert_eq!(resolved, Some(scope));
     }
@@ -1919,7 +2009,7 @@ mod tests {
         });
 
         let resolved =
-            workspace_scope_or_error(&shared, "chat-1", Some("turn-1"), "conn-1", resolver).await;
+            workspace_scope_or_error(&shared, Some("chat-1"), Some("turn-1"), "conn-1", resolver).await;
 
         assert!(resolved.is_none());
         let msg = rx.try_recv().expect("expected a rejection frame");
@@ -1929,6 +2019,90 @@ mod tests {
         assert_eq!(body["turn_id"], "turn-1");
         assert_eq!(body["detail"], "workspace_scope_rejected");
         assert_eq!(body["reason"], "workspace escalation denied");
+    }
+
+    #[tokio::test]
+    async fn workspace_scope_or_error_omits_chat_id_when_cid_is_none() {
+        // Mirrors nanobot's `new_chat` handler, which calls
+        // `_workspace_scope_or_error` without a `chat_id` at all: a rejected
+        // new-chat scope was never attached to any chat id, so the field
+        // must be absent from the error payload, not merely empty.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let resolver: ScopeResolver = Arc::new(|| {
+            Box::pin(async { Err(WorkspaceScopeError::new(403, "workspace escalation denied")) })
+        });
+
+        let resolved = workspace_scope_or_error(&shared, None, None, "conn-1", resolver).await;
+
+        assert!(resolved.is_none());
+        let msg = rx.try_recv().expect("expected a rejection frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "error");
+        assert!(
+            body.get("chat_id").is_none(),
+            "chat_id must be omitted, not just null: {body}"
+        );
+        assert!(body.get("turn_id").is_none());
+        assert_eq!(body["detail"], "workspace_scope_rejected");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_new_chat_attaches_and_sends_session_updated_with_workspace_scope() {
+        // Regression guard for the un-scoped `session_manager` `MutexGuard`
+        // bug: held across `.await`s, it made the connection future `!Send`
+        // (a compile error) and would have self-deadlocked at runtime, since
+        // `hydrate_after_subscribe` re-locks the same mutex on the same call
+        // chain. Wrapping in `tokio::time::timeout` turns a reintroduced
+        // deadlock into a clean test failure instead of a hung test run.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("new_chat"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_new_chat must not hang");
+
+        let attached = rx.try_recv().expect("expected an attached frame");
+        let attached_body: serde_json::Value =
+            serde_json::from_str(&attached.into_text().unwrap()).unwrap();
+        assert_eq!(attached_body["event"], "attached");
+        let new_chat_id = attached_body["chat_id"]
+            .as_str()
+            .expect("attached frame should carry the new chat_id")
+            .to_string();
+        assert!(!new_chat_id.is_empty());
+
+        let session_updated = rx.try_recv().expect("expected a session_updated frame");
+        let session_updated_body: serde_json::Value =
+            serde_json::from_str(&session_updated.into_text().unwrap()).unwrap();
+        assert_eq!(session_updated_body["event"], "session_updated");
+        assert_eq!(session_updated_body["chat_id"], new_chat_id);
+        assert_eq!(session_updated_body["scope"], "metadata");
+        assert!(
+            session_updated_body.get("workspace_scope").is_some(),
+            "session_updated must carry the new chat's workspace scope: {session_updated_body}"
+        );
     }
 
     #[tokio::test]

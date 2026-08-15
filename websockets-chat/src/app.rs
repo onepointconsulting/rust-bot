@@ -28,6 +28,7 @@ use crate::api::{self, WsSender};
 use crate::components::ChatShell;
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, ConnectionStatus};
+use crate::storage_keys::CHAT_ID_STORAGE_KEY;
 use crate::storage_keys::CHAT_OPEN_STORAGE_KEY;
 use crate::storage_keys::EXPANDED_STORAGE_KEY;
 
@@ -115,6 +116,27 @@ fn trim_to_max_turns(entries: Vec<ChatEntry>, max_turns: usize) -> Vec<ChatEntry
 }
 
 /// Read (once) or mint a stable per-browser `client_id`.
+fn read_stored_chat_id() -> Option<String> {
+    BrowserLocalStorage::get::<String>(CHAT_ID_STORAGE_KEY)
+        .ok()
+        .filter(|id| !id.is_empty())
+}
+
+fn persist_chat_id(chat_id: &str) {
+    let _ = BrowserLocalStorage::set(CHAT_ID_STORAGE_KEY, &chat_id.to_string());
+}
+
+fn clear_stored_chat_id() {
+    BrowserLocalStorage::delete(CHAT_ID_STORAGE_KEY);
+}
+
+/// Remember `chat_id` in memory and localStorage so a refresh or browser
+/// restart keeps appending to the same gateway session.
+fn adopt_chat_id(ctx: &WsContext, chat_id: String) {
+    persist_chat_id(&chat_id);
+    ctx.chat_id.set(Some(chat_id));
+}
+
 fn read_or_create_client_id() -> String {
     if let Ok(existing) = BrowserLocalStorage::get::<String>(CLIENT_ID_STORAGE_KEY) {
         if !existing.is_empty() {
@@ -237,6 +259,11 @@ struct WsContext {
     /// superseded it, so its close is a stale no-op rather than triggering
     /// a redundant reconnect. See [`handle_connection_closed`].
     generation: RwSignal<u64>,
+    /// From the gateway `ready` event: whether this channel will stream
+    /// token `delta`s. Drives the in-progress indicator (cursor vs spinner).
+    /// Defaults to `false` until `ready` arrives, matching the server's
+    /// `WebSocketConfig.streaming` default.
+    token_streaming: RwSignal<bool>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -319,8 +346,7 @@ fn handle_message_event(
             // The backend's `before_execute_tools` hook only ever sends
             // free-text hints — a tool-call line (e.g. `web_search("...")`,
             // `kind: "tool_hint"`) and, whenever no `on_stream` callback is
-            // wired up (true here, since `channels.websocket.streaming` is
-            // `false`), a narration line (the model's in-between "thinking
+            // wired up, a narration line (the model's in-between "thinking
             // out loud" text, `kind: "progress"`) — with `tool_events`
             // always left `None`. No code path in the backend populates the
             // structured shape this crate was originally built to render
@@ -349,24 +375,26 @@ fn handle_message_event(
     }
 }
 
-/// Handle a `stream_end` event. `merge_next: Some(true)` hints that another
-/// delta stream will continue this same logical answer; `apply_stream_end`
-/// unconditionally clears `streaming`, so when that hint is set this
-/// re-marks the entry as streaming immediately afterward rather than
-/// leaving the cursor flicker off between the two streams.
-fn handle_stream_end(ctx: &WsContext, text: Option<String>, merge_next: Option<bool>) {
+/// Handle a `stream_end` event. `resuming` / `merge_next` mean this turn is
+/// not finished: tool calls follow, or another delta stream continues the
+/// same answer. `apply_stream_end` unconditionally clears `streaming`, so
+/// when the turn continues this re-marks the entry as streaming rather than
+/// leaving the cursor off between segments — and, critically, leaves
+/// `active_turn_id` set so later `delta` frames are not dropped.
+fn handle_stream_end(
+    ctx: &WsContext,
+    text: Option<String>,
+    resuming: Option<bool>,
+    merge_next: Option<bool>,
+) {
     let Some(turn_id) = ctx.active_turn_id.get_untracked() else {
         return;
     };
-    let keep_streaming = merge_next.unwrap_or(false);
+    let keep_streaming = state::stream_end_continues_turn(resuming, merge_next);
     update_entries(ctx, |entries, index| {
         state::apply_stream_end(entries, index, &turn_id, text.as_deref());
         if keep_streaming {
-            if let Some(entry_id) = index.get(&turn_id).copied() {
-                if let Some(entry) = entries.iter_mut().find(|entry| entry.id == entry_id) {
-                    entry.streaming = true;
-                }
-            }
+            state::reopen_streaming(entries, index, &turn_id);
         }
     });
     if !keep_streaming {
@@ -378,11 +406,21 @@ fn handle_stream_end(ctx: &WsContext, text: Option<String>, merge_next: Option<b
 /// (or, for events with no reducer, a log line) per the dispatch table in
 /// the task's plan.
 fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
+    if should_drop_event(ctx, &event) {
+        return;
+    }
     match event {
-        ServerEvent::Ready { chat_id, client_id } => {
-            log::info!("gateway ready: chat_id={chat_id} client_id={client_id}");
-            ctx.chat_id.set(Some(chat_id));
+        ServerEvent::Ready { chat_id, client_id, streaming } => {
+            log::info!(
+                "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming}"
+            );
             ctx.connection_status.set(ConnectionStatus::Connected);
+            ctx.token_streaming.set(streaming);
+            // The gateway always mints a fresh id on connect. Keep a stored
+            // one so refresh/restart continue the same session file.
+            if ctx.chat_id.get_untracked().is_none() {
+                adopt_chat_id(ctx, chat_id);
+            }
         }
         ServerEvent::MessageAccepted { chat_id, turn_id } => {
             log::info!("message accepted: chat_id={chat_id} turn_id={turn_id}");
@@ -402,8 +440,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 });
             }
         }
-        ServerEvent::StreamEnd { text, merge_next, .. } => {
-            handle_stream_end(ctx, text, merge_next);
+        ServerEvent::StreamEnd { text, resuming, merge_next, .. } => {
+            handle_stream_end(ctx, text, resuming, merge_next);
         }
         ServerEvent::ReasoningDelta { text, .. } => {
             if let Some(turn_id) = ctx.active_turn_id.get_untracked() {
@@ -431,13 +469,34 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             ctx.active_turn_id.set(None);
         }
-        ServerEvent::Attached(value) => log::info!("attach ack (shape not finalized server-side): {value}"),
-        ServerEvent::SessionUpdated(value) => log::info!("session updated (shape not finalized server-side): {value}"),
+        ServerEvent::Attached { chat_id } => {
+            log::info!("attached to chat_id={chat_id}");
+            adopt_chat_id(ctx, chat_id);
+            ctx.chat_error.set(None);
+        }
+        ServerEvent::SessionUpdated(value) => log::info!("session updated: {value}"),
         ServerEvent::GoalState(value) => log::info!("goal state (shape not finalized server-side): {value}"),
         ServerEvent::FileEdit { chat_id, edits } => {
             log::info!("file_edit for chat_id={chat_id}: {edits:?}");
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
+    }
+}
+
+/// Drop leftover frames from a previous chat after "New chat" clears
+/// `chat_id` and before the `attached` ack lands — and, afterward, frames
+/// still fanned out for the old subscription. `attached` / `ready` always
+/// pass so the new id can be installed; unscoped errors (rejected `new_chat`)
+/// pass so the user still sees the rejection.
+fn should_drop_event(ctx: &WsContext, event: &ServerEvent) -> bool {
+    match event {
+        ServerEvent::Attached { .. } | ServerEvent::Ready { .. } | ServerEvent::Unknown(_) => {
+            false
+        }
+        _ => match event.chat_id() {
+            None => false,
+            Some(cid) => ctx.chat_id.get_untracked().as_deref() != Some(cid),
+        },
     }
 }
 
@@ -530,11 +589,35 @@ fn manual_retry(ctx: WsContext) {
     open_connection(ctx);
 }
 
+/// Serialize `envelope` and send it on the open socket. Surfaces encode /
+/// disconnected / send failures on `ctx.chat_error`.
+fn send_client_envelope(
+    ctx: WsContext,
+    envelope: protocol::ClientEnvelope,
+    encode_error: &'static str,
+) {
+    let Ok(payload) = serde_json::to_string(&envelope) else {
+        ctx.chat_error.set(Some(encode_error.to_string()));
+        return;
+    };
+    spawn_local(async move {
+        let sender_rc = ctx.ws_sender.get_untracked();
+        let mut guard = sender_rc.borrow_mut();
+        let Some(sender) = guard.as_mut() else {
+            ctx.chat_error
+                .set(Some("Not connected to the gateway.".to_string()));
+            return;
+        };
+        if let Err(err) = sender.send_text(payload).await {
+            ctx.chat_error
+                .set(Some(format!("Failed to send message: {err}")));
+        }
+    });
+}
+
 /// Tear down the current socket without letting [`handle_connection_closed`]
 /// schedule an automatic reconnect (bumping `generation` makes its
-/// eventual, stale `on_close` callback a no-op). Used by logout (no reopen)
-/// and "New chat" (the caller reopens immediately afterward to obtain a
-/// fresh server-assigned `chat_id`).
+/// eventual, stale `on_close` callback a no-op). Used by logout.
 fn close_connection(ctx: &WsContext) {
     ctx.generation.set(ctx.generation.get_untracked() + 1);
     if let Some(mut sender) = ctx.ws_sender.get_untracked().borrow_mut().take() {
@@ -571,7 +654,7 @@ pub fn App() -> impl IntoView {
     );
 
     let client_id = RwSignal::new(read_or_create_client_id());
-    let chat_id = RwSignal::new(None::<String>);
+    let chat_id = RwSignal::new(read_stored_chat_id());
     let connection_status = RwSignal::new(ConnectionStatus::Disconnected);
     let reconnect_attempt = RwSignal::new(0u32);
     let reconnect_exhausted = RwSignal::new(false);
@@ -597,6 +680,7 @@ pub fn App() -> impl IntoView {
     // empty-state suggestion list simply stays empty for now.
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
+    let token_streaming = RwSignal::new(false);
 
     let ws_context = WsContext {
         token,
@@ -613,6 +697,7 @@ pub fn App() -> impl IntoView {
         ws_base_override,
         ws_sender,
         generation,
+        token_streaming,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -652,7 +737,6 @@ pub fn App() -> impl IntoView {
                     next_id.set(0);
                     turn_index.set(HashMap::new());
                     active_turn_id.set(None);
-                    chat_id.set(None);
                     reconnect_attempt.set(0);
                     reconnect_exhausted.set(false);
                     token.set(Some(jwt));
@@ -668,6 +752,7 @@ pub fn App() -> impl IntoView {
         close_connection(&ws_context);
         SessionStorage::delete(TOKEN_STORAGE_KEY);
         clear_stored_entries();
+        clear_stored_chat_id();
         token.set(None);
         chat_id.set(None);
         entries.set(Vec::new());
@@ -679,6 +764,7 @@ pub fn App() -> impl IntoView {
         reconnect_attempt.set(0);
         reconnect_exhausted.set(false);
         connection_status.set(ConnectionStatus::Disconnected);
+        token_streaming.set(false);
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -701,27 +787,14 @@ pub fn App() -> impl IntoView {
         chat_error.set(None);
 
         let media = build_media_payload(&attachments);
-        let envelope = protocol::ClientEnvelope::message(current_chat_id, Some(turn_id), text, media);
-        let Ok(payload) = serde_json::to_string(&envelope) else {
-            chat_error.set(Some("Failed to encode the outgoing message.".to_string()));
-            return;
-        };
-
-        spawn_local(async move {
-            let sender_rc = ws_context.ws_sender.get_untracked();
-            let mut guard = sender_rc.borrow_mut();
-            let Some(sender) = guard.as_mut() else {
-                chat_error.set(Some("Not connected to the gateway.".to_string()));
-                return;
-            };
-            if let Err(err) = sender.send_text(payload).await {
-                chat_error.set(Some(format!("Failed to send message: {err}")));
-            }
-        });
+        send_client_envelope(
+            ws_context,
+            protocol::ClientEnvelope::message(current_chat_id, Some(turn_id), text, media),
+            "Failed to encode the outgoing message.",
+        );
     };
 
     let do_new_chat = move || {
-        close_connection(&ws_context);
         clear_stored_entries();
         entries.set(Vec::new());
         next_id.set(0);
@@ -729,14 +802,24 @@ pub fn App() -> impl IntoView {
         active_turn_id.set(None);
         chat_id.set(None);
         chat_error.set(None);
-        reconnect_attempt.set(0);
-        reconnect_exhausted.set(false);
-        // TODO(next agent): switch to a `new_chat` envelope once the
-        // backend implements it — `ClientEnvelope`'s doc comment in
-        // `protocol.rs` notes only `message` is dispatched server-side
-        // today. Until then, reconnecting is the only way to obtain a
-        // fresh server-assigned `chat_id` from the next `ready` event.
-        open_connection(ws_context);
+
+        let connected = ws_context
+            .ws_sender
+            .get_untracked()
+            .borrow()
+            .as_ref()
+            .is_some();
+        if connected {
+            send_client_envelope(
+                ws_context,
+                protocol::ClientEnvelope::new_chat(),
+                "Failed to encode the new-chat request.",
+            );
+        } else {
+            reconnect_attempt.set(0);
+            reconnect_exhausted.set(false);
+            open_connection(ws_context);
+        }
     };
 
     let do_retry = move || manual_retry(ws_context);
@@ -781,6 +864,7 @@ pub fn App() -> impl IntoView {
                     example_prompts=Signal::derive(move || example_prompts.get())
                     connection_status=Signal::derive(move || connection_status.get())
                     reconnect_exhausted=Signal::derive(move || reconnect_exhausted.get())
+                    token_streaming=Signal::derive(move || token_streaming.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat

@@ -433,13 +433,13 @@ impl AgentRunner {
     ///
     /// Mirrors Python's `_request_model`:
     ///   - Builds the request parameters from `spec`.
-    ///   - If the hook requests streaming, the response content is forwarded
-    ///     to `hook.on_stream` as a single delta once the full response arrives.
+    ///   - If the hook requests streaming, each content delta is forwarded to
+    ///     `hook.on_stream` as it arrives from the provider.
     pub async fn request_model(
         &self,
         spec: &AgentRunSpec,
         messages: Vec<Value>,
-        hook: &dyn AgentHook,
+        hook: Arc<dyn AgentHook>,
         context: &mut AgentHookContext,
     ) -> LLMResponse {
         log::info!("Using model: {}", spec.model);
@@ -447,21 +447,20 @@ impl AgentRunner {
         let tools_opt = if tools.is_empty() { None } else { Some(tools) };
 
         if hook.wants_streaming() {
-            // `BoxedStreamCallback` must be `Send + Sync`, so we cannot capture
-            // `&mut AgentHookContext` directly inside it.  Instead we collect
-            // each delta into a shared buffer and replay them to the hook once
-            // the request completes — preserving the correct ordering while
-            // staying free of unsafe code.
-            let deltas: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-            let deltas_cb = Arc::clone(&deltas);
+            // `BoxedStreamCallback` is `'static + Send + Sync`, so it cannot
+            // capture `&dyn AgentHook` or `&mut AgentHookContext`. Hold the hook
+            // in an `Arc` and clone an owned context snapshot instead.
+            let hook_cb = Arc::clone(&hook);
+            let ctx_snapshot = context.clone();
             let callback: BoxedStreamCallback = Box::new(move |delta: String| {
-                let deltas = Arc::clone(&deltas_cb);
+                let hook = Arc::clone(&hook_cb);
+                let mut ctx = ctx_snapshot.clone();
                 Box::pin(async move {
-                    deltas.lock().unwrap().push(delta);
+                    hook.on_stream(&mut ctx, &delta).await;
                 })
             });
 
-            let response = self
+            return self
                 .provider
                 .chat_stream_with_retry_boxed(
                     messages,
@@ -474,13 +473,6 @@ impl AgentRunner {
                     Some(callback),
                 )
                 .await;
-
-            let drained: Vec<String> = deltas.lock().unwrap().drain(..).collect();
-            for delta in drained {
-                hook.on_stream(context, &delta).await;
-            }
-
-            return response;
         }
 
         self.provider
@@ -840,7 +832,7 @@ impl AgentRunner {
             log::debug!("Messages for model: {}", messages_for_model.clone().iter().map(|m| m.to_string().chars().take(400).collect::<String>()).collect::<Vec<String>>().join("\n"));
             // ── LLM call ──────────────────────────────────────────────────────
             let response = self
-                .request_model(&spec, messages_for_model.clone(), hook.as_ref(), &mut ctx)
+                .request_model(&spec, messages_for_model.clone(), Arc::clone(&hook), &mut ctx)
                 .await;
             log::info!("Response: {}", response.content.clone().unwrap_or("".to_string()).chars().take(400).collect::<String>());
 

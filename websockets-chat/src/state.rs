@@ -46,6 +46,31 @@ pub fn apply_delta(
     }
 }
 
+/// Whether a `stream_end` is only a pause in the same logical answer.
+///
+/// The gateway sets `resuming` when tool calls follow and a later stream
+/// segment will continue this turn (`on_stream_end(true)`). `merge_next`
+/// means more deltas will arrive on the same `stream_id`. Either flag must
+/// keep the client turn alive; otherwise later `delta` frames are dropped.
+pub fn stream_end_continues_turn(resuming: Option<bool>, merge_next: Option<bool>) -> bool {
+    resuming.unwrap_or(false) || merge_next.unwrap_or(false)
+}
+
+/// Re-mark the entry as streaming after a continuing [`apply_stream_end`].
+///
+/// `apply_stream_end` always clears `streaming`; call this when
+/// [`stream_end_continues_turn`] is true so the cursor stays on between
+/// tool-call pauses and the next delta segment.
+pub fn reopen_streaming(
+    entries: &mut Vec<ChatEntry>,
+    turn_index: &HashMap<String, u64>,
+    turn_id: &str,
+) {
+    if let Some(entry) = find_entry_for_turn(entries, turn_index, turn_id) {
+        entry.streaming = true;
+    }
+}
+
 /// Apply a `stream_end` event: mark the entry no longer streaming, and, when
 /// the gateway supplied the authoritative full `text`, overwrite the
 /// accumulated delta content with it. The backend sends `text` as the
@@ -174,9 +199,9 @@ pub fn synthesize_tool_hint_event(text: &str) -> ToolEvent {
 /// exists: `agent_loop.rs`'s `before_execute_tools` hook also fires
 /// `on_progress(thought, ProgressKind::Plain)` — the model's in-between
 /// "thinking out loud" text, shown as `↳ ...` lines in the CLI — whenever no
-/// `on_stream` callback is wired up (true here, since
-/// `channels.websocket.streaming` is `false` in this deployment), and that
-/// too arrives with `tool_events` left `None`.
+/// `on_stream` callback is wired up, and that too arrives with `tool_events`
+/// left `None`. When streaming is enabled, that narration arrives as `delta`
+/// frames instead and this helper is unused.
 ///
 /// Deliberately given the status `"note"` rather than `"running"`: unlike a
 /// tool call, a narration line isn't a stateful in-flight operation with a
@@ -452,6 +477,37 @@ mod tests {
         apply_stream_end(&mut entries, &index, "turn-1", Some("authoritative full text"));
 
         assert_eq!(entries[0].content, "authoritative full text");
+        assert!(!entries[0].streaming);
+    }
+
+    #[test]
+    fn stream_end_continues_turn_on_resuming_or_merge_next() {
+        assert!(stream_end_continues_turn(Some(true), Some(false)));
+        assert!(stream_end_continues_turn(Some(true), None));
+        assert!(stream_end_continues_turn(None, Some(true)));
+        assert!(stream_end_continues_turn(Some(false), Some(true)));
+        assert!(!stream_end_continues_turn(Some(false), Some(false)));
+        assert!(!stream_end_continues_turn(None, None));
+    }
+
+    #[test]
+    fn later_deltas_append_after_resuming_stream_end() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+
+        apply_delta(&mut entries, &index, "turn-1", "I'll pull the paper. ");
+        apply_stream_end(&mut entries, &index, "turn-1", None);
+        assert!(stream_end_continues_turn(Some(true), Some(false)));
+        reopen_streaming(&mut entries, &index, "turn-1");
+        assert!(entries[0].streaming);
+
+        apply_delta(&mut entries, &index, "turn-1", "Here is the summary.");
+        apply_stream_end(&mut entries, &index, "turn-1", None);
+
+        assert_eq!(
+            entries[0].content,
+            "I'll pull the paper. Here is the summary."
+        );
         assert!(!entries[0].streaming);
     }
 

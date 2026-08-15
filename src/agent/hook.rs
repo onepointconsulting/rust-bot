@@ -10,6 +10,7 @@ use crate::providers::base::{LLMResponse, ToolCallRequest};
 
 // ── AgentHookContext ──────────────────────────────────────────────────────────
 
+#[derive(Debug, Clone, PartialEq)]
 /// Mutable per-iteration state exposed to runner hooks.
 pub struct AgentHookContext {
     pub iteration: usize,

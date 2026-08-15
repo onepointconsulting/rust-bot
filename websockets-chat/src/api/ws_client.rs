@@ -42,11 +42,10 @@ impl WsSender {
     /// Gracefully close the underlying WebSocket send half, initiating the
     /// close handshake.
     ///
-    /// Used by `app.rs` for *intentional* teardown (logout, "New chat"
-    /// reconnect): closing the sink causes the paired receive half's stream
-    /// to end promptly, which fires [`spawn_receive_loop`]'s `on_close`
-    /// callback so the app can react (e.g. open a fresh connection) without
-    /// waiting on the browser's own idle-connection timeout.
+    /// Used by `app.rs` for *intentional* teardown (logout): closing the
+    /// sink causes the paired receive half's stream to end promptly, which
+    /// fires [`spawn_receive_loop`]'s `on_close` callback so the app can
+    /// react without waiting on the browser's own idle-connection timeout.
     pub async fn close(&mut self) -> Result<(), ApiError> {
         self.0
             .close()

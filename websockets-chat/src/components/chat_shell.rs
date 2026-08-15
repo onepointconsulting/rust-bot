@@ -25,6 +25,7 @@ pub fn ChatShell(
     #[prop(into)] example_prompts: Signal<Vec<String>>,
     #[prop(into)] connection_status: Signal<ConnectionStatus>,
     #[prop(into)] reconnect_exhausted: Signal<bool>,
+    #[prop(into)] token_streaming: Signal<bool>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Send + Sync + Copy,
@@ -160,7 +161,12 @@ pub fn ChatShell(
                 </p>
             </Show>
 
-            <MessageList entries=entries example_prompts=example_prompts on_use_prompt=on_use_prompt />
+            <MessageList
+                entries=entries
+                example_prompts=example_prompts
+                token_streaming=token_streaming
+                on_use_prompt=on_use_prompt
+            />
             <ChatInput pending=pending draft=draft on_send=on_send />
         </div>
     }

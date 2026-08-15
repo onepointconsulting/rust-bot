@@ -5,8 +5,7 @@
 //! this module owns both directions of that conversation from the browser's
 //! side of the connection.
 //!
-//! * Outbound: [`ClientEnvelope`], the only envelope shape actually
-//!   implemented server-side today (`EnvelopeType::Message`).
+//! * Outbound: [`ClientEnvelope`], currently `message` and `new_chat`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -19,27 +18,23 @@ use std::collections::HashMap;
 use chat_ui::models::ToolEvent;
 use serde::{Deserialize, Serialize};
 
-/// Outbound envelope sent to the gateway for a chat message.
+/// Outbound envelope sent to the gateway.
 ///
 /// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) has six
 /// variants (`new_chat`, `fork_chat`, `attach`, `set_workspace_scope`,
-/// `transcribe_audio`, `message`), but only `message` is actually dispatched
-/// server-side today — the rest are recognized but stubbed out. Rather than
-/// model a general envelope enum this crate can't yet do anything useful
-/// with, `ClientEnvelope` is a single struct whose `type_` field always
-/// serializes as the literal `"message"` (see [`ClientEnvelope::message`]).
-/// This keeps callers from accidentally constructing an envelope shape the
-/// gateway would reject with "unknown type", and gives this type a natural
-/// place to grow real variants once the backend implements them.
+/// `transcribe_audio`, `message`). This struct covers the two the frontend
+/// actually sends (`message` and `new_chat`); constructors pin `type_` so
+/// callers cannot invent a shape the gateway would reject with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClientEnvelope {
-    /// Always `"message"` today; see the type-level doc comment.
     #[serde(rename = "type")]
     pub type_: &'static str,
-    pub chat_id: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub chat_id: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub turn_id: Option<String>,
-    pub content: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<Vec<serde_json::Value>>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
@@ -59,10 +54,26 @@ impl ClientEnvelope {
     ) -> Self {
         Self {
             type_: "message",
-            chat_id: chat_id.into(),
+            chat_id: Some(chat_id.into()),
             turn_id,
-            content: content.into(),
+            content: Some(content.into()),
             media,
+            webui: true,
+        }
+    }
+
+    /// Ask the gateway to mint a new chat on this connection.
+    ///
+    /// The reply is an `attached` event carrying the new `chat_id` (and a
+    /// `session_updated` with the resolved workspace scope). A rejected
+    /// scope comes back as `error` with no `chat_id`.
+    pub fn new_chat() -> Self {
+        Self {
+            type_: "new_chat",
+            chat_id: None,
+            turn_id: None,
+            content: None,
+            media: None,
             webui: true,
         }
     }
@@ -82,16 +93,28 @@ impl ClientEnvelope {
 pub enum ServerEvent {
     /// The connection is up and the gateway has assigned (or confirmed) a
     /// `chat_id` and echoed back the connecting `client_id`.
-    Ready { chat_id: String, client_id: String },
-    /// A server-side error, optionally scoped to one in-flight turn.
-    Error {
+    ///
+    /// `streaming` is the channel's `supports_streaming` flag: when `true`
+    /// the turn arrives as `delta`/`stream_end` frames; when `false` the
+    /// client should expect a single final `message` and show a thinking
+    /// indicator instead of a token cursor. Missing on older gateways,
+    /// treated as `false`.
+    Ready {
         chat_id: String,
+        client_id: String,
+        streaming: bool,
+    },
+    /// A server-side error, optionally scoped to one chat / in-flight turn.
+    /// `chat_id` is omitted when the error is not attached to any chat yet
+    /// (e.g. a rejected `new_chat` workspace scope).
+    Error {
+        chat_id: Option<String>,
         turn_id: Option<String>,
         detail: String,
     },
-    /// Response to an `attach` envelope. Shape not yet finalized server-side
-    /// (that envelope type is still a stub), so the raw JSON is kept as-is.
-    Attached(serde_json::Value),
+    /// The connection is now attached to `chat_id` — the reply to a
+    /// `new_chat` envelope (and, later, to `attach`).
+    Attached { chat_id: String },
     /// Sent when the server-side session state changes. Shape not yet
     /// finalized server-side, so the raw JSON is kept as-is.
     SessionUpdated(serde_json::Value),
@@ -157,6 +180,33 @@ pub enum ServerEvent {
     Unknown(serde_json::Value),
 }
 
+impl ServerEvent {
+    /// The `chat_id` this event is scoped to, if the payload carries one.
+    ///
+    /// Used by the app to ignore leftover frames from a previous chat after
+    /// `new_chat` switches the connection onto a new id. `Unknown` and
+    /// unscoped errors (no `chat_id`) return `None`.
+    pub fn chat_id(&self) -> Option<&str> {
+        match self {
+            ServerEvent::Ready { chat_id, .. }
+            | ServerEvent::Attached { chat_id }
+            | ServerEvent::MessageAccepted { chat_id, .. }
+            | ServerEvent::GoalStatus { chat_id, .. }
+            | ServerEvent::Message { chat_id, .. }
+            | ServerEvent::Delta { chat_id, .. }
+            | ServerEvent::StreamEnd { chat_id, .. }
+            | ServerEvent::ReasoningDelta { chat_id, .. }
+            | ServerEvent::ReasoningEnd { chat_id, .. }
+            | ServerEvent::FileEdit { chat_id, .. } => Some(chat_id.as_str()),
+            ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
+            ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
+                value.get("chat_id").and_then(serde_json::Value::as_str)
+            }
+            ServerEvent::Unknown(_) => None,
+        }
+    }
+}
+
 /// Error produced by [`parse_server_event`] when a frame names a *known*
 /// `event` value but its payload doesn't match the expected shape, or the
 /// frame isn't valid JSON at all.
@@ -191,14 +241,22 @@ impl std::error::Error for ProtocolError {}
 struct ReadyWire {
     chat_id: String,
     client_id: String,
+    #[serde(default)]
+    streaming: bool,
 }
 
 #[derive(Deserialize)]
 struct ErrorWire {
-    chat_id: String,
+    #[serde(default)]
+    chat_id: Option<String>,
     #[serde(default)]
     turn_id: Option<String>,
     detail: String,
+}
+
+#[derive(Deserialize)]
+struct AttachedWire {
+    chat_id: String,
 }
 
 #[derive(Deserialize)]
@@ -302,13 +360,16 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "ready" => decode::<ReadyWire>(&value).map(|w| ServerEvent::Ready {
             chat_id: w.chat_id,
             client_id: w.client_id,
+            streaming: w.streaming,
         }),
         "error" => decode::<ErrorWire>(&value).map(|w| ServerEvent::Error {
             chat_id: w.chat_id,
             turn_id: w.turn_id,
             detail: w.detail,
         }),
-        "attached" => Ok(ServerEvent::Attached(value)),
+        "attached" => decode::<AttachedWire>(&value).map(|w| ServerEvent::Attached {
+            chat_id: w.chat_id,
+        }),
         "session_updated" => Ok(ServerEvent::SessionUpdated(value)),
         "message_accepted" => {
             decode::<MessageAcceptedWire>(&value).map(|w| ServerEvent::MessageAccepted {
@@ -376,6 +437,21 @@ mod tests {
             ServerEvent::Ready {
                 chat_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_id: "browser-abc".to_string(),
+                streaming: false,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_ready_with_streaming() {
+        let raw = r#"{"event":"ready","chat_id":"chat-1","client_id":"browser-abc","streaming":true}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::Ready {
+                chat_id: "chat-1".to_string(),
+                client_id: "browser-abc".to_string(),
+                streaming: true,
             }
         );
     }
@@ -387,7 +463,7 @@ mod tests {
         assert_eq!(
             event,
             ServerEvent::Error {
-                chat_id: "chat-1".to_string(),
+                chat_id: Some("chat-1".to_string()),
                 turn_id: Some("turn-1".to_string()),
                 detail: "boom".to_string(),
             }
@@ -401,7 +477,7 @@ mod tests {
         assert_eq!(
             event,
             ServerEvent::Error {
-                chat_id: "chat-1".to_string(),
+                chat_id: Some("chat-1".to_string()),
                 turn_id: None,
                 detail: "boom".to_string(),
             }
@@ -409,12 +485,28 @@ mod tests {
     }
 
     #[test]
-    fn parses_attached_as_raw_value() {
-        let raw = r#"{"event":"attached","chat_id":"chat-1","note":"whatever shape"}"#;
+    fn parses_error_without_chat_id() {
+        let raw = r#"{"event":"error","detail":"workspace_scope_rejected"}"#;
         let event = parse_server_event(raw).expect("should parse");
         assert_eq!(
             event,
-            ServerEvent::Attached(serde_json::from_str(raw).unwrap())
+            ServerEvent::Error {
+                chat_id: None,
+                turn_id: None,
+                detail: "workspace_scope_rejected".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_attached() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::Attached {
+                chat_id: "chat-1".to_string(),
+            }
         );
     }
 
@@ -655,6 +747,19 @@ mod tests {
         let raw = r#"{"event":"ready","chat_id":"chat-1"}"#;
         let err = parse_server_event(raw).expect_err("missing required field should error");
         assert!(!err.message.is_empty());
+    }
+
+    #[test]
+    fn client_envelope_new_chat_serializes_expected_shape() {
+        let envelope = ClientEnvelope::new_chat();
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "new_chat",
+                "webui": true,
+            })
+        );
     }
 
     #[test]

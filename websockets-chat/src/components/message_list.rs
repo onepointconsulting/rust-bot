@@ -66,7 +66,10 @@ fn entry_render_key(entry: &ChatEntry) -> (u64, String, bool, String) {
 /// entirely, hence the two separate `view!` branches below rather than one
 /// with a conditional prop value.
 #[component]
-fn ChatEntryBubble(entry: ChatEntry) -> impl IntoView {
+fn ChatEntryBubble(
+    entry: ChatEntry,
+    #[prop(into)] token_streaming: Signal<bool>,
+) -> impl IntoView {
     let streaming = entry.streaming;
     let tool_events = entry.tool_events.clone().unwrap_or_default();
     let reasoning = entry.reasoning.clone().unwrap_or_default();
@@ -100,12 +103,21 @@ fn ChatEntryBubble(entry: ChatEntry) -> impl IntoView {
             .into_any()
         });
         view! {
-            <MessageBubble entry=entry streaming=Signal::derive(move || streaming) extra=extra />
+            <MessageBubble
+                entry=entry
+                streaming=Signal::derive(move || streaming)
+                token_streaming=token_streaming
+                extra=extra
+            />
         }
         .into_any()
     } else {
         view! {
-            <MessageBubble entry=entry streaming=Signal::derive(move || streaming) />
+            <MessageBubble
+                entry=entry
+                streaming=Signal::derive(move || streaming)
+                token_streaming=token_streaming
+            />
         }
         .into_any()
     }
@@ -115,6 +127,7 @@ fn ChatEntryBubble(entry: ChatEntry) -> impl IntoView {
 pub fn MessageList(
     #[prop(into)] entries: Signal<Vec<ChatEntry>>,
     #[prop(into)] example_prompts: Signal<Vec<String>>,
+    #[prop(into)] token_streaming: Signal<bool>,
     on_use_prompt: impl Fn(String) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let list_ref = NodeRef::<Div>::new();
@@ -140,7 +153,7 @@ pub fn MessageList(
                 <SuggestionPrompts prompts=example_prompts on_use_prompt=on_use_prompt />
             </Show>
             <For each=move || entries.get() key=entry_render_key let(entry)>
-                <ChatEntryBubble entry=entry />
+                <ChatEntryBubble entry=entry token_streaming=token_streaming />
             </For>
         </div>
     }

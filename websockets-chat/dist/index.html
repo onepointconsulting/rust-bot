@@ -6,8 +6,8 @@
     <title>Rust Bot Live Chat</title>
     
 <script type="module">
-import init, * as bindings from '/websockets-chat-a38991359168c3c4.js';
-const wasm = await init({ module_or_path: '/websockets-chat-a38991359168c3c4_bg.wasm' });
+import init, * as bindings from '/websockets-chat-9a35d3d25d8d5b4a.js';
+const wasm = await init({ module_or_path: '/websockets-chat-9a35d3d25d8d5b4a_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -16,11 +16,11 @@ window.wasmBindings = bindings;
 dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
 
 </script>
-    <link rel="stylesheet" href="/input-c843f1e02882d30b.css" integrity="sha384-Uy/ggeH+oTVj9mDYGmjOhh/8D+buFt5WGncRicrrmxUWhNEqTiRabun29TdXmdie"/>
+    <link rel="stylesheet" href="/input-c8c72bafd22cb7da.css" integrity="sha384-Zv0EYRJllrqgCxRbHiEI+Ac/8bTPx7G8rBDpONbOMJ4RQOgPSIPIKqFS3UI0flkA"/>
     <!-- Plain (non-Tailwind) shared stylesheet from chat-ui; see the comment
          in style/input.css for why this can't be an @import instead. -->
-    <link rel="stylesheet" href="/shared-2b1f7dc29392780c.css" integrity="sha384-9sWqsCBrYn3rt+T2yJhBg86Lm4dlsnheTLOF0hYq2AnktZL8ApYxKg7QROCn8KC4"/>
-  <link rel="modulepreload" href="/websockets-chat-a38991359168c3c4.js" crossorigin="anonymous" integrity="sha384-VDmZJcNk5+UtBFRMWcCXahNgJ0Uzf3SEV19UAZ3RkrmKvu9Ub6iRcgRa7VbtRrYT"><link rel="preload" href="/websockets-chat-a38991359168c3c4_bg.wasm" crossorigin="anonymous" integrity="sha384-xCNcJU8bD8u8RvbgrFa0JM8of9ZGei8m4elObQVJa3UvsyWtwTS4+tzruTAnjo+Q" as="fetch" type="application/wasm"></head>
+    <link rel="stylesheet" href="/shared-8841dd8937f20842.css" integrity="sha384-6VJ0atCrtXLrkuX+ReUHkUewETgveohwsPgOpnTl82VWpt0BDNj6LJgBzRZ9Ub5M"/>
+  <link rel="modulepreload" href="/websockets-chat-9a35d3d25d8d5b4a.js" crossorigin="anonymous" integrity="sha384-4aZEoqGgMuPCXbqB6rPxYN5+r05vUPX0JITwSajTmvFMT6wCezodOWBz6o/NpuS/"><link rel="preload" href="/websockets-chat-9a35d3d25d8d5b4a_bg.wasm" crossorigin="anonymous" integrity="sha384-r3P4s5lbeCgO3A26AUnn9x4iy5xIeZPrbTj4Qb3YCRYUQLqI0GDbzBPcAT5PRwo2" as="fetch" type="application/wasm"></head>
   <body class="min-h-full bg-transparent">
     <div id="rust-bot-chat"></div>
   </body>

@@ -821,10 +821,6 @@ video {
   flex-shrink: 0;
 }
 
-.grow {
-  flex-grow: 1;
-}
-
 .resize-none {
   resize: none;
 }

@@ -100,11 +100,39 @@
   text-align: left;
   border-collapse: collapse;
   margin-bottom: 0.5rem; /* mb-2 */
+  display: table;
 }
 .markdown th,
 .markdown td {
   border: 1px solid #e2e8f0; /* border-slate-200 */
   padding: 0.25rem 0.5rem; /* px-2 py-1 */
+  vertical-align: top;
+}
+.markdown th {
+  font-weight: 600; /* font-semibold */
+  background-color: #f8fafc; /* bg-slate-50 */
+}
+.markdown math {
+  font-family: math, "Cambria Math", "STIX Two Math", "Latin Modern Math", serif;
+  font-style: normal;
+  overflow-wrap: normal;
+  word-break: normal;
+  /* Tailwind Preflight sets `box-sizing: border-box` and `border-style: solid`
+     on `*`. Chromium's MathML layout treats that as a broken inner display
+     and stacks every token vertically (tall stretchy parens + a scrollbar). */
+  box-sizing: content-box;
+  border-style: none;
+}
+.markdown math * {
+  box-sizing: content-box;
+  border-width: 0;
+  border-style: none;
+}
+.markdown .math-display {
+  display: block;
+  margin: 0.75em 0;
+  overflow-x: auto;
+  text-align: center;
 }
 
 .streaming-cursor {
@@ -117,6 +145,27 @@
   animation: streaming-blink 1s step-end infinite;
 }
 
+.thinking-indicator {
+  display: flex;
+  align-items: center;
+  gap: 0.5rem; /* gap-2 */
+  font-size: 0.875rem; /* text-sm */
+  line-height: 1.25rem;
+  color: #64748b; /* text-slate-500 */
+}
+
+.thinking-spinner {
+  box-sizing: border-box;
+  display: inline-block;
+  height: 0.875rem; /* h-3.5 */
+  width: 0.875rem;
+  flex-shrink: 0;
+  border: 2px solid #cbd5e1; /* border-slate-300 */
+  border-top-color: #ea580c; /* border-orange-600 */
+  border-radius: 50%;
+  animation: thinking-spin 0.7s linear infinite;
+}
+
 @keyframes streaming-blink {
   0%,
   50% {
@@ -125,5 +174,11 @@
   50.01%,
   100% {
     opacity: 0;
+  }
+}
+
+@keyframes thinking-spin {
+  to {
+    transform: rotate(360deg);
   }
 }
