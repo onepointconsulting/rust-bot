@@ -80,6 +80,10 @@ jobs:
         working-directory: web-chat
         run: trunk build --release
 
+      - name: Build websockets-chat (Leptos/WASM UI)
+        working-directory: websockets-chat
+        run: trunk build --release
+
       - name: Build release binaries
         run: cargo build --release --bin rust-bot --bin generate-jwt --bin gmail-auth --target x86_64-pc-windows-msvc
 
@@ -100,6 +104,7 @@ jobs:
           Copy-Item "packaging\INSTALL.md" -Destination "$stageName\INSTALL.md"
           Copy-Item "packaging\samples\*" -Destination "$stageName\configuration\samples\"
           Copy-Item "web-chat\dist" -Destination "$stageName\web" -Recurse
+          Copy-Item "websockets-chat\dist" -Destination "$stageName\websockets" -Recurse
 
           Compress-Archive -Path $stageName -DestinationPath $archiveName -Force
 
@@ -121,6 +126,7 @@ jobs:
 
             Each package bundles the `rust-bot`, `generate-jwt`, and
             `gmail-auth` binaries, the web-chat UI assets under `web/`,
+            the websockets-chat UI assets under `websockets/`,
             sample configurations under `configuration/samples/`, and an
             `INSTALL.md` with setup instructions.
           files: ${{ steps.package.outputs.archive }}
