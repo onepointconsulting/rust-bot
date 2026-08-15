@@ -9,7 +9,7 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 - [Build](#build)
 - [Quick start](#quick-start)
 - [Command line](#command-line)
-  - [`agent` subcommand](#agent-subcommand)
+  - `agent` [subcommand](#agent-subcommand)
   - [Exit codes](#exit-codes)
   - [Examples](#examples)
 - [Interactive console](#interactive-console)
@@ -20,10 +20,10 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
   - [Multi-line input](#multi-line-input)
   - [Leaving the console](#leaving-the-console)
 - [Chat commands](#chat-commands)
-  - [`/mcp-preset`](#mcp-preset)
+  - `[/mcp-preset](#mcp-preset)`
 - [Gmail support](#gmail-support)
   - [Google Cloud setup](#google-cloud-setup)
-  - [OAuth helper (`gmail-auth`)](#oauth-helper-gmail-auth)
+  - [OAuth helper (](#oauth-helper-gmail-auth)`gmail-auth`[)](#oauth-helper-gmail-auth)
   - [Enabling the Gmail tools](#enabling-the-gmail-tools)
   - [Gmail agent tools](#gmail-agent-tools)
 - [Configuration](#configuration)
@@ -31,10 +31,14 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 
 ---
 
+
+
 ## Pre-requisites
 
 - Install [Rust](https://www.rust-lang.org/tools/install) (stable toolchain).
 - A working terminal. On Windows use Windows Terminal, PowerShell 7, or `cmd`; on macOS / Linux any modern terminal emulator works.
+
+
 
 ## Testing
 
@@ -49,6 +53,8 @@ Integration tests:
 ```
 cargo test --tests
 ```
+
+
 
 ## Build
 
@@ -72,6 +78,8 @@ To build both the CLI and the web-chat UI in one step (requires [Trunk](https://
 ./scripts/build_all.sh
 ```
 
+
+
 ## Quick start
 
 ```bash
@@ -87,6 +95,8 @@ The agent will use the workspace directory (`~/.rust-bot/workspace` by default) 
 
 ---
 
+
+
 ## Command line
 
 Run the agent from the terminal:
@@ -101,6 +111,8 @@ After a release build (`cargo build -r`), use:
 rust-bot agent [OPTIONS]
 ```
 
+
+
 ### `agent` subcommand
 
 Run the agent from the command line. For the full, up-to-date option list:
@@ -109,24 +121,30 @@ Run the agent from the command line. For the full, up-to-date option list:
 cargo run -- agent --help
 ```
 
-| Flag | Default | Description |
-|------|---------|-------------|
-| `-m`, `--message` | _(none)_ | Message to send to the agent. Omit to enter the [interactive console](#interactive-console). |
-| `-s`, `--session` | `cli:direct` | Session ID |
-| `-w`, `--workspace` | `~/.rust-bot/workspace` | Workspace directory |
-| `-c`, `--config` | `~/.rust-bot/config.json` | Config file path |
-| `--markdown` / `--no-markdown` | `true` | Render assistant output as Markdown |
-| `--logs` / `--no-logs` | `false` | Show runtime logs during chat |
+
+| Flag                           | Default                   | Description                                                                                  |
+| ------------------------------ | ------------------------- | -------------------------------------------------------------------------------------------- |
+| `-m`, `--message`              | *(none)*                  | Message to send to the agent. Omit to enter the [interactive console](#interactive-console). |
+| `-s`, `--session`              | `cli:direct`              | Session ID                                                                                   |
+| `-w`, `--workspace`            | `~/.rust-bot/workspace`   | Workspace directory                                                                          |
+| `-c`, `--config`               | `~/.rust-bot/config.json` | Config file path                                                                             |
+| `--markdown` / `--no-markdown` | `true`                    | Render assistant output as Markdown                                                          |
+| `--logs` / `--no-logs`         | `false`                   | Show runtime logs during chat                                                                |
+
+
+
 
 ### Exit codes
 
-| Code | Constant | Meaning |
-|------|----------|---------|
-| `0` | `SUCCESS` | Success (also used after spawning a restarted process on Windows) |
-| `1` | `GENERAL_ERROR` | Config or general CLI error |
-| `3` | `INVALID_PROVIDER` | Invalid provider (unknown value in `agents.provider`) |
-| `4` | `GMAIL_CONFIG_ERROR` | Gmail tool credentials missing (OAuth client secret or token cache) |
-| `5` | `CHANNEL_ALLOW_FROM_EMPTY` | Channel has an empty `allowFrom` list (set `["*"]` or specific user IDs) |
+
+| Code | Constant                   | Meaning                                                                  |
+| ---- | -------------------------- | ------------------------------------------------------------------------ |
+| `0`  | `SUCCESS`                  | Success (also used after spawning a restarted process on Windows)        |
+| `1`  | `GENERAL_ERROR`            | Config or general CLI error                                              |
+| `3`  | `INVALID_PROVIDER`         | Invalid provider (unknown value in `agents.provider`)                    |
+| `4`  | `GMAIL_CONFIG_ERROR`       | Gmail tool credentials missing (OAuth client secret or token cache)      |
+| `5`  | `CHANNEL_ALLOW_FROM_EMPTY` | Channel has an empty `allowFrom` list (set `["*"]` or specific user IDs) |
+
 
 Constants live in `src/utils/exit_codes.rs`.
 
@@ -175,9 +193,11 @@ cargo build -r
 
 ---
 
+
+
 ## Interactive console
 
-Rust Bot ships with a small REPL-style interactive console built on [`reedline`](https://github.com/nushell/reedline). It uses Emacs-style keybindings by default, supports history, and lets you paste images, paste clipboard text, and write multi-line prompts without leaving the terminal.
+Rust Bot ships with a small REPL-style interactive console built on `[reedline](https://github.com/nushell/reedline)`. It uses Emacs-style keybindings by default, supports history, and lets you paste images, paste clipboard text, and write multi-line prompts without leaving the terminal.
 
 ### Starting the console
 
@@ -191,58 +211,76 @@ A short banner is printed, showing the logo and the available shortcuts. Then th
 
 > Note: the console requires a real TTY. If stdin is redirected (for example, in a non-interactive pipe), the binary returns a non-zero exit instead of dropping into the REPL.
 
+
+
 ### Key bindings
 
 The line editor uses **Emacs** keybindings. The full default set is available; the table below highlights the bindings that are most useful day-to-day. Custom bindings added by Rust Bot are marked.
 
 #### Movement
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+F` / `→` | Move cursor one character forward |
+
+| Key            | Action                             |
+| -------------- | ---------------------------------- |
+| `Ctrl+F` / `→` | Move cursor one character forward  |
 | `Ctrl+B` / `←` | Move cursor one character backward |
-| `Alt+F` | Move cursor one word forward |
-| `Alt+B` | Move cursor one word backward |
-| `Ctrl+A` | Move to start of line |
-| `Ctrl+E` | Move to end of line |
-| `Ctrl+N` / `↓` | Next history entry |
-| `Ctrl+P` / `↑` | Previous history entry |
-| `Ctrl+→` | Move forward by word |
-| `Ctrl+←` | Move backward by word |
+| `Alt+F`        | Move cursor one word forward       |
+| `Alt+B`        | Move cursor one word backward      |
+| `Ctrl+A`       | Move to start of line              |
+| `Ctrl+E`       | Move to end of line                |
+| `Ctrl+N` / `↓` | Next history entry                 |
+| `Ctrl+P` / `↑` | Previous history entry             |
+| `Ctrl+→`       | Move forward by word               |
+| `Ctrl+←`       | Move backward by word              |
+
+
+
 
 #### Editing
 
-| Key | Action |
-|-----|--------|
-| `Ctrl+D` | Delete character under cursor; exits the console if the line is empty |
-| `Ctrl+H` / `Backspace` | Delete character before cursor |
-| `Alt+D` | Delete word forward |
-| `Alt+Backspace` | Delete word backward |
-| `Ctrl+K` | Kill to end of line |
-| `Ctrl+U` | Kill to start of line |
-| `Ctrl+W` | Kill previous word |
-| `Ctrl+Y` | Yank (paste) last killed text |
-| `Ctrl+T` | Transpose characters |
-| `Alt+T` | Transpose words |
-| `Ctrl+I` / `Tab` | _(custom)_ Paste image from clipboard — see [Image paste](#image-paste) |
-| `Alt+V` | _(custom)_ Paste clipboard text into the current prompt — see [Text paste](#text-paste) |
-| `Ctrl+O` | _(custom)_ Insert a newline, do not submit — see [Multi-line input](#multi-line-input) |
+
+| Key                         | Action                                                                                                                   |
+| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
+| `Ctrl+D`                    | Delete character under cursor; exits the console if the line is empty                                                    |
+| `Ctrl+H` / `Backspace`      | Delete character before cursor                                                                                           |
+| `Alt+D`                     | Delete word forward                                                                                                      |
+| `Alt+Backspace`             | Delete word backward                                                                                                     |
+| `Ctrl+K`                    | Kill to end of line                                                                                                      |
+| `Ctrl+U`                    | Kill to start of line                                                                                                    |
+| `Ctrl+W`                    | Kill previous word                                                                                                       |
+| `Ctrl+Y`                    | Yank (paste) last killed text                                                                                            |
+| `Ctrl+T`                    | Transpose characters                                                                                                     |
+| `Alt+T`                     | Transpose words                                                                                                          |
+| `Ctrl+I` / `Tab`            | *(custom)* Paste image from clipboard — see [Image paste](#image-paste)                                                  |
+| `Alt+V`                     | *(custom)* Paste clipboard text into the current prompt — see [Text paste](#text-paste)                                  |
+| `Ctrl+O`                    | *(custom)* Insert a newline, do not submit — see [Multi-line input](#multi-line-input)                                   |
 | `Alt+Enter` / `Shift+Enter` | Insert a newline, do not submit (only on terminals that report the modifier — see [Multi-line input](#multi-line-input)) |
-| `Ctrl+C` | Cancel the current line and re-show the prompt (does not exit) |
-| `Ctrl+L` | Clear the screen |
+| `Ctrl+C`                    | Cancel the current line and re-show the prompt (does not exit)                                                           |
+| `Ctrl+L`                    | Clear the screen                                                                                                         |
+
+
+
 
 #### History search
 
-| Key | Action |
-|-----|--------|
+
+| Key      | Action                                                                                             |
+| -------- | -------------------------------------------------------------------------------------------------- |
 | `Ctrl+R` | Start incremental reverse search; type to narrow, `Enter` to accept, `Ctrl+C` / `Ctrl+G` to cancel |
-| `Ctrl+S` | Forward search (continues a `Ctrl+R` session) |
+| `Ctrl+S` | Forward search (continues a `Ctrl+R` session)                                                      |
+
+
+
 
 #### Submission
 
-| Key | Action |
-|-----|--------|
+
+| Key     | Action                                            |
+| ------- | ------------------------------------------------- |
 | `Enter` | Submit the current line as a message to the agent |
+
+
+
 
 ### History
 
@@ -258,6 +296,8 @@ Pressing `Ctrl+I` (or `Tab`) reads the current clipboard image and inserts a sen
 - `Ctrl+I` is bound to image paste because `Tab` would otherwise complete completions; if you don't have an image on the clipboard the binding is a safe no-op (the sentinel stays in the buffer and is stripped on submit).
 - The console uses **bracketed paste mode**, so multi-line text pasted from the terminal is treated as one block rather than being submitted early.
 
+
+
 ### Text paste
 
 Pressing `Alt+V` captures the current clipboard text and inserts it into the prompt at the cursor position. The text is sent as part of the same message when you press `Enter`.
@@ -269,13 +309,17 @@ This is useful when pasting larger snippets, code, logs, or text that may contai
 - Multiple `Alt+V` presses in one prompt are fully supported; each paste gets its own index and is substituted independently on submit.
 - If clipboard text cannot be read, the paste is treated as empty and the placeholder is stripped on submit.
 
+
+
 ### Multi-line input
 
 By default, `Enter` submits the current line. To continue a thought on a new line without sending the message, press `Ctrl+O` — a newline is inserted and you can keep typing. The whole block is sent to the agent as a single message when you finally press `Enter`.
 
 This is useful for pasting code blocks, listing steps, or writing prompts that span several lines.
 
-> **Why not `Ctrl+Enter`?** The console enables `ENABLE_VIRTUAL_TERMINAL_INPUT` (required for bracketed paste). In that mode Windows Terminal reports `Ctrl+Enter`, `Shift+Enter`, and `Alt+Enter` all as a plain `Enter`, so the modifier is lost before it reaches the line editor. A `Ctrl`+letter combo (`Ctrl+O`) arrives as a distinct control byte and works reliably on every platform. `Alt+Enter` / `Shift+Enter` still work on terminals that disambiguate them (e.g. kitty-protocol-capable emulators on Unix).
+> **Why not** `Ctrl+Enter`**?** The console enables `ENABLE_VIRTUAL_TERMINAL_INPUT` (required for bracketed paste). In that mode Windows Terminal reports `Ctrl+Enter`, `Shift+Enter`, and `Alt+Enter` all as a plain `Enter`, so the modifier is lost before it reaches the line editor. A `Ctrl`+letter combo (`Ctrl+O`) arrives as a distinct control byte and works reliably on every platform. `Alt+Enter` / `Shift+Enter` still work on terminals that disambiguate them (e.g. kitty-protocol-capable emulators on Unix).
+
+
 
 ### Leaving the console
 
@@ -289,33 +333,39 @@ The console always prints the banner on entry — that's the easiest way to conf
 
 ---
 
+
+
 ## Chat commands
 
 These are typed directly into a running conversation (the interactive console, or
 any connected channel) — distinct from the `rust-bot <subcommand>` process
 launchers documented under [Command line](#command-line).
 
-| Command | Description |
-|---|---|
-| `/new` | Start a new conversation |
-| `/stop` | Stop the current task |
-| `/restart` | Restart the bot |
-| `/status` | Show bot status |
-| `/model` | Show the current model |
-| `/model-preset` | Show the current preset's model and provider, or switch: `/model-preset <name>` |
-| `/model-presets` | List available model presets |
-| `/dream` | Manually trigger Dream consolidation |
-| `/dream-log` | Show what the last Dream changed |
-| `/dream-restore` | Revert memory to a previous state |
-| `/help` | Show available commands |
-| `/mcp-list` | List connected MCP servers |
-| `/mcp-preset` | Manage built-in MCP server presets — see [below](#mcp-preset) |
-| `/tools` | List available tools |
-| `/workspace` | Show or switch the session's workspace scope |
-| `/goal` | Start/check/cancel a sustained session goal |
-| `/cleanup` | Remove stray files from the workspace |
-| `/list-sessions` | List available sessions in the current workspace |
-| `/example-prompts` | List example prompts |
+
+| Command            | Description                                                                     |
+| ------------------ | ------------------------------------------------------------------------------- |
+| `/new`             | Start a new conversation                                                        |
+| `/stop`            | Stop the current task                                                           |
+| `/restart`         | Restart the bot                                                                 |
+| `/status`          | Show bot status                                                                 |
+| `/model`           | Show the current model                                                          |
+| `/model-preset`    | Show the current preset's model and provider, or switch: `/model-preset <name>` |
+| `/model-presets`   | List available model presets                                                    |
+| `/dream`           | Manually trigger Dream consolidation                                            |
+| `/dream-log`       | Show what the last Dream changed                                                |
+| `/dream-restore`   | Revert memory to a previous state                                               |
+| `/help`            | Show available commands                                                         |
+| `/mcp-list`        | List connected MCP servers                                                      |
+| `/mcp-preset`      | Manage built-in MCP server presets — see [below](#mcp-preset)                   |
+| `/tools`           | List available tools                                                            |
+| `/workspace`       | Show or switch the session's workspace scope                                    |
+| `/goal`            | Start/check/cancel a sustained session goal                                     |
+| `/cleanup`         | Remove stray files from the workspace                                           |
+| `/list-sessions`   | List available sessions in the current workspace                                |
+| `/example-prompts` | List example prompts                                                            |
+
+
+
 
 ### `/mcp-preset`
 
@@ -333,31 +383,33 @@ additions.
 /mcp-preset disable github
 ```
 
-- **`list`** — shows every preset with its status (`configured`,
-  `missing_credentials`, `missing_dependency`, `not_installed`), plus any
-  custom (non-preset) MCP servers already in `config.json`.
-- **`enable <name> [field=value ...]`** — materializes the preset into a full
-  MCP server config and writes it into `config.json`. Any field a preset needs
-  (an API key, a token) can be supplied inline as `field=value`; if omitted, an
-  already-configured value is reused, and failing that, a matching environment
-  variable is referenced as `${VAR_NAME}` in the saved config (the secret
-  itself is never copied into `config.json` if it's only set as an env var).
-  **Requires a restart** — the running process only reads its MCP server list
-  once at startup.
-- **`disable <name>`** — removes the server from `config.json`. Also requires
-  a restart.
-- **`test <name>`** — connects to an already-enabled server right away (no
-  restart needed) and reports how many tools it exposes, or why the connection
-  failed.
+- `list` — shows every preset with its status (`configured`,
+`missing_credentials`, `missing_dependency`, `not_installed`), plus any
+custom (non-preset) MCP servers already in `config.json`.
+- `enable <name> [field=value ...]` — materializes the preset into a full
+MCP server config and writes it into `config.json`. Any field a preset needs
+(an API key, a token) can be supplied inline as `field=value`; if omitted, an
+already-configured value is reused, and failing that, a matching environment
+variable is referenced as `${VAR_NAME}` in the saved config (the secret
+itself is never copied into `config.json` if it's only set as an env var).
+**Requires a restart** — the running process only reads its MCP server list
+once at startup.
+- `disable <name>` — removes the server from `config.json`. Also requires
+a restart.
+- `test <name>` — connects to an already-enabled server right away (no
+restart needed) and reports how many tools it exposes, or why the connection
+failed.
 
 ---
+
+
 
 ## Gmail support
 
 Rust Bot can expose two Gmail agent tools when enabled in config:
 
-- **`gmail`** — reads messages from the user's inbox (read-only)
-- **`gmail_email_send`** — sends an email to a recipient (plain text or HTML)
+- `gmail` — reads messages from the user's inbox (read-only)
+- `gmail_email_send` — sends an email to a recipient (plain text or HTML)
 
 Access is granted through Google OAuth; credentials are stored on disk and reused by the agent. Both tools share the same `client_secret.json` and `token_cache.json` paths from config.
 
@@ -372,6 +424,8 @@ Access is granted through Google OAuth; credentials are stored on disk and reuse
 Save the downloaded file as `client_secret.json` before running the OAuth helper (see below). The `gmail-auth` helper looks for `./credentials/client_secret.json` by default; the agent expects credential files under `~/.rust-bot/credentials/` unless you override the paths in config (see [Enabling the Gmail tools](#enabling-the-gmail-tools)).
 
 > Credential files contain secrets and are gitignored. Do not commit `client_secret.json` or `token_cache.json`.
+
+
 
 ### OAuth helper (`gmail-auth`)
 
@@ -400,7 +454,7 @@ What happens:
 
 1. A local HTTP server on port **8080** receives the OAuth callback (no manual code copy-paste).
 2. You sign in with Google and grant Gmail read and send permission.
-3. Tokens are persisted to **`token_cache.json`** in the project root.
+3. Tokens are persisted to `token_cache.json` in the project root.
 4. The helper fetches a few inbox subjects to confirm read access works.
 
 If you previously authenticated with read-only scope, delete the old `token_cache.json` and run `gmail-auth` again so the cache includes `gmail.send`.
@@ -428,7 +482,7 @@ Enable both tools in your agent config under `tools.gmail`:
 }
 ```
 
-There is no separate flag for send — when `enable` is `true`, the agent registers **`gmail`** and **`gmail_email_send`**.
+There is no separate flag for send — when `enable` is `true`, the agent registers `gmail` and `gmail_email_send`.
 
 A sample config with Gmail enabled is in `configs/openai-compat/config_gmail.json`. Run the agent with that config once credentials are in place:
 
@@ -450,25 +504,33 @@ The agent uses the cached tokens from `token_cache.json` and refreshes them auto
 
 ### Gmail agent tools
 
-| Tool name | Purpose | Key parameters |
-|-----------|---------|----------------|
-| `gmail` | List and read inbox messages | `limit`, `after`, `before`, `only_subject`, `body_limit` |
-| `gmail_email_send` | Send an email | `to`, `subject`, `body` (required); `format` (optional) |
+
+| Tool name          | Purpose                      | Key parameters                                           |
+| ------------------ | ---------------------------- | -------------------------------------------------------- |
+| `gmail`            | List and read inbox messages | `limit`, `after`, `before`, `only_subject`, `body_limit` |
+| `gmail_email_send` | Send an email                | `to`, `subject`, `body` (required); `format` (optional)  |
+
+
+
 
 #### `gmail_email_send` parameters
 
-| Parameter | Required | Default | Description |
-|-----------|----------|---------|-------------|
-| `to` | yes | — | Recipient email address |
-| `subject` | yes | — | Email subject (non-ASCII characters are RFC 2047–encoded) |
-| `body` | yes | — | Message body: plain text or HTML, depending on `format` |
-| `format` | no | `plain` | `plain` for `text/plain`, or `html` for `text/html` |
+
+| Parameter | Required | Default | Description                                               |
+| --------- | -------- | ------- | --------------------------------------------------------- |
+| `to`      | yes      | —       | Recipient email address                                   |
+| `subject` | yes      | —       | Email subject (non-ASCII characters are RFC 2047–encoded) |
+| `body`    | yes      | —       | Message body: plain text or HTML, depending on `format`   |
+| `format`  | no       | `plain` | `plain` for `text/plain`, or `html` for `text/html`       |
+
 
 When `format` is `html`, pass HTML markup in `body` (for example `<p>Hello</p>`). Gmail renders it as HTML in the recipient's client. When omitted or set to `plain`, the body is sent as plain text.
 
 Send uses the Gmail API `users.messages.send` endpoint with an RFC 2822 MIME message encoded as base64url. Messages are sent from the authenticated Google account.
 
 ---
+
+
 
 ## Configuration
 
@@ -482,6 +544,8 @@ Typical keys: provider, model, API key / base URL (read from env), and channel s
 The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`, plus the standard folder layout. These come from the compiled-in template bundle by default; drop a `templates/` directory next to the binary (or set `RUST_BOT_TEMPLATES_DIR`) if you want to override them with your own copies.
 
 ---
+
+
 
 ## Project layout
 
@@ -507,6 +571,8 @@ rust-bot/
 └── README.md
 ```
 
+
+
 ### Web chat UI
 
 `web-chat/` is a small Leptos + Tailwind chat UI (login + chat) that talks
@@ -530,7 +596,7 @@ cargo run -- api --config ./configs/simple1/config.json --web-root ./web-chat/di
 
 Or use `./scripts/build_all.sh` to build the release CLI and web-chat together.
 
-Then open `http://127.0.0.1:8900/`. See [`web-chat/README.md`](web-chat/README.md)
+Then open `http://127.0.0.1:8900/`. See `[web-chat/README.md](web-chat/README.md)`
 for local development (`trunk serve`) instructions.
 
 ## License

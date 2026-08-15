@@ -1,0 +1,297 @@
+{
+  "presets": [
+    {
+      "name": "browserbase",
+      "displayName": "Browserbase",
+      "category": "browser",
+      "description": "Cloud browser automation through Browserbase's hosted MCP server.",
+      "docsUrl": "https://docs.browserbase.com/integrations/mcp/setup",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Browserbase API key",
+      "note": "",
+      "server": {
+        "type": "streamableHttp",
+        "url": "https://mcp.browserbase.com/mcp",
+        "toolTimeout": 60
+      },
+      "fields": [
+        {
+          "name": "browserbase_api_key",
+          "label": "Browserbase API key",
+          "target": ["url_param", "browserbaseApiKey"],
+          "secret": true,
+          "required": true,
+          "envVar": "BROWSERBASE_API_KEY",
+          "placeholder": "bb_live_..."
+        }
+      ]
+    },
+    {
+      "name": "playwright",
+      "displayName": "Playwright",
+      "category": "browser",
+      "description": "Local browser inspection and automation with Playwright's MCP server.",
+      "docsUrl": "https://playwright.dev/docs/getting-started-mcp",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "Node.js and npx",
+      "note": "",
+      "server": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@playwright/mcp@latest"],
+        "toolTimeout": 60
+      },
+      "fields": []
+    },
+    {
+      "name": "context7",
+      "displayName": "Context7",
+      "category": "docs",
+      "description": "Fetch current library docs and code examples while the agent works.",
+      "docsUrl": "https://context7.com/docs/resources/all-clients",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "Node.js and npx; API key optional",
+      "note": "Works without a key for basic public docs; add a key for higher limits or private docs.",
+      "server": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@upstash/context7-mcp@latest"],
+        "toolTimeout": 45
+      },
+      "fields": [
+        {
+          "name": "context7_api_key",
+          "label": "Context7 API key",
+          "target": ["arg", "--api-key"],
+          "secret": true,
+          "required": false,
+          "envVar": "CONTEXT7_API_KEY",
+          "placeholder": "ctx7_..."
+        }
+      ]
+    },
+    {
+      "name": "firecrawl",
+      "displayName": "Firecrawl",
+      "category": "web",
+      "description": "Scrape, crawl, search, and extract web pages through Firecrawl's MCP server.",
+      "docsUrl": "https://docs.firecrawl.dev/use-cases/developers-mcp",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Network access",
+      "note": "Uses Firecrawl Keyless through the hosted MCP endpoint. No API key is required for the built-in preset; use a custom MCP server URL if you want account-specific limits.",
+      "server": {
+        "type": "streamableHttp",
+        "url": "https://mcp.firecrawl.dev/v2/mcp",
+        "toolTimeout": 60
+      },
+      "fields": []
+    },
+    {
+      "name": "parallel-search",
+      "displayName": "Parallel Search",
+      "category": "web",
+      "description": "Search the web and fetch relevant page content through Parallel's hosted MCP server.",
+      "docsUrl": "https://docs.parallel.ai/integrations/mcp/search-mcp",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Network access",
+      "note": "Free anonymous access for light use; no API key is required.",
+      "server": {
+        "type": "streamableHttp",
+        "url": "https://search.parallel.ai/mcp",
+        "toolTimeout": 60,
+        "enabledTools": ["web_search", "web_fetch"]
+      },
+      "fields": []
+    },
+    {
+      "name": "exa",
+      "displayName": "Exa",
+      "category": "web",
+      "description": "Search the web and fetch clean page content through Exa's hosted MCP server.",
+      "docsUrl": "https://exa.ai/mcp",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Network access",
+      "note": "Hosted Exa MCP endpoint currently does not require an API key.",
+      "server": {
+        "type": "streamableHttp",
+        "url": "https://mcp.exa.ai/mcp",
+        "toolTimeout": 45
+      },
+      "fields": []
+    },
+    {
+      "name": "microsoft-learn",
+      "displayName": "Microsoft Learn",
+      "category": "docs",
+      "description": "Search and fetch Microsoft Learn documentation through Microsoft's hosted MCP server.",
+      "docsUrl": "https://learn.microsoft.com/en-us/training/support/mcp",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Network access",
+      "note": "Public documentation only; no authentication required.",
+      "server": {
+        "type": "streamableHttp",
+        "url": "https://learn.microsoft.com/api/mcp",
+        "toolTimeout": 45
+      },
+      "fields": []
+    },
+    {
+      "name": "aws-docs",
+      "displayName": "AWS Documentation",
+      "category": "docs",
+      "description": "Search AWS documentation and service guidance through AWS Labs' documentation MCP server.",
+      "docsUrl": "https://awslabs.github.io/mcp/servers/aws-documentation-mcp-server/",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "uvx",
+      "note": "",
+      "server": {
+        "type": "stdio",
+        "command": "uvx",
+        "args": ["awslabs.aws-documentation-mcp-server@latest"],
+        "env": {
+          "FASTMCP_LOG_LEVEL": "ERROR",
+          "AWS_DOCUMENTATION_PARTITION": "aws"
+        },
+        "toolTimeout": 60
+      },
+      "fields": []
+    },
+    {
+      "name": "brave-search",
+      "displayName": "Brave Search",
+      "category": "web",
+      "description": "Run web, news, image, video, and local search through Brave Search.",
+      "docsUrl": "https://www.npmjs.com/package/@brave/brave-search-mcp-server",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "Node.js, npx, and Brave Search API key",
+      "note": "",
+      "server": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@brave/brave-search-mcp-server@latest", "--transport", "stdio"],
+        "toolTimeout": 45
+      },
+      "fields": [
+        {
+          "name": "brave_api_key",
+          "label": "Brave Search API key",
+          "target": ["env", "BRAVE_API_KEY"],
+          "secret": true,
+          "required": true,
+          "envVar": "BRAVE_API_KEY",
+          "placeholder": "BSA..."
+        }
+      ]
+    },
+    {
+      "name": "postman",
+      "displayName": "Postman",
+      "category": "api",
+      "description": "Inspect and manage Postman APIs, collections, and workspaces through the local MCP server.",
+      "docsUrl": "https://learning.postman.com/docs/developer/postman-api/postman-mcp-server/postman-mcp-local-server",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "Node.js, npx, and Postman API key",
+      "note": "",
+      "server": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@postman/postman-mcp-server@latest", "--full"],
+        "toolTimeout": 60
+      },
+      "fields": [
+        {
+          "name": "postman_api_key",
+          "label": "Postman API key",
+          "target": ["env", "POSTMAN_API_KEY"],
+          "secret": true,
+          "required": true,
+          "envVar": "POSTMAN_API_KEY",
+          "placeholder": "PMAK-..."
+        }
+      ]
+    },
+    {
+      "name": "figma",
+      "displayName": "Figma",
+      "category": "design",
+      "description": "Read design context from Figma using the local Dev Mode MCP server.",
+      "docsUrl": "https://help.figma.com/hc/en-us/articles/32132100833559-Guide-to-the-Figma-MCP-server",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Figma desktop app with MCP enabled",
+      "note": "Requires Figma Desktop Dev Mode MCP to be running locally.",
+      "server": {
+        "type": "streamableHttp",
+        "url": "http://127.0.0.1:3845/mcp",
+        "toolTimeout": 45
+      },
+      "fields": []
+    },
+    {
+      "name": "github",
+      "displayName": "GitHub",
+      "category": "code",
+      "description": "Repository, issue, and pull request workflows via GitHub's MCP server.",
+      "docsUrl": "https://github.com/github/github-mcp-server",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "Docker and GitHub token",
+      "note": "",
+      "server": {
+        "type": "stdio",
+        "command": "docker",
+        "args": ["run", "-i", "--rm", "-e", "GITHUB_PERSONAL_ACCESS_TOKEN", "ghcr.io/github/github-mcp-server"],
+        "toolTimeout": 60
+      },
+      "fields": [
+        {
+          "name": "github_token",
+          "label": "GitHub token",
+          "target": ["env", "GITHUB_PERSONAL_ACCESS_TOKEN"],
+          "secret": true,
+          "required": true,
+          "envVar": "GITHUB_PERSONAL_ACCESS_TOKEN",
+          "placeholder": "ghp_..."
+        }
+      ]
+    },
+    {
+      "name": "supabase",
+      "displayName": "Supabase",
+      "category": "database",
+      "description": "Inspect and manage Supabase projects through the Supabase MCP server.",
+      "docsUrl": "https://supabase.com/docs/guides/ai-tools/mcp",
+      "transport": "stdio",
+      "installSupported": true,
+      "requires": "Node.js, npx, and Supabase access token",
+      "note": "MVP config starts read-only by default.",
+      "server": {
+        "type": "stdio",
+        "command": "npx",
+        "args": ["-y", "@supabase/mcp-server-supabase@latest", "--read-only"],
+        "toolTimeout": 60
+      },
+      "fields": [
+        {
+          "name": "supabase_access_token",
+          "label": "Supabase access token",
+          "target": ["env", "SUPABASE_ACCESS_TOKEN"],
+          "secret": true,
+          "required": true,
+          "envVar": "SUPABASE_ACCESS_TOKEN",
+          "placeholder": "sbp_..."
+        }
+      ]
+    }
+  ]
+}
