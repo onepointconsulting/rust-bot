@@ -8,3 +8,8 @@ cd "$ROOT"
 cargo build -r
 cd web-chat
 trunk build --release
+
+cd ..
+
+cd websockets-chat
+trunk build --release
