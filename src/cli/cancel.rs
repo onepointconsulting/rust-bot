@@ -19,17 +19,44 @@ const POLL_INTERVAL: Duration = Duration::from_millis(75);
 /// On Windows, `crossterm::terminal::enable_raw_mode` only clears input-handle
 /// console modes (line input / echo / processed input); it does not touch the
 /// output handle, so concurrent `println!`/`write!` calls elsewhere in the
-/// turn are unaffected. On Unix this also disables output post-processing,
-/// which is fine here because the only output produced while this guard is
-/// live is unrelated CLI turn output — this feature targets the Windows
-/// `cmd.exe` "Terminate batch job" problem described in the plan.
+/// turn are unaffected.
+///
+/// On Unix, `cfmakeraw` also clears `OPOST`, so `\n` is no longer mapped to
+/// `\r\n`. Tool-hint / spinner lines then start at the previous line's end
+/// column (the staircase seen on Linux and WSL). Input stays raw so Esc is
+/// still readable; output post-processing is restored immediately after.
 struct RawModeGuard;
 
 impl RawModeGuard {
     fn enable() -> std::io::Result<Self> {
+        #[cfg(unix)]
+        let saved_oflag = unix_output_flags();
         terminal::enable_raw_mode()?;
+        #[cfg(unix)]
+        if let Some(oflag) = saved_oflag {
+            restore_unix_output_flags(oflag);
+        }
         Ok(Self)
     }
+}
+
+/// Snapshot `c_oflag` from the interactive tty (stdin/stdout share it).
+#[cfg(unix)]
+fn unix_output_flags() -> Option<libc::tcflag_t> {
+    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+    let rc = unsafe { libc::tcgetattr(libc::STDOUT_FILENO, &mut termios) };
+    (rc == 0).then_some(termios.c_oflag)
+}
+
+/// Re-apply the pre-raw `c_oflag` so `println!` still returns to column 0.
+#[cfg(unix)]
+fn restore_unix_output_flags(oflag: libc::tcflag_t) {
+    let mut termios = unsafe { std::mem::zeroed::<libc::termios>() };
+    if unsafe { libc::tcgetattr(libc::STDOUT_FILENO, &mut termios) } != 0 {
+        return;
+    }
+    termios.c_oflag = oflag;
+    let _ = unsafe { libc::tcsetattr(libc::STDOUT_FILENO, libc::TCSANOW, &termios) };
 }
 
 impl Drop for RawModeGuard {
@@ -103,5 +130,18 @@ pub async fn wait_for_escape_cancel() {
     match handle.await {
         Ok(true) => {}
         _ => std::future::pending::<()>().await,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[cfg(unix)]
+    #[test]
+    fn restoring_saved_output_flags_is_idempotent() {
+        let Some(oflag) = super::unix_output_flags() else {
+            return;
+        };
+        super::restore_unix_output_flags(oflag);
+        assert_eq!(super::unix_output_flags(), Some(oflag));
     }
 }

@@ -5423,6 +5423,7 @@ dependencies = [
  "ipnet",
  "jsonwebtoken",
  "lettre",
+ "libc",
  "log",
  "mailparse",
  "native-tls",
