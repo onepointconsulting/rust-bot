@@ -599,7 +599,7 @@ fn default_jwt_iss() -> String {
 }
 
 fn default_jwt_aud() -> String {
-    String::new()
+    "/ws".to_string()
 }
 
 fn validate_jwt_aud_when_enabled(value: &JwtConfig, _ctx: &()) -> garde::Result {

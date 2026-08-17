@@ -34,6 +34,13 @@ pub enum EnvelopeType {
     SetWorkspaceScope,
     TranscribeAudio,
     Message,
+    /// List this connection's forkable chats (`websocket:*` sessions). Rust-side
+    /// protocol addition with no nanobot precedent — the Python reference has
+    /// no chat-discovery envelope at all, since `fork_chat` always assumes the
+    /// caller already knows `source_chat_id` from the chat it's attached to.
+    /// Added so a UI can offer "fork one of my other chats", not just "fork
+    /// the one I'm currently in".
+    ListChats,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
@@ -45,8 +52,8 @@ pub enum EnvelopeType {
 
 impl From<&str> for EnvelopeType {
     /// Maps a raw envelope `type` string (e.g. `"new_chat"`) to its variant.
-    /// Infallible by design — anything that isn't one of the six known
-    /// values becomes `Unrecognized`, mirroring nanobot's `_dispatch_envelope`
+    /// Infallible by design — anything that isn't one of the known values
+    /// becomes `Unrecognized`, mirroring nanobot's `_dispatch_envelope`
     /// fallthrough (`runtime.py:850`) rather than failing to parse.
     fn from(value: &str) -> Self {
         match value {
@@ -56,6 +63,7 @@ impl From<&str> for EnvelopeType {
             "set_workspace_scope" => Self::SetWorkspaceScope,
             "transcribe_audio" => Self::TranscribeAudio,
             "message" => Self::Message,
+            "list_chats" => Self::ListChats,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -78,6 +86,9 @@ pub enum WsOutboundEvent {
     MessageAccepted,
     GoalState,
     GoalStatus,
+    /// Reply to [`EnvelopeType::ListChats`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    ChatsList,
 }
 
 impl WsOutboundEvent {
@@ -90,6 +101,7 @@ impl WsOutboundEvent {
             Self::MessageAccepted => "message_accepted",
             Self::GoalState => "goal_state",
             Self::GoalStatus => "goal_status",
+            Self::ChatsList => "chats",
         }
     }
 }
@@ -170,7 +182,7 @@ impl Default for WebSocketConfig {
             enabled: true,
             host: "127.0.0.1".to_string(),
             port: 8765,
-            path: "/".to_string(),
+            path: "/ws".to_string(),
             jwt: JwtConfig::default(),
             allow_from: vec![],
             streaming: false,
@@ -337,6 +349,7 @@ mod tests {
         assert_eq!(EnvelopeType::from("set_workspace_scope"), EnvelopeType::SetWorkspaceScope);
         assert_eq!(EnvelopeType::from("transcribe_audio"), EnvelopeType::TranscribeAudio);
         assert_eq!(EnvelopeType::from("message"), EnvelopeType::Message);
+        assert_eq!(EnvelopeType::from("list_chats"), EnvelopeType::ListChats);
     }
 
     #[test]
@@ -356,5 +369,12 @@ mod tests {
         assert_eq!(WsOutboundEvent::MessageAccepted.as_str(), "message_accepted");
         assert_eq!(WsOutboundEvent::GoalState.as_str(), "goal_state");
         assert_eq!(WsOutboundEvent::GoalStatus.as_str(), "goal_status");
+    }
+
+    #[test]
+    fn ws_outbound_event_chats_list_has_no_nanobot_precedent() {
+        // Not part of the previous test's "matches nanobot wire names" set —
+        // this event is a Rust-side addition (see `EnvelopeType::ListChats`).
+        assert_eq!(WsOutboundEvent::ChatsList.as_str(), "chats");
     }
 }

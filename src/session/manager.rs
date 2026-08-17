@@ -1,17 +1,22 @@
 use std::{
-    collections::HashMap,
-    fs::{self, File},
-    io::{BufRead, BufReader, Write},
-    path::{Path, PathBuf},
+    collections::HashMap, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex},
 };
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use regex::Regex;
 use serde_json::{Map, Value, json};
 
+use tera::Context;
+
 use crate::{
-    config::paths::get_legacy_sessions_dir,
-    utils::helpers::{ensure_dir, find_legal_message_start, safe_filename},
+    config::paths::get_legacy_sessions_dir, providers::base::LLMProviderDyn, session::{SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message, keys::{COMMAND_KEY, HIDDEN_HISTORY_KEY}}, utils::helpers::{ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text}, utils::prompt_templates::render_template,
 };
+
+/// Max stored title length in Unicode scalar values. Matches nanobot `TITLE_MAX_CHARS`.
+const TITLE_MAX_CHARS: usize = 60;
+const TITLE_GENERATION_MAX_TOKENS: usize = 96;
+const TITLE_GENERATION_TEMPERATURE: f32 = 0.2;
+const TITLE_INPUT_MAX_CHARS: usize = 1_000;
 
 /// In-memory conversation session record.
 #[derive(Clone)]
@@ -57,6 +62,7 @@ impl Session {
     }
 
     /// Recent messages for prompting, from `last_consolidated` onward (trimmed and normalized).
+    /// Messages tagged with [`COMMAND_KEY`] are omitted.
     ///
     /// * `max_messages` — keep at most this many messages from the **end** of that window before
     ///   user-turn alignment. `None` means 500. **`Some(0)` is treated like `None`** (also 500): a
@@ -88,6 +94,9 @@ impl Session {
 
         let mut out: Vec<Value> = Vec::new();
         for message in sliced {
+            if message.get(COMMAND_KEY).is_some() {
+                continue;
+            }
             let mut entry = json!({
                 "role": message.get("role").and_then(|v| v.as_str()).unwrap_or(""),
                 "content": message.get("content").and_then(|v| v.as_str()).unwrap_or(""),
@@ -183,6 +192,61 @@ fn json_value_as_last_consolidated(v: &Value) -> usize {
         .unwrap_or(0)
 }
 
+fn title_inputs(session: &Session) -> (String, String) {
+    let mut user_text = String::new();
+    let mut assistant_text = String::new();
+    for message in &session.messages {
+        if message.get(COMMAND_KEY) == Some(&Value::Bool(true)) {
+            continue;
+        }
+        if is_hidden_history_message(message) {
+            continue;
+        }
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        let Some(content) = message.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        if content.trim().is_empty() {
+            continue;
+        }
+        let content = strip_think(content);
+        if content.is_empty() {
+            continue;
+        }
+        if role == "user" && user_text.is_empty() {
+            user_text = content;
+        } else if role == "assistant" && assistant_text.is_empty() {
+            assistant_text = content;
+        }
+        if !user_text.is_empty() && !assistant_text.is_empty() {
+            break;
+        }
+    }
+    (user_text, assistant_text)
+}
+
+fn title_generation_prompt(user_text: &str, assistant_text: &str) -> Result<(String, String), String> {
+    let user_text = truncate_text(user_text, TITLE_INPUT_MAX_CHARS);
+    let assistant_text = if assistant_text.is_empty() {
+        String::new()
+    } else {
+        truncate_text(assistant_text, TITLE_INPUT_MAX_CHARS)
+    };
+    let mut system_ctx = Context::new();
+    system_ctx.insert("part", "system");
+    let system = render_template("history/title_generation.md", &system_ctx, true)?;
+
+    let mut user_ctx = Context::new();
+    user_ctx.insert("part", "user");
+    user_ctx.insert("user", &user_text);
+    user_ctx.insert("assistant", &assistant_text);
+    let user = render_template("history/title_generation.md", &user_ctx, true)?;
+    Ok((system, user))
+}
+
 pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
@@ -219,26 +283,26 @@ impl SessionManager {
         return self.legacy_sessions_dir.join(format!("{}.jsonl", safe_key));
     }
 
+    /// Existing session from cache or disk. Does not create a session and does
+    /// not insert a disk load into the cache — that is [`Self::get_or_create_session`].
+    pub(crate) fn get_session_internal(&self, session_key: &str) -> Option<Session> {
+        if let Some(session) = self.cache.get(session_key) {
+            return Some(session.clone());
+        }
+        self.load(session_key)
+    }
+
     /// Get an existing session or create a new one.
     ///
-    /// # Arguments
-    ///
-    /// * `key` - The key of the session.
-    ///
-    /// # Returns
-    ///
-    /// The session.
+    /// Cache first; on a miss, load from disk or insert a fresh session.
     pub fn get_or_create_session(&mut self, key: &str) -> &mut Session {
-        if self.cache.contains_key(key) {
-            return self.cache.get_mut(key).unwrap();
+        if !self.cache.contains_key(key) {
+            let session = self
+                .load(key)
+                .unwrap_or_else(|| Session::new(key.to_string()));
+            self.cache.insert(key.to_string(), session);
         }
-        let mut session_opt = self.load(key);
-        if let None = &mut session_opt {
-            session_opt = Some(Session::new(key.to_string()));
-        }
-        let session = session_opt.unwrap();
-        self.cache.insert(key.to_string(), session);
-        return self.cache.get_mut(key).expect("just inserted");
+        self.cache.get_mut(key).expect("session is in cache")
     }
 
     fn load(&self, key: &str) -> Option<Session> {
@@ -402,6 +466,7 @@ impl SessionManager {
                                         "created_at": metadata.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
                                         "updated_at": metadata.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
                                         "path": path.display().to_string(),
+                                        "title": listed_session_title(&metadata),
                                     }));
                                 }
                             }
@@ -611,6 +676,149 @@ impl SessionManager {
             messages,
         }
     }
+
+    /// True when this session has user text and no stored title yet.
+    pub fn session_needs_title(&self, session_key: &str) -> bool {
+        let Some(session) = self.get_session_internal(session_key) else {
+            return false;
+        };
+        let has_title = session
+            .metadata
+            .get(SESSION_TITLE_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .is_some_and(|s| !s.is_empty());
+        if has_title {
+            return false;
+        }
+        let (user_text, _) = title_inputs(&session);
+        !user_text.is_empty()
+    }
+
+    /// Generate and persist a session title. Locks `sessions` only around the
+    /// read and the save — the LLM call runs with the lock released.
+    pub async fn generate_title(
+        sessions: &Mutex<SessionManager>,
+        session_key: &str,
+        provider: Arc<dyn LLMProviderDyn>,
+        model: &str,
+    ) -> Option<String> {
+        let (system, user) = {
+            let manager = sessions.lock().unwrap_or_else(|e| e.into_inner());
+            let Some(session) = manager.get_session_internal(session_key) else {
+                log::error!("Session not found: {}", session_key);
+                return None;
+            };
+            let title = session
+                .metadata
+                .get(SESSION_TITLE_METADATA_KEY)
+                .and_then(|v| v.as_str())
+                .unwrap_or_default();
+            if !title.is_empty() {
+                return Some(title.to_string());
+            }
+            let (user_text, assistant_text) = title_inputs(&session);
+            if user_text.is_empty() {
+                return None;
+            }
+            match title_generation_prompt(&user_text, &assistant_text) {
+                Ok(prompt) => prompt,
+                Err(e) => {
+                    log::error!("Failed to render title generation template: {e}");
+                    return None;
+                }
+            }
+        };
+        let response = provider
+            .chat_with_retry(
+                vec![
+                    json!({ "role": "system", "content": system }),
+                    json!({ "role": "user", "content": user }),
+                ],
+                None,
+                Some(model.to_string()),
+                Some(TITLE_GENERATION_MAX_TOKENS),
+                Some(TITLE_GENERATION_TEMPERATURE),
+                Some("none".to_string()),
+                None,
+            )
+            .await;
+        let title = Self::clean_generated_title(response.content);
+        if title.is_empty() || title.to_lowercase().starts_with("error") {
+            log::debug!(
+                "Title generation returned no usable title for {session_key} (finish_reason={})",
+                response.finish_reason
+            );
+            return None;
+        }
+
+        let mut manager = sessions.lock().unwrap_or_else(|e| e.into_inner());
+        manager.persist_generated_title(session_key, title)
+    }
+
+    fn persist_generated_title(&mut self, session_key: &str, title: String) -> Option<String> {
+        let session = self.get_or_create_session(session_key);
+        if let Some(existing) = session
+            .metadata
+            .get(SESSION_TITLE_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+        {
+            return Some(existing.to_string());
+        }
+        session
+            .metadata
+            .insert(SESSION_TITLE_METADATA_KEY.to_string(), json!(title.clone()));
+        let snapshot = session.clone();
+        if let Err(e) = self.save(snapshot) {
+            log::error!("Failed to save generated title for {session_key}: {e}");
+        }
+        Some(title)
+    }
+
+    fn clean_generated_title(raw: Option<String>) -> String {
+        static TITLE_PREFIX_RE: LazyLock<Regex> = LazyLock::new(|| {
+            Regex::new(r"(?i)^\s*(title|标题)\s*[:：]\s*").expect("title prefix regex")
+        });
+
+        let text = raw.unwrap_or_default();
+        let text = text.trim();
+        if text.is_empty() {
+            return String::new();
+        }
+
+        let text = TITLE_PREFIX_RE.replace(text, "");
+        let text = text
+            .trim()
+            .trim_matches(|c: char| matches!(c, '"' | '\'' | '`' | '“' | '”' | '‘' | '’'));
+        let text = strip_think(text);
+        let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        let text = text
+            .trim_end_matches(|c: char| {
+                matches!(c, '。' | '.' | '!' | '！' | '?' | '？' | ',' | '，' | ';' | '；' | ':')
+            })
+            .to_string();
+
+        if text.chars().count() > TITLE_MAX_CHARS {
+            let mut truncated: String = text.chars().take(TITLE_MAX_CHARS - 1).collect();
+            let end = truncated.trim_end().len();
+            truncated.truncate(end);
+            truncated.push('…');
+            truncated
+        } else {
+            text
+        }
+    }
+
+}
+
+/// Title stored on the JSONL metadata line (`metadata.title`), if any.
+fn listed_session_title(metadata_line: &Value) -> String {
+    metadata_line
+        .get("metadata")
+        .and_then(|m| m.get(SESSION_TITLE_METADATA_KEY))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
 }
 
 fn parse_session_timestamp(s: &str) -> Option<DateTime<Utc>> {
@@ -641,9 +849,17 @@ pub fn format_sessions_list(sessions: &[Value], current_key: Option<&str>) -> St
             .filter(|s| !s.is_empty());
         let current = current_key == Some(key);
         let suffix = if current { " (current)" } else { "" };
+        let title = entry
+            .get("title")
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty());
+        let label = match title {
+            Some(title) => format!("{title} [{key}]"),
+            None => key.to_string(),
+        };
         match updated {
-            Some(ts) => lines.push(format!("- {key}{suffix} — updated {ts}")),
-            None => lines.push(format!("- {key}{suffix}")),
+            Some(ts) => lines.push(format!("- {label}{suffix} — updated {ts}")),
+            None => lines.push(format!("- {label}{suffix}")),
         }
     }
     lines.join("\n")
@@ -748,6 +964,27 @@ mod tests {
             json!([{"type": "function", "id": "c1"}])
         );
         assert!(h[0].get("name").is_none());
+    }
+
+    #[test]
+    fn get_history_omits_command_messages() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", "hello"));
+        let mut command = Map::new();
+        command.insert("role".into(), json!("user"));
+        command.insert("content".into(), json!("/status"));
+        command.insert("timestamp".into(), json!("2026-01-01T00:00:00Z"));
+        command.insert(COMMAND_KEY.to_string(), json!(true));
+        session.messages.push(Value::Object(command));
+        session
+            .messages
+            .push(fixture_message("assistant", "hi"));
+
+        let h = session.get_history(None);
+        assert_eq!(h.len(), 2);
+        assert_eq!(h[0]["content"], json!("hello"));
+        assert_eq!(h[1]["content"], json!("hi"));
+        assert!(h.iter().all(|m| m.get(COMMAND_KEY).is_none()));
     }
 
     #[test]
@@ -1137,6 +1374,7 @@ mod tests {
         assert_eq!(e["created_at"], json!("2026-04-01T12:00:00+00:00"));
         assert_eq!(e["updated_at"], json!("2026-04-02T15:30:00+00:00"));
         assert_eq!(e["path"], json!(path.display().to_string()));
+        assert_eq!(e["title"], json!(""));
     }
 
     #[test]
@@ -1154,6 +1392,7 @@ mod tests {
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["created_at"], json!(""));
         assert_eq!(listed[0]["updated_at"], json!(""));
+        assert_eq!(listed[0]["title"], json!(""));
     }
 
     #[test]
@@ -1195,6 +1434,37 @@ mod tests {
         let text = format_sessions_list(&sessions, Some("cli:direct"));
         assert!(text.contains("cli:direct (current) — updated 2026-06-01T00:00:00Z"));
         assert!(text.contains("- other:session — updated 2026-06-02T00:00:00Z"));
+    }
+
+    #[test]
+    fn format_sessions_list_includes_title_when_present() {
+        let sessions = vec![json!({
+            "key": "websocket:chat-1",
+            "updated_at": "2026-06-01T00:00:00Z",
+            "title": "Fix the login bug",
+        })];
+        let text = format_sessions_list(&sessions, None);
+        assert!(text.contains("- Fix the login bug [websocket:chat-1] — updated 2026-06-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn list_sessions_includes_generated_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        {
+            let session = mgr.get_or_create_session("chat");
+            session.metadata.insert(
+                SESSION_TITLE_METADATA_KEY.to_string(),
+                json!("Fix the login bug"),
+            );
+            let snapshot = session.clone();
+            mgr.save(snapshot).unwrap();
+        }
+        mgr.cache.clear();
+
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["title"], json!("Fix the login bug"));
     }
 
     #[test]
@@ -1281,5 +1551,158 @@ mod tests {
             Some(&json!("recovered"))
         );
         assert_eq!(payload.metadata.get("ok"), Some(&json!(true)));
+    }
+
+    #[test]
+    fn clean_generated_title_empty_and_none() {
+        assert_eq!(SessionManager::clean_generated_title(None), "");
+        assert_eq!(SessionManager::clean_generated_title(Some("   ".into())), "");
+    }
+
+    #[test]
+    fn clean_generated_title_strips_prefix_quotes_think_and_punct() {
+        assert_eq!(
+            SessionManager::clean_generated_title(Some("Title: \"Hello world!\"".into())),
+            "Hello world"
+        );
+        assert_eq!(
+            SessionManager::clean_generated_title(Some("标题：  调试会话。".into())),
+            "调试会话"
+        );
+        assert_eq!(
+            SessionManager::clean_generated_title(Some(
+                "<think>secret</think> Fix login bug".into()
+            )),
+            "Fix login bug"
+        );
+    }
+
+    #[test]
+    fn clean_generated_title_collapses_whitespace_and_truncates() {
+        assert_eq!(
+            SessionManager::clean_generated_title(Some("foo   \n\t  bar".into())),
+            "foo bar"
+        );
+        let long = "a".repeat(TITLE_MAX_CHARS + 10);
+        let cleaned = SessionManager::clean_generated_title(Some(long));
+        assert_eq!(cleaned.chars().count(), TITLE_MAX_CHARS);
+        assert!(cleaned.ends_with('…'));
+        assert_eq!(
+            cleaned.chars().take(TITLE_MAX_CHARS - 1).collect::<String>(),
+            "a".repeat(TITLE_MAX_CHARS - 1)
+        );
+    }
+
+    #[test]
+    fn title_inputs_empty_session() {
+        let session = Session::new("s1".into());
+        assert_eq!(title_inputs(&session), (String::new(), String::new()));
+    }
+
+    #[test]
+    fn title_inputs_takes_first_user_and_assistant() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", "  hello  "));
+        session.messages.push(fixture_message("assistant", "hi there"));
+        session.messages.push(fixture_message("user", "later user"));
+        session.messages.push(fixture_message("assistant", "later assistant"));
+        assert_eq!(
+            title_inputs(&session),
+            ("hello".to_string(), "hi there".to_string())
+        );
+    }
+
+    #[test]
+    fn title_inputs_skips_commands_hidden_empty_and_think_only() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(json!({
+            "role": "user",
+            "content": "/help",
+            "_command": true,
+        }));
+        session.messages.push(json!({
+            "role": "assistant",
+            "content": "Available commands",
+            "_command": true,
+        }));
+        session.messages.push(json!({
+            "role": "user",
+            "content": "hidden prompt",
+            "_hidden_history": true,
+        }));
+        session.messages.push(fixture_message("user", "   "));
+        session.messages.push(fixture_message("user", "<think>secret</think>"));
+        session.messages.push(json!({
+            "role": "user",
+            "content": ["not", "a", "string"],
+        }));
+        session.messages.push(fixture_message(
+            "user",
+            "<think>scratch</think> real question",
+        ));
+        session.messages.push(fixture_message("assistant", "real answer"));
+        assert_eq!(session.messages[0][COMMAND_KEY], json!(true));
+        assert_eq!(session.messages[2][HIDDEN_HISTORY_KEY], json!(true));
+        assert_eq!(
+            title_inputs(&session),
+            ("real question".to_string(), "real answer".to_string())
+        );
+    }
+
+    #[test]
+    fn title_inputs_user_only_leaves_assistant_empty() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", "just a question"));
+        assert_eq!(
+            title_inputs(&session),
+            ("just a question".to_string(), String::new())
+        );
+    }
+
+    #[test]
+    fn title_generation_prompt_includes_user_and_assistant() {
+        let (system, user) = title_generation_prompt("Fix the login bug", "Reset the token").unwrap();
+        assert!(system.contains("Return only the title text"));
+        assert!(!system.contains("User:"));
+        assert!(user.contains("User: Fix the login bug"));
+        assert!(user.contains("Assistant: Reset the token"));
+        assert!(user.contains("3 to 8 words"));
+    }
+
+    #[test]
+    fn title_generation_prompt_omits_empty_assistant() {
+        let (_, user) = title_generation_prompt("Fix the login bug", "").unwrap();
+        assert!(user.contains("User: Fix the login bug"));
+        assert!(!user.contains("Assistant:"));
+    }
+
+    #[test]
+    fn session_needs_title_false_when_missing_titled_or_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().to_path_buf());
+        assert!(!mgr.session_needs_title("missing"));
+
+        mgr.get_or_create_session("empty");
+        assert!(!mgr.session_needs_title("empty"));
+
+        {
+            let session = mgr.get_or_create_session("empty");
+            session.messages.push(fixture_message("user", "hello"));
+            session
+                .metadata
+                .insert(SESSION_TITLE_METADATA_KEY.to_string(), json!("Existing"));
+        }
+        assert!(!mgr.session_needs_title("empty"));
+    }
+
+    #[test]
+    fn session_needs_title_true_when_user_text_and_no_title() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().to_path_buf());
+        {
+            let session = mgr.get_or_create_session("chat");
+            session.messages.push(fixture_message("user", "hello"));
+        }
+        assert!(mgr.session_needs_title("chat"));
     }
 }

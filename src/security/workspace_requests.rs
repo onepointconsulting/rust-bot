@@ -20,6 +20,7 @@ use crate::{
         build_workspace_scope, default_workspace_scope, validate_workspace_scope_payload,
         workspace_scope_from_metadata,
     },
+    session::keys::SESSION_WEBUI_METADATA_KEY,
     session::manager::SessionManager,
     utils::helpers::write_text_atomic,
 };
@@ -333,7 +334,7 @@ impl WorkspaceRequestHandler {
     pub fn persist_scope(&self, session_manager: &mut SessionManager, chat_id: &str, scope: &WorkspaceScope) {
         let session_key = format!("websocket:{chat_id}");
         let session = session_manager.get_or_create_session(&session_key);
-        session.metadata.insert("webui".to_string(), serde_json::json!(true));
+        session.metadata.insert(SESSION_WEBUI_METADATA_KEY.to_string(), serde_json::json!(true));
         session
             .metadata
             .insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
@@ -574,6 +575,6 @@ mod tests {
         assert_eq!(reloaded.access_mode, WorkspaceAccessMode::Full);
 
         let session = sessions.get_or_create_session("websocket:chat-1");
-        assert_eq!(session.metadata.get("webui"), Some(&json!(true)));
+        assert_eq!(session.metadata.get(SESSION_WEBUI_METADATA_KEY), Some(&json!(true)));
     }
 }

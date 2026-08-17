@@ -658,10 +658,68 @@ impl OpenAICompatProvider {
         request
     }
 
-    /// POST the request as raw JSON and deserialize with unknown `service_tier`
-    /// variants stripped out.  This works around async-openai's strict `ServiceTier`
-    /// enum that rejects values like `"standard"` returned by Anthropic's
-    /// OpenAI-compatible endpoint.
+    /// Drop or reshape fields that `async-openai`'s typed response structs
+    /// reject. OpenAI-compatible gateways (Requesty, Anthropic, Vertex/Gemini)
+    /// often emit extra citation / routing metadata that is unused by
+    /// [`Self::parse_response`] but still fails serde.
+    fn sanitize_compat_response(json: &mut serde_json::Value) {
+        if let Some(obj) = json.as_object_mut() {
+            // Anthropic's OpenAI-compat endpoint returns `"standard"`.
+            obj.remove("service_tier");
+        }
+
+        let Some(choices) = json.get_mut("choices").and_then(|c| c.as_array_mut()) else {
+            return;
+        };
+        for choice in choices {
+            for key in ["message", "delta"] {
+                let Some(container) = choice.get_mut(key).and_then(|m| m.as_object_mut()) else {
+                    continue;
+                };
+                Self::sanitize_message_annotations(container);
+            }
+        }
+    }
+
+    /// `async-openai` only accepts `annotations[].type == "url_citation"` with
+    /// a nested `url_citation` object. Requesty/Gemini grounding often sends
+    /// `"type": "annotation"` (or a flattened citation), which otherwise
+    /// errors as `unknown variant 'annotation', expected 'url_citation'`.
+    fn sanitize_message_annotations(message: &mut serde_json::Map<String, serde_json::Value>) {
+        let Some(annotations) = message.get_mut("annotations").and_then(|a| a.as_array_mut())
+        else {
+            return;
+        };
+
+        let before = annotations.len();
+        annotations.retain(Self::is_typed_url_citation);
+        let dropped = before.saturating_sub(annotations.len());
+        if dropped > 0 {
+            log::debug!(
+                "Dropped {dropped} incompatible message annotation(s) from OpenAI-compat response"
+            );
+        }
+        if annotations.is_empty() {
+            message.remove("annotations");
+        }
+    }
+
+    fn is_typed_url_citation(ann: &serde_json::Value) -> bool {
+        if ann.get("type").and_then(|t| t.as_str()) != Some("url_citation") {
+            return false;
+        }
+        let Some(citation) = ann.get("url_citation") else {
+            return false;
+        };
+        citation.get("url").is_some()
+            && citation.get("title").is_some()
+            && citation.get("start_index").is_some()
+            && citation.get("end_index").is_some()
+    }
+
+    /// POST the request as raw JSON and deserialize after
+    /// [`Self::sanitize_compat_response`], so unknown gateway fields do not
+    /// fail typed parsing.
     async fn chat_raw(
         &self,
         request: &CreateChatCompletionRequest,
@@ -683,11 +741,10 @@ impl OpenAICompatProvider {
             return Err(format!("HTTP {status}: {json}"));
         }
 
-        // Strip fields that async-openai's typed structs cannot deserialize
-        // (e.g. `service_tier: "standard"` from Anthropic).
-        if let Some(obj) = json.as_object_mut() {
-            obj.remove("service_tier");
-        }
+        // Strip / coerce fields that async-openai's typed structs cannot
+        // deserialize (unknown `service_tier` values, Gemini/Requesty
+        // citation annotations with `type: "annotation"`, etc.).
+        Self::sanitize_compat_response(&mut json);
 
         let response = serde_json::from_value(json.clone())
             .map_err(|e| format!("failed to deserialize api response: {e}"))?;
@@ -1466,5 +1523,80 @@ mod tests {
             None
         );
         assert_eq!(OpenAICompatProvider::assistant_message_content(None), None);
+    }
+
+    fn sample_compat_response(annotations: serde_json::Value) -> serde_json::Value {
+        serde_json::json!({
+            "id": "chatcmpl-test",
+            "object": "chat.completion",
+            "created": 1,
+            "model": "vertex/gemini-3.7-flash@eu",
+            "choices": [{
+                "index": 0,
+                "finish_reason": "stop",
+                "message": {
+                    "role": "assistant",
+                    "content": "Here are some papers.",
+                    "annotations": annotations
+                }
+            }]
+        })
+    }
+
+    #[test]
+    fn sanitize_compat_response_drops_gemini_annotation_variant() {
+        let mut json = sample_compat_response(serde_json::json!([{
+            "type": "annotation",
+            "url": "https://arxiv.org/abs/1234.5678",
+            "title": "Agentic AI",
+            "start_index": 0,
+            "end_index": 12
+        }]));
+
+        let before = serde_json::from_value::<CreateChatCompletionResponse>(json.clone());
+        let err = before.expect_err("unsanitized Requesty/Gemini annotations should fail");
+        assert!(
+            err.to_string().contains("annotation"),
+            "expected unknown annotation variant, got {err}"
+        );
+
+        json.as_object_mut()
+            .unwrap()
+            .insert("service_tier".into(), serde_json::json!("standard"));
+        OpenAICompatProvider::sanitize_compat_response(&mut json);
+        assert!(json.get("service_tier").is_none());
+        assert!(json["choices"][0]["message"].get("annotations").is_none());
+
+        let parsed = serde_json::from_value::<CreateChatCompletionResponse>(json)
+            .expect("sanitized response should deserialize");
+        assert_eq!(
+            parsed.choices[0].message.content.as_deref(),
+            Some("Here are some papers.")
+        );
+    }
+
+    #[test]
+    fn sanitize_compat_response_keeps_openai_url_citations() {
+        let mut json = sample_compat_response(serde_json::json!([{
+            "type": "url_citation",
+            "url_citation": {
+                "url": "https://arxiv.org/abs/1234.5678",
+                "title": "Agentic AI",
+                "start_index": 0,
+                "end_index": 12
+            }
+        }]));
+
+        OpenAICompatProvider::sanitize_compat_response(&mut json);
+        let parsed = serde_json::from_value::<CreateChatCompletionResponse>(json)
+            .expect("valid url_citation annotations should deserialize");
+        assert_eq!(
+            parsed.choices[0]
+                .message
+                .annotations
+                .as_ref()
+                .map(|a| a.len()),
+            Some(1)
+        );
     }
 }

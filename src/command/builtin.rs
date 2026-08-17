@@ -109,6 +109,9 @@ impl CommandHandler for CmdStop {
         }
         let sub_cancelled = agent_loop.subagents.cancel_by_session(&session_key).await;
         let total = cancelled + sub_cancelled;
+        // Abort drops `dispatch` before its post-`process_message` TurnEnd, so
+        // the registry/UI would stay "running" unless we publish it here.
+        agent_loop.publish_turn_end(&ctx.msg, None);
         let content = if total > 0 {
             format!("Stopped {total} task(s).")
         } else {

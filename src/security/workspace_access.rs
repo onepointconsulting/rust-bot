@@ -13,10 +13,7 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 
-/// Session-metadata key under which a persisted [`WorkspaceScope`] override
-/// lives. Owned here per rust-bot's per-concept metadata-key convention
-/// (compare `SESSION_MODEL_PRESET_METADATA_KEY` in `agent::model_runtime`).
-pub const WORKSPACE_SCOPE_METADATA_KEY: &str = "workspace_scope";
+pub use crate::session::keys::WORKSPACE_SCOPE_METADATA_KEY;
 
 /// Env vars used to detect OS-level sandbox enforcement of workspace
 /// restriction. rust-bot house prefix, not nanobot's `NANOBOT_*` names.

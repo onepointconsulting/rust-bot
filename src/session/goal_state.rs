@@ -12,7 +12,7 @@ use serde_json::{json, Map, Value};
 
 use crate::session::manager::{Session, SessionManager};
 
-pub const GOAL_STATE_KEY: &str = "goal_state";
+pub use crate::session::keys::GOAL_STATE_KEY;
 pub const MAX_GOAL_OBJECTIVE_CHARS: usize = 4000;
 const MAX_GOAL_OBJECTIVE_WS_CHARS: usize = 600; // nanobot's `_MAX_OBJECTIVE_WS`
 

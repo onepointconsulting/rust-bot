@@ -906,6 +906,12 @@ impl BaseChannel for WhatsAppChannel {
     }
 
     async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
+        if matches!(
+            msg.event,
+            Some(crate::bus::outbound_events::OutboundEvent::TurnEnd(_))
+        ) {
+            return Ok(());
+        }
         if !self.base.running.load(Ordering::Relaxed) {
             return Err("WhatsApp channel is not running".to_string());
         }

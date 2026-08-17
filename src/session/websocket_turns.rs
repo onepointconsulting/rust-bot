@@ -3,10 +3,12 @@
 //! `_WEBSOCKET_ACTIVE_TURNS` map and its accessors), scoped to just that —
 //! title generation, `WebuiTurnRoutePolicy`, and `WebuiTurnCoordinator` are
 //! not part of this port (see the plan for why: they each depend on pieces
-//! that don't exist in rust-bot yet — an `LLMRuntime` concept, history
-//! visibility filtering, a `FallbackModelObserver`, and above all a
-//! `RuntimeEventBus` to drive registration automatically from real turn
-//! lifecycle events, none of which exist in this codebase today).
+//! that don't exist in rust-bot yet — history visibility filtering, a
+//! `FallbackModelObserver`, and above all a `RuntimeEventBus` to drive
+//! registration automatically from real turn lifecycle events, none of
+//! which exist in this codebase today). The `LLMRuntime` concept nanobot's
+//! title generation depends on does have a counterpart here — see
+//! `ModelRuntime`/`ModelRuntimeResolver` in `agent/model_runtime.rs`.
 //!
 //! Nothing calls [`WebsocketTurnRegistry`]'s methods yet — wiring it into
 //! `WsShared`/`EnvelopeDispatchContext` is a separate follow-up, same as
@@ -189,6 +191,13 @@ impl WebsocketTurnRegistry {
         }
         true
     }
+
+    /// Drop every in-flight owner for `chat_id`. Used when a `TurnEnd` arrives
+    /// without `_websocket_turn_owner` (e.g. `/stop`, whose inbound metadata
+    /// is the stop command, not the original turn).
+    pub fn clear_chat(&mut self, chat_id: &str) -> bool {
+        self.turns.remove(chat_id).is_some()
+    }
 }
 
 #[cfg(test)]
@@ -321,5 +330,18 @@ mod tests {
         assert!(!registry.clear_turn_if_current("chat-1", Some("owner-missing"), false));
         assert!(!registry.clear_turn_if_current("unknown-chat", Some("owner-a"), false));
         assert!(!registry.clear_turn_if_current("chat-1", None, false));
+    }
+
+    #[test]
+    fn clear_chat_removes_all_owners_for_that_chat_only() {
+        let mut registry = WebsocketTurnRegistry::default();
+        registry.start_turn("chat-1", "owner-a", None);
+        registry.start_turn("chat-1", "owner-b", None);
+        registry.start_turn("chat-2", "owner-c", None);
+
+        assert!(registry.clear_chat("chat-1"));
+        assert!(registry.websocket_turn_wall_started_at("chat-1").is_none());
+        assert!(registry.websocket_turn_wall_started_at("chat-2").is_some());
+        assert!(!registry.clear_chat("chat-1"));
     }
 }

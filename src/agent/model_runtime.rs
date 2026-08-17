@@ -16,9 +16,7 @@ use crate::providers::base::LLMProviderDyn;
 use crate::providers::factory::{create_provider_for, resolve_concrete_provider_name};
 use crate::session::manager::{Session, SessionManager};
 
-/// Session metadata key holding a session-scoped preset override, written by
-/// `/model <name>` and read back by [`ModelRuntimeResolver::runtime_for_session`].
-pub const SESSION_MODEL_PRESET_METADATA_KEY: &str = "model_preset";
+pub use crate::session::keys::SESSION_MODEL_PRESET_METADATA_KEY;
 
 /// One resolved, immutable model/provider/generation snapshot for a turn.
 ///

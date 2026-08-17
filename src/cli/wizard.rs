@@ -38,6 +38,7 @@ const EXIT_WITHOUT_SAVING: &'static str = "Exit Without Saving";
 
 const PROVIDER_OPENROUTER: &'static str = "openrouter";
 const PROVIDER_EDENAI: &'static str = "edenai";
+const PROVIDER_REQUESTY: &'static str = "requesty";
 const PROVIDER_ANTHROPIC: &'static str = "anthropic";
 
 const WIZARD_OPTIONS: [&str; 11] = [
@@ -147,7 +148,7 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
 
 //Configure LLM providers.
 pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
-    let provider_names = vec![PROVIDER_OPENROUTER, PROVIDER_ANTHROPIC, PROVIDER_EDENAI];
+    let provider_names = vec![PROVIDER_OPENROUTER, PROVIDER_ANTHROPIC, PROVIDER_EDENAI, PROVIDER_REQUESTY];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
         provider_names.to_vec().clone(),
@@ -176,6 +177,9 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
         PROVIDER_EDENAI => {
             config.providers.custom.api_key = api_key;
         }
+        PROVIDER_REQUESTY => {
+            config.providers.custom.api_key = api_key;
+        }
         _ => {
             eprint_error("Invalid provider");
             return Err(CliError::Inquire(
@@ -194,8 +198,9 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
             "e.g. https://api.edenai.run/v3"
         } else if provider_name == PROVIDER_ANTHROPIC {
             "e.g. https://api.anthropic.com/v1"
-        }
-        else {
+        } else if provider_name == PROVIDER_REQUESTY {
+            "e.g. https://router.requesty.ai/v1"
+        } else {
             ""
         })
         .prompt()?;
@@ -207,6 +212,9 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
             config.providers.anthropic.api_base = Some(endpoint);
         }
         PROVIDER_EDENAI => {
+            config.providers.custom.api_base = Some(endpoint);
+        }
+        PROVIDER_REQUESTY => {
             config.providers.custom.api_base = Some(endpoint);
         }
         _ => {}

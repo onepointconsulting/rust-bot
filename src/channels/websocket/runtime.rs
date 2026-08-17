@@ -28,7 +28,9 @@ use crate::channels::websocket::types::{
     ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
     WsOutboundEvent, WsShared, WsUpgradeQuery,
 };
-use crate::channels::websocket::webui::metadata::WEBSOCKET_TURN_OWNER_METADATA_KEY;
+use crate::channels::websocket::webui::metadata::{
+    WEBUI_TURN_METADATA_KEY, WEBSOCKET_TURN_OWNER_METADATA_KEY,
+};
 use crate::channels::websocket::webui::transcript::client_turn_metadata;
 use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
@@ -441,6 +443,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::Message => {
             handle_envelope_message(envelope_dispatch_context).await;
         }
+        EnvelopeType::ListChats => {
+            handle_envelope_list_chats(envelope_dispatch_context).await;
+        }
         EnvelopeType::Unrecognized(t) => {
             send_event(
                 envelope_dispatch_context.shared,
@@ -514,6 +519,65 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
     )
     .await;
     hydrate_after_subscribe(&new_id, shared).await;
+}
+
+/// Filter [`SessionManager::list_sessions`]'s output down to this channel's
+/// own `websocket:`-keyed chats, stripping that prefix down to a bare
+/// `chat_id` the client can pass straight back as `fork_chat`'s
+/// `source_chat_id` / `attach`'s `chat_id`. Kept as a plain, signal-free
+/// function (no lock, no I/O) so the filtering/reshaping logic is
+/// unit-testable without a real `SessionManager`.
+///
+/// `list_sessions()` returns every persisted session regardless of owning
+/// channel (`cli:*`, `cron:*`, ...) — those are deliberately excluded here:
+/// they aren't chats this WebSocket UI could sensibly attach to or fork.
+fn list_websocket_chats(sessions: Vec<serde_json::Value>) -> Vec<serde_json::Value> {
+    const PREFIX: &str = "websocket:";
+    sessions
+        .into_iter()
+        .filter_map(|mut entry| {
+            let key = entry.get("key")?.as_str()?.to_string();
+            let chat_id = key.strip_prefix(PREFIX)?;
+            if !is_valid_chat_id(chat_id) {
+                return None;
+            }
+            let chat_id = chat_id.to_string();
+            let map = entry.as_object_mut()?;
+            map.remove("key");
+            map.remove("path"); // an internal filesystem detail, not for the wire
+            map.insert("chat_id".to_string(), serde_json::Value::String(chat_id));
+            Some(entry)
+        })
+        .collect()
+}
+
+/// Handle a `list_chats` envelope: reply with every `websocket:`-keyed
+/// session as a `chats` event, most-recently-updated first (the order
+/// `list_sessions()` already sorts in). New protocol surface with no
+/// nanobot precedent — see [`EnvelopeType::ListChats`]'s doc comment.
+async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let shared = envelope_dispatch_context.shared;
+    let connection_id = envelope_dispatch_context.connection_id;
+
+    let sessions = {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before
+        // `send_event`'s `.await` below — same discipline as every other
+        // `session_manager` use in this file.
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.list_sessions()
+    };
+    let chats = list_websocket_chats(sessions);
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ChatsList,
+        None,
+        serde_json::json!({"chats": chats}),
+    )
+    .await;
 }
 
 async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
@@ -1300,12 +1364,37 @@ impl BaseChannel for WebSocketChannel {
         // `_stream_end`-flagged messages to `send_delta` instead of `send`,
         // and reasoning-kind `Progress` events to `send_reasoning_delta`/
         // `send_reasoning_end` — so `send` only ever sees a plain `Progress`
-        // event or no typed event at all. Other `OutboundEvent` variants
-        // (goal state/status already go through the separate
-        // `send_goal_state`/`send_goal_status` free functions; the rest are
-        // unused by any current publisher — see the module-level plan notes)
-        // fail safe with a logged skip rather than reusing the wrong shape.
+        // event, a `TurnEnd`, or no typed event at all. Other `OutboundEvent`
+        // variants fail safe with a logged skip rather than reusing the wrong
+        // shape.
         let payload = match &msg.event {
+            Some(OutboundEvent::TurnEnd(_)) => {
+                let owner = msg
+                    .metadata
+                    .get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
+                    .and_then(|v| v.as_str());
+                {
+                    let mut turn_registry = self
+                        .gateway_services
+                        .turn_registry
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    if let Some(owner) = owner.filter(|o| !o.is_empty()) {
+                        turn_registry.clear_turn_if_current(&msg.chat_id, Some(owner), false);
+                    } else {
+                        turn_registry.clear_chat(&msg.chat_id);
+                    }
+                }
+                let turn_id = msg
+                    .metadata
+                    .get(WEBUI_TURN_METADATA_KEY)
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                let shared = self.shared();
+                send_goal_status(&msg.chat_id, "idle", None, turn_id, &shared).await;
+                return Ok(());
+            }
             Some(OutboundEvent::Progress(progress_event)) => {
                 if let Some(edits) = progress_event
                     .file_edit_events
@@ -2105,6 +2194,100 @@ mod tests {
         );
     }
 
+    // --- list_websocket_chats / handle_envelope_list_chats ---
+
+    #[test]
+    fn list_websocket_chats_filters_to_websocket_prefixed_keys_and_strips_prefix() {
+        let sessions = vec![
+            serde_json::json!({
+                "key": "websocket:chat-1", "created_at": "t1", "updated_at": "t2", "path": "/some/path", "title": "Fix the login bug",
+            }),
+            serde_json::json!({
+                "key": "cli:direct", "created_at": "t1", "updated_at": "t2", "path": "/other/path",
+            }),
+            serde_json::json!({
+                "key": "cron:job-1", "created_at": "t1", "updated_at": "t2", "path": "/cron/path",
+            }),
+        ];
+
+        let chats = list_websocket_chats(sessions);
+
+        assert_eq!(chats.len(), 1, "only the websocket:-prefixed session should survive");
+        assert_eq!(chats[0]["chat_id"], "chat-1");
+        assert!(
+            chats[0].get("key").is_none(),
+            "internal session key must not leak onto the wire"
+        );
+        assert!(
+            chats[0].get("path").is_none(),
+            "internal filesystem path must not leak onto the wire"
+        );
+        assert_eq!(chats[0]["created_at"], "t1");
+        assert_eq!(chats[0]["updated_at"], "t2");
+        assert_eq!(chats[0]["title"], "Fix the login bug");
+    }
+
+    #[test]
+    fn list_websocket_chats_skips_invalid_chat_ids_after_stripping_prefix() {
+        let sessions = vec![
+            serde_json::json!({"key": "websocket:", "created_at": "", "updated_at": "", "path": ""}),
+            serde_json::json!({"key": "websocket:has space", "created_at": "", "updated_at": "", "path": ""}),
+        ];
+
+        let chats = list_websocket_chats(sessions);
+
+        assert!(chats.is_empty(), "empty/invalid chat ids must not reach the wire: {chats:?}");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_list_chats_returns_only_websocket_sessions() {
+        let shared = test_shared("browser");
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(crate::session::manager::Session::new("websocket:chat-a".to_string()))
+                .unwrap();
+            session_manager
+                .save(crate::session::manager::Session::new("websocket:chat-b".to_string()))
+                .unwrap();
+            session_manager
+                .save(crate::session::manager::Session::new("cli:direct".to_string()))
+                .unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_chats"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+
+        dispatch_envelope(ctx).await;
+
+        let frame = rx.try_recv().expect("expected a chats frame");
+        let body: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "chats");
+        let chats = body["chats"].as_array().expect("chats should be an array");
+        assert_eq!(chats.len(), 2, "cli:direct must be excluded: {chats:?}");
+        let chat_ids: std::collections::HashSet<&str> =
+            chats.iter().filter_map(|c| c["chat_id"].as_str()).collect();
+        assert!(chat_ids.contains("chat-a"));
+        assert!(chat_ids.contains("chat-b"));
+    }
+
     #[tokio::test]
     async fn maybe_push_active_goal_state_noop_when_no_session_file_exists() {
         let shared = test_shared("browser");
@@ -2381,12 +2564,85 @@ mod tests {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         channel.connections.lock().await.register("conn-1", "chat-1", tx);
-        let event = Some(OutboundEvent::TurnEnd(Default::default()));
+        let event = Some(OutboundEvent::RetryWait(Default::default()));
 
         let result = BaseChannel::send(&channel, outbound("chat-1", "", event)).await;
 
         assert_eq!(result, Ok(()));
         assert!(rx.try_recv().is_err(), "no frame should have been sent");
+    }
+
+    #[tokio::test]
+    async fn send_turn_end_clears_registry_and_announces_idle() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap()
+            .start_turn("chat-1", "owner-1", Some("turn-1"));
+
+        let mut msg = outbound(
+            "chat-1",
+            "",
+            Some(OutboundEvent::TurnEnd(Default::default())),
+        );
+        msg.metadata.insert(
+            WEBSOCKET_TURN_OWNER_METADATA_KEY.to_string(),
+            serde_json::json!("owner-1"),
+        );
+        msg.metadata.insert(
+            WEBUI_TURN_METADATA_KEY.to_string(),
+            serde_json::json!("turn-1"),
+        );
+
+        let result = BaseChannel::send(&channel, msg).await;
+        assert_eq!(result, Ok(()));
+
+        let frame = rx.try_recv().expect("expected a goal_status idle frame");
+        let body: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "goal_status");
+        assert_eq!(body["status"], "idle");
+        assert_eq!(body["turn_id"], "turn-1");
+        assert!(body.get("started_at").is_none());
+        assert!(
+            channel
+                .gateway_services
+                .turn_registry
+                .lock()
+                .unwrap()
+                .websocket_turn_wall_started_at("chat-1")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_turn_end_without_owner_clears_the_chat() {
+        let channel = test_channel();
+        channel
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap()
+            .start_turn("chat-1", "owner-1", None);
+
+        let result = BaseChannel::send(
+            &channel,
+            outbound("chat-1", "", Some(OutboundEvent::TurnEnd(Default::default()))),
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+        assert!(
+            channel
+                .gateway_services
+                .turn_registry
+                .lock()
+                .unwrap()
+                .websocket_turn_wall_started_at("chat-1")
+                .is_none()
+        );
     }
 
     #[tokio::test]

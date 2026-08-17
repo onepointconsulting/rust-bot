@@ -926,9 +926,13 @@ impl BaseChannel for EmailChannel {
 
         // Skip progress messages to prevent sending an empty email after each
         // tool call. Mirrors nanobot's `isinstance(msg.event, ProgressEvent)`
-        // guard (`channels/email/runtime.py:223-226`).
-        if matches!(msg.event, Some(OutboundEvent::Progress(_))) {
-            log::debug!("Skip progress message to {}", msg.chat_id);
+        // guard (`channels/email/runtime.py:223-226`). `TurnEnd` is the same
+        // kind of control event — no mailbox content.
+        if matches!(
+            msg.event,
+            Some(OutboundEvent::Progress(_)) | Some(OutboundEvent::TurnEnd(_))
+        ) {
+            log::debug!("Skip control event to {}", msg.chat_id);
             return Ok(());
         }
 

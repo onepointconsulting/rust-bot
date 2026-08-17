@@ -129,6 +129,7 @@ pub struct SessionSummary {
     pub created_at: String,
     pub updated_at: String,
     pub path: String,
+    pub title: String,
 }
 
 #[derive(Debug, Serialize, ToSchema)]
@@ -166,6 +167,11 @@ impl SessionSummary {
                 .to_string(),
             path: entry
                 .get("path")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .to_string(),
+            title: entry
+                .get("title")
                 .and_then(|v| v.as_str())
                 .unwrap_or("")
                 .to_string(),
@@ -263,9 +269,24 @@ mod tests {
         assert_eq!(response.sessions[0].created_at, "2026-01-01T00:00:00Z");
         assert_eq!(response.sessions[0].updated_at, "2026-06-01T00:00:00Z");
         assert_eq!(response.sessions[0].path, "/tmp/cli:direct.jsonl");
+        assert_eq!(response.sessions[0].title, "");
         assert_eq!(response.sessions[1].key, "other");
         assert_eq!(response.sessions[1].created_at, "2026-01-02T00:00:00Z");
         assert_eq!(response.sessions[1].updated_at, "2026-06-02T00:00:00Z");
+        assert_eq!(response.sessions[1].title, "");
+    }
+
+    #[test]
+    fn sessions_list_response_forwards_title() {
+        let entries = vec![json!({
+            "key": "websocket:chat-1",
+            "created_at": "2026-01-01T00:00:00Z",
+            "updated_at": "2026-06-01T00:00:00Z",
+            "path": "/tmp/chat.jsonl",
+            "title": "Fix the login bug",
+        })];
+        let response = SessionsListResponse::from_session_entries(&entries);
+        assert_eq!(response.sessions[0].title, "Fix the login bug");
     }
 
     // ── multimodal content ─────────────────────────────────────────────────

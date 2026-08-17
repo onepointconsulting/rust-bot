@@ -414,6 +414,9 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
 
     system_listener.abort();
     outbound_listener.abort();
+    // Drain title generation / consolidation before exit. One-shot `-m`
+    // otherwise kills those background tasks before they persist.
+    agent_loop.close_mcp().await;
     result
 }
 

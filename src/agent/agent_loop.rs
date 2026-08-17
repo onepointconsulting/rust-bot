@@ -5,7 +5,7 @@ use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
 use chrono::Utc;
@@ -38,10 +38,11 @@ use crate::agent::workspace_context::{
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::bus::outbound_events::{
     OutboundEvent, ProgressEvent, ProgressKind, StreamDeltaEvent, StreamEndEvent,
-    StreamedResponseEvent,
+    StreamedResponseEvent, TurnEndEvent, outbound_message_for_event,
 };
 use crate::bus::queue::MessageBus;
 use crate::command::CommandContext;
+use crate::command::types::ChatCommand;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
     ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
@@ -54,6 +55,7 @@ use crate::security::workspace_access::{
 };
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::goal_state;
+use crate::session::keys::{COMMAND_KEY, RUNTIME_CHECKPOINT_KEY};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
@@ -352,8 +354,6 @@ pub struct AgentLoop {
 }
 
 impl AgentLoop {
-    const RUNTIME_CHECKPOINT_KEY: &str = "runtime_checkpoint";
-
     pub fn new(
         bus: Arc<MessageBus>,
         provider: Arc<dyn LLMProviderDyn>,
@@ -851,6 +851,33 @@ impl AgentLoop {
         Arc::clone(&self.bus)
     }
 
+    /// Publish a channel-agnostic [`OutboundEvent::TurnEnd`] for `msg`'s chat.
+    ///
+    /// A second bus message, never mixed into the final assistant payload:
+    /// that payload may carry `_streamed` and would be dropped for WebSocket.
+    /// Inbound metadata is copied through so `_websocket_turn_owner` /
+    /// `webui_turn_id` survive to the channel that started the registry turn.
+    pub(crate) fn publish_turn_end(&self, msg: &InboundMessage, started_at: Option<Instant>) {
+        let latency_ms = started_at.map(|t| t.elapsed().as_millis() as i64);
+        let outbound = outbound_message_for_event(
+            &msg.channel,
+            &msg.chat_id,
+            OutboundEvent::TurnEnd(TurnEndEvent {
+                latency_ms,
+                goal_state: None,
+            }),
+            None,
+            Some(msg.metadata.clone()),
+        );
+        if let Err(e) = self.bus.publish_outbound(outbound) {
+            log::error!(
+                "Failed to publish TurnEnd for {}:{}: {e}",
+                msg.channel,
+                msg.chat_id
+            );
+        }
+    }
+
     /// Update context for all tools that need routing info.
     pub fn set_tool_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
         let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
@@ -980,7 +1007,7 @@ impl AgentLoop {
         let session = manager.get_or_create_session(session_key);
         session
             .metadata
-            .insert(AgentLoop::RUNTIME_CHECKPOINT_KEY.to_string(), payload);
+            .insert(RUNTIME_CHECKPOINT_KEY.to_string(), payload);
         let snapshot = session.clone();
         if let Err(e) = manager.save(snapshot) {
             log::error!("Failed to save runtime checkpoint: {e}");
@@ -1008,6 +1035,7 @@ impl AgentLoop {
                 // queued behind the very work they're meant to interrupt.
                 let ctx = CommandContext::with_options(msg.clone(), None, msg.session_key(), raw, "", Some(Arc::clone(self)));
                 if let Some(result) = self.commands.dispatch_priority(&ctx).await {
+                    self.persist_command_turn(&msg.session_key(), &msg.content, raw, &result);
                     if let Err(error) = self.bus.publish_outbound(result) {
                         log::error!("Failed to publish outbound message: {error}");
                     }
@@ -1171,7 +1199,10 @@ impl AgentLoop {
         // `try` block. There's no explicit `except asyncio.CancelledError` arm:
         // Tokio cancellation drops this future instead of raising, so it already
         // propagates cleanly. `catch_unwind` only intercepts panics, which is the
-        // equivalent of Python's `except Exception`.
+        // equivalent of Python's `except Exception`. `/stop` abort is that
+        // cancellation path — `CmdStop` publishes `TurnEnd` itself because this
+        // future never reaches the match below.
+        let started_at = Instant::now();
         let processed = AssertUnwindSafe(Arc::clone(&self).process_message(
             msg.clone(),
             &session_key,
@@ -1219,9 +1250,38 @@ impl AgentLoop {
                 });
             }
         }
+        // After content (or the lack of it): a separate TurnEnd so streamed
+        // replies with `_streamed` still notify channels the turn is done.
+        // Title generation is scheduled inside `process_message` so CLI/API
+        // `process_direct` (which never goes through `dispatch`) gets it too.
+        self.publish_turn_end(&msg, Some(started_at));
     }
 
-    
+    /// Fire-and-forget title generation after a finished turn.
+    ///
+    /// Skips when the session already has a title or has no user text. The LLM
+    /// call runs in [`Self::schedule_background`] so it does not block the
+    /// turn or hold the session-manager lock.
+    async fn maybe_schedule_title_generation(&self, session_key: &str) {
+        let (provider, model) = {
+            let manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if !manager.session_needs_title(session_key) {
+                return;
+            }
+            let session = manager.get_session_internal(session_key);
+            let runtime = self.runtime_resolver.runtime_for_session(session.as_ref());
+            (runtime.provider, runtime.model)
+        };
+        let sessions = Arc::clone(&self.session_manager);
+        let key = session_key.to_string();
+        self.schedule_background(async move {
+            SessionManager::generate_title(sessions.as_ref(), &key, provider, &model).await;
+        })
+        .await;
+    }
 
     /// Handle system-channel messages (checkpoint restore + consolidation).
     ///
@@ -1345,6 +1405,39 @@ impl AgentLoop {
             metadata: HashMap::new(),
             event: None,
         })
+    }
+
+    /// Persist a slash-command turn so it is in session history but filtered
+    /// out of LLM context by [`Session::get_history`]. `/new` is skipped because
+    /// it clears the session.
+    fn persist_command_turn(
+        &self,
+        session_key: &str,
+        user_content: &str,
+        raw_command: &str,
+        reply: &OutboundMessage,
+    ) {
+        if raw_command
+            .trim()
+            .eq_ignore_ascii_case(&ChatCommand::New.to_string())
+        {
+            return;
+        }
+        let mut extras = serde_json::Map::new();
+        extras.insert(COMMAND_KEY.to_string(), Value::Bool(true));
+        let mut session_manager = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let snapshot = {
+            let session = session_manager.get_or_create_session(session_key);
+            session.add_message("user", user_content, extras.clone());
+            session.add_message("assistant", reply.content.clone(), extras);
+            session.clone()
+        };
+        if let Err(e) = session_manager.save(snapshot) {
+            log::error!("Failed to save command turn for session {session_key}: {e}");
+        }
     }
 
     /// Save new-turn messages into session, truncating large tool results.
@@ -1489,6 +1582,10 @@ impl AgentLoop {
     /// `agent::workspace_context`), then runs [`Self::process_message_inner`].
     /// Mirrors how `cli::commands::run_gateway` wraps each cron job body in
     /// `with_cron_context_stack`.
+    ///
+    /// Title generation is scheduled here (not in [`Self::dispatch`]) so every
+    /// caller — gateway bus, CLI/API `process_direct`, cron, heartbeat — gets
+    /// a title after the first user turn.
     async fn process_message(
         self: Arc<Self>,
         msg: InboundMessage,
@@ -1497,10 +1594,18 @@ impl AgentLoop {
         on_stream: Option<StreamCallback>,
         on_stream_end: Option<StreamEndCallback>,
     ) -> Option<OutboundMessage> {
-        with_workspace_scope_stack(move || {
+        let title_key = if session_key.is_empty() {
+            msg.session_key()
+        } else {
+            session_key.to_string()
+        };
+        let this = Arc::clone(&self);
+        let result = with_workspace_scope_stack(move || {
             self.process_message_inner(msg, session_key, on_progress, on_stream, on_stream_end)
         })
-        .await
+        .await;
+        this.maybe_schedule_title_generation(&title_key).await;
+        result
     }
 
     async fn process_message_inner(
@@ -1564,10 +1669,12 @@ impl AgentLoop {
         // bus (API, CLI `process_direct`) still need them to be recognized here.
         if self.commands.is_priority(raw) {
             if let Some(result) = self.commands.dispatch_priority(&ctx).await {
+                self.persist_command_turn(&key, &msg.content, raw, &result);
                 return Some(result);
             }
         }
         if let Some(result) = self.commands.dispatch(&mut ctx).await {
+            self.persist_command_turn(&key, &msg.content, raw, &result);
             return Some(result);
         }
         self.consolidator.maybe_consolidate_by_tokens(&key).await;
@@ -1767,7 +1874,7 @@ impl AgentLoop {
     fn restore_runtime_checkpoint(&self, session: &mut Session) -> bool {
         let Some(checkpoint) = session
             .metadata
-            .get(AgentLoop::RUNTIME_CHECKPOINT_KEY)
+            .get(RUNTIME_CHECKPOINT_KEY)
             .and_then(Value::as_object)
         else {
             return false;
@@ -1853,7 +1960,7 @@ impl AgentLoop {
     }
 
     fn clear_runtime_checkpoint(&self, session: &mut Session) {
-        session.metadata.remove(AgentLoop::RUNTIME_CHECKPOINT_KEY);
+        session.metadata.remove(RUNTIME_CHECKPOINT_KEY);
     }
 
     /// Schedule a future as a tracked background task (drained by [`Self::close_mcp`]).
@@ -2236,6 +2343,47 @@ mod tests {
         }
 
         assert!(session.updated_at >= before);
+    }
+
+    fn command_reply(content: &str) -> OutboundMessage {
+        OutboundMessage {
+            channel: "cli".into(),
+            chat_id: "direct".into(),
+            content: content.to_string(),
+            reply_to: None,
+            media: vec![],
+            metadata: HashMap::new(),
+            event: None,
+        }
+    }
+
+    #[test]
+    fn persist_command_turn_writes_marked_messages_omitted_from_get_history() {
+        let loop_ = make_save_turn_loop(1000);
+        let key = "test:persist_command_turn";
+        loop_.persist_command_turn(key, "/help", "/help", &command_reply("Available commands..."));
+
+        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session(key);
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(session.messages[0]["role"], json!("user"));
+        assert_eq!(session.messages[0]["content"], json!("/help"));
+        assert_eq!(session.messages[0][COMMAND_KEY], json!(true));
+        assert_eq!(session.messages[1]["role"], json!("assistant"));
+        assert_eq!(session.messages[1]["content"], json!("Available commands..."));
+        assert_eq!(session.messages[1][COMMAND_KEY], json!(true));
+        assert!(session.get_history(None).is_empty());
+    }
+
+    #[test]
+    fn persist_command_turn_skips_new() {
+        let loop_ = make_save_turn_loop(1000);
+        let key = "test:persist_command_turn_new";
+        loop_.persist_command_turn(key, "/NEW", "/NEW", &command_reply("New session started."));
+
+        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session(key);
+        assert!(session.messages.is_empty());
     }
 
     // ── workspace scope ──────────────────────────────────────────────────────
