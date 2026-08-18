@@ -16,9 +16,8 @@ use crate::{
     config::paths::get_legacy_sessions_dir,
     providers::base::LLMProviderDyn,
     session::{
-        SESSION_TITLE_METADATA_KEY,
-        history_visibility::is_hidden_history_message,
-        keys::{COMMAND_KEY},
+        SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message,
+        keys::COMMAND_KEY,
     },
     utils::helpers::{
         ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
@@ -891,6 +890,7 @@ pub fn format_sessions_list(sessions: &[Value], current_key: Option<&str>) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::session::HIDDEN_HISTORY_KEY;
 
     fn fixture_message(role: &str, content: &str) -> Value {
         json!({

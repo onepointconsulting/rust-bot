@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, ToolEvent};
+use chat_ui::models::{ChatEntry, Role, ToolEvent};
 
 /// Look up the entry tracking `turn_id` and hand back a mutable reference to
 /// it, if both the turn is known and its entry still exists.
@@ -59,8 +59,11 @@ pub fn stream_end_continues_turn(resuming: Option<bool>, merge_next: Option<bool
 /// Re-mark the entry as streaming after a continuing [`apply_stream_end`].
 ///
 /// `apply_stream_end` always clears `streaming`; call this when
-/// [`stream_end_continues_turn`] is true so the cursor stays on between
-/// tool-call pauses and the next delta segment.
+/// `merge_next` is set so the cursor stays on for more deltas on the *same*
+/// stream segment. A `resuming` stream_end (next LLM round after tools)
+/// should call [`begin_next_stream_segment`] instead — otherwise later
+/// deltas concatenate onto the previous thought with no separator, which is
+/// why live streaming disagreed with attach's one-bubble-per-round history.
 pub fn reopen_streaming(
     entries: &mut Vec<ChatEntry>,
     turn_index: &HashMap<String, u64>,
@@ -69,6 +72,29 @@ pub fn reopen_streaming(
     if let Some(entry) = find_entry_for_turn(entries, turn_index, turn_id) {
         entry.streaming = true;
     }
+}
+
+/// Open a new streaming assistant bubble for the next LLM round of `turn_id`
+/// and retarget `turn_index` so later deltas land there.
+///
+/// Matches how the session file stores one assistant message per round —
+/// the view `websocket_chat_history` sends on `attached`.
+pub fn begin_next_stream_segment(
+    entries: &mut Vec<ChatEntry>,
+    turn_index: &mut HashMap<String, u64>,
+    turn_id: &str,
+    new_id: u64,
+) {
+    entries.push(ChatEntry {
+        id: new_id,
+        role: Role::Assistant,
+        content: String::new(),
+        attachments: Vec::new(),
+        streaming: true,
+        tool_events: None,
+        reasoning: None,
+    });
+    turn_index.insert(turn_id.to_string(), new_id);
 }
 
 /// Apply a `stream_end` event: mark the entry no longer streaming, and, when
@@ -209,9 +235,11 @@ pub fn synthesize_tool_hint_event(text: &str) -> ToolEvent {
 /// to "done" for — so it renders as a static, non-pulsing chip
 /// (`classify_tool_status("note")` falls into the `Done` bucket, since
 /// `"note"` contains none of `Running`'s `"run"`/`"progress"` substrings).
+/// The `↳` prefix follows the CLI's rendering for the same text, and is
+/// chosen over a progress glyph so the marker doesn't contradict that.
 pub fn synthesize_progress_note_event(text: &str) -> ToolEvent {
     ToolEvent {
-        name: format!("⏳ {text}"),
+        name: format!("↳ {text}"),
         status: "note".to_string(),
         detail: None,
     }
@@ -499,24 +527,38 @@ mod tests {
     }
 
     #[test]
-    fn later_deltas_append_after_resuming_stream_end() {
+    fn resuming_stream_end_opens_a_new_bubble_for_the_next_round() {
         let mut entries = vec![assistant_entry(0)];
-        let index = index_with("turn-1", 0);
+        let mut index = index_with("turn-1", 0);
 
-        apply_delta(&mut entries, &index, "turn-1", "I'll pull the paper. ");
+        apply_delta(&mut entries, &index, "turn-1", "I'll pull the paper.");
         apply_stream_end(&mut entries, &index, "turn-1", None);
-        assert!(stream_end_continues_turn(Some(true), Some(false)));
-        reopen_streaming(&mut entries, &index, "turn-1");
-        assert!(entries[0].streaming);
+        begin_next_stream_segment(&mut entries, &mut index, "turn-1", 1);
 
         apply_delta(&mut entries, &index, "turn-1", "Here is the summary.");
         apply_stream_end(&mut entries, &index, "turn-1", None);
 
-        assert_eq!(
-            entries[0].content,
-            "I'll pull the paper. Here is the summary."
-        );
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].content, "I'll pull the paper.");
         assert!(!entries[0].streaming);
+        assert_eq!(entries[1].content, "Here is the summary.");
+        assert!(!entries[1].streaming);
+        assert_eq!(index.get("turn-1"), Some(&1));
+    }
+
+    #[test]
+    fn merge_next_keeps_deltas_on_the_same_bubble() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+
+        apply_delta(&mut entries, &index, "turn-1", "partial");
+        apply_stream_end(&mut entries, &index, "turn-1", None);
+        reopen_streaming(&mut entries, &index, "turn-1");
+        apply_delta(&mut entries, &index, "turn-1", " rest");
+
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].content, "partial rest");
+        assert!(entries[0].streaming);
     }
 
     #[test]
@@ -705,7 +747,7 @@ mod tests {
     fn synthesize_progress_note_event_wraps_text_as_a_static_note() {
         let event = synthesize_progress_note_event("I'll check local docs first.");
 
-        assert_eq!(event.name, "I'll check local docs first.");
+        assert_eq!(event.name, "↳ I'll check local docs first.");
         assert_eq!(event.status, "note");
         assert_eq!(event.detail, None);
         assert_eq!(

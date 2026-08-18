@@ -85,9 +85,17 @@ fn strip_data_url_attachments(entries: &[ChatEntry]) -> Vec<ChatEntry> {
         .collect()
 }
 
+/// Snapshot `entries` to SessionStorage for the next page load.
+///
+/// Trimmed as well as sanitized: an `attached` history snapshot can be up to
+/// the gateway's `MAX_HISTORY_MESSAGES` (500) rows, which is fine to hold in
+/// memory but would push a long chat past the ~5 MB storage quota and fail
+/// the whole write. The push path has already trimmed by the time it calls
+/// here, so this is a no-op there.
 fn persist_entries(entries: &[ChatEntry]) {
     let sanitized = strip_data_url_attachments(entries);
-    let _ = SessionStorage::set(ENTRIES_STORAGE_KEY, &sanitized);
+    let trimmed = trim_to_max_turns(sanitized, MAX_STORED_TURNS);
+    let _ = SessionStorage::set(ENTRIES_STORAGE_KEY, &trimmed);
 }
 
 fn clear_stored_entries() {
@@ -281,6 +289,18 @@ struct WsContext {
     /// each turn finishes, since title generation runs asynchronously with
     /// no push notification when it completes.
     sessions: RwSignal<Vec<SessionListItem>>,
+    /// A sidebar session the user picked while the socket was down, to be
+    /// attached as soon as `ready` arrives on the reopened connection. Takes
+    /// priority over resuming [`Self::chat_id`], since it is the more recent
+    /// intent. Cleared once the `attach` envelope is sent.
+    pending_attach: RwSignal<Option<String>>,
+    /// When true, the next `delta` / `reasoning_delta` for the active turn
+    /// opens a new assistant bubble instead of appending to the one just
+    /// closed by a `resuming` `stream_end`. Delayed until that first token
+    /// so a following `tool_hint` still attaches to the thought that
+    /// requested the tools — matching session history, which stores one
+    /// assistant message per LLM round.
+    split_stream_on_next_delta: RwSignal<bool>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -347,6 +367,7 @@ fn handle_message_event(
                         state::apply_stream_end(entries, index, &turn_id, Some(&text));
                     });
                     ctx.active_turn_id.set(None);
+                    ctx.split_stream_on_next_delta.set(false);
                     request_chat_list(ctx);
                     schedule_delayed_chat_list_refresh(*ctx);
                 }
@@ -397,12 +418,13 @@ fn handle_message_event(
     }
 }
 
-/// Handle a `stream_end` event. `resuming` / `merge_next` mean this turn is
-/// not finished: tool calls follow, or another delta stream continues the
-/// same answer. `apply_stream_end` unconditionally clears `streaming`, so
-/// when the turn continues this re-marks the entry as streaming rather than
-/// leaving the cursor off between segments — and, critically, leaves
-/// `active_turn_id` set so later `delta` frames are not dropped.
+/// Handle a `stream_end` event.
+///
+/// `merge_next` means more deltas will arrive on the *same* stream segment
+/// (keep the current bubble streaming). `resuming` means tool calls follow
+/// and a later LLM round will continue this turn — that round is stored as
+/// its own assistant message in the session file, so live UI opens a new
+/// bubble on the next token rather than concatenating ("onGood").
 fn handle_stream_end(
     ctx: &WsContext,
     text: Option<String>,
@@ -412,18 +434,41 @@ fn handle_stream_end(
     let Some(turn_id) = ctx.active_turn_id.get_untracked() else {
         return;
     };
-    let keep_streaming = state::stream_end_continues_turn(resuming, merge_next);
+    let resuming = resuming.unwrap_or(false);
+    let merge_next = merge_next.unwrap_or(false);
     update_entries(ctx, |entries, index| {
         state::apply_stream_end(entries, index, &turn_id, text.as_deref());
-        if keep_streaming {
+        if merge_next {
             state::reopen_streaming(entries, index, &turn_id);
         }
     });
-    if !keep_streaming {
+    if merge_next {
+        ctx.split_stream_on_next_delta.set(false);
+    } else if resuming {
+        ctx.split_stream_on_next_delta.set(true);
+    } else {
+        ctx.split_stream_on_next_delta.set(false);
         ctx.active_turn_id.set(None);
         request_chat_list(ctx);
         schedule_delayed_chat_list_refresh(*ctx);
     }
+}
+
+/// If a `resuming` stream_end asked us to start a new bubble, retarget the
+/// turn onto a fresh streaming assistant entry before the next tokens land.
+fn maybe_begin_next_stream_segment(ctx: &WsContext, turn_id: &str) {
+    if !ctx.split_stream_on_next_delta.get_untracked() {
+        return;
+    }
+    ctx.split_stream_on_next_delta.set(false);
+    let new_id = ctx.next_id.get_untracked();
+    ctx.next_id.set(new_id + 1);
+    let mut entries = ctx.entries.get_untracked();
+    ctx.turn_index.update(|map| {
+        state::begin_next_stream_segment(&mut entries, map, turn_id, new_id);
+    });
+    persist_entries(&entries);
+    ctx.entries.set(entries);
 }
 
 /// Route one parsed [`ServerEvent`] to the appropriate `state.rs` reducer
@@ -444,12 +489,33 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
             ctx.token_streaming.set(streaming);
-            // The gateway always mints a fresh id on connect. Keep a stored
-            // one so refresh/restart continue the same session file.
-            if ctx.chat_id.get_untracked().is_none() {
-                adopt_chat_id(ctx, chat_id);
-            }
+            // The chat list is connection-scoped, not chat-scoped — ask for
+            // it on every `ready`, not only after `attached`. A refresh
+            // always has a stored `chat_id`, so the previous "list only on
+            // the no-resume path" left the sidebar empty whenever attach
+            // was slow, rejected, or its follow-up send never ran.
             request_chat_list(ctx);
+            // The gateway mints a fresh chat_id per connection and
+            // subscribes the connection to *that* id. So whenever we mean to
+            // continue an existing chat (refresh, reconnect, or a session
+            // picked while the socket was down), saying nothing would leave
+            // this connection fanned out on a chat nobody is looking at
+            // until the next `message` envelope happens to re-attach it.
+            let resume = ctx
+                .pending_attach
+                .get_untracked()
+                .or_else(|| ctx.chat_id.get_untracked());
+            match resume {
+                Some(target) => {
+                    ctx.pending_attach.set(None);
+                    send_client_envelope(
+                        *ctx,
+                        protocol::ClientEnvelope::attach(target),
+                        "Failed to encode the attach request.",
+                    );
+                }
+                None => adopt_chat_id(ctx, chat_id),
+            }
         }
         ServerEvent::MessageAccepted { chat_id, turn_id } => {
             log::info!("message accepted: chat_id={chat_id} turn_id={turn_id}");
@@ -475,6 +541,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::Delta { text, .. } => {
             if let Some(turn_id) = ctx.active_turn_id.get_untracked() {
+                maybe_begin_next_stream_segment(ctx, &turn_id);
                 update_entries(ctx, |entries, index| {
                     state::apply_delta(entries, index, &turn_id, &text);
                 });
@@ -490,6 +557,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::ReasoningDelta { text, .. } => {
             if let Some(turn_id) = ctx.active_turn_id.get_untracked() {
+                maybe_begin_next_stream_segment(ctx, &turn_id);
                 update_entries(ctx, |entries, index| {
                     state::apply_reasoning_delta(entries, index, &turn_id, &text);
                 });
@@ -515,11 +583,26 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 });
             }
             ctx.active_turn_id.set(None);
+            ctx.split_stream_on_next_delta.set(false);
         }
-        ServerEvent::Attached { chat_id } => {
-            log::info!("attached to chat_id={chat_id}");
+        ServerEvent::Attached { chat_id, history } => {
+            log::info!("attached to chat_id={chat_id} history_len={}", history.len());
             adopt_chat_id(ctx, chat_id);
             ctx.chat_error.set(None);
+            ctx.turn_index.set(HashMap::new());
+            ctx.active_turn_id.set(None);
+            ctx.split_stream_on_next_delta.set(false);
+            // An empty snapshot means the gateway has nothing *persisted*
+            // for this chat (brand new, or a first turn still in flight) —
+            // not that the transcript is empty. Adopting it verbatim would
+            // erase a just-sent message when `ready` re-attaches after a
+            // reconnect. A genuine session switch still lands on a blank
+            // transcript because `on_select_session` clears entries itself.
+            if !history.is_empty() {
+                ctx.next_id.set(next_entry_id(&history));
+                persist_entries(&history);
+                ctx.entries.set(history);
+            }
             request_chat_list(ctx);
         }
         ServerEvent::SessionUpdated(value) => log::info!("session updated: {value}"),
@@ -649,6 +732,34 @@ fn manual_retry(ctx: WsContext) {
     open_connection(ctx);
 }
 
+/// How many event-loop turns to wait for another in-flight send to put the
+/// sink back before concluding the socket is gone.
+const SEND_CHECKOUT_ATTEMPTS: u32 = 32;
+
+/// Take the send half out of the `RefCell` so [`send_client_envelope`] does
+/// not hold a `RefMut` across `.await` (which panics if `ready` queues
+/// `list_chats` and `attach` in the same turn, or if `attached` tries to
+/// send while the attach frame is still flushing).
+async fn checkout_sender(sender_rc: &Rc<RefCell<Option<WsSender>>>) -> Option<WsSender> {
+    for _ in 0..SEND_CHECKOUT_ATTEMPTS {
+        {
+            let mut guard = sender_rc.borrow_mut();
+            if let Some(sender) = guard.take() {
+                return Some(sender);
+            }
+        }
+        gloo_timers::future::sleep(Duration::from_millis(0)).await;
+    }
+    None
+}
+
+fn checkin_sender(sender_rc: &Rc<RefCell<Option<WsSender>>>, sender: WsSender) {
+    let mut guard = sender_rc.borrow_mut();
+    if guard.is_none() {
+        *guard = Some(sender);
+    }
+}
+
 /// Serialize `envelope` and send it on the open socket. Surfaces encode /
 /// disconnected / send failures on `ctx.chat_error`.
 fn send_client_envelope(
@@ -662,13 +773,14 @@ fn send_client_envelope(
     };
     spawn_local(async move {
         let sender_rc = ctx.ws_sender.get_untracked();
-        let mut guard = sender_rc.borrow_mut();
-        let Some(sender) = guard.as_mut() else {
+        let Some(mut sender) = checkout_sender(&sender_rc).await else {
             ctx.chat_error
                 .set(Some("Not connected to the gateway.".to_string()));
             return;
         };
-        if let Err(err) = sender.send_text(payload).await {
+        let result = sender.send_text(payload).await;
+        checkin_sender(&sender_rc, sender);
+        if let Err(err) = result {
             ctx.chat_error
                 .set(Some(format!("Failed to send message: {err}")));
         }
@@ -775,6 +887,8 @@ pub fn App() -> impl IntoView {
     let token_streaming = RwSignal::new(false);
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
     let sidebar_open = RwSignal::new(false);
+    let pending_attach = RwSignal::new(None::<String>);
+    let split_stream_on_next_delta = RwSignal::new(false);
 
     let ws_context = WsContext {
         token,
@@ -793,6 +907,8 @@ pub fn App() -> impl IntoView {
         generation,
         token_streaming,
         sessions,
+        pending_attach,
+        split_stream_on_next_delta,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -836,6 +952,7 @@ pub fn App() -> impl IntoView {
                     next_id.set(0);
                     turn_index.set(HashMap::new());
                     active_turn_id.set(None);
+                    split_stream_on_next_delta.set(false);
                     reconnect_attempt.set(0);
                     reconnect_exhausted.set(false);
                     token.set(Some(jwt));
@@ -854,10 +971,12 @@ pub fn App() -> impl IntoView {
         clear_stored_chat_id();
         token.set(None);
         chat_id.set(None);
+        pending_attach.set(None);
         entries.set(Vec::new());
         next_id.set(0);
         turn_index.set(HashMap::new());
         active_turn_id.set(None);
+        split_stream_on_next_delta.set(false);
         composer_draft.set(String::new());
         chat_error.set(None);
         reconnect_attempt.set(0);
@@ -886,6 +1005,7 @@ pub fn App() -> impl IntoView {
         });
         active_turn_id.set(Some(turn_id.clone()));
         chat_error.set(None);
+        split_stream_on_next_delta.set(false);
 
         let media = build_media_payload(&attachments);
         send_client_envelope(
@@ -897,12 +1017,15 @@ pub fn App() -> impl IntoView {
 
     let do_new_chat = move || {
         clear_stored_entries();
+        clear_stored_chat_id();
         entries.set(Vec::new());
         next_id.set(0);
         turn_index.set(HashMap::new());
         active_turn_id.set(None);
         chat_id.set(None);
         chat_error.set(None);
+        pending_attach.set(None);
+        split_stream_on_next_delta.set(false);
 
         let connected = ws_context
             .ws_sender
@@ -939,11 +1062,45 @@ pub fn App() -> impl IntoView {
     };
     let toggle_sidebar = move || sidebar_open.update(|open| *open = !*open);
     let close_sidebar = move || sidebar_open.set(false);
-    // Switching sessions isn't implemented yet (list-only sidebar for now —
-    // see `chat_ui::components::SessionsSidebar`'s doc comment): the WS
-    // `attach` envelope is still a server-side stub, and there is no
-    // history-replay API to repopulate `entries` from a past session.
-    let on_select_session = move |_chat_id: String| {};
+    let on_select_session = move |selected_id: String| {
+        if chat_id.get_untracked().as_deref() == Some(selected_id.as_str()) {
+            return;
+        }
+        // Same local reset as "New chat" so leftover frames from the old
+        // subscription are dropped (`should_drop_event`) until `attached`
+        // lands with this chat's history.
+        clear_stored_entries();
+        clear_stored_chat_id();
+        entries.set(Vec::new());
+        next_id.set(0);
+        turn_index.set(HashMap::new());
+        active_turn_id.set(None);
+        chat_id.set(None);
+        chat_error.set(None);
+        split_stream_on_next_delta.set(false);
+
+        let connected = ws_context
+            .ws_sender
+            .get_untracked()
+            .borrow()
+            .as_ref()
+            .is_some();
+        if connected {
+            send_client_envelope(
+                ws_context,
+                protocol::ClientEnvelope::attach(selected_id),
+                "Failed to encode the attach request.",
+            );
+        } else {
+            // Nothing to send on yet. Reopen and let `ready` attach, rather
+            // than stranding the user on a cleared transcript with no chat
+            // — the same fallback `do_new_chat` uses.
+            pending_attach.set(Some(selected_id));
+            reconnect_attempt.set(0);
+            reconnect_exhausted.set(false);
+            open_connection(ws_context);
+        }
+    };
 
     let pending = Signal::derive(move || entries.get().iter().any(|entry| entry.streaming));
 

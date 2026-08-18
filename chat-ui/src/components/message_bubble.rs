@@ -5,6 +5,7 @@ use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
 use crate::components::MarkdownView;
+use crate::markdown;
 use crate::models::{ChatEntry, Role};
 
 fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
@@ -58,7 +59,7 @@ pub fn MessageBubble(
     };
 
     if is_user {
-        let has_text = !content.trim().is_empty();
+        let has_text = markdown::has_visible_chars(&content);
         let text_view = if has_text {
             view! {
                 <p class="whitespace-pre-wrap text-sm overflow-hidden">
@@ -68,9 +69,10 @@ pub fn MessageBubble(
             }
             .into_any()
         } else {
-            ().into_any()
+            pending_view()
         };
-        let attachments_view = if attachments.is_empty() {
+        let has_attachments = !attachments.is_empty();
+        let attachments_view = if !has_attachments {
             ().into_any()
         } else {
             let row_class = if has_text {
@@ -95,6 +97,9 @@ pub fn MessageBubble(
             }
             .into_any()
         };
+        if !has_text && !has_attachments && extra_view.is_none() && !streaming.get() {
+            return ().into_any();
+        }
         view! {
             <div class="flex justify-end">
                 <div class="max-w-[80%] rounded-2xl bg-orange-600 px-4 py-2 text-sm text-white shadow-sm">
@@ -106,17 +111,35 @@ pub fn MessageBubble(
         }
         .into_any()
     } else {
-        view! {
-            <div class="flex items-end gap-1.5 justify-start">
-                <div class="max-w-[80%] rounded-2xl bg-white px-4 py-2 text-slate-800 shadow-sm">
-                    <MarkdownView source=content.clone() />
+        // `trim().is_empty()` is not enough: markdown like `****` or a
+        // zero-width fragment still produces a padded bubble + copy button
+        // with nothing visible inside it.
+        let has_text = !markdown::is_blank(&content);
+        if has_text {
+            view! {
+                <div class="flex items-end gap-1.5 justify-start">
+                    <div class="max-w-[80%] rounded-2xl bg-white px-4 py-2 text-slate-800 shadow-sm">
+                        <MarkdownView source=content.clone() />
+                        {pending_view()}
+                        {extra_view}
+                    </div>
+                    <CopyButton text=content />
+                </div>
+            }
+            .into_any()
+        } else if extra_view.is_some() || streaming.get() {
+            // Keep the thinking spinner / tool+reasoning extras; only the
+            // empty padded pill is dropped.
+            view! {
+                <div class="flex flex-col items-start gap-2">
                     {pending_view()}
                     {extra_view}
                 </div>
-                <CopyButton text=content />
-            </div>
+            }
+            .into_any()
+        } else {
+            ().into_any()
         }
-        .into_any()
     }
 }
 

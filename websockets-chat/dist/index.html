@@ -6,8 +6,8 @@
     <title>Rust Bot Live Chat</title>
     
 <script type="module">
-import init, * as bindings from '/websockets-chat-cdeb4c8f1d66ee3e.js';
-const wasm = await init({ module_or_path: '/websockets-chat-cdeb4c8f1d66ee3e_bg.wasm' });
+import init, * as bindings from '/websockets-chat-dad99f9b48982151.js';
+const wasm = await init({ module_or_path: '/websockets-chat-dad99f9b48982151_bg.wasm' });
 
 
 window.wasmBindings = bindings;
@@ -20,7 +20,7 @@ dispatchEvent(new CustomEvent("TrunkApplicationStarted", {detail: {wasm}}));
     <!-- Plain (non-Tailwind) shared stylesheet from chat-ui; see the comment
          in style/input.css for why this can't be an @import instead. -->
     <link rel="stylesheet" href="/shared-f5a270ea27b46f9a.css" integrity="sha384-NrR9DzJUCToCCaG8LKP+gh3KWw0mufgassodXe/BiQLefYWjw3dO+ELwAQ+4OqGE"/>
-  <link rel="modulepreload" href="/websockets-chat-cdeb4c8f1d66ee3e.js" crossorigin="anonymous" integrity="sha384-7zFcQRm1Ghj4iiSMnyhrhkAmlL1U1M17OvJuiV6kuqniTysEVBhUreLnh4mct/I/"><link rel="preload" href="/websockets-chat-cdeb4c8f1d66ee3e_bg.wasm" crossorigin="anonymous" integrity="sha384-YTsd8typUtSyPczJwnl2SkkVRAZazPO6JDUWN2TviPVMH36rW5uaG6lBFuFq8U5+" as="fetch" type="application/wasm"></head>
+  <link rel="modulepreload" href="/websockets-chat-dad99f9b48982151.js" crossorigin="anonymous" integrity="sha384-9o7MG5O7hjD9+rBrumWwHE242KCQxaOVRwrViOmJK7QE+KQZx8d0LnUEftcPzehe"><link rel="preload" href="/websockets-chat-dad99f9b48982151_bg.wasm" crossorigin="anonymous" integrity="sha384-Rw7WIog+tQZl8VFC6dHZ+/cxA4p3ltIWbgtOQYxb+kzZ2/I2PH5pNxk4HUfN5yYF" as="fetch" type="application/wasm"></head>
   <body class="min-h-full bg-transparent">
     <div id="rust-bot-chat"></div>
   </body>

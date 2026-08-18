@@ -5,8 +5,8 @@
 //! this module owns both directions of that conversation from the browser's
 //! side of the connection.
 //!
-//! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`, and
-//!   `list_chats`.
+//! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
+//!   `attach`, and `list_chats`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -16,16 +16,17 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::ToolEvent;
+use chat_ui::models::{ChatEntry, Role, ToolEvent};
 use serde::{Deserialize, Serialize};
 
 /// Outbound envelope sent to the gateway.
 ///
 /// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) has six
 /// variants (`new_chat`, `fork_chat`, `attach`, `set_workspace_scope`,
-/// `transcribe_audio`, `message`). This struct covers the two the frontend
-/// actually sends (`message` and `new_chat`); constructors pin `type_` so
-/// callers cannot invent a shape the gateway would reject with "unknown type".
+/// `transcribe_audio`, `message`). This struct covers the ones the frontend
+/// actually sends (`message`, `new_chat`, `attach`, `list_chats`); constructors
+/// pin `type_` so callers cannot invent a shape the gateway would reject
+/// with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClientEnvelope {
     #[serde(rename = "type")]
@@ -72,6 +73,21 @@ impl ClientEnvelope {
         Self {
             type_: "new_chat",
             chat_id: None,
+            turn_id: None,
+            content: None,
+            media: None,
+            webui: true,
+        }
+    }
+
+    /// Ask the gateway to subscribe this connection to an existing `chat_id`.
+    ///
+    /// The reply is an `attached` event carrying that `chat_id` and a
+    /// display `history` snapshot (empty if the session has no messages).
+    pub fn attach(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "attach",
+            chat_id: Some(chat_id.into()),
             turn_id: None,
             content: None,
             media: None,
@@ -142,8 +158,13 @@ pub enum ServerEvent {
         detail: String,
     },
     /// The connection is now attached to `chat_id` — the reply to a
-    /// `new_chat` envelope (and, later, to `attach`).
-    Attached { chat_id: String },
+    /// `new_chat` or `attach` envelope. `history` is the display snapshot
+    /// from the gateway (`[]` when the chat is new or has no messages, and
+    /// when an older gateway omits the field).
+    Attached {
+        chat_id: String,
+        history: Vec<ChatEntry>,
+    },
     /// Sent when the server-side session state changes. Shape not yet
     /// finalized server-side, so the raw JSON is kept as-is.
     SessionUpdated(serde_json::Value),
@@ -222,7 +243,7 @@ impl ServerEvent {
     pub fn chat_id(&self) -> Option<&str> {
         match self {
             ServerEvent::Ready { chat_id, .. }
-            | ServerEvent::Attached { chat_id }
+            | ServerEvent::Attached { chat_id, .. }
             | ServerEvent::MessageAccepted { chat_id, .. }
             | ServerEvent::GoalStatus { chat_id, .. }
             | ServerEvent::Message { chat_id, .. }
@@ -287,9 +308,56 @@ struct ErrorWire {
     detail: String,
 }
 
+/// One row of the `attached` event's `history` array — mirrors
+/// `websocket_chat_history` in `src/channels/websocket/runtime.rs`.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct HistoryMessage {
+    role: String,
+    #[serde(default)]
+    content: String,
+    #[serde(default)]
+    reasoning_content: Option<String>,
+}
+
+/// Map a gateway history snapshot into transcript [`ChatEntry`]s, skipping
+/// any row whose `role` isn't `user`/`assistant`. Ids are assigned in order
+/// from 0 so the app can resume `next_id` at `entries.len()`.
+fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
+    history
+        .iter()
+        .filter_map(|message| {
+            let role = match message.role.as_str() {
+                "user" => Role::User,
+                "assistant" => Role::Assistant,
+                _ => return None,
+            };
+            Some(ChatEntry {
+                id: 0,
+                role,
+                content: message.content.clone(),
+                attachments: Vec::new(),
+                streaming: false,
+                tool_events: None,
+                reasoning: message
+                    .reasoning_content
+                    .clone()
+                    .filter(|s| !s.is_empty()),
+            })
+        })
+        .enumerate()
+        .map(|(index, mut entry)| {
+            entry.id = index as u64;
+            entry
+        })
+        .collect()
+}
+
 #[derive(Deserialize)]
 struct AttachedWire {
     chat_id: String,
+    /// Absent on `new_chat`'s `attached` ack and on older gateways.
+    #[serde(default)]
+    history: Vec<HistoryMessage>,
 }
 
 #[derive(Deserialize)]
@@ -405,9 +473,10 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             turn_id: w.turn_id,
             detail: w.detail,
         }),
-        "attached" => {
-            decode::<AttachedWire>(&value).map(|w| ServerEvent::Attached { chat_id: w.chat_id })
-        }
+        "attached" => decode::<AttachedWire>(&value).map(|w| ServerEvent::Attached {
+            chat_id: w.chat_id,
+            history: history_to_entries(&w.history),
+        }),
         "session_updated" => Ok(ServerEvent::SessionUpdated(value)),
         "message_accepted" => {
             decode::<MessageAcceptedWire>(&value).map(|w| ServerEvent::MessageAccepted {
@@ -548,7 +617,46 @@ mod tests {
             event,
             ServerEvent::Attached {
                 chat_id: "chat-1".to_string(),
+                history: vec![],
             }
+        );
+    }
+
+    #[test]
+    fn parses_attached_with_history() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi","reasoning_content":"think"},
+            {"role":"tool","content":"skipped"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { chat_id, history } => {
+                assert_eq!(chat_id, "chat-1");
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].id, 0);
+                assert_eq!(history[0].role, Role::User);
+                assert_eq!(history[0].content, "hello");
+                assert_eq!(history[1].id, 1);
+                assert_eq!(history[1].role, Role::Assistant);
+                assert_eq!(history[1].content, "hi");
+                assert_eq!(history[1].reasoning.as_deref(), Some("think"));
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn client_envelope_attach_serializes_expected_shape() {
+        let envelope = ClientEnvelope::attach("chat-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "attach",
+                "chat_id": "chat-1",
+                "webui": true,
+            })
         );
     }
 

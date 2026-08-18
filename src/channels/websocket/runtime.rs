@@ -37,6 +37,8 @@ use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
 use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
 use crate::session::goal_state::goal_state_ws_blob;
+use crate::session::history_visibility::is_hidden_history_message;
+use crate::session::keys::COMMAND_KEY;
 use crate::{
     bus::{
         events::OutboundMessage,
@@ -52,8 +54,10 @@ use crate::{
     security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
-    session::manager::SessionManager,
+    session::manager::{Session, SessionManager},
 };
+
+const MAX_HISTORY_MESSAGES: usize = 200;
 
 /// Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel).
 pub fn publish_runtime_model_update(bus: Arc<MessageBus>, model: &str, model_preset: Option<&str>) {
@@ -437,7 +441,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
             handle_envelope_new_chat(envelope_dispatch_context).await;
         }
         EnvelopeType::ForkChat => { /* ... */ }
-        EnvelopeType::Attach => { /* ... */ }
+        EnvelopeType::Attach => {
+            handle_envelope_attach(envelope_dispatch_context).await;
+        }
         EnvelopeType::SetWorkspaceScope => { /* ... */ }
         EnvelopeType::TranscribeAudio => { /* ... */ }
         EnvelopeType::Message => {
@@ -457,6 +463,58 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
             .await;
         }
     }
+}
+
+/// Handle an `attach` envelope: subscribe this connection to an existing
+/// `chat_id` (page-reload rehydrate / session switch). Mirrors nanobot's
+/// `attach` branch (`channels/websocket/runtime.py`): validate, `_attach`,
+/// ack `attached`, then `_hydrate_after_subscribe`. Existence of a session
+/// file is not required — subscribe is idempotent, `history` is `[]` when
+/// nothing is persisted, and hydrate is a no-op in that case.
+async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let envelope = envelope_dispatch_context.envelope;
+    let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
+    let shared = envelope_dispatch_context.shared;
+
+    let cid = envelope
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if !is_valid_chat_id(cid) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "invalid chat_id"}),
+        )
+        .await;
+        return;
+    }
+
+    // `attached` carries a transcript snapshot, so this envelope reads chat
+    // content and must clear the same allowlist bar as `message` — the
+    // upgrade only proves the JWT was valid (and `authorize` returns `false`
+    // rather than erroring when JWT is disabled entirely).
+    //
+    // The rejection stays unscoped (no `chat_id` field), like the
+    // `invalid chat_id` one above: a client mid-session-switch has already
+    // cleared its local chat_id, so a chat-scoped error frame would be
+    // filtered out as belonging to the previous subscription.
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    attach_chat(connection_id, cid, shared).await;
 }
 
 async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
@@ -592,6 +650,120 @@ async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispa
         serde_json::json!({"chats": chats}),
     )
     .await;
+}
+
+/// Flatten a persisted `content` field to the text a transcript can render.
+///
+/// [`AgentLoop::save_turn`] writes a block array (not a string) whenever the
+/// turn carried media, so a plain `as_str()` would silently blank out every
+/// message that had an image attached. Non-text blocks have no transcript
+/// representation here and are dropped.
+fn display_text(content: Option<&serde_json::Value>) -> String {
+    match content {
+        Some(serde_json::Value::String(text)) => text.clone(),
+        Some(serde_json::Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<&str>>()
+            .join("\n"),
+        _ => String::new(),
+    }
+}
+
+/// Shape one session's messages for the `attached` envelope's `history`
+/// field. Kept as a plain, signal-free function (no lock, no I/O) so the
+/// filter/cap/projection is unit-testable without a live WebSocket.
+///
+/// Unlike [`Session::get_history`] (the LLM prompt window: drops the
+/// consolidated prefix and keeps tool rows), this is a *display* view: the
+/// full conversation (capped), `user`/`assistant` only, with slash-command
+/// and hidden/automation turns stripped.
+fn websocket_chat_history(
+    session: Option<&Session>,
+    max_messages: usize,
+) -> Vec<serde_json::Value> {
+    let Some(session) = session else {
+        return Vec::new();
+    };
+    if max_messages == 0 {
+        return Vec::new();
+    }
+    let mut visible: Vec<&serde_json::Value> = session
+        .messages
+        .iter()
+        .filter(|message| {
+            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            (role == "user" || role == "assistant")
+                && message.get(COMMAND_KEY).is_none()
+                && !is_hidden_history_message(message)
+        })
+        .collect();
+
+    if visible.len() > max_messages {
+        visible = visible[visible.len() - max_messages..].to_vec();
+    }
+    // Don't open the transcript on a dangling assistant reply.
+    if let Some(start) = visible
+        .iter()
+        .position(|message| message.get("role").and_then(|v| v.as_str()) == Some("user"))
+    {
+        visible = visible[start..].to_vec();
+    }
+
+    visible
+        .into_iter()
+        .map(|message| {
+            let mut entry = serde_json::json!({
+                "role": message.get("role").and_then(|v| v.as_str()).unwrap_or(""),
+                "content": display_text(message.get("content")),
+            });
+            if let Some(timestamp) = message.get("timestamp").and_then(|v| v.as_str()) {
+                entry["timestamp"] = serde_json::json!(timestamp);
+            }
+            if let Some(reasoning) = message
+                .get("reasoning_content")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+            {
+                entry["reasoning_content"] = serde_json::json!(reasoning);
+            }
+            entry
+        })
+        .collect()
+}
+
+/// Subscribe `connection_id` to `chat_id`, ack with `attached` (including
+/// a display `history` snapshot), then replay any in-flight goal/turn
+/// strip. Argument order matches [`ConnectionRegistry::attach`] /
+/// nanobot's `_attach(connection, chat_id)`.
+async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
+    shared
+        .connections
+        .lock()
+        .await
+        .attach(connection_id, chat_id);
+    let history = {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before
+        // `send_event`'s `.await` below — same discipline as every other
+        // `session_manager` use in this file.
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = session_manager.get_session_internal(&format!("websocket:{chat_id}"));
+        websocket_chat_history(session.as_ref(), MAX_HISTORY_MESSAGES)
+    };
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Attached,
+        None,
+        serde_json::json!({"chat_id": chat_id, "history": history}),
+    )
+    .await;
+    hydrate_after_subscribe(chat_id, shared).await;
 }
 
 async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
@@ -2215,6 +2387,436 @@ mod tests {
             session_updated_body.get("workspace_scope").is_some(),
             "session_updated must carry the new chat's workspace scope: {session_updated_body}"
         );
+    }
+
+    // --- handle_envelope_attach ---
+
+    fn recv_json(rx: &mut mpsc::UnboundedReceiver<Message>) -> serde_json::Value {
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        serde_json::from_str(&msg.into_text().unwrap()).unwrap()
+    }
+
+    async fn dispatch_attach(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("attach"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_attach must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_subscribes_and_sends_attached() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["chat_id"], "existing-chat");
+        assert_eq!(
+            body["history"],
+            serde_json::json!([]),
+            "a chat with no session file must still carry an empty history array"
+        );
+        if let Ok(extra) = rx.try_recv() {
+            panic!(
+                "attach must not send session_updated (that's new_chat-only), got {}",
+                extra.into_text().unwrap()
+            );
+        }
+
+        let recipients = shared
+            .connections
+            .lock()
+            .await
+            .senders_for_chat("existing-chat");
+        assert_eq!(recipients.len(), 1);
+        assert_eq!(recipients[0].0, "conn-1");
+        // Multiplex: attach is additive, so the connection's original
+        // subscription stays in place (nanobot's `_attach` is a set-add).
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("initial-chat")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_rejects_invalid_or_missing_chat_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        for chat_id in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("has space")),
+            Some(serde_json::json!(123)),
+        ] {
+            dispatch_attach(&shared, "conn-1", chat_id.clone()).await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected payload: {chat_id:?}");
+            assert_eq!(body["detail"], "invalid chat_id");
+            assert!(
+                body.get("chat_id").is_none(),
+                "invalid attach must omit chat_id, matching nanobot: {body}"
+            );
+        }
+
+        assert!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("has space")
+                .is_empty()
+        );
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("initial-chat")
+                .len(),
+            1,
+            "a rejected attach must not drop the connection's existing subscription"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_hydrates_active_goal_state() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        {
+            let mut session_manager = shared.session_manager.lock().unwrap();
+            crate::session::goal_state::create_session_goal(
+                &mut session_manager,
+                "websocket:existing-chat",
+                "ship the feature",
+                None,
+            )
+            .unwrap();
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        assert_eq!(attached["chat_id"], "existing-chat");
+
+        let goal = recv_json(&mut rx);
+        assert_eq!(goal["event"], "goal_state");
+        assert_eq!(goal["chat_id"], "existing-chat");
+        assert_eq!(goal["goal_state"]["objective"], "ship the feature");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_is_idempotent() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+        let _ = recv_json(&mut rx);
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["chat_id"], "existing-chat");
+
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("existing-chat")
+                .len(),
+            1,
+            "re-attaching the same chat must not duplicate the subscription"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_includes_persisted_session_history() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:existing-chat".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.add_message("assistant", "hi there", serde_json::Map::new());
+            // Consolidated prefix must still reach the UI (get_history would drop it).
+            session.last_consolidated = 2;
+            session.add_message("user", "follow-up", serde_json::Map::new());
+            session.add_message("assistant", "sure", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["chat_id"], "existing-chat");
+        let history = body["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["hello", "hi there", "follow-up", "sure"]);
+        assert!(
+            history.iter().all(|m| m.get(COMMAND_KEY).is_none()),
+            "wire history must not leak internal markers: {history:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:secret-chat".to_string());
+            session.add_message("user", "confidential", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("secret-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(
+            body["detail"], "access_denied",
+            "attach returns transcript content, so it must clear the same bar as `message`"
+        );
+        assert!(
+            body.get("chat_id").is_none(),
+            "the rejection must stay unscoped or a switching client filters it out: {body}"
+        );
+        assert!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("secret-chat")
+                .is_empty(),
+            "a denied attach must not subscribe the connection"
+        );
+    }
+
+    // --- websocket_chat_history ---
+
+    fn history_message(role: &str, content: &str) -> serde_json::Value {
+        serde_json::json!({
+            "role": role,
+            "content": content,
+            "timestamp": "2026-01-01T00:00:00Z",
+        })
+    }
+
+    #[test]
+    fn websocket_chat_history_empty_when_session_is_missing() {
+        assert!(websocket_chat_history(None, 500).is_empty());
+    }
+
+    #[test]
+    fn websocket_chat_history_maps_user_and_assistant_and_drops_internal_keys() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(history_message("user", "hello"));
+        session
+            .messages
+            .push(serde_json::json!({
+                "role": "assistant",
+                "content": "hi",
+                "timestamp": "2026-01-01T00:00:01Z",
+                "reasoning_content": "think",
+                "tool_calls": [{"id": "c1"}],
+            }));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[0]["timestamp"], "2026-01-01T00:00:00Z");
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"], "hi");
+        assert_eq!(history[1]["reasoning_content"], "think");
+        assert!(
+            history[1].get("tool_calls").is_none(),
+            "LLM tool_calls are not a ChatEntry field: {}",
+            history[1]
+        );
+    }
+
+    #[test]
+    fn websocket_chat_history_omits_commands_hidden_tool_and_system_rows() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(history_message("user", "keep me"));
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": "/status",
+            "_command": true,
+        }));
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": "hidden prompt",
+            "_hidden_history": true,
+        }));
+        session.messages.push(history_message("tool", "tool output"));
+        session.messages.push(history_message("system", "sys"));
+        session
+            .messages
+            .push(history_message("assistant", "visible reply"));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["keep me", "visible reply"]);
+    }
+
+    #[test]
+    fn websocket_chat_history_keeps_consolidated_prefix() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(history_message("user", "before"));
+        session
+            .messages
+            .push(history_message("assistant", "summarized"));
+        session.messages.push(history_message("user", "after"));
+        session.last_consolidated = 2;
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["before", "summarized", "after"]);
+    }
+
+    #[test]
+    fn websocket_chat_history_caps_from_the_end_and_aligns_to_a_user_turn() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(history_message("user", "old"));
+        session.messages.push(history_message("assistant", "old-a"));
+        session.messages.push(history_message("assistant", "dangling"));
+        session.messages.push(history_message("user", "keep"));
+        session.messages.push(history_message("assistant", "keep-a"));
+
+        let history = websocket_chat_history(Some(&session), 3);
+
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        // Cap of 3 lands on [dangling, keep, keep-a]; align drops dangling.
+        assert_eq!(contents, vec!["keep", "keep-a"]);
+    }
+
+    #[test]
+    fn websocket_chat_history_flattens_multimodal_block_content() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        // The shape `AgentLoop::save_turn` persists for a turn with media.
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            ],
+        }));
+        session.messages.push(history_message("assistant", "a cat"));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["what is in this picture?", "a cat"]);
+    }
+
+    #[test]
+    fn display_text_joins_text_blocks_and_ignores_everything_else() {
+        assert_eq!(display_text(Some(&serde_json::json!("plain"))), "plain");
+        assert_eq!(
+            display_text(Some(&serde_json::json!([
+                {"type": "text", "text": "first"},
+                {"type": "text", "text": ""},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+                {"type": "text", "text": "second"},
+            ]))),
+            "first\nsecond"
+        );
+        assert_eq!(display_text(None), "");
+        assert_eq!(display_text(Some(&serde_json::Value::Null)), "");
+    }
+
+    #[test]
+    fn websocket_chat_history_zero_cap_returns_empty() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(history_message("user", "hello"));
+        assert!(websocket_chat_history(Some(&session), 0).is_empty());
     }
 
     // --- list_websocket_chats / handle_envelope_list_chats ---

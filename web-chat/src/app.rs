@@ -281,26 +281,32 @@ pub fn App() -> impl IntoView {
         });
     };
 
+    let adopt_session = move |session: String| {
+        clear_stored_entries();
+        entries.set(Vec::new());
+        next_id.set(0);
+        chat_error.set(None);
+        chat_pending.set(false);
+        persist_session(&session);
+        session_id.set(session);
+    };
+
     let do_new_chat = move || {
         let Some(jwt) = token.get() else { return };
         let Some(email) = read_stored_email() else {
             return;
         };
-        clear_stored_entries();
-        entries.set(Vec::new());
-        next_id.set(0);
-        chat_error.set(None);
         let session = session_id_for(&email);
-        persist_session(&session);
-        session_id.set(session.clone());
-        let jwt_for_refresh = jwt.clone();
-        let email_for_refresh = email.clone();
-        spawn_local(async move {
-            if let Err(err) = api::start_new_session(&jwt, &session).await {
-                chat_error.set(Some(err.to_string()));
+        adopt_session(session.clone());
+        spawn_local({
+            let jwt = jwt.clone();
+            async move {
+                if let Err(err) = api::start_new_session(&jwt, &session).await {
+                    chat_error.set(Some(err.to_string()));
+                }
             }
         });
-        load_sessions(jwt_for_refresh, email_for_refresh);
+        load_sessions(jwt, email);
     };
 
     let open_chat = move || chat_open.set(true);
@@ -308,10 +314,24 @@ pub fn App() -> impl IntoView {
     let toggle_expand = move || expanded.update(|value| *value = !*value);
     let toggle_sidebar = move || sidebar_open.update(|open| *open = !*open);
     let close_sidebar = move || sidebar_open.set(false);
-    // Switching sessions isn't implemented yet (list-only sidebar for now —
-    // see `chat_ui::components::SessionsSidebar`'s doc comment): there is no
-    // history-fetch API to repopulate `entries` from a past session.
-    let on_select_session = move |_session_id: String| {};
+    // Same local reset as "New chat", but the selected id is adopted as-is
+    // (no `/new` command — that would wipe the server session). There is
+    // still no history-fetch API, so the transcript starts empty; later
+    // sends use this `session_id` and the gateway already has the thread.
+    let on_select_session = move |selected_id: String| {
+        let Some(jwt) = token.get() else { return };
+        let Some(email) = read_stored_email() else {
+            return;
+        };
+        if !selected_id.starts_with(&session_prefix_for(&email)) {
+            return;
+        }
+        if session_id.get_untracked() == selected_id {
+            return;
+        }
+        adopt_session(selected_id);
+        load_sessions(jwt, email);
+    };
 
     view! {
         <Show

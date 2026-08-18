@@ -7,6 +7,61 @@ use pulldown_cmark::{html, CowStr, Event, Options, Parser};
 use pulldown_latex::config::DisplayMode;
 use pulldown_latex::{push_mathml, Parser as LatexParser, RenderConfig, Storage};
 
+/// True when `source` would not produce any user-visible output in [`render`].
+///
+/// Catches empty/whitespace strings, zero-width-only fragments (LLMs
+/// sometimes emit U+200B), and markdown that sanitizes down to empty tags
+/// (`****`, stripped HTML) — those still fail a naive `trim().is_empty()`
+/// check but paint an empty bubble with a copy button.
+pub fn is_blank(source: &str) -> bool {
+    if !has_visible_chars(source) {
+        return true;
+    }
+    !html_is_visible(&render(source))
+}
+
+/// True when `s` contains at least one character that would show up as
+/// text, as opposed to whitespace, controls, or zero-width format chars.
+pub fn has_visible_chars(s: &str) -> bool {
+    s.chars().any(is_visible_char)
+}
+
+fn is_visible_char(c: char) -> bool {
+    !c.is_whitespace() && !c.is_control() && !is_zero_width(c)
+}
+
+fn is_zero_width(c: char) -> bool {
+    matches!(
+        c,
+        '\u{00AD}' | '\u{200B}' | '\u{200C}' | '\u{200D}' | '\u{2060}' | '\u{FEFF}'
+    )
+}
+
+fn html_is_visible(html: &str) -> bool {
+    let lower = html.to_ascii_lowercase();
+    if ["<img", "<pre", "<table", "<math", "<hr", "<video", "<svg"]
+        .iter()
+        .any(|tag| lower.contains(tag))
+    {
+        return true;
+    }
+    has_visible_chars(&strip_tags(html))
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::with_capacity(html.len());
+    let mut in_tag = false;
+    for c in html.chars() {
+        match c {
+            '<' => in_tag = true,
+            '>' => in_tag = false,
+            _ if !in_tag => out.push(c),
+            _ => {}
+        }
+    }
+    out.replace("&nbsp;", " ").replace("&#160;", " ")
+}
+
 /// Convert Markdown to sanitized HTML suitable for `inner_html`.
 ///
 /// Ammonia's defaults already strip scripts/event handlers and attach
@@ -546,5 +601,22 @@ mod tests {
             html.contains("| Paper |") || html.contains("| Paper | Why |"),
             "got: {html}"
         );
+    }
+
+    #[test]
+    fn is_blank_treats_empty_whitespace_and_zero_width_as_blank() {
+        assert!(is_blank(""));
+        assert!(is_blank("   \n\t  "));
+        assert!(is_blank("\u{200B}\u{FEFF}"));
+        assert!(is_blank("&nbsp;&nbsp;"));
+        assert!(is_blank("<script>alert(1)</script>"));
+    }
+
+    #[test]
+    fn is_blank_keeps_real_markdown_and_media() {
+        assert!(!is_blank("hello"));
+        assert!(!is_blank("**bold**"));
+        assert!(!is_blank("![](https://example.com/a.png)"));
+        assert!(!is_blank("| A | B |\n| --- | --- |\n| 1 | 2 |"));
     }
 }
