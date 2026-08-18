@@ -166,6 +166,29 @@ const TRANSIENT_ERROR_MARKERS: &[&str] = &[
     "temporarily unavailable",
 ];
 
+/// Markers that the selected model cannot accept image / vision input.
+/// These are capability mismatches, not transient failures — retrying with
+/// the image stripped hides the real error from the user.
+const UNSUPPORTED_IMAGE_INPUT_MARKERS: &[&str] = &[
+    "no endpoints found that support image",
+    "does not support image",
+    "doesn't support image",
+    "image input is not supported",
+    "images are not supported",
+    "does not support vision",
+    "doesn't support vision",
+    "vision is not supported",
+    "support image input",
+];
+
+/// True when `content` is an LLM error saying the model cannot take images.
+pub fn is_unsupported_image_input_error(content: Option<&str>) -> bool {
+    let err = content.unwrap_or("").to_lowercase();
+    UNSUPPORTED_IMAGE_INPUT_MARKERS
+        .iter()
+        .any(|marker| err.contains(marker))
+}
+
 /// A dyn-safe streaming callback: receives one content delta per token and
 /// returns a boxed `Send` future.
 ///
@@ -623,6 +646,21 @@ pub trait LLMProvider: Send + Sync {
             .any(|marker| err.contains(marker))
     }
 
+    /// Strip images and retry only when the failure is not a vision-capability
+    /// mismatch. Returns `None` when the caller should surface the error as-is.
+    fn retry_messages_without_images(
+        content: Option<&str>,
+        messages: &[serde_json::Value],
+    ) -> Option<Vec<serde_json::Value>> {
+        if is_unsupported_image_input_error(content) {
+            log::warn!(
+                "Model does not support image input; returning error instead of retrying without images"
+            );
+            return None;
+        }
+        Self::strip_image_content(messages)
+    }
+
     /// Replace image_url blocks with text placeholder. Returns None if no images found.
     /// Rough equivalent of the Python static method _strip_image_content.
     fn strip_image_content(messages: &[serde_json::Value]) -> Option<Vec<serde_json::Value>> {
@@ -901,7 +939,9 @@ pub trait LLMProvider: Send + Sync {
                 // If the error is NOT transient, attempt to strip image content, else return.
                 if !Self::is_transient_error(response.content.as_deref()) {
                     // Attempt to strip image content and retry just once if possible.
-                    if let Some(stripped) = Self::strip_image_content(&messages) {
+                    if let Some(stripped) =
+                        Self::retry_messages_without_images(response.content.as_deref(), &messages)
+                    {
                         log::warn!(
                             "Non-transient LLM error with image content, retrying without images"
                         );
@@ -996,7 +1036,9 @@ pub trait LLMProvider: Send + Sync {
 
                 if !Self::is_transient_error(response.content.as_deref()) {
                     // Attempt to strip image content and retry just once if possible.
-                    if let Some(stripped) = Self::strip_image_content(&messages) {
+                    if let Some(stripped) =
+                        Self::retry_messages_without_images(response.content.as_deref(), &messages)
+                    {
                         log::warn!(
                             "Non-transient LLM error with image content, retrying without images"
                         );
@@ -1376,6 +1418,24 @@ mod tests {
     }
 
     #[test]
+    fn test_is_unsupported_image_input_error() {
+        assert!(is_unsupported_image_input_error(Some(
+            "No endpoints found that support image input"
+        )));
+        assert!(is_unsupported_image_input_error(Some(
+            "This model does not support image input"
+        )));
+        assert!(is_unsupported_image_input_error(Some(
+            "failed to deserialize api response: error:x content:{\"error\":{\"message\":\"No endpoints found that support image input\",\"code\":404}}"
+        )));
+        assert!(!is_unsupported_image_input_error(None));
+        assert!(!is_unsupported_image_input_error(Some("invalid image")));
+        assert!(!is_unsupported_image_input_error(Some(
+            "image omitted due to size"
+        )));
+    }
+
+    #[test]
     fn test_strip_image_content() {
         let messages = vec![serde_json::json!(
             {
@@ -1680,6 +1740,136 @@ mod tests {
             .await;
 
         assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+    }
+
+    fn image_user_message() -> serde_json::Value {
+        serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "Describe this"
+                },
+                {
+                    "type": "image_url",
+                    "image_url": { "url": "data:image/png;base64,AA==" },
+                    "_meta": { "path": "/tmp/test.png" }
+                }
+            ]
+        })
+    }
+
+    #[tokio::test]
+    async fn test_safe_chat_stream_with_retry_does_not_strip_unsupported_image_input() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct VisionErrorProvider {
+            generation: GenerationSettings,
+            stream_calls: AtomicUsize,
+        }
+
+        impl LLMProvider for VisionErrorProvider {
+            fn new(
+                _api_key: Option<String>,
+                _api_base: Option<String>,
+                _default_model: Option<String>,
+                _extra_headers: Option<HashMap<String, String>>,
+                _spec: Option<ProviderSpec>,
+            ) -> Self {
+                Self {
+                    generation: GenerationSettings::new(),
+                    stream_calls: AtomicUsize::new(0),
+                }
+            }
+
+            fn api_key(&self) -> Option<String> {
+                None
+            }
+
+            fn api_base(&self) -> Option<String> {
+                None
+            }
+
+            fn generation_settings(&self) -> &GenerationSettings {
+                &self.generation
+            }
+
+            fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+                &mut self.generation
+            }
+
+            fn extra_headers(&self) -> Option<HashMap<String, String>> {
+                None
+            }
+
+            fn spec(&self) -> Option<&ProviderSpec> {
+                None
+            }
+
+            async fn chat(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+                _model: Option<String>,
+                _max_tokens: usize,
+                _temperature: f32,
+                _reasoning_effort: Option<String>,
+                _tool_choice: Option<serde_json::Value>,
+            ) -> LLMResponse {
+                unimplemented!()
+            }
+
+            fn get_default_model(&self) -> String {
+                "test".to_string()
+            }
+
+            async fn chat_stream<F, Fut>(
+                &self,
+                _messages: Vec<serde_json::Value>,
+                _tools: Option<Vec<serde_json::Value>>,
+                _model: Option<String>,
+                _max_tokens: usize,
+                _temperature: f32,
+                _reasoning_effort: Option<String>,
+                _tool_choice: Option<serde_json::Value>,
+                _on_content_delta: &Option<F>,
+            ) -> LLMResponse
+            where
+                F: Fn(String) -> Fut + Send + Sync,
+                Fut: std::future::Future<Output = ()> + Send,
+            {
+                self.stream_calls.fetch_add(1, Ordering::SeqCst);
+                LLMResponse {
+                    content: Some("No endpoints found that support image input".to_string()),
+                    finish_reason: "error".to_string(),
+                    tool_calls: Vec::new(),
+                    usage: HashMap::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                }
+            }
+        }
+
+        let provider = VisionErrorProvider::new(None, None, None, None, None);
+        let result = provider
+            .safe_chat_stream_with_retry(
+                vec![image_user_message()],
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &None::<fn(String) -> std::future::Ready<()>>,
+            )
+            .await;
+
+        assert_eq!(provider.stream_calls.load(Ordering::SeqCst), 1);
+        assert_eq!(result.finish_reason, "error");
+        assert_eq!(
+            result.content.as_deref(),
+            Some("No endpoints found that support image input")
+        );
     }
 
     fn openai_tool(name: &str) -> serde_json::Value {

@@ -22,7 +22,7 @@ use uuid::Uuid;
 
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
-use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role};
+use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem};
 
 use crate::api::{self, WsSender};
 use crate::components::ChatShell;
@@ -276,6 +276,11 @@ struct WsContext {
     /// Defaults to `false` until `ready` arrives, matching the server's
     /// `WebSocketConfig.streaming` default.
     token_streaming: RwSignal<bool>,
+    /// This connection's `websocket:*` chats, for the sessions sidebar.
+    /// Refreshed by [`request_chat_list`] on `ready`/`attached` and after
+    /// each turn finishes, since title generation runs asynchronously with
+    /// no push notification when it completes.
+    sessions: RwSignal<Vec<SessionListItem>>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -342,6 +347,8 @@ fn handle_message_event(
                         state::apply_stream_end(entries, index, &turn_id, Some(&text));
                     });
                     ctx.active_turn_id.set(None);
+                    request_chat_list(ctx);
+                    schedule_delayed_chat_list_refresh(*ctx);
                 }
                 None => {
                     // No turn to attach to (a server-initiated message
@@ -414,6 +421,8 @@ fn handle_stream_end(
     });
     if !keep_streaming {
         ctx.active_turn_id.set(None);
+        request_chat_list(ctx);
+        schedule_delayed_chat_list_refresh(*ctx);
     }
 }
 
@@ -440,6 +449,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             if ctx.chat_id.get_untracked().is_none() {
                 adopt_chat_id(ctx, chat_id);
             }
+            request_chat_list(ctx);
         }
         ServerEvent::MessageAccepted { chat_id, turn_id } => {
             log::info!("message accepted: chat_id={chat_id} turn_id={turn_id}");
@@ -510,6 +520,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             log::info!("attached to chat_id={chat_id}");
             adopt_chat_id(ctx, chat_id);
             ctx.chat_error.set(None);
+            request_chat_list(ctx);
         }
         ServerEvent::SessionUpdated(value) => log::info!("session updated: {value}"),
         ServerEvent::GoalState(value) => {
@@ -517,6 +528,18 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::FileEdit { chat_id, edits } => {
             log::info!("file_edit for chat_id={chat_id}: {edits:?}");
+        }
+        ServerEvent::ChatsList { chats } => {
+            let items: Vec<SessionListItem> = chats
+                .into_iter()
+                .map(|chat| SessionListItem {
+                    id: chat.chat_id,
+                    title: chat.title,
+                    created_at: chat.created_at,
+                    updated_at: chat.updated_at,
+                })
+                .collect();
+            ctx.sessions.set(items);
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
@@ -652,6 +675,40 @@ fn send_client_envelope(
     });
 }
 
+/// Ask the gateway to refresh this connection's chat list (sessions
+/// sidebar). Fire-and-forget: failures just leave the sidebar's last known
+/// state on screen rather than surfacing a user-facing error.
+fn request_chat_list(ctx: &WsContext) {
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_chats(),
+        "Failed to encode the chats list request.",
+    );
+}
+
+/// How long after a turn finishes to re-request the chat list, to pick up a
+/// title that was still generating when [`request_chat_list`]'s
+/// immediately-on-completion call ran. See [`schedule_delayed_chat_list_refresh`].
+const TITLE_REFRESH_DELAY_MS: u32 = 4_000;
+
+/// Follow-up [`request_chat_list`] a few seconds after a turn completes.
+///
+/// Title generation (`maybe_schedule_title_generation` server-side) is a
+/// fire-and-forget background LLM call kicked off only once the turn
+/// finishes — it is not remotely done by the time this connection's own
+/// `stream_end`/final `message` arrives, so the immediate refresh at
+/// completion almost always still shows the "New chat" placeholder. There is
+/// no push notification for "title ready", so this is a one-shot,
+/// best-effort timer rather than a guarantee: if the LLM call is unusually
+/// slow, the real title only shows up on the *next* refresh (another turn,
+/// a new chat, or a reconnect).
+fn schedule_delayed_chat_list_refresh(ctx: WsContext) {
+    spawn_local(async move {
+        gloo_timers::future::sleep(Duration::from_millis(u64::from(TITLE_REFRESH_DELAY_MS))).await;
+        request_chat_list(&ctx);
+    });
+}
+
 /// Tear down the current socket without letting [`handle_connection_closed`]
 /// schedule an automatic reconnect (bumping `generation` makes its
 /// eventual, stale `on_close` callback a no-op). Used by logout.
@@ -716,6 +773,8 @@ pub fn App() -> impl IntoView {
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
     let token_streaming = RwSignal::new(false);
+    let sessions = RwSignal::new(Vec::<SessionListItem>::new());
+    let sidebar_open = RwSignal::new(false);
 
     let ws_context = WsContext {
         token,
@@ -733,6 +792,7 @@ pub fn App() -> impl IntoView {
         ws_sender,
         generation,
         token_streaming,
+        sessions,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -804,6 +864,8 @@ pub fn App() -> impl IntoView {
         reconnect_exhausted.set(false);
         connection_status.set(ConnectionStatus::Disconnected);
         token_streaming.set(false);
+        sessions.set(Vec::new());
+        sidebar_open.set(false);
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -875,6 +937,13 @@ pub fn App() -> impl IntoView {
         expanded.update(|value| *value = !*value);
         let _ = BrowserLocalStorage::set(EXPANDED_STORAGE_KEY, &expanded.get());
     };
+    let toggle_sidebar = move || sidebar_open.update(|open| *open = !*open);
+    let close_sidebar = move || sidebar_open.set(false);
+    // Switching sessions isn't implemented yet (list-only sidebar for now —
+    // see `chat_ui::components::SessionsSidebar`'s doc comment): the WS
+    // `attach` envelope is still a server-side stub, and there is no
+    // history-replay API to repopulate `entries` from a past session.
+    let on_select_session = move |_chat_id: String| {};
 
     let pending = Signal::derive(move || entries.get().iter().any(|entry| entry.streaming));
 
@@ -904,6 +973,9 @@ pub fn App() -> impl IntoView {
                     connection_status=Signal::derive(move || connection_status.get())
                     reconnect_exhausted=Signal::derive(move || reconnect_exhausted.get())
                     token_streaming=Signal::derive(move || token_streaming.get())
+                    sessions=Signal::derive(move || sessions.get())
+                    active_session_id=Signal::derive(move || chat_id.get())
+                    sidebar_open=Signal::derive(move || sidebar_open.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat
@@ -912,6 +984,9 @@ pub fn App() -> impl IntoView {
                     on_retry=do_retry
                     expanded=Signal::derive(move || expanded.get())
                     on_toggle_expand=toggle_expand
+                    on_toggle_sidebar=toggle_sidebar
+                    on_close_sidebar=close_sidebar
+                    on_select_session=on_select_session
                 />
             </Show>
         </Show>

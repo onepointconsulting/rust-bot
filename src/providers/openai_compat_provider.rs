@@ -3,6 +3,7 @@ use crate::providers::{
     cache_control::apply_cache_control,
     registry::ProviderSpec,
 };
+use async_openai::error::OpenAIError;
 use async_openai::types::chat::ImageUrl;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
@@ -994,6 +995,51 @@ impl OpenAICompatProvider {
         }
         incoming
     }
+
+    /// Pull a provider `error.message` out of a raw error string or JSON body.
+    ///
+    /// OpenRouter (and similar gateways) often return
+    /// `{"error":{"message":"...","code":404}}` as a stream event that
+    /// async-openai cannot deserialize as a chat chunk. The SDK then wraps
+    /// that JSON in `OpenAIError::JSONDeserialize`.
+    fn extract_api_error_message(raw: &str) -> String {
+        if let Some(msg) = Self::api_error_message_from_json(raw) {
+            return msg;
+        }
+        if let Some(start) = raw.find('{') {
+            if let Some(msg) = Self::api_error_message_from_json(&raw[start..]) {
+                return msg;
+            }
+        }
+        raw.to_string()
+    }
+
+    fn api_error_message_from_json(raw: &str) -> Option<String> {
+        let json: serde_json::Value = serde_json::from_str(raw).ok()?;
+        let error = json.get("error")?;
+        error
+            .get("message")
+            .and_then(|m| m.as_str())
+            .map(str::to_string)
+            .or_else(|| error.as_str().map(str::to_string))
+            .filter(|s| !s.is_empty())
+    }
+
+    fn llm_response_from_openai_error(err: OpenAIError) -> LLMResponse {
+        let message = match &err {
+            OpenAIError::JSONDeserialize(_, content) => Self::extract_api_error_message(content),
+            OpenAIError::ApiError(api) => api.message.clone(),
+            other => Self::extract_api_error_message(&other.to_string()),
+        };
+        LLMResponse {
+            content: Some(message),
+            finish_reason: "error".to_string(),
+            tool_calls: Vec::new(),
+            usage: HashMap::new(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
+    }
 }
 
 impl LLMProvider for OpenAICompatProvider {
@@ -1222,50 +1268,54 @@ impl LLMProvider for OpenAICompatProvider {
                         > = std::collections::BTreeMap::new();
                         let cb = on_content_delta.as_ref();
                         while let Some(chunk) = stream.next().await {
-                            if let Ok(chunk) = chunk {
-                                for choice in &chunk.choices {
-                                    if let Some(delta_content) = &choice.delta.content {
-                                        let normalized = Self::non_overlapping_suffix(
-                                            &content_buf,
-                                            delta_content.as_str(),
-                                        );
-                                        if !normalized.is_empty() {
-                                            content_buf.push_str(normalized);
-                                            if let Some(cb) = cb {
-                                                cb(normalized.to_string()).await;
+                            let chunk = match chunk {
+                                Ok(chunk) => chunk,
+                                Err(e) => {
+                                    return Self::llm_response_from_openai_error(e);
+                                }
+                            };
+                            for choice in &chunk.choices {
+                                if let Some(delta_content) = &choice.delta.content {
+                                    let normalized = Self::non_overlapping_suffix(
+                                        &content_buf,
+                                        delta_content.as_str(),
+                                    );
+                                    if !normalized.is_empty() {
+                                        content_buf.push_str(normalized);
+                                        if let Some(cb) = cb {
+                                            cb(normalized.to_string()).await;
+                                        }
+                                    }
+                                }
+                                if let Some(ref tcs) = choice.delta.tool_calls {
+                                    for tc in tcs {
+                                        // (id, name, arguments) accumulated per index.
+                                        let entry =
+                                            tool_call_acc.entry(tc.index).or_insert_with(|| {
+                                                (None, String::new(), String::new())
+                                            });
+                                        if let Some(id) = &tc.id {
+                                            if !id.is_empty() {
+                                                entry.0 = Some(id.clone());
+                                            }
+                                        }
+                                        if let Some(func) = &tc.function {
+                                            if let Some(name) = &func.name {
+                                                if !name.is_empty() {
+                                                    entry.1 = name.clone();
+                                                }
+                                            }
+                                            if let Some(args) = &func.arguments {
+                                                entry.2.push_str(args);
                                             }
                                         }
                                     }
-                                    if let Some(ref tcs) = choice.delta.tool_calls {
-                                        for tc in tcs {
-                                            // (id, name, arguments) accumulated per index.
-                                            let entry =
-                                                tool_call_acc.entry(tc.index).or_insert_with(
-                                                    || (None, String::new(), String::new()),
-                                                );
-                                            if let Some(id) = &tc.id {
-                                                if !id.is_empty() {
-                                                    entry.0 = Some(id.clone());
-                                                }
-                                            }
-                                            if let Some(func) = &tc.function {
-                                                if let Some(name) = &func.name {
-                                                    if !name.is_empty() {
-                                                        entry.1 = name.clone();
-                                                    }
-                                                }
-                                                if let Some(args) = &func.arguments {
-                                                    entry.2.push_str(args);
-                                                }
-                                            }
-                                        }
-                                    }
-                                    if let Some(reason) = choice.finish_reason {
-                                        finish_reason = serde_json::to_value(reason)
-                                            .ok()
-                                            .and_then(|v| v.as_str().map(str::to_string))
-                                            .unwrap_or(finish_reason.clone());
-                                    }
+                                }
+                                if let Some(reason) = choice.finish_reason {
+                                    finish_reason = serde_json::to_value(reason)
+                                        .ok()
+                                        .and_then(|v| v.as_str().map(str::to_string))
+                                        .unwrap_or(finish_reason.clone());
                                 }
                             }
                         }
@@ -1287,7 +1337,7 @@ impl LLMProvider for OpenAICompatProvider {
                         );
                     }
                     Err(e) => {
-                        return OpenAICompatProvider::handle_error(Box::new(e));
+                        return Self::llm_response_from_openai_error(e);
                     }
                 }
             }
@@ -1642,6 +1692,41 @@ mod tests {
                 .as_ref()
                 .map(|a| a.len()),
             Some(1)
+        );
+    }
+
+    #[test]
+    fn extract_api_error_message_from_openrouter_json() {
+        let raw =
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#;
+        assert_eq!(
+            OpenAICompatProvider::extract_api_error_message(raw),
+            "No endpoints found that support image input"
+        );
+    }
+
+    #[test]
+    fn extract_api_error_message_from_deserialize_wrapper() {
+        let raw = r#"failed to deserialize api response: error:missing field content:{"error":{"message":"No endpoints found that support image input","code":404}}"#;
+        assert_eq!(
+            OpenAICompatProvider::extract_api_error_message(raw),
+            "No endpoints found that support image input"
+        );
+    }
+
+    #[test]
+    fn llm_response_from_json_deserialize_error_uses_api_message() {
+        let body =
+            r#"{"error":{"message":"No endpoints found that support image input","code":404}}"#;
+        let err = OpenAIError::JSONDeserialize(
+            serde_json::from_str::<serde_json::Value>("not json").unwrap_err(),
+            body.to_string(),
+        );
+        let response = OpenAICompatProvider::llm_response_from_openai_error(err);
+        assert_eq!(response.finish_reason, "error");
+        assert_eq!(
+            response.content.as_deref(),
+            Some("No endpoints found that support image input")
         );
     }
 }

@@ -9,6 +9,11 @@ path = "src/lib.rs"
 
 [dependencies]
 leptos = { version = "0.8", features = ["csr"] }
+# RFC3339 parsing for the sessions sidebar's date grouping
+# (`session_groups.rs`). Never calls `Utc::now()` (unsupported on
+# `wasm32-unknown-unknown` without the `wasmbind` feature) — "now" is always
+# passed in as `now_ms`, computed by the caller from `js_sys::Date::now()`.
+chrono = "0.4"
 wasm-bindgen = "0.2"
 wasm-bindgen-futures = "0.4"
 js-sys = "0.3"

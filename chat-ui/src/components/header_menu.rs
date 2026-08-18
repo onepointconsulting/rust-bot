@@ -145,7 +145,11 @@ pub fn ChatHeaderActions(
         on_toggle_expand();
     };
     let expand_label = move || {
-        if expanded.get() { "Restore" } else { "Expand" }
+        if expanded.get() {
+            "Restore"
+        } else {
+            "Expand"
+        }
     };
     let expand_aria = move || {
         if expanded.get() {

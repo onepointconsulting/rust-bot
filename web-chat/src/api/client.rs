@@ -10,6 +10,7 @@
 //! `POST /v1/login` shape.
 
 use chat_ui::api::{error_from_response, ApiError};
+use chat_ui::models::SessionListItem;
 use gloo_net::http::Request;
 use serde::{Deserialize, Serialize};
 
@@ -79,6 +80,27 @@ struct ChatCommandResponse {
 #[derive(Debug, Deserialize)]
 struct ExamplePromptsResponse {
     prompts: Vec<String>,
+}
+
+/// Mirrors the backend's `SessionSummary` (`src/api/types.rs`): `key` is the
+/// full session key across *every* channel (`cli:*`, `websocket:*`,
+/// `web-*`, ...) — this endpoint applies no server-side filtering, so
+/// callers narrow down to their own channel's keys themselves (see
+/// `app.rs`'s `session_prefix_for`).
+#[derive(Debug, Deserialize)]
+struct SessionSummaryWire {
+    key: String,
+    #[serde(default)]
+    created_at: String,
+    #[serde(default)]
+    updated_at: String,
+    #[serde(default)]
+    title: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SessionsListResponse {
+    sessions: Vec<SessionSummaryWire>,
 }
 
 /// Send a chat message (with optional image attachments) and return the
@@ -183,4 +205,35 @@ pub async fn fetch_example_prompts(token: &str) -> Result<Vec<String>, ApiError>
         .await
         .map(|body| body.prompts)
         .map_err(|e| ApiError::new(e.to_string()))
+}
+
+/// Fetch every persisted session across all channels (`GET /v1/sessions`),
+/// most-recently-updated first. Used by the sessions sidebar; callers
+/// filter down to their own channel's key prefix.
+pub async fn fetch_sessions(token: &str) -> Result<Vec<SessionListItem>, ApiError> {
+    let resp = Request::get("/v1/sessions")
+        .header("Authorization", &format!("Bearer {token}"))
+        .send()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+
+    if !resp.ok() {
+        return Err(error_from_response(resp).await);
+    }
+
+    let body = resp
+        .json::<SessionsListResponse>()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+
+    Ok(body
+        .sessions
+        .into_iter()
+        .map(|session| SessionListItem {
+            id: session.key,
+            title: session.title,
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+        })
+        .collect())
 }

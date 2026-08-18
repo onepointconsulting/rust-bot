@@ -56,3 +56,21 @@ pub struct OutgoingMessage {
     pub text: String,
     pub attachments: Vec<ImageAttachment>,
 }
+
+/// One entry in the sessions sidebar (see `session_groups` and
+/// `components::SessionsSidebar`).
+///
+/// Deliberately a thin, channel-agnostic shape: `id` is whatever key the
+/// owning frontend uses to identify a session (a WebSocket `chat_id` for
+/// `websockets-chat`, a raw session key for `web-chat`'s `GET /v1/sessions`).
+/// `created_at`/`updated_at` are RFC3339 strings exactly as the backend
+/// produces them (`chrono::DateTime::to_rfc3339`) — kept as strings rather
+/// than parsed here so this crate has no opinion on parse failure; grouping
+/// (`session_groups::group_sessions`) does its own tolerant parsing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SessionListItem {
+    pub id: String,
+    pub title: String,
+    pub created_at: String,
+    pub updated_at: String,
+}

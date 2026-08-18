@@ -9,3 +9,4 @@ pub mod api;
 pub mod components;
 pub mod markdown;
 pub mod models;
+pub mod session_groups;

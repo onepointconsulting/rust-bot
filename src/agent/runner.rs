@@ -6,7 +6,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::hook::{AgentHook, AgentHookContext};
 use crate::agent::tools::registry::ToolRegistry;
-use crate::providers::base::{BoxedStreamCallback, LLMProviderDyn, LLMResponse, ToolCallRequest};
+use crate::providers::base::{
+    BoxedStreamCallback, LLMProviderDyn, LLMResponse, ToolCallRequest,
+    is_unsupported_image_input_error,
+};
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
     find_legal_message_start, maybe_persist_tool_result, truncate_text,
@@ -19,6 +22,7 @@ use crate::utils::runtime::{
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
+const UNSUPPORTED_IMAGE_INPUT_MESSAGE: &str = "The selected model does not support image input. Switch to a vision-capable model, or send the message without an image.";
 const MAX_EMPTY_RETRIES: usize = 2;
 const MAX_LENGTH_RECOVERIES: usize = 3;
 const SNIP_SAFETY_BUFFER: usize = 1024;
@@ -802,6 +806,42 @@ impl AgentRunner {
         ));
     }
 
+    fn format_provider_error_for_user(detail: Option<&str>, fallback: &str) -> String {
+        let detail = detail.unwrap_or("").trim();
+        if is_unsupported_image_input_error(Some(detail)) {
+            return UNSUPPORTED_IMAGE_INPUT_MESSAGE.to_string();
+        }
+        if detail.is_empty() {
+            return fallback.to_string();
+        }
+        format!("Error: {detail}\n{fallback}")
+    }
+
+    async fn abort_with_provider_error(
+        spec: &AgentRunSpec,
+        hook: &Arc<dyn AgentHook>,
+        ctx: &mut AgentHookContext,
+        messages: &mut Vec<Value>,
+        detail: Option<&str>,
+    ) -> String {
+        let fallback = spec
+            .error_message
+            .as_deref()
+            .unwrap_or(DEFAULT_ERROR_MESSAGE);
+        let error_msg = Self::format_provider_error_for_user(detail, fallback);
+        if hook.wants_streaming() {
+            hook.on_stream(ctx, &error_msg).await;
+        }
+        hook.on_stream_end(ctx, false).await;
+        Self::append_final_message(messages, Some(&error_msg));
+        log::error!("Provider-signalled error: {}", error_msg);
+        ctx.stop_reason = Some("error".to_string());
+        ctx.error = Some(error_msg.clone());
+        ctx.final_content = Some(error_msg.clone());
+        hook.after_iteration(ctx).await;
+        error_msg
+    }
+
     async fn request_finalization_retry(
         &self,
         spec: &AgentRunSpec,
@@ -1008,6 +1048,25 @@ impl AgentRunner {
             // ── Text response branch ──────────────────────────────────────────
             let content = hook.finalize_content(&ctx, response.content.clone());
 
+            // Provider-signalled error — surface it before empty-retry logic
+            // so streaming clients receive the message in the open bubble
+            // instead of an empty stream_end.
+            if response.finish_reason == "error" {
+                let error_msg = Self::abort_with_provider_error(
+                    &spec,
+                    &hook,
+                    &mut ctx,
+                    &mut messages,
+                    content.as_deref().or(response.content.as_deref()),
+                )
+                .await;
+                stop_reason = "error".to_string();
+                final_result_content = Some(error_msg.clone());
+                final_error = Some(error_msg);
+                exhausted = false;
+                break 'outer;
+            }
+
             // Blank with retries remaining — keep going.
             if is_blank_text(content.as_deref()) && empty_retries < MAX_EMPTY_RETRIES {
                 hook.on_stream_end(&mut ctx, false).await;
@@ -1049,26 +1108,25 @@ impl AgentRunner {
                 continue;
             }
 
-            hook.on_stream_end(&mut ctx, false).await;
-
-            // Provider-signalled error.
+            // Finalization retry (or a late-arriving provider error) can still
+            // signal failure after the original response looked blank.
             if finish_reason == "error" {
-                let error_msg = format!(
-                    "Error: {}\n{}",
-                    "Provider-signalled error",
-                    spec.error_message
-                        .as_deref()
-                        .unwrap_or(DEFAULT_ERROR_MESSAGE)
-                );
+                let error_msg = Self::abort_with_provider_error(
+                    &spec,
+                    &hook,
+                    &mut ctx,
+                    &mut messages,
+                    final_content.as_deref(),
+                )
+                .await;
                 stop_reason = "error".to_string();
-                Self::append_final_message(&mut messages, Some(&error_msg));
-                log::error!("Provider-signalled error: {}", error_msg);
-                ctx.stop_reason = Some("error".to_string());
-                hook.after_iteration(&mut ctx).await;
-                final_result_content = Some(error_msg.to_string());
+                final_result_content = Some(error_msg.clone());
+                final_error = Some(error_msg);
                 exhausted = false;
                 break 'outer;
             }
+
+            hook.on_stream_end(&mut ctx, false).await;
 
             // Still blank after all retry paths.
             if is_blank_text(final_content.as_deref()) {
@@ -1240,6 +1298,140 @@ mod tests {
 
     fn make_runner() -> AgentRunner {
         AgentRunner::new(StubProvider::new())
+    }
+
+    struct FixedResponseProvider {
+        settings: GenerationSettings,
+        response: LLMResponse,
+    }
+
+    impl FixedResponseProvider {
+        fn new(response: LLMResponse) -> Arc<dyn LLMProviderDyn> {
+            Arc::new(Self {
+                settings: GenerationSettings::new(),
+                response,
+            })
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProviderDyn for FixedResponseProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            String::new()
+        }
+        async fn chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.response.clone()
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: f32,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.response.clone()
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.response.clone()
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+            _: Option<BoxedStreamCallback>,
+        ) -> LLMResponse {
+            self.response.clone()
+        }
+    }
+
+    struct RecordingHook {
+        wants_stream: bool,
+        stream_content: Mutex<String>,
+    }
+
+    impl RecordingHook {
+        fn streaming() -> Arc<Self> {
+            Arc::new(Self {
+                wants_stream: true,
+                stream_content: Mutex::new(String::new()),
+            })
+        }
+
+        fn streamed(&self) -> String {
+            self.stream_content
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for RecordingHook {
+        fn wants_streaming(&self) -> bool {
+            self.wants_stream
+        }
+
+        async fn on_stream(&self, _ctx: &mut AgentHookContext, delta: &str) {
+            self.stream_content
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push_str(delta);
+        }
+    }
+
+    fn vision_error_response() -> LLMResponse {
+        LLMResponse {
+            content: Some("No endpoints found that support image input".to_string()),
+            finish_reason: "error".to_string(),
+            tool_calls: Vec::new(),
+            usage: HashMap::new(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
     }
 
     #[test]
@@ -2107,5 +2299,70 @@ mod tests {
             .request_finalization_retry(&spec, &mut messages)
             .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
+    }
+
+    #[test]
+    fn format_provider_error_for_user_uses_vision_message() {
+        let msg = AgentRunner::format_provider_error_for_user(
+            Some("No endpoints found that support image input"),
+            DEFAULT_ERROR_MESSAGE,
+        );
+        assert_eq!(msg, UNSUPPORTED_IMAGE_INPUT_MESSAGE);
+        assert!(!msg.contains(DEFAULT_ERROR_MESSAGE));
+    }
+
+    #[test]
+    fn format_provider_error_for_user_includes_generic_detail() {
+        let msg = AgentRunner::format_provider_error_for_user(
+            Some("model overloaded"),
+            DEFAULT_ERROR_MESSAGE,
+        );
+        assert!(msg.contains("model overloaded"));
+        assert!(msg.contains(DEFAULT_ERROR_MESSAGE));
+    }
+
+    #[tokio::test]
+    async fn run_surfaces_unsupported_image_input_as_error() {
+        let runner = AgentRunner::new(FixedResponseProvider::new(vision_error_response()));
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({
+                    "role": "user",
+                    "content": "describe this image"
+                })],
+                model: "test".to_string(),
+                max_iterations: 2,
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(result.stop_reason, "error");
+        assert_eq!(
+            result.final_content.as_deref(),
+            Some(UNSUPPORTED_IMAGE_INPUT_MESSAGE)
+        );
+        assert_eq!(
+            result.error.as_deref(),
+            Some(UNSUPPORTED_IMAGE_INPUT_MESSAGE)
+        );
+    }
+
+    #[tokio::test]
+    async fn run_streams_unsupported_image_input_error_to_hook() {
+        let hook = RecordingHook::streaming();
+        let runner = AgentRunner::new(FixedResponseProvider::new(vision_error_response()));
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({
+                    "role": "user",
+                    "content": "describe this image"
+                })],
+                model: "test".to_string(),
+                max_iterations: 2,
+                hook: Some(Arc::clone(&hook) as Arc<dyn AgentHook>),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(result.stop_reason, "error");
+        assert_eq!(hook.streamed(), UNSUPPORTED_IMAGE_INPUT_MESSAGE);
     }
 }

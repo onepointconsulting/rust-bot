@@ -1,10 +1,12 @@
+use std::time::Duration;
+
 use gloo_storage::{SessionStorage, Storage};
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
-use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role};
+use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem};
 
 use crate::api;
 use crate::components::ChatShell;
@@ -16,6 +18,17 @@ const ENTRIES_STORAGE_KEY: &str = "rust-bot-web-chat-entries";
 
 /// Max user/assistant exchanges kept in SessionStorage across refresh.
 const MAX_STORED_TURNS: usize = 10;
+
+/// How long after a reply lands to re-request the sessions list, to pick up
+/// a title that was still generating when the immediately-on-completion
+/// refresh ran (see `load_sessions`'s call sites in `App`). Title generation
+/// is a fire-and-forget background LLM call kicked off only once the turn
+/// finishes server-side, so it is essentially never done by the time this
+/// request's own response comes back. There is no push notification for
+/// "title ready", so this is a one-shot, best-effort timer rather than a
+/// guarantee: if the LLM call is unusually slow, the real title only shows
+/// up on the *next* refresh (another message, a new chat, or a reload).
+const TITLE_REFRESH_DELAY_MS: u32 = 4_000;
 
 fn read_stored_token() -> Option<String> {
     SessionStorage::get::<String>(TOKEN_STORAGE_KEY).ok()
@@ -84,10 +97,17 @@ fn trim_to_max_turns(entries: Vec<ChatEntry>, max_turns: usize) -> Vec<ChatEntry
     entries[start..].to_vec()
 }
 
+/// Shared prefix for every session key this app mints for `email` (see
+/// `session_id_for`). Used to filter `GET /v1/sessions`'s all-channel result
+/// down to just this user's `web-chat` sessions for the sidebar.
+fn session_prefix_for(email: &str) -> String {
+    format!("web-{}-", email.replace('@', "_at_"))
+}
+
 fn session_id_for(email: &str) -> String {
     format!(
-        "web-{}-{}",
-        email.replace('@', "_at_"),
+        "{}{}",
+        session_prefix_for(email),
         js_sys::Date::now() as u64
     )
 }
@@ -132,6 +152,8 @@ pub fn App() -> impl IntoView {
     let chat_error = RwSignal::new(None::<String>);
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
+    let sessions = RwSignal::new(Vec::<SessionListItem>::new());
+    let sidebar_open = RwSignal::new(false);
 
     let load_example_prompts = move |jwt: String| {
         spawn_local(async move {
@@ -141,10 +163,31 @@ pub fn App() -> impl IntoView {
         });
     };
 
+    // Refresh the sessions sidebar: fetch every persisted session and keep
+    // only this user's `web-chat` keys (see `session_prefix_for`), in the
+    // all-channel order `GET /v1/sessions` already returns them
+    // (most-recently-updated first).
+    let load_sessions = move |jwt: String, email: String| {
+        spawn_local(async move {
+            if let Ok(all) = api::fetch_sessions(&jwt).await {
+                let prefix = session_prefix_for(&email);
+                let filtered: Vec<SessionListItem> = all
+                    .into_iter()
+                    .filter(|session| session.id.starts_with(&prefix))
+                    .collect();
+                sessions.set(filtered);
+            }
+        });
+    };
+
     // Session restored from a previous page load: fetch prompts up front so
-    // they're ready the moment the (empty) chat pane renders.
+    // they're ready the moment the (empty) chat pane renders, and refresh
+    // the sidebar with this user's persisted sessions.
     if let Some(jwt) = token.get_untracked() {
-        load_example_prompts(jwt);
+        load_example_prompts(jwt.clone());
+        if let Some(email) = read_stored_email() {
+            load_sessions(jwt, email);
+        }
     }
 
     let push_entry = move |role: Role, content: String, attachments: Vec<ImageAttachment>| {
@@ -180,6 +223,7 @@ pub fn App() -> impl IntoView {
                     entries.set(Vec::new());
                     next_id.set(0);
                     load_example_prompts(jwt.clone());
+                    load_sessions(jwt.clone(), email);
                     token.set(Some(jwt));
                 }
                 Err(err) => login_error.set(Some(err.to_string())),
@@ -198,6 +242,8 @@ pub fn App() -> impl IntoView {
         next_id.set(0);
         example_prompts.set(Vec::new());
         composer_draft.set(String::new());
+        sessions.set(Vec::new());
+        sidebar_open.set(false);
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -208,9 +254,27 @@ pub fn App() -> impl IntoView {
         chat_pending.set(true);
         let session = session_id.get();
         let image_urls: Vec<String> = attachments.into_iter().map(|a| a.url).collect();
+        let jwt_for_refresh = jwt.clone();
         spawn_local(async move {
             match api::send_chat_message(&jwt, &session, &text, &image_urls).await {
-                Ok(reply) => push_entry(Role::Assistant, reply, Vec::new()),
+                Ok(reply) => {
+                    push_entry(Role::Assistant, reply, Vec::new());
+                    // Refresh now (title generation was just scheduled
+                    // server-side, so this almost always still shows the
+                    // "New chat" placeholder) and again after a short delay
+                    // to pick up the title once that background LLM call
+                    // actually finishes — see `TITLE_REFRESH_DELAY_MS`.
+                    if let Some(email) = read_stored_email() {
+                        load_sessions(jwt_for_refresh.clone(), email.clone());
+                        spawn_local(async move {
+                            gloo_timers::future::sleep(Duration::from_millis(u64::from(
+                                TITLE_REFRESH_DELAY_MS,
+                            )))
+                            .await;
+                            load_sessions(jwt_for_refresh, email);
+                        });
+                    }
+                }
                 Err(err) => chat_error.set(Some(err.to_string())),
             }
             chat_pending.set(false);
@@ -229,16 +293,25 @@ pub fn App() -> impl IntoView {
         let session = session_id_for(&email);
         persist_session(&session);
         session_id.set(session.clone());
+        let jwt_for_refresh = jwt.clone();
+        let email_for_refresh = email.clone();
         spawn_local(async move {
             if let Err(err) = api::start_new_session(&jwt, &session).await {
                 chat_error.set(Some(err.to_string()));
             }
         });
+        load_sessions(jwt_for_refresh, email_for_refresh);
     };
 
     let open_chat = move || chat_open.set(true);
     let close_chat = move || chat_open.set(false);
     let toggle_expand = move || expanded.update(|value| *value = !*value);
+    let toggle_sidebar = move || sidebar_open.update(|open| *open = !*open);
+    let close_sidebar = move || sidebar_open.set(false);
+    // Switching sessions isn't implemented yet (list-only sidebar for now —
+    // see `chat_ui::components::SessionsSidebar`'s doc comment): there is no
+    // history-fetch API to repopulate `entries` from a past session.
+    let on_select_session = move |_session_id: String| {};
 
     view! {
         <Show
@@ -263,6 +336,9 @@ pub fn App() -> impl IntoView {
                     pending=Signal::derive(move || chat_pending.get())
                     error=Signal::derive(move || chat_error.get())
                     example_prompts=Signal::derive(move || example_prompts.get())
+                    sessions=Signal::derive(move || sessions.get())
+                    active_session_id=Signal::derive(move || Some(session_id.get()))
+                    sidebar_open=Signal::derive(move || sidebar_open.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat
@@ -270,6 +346,9 @@ pub fn App() -> impl IntoView {
                     on_minimize=close_chat
                     expanded=Signal::derive(move || expanded.get())
                     on_toggle_expand=toggle_expand
+                    on_toggle_sidebar=toggle_sidebar
+                    on_close_sidebar=close_sidebar
+                    on_select_session=on_select_session
                 />
             </Show>
         </Show>

@@ -18,7 +18,7 @@ use crate::{
     session::{
         SESSION_TITLE_METADATA_KEY,
         history_visibility::is_hidden_history_message,
-        keys::{COMMAND_KEY, HIDDEN_HISTORY_KEY},
+        keys::{COMMAND_KEY},
     },
     utils::helpers::{
         ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
@@ -763,6 +763,7 @@ impl SessionManager {
                 None,
             )
             .await;
+        log::info!("Title generation response: {:?}", response);
         let title = Self::clean_generated_title(response.content);
         if title.is_empty() || title.to_lowercase().starts_with("error") {
             log::debug!(

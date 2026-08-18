@@ -5,7 +5,8 @@
 //! this module owns both directions of that conversation from the browser's
 //! side of the connection.
 //!
-//! * Outbound: [`ClientEnvelope`], currently `message` and `new_chat`.
+//! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`, and
+//!   `list_chats`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -77,6 +78,34 @@ impl ClientEnvelope {
             webui: true,
         }
     }
+
+    /// Ask the gateway for this connection's forkable `websocket:*` chats.
+    /// The reply is a `chats` event (see [`ServerEvent::ChatsList`]).
+    pub fn list_chats() -> Self {
+        Self {
+            type_: "list_chats",
+            chat_id: None,
+            turn_id: None,
+            content: None,
+            media: None,
+            webui: true,
+        }
+    }
+}
+
+/// One chat summary entry inside a `chats` event's list — mirrors the
+/// backend's `list_websocket_chats` output shape
+/// (`src/channels/websocket/runtime.rs`): a `websocket:*` session with its
+/// `key`/`path` stripped and replaced by a bare `chat_id`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ChatSummary {
+    pub chat_id: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub updated_at: String,
 }
 
 /// One event the gateway can push down the WebSocket connection.
@@ -175,6 +204,10 @@ pub enum ServerEvent {
         chat_id: String,
         edits: Vec<HashMap<String, String>>,
     },
+    /// Reply to a `list_chats` envelope: every `websocket:*` chat on this
+    /// connection, most-recently-updated first. Not scoped to any one
+    /// `chat_id` — see [`ServerEvent::chat_id`].
+    ChatsList { chats: Vec<ChatSummary> },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -202,7 +235,7 @@ impl ServerEvent {
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
             }
-            ServerEvent::Unknown(_) => None,
+            ServerEvent::ChatsList { .. } | ServerEvent::Unknown(_) => None,
         }
     }
 }
@@ -333,6 +366,11 @@ struct FileEditWire {
     edits: Vec<HashMap<String, String>>,
 }
 
+#[derive(Deserialize)]
+struct ChatsListWire {
+    chats: Vec<ChatSummary>,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -420,6 +458,9 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             chat_id: w.chat_id,
             edits: w.edits,
         }),
+        "chats" => {
+            decode::<ChatsListWire>(&value).map(|w| ServerEvent::ChatsList { chats: w.chats })
+        }
         _ => Ok(ServerEvent::Unknown(value)),
     }
 }
@@ -709,6 +750,60 @@ mod tests {
                 chat_id: "chat-1".to_string(),
                 edits: vec![expected_edit],
             }
+        );
+    }
+
+    #[test]
+    fn parses_chats_list() {
+        let raw = r#"{"event":"chats","chats":[
+            {"chat_id":"chat-1","title":"Fix the login bug","created_at":"2024-01-01T00:00:00Z","updated_at":"2024-01-02T00:00:00Z"},
+            {"chat_id":"chat-2","title":"","created_at":"2024-01-03T00:00:00Z","updated_at":"2024-01-03T00:00:00Z"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ChatsList {
+                chats: vec![
+                    ChatSummary {
+                        chat_id: "chat-1".to_string(),
+                        title: "Fix the login bug".to_string(),
+                        created_at: "2024-01-01T00:00:00Z".to_string(),
+                        updated_at: "2024-01-02T00:00:00Z".to_string(),
+                    },
+                    ChatSummary {
+                        chat_id: "chat-2".to_string(),
+                        title: String::new(),
+                        created_at: "2024-01-03T00:00:00Z".to_string(),
+                        updated_at: "2024-01-03T00:00:00Z".to_string(),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_empty_chats_list() {
+        let raw = r#"{"event":"chats","chats":[]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(event, ServerEvent::ChatsList { chats: Vec::new() });
+    }
+
+    #[test]
+    fn chats_list_has_no_scoping_chat_id() {
+        let event = ServerEvent::ChatsList { chats: Vec::new() };
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_list_chats_serializes_expected_shape() {
+        let envelope = ClientEnvelope::list_chats();
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "list_chats",
+                "webui": true,
+            })
         );
     }
 
