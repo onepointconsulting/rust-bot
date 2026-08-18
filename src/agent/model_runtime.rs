@@ -112,31 +112,37 @@ impl ModelRuntimeResolver {
         provider_cache: &Mutex<HashMap<String, Arc<dyn LLMProviderDyn>>>,
         name: &str,
     ) -> Result<ModelRuntime, String> {
-        let (model, provider_cfg_name, max_tokens, context_window_tokens, temperature, reasoning_effort) =
-            if name == RESERVED_MODEL_PRESET_NAME {
-                let a = &config.agents;
-                (
-                    a.model.clone(),
-                    a.provider.clone(),
-                    a.max_tokens,
-                    a.context_window_tokens,
-                    a.temperature,
-                    a.reasoning_effort.clone(),
-                )
-            } else {
-                let preset = config
-                    .model_presets
-                    .get(name)
-                    .ok_or_else(|| format!("Unknown model preset '{name}'"))?;
-                (
-                    preset.model.clone(),
-                    preset.provider.clone(),
-                    preset.max_tokens,
-                    preset.context_window_tokens,
-                    preset.temperature,
-                    preset.reasoning_effort.clone(),
-                )
-            };
+        let (
+            model,
+            provider_cfg_name,
+            max_tokens,
+            context_window_tokens,
+            temperature,
+            reasoning_effort,
+        ) = if name == RESERVED_MODEL_PRESET_NAME {
+            let a = &config.agents;
+            (
+                a.model.clone(),
+                a.provider.clone(),
+                a.max_tokens,
+                a.context_window_tokens,
+                a.temperature,
+                a.reasoning_effort.clone(),
+            )
+        } else {
+            let preset = config
+                .model_presets
+                .get(name)
+                .ok_or_else(|| format!("Unknown model preset '{name}'"))?;
+            (
+                preset.model.clone(),
+                preset.provider.clone(),
+                preset.max_tokens,
+                preset.context_window_tokens,
+                preset.temperature,
+                preset.reasoning_effort.clone(),
+            )
+        };
 
         let resolved_provider_name = resolve_concrete_provider_name(config, &provider_cfg_name)?;
 
@@ -169,7 +175,10 @@ impl ModelRuntimeResolver {
     /// process default — but it's kept for a future admin-level setter.
     pub fn select_preset(&self, name: &str) -> Result<ModelRuntime, String> {
         let runtime = self.resolve_preset(name)?;
-        *self.default_runtime.lock().unwrap_or_else(|e| e.into_inner()) = runtime.clone();
+        *self
+            .default_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = runtime.clone();
         Ok(runtime)
     }
 
@@ -183,7 +192,10 @@ impl ModelRuntimeResolver {
         if model.is_empty() {
             return Err("select_model: model must not be empty".to_string());
         }
-        let mut guard = self.default_runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .default_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.model = model.to_string();
         guard.preset_name = RESERVED_MODEL_PRESET_NAME.to_string();
         Ok(guard.clone())
@@ -202,7 +214,10 @@ impl ModelRuntimeResolver {
     /// touching any other field. Mirrors nanobot's
     /// `RuntimeResolver.select_context_window`.
     pub fn select_context_window(&self, tokens: u64) -> ModelRuntime {
-        let mut guard = self.default_runtime.lock().unwrap_or_else(|e| e.into_inner());
+        let mut guard = self
+            .default_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         guard.context_window_tokens = tokens;
         guard.clone()
     }
@@ -375,7 +390,10 @@ mod tests {
         assert_eq!(runtime.model, "claude-opus-4-6");
         assert_eq!(runtime.preset_name, RESERVED_MODEL_PRESET_NAME);
         assert_eq!(resolver.current_default().model, "claude-opus-4-6");
-        assert_eq!(resolver.current_default().preset_name, RESERVED_MODEL_PRESET_NAME);
+        assert_eq!(
+            resolver.current_default().preset_name,
+            RESERVED_MODEL_PRESET_NAME
+        );
     }
 
     #[test]

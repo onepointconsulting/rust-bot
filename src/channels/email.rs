@@ -6,10 +6,7 @@ use regex::Regex;
 use std::{
     collections::{HashMap, HashSet},
     path::{Path, PathBuf},
-    sync::{
-        Arc, LazyLock, Mutex,
-        atomic::Ordering,
-    },
+    sync::{Arc, LazyLock, Mutex, atomic::Ordering},
 };
 
 use futures::TryStreamExt;
@@ -29,9 +26,7 @@ use crate::{
 use async_imap::{Client, Session};
 use lettre::{
     AsyncSmtpTransport, AsyncTransport, Message, Tokio1Executor,
-    message::{
-        Attachment, Mailbox, MessageBuilder, MultiPart, SinglePart, header::ContentType,
-    },
+    message::{Attachment, Mailbox, MessageBuilder, MultiPart, SinglePart, header::ContentType},
     transport::smtp::authentication::Credentials,
 };
 use mailparse::{DispositionType, MailHeaderMap, ParsedMail, addrparse_header, parse_mail};
@@ -209,7 +204,6 @@ pub struct EmailChannel {
 }
 
 impl EmailChannel {
-
     const MAX_PROCESSED_UIDS: usize = 100000;
 
     pub fn new(
@@ -796,9 +790,7 @@ impl EmailChannel {
                 "application/vnd.openxmlformats-officedocument.wordprocessingml.document"
             }
             Some("xls") => "application/vnd.ms-excel",
-            Some("xlsx") => {
-                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
-            }
+            Some("xlsx") => "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
             _ => "application/octet-stream",
         };
         ContentType::parse(mime).unwrap_or_else(|_| {
@@ -1115,7 +1107,8 @@ Set verify_dkim=true and verify_spf=true for anti-spoofing protection."
                 let metadata = item.get("metadata").and_then(|v| {
                     serde_json::from_value::<HashMap<String, serde_json::Value>>(v.clone()).ok()
                 });
-                let res = self.handle_message(sender, sender, content, media, metadata, None, false, None)
+                let res = self
+                    .handle_message(sender, sender, content, media, metadata, None, false, None)
                     .await;
                 if let Err(e) = res {
                     log::error!("Error handling email message: {e}");
@@ -1661,10 +1654,8 @@ mod tests {
 
     #[test]
     fn build_email_message_attaches_media_paths() {
-        let dir = std::env::temp_dir().join(format!(
-            "rust-bot-email-attach-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("rust-bot-email-attach-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         let pdf_path = dir.join("report.pdf");

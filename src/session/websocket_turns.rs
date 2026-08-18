@@ -90,12 +90,15 @@ impl WebsocketTurnRegistry {
     /// always admits, regardless of how many other owners are already
     /// active for this chat.
     pub fn start_turn(&mut self, chat_id: &str, owner: &str, turn_id: Option<&str>) {
-        self.turns.entry(chat_id.to_string()).or_default().upsert_latest(OwnedTurn {
-            owner: owner.to_string(),
-            started_at: now_wall_clock_secs(),
-            turn_id: turn_id.map(str::to_string),
-            transcript_persistence_failed: false,
-        });
+        self.turns
+            .entry(chat_id.to_string())
+            .or_default()
+            .upsert_latest(OwnedTurn {
+                owner: owner.to_string(),
+                started_at: now_wall_clock_secs(),
+                turn_id: turn_id.map(str::to_string),
+                transcript_persistence_failed: false,
+            });
     }
 
     /// Admit a new turn only if `chat_id` has no active owner yet; mints and
@@ -122,7 +125,10 @@ impl WebsocketTurnRegistry {
     /// `websocket_turn_wall_started_at(cid) is not None` idiom, so no
     /// separate boolean wrapper is added here.
     pub fn websocket_turn_wall_started_at(&self, chat_id: &str) -> Option<f64> {
-        self.turns.get(chat_id).and_then(ChatTurns::latest).map(|t| t.started_at)
+        self.turns
+            .get(chat_id)
+            .and_then(ChatTurns::latest)
+            .map(|t| t.started_at)
     }
 
     /// The latest owner's WebUI-supplied turn identity, if it has one.
@@ -130,7 +136,10 @@ impl WebsocketTurnRegistry {
     /// active if that owner's `turn_id` happens to be `None` (matches
     /// nanobot's own projection-clearing behavior in that case).
     pub fn websocket_turn_id(&self, chat_id: &str) -> Option<String> {
-        self.turns.get(chat_id).and_then(ChatTurns::latest).and_then(|t| t.turn_id.clone())
+        self.turns
+            .get(chat_id)
+            .and_then(ChatTurns::latest)
+            .and_then(|t| t.turn_id.clone())
     }
 
     /// Whether `owner` is still registered for `chat_id` with exactly this
@@ -146,7 +155,9 @@ impl WebsocketTurnRegistry {
     /// incomplete canonical transcript. Mirrors
     /// `websocket_turn_transcript_persistence_failed`.
     pub fn transcript_persistence_failed(&self, chat_id: &str, owner: Option<&str>) -> bool {
-        let Some(chat) = self.turns.get(chat_id) else { return false };
+        let Some(chat) = self.turns.get(chat_id) else {
+            return false;
+        };
         let turn = match owner {
             Some(o) => chat.find(o),
             None => chat.latest(),
@@ -157,10 +168,20 @@ impl WebsocketTurnRegistry {
     /// Keep `owner`'s turn active past normal completion because a canonical
     /// display event failed to persist. Mirrors
     /// `mark_websocket_turn_transcript_persistence_failed`.
-    pub fn mark_transcript_persistence_failed(&mut self, chat_id: &str, owner: Option<&str>) -> bool {
-        let Some(owner) = owner.filter(|o| !o.is_empty()) else { return false };
-        let Some(chat) = self.turns.get_mut(chat_id) else { return false };
-        let Some(turn) = chat.0.iter_mut().find(|t| t.owner == owner) else { return false };
+    pub fn mark_transcript_persistence_failed(
+        &mut self,
+        chat_id: &str,
+        owner: Option<&str>,
+    ) -> bool {
+        let Some(owner) = owner.filter(|o| !o.is_empty()) else {
+            return false;
+        };
+        let Some(chat) = self.turns.get_mut(chat_id) else {
+            return false;
+        };
+        let Some(turn) = chat.0.iter_mut().find(|t| t.owner == owner) else {
+            return false;
+        };
         turn.transcript_persistence_failed = true;
         true
     }
@@ -176,10 +197,16 @@ impl WebsocketTurnRegistry {
         owner: Option<&str>,
         preserve_persistence_failure: bool,
     ) -> bool {
-        let Some(owner) = owner.filter(|o| !o.is_empty()) else { return false };
+        let Some(owner) = owner.filter(|o| !o.is_empty()) else {
+            return false;
+        };
         let should_remove_chat = {
-            let Some(chat) = self.turns.get_mut(chat_id) else { return false };
-            let Some(turn) = chat.find(owner) else { return false };
+            let Some(chat) = self.turns.get_mut(chat_id) else {
+                return false;
+            };
+            let Some(turn) = chat.find(owner) else {
+                return false;
+            };
             if preserve_persistence_failure && turn.transcript_persistence_failed {
                 return false;
             }
@@ -216,7 +243,11 @@ mod tests {
     fn register_queued_turn_if_idle_refuses_when_chat_already_running() {
         let mut registry = WebsocketTurnRegistry::default();
         registry.register_queued_turn_if_idle("chat-1", None);
-        assert!(registry.register_queued_turn_if_idle("chat-1", None).is_none());
+        assert!(
+            registry
+                .register_queued_turn_if_idle("chat-1", None)
+                .is_none()
+        );
     }
 
     #[test]
@@ -249,7 +280,10 @@ mod tests {
     fn websocket_turn_id_is_none_when_latest_owner_has_no_turn_id() {
         let mut registry = WebsocketTurnRegistry::default();
         registry.start_turn("chat-1", "owner-a", Some("turn-1"));
-        assert_eq!(registry.websocket_turn_id("chat-1"), Some("turn-1".to_string()));
+        assert_eq!(
+            registry.websocket_turn_id("chat-1"),
+            Some("turn-1".to_string())
+        );
 
         registry.start_turn("chat-1", "owner-b", None);
         assert_eq!(
@@ -264,7 +298,10 @@ mod tests {
         let mut registry = WebsocketTurnRegistry::default();
         registry.start_turn("chat-1", "owner-a", Some("turn-1"));
         registry.start_turn("chat-1", "owner-b", Some("turn-2"));
-        assert_eq!(registry.websocket_turn_id("chat-1"), Some("turn-2".to_string()));
+        assert_eq!(
+            registry.websocket_turn_id("chat-1"),
+            Some("turn-2".to_string())
+        );
 
         registry.start_turn("chat-1", "owner-a", Some("turn-3"));
         assert_eq!(

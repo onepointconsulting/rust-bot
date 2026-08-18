@@ -3,7 +3,11 @@ use std::path::PathBuf;
 use chrono::{Datelike, Local, Months};
 use dotenv::dotenv;
 use rust_bot::{
-    agent::tools::{base::Tool, gmail::{GmailEmailSendTool, GmailEmailsTool}}, config::loader::load_config,
+    agent::tools::{
+        base::Tool,
+        gmail::{GmailEmailSendTool, GmailEmailsTool},
+    },
+    config::loader::load_config,
 };
 
 /// Gmail `after` is inclusive; `before` is exclusive — use the 1st of next month
@@ -29,8 +33,9 @@ fn current_month_gmail_params(limit: u32) -> serde_json::Value {
 async fn test_gmail_tool() {
     // Note: this test will only work if you have a valid client_secret.json and token_cache.json in the default workspace.
     dotenv().ok();
-    let config =
-        load_config(Some(PathBuf::from("./configs/openai-compat/config_gmail.json")));
+    let config = load_config(Some(PathBuf::from(
+        "./configs/openai-compat/config_gmail.json",
+    )));
     let gmail_tool = GmailEmailsTool::new(config.tools.gmail);
     let params = current_month_gmail_params(10);
     let result = gmail_tool.execute(&params).await;
@@ -42,8 +47,9 @@ async fn test_gmail_tool() {
 #[ignore]
 async fn test_gmail_send_tool() {
     dotenv().ok();
-    let config =
-        load_config(Some(PathBuf::from("./configs/openai-compat/config_gmail.json")));
+    let config = load_config(Some(PathBuf::from(
+        "./configs/openai-compat/config_gmail.json",
+    )));
     let gmail_tool = GmailEmailSendTool::new(config.tools.gmail);
     let params = serde_json::json!({
         "to": "gil.fernandes@gmail.com",

@@ -9,10 +9,26 @@ use chrono::Utc;
 
 use crate::{
     agent::{
-        context::ContextBuilder, hook::{AgentHook, AgentHookContext}, model_runtime::ModelRuntimeResolver, runner::{AgentRunResult, AgentRunSpec, AgentRunner}, skills::SkillsLoader, tools::{filesystem::FsToolConfig, registry::ToolRegistry, shell::ShellTool},
-    }, bus::{events::InboundMessage, queue::MessageBus}, config::schema::{Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, SubagentConfig, WebToolsConfig}, providers::base::LLMProviderDyn, session::manager::SessionManager, utils::{
-        prompt_templates::render_template, registry_helper::{
-            filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
+        context::ContextBuilder,
+        hook::{AgentHook, AgentHookContext},
+        model_runtime::ModelRuntimeResolver,
+        runner::{AgentRunResult, AgentRunSpec, AgentRunner},
+        skills::SkillsLoader,
+        tools::{filesystem::FsToolConfig, registry::ToolRegistry, shell::ShellTool},
+    },
+    bus::{events::InboundMessage, queue::MessageBus},
+    config::schema::{
+        Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig,
+        OcrToolConfig, SubagentConfig, WebToolsConfig,
+    },
+    providers::base::LLMProviderDyn,
+    session::manager::SessionManager,
+    utils::{
+        prompt_templates::render_template,
+        registry_helper::{
+            filesystem_tool_scope, register_conversion_tools, register_filesystem_tools,
+            register_gmail_tools, register_image_generation_tools, register_ocr_tools,
+            register_web_tools,
         },
     },
 };
@@ -184,8 +200,7 @@ impl SubagentManager {
                     running_tasks.lock().unwrap().remove(&task_id_bg);
                     log::info!("Removed from running tasks: {}", task_id_bg);
                     if let Some(session_key) = session_key_owned {
-                        if let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key)
-                        {
+                        if let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key) {
                             tasks.remove(&task_id_bg);
                             log::info!("Removed from tasks: {}", task_id_bg);
                         }
@@ -207,7 +222,9 @@ impl SubagentManager {
         }
 
         log::info!("Spawned subagent [{}]: {}", task_id, display_label_owned);
-        return format!("Subagent [{display_label_owned}] started (id: {task_id}). I'll notify you when it completes.");
+        return format!(
+            "Subagent [{display_label_owned}] started (id: {task_id}). I'll notify you when it completes."
+        );
     }
 
     /// Execute the subagent task and announce the result.
@@ -281,13 +298,9 @@ impl SubagentManager {
             &mut tools,
         );
         register_conversion_tools(
-            &self.docx_config, 
-            &FsToolConfig::new(Some(
-                self.workspace.clone()), 
-                allowed_dir,
-                 Some(extra_read)
-            ), 
-            &mut tools
+            &self.docx_config,
+            &FsToolConfig::new(Some(self.workspace.clone()), allowed_dir, Some(extra_read)),
+            &mut tools,
         );
         register_image_generation_tools(&self.image_generation_config, &self.workspace, &mut tools);
 
@@ -301,7 +314,9 @@ impl SubagentManager {
             serde_json::json!({"role": "user", "content": task}),
         ];
         let runtime = match session_key {
-            Some(key) => self.runtime_resolver.resolve_for_session_key(&self.sessions, key),
+            Some(key) => self
+                .runtime_resolver
+                .resolve_for_session_key(&self.sessions, key),
             None => self.runtime_resolver.current_default(),
         };
         let runner = AgentRunner::new(runtime.provider.clone());
@@ -336,9 +351,9 @@ impl SubagentManager {
                 .await;
             return Ok(());
         }
-        let final_result = result.final_content.unwrap_or(
-            "Task completed but no final response was generated.".to_string(),
-        );
+        let final_result = result
+            .final_content
+            .unwrap_or("Task completed but no final response was generated.".to_string());
         log::info!("Subagent [{task_id}] completed successfully");
         self.announce_result(task_id, label, task, &final_result, origin, "ok")
             .await;
@@ -434,7 +449,10 @@ impl SubagentManager {
         ctx.insert("result", result);
         let announce_content_result = render_template("agent/subagent_announce.md", &ctx, true);
 
-        log::info!("Announcing subagent result: {}", announce_content_result.is_ok());
+        log::info!(
+            "Announcing subagent result: {}",
+            announce_content_result.is_ok()
+        );
 
         if let Ok(announce_content) = announce_content_result {
             let origin_channel = origin.get("channel").map(|s| s.as_str()).unwrap_or("cli");
@@ -1010,10 +1028,7 @@ mod tests {
             tool_calls: vec![ToolCallRequest {
                 id: "call_read".to_string(),
                 name: "read_file".to_string(),
-                arguments: HashMap::from([(
-                    "path".to_string(),
-                    serde_json::json!("missing.txt"),
-                )]),
+                arguments: HashMap::from([("path".to_string(), serde_json::json!("missing.txt"))]),
                 extra_content: None,
                 provider_specific_fields: None,
                 function_provider_specific_fields: None,
@@ -1030,12 +1045,8 @@ mod tests {
     ) -> (Result<(), String>, InboundMessage) {
         let tmp = TempDir::new().unwrap();
         let bus = Arc::new(MessageBus::new());
-        let manager = SubagentManager::new_simple(
-            provider,
-            tmp.path().to_path_buf(),
-            bus.clone(),
-            4096,
-        );
+        let manager =
+            SubagentManager::new_simple(provider, tmp.path().to_path_buf(), bus.clone(), 4096);
         let origin = origin("cli", "direct");
         let result = manager
             .run_subagent_inner("task-1", task, label, &origin, None)
@@ -1045,7 +1056,10 @@ mod tests {
             Ok(bus) => bus,
             Err(_) => panic!("manager should release bus Arc"),
         };
-        let msg = bus.consume_inbound().await.expect("announce should publish");
+        let msg = bus
+            .consume_inbound()
+            .await
+            .expect("announce should publish");
         (result, msg)
     }
 
@@ -1103,12 +1117,7 @@ mod tests {
     async fn run_subagent_inner_empty_final_response_announces_fallback() {
         let empty = LLMResponse::new();
         let (result, msg) = run_inner_and_consume(
-            ScriptedProvider::arc(vec![
-                empty.clone(),
-                empty.clone(),
-                empty.clone(),
-                empty,
-            ]),
+            ScriptedProvider::arc(vec![empty.clone(), empty.clone(), empty.clone(), empty]),
             "empty reply task",
             "worker",
         )

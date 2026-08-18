@@ -18,9 +18,8 @@ use crate::cron::{
 const MAX_RUN_HISTORY: usize = 20;
 
 /// Async handler invoked when a job runs.
-pub type CronJobCallback = Arc<
-    dyn Fn(CronJob) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync,
->;
+pub type CronJobCallback =
+    Arc<dyn Fn(CronJob) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
 /// Result of [`CronService::remove_job`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -216,11 +215,7 @@ impl CronService {
     }
 
     /// Enable or disable a job.
-    pub async fn enable_job(
-        self: &Arc<Self>,
-        job_id: &str,
-        enabled: bool,
-    ) -> Option<CronJob> {
+    pub async fn enable_job(self: &Arc<Self>, job_id: &str, enabled: bool) -> Option<CronJob> {
         let mut inner = self.inner.lock().await;
         let store = inner.store_mut();
         let job = store.jobs.iter_mut().find(|j| j.id == job_id)?;
@@ -319,10 +314,7 @@ impl CronService {
             }
 
             let running = inner.running;
-            let next_wake = inner
-                .store
-                .as_ref()
-                .and_then(|s| Self::get_next_wake_ms(s));
+            let next_wake = inner.store.as_ref().and_then(|s| Self::get_next_wake_ms(s));
 
             let delay_ms = next_wake.map(|wake| (wake - now_ms()).max(0));
             (running, next_wake, delay_ms)
@@ -359,12 +351,7 @@ impl CronService {
             store
                 .jobs
                 .iter()
-                .filter(|j| {
-                    j.enabled
-                        && j.state
-                            .next_run_at_ms
-                            .is_some_and(|t| now >= t)
-                })
+                .filter(|j| j.enabled && j.state.next_run_at_ms.is_some_and(|t| now >= t))
                 .map(|j| j.id.clone())
                 .collect()
         };
@@ -396,11 +383,7 @@ impl CronService {
             let Some(job) = store.jobs.iter().find(|j| j.id == job_id) else {
                 return;
             };
-            (
-                inner.on_job.clone(),
-                job.name.clone(),
-                job.id.clone(),
-            )
+            (inner.on_job.clone(), job.name.clone(), job.id.clone())
         };
 
         log::info!("Cron: executing job '{job_name}' ({job_id_log})");

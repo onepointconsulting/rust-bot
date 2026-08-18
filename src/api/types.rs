@@ -111,7 +111,7 @@ pub struct ChatCommandRequest {
     #[serde(default)]
     #[schema(example = "new")]
     pub command: ChatCommand,
-    
+
     #[serde(default)]
     #[schema(example = "my-session")]
     pub session_id: Option<String>,
@@ -134,20 +134,16 @@ pub struct SessionSummary {
 
 #[derive(Debug, Serialize, ToSchema)]
 pub struct SessionsListResponse {
-    pub sessions: Vec<SessionSummary>
+    pub sessions: Vec<SessionSummary>,
 }
 
 impl SessionsListResponse {
-    pub fn from_session_entries(
-        entries: &[serde_json::Value],
-    ) -> Self {
+    pub fn from_session_entries(entries: &[serde_json::Value]) -> Self {
         let sessions = entries
             .iter()
             .filter_map(|entry| SessionSummary::from_entry(entry))
             .collect();
-        Self {
-            sessions
-        }
+        Self { sessions }
     }
 }
 
@@ -334,7 +330,10 @@ mod tests {
         ]))];
         let turn = extract_last_user_turn(&messages).expect("turn");
         assert_eq!(turn.text, "");
-        assert_eq!(turn.image_urls, vec!["https://example.com/a.png".to_string()]);
+        assert_eq!(
+            turn.image_urls,
+            vec!["https://example.com/a.png".to_string()]
+        );
     }
 
     #[test]

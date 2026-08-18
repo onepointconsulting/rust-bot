@@ -1,8 +1,9 @@
 use crate::{
+    PKG_VERSION,
     agent::context::BOOTSTRAP_FILES,
     agent::tools::mcp::{load_mcp_tools_from_config, mcp_presets_api},
     bus::events::OutboundMessage,
-    command::{types::ChatCommand, CommandContext, CommandHandler, CommandRouter},
+    command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
     config::{
         loader::{load_config, resolve_config_env_vars, save_config},
         schema::McpServerConfig,
@@ -16,7 +17,6 @@ use crate::{
         restart::restart_with_notice,
         searchusage::fetch_search_usage,
     },
-    PKG_VERSION,
 };
 use async_trait::async_trait;
 use futures::FutureExt;
@@ -2047,9 +2047,10 @@ mod tests {
             None,
         );
         let out = CmdMcpList.handle(&ctx).await;
-        assert!(out
-            .content
-            .contains("No agent available to execute command: /mcp-list"));
+        assert!(
+            out.content
+                .contains("No agent available to execute command: /mcp-list")
+        );
     }
 
     #[tokio::test]
@@ -2072,9 +2073,10 @@ mod tests {
             None,
         );
         let out = CmdMcpPreset.handle(&ctx).await;
-        assert!(out
-            .content
-            .contains("No agent available to execute command: /mcp-preset"));
+        assert!(
+            out.content
+                .contains("No agent available to execute command: /mcp-preset")
+        );
     }
 
     #[test]
@@ -2098,11 +2100,13 @@ mod tests {
 
     #[test]
     fn format_preset_list_shows_status_and_custom_servers() {
-        let presets = vec![mcp_presets_api::load_mcp_presets("/no/such/file")
-            .unwrap()
-            .into_iter()
-            .find(|p| p.name == "github")
-            .unwrap()];
+        let presets = vec![
+            mcp_presets_api::load_mcp_presets("/no/such/file")
+                .unwrap()
+                .into_iter()
+                .find(|p| p.name == "github")
+                .unwrap(),
+        ];
         let mut configured = HashMap::new();
         configured.insert("my-custom-server".to_string(), McpServerConfig::default());
         let content = format_preset_list(&presets, &configured);

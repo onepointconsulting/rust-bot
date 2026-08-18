@@ -91,17 +91,14 @@ pub fn discover_all(
 mod tests {
     use std::path::PathBuf;
 
-use crate::config::loader::load_config;
+    use crate::config::loader::load_config;
 
-use super::*;
+    use super::*;
 
     #[test]
     fn discovers_email_channel() {
         let names = discover_channel_names();
-        assert!(
-            names.contains(&"email"),
-            "expected 'email' in {names:?}"
-        );
+        assert!(names.contains(&"email"), "expected 'email' in {names:?}");
     }
 
     #[test]
@@ -136,8 +133,12 @@ use super::*;
             test_session_manager(),
             test_workspace_request_handler(),
         );
-        let message = channels.iter().map(|(k, _v)| k.to_string()).collect::<Vec<String>>().join(", ");
-        let err= format!("expected 'email' in {}", message);
+        let message = channels
+            .iter()
+            .map(|(k, _v)| k.to_string())
+            .collect::<Vec<String>>()
+            .join(", ");
+        let err = format!("expected 'email' in {}", message);
         assert!(channels.contains_key("email"), "{err}");
     }
 }

@@ -71,8 +71,7 @@ fn build_environment(root: Option<&Path>) -> Result<Tera, String> {
     match root {
         Some(root) => {
             let glob = format!("{}/**/*.md", root.to_string_lossy());
-            Tera::new(&glob)
-                .map_err(|e| format!("Failed to load templates from {:?}: {}", root, e))
+            Tera::new(&glob).map_err(|e| format!("Failed to load templates from {:?}: {}", root, e))
         }
         None => {
             let mut tera = Tera::default();
@@ -80,9 +79,8 @@ fn build_environment(root: Option<&Path>) -> Result<Tera, String> {
                 if !path.ends_with(".md") {
                     continue;
                 }
-                let content = embedded_templates::get(&path).ok_or_else(|| {
-                    format!("Embedded template '{path}' is not valid UTF-8")
-                })?;
+                let content = embedded_templates::get(&path)
+                    .ok_or_else(|| format!("Embedded template '{path}' is not valid UTF-8"))?;
                 tera.add_raw_template(&path, &content)
                     .map_err(|e| format!("Failed to load embedded template '{path}': {e}"))?;
             }
@@ -102,7 +100,11 @@ pub fn render_template(name: &str, context: &Context, strip: bool) -> Result<Str
     let text = tera
         .render(name, context)
         .map_err(|e| format!("Failed to render template '{}': {}", name, e))?;
-    Ok(if strip { text.trim_end().to_string() } else { text })
+    Ok(if strip {
+        text.trim_end().to_string()
+    } else {
+        text
+    })
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -128,7 +130,11 @@ mod tests {
         let text = tera
             .render(name, context)
             .map_err(|e| format!("Failed to render template '{}': {}", name, e))?;
-        Ok(if strip { text.trim_end().to_string() } else { text })
+        Ok(if strip {
+            text.trim_end().to_string()
+        } else {
+            text
+        })
     }
 
     // ── static / no-variable templates ───────────────────────────────────────
@@ -136,8 +142,7 @@ mod tests {
     #[test]
     fn test_render_static_template() {
         // dream_phase1.md has no variables — must render without error
-        let result = render_template("agent/dream_phase1.md", 
-        &ctx(), false);
+        let result = render_template("agent/dream_phase1.md", &ctx(), false);
         assert!(result.is_ok(), "unexpected error: {:?}", result.err());
         assert!(!result.unwrap().is_empty());
     }
@@ -182,7 +187,11 @@ mod tests {
         ctx.insert("max_iterations", &max_iterations);
         let result = render_template("agent/max_iterations_message.md", &ctx, true).unwrap();
         println!("result: {}", result);
-        assert!(result.contains("42"), "expected iteration count in output: {}", result);
+        assert!(
+            result.contains("42"),
+            "expected iteration count in output: {}",
+            result
+        );
     }
 
     #[test]
@@ -206,7 +215,10 @@ mod tests {
         ctx.insert("system", "Windows");
         let result = render_template("agent/platform_policy.md", &ctx, true).unwrap();
         assert!(result.contains("Windows"), "expected Windows section");
-        assert!(!result.contains("POSIX"), "should not contain POSIX section");
+        assert!(
+            !result.contains("POSIX"),
+            "should not contain POSIX section"
+        );
     }
 
     #[test]
@@ -215,7 +227,10 @@ mod tests {
         ctx.insert("system", "Linux");
         let result = render_template("agent/platform_policy.md", &ctx, true).unwrap();
         assert!(result.contains("POSIX"), "expected POSIX section");
-        assert!(!result.contains("Windows"), "should not contain Windows section");
+        assert!(
+            !result.contains("Windows"),
+            "should not contain Windows section"
+        );
     }
 
     // ── include directive ─────────────────────────────────────────────────────
@@ -245,7 +260,10 @@ mod tests {
         ctx.insert("workspace", "/tmp/ws");
         ctx.insert("skills_summary", &""); // falsy → skills block should be omitted
         let result = render_template("agent/subagent_system.md", &ctx, true).unwrap();
-        assert!(!result.contains("## Skills"), "skills block should be absent");
+        assert!(
+            !result.contains("## Skills"),
+            "skills block should be absent"
+        );
     }
 
     #[test]
@@ -255,7 +273,10 @@ mod tests {
         ctx.insert("workspace", "/tmp/ws");
         ctx.insert("skills_summary", "- /skills/search/SKILL.md");
         let result = render_template("agent/subagent_system.md", &ctx, true).unwrap();
-        assert!(result.contains("## Skills"), "skills block should be present");
+        assert!(
+            result.contains("## Skills"),
+            "skills block should be present"
+        );
         assert!(result.contains("SKILL.md"));
     }
 

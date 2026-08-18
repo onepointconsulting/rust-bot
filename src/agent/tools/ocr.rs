@@ -10,10 +10,7 @@ use crate::{
         filesystem::{FsToolConfig, ResolvePathError},
     },
     config::schema::{OcrProvider, OcrToolConfig},
-    providers::{
-        anthropic_provider::AnthropicProvider,
-        base::LLMProvider,
-    },
+    providers::{anthropic_provider::AnthropicProvider, base::LLMProvider},
 };
 
 const OCR_PROMPT: &str = "Extract all readable text from the provided document or image. \
@@ -45,7 +42,9 @@ fn media_type_for_path(path: &Path) -> Result<OcrMediaType, String> {
         .extension()
         .and_then(|e| e.to_str())
         .map(|e| e.to_ascii_lowercase())
-        .ok_or_else(|| "Error: file has no extension; supported: pdf, png, jpg, jpeg, gif, webp".to_string())?;
+        .ok_or_else(|| {
+            "Error: file has no extension; supported: pdf, png, jpg, jpeg, gif, webp".to_string()
+        })?;
 
     match ext.as_str() {
         "pdf" => Ok(OcrMediaType {

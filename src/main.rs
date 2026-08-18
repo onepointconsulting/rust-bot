@@ -1,5 +1,5 @@
 use clap::Parser;
-use rust_bot::cli::{eprint_error, Cli, run};
+use rust_bot::cli::{Cli, eprint_error, run};
 use rust_bot::utils::exit_codes::{self, GENERAL_ERROR};
 
 #[tokio::main]

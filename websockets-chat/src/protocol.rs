@@ -367,9 +367,9 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             turn_id: w.turn_id,
             detail: w.detail,
         }),
-        "attached" => decode::<AttachedWire>(&value).map(|w| ServerEvent::Attached {
-            chat_id: w.chat_id,
-        }),
+        "attached" => {
+            decode::<AttachedWire>(&value).map(|w| ServerEvent::Attached { chat_id: w.chat_id })
+        }
         "session_updated" => Ok(ServerEvent::SessionUpdated(value)),
         "message_accepted" => {
             decode::<MessageAcceptedWire>(&value).map(|w| ServerEvent::MessageAccepted {
@@ -444,7 +444,8 @@ mod tests {
 
     #[test]
     fn parses_ready_with_streaming() {
-        let raw = r#"{"event":"ready","chat_id":"chat-1","client_id":"browser-abc","streaming":true}"#;
+        let raw =
+            r#"{"event":"ready","chat_id":"chat-1","client_id":"browser-abc","streaming":true}"#;
         let event = parse_server_event(raw).expect("should parse");
         assert_eq!(
             event,
@@ -623,7 +624,8 @@ mod tests {
 
     #[test]
     fn parses_delta() {
-        let raw = r#"{"event":"delta","chat_id":"chat-1","text":"partial ","stream_id":"stream-1"}"#;
+        let raw =
+            r#"{"event":"delta","chat_id":"chat-1","text":"partial ","stream_id":"stream-1"}"#;
         let event = parse_server_event(raw).expect("should parse");
         assert_eq!(
             event,
@@ -669,8 +671,7 @@ mod tests {
 
     #[test]
     fn parses_reasoning_delta() {
-        let raw =
-            r#"{"event":"reasoning_delta","chat_id":"chat-1","text":"thinking...","stream_id":"stream-1"}"#;
+        let raw = r#"{"event":"reasoning_delta","chat_id":"chat-1","text":"thinking...","stream_id":"stream-1"}"#;
         let event = parse_server_event(raw).expect("should parse");
         assert_eq!(
             event,
@@ -764,12 +765,8 @@ mod tests {
 
     #[test]
     fn client_envelope_serializes_expected_shape() {
-        let envelope = ClientEnvelope::message(
-            "chat-123",
-            Some("turn-456".to_string()),
-            "hello",
-            None,
-        );
+        let envelope =
+            ClientEnvelope::message("chat-123", Some("turn-456".to_string()), "hello", None);
         let value = serde_json::to_value(&envelope).expect("should serialize");
         assert_eq!(
             value,
@@ -804,7 +801,9 @@ mod tests {
             "chat-123",
             None,
             "hi",
-            Some(vec![serde_json::json!({"url": "data:image/png;base64,AAAA"})]),
+            Some(vec![
+                serde_json::json!({"url": "data:image/png;base64,AAAA"}),
+            ]),
         );
         let value = serde_json::to_value(&envelope).expect("should serialize");
         assert_eq!(

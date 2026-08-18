@@ -125,7 +125,13 @@ pub(crate) async fn login(
     let aud = jwt.opts.aud.clone();
     let purpose = state.token_purpose.clone();
     let minted = tokio::task::spawn_blocking(move || {
-        generate_jwt_token(private_key_path, iss, aud, purpose, DEFAULT_EXPIRES_IN_MONTHS)
+        generate_jwt_token(
+            private_key_path,
+            iss,
+            aud,
+            purpose,
+            DEFAULT_EXPIRES_IN_MONTHS,
+        )
     })
     .await
     .map_err(|_| ApiError::internal("Token minting task failed"))?
@@ -195,7 +201,10 @@ mod tests {
         let err = login(State(state), Json(request("a@b.com", "pw")))
             .await
             .unwrap_err();
-        assert_eq!(err.message(), "JWT is not enabled; cannot mint login tokens");
+        assert_eq!(
+            err.message(),
+            "JWT is not enabled; cannot mint login tokens"
+        );
     }
 
     #[tokio::test]

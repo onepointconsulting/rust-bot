@@ -1,2 +1,2 @@
-pub mod transcript;
 pub mod metadata;
+pub mod transcript;

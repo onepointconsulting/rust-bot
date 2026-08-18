@@ -109,9 +109,7 @@ impl CommandContext {
             .unwrap_or_else(|e| e.into_inner());
         let session = match &self.session {
             Some(session) => session.clone(),
-            None => session_manager
-                .get_or_create_session(&self.key)
-                .clone(),
+            None => session_manager.get_or_create_session(&self.key).clone(),
         };
         (session_manager, session)
     }
@@ -193,7 +191,6 @@ impl CommandRouter {
 
         None
     }
-
 }
 
 impl Default for CommandRouter {
@@ -222,17 +219,17 @@ mod tests {
     #[test]
     fn normalize_leaves_commands_without_bot_suffix() {
         assert_eq!(normalize_command_text("/help"), "/help");
-        assert_eq!(normalize_command_text("/model claude-fast"), "/model claude-fast");
+        assert_eq!(
+            normalize_command_text("/model claude-fast"),
+            "/model claude-fast"
+        );
     }
 
     #[test]
     fn normalize_strips_telegram_style_bot_suffix() {
         assert_eq!(normalize_command_text("/help@MyBot"), "/help");
         assert_eq!(normalize_command_text("/stop@nanobot_bot"), "/stop");
-        assert_eq!(
-            normalize_command_text("/dream@MyBot log"),
-            "/dream log"
-        );
+        assert_eq!(normalize_command_text("/dream@MyBot log"), "/dream log");
     }
 
     #[test]
@@ -242,10 +239,7 @@ mod tests {
             "/model Claude Fast"
         );
         // partition only on the first space — leading spaces in the rest stay
-        assert_eq!(
-            normalize_command_text("/cmd@Bot  spaced"),
-            "/cmd  spaced"
-        );
+        assert_eq!(normalize_command_text("/cmd@Bot  spaced"), "/cmd  spaced");
     }
 
     #[test]
@@ -337,10 +331,7 @@ mod tests {
     #[tokio::test]
     async fn dispatch_priority_matches_raw_case_insensitive() {
         let mut router = CommandRouter::new();
-        router.priority(
-            "/stop",
-            Arc::new(StaticReplyHandler("stopped")),
-        );
+        router.priority("/stop", Arc::new(StaticReplyHandler("stopped")));
 
         let ctx = CommandContext::new(sample_msg(), None, "stop", "/STOP");
         let out = router.dispatch_priority(&ctx).await;
@@ -381,4 +372,3 @@ mod tests {
         assert_eq!(bare_out.content.trim(), "");
     }
 }
-

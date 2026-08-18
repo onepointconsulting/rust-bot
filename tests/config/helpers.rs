@@ -1,6 +1,9 @@
-use std::{collections::HashMap, env, path::PathBuf};
 use dotenv::dotenv;
-use rust_bot::providers::{anthropic_provider::AnthropicProvider, base::LLMProvider, openai_compat_provider::OpenAICompatProvider, registry::ProviderSpec};
+use rust_bot::providers::{
+    anthropic_provider::AnthropicProvider, base::LLMProvider,
+    openai_compat_provider::OpenAICompatProvider, registry::ProviderSpec,
+};
+use std::{collections::HashMap, env, path::PathBuf};
 use uuid::Uuid;
 
 pub fn read_env() -> (String, String, String) {
@@ -15,7 +18,8 @@ pub fn read_anthropic_env() -> (String, String, String) {
     dotenv().expect("Failed to read .env file");
     let anthropic_api_key = env::var("ANTHROPIC_API_KEY").expect("ANTHROPIC_API_KEY is not set");
     let anthropic_api_base = env::var("ANTHROPIC_API_BASE").expect("ANTHROPIC_API_BASE is not set");
-    let anthropic_api_model = env::var("ANTHROPIC_API_MODEL").expect("ANTHROPIC_API_MODEL is not set");
+    let anthropic_api_model =
+        env::var("ANTHROPIC_API_MODEL").expect("ANTHROPIC_API_MODEL is not set");
     (anthropic_api_key, anthropic_api_base, anthropic_api_model)
 }
 
@@ -107,4 +111,3 @@ pub fn prepare_cron_workspace() -> PathBuf {
     }
     cron_path
 }
-

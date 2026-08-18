@@ -8,7 +8,5 @@ use crate::markdown;
 pub fn MarkdownView(#[prop(into)] source: Signal<String>) -> impl IntoView {
     let html_string = move || markdown::render(&source.get());
 
-    html::div()
-        .class("markdown")
-        .inner_html(html_string)
+    html::div().class("markdown").inner_html(html_string)
 }

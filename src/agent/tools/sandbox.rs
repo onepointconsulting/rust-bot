@@ -22,7 +22,10 @@ fn shell_quote(s: &str) -> String {
 /// Join a slice of arguments into a single shell command string, matching
 /// Python's `shlex.join`.
 fn shell_join(args: &[String]) -> String {
-    args.iter().map(|a| shell_quote(a)).collect::<Vec<_>>().join(" ")
+    args.iter()
+        .map(|a| shell_quote(a))
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
 /// Wrap `command` in a bubblewrap sandbox (requires `bwrap` on the host).
@@ -73,12 +76,19 @@ fn bwrap(command: &str, workspace: &str, cwd: &str, media_dir: Option<&Path>) ->
     }
 
     args.extend([
-        "--proc".into(), "/proc".into(),
-        "--dev".into(),  "/dev".into(),
-        "--tmpfs".into(), "/tmp".into(),
-        "--tmpfs".into(), ws_parent,
-        "--dir".into(),   ws_str.clone(),
-        "--bind".into(),  ws_str.clone(), ws_str,
+        "--proc".into(),
+        "/proc".into(),
+        "--dev".into(),
+        "/dev".into(),
+        "--tmpfs".into(),
+        "/tmp".into(),
+        "--tmpfs".into(),
+        ws_parent,
+        "--dir".into(),
+        ws_str.clone(),
+        "--bind".into(),
+        ws_str.clone(),
+        ws_str,
     ]);
 
     if let Some(media) = media_dir {
@@ -91,9 +101,12 @@ fn bwrap(command: &str, workspace: &str, cwd: &str, media_dir: Option<&Path>) ->
     }
 
     args.extend([
-        "--chdir".into(), sandbox_cwd_str,
+        "--chdir".into(),
+        sandbox_cwd_str,
         "--".into(),
-        "sh".into(), "-c".into(), command.into(),
+        "sh".into(),
+        "-c".into(),
+        command.into(),
     ]);
 
     shell_join(&args)
@@ -165,7 +178,13 @@ mod tests {
     #[cfg(unix)]
     fn test_bwrap_with_media_dir() {
         let media = Path::new("/tmp/media");
-        let result = wrap_command("bwrap", "ls", "/tmp/workspace", "/tmp/workspace", Some(media));
+        let result = wrap_command(
+            "bwrap",
+            "ls",
+            "/tmp/workspace",
+            "/tmp/workspace",
+            Some(media),
+        );
         assert!(result.is_ok());
         let cmd = result.unwrap();
         assert!(cmd.contains("/tmp/media"));

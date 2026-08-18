@@ -1728,10 +1728,7 @@ mod tests {
 
     #[test]
     fn tool_cache_marker_indices_tail_only_when_all_mcp() {
-        let tools = vec![
-            openai_tool("mcp_a"),
-            openai_tool("mcp_b"),
-        ];
+        let tools = vec![openai_tool("mcp_a"), openai_tool("mcp_b")];
 
         assert_eq!(
             TestLLMProvider::tool_cache_marker_indices(Some(tools)),
@@ -1741,10 +1738,7 @@ mod tests {
 
     #[test]
     fn tool_name_reads_openai_and_anthropic_schemas() {
-        assert_eq!(
-            TestLLMProvider::tool_name(&openai_tool("search")),
-            "search"
-        );
+        assert_eq!(TestLLMProvider::tool_name(&openai_tool("search")), "search");
         assert_eq!(
             TestLLMProvider::tool_name(&serde_json::json!({
                 "name": "direct",

@@ -11,9 +11,8 @@ use crate::bus::events::OutboundMessage;
 use crate::bus::queue::MessageBus;
 use crate::utils::helpers::strip_think;
 
-pub type SendCallback = Arc<
-    dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type SendCallback =
+    Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
 /// Tool for sending messages (and optional media) to a chat channel.
 pub struct MessageTool {
@@ -45,10 +44,18 @@ impl MessageTool {
 
     /// Set the current message context.
     pub fn set_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
-        *self.default_channel.lock().unwrap_or_else(|e| e.into_inner()) = channel.to_string();
-        *self.default_chat_id.lock().unwrap_or_else(|e| e.into_inner()) = chat_id.to_string();
-        *self.default_message_id.lock().unwrap_or_else(|e| e.into_inner()) =
-            message_id.map(str::to_string);
+        *self
+            .default_channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = channel.to_string();
+        *self
+            .default_chat_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = chat_id.to_string();
+        *self
+            .default_message_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = message_id.map(str::to_string);
     }
 
     /// Set the callback for sending messages.
@@ -59,7 +66,10 @@ impl MessageTool {
     /// Reset per-turn send tracking.
     pub fn start_turn(&self) {
         *self.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) = false;
-        *self.last_owner_outbound.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .last_owner_outbound
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
     }
 
     /// Outbound already delivered to the owning chat this turn, if any.
@@ -365,7 +375,9 @@ mod tests {
     async fn execute_sends_to_default_context_and_marks_sent_in_turn() {
         let (tool, captured) = tool_with_capture("cli", "direct", Some("owner-msg".to_string()));
 
-        let result = tool.execute(&serde_json::json!({ "content": "hello" })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "content": "hello" }))
+            .await;
 
         assert_eq!(result, "Message sent to cli:direct");
         let sent = captured.lock().unwrap();
@@ -433,7 +445,10 @@ mod tests {
 
         assert_eq!(result, "Message sent to cli:direct with 2 attachments");
         let sent = captured.lock().unwrap();
-        assert_eq!(sent[0].media, vec!["a.png".to_string(), "b.pdf".to_string()]);
+        assert_eq!(
+            sent[0].media,
+            vec!["a.png".to_string(), "b.pdf".to_string()]
+        );
     }
 
     #[tokio::test]

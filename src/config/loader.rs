@@ -6,9 +6,8 @@ use std::sync::{LazyLock, OnceLock};
 
 use regex::Regex;
 
-
 use crate::cli::CliError;
-use crate::config::schema::{validate_model_presets, Config};
+use crate::config::schema::{Config, validate_model_presets};
 use crate::security::network::configure_ssrf_whitelist;
 use crate::utils::helpers::expand_tilde_path;
 
@@ -72,7 +71,10 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) -> Result<(), 
 
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).unwrap_or_else(|e| {
-            panic!("Failed to create config directory '{}': {e}", parent.display());
+            panic!(
+                "Failed to create config directory '{}': {e}",
+                parent.display()
+            );
         });
     }
 
@@ -81,7 +83,10 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) -> Result<(), 
     });
 
     let mut file = File::create(&path).unwrap_or_else(|e| {
-        panic!("Failed to open config file '{}' for writing: {e}", path.display());
+        panic!(
+            "Failed to open config file '{}' for writing: {e}",
+            path.display()
+        );
     });
 
     file.write_all(json.as_bytes()).unwrap_or_else(|e| {
@@ -90,9 +95,8 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) -> Result<(), 
     Ok(())
 }
 
-static ENV_VAR_RE: LazyLock<Regex> = LazyLock::new(|| {
-    Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap()
-});
+static ENV_VAR_RE: LazyLock<Regex> =
+    LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
 
 /// Return a copy of `config` with every `${VAR}` placeholder in string values
 /// replaced by the corresponding environment variable.
@@ -133,7 +137,8 @@ fn resolve_env_vars_in_value(value: serde_json::Value) -> Result<serde_json::Val
             Ok(serde_json::Value::Object(new_map))
         }
         serde_json::Value::Array(arr) => {
-            let resolved: Result<Vec<_>, _> = arr.into_iter().map(resolve_env_vars_in_value).collect();
+            let resolved: Result<Vec<_>, _> =
+                arr.into_iter().map(resolve_env_vars_in_value).collect();
             Ok(serde_json::Value::Array(resolved?))
         }
         other => Ok(other),
@@ -146,8 +151,6 @@ fn apply_ssrf_whitelist(config: &Config) {
         configure_ssrf_whitelist(ssrf_whitelist);
     }
 }
-
-
 
 #[cfg(test)]
 mod tests {
@@ -177,7 +180,10 @@ mod tests {
         assert_eq!(preset.model, config.agents.model);
         assert_eq!(preset.provider, config.agents.provider);
         assert_eq!(preset.max_tokens, config.agents.max_tokens);
-        assert_eq!(preset.context_window_tokens, config.agents.context_window_tokens);
+        assert_eq!(
+            preset.context_window_tokens,
+            config.agents.context_window_tokens
+        );
         assert_eq!(preset.temperature, config.agents.temperature);
     }
 
@@ -241,7 +247,8 @@ mod tests {
     #[test]
     fn test_apply_ssrf_whitelist() {
         let mut config = Config::default();
-        config.tools.ssrf_whitelist = vec!["100.64.0.0/10".to_string(), "192.168.0.0/16".to_string()];
+        config.tools.ssrf_whitelist =
+            vec!["100.64.0.0/10".to_string(), "192.168.0.0/16".to_string()];
         assert!(!config.tools.ssrf_whitelist.is_empty());
         assert!(config.tools.ssrf_whitelist.len() == 2);
         assert!(config.tools.ssrf_whitelist.get(0).unwrap() == "100.64.0.0/10");
@@ -286,7 +293,10 @@ mod tests {
         let result = resolve_config_env_vars(&config);
         assert!(result.is_err());
         let msg = result.unwrap_err();
-        assert!(msg.contains("THIS_VAR_DEFINITELY_DOES_NOT_EXIST_12345"), "got: {msg}");
+        assert!(
+            msg.contains("THIS_VAR_DEFINITELY_DOES_NOT_EXIST_12345"),
+            "got: {msg}"
+        );
     }
 
     #[test]

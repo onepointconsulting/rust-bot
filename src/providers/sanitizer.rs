@@ -15,7 +15,7 @@ pub fn normalize_tool_call_id(tool_call_id: &Value) -> Value {
             Value::String(s.to_string())
         } else {
             // Hash with sha1 and take first 9 hex chars
-            use sha1::{Sha1, Digest};
+            use sha1::{Digest, Sha1};
             let mut hasher = Sha1::new();
             hasher.update(s.as_bytes());
             let result = hasher.finalize();

@@ -1,12 +1,31 @@
-use std::{collections::HashMap, sync::Arc, time::Duration};
-use rmcp::ServiceExt;
-use serde_json::Value;
-use rust_bot::{agent::{runner::{AgentRunResult, AgentRunSpec, AgentRunner}, tools::{base::Tool, cron::CronTool, filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool}, mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config}, registry::ToolRegistry, search::{GlobTool, GrepTool}, shell::ShellTool, web::{WebFetchTool, WebSearchTool}}}, config::schema::{McpServerConfig, McpTransportType, WebSearchConfig}, cron::CronService};
 use ctor::ctor;
+use rmcp::ServiceExt;
+use rust_bot::{
+    agent::{
+        runner::{AgentRunResult, AgentRunSpec, AgentRunner},
+        tools::{
+            base::Tool,
+            cron::CronTool,
+            filesystem::{EditFileTool, ListDirTool, ReadFileTool, WriteFileTool},
+            mcp::{LoadedMcpTools, MCPToolWrapper, load_mcp_tools_from_config},
+            registry::ToolRegistry,
+            search::{GlobTool, GrepTool},
+            shell::ShellTool,
+            web::{WebFetchTool, WebSearchTool},
+        },
+    },
+    config::schema::{McpServerConfig, McpTransportType, WebSearchConfig},
+    cron::CronService,
+};
+use serde_json::Value;
+use std::{collections::HashMap, sync::Arc, time::Duration};
 
-use crate::{agent::mcp_dummy_client::DummyMcpClient, config::helpers::{prepare_cron_workspace, prepare_workspace, read_mcp_env}};
 use crate::agent::mcp_dummy_server::HelloServer;
-use crate::config::helpers::{read_env, create_openrouter_provider};
+use crate::config::helpers::{create_openrouter_provider, read_env};
+use crate::{
+    agent::mcp_dummy_client::DummyMcpClient,
+    config::helpers::{prepare_cron_workspace, prepare_workspace, read_mcp_env},
+};
 
 #[ctor(unsafe)]
 pub fn init_logger() {
@@ -20,7 +39,7 @@ fn create_agent_run_spec(messages: Vec<Value>) -> AgentRunSpec {
         model: openai_api_model,
         max_iterations: 30,
         initial_messages: messages,
-        ..AgentRunSpec::default()   // everything else gets its default
+        ..AgentRunSpec::default() // everything else gets its default
     }
 }
 
@@ -32,31 +51,27 @@ fn create_agent_runner() -> AgentRunner {
 fn create_agent_run_spec_with_write_tool(messages: Vec<Value>) -> AgentRunSpec {
     // Create workspace directory relative to the project root
     let workspace_path = prepare_workspace();
-    create_agent_run_spec_with_tools(messages, vec![Box::new(WriteFileTool::new(
-        Some(workspace_path), 
-        None, 
-        None
-    ))], None)
+    create_agent_run_spec_with_tools(
+        messages,
+        vec![Box::new(WriteFileTool::new(
+            Some(workspace_path),
+            None,
+            None,
+        ))],
+        None,
+    )
 }
 
 fn create_agent_run_spec_with_write_and_list_dir_tool(messages: Vec<Value>) -> AgentRunSpec {
     // Create workspace directory relative to the project root
     let workspace_path = prepare_workspace();
-    let read_tool = Box::new(WriteFileTool::new(
-        Some(workspace_path.clone()), 
-        None, 
-        None
-    ));
-    let list_dir_tool = Box::new(ListDirTool::new(
-        Some(workspace_path), 
-        None, 
-        None
-    ));
+    let read_tool = Box::new(WriteFileTool::new(Some(workspace_path.clone()), None, None));
+    let list_dir_tool = Box::new(ListDirTool::new(Some(workspace_path), None, None));
     create_agent_run_spec_with_tools(messages, vec![read_tool, list_dir_tool], None)
 }
 
 fn create_agent_run_spec_with_tools(
-    messages: Vec<Value>, 
+    messages: Vec<Value>,
     tools: Vec<Box<dyn Tool>>,
     reasoning_effort: Option<String>,
 ) -> AgentRunSpec {
@@ -71,19 +86,22 @@ fn create_agent_run_spec_with_tools(
         initial_messages: messages,
         tools: tool_registry,
         reasoning_effort,
-        ..AgentRunSpec::default()   // everything else gets its default
+        ..AgentRunSpec::default() // everything else gets its default
     }
 }
 
 fn create_agent_run_spec_with_shell_tool(messages: Vec<Value>) -> AgentRunSpec {
     let workspace_path = prepare_workspace();
     let shell_tool = Box::new(ShellTool::new(
-        10, Some(workspace_path.clone()), None, None, false, None, None));
-    let write_tool = Box::new(WriteFileTool::new(
-        Some(workspace_path), 
-        None, 
-        None
+        10,
+        Some(workspace_path.clone()),
+        None,
+        None,
+        false,
+        None,
+        None,
     ));
+    let write_tool = Box::new(WriteFileTool::new(Some(workspace_path), None, None));
     create_agent_run_spec_with_tools(messages, vec![shell_tool, write_tool], None)
 }
 
@@ -103,7 +121,11 @@ fn completion_message_check(result: &AgentRunResult) {
     if let Some(final_message) = result.final_content.as_ref() {
         let final_message = final_message.as_str();
         assert!(final_message.len() > 0);
-        assert!(result.stop_reason == "completed", "stop_reason: {}", result.stop_reason);
+        assert!(
+            result.stop_reason == "completed",
+            "stop_reason: {}",
+            result.stop_reason
+        );
         println!("final_message: {:?}", final_message);
     } else {
         assert!(false, "No final message found");
@@ -214,9 +236,15 @@ async fn test_write_and_append_poem_verse() {
     let spec1 = create_agent_run_spec_with_read_write_edit_tool(initial_messages);
     let result1 = runner.run(spec1).await;
     completion_message_check(&result1);
-    assert!(poem_file.exists(), "llm_poem2.txt should have been created after turn 1");
+    assert!(
+        poem_file.exists(),
+        "llm_poem2.txt should have been created after turn 1"
+    );
     let content_after_turn1 = std::fs::read_to_string(&poem_file).unwrap();
-    assert!(!content_after_turn1.trim().is_empty(), "File should contain the first verse");
+    assert!(
+        !content_after_turn1.trim().is_empty(),
+        "File should contain the first verse"
+    );
 
     // ── Turn 2: append a second verse ────────────────────────────────────────
     let mut turn2_messages = result1.messages.clone();
@@ -319,7 +347,7 @@ async fn test_glob_tool() {
         max_iterations: 30,
         initial_messages: messages,
         tools: tool_registry,
-        ..AgentRunSpec::default()   // everything else gets its default
+        ..AgentRunSpec::default() // everything else gets its default
     };
     let result = runner.run(spec).await;
     completion_message_check(&result);
@@ -343,7 +371,7 @@ async fn test_grep_tool() {
         max_iterations: 30,
         initial_messages: messages,
         tools: tool_registry,
-        ..AgentRunSpec::default()   // everything else gets its default
+        ..AgentRunSpec::default() // everything else gets its default
     };
     let result = runner.run(spec).await;
     completion_message_check(&result);
@@ -374,7 +402,10 @@ async fn test_mcp_tool() {
 
     let peer = client_service.peer().clone();
     let tools_result = peer.list_tools(None).await.expect("list_tools failed");
-    assert!(!tools_result.tools.is_empty(), "HelloServer must expose at least one tool");
+    assert!(
+        !tools_result.tools.is_empty(),
+        "HelloServer must expose at least one tool"
+    );
 
     // Wrap every discovered tool in an MCPToolWrapper so the agent can call it
     let mcp_tools: Vec<Box<dyn Tool>> = tools_result
@@ -436,10 +467,12 @@ async fn test_mcp_tool_with_mcp_config() {
     })];
     let spec = create_agent_run_spec_with_tools(messages, mcp_tools, None);
     let result = runner.run(spec).await;
-    assert!(result.final_content.is_some(), "result should have final content");
+    assert!(
+        result.final_content.is_some(),
+        "result should have final content"
+    );
     println!("result: {:?}", result.final_content.clone().unwrap());
     completion_message_check(&result);
-
 }
 
 #[tokio::test]
@@ -455,9 +488,7 @@ async fn test_web_search_tool() {
         ..WebSearchConfig::default()
     };
     let web_search_tool = WebSearchTool::new(Some(config), None, None);
-    let spec = create_agent_run_spec_with_tools(
-        messages, vec![Box::new(web_search_tool)], None
-    );
+    let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(web_search_tool)], None);
     let result = runner.run(spec).await;
     completion_message_check(&result);
 }
@@ -467,7 +498,7 @@ async fn test_web_search_fetch_tool() {
     let runner = create_agent_runner();
     let messages = vec![serde_json::json!({
         "role": "user",
-        "content": "Can you please search the web for information about the weather in London and 
+        "content": "Can you please search the web for information about the weather in London and
         then fetch from the first result the content of the page and write it to a file called weather_in_london.txt?"
     })];
     let config = WebSearchConfig {
@@ -482,7 +513,7 @@ async fn test_web_search_fetch_tool() {
     let tools: Vec<Box<dyn Tool>> = vec![
         Box::new(web_search_tool),
         Box::new(web_fetch_tool),
-        Box::new(write_tool)
+        Box::new(write_tool),
     ];
     let spec = create_agent_run_spec_with_tools(messages, tools, None);
     let result = runner.run(spec).await;
@@ -501,8 +532,7 @@ async fn test_cron_tool() {
     let cron_service = CronService::new(store_path, None);
     let cron_tool = CronTool::new(cron_service, "UTC");
     cron_tool.set_context("cli", "test_cron_tool");
-    let spec = create_agent_run_spec_with_tools(
-        messages, vec![Box::new(cron_tool)], None);
+    let spec = create_agent_run_spec_with_tools(messages, vec![Box::new(cron_tool)], None);
     let result = runner.run(spec).await;
     completion_message_check(&result);
 }

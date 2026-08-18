@@ -1,8 +1,8 @@
 pub mod base;
 pub mod email;
-pub mod types;
+pub mod gateway_services;
 pub mod manager;
 pub mod registry;
-pub mod whatsapp;
+pub mod types;
 pub mod websocket;
-pub mod gateway_services;
+pub mod whatsapp;

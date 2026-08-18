@@ -76,7 +76,13 @@ const TOOL_DOCX: &'static str = "docx";
 const TOOL_MCP: &'static str = "mcp";
 const TOOL_IMAGE_GENERATION: &'static str = "image_generation";
 const AVAILABLE_TOOLS: [&str; 7] = [
-    TOOL_GMAIL, TOOL_WEB, TOOL_EXEC, TOOL_OCR, TOOL_DOCX, TOOL_MCP, TOOL_IMAGE_GENERATION,
+    TOOL_GMAIL,
+    TOOL_WEB,
+    TOOL_EXEC,
+    TOOL_OCR,
+    TOOL_DOCX,
+    TOOL_MCP,
+    TOOL_IMAGE_GENERATION,
 ];
 
 const WEB_SEARCH_PROVIDERS: [&str; 5] = ["brave", "tavily", "duckduckgo", "searxng", "jina"];
@@ -86,10 +92,8 @@ const MCP_TRANSPORT_OPTIONS: [&str; 4] = ["auto", "stdio", "sse", "streamableHtt
 
 pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
     let config_path = resolve_onboard_config_path(args.config);
-    let mut config = apply_workspace_override(
-        load_config(Some(config_path.clone())),
-        args.workspace,
-    );
+    let mut config =
+        apply_workspace_override(load_config(Some(config_path.clone())), args.workspace);
     loop {
         let answer = Select::new(
             "What would you like to configure?",
@@ -148,7 +152,12 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
 
 //Configure LLM providers.
 pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
-    let provider_names = vec![PROVIDER_OPENROUTER, PROVIDER_ANTHROPIC, PROVIDER_EDENAI, PROVIDER_REQUESTY];
+    let provider_names = vec![
+        PROVIDER_OPENROUTER,
+        PROVIDER_ANTHROPIC,
+        PROVIDER_EDENAI,
+        PROVIDER_REQUESTY,
+    ];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
         provider_names.to_vec().clone(),
@@ -193,7 +202,7 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
 pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
     let endpoint = Text::new("Enter endpoint")
         .with_help_message(if provider_name == PROVIDER_OPENROUTER {
-            "e.g. https://openrouter.ai/api/v1, https://api.edenai.run/v3" 
+            "e.g. https://openrouter.ai/api/v1, https://api.edenai.run/v3"
         } else if provider_name == PROVIDER_EDENAI {
             "e.g. https://api.edenai.run/v3"
         } else if provider_name == PROVIDER_ANTHROPIC {
@@ -274,7 +283,6 @@ pub fn configure_extra_headers(
 }
 
 pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
-    
     let expanded = PathBuf::from(expand_tilde_path(&config_path.to_string_lossy()).as_ref());
     let config_path = if expanded.is_absolute() {
         expanded
@@ -284,7 +292,7 @@ pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
             .join(expanded)
     };
     set_config_path(config_path.clone());
-    
+
     let dim = Style::new().dimmed();
     println!(
         "{}Using config: {}{}",
@@ -679,11 +687,8 @@ fn create_model_presets(config: &mut Config) -> Result<(), CliError> {
             }
         }
 
-        let mut preset: ModelPresetConfig = config
-            .model_presets
-            .get(&name)
-            .cloned()
-            .unwrap_or_default();
+        let mut preset: ModelPresetConfig =
+            config.model_presets.get(&name).cloned().unwrap_or_default();
 
         let current_label = preset.label.clone().unwrap_or_default();
         let label = Text::new("Label")

@@ -125,11 +125,9 @@ pub fn format_tool_hints(tool_calls: Vec<ToolCallRequest>) -> String {
         let mut hint: String;
         if let Some(fmt) = fmt {
             hint = fmt_known(&group.first, fmt);
-        }
-        else if group.name.starts_with("mcp_") {
+        } else if group.name.starts_with("mcp_") {
             hint = fmt_mcp(&group.first);
-        }
-        else {
+        } else {
             hint = fmt_fallback(&group.first);
         }
         if group.count > 1 {
@@ -152,12 +150,15 @@ fn group_consecutive(calls: Vec<ToolCallRequest>) -> Vec<ToolCallGroup> {
                 count: groups.last().unwrap().count + 1,
                 first: groups.last().unwrap().first.clone(),
             }
-        }
-        else {
-            groups.push(ToolCallGroup { name: tc.name.clone(), count: 1, first: tc });
+        } else {
+            groups.push(ToolCallGroup {
+                name: tc.name.clone(),
+                count: 1,
+                first: tc,
+            });
         }
     }
-    return groups
+    return groups;
 }
 
 /// Format a registered tool using its template.
@@ -189,7 +190,9 @@ fn extract_arg(tc: &ToolCallRequest, key_args: &[&str]) -> Option<String> {
     let args = tc.arguments.clone();
     for key in key_args {
         let val_option = args.get(*key);
-        if let Some(val) = val_option && val.is_string() {
+        if let Some(val) = val_option
+            && val.is_string()
+        {
             if let Some(val_str) = val.as_str() {
                 if !val_str.is_empty() {
                     return Some(val_str.to_string());
@@ -278,8 +281,8 @@ fn fmt_fallback(tc: &ToolCallRequest) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::collections::HashMap;
     use serde_json::json;
+    use std::collections::HashMap;
 
     fn tool_call(name: &str, args: HashMap<String, serde_json::Value>) -> ToolCallRequest {
         tool_call_with_id("call_1", name, args)
@@ -441,10 +444,7 @@ mod tests {
                 ("file_path".into(), json!("/ok")),
             ]),
         );
-        assert_eq!(
-            extract_arg(&tc, &["path", "file_path"]),
-            Some("/ok".into())
-        );
+        assert_eq!(extract_arg(&tc, &["path", "file_path"]), Some("/ok".into()));
     }
 
     #[test]
@@ -457,10 +457,7 @@ mod tests {
     fn test_extract_arg_returns_none_when_only_empty_strings() {
         let tc = tool_call(
             "read_file",
-            HashMap::from([
-                ("path".into(), json!("")),
-                ("other".into(), json!("")),
-            ]),
+            HashMap::from([("path".into(), json!("")), ("other".into(), json!(""))]),
         );
         assert_eq!(extract_arg(&tc, &["path"]), None);
     }
@@ -610,7 +607,10 @@ mod tests {
 
     #[test]
     fn test_parse_mcp_name_without_mcp_prefix() {
-        assert_eq!(parse_mcp_name("custom__tool"), ("custom".into(), "tool".into()));
+        assert_eq!(
+            parse_mcp_name("custom__tool"),
+            ("custom".into(), "tool".into())
+        );
     }
 
     #[test]
@@ -637,14 +637,20 @@ mod tests {
     #[test]
     fn test_fmt_fallback_exactly_max_len_not_abbreviated() {
         let value = "a".repeat(HINT_MAX_LEN);
-        let tc = tool_call("custom_tool", HashMap::from([("query".into(), json!(value.clone()))]));
+        let tc = tool_call(
+            "custom_tool",
+            HashMap::from([("query".into(), json!(value.clone()))]),
+        );
         assert_eq!(fmt_fallback(&tc), format!("custom_tool(\"{value}\")"));
     }
 
     #[test]
     fn test_fmt_fallback_long_string_abbreviated() {
         let value = "very/long/nested/directory/structure/file.txt";
-        let tc = tool_call("custom_tool", HashMap::from([("path".into(), json!(value))]));
+        let tc = tool_call(
+            "custom_tool",
+            HashMap::from([("path".into(), json!(value))]),
+        );
         let result = fmt_fallback(&tc);
         assert!(result.starts_with("custom_tool(\""));
         assert!(result.contains(ELLIPSIS));

@@ -2,10 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    channels::websocket::webui::transcript::WebUiTranscriptRecorder,
-    config::paths::get_webui_dir,
-    security::WebUIIngressPolicy,
-    session::websocket_turns::WebsocketTurnRegistry,
+    channels::websocket::webui::transcript::WebUiTranscriptRecorder, config::paths::get_webui_dir,
+    security::WebUIIngressPolicy, session::websocket_turns::WebsocketTurnRegistry,
 };
 
 #[derive(Clone)]

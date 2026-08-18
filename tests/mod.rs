@@ -1,3 +1,3 @@
-pub mod providers;
 pub mod agent;
 pub mod config;
+pub mod providers;

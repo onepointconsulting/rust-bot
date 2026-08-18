@@ -346,8 +346,14 @@ mod tests {
         assert_eq!(EnvelopeType::from("new_chat"), EnvelopeType::NewChat);
         assert_eq!(EnvelopeType::from("fork_chat"), EnvelopeType::ForkChat);
         assert_eq!(EnvelopeType::from("attach"), EnvelopeType::Attach);
-        assert_eq!(EnvelopeType::from("set_workspace_scope"), EnvelopeType::SetWorkspaceScope);
-        assert_eq!(EnvelopeType::from("transcribe_audio"), EnvelopeType::TranscribeAudio);
+        assert_eq!(
+            EnvelopeType::from("set_workspace_scope"),
+            EnvelopeType::SetWorkspaceScope
+        );
+        assert_eq!(
+            EnvelopeType::from("transcribe_audio"),
+            EnvelopeType::TranscribeAudio
+        );
         assert_eq!(EnvelopeType::from("message"), EnvelopeType::Message);
         assert_eq!(EnvelopeType::from("list_chats"), EnvelopeType::ListChats);
     }
@@ -366,7 +372,10 @@ mod tests {
         assert_eq!(WsOutboundEvent::Error.as_str(), "error");
         assert_eq!(WsOutboundEvent::Attached.as_str(), "attached");
         assert_eq!(WsOutboundEvent::SessionUpdated.as_str(), "session_updated");
-        assert_eq!(WsOutboundEvent::MessageAccepted.as_str(), "message_accepted");
+        assert_eq!(
+            WsOutboundEvent::MessageAccepted.as_str(),
+            "message_accepted"
+        );
         assert_eq!(WsOutboundEvent::GoalState.as_str(), "goal_state");
         assert_eq!(WsOutboundEvent::GoalStatus.as_str(), "goal_status");
     }

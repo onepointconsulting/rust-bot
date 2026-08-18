@@ -4,12 +4,20 @@ use rust_bot::providers::base::LLMProvider;
 #[tokio::test]
 async fn test_simple_chat() {
     let provider = create_anthropic_provider();
-    let response = provider.chat(vec![
-        serde_json::json!({
-            "role": "user",
-            "content": "Hello, how are you? Who are you as an AI model?"
-        }),
-    ], None, None, 1024, 0.5, None, None).await;
+    let response = provider
+        .chat(
+            vec![serde_json::json!({
+                "role": "user",
+                "content": "Hello, how are you? Who are you as an AI model?"
+            })],
+            None,
+            None,
+            1024,
+            0.5,
+            None,
+            None,
+        )
+        .await;
     println!("response: {:?}", response);
     assert!(response.content.is_some());
     assert!(response.finish_reason == "stop");

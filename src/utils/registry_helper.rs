@@ -2,10 +2,22 @@ use std::path::PathBuf;
 
 use crate::{
     agent::{
-        skills::BUILTIN_SKILLS_DIR, tools::{
-            base::Tool, docx::DocxConversionTool, filesystem::{EditFileTool, FsToolConfig, ListDirTool, ReadFileTool, WriteFileTool}, gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool}, image_generation::ImageGenerationTool, ocr::OcrTool, registry::ToolRegistry, search::{GlobTool, GrepTool}, web::{WebFetchTool, WebSearchTool},
+        skills::BUILTIN_SKILLS_DIR,
+        tools::{
+            base::Tool,
+            docx::DocxConversionTool,
+            filesystem::{EditFileTool, FsToolConfig, ListDirTool, ReadFileTool, WriteFileTool},
+            gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool},
+            image_generation::ImageGenerationTool,
+            ocr::OcrTool,
+            registry::ToolRegistry,
+            search::{GlobTool, GrepTool},
+            web::{WebFetchTool, WebSearchTool},
         },
-    }, config::schema::{DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, WebToolsConfig},
+    },
+    config::schema::{
+        DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, WebToolsConfig,
+    },
 };
 
 /// Workspace restriction and builtin-skills read path used by filesystem tools.
@@ -149,8 +161,7 @@ mod tests {
     #[test]
     fn filesystem_tool_scope_restricted_includes_builtin_skills() {
         let workspace = PathBuf::from("/workspace");
-        let (allowed_dir, extra_read) =
-            filesystem_tool_scope(&workspace, true, "");
+        let (allowed_dir, extra_read) = filesystem_tool_scope(&workspace, true, "");
         assert_eq!(allowed_dir, Some(workspace));
         assert_eq!(extra_read.len(), 1);
     }

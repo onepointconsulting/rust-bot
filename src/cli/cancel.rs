@@ -1,6 +1,6 @@
 use std::io::IsTerminal;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
@@ -108,22 +108,24 @@ pub async fn wait_for_escape_cancel() {
     let _stop_guard = StopOnDrop(Arc::clone(&stop));
 
     let poll_stop = Arc::clone(&stop);
-    let handle = tokio::task::spawn_blocking(move || loop {
-        if poll_stop.load(Ordering::Relaxed) {
-            return false;
-        }
-        match event::poll(POLL_INTERVAL) {
-            Ok(true) => match event::read() {
-                Ok(Event::Key(key))
-                    if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press =>
-                {
-                    return true;
-                }
-                Ok(_) => continue,
+    let handle = tokio::task::spawn_blocking(move || {
+        loop {
+            if poll_stop.load(Ordering::Relaxed) {
+                return false;
+            }
+            match event::poll(POLL_INTERVAL) {
+                Ok(true) => match event::read() {
+                    Ok(Event::Key(key))
+                        if key.code == KeyCode::Esc && key.kind == KeyEventKind::Press =>
+                    {
+                        return true;
+                    }
+                    Ok(_) => continue,
+                    Err(_) => return false,
+                },
+                Ok(false) => continue,
                 Err(_) => return false,
-            },
-            Ok(false) => continue,
-            Err(_) => return false,
+            }
         }
     });
 

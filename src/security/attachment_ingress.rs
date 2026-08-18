@@ -6,7 +6,7 @@ use std::path::Path;
 use serde_json::Value;
 
 use crate::security::ingress_policy::AttachmentIngressLimits;
-use crate::utils::media_decode::{save_base64_data_url, SaveDataUrlError};
+use crate::utils::media_decode::{SaveDataUrlError, save_base64_data_url};
 
 /// Rejection code returned by [`store_inbound_attachments`]. Mirrors
 /// nanobot's `AttachmentRejection` (`Literal[...]`).
@@ -90,8 +90,9 @@ fn classify_mime(mime: &str) -> Option<MimeCategory> {
     }
 }
 
-static DATA_URL_MIME_RE: std::sync::LazyLock<regex::Regex> =
-    std::sync::LazyLock::new(|| regex::Regex::new(r"(?s)^data:([^;,]+)(?:;[^,]*)*;base64,").unwrap());
+static DATA_URL_MIME_RE: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+    regex::Regex::new(r"(?s)^data:([^;,]+)(?:;[^,]*)*;base64,").unwrap()
+});
 
 /// Return the normalized MIME from a base64 data URL, else `None`.
 ///
@@ -168,7 +169,10 @@ pub fn store_inbound_attachments(
         let Some(attachment) = item.as_object() else {
             return abort(&paths, AttachmentRejection::Malformed);
         };
-        let Some(data_url) = attachment.get("data_url").and_then(Value::as_str).filter(|s| !s.is_empty())
+        let Some(data_url) = attachment
+            .get("data_url")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
         else {
             return abort(&paths, AttachmentRejection::Malformed);
         };
@@ -180,7 +184,11 @@ pub fn store_inbound_attachments(
         };
         let is_video = category == MimeCategory::Video;
         let is_document = category == MimeCategory::Document;
-        let max_bytes = if is_video { MAX_VIDEO_BYTES } else { limits.max_file_bytes };
+        let max_bytes = if is_video {
+            MAX_VIDEO_BYTES
+        } else {
+            limits.max_file_bytes
+        };
         let name = if is_document {
             attachment.get("name").and_then(Value::as_str)
         } else {
@@ -219,7 +227,7 @@ pub fn store_inbound_attachments(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use base64::{engine::general_purpose::STANDARD, Engine};
+    use base64::{Engine, engine::general_purpose::STANDARD};
 
     fn data_url(mime: &str, bytes: &[u8]) -> Value {
         serde_json::json!({
@@ -244,7 +252,10 @@ mod tests {
     #[test]
     fn empty_media_list_succeeds_with_no_paths() {
         let dir = tempfile::tempdir().unwrap();
-        assert_eq!(store_inbound_attachments(&[], dir.path(), limits()), Ok(vec![]));
+        assert_eq!(
+            store_inbound_attachments(&[], dir.path(), limits()),
+            Ok(vec![])
+        );
     }
 
     #[test]
@@ -334,7 +345,10 @@ mod tests {
 
         // The first (valid) attachment must have been unlinked, not left behind.
         let remaining: Vec<_> = std::fs::read_dir(dir.path()).unwrap().collect();
-        assert!(remaining.is_empty(), "expected cleanup, found {remaining:?}");
+        assert!(
+            remaining.is_empty(),
+            "expected cleanup, found {remaining:?}"
+        );
     }
 
     #[test]
@@ -367,6 +381,9 @@ mod tests {
         img["name"] = serde_json::json!("should-be-ignored.png");
         let saved = store_inbound_attachments(&[img], dir.path(), limits()).unwrap();
         let name = Path::new(&saved[0]).file_name().unwrap().to_str().unwrap();
-        assert!(!name.contains("should-be-ignored"), "unexpected stem in {name}");
+        assert!(
+            !name.contains("should-be-ignored"),
+            "unexpected stem in {name}"
+        );
     }
 }

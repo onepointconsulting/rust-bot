@@ -2,8 +2,6 @@ use std::path::PathBuf;
 
 use rust_bot::agent::skills::SkillsLoader;
 
-
-
 #[tokio::test]
 async fn test_skills_loader_list_skills() {
     let loader = SkillsLoader::new(&PathBuf::from("."), None);

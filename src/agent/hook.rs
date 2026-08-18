@@ -67,11 +67,7 @@ pub trait AgentHook: Send + Sync {
 
     /// Post-process the final content string. Called synchronously in a pipeline:
     /// each hook receives the output of the previous one.
-    fn finalize_content(
-        &self,
-        _ctx: &AgentHookContext,
-        content: Option<String>,
-    ) -> Option<String> {
+    fn finalize_content(&self, _ctx: &AgentHookContext, content: Option<String>) -> Option<String> {
         content
     }
 }
@@ -110,11 +106,16 @@ impl AgentHook for CompositeHook {
 
     async fn before_iteration(&self, ctx: &mut AgentHookContext) {
         for hook in &self.hooks {
-            match AssertUnwindSafe(hook.before_iteration(ctx)).catch_unwind().await {
+            match AssertUnwindSafe(hook.before_iteration(ctx))
+                .catch_unwind()
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => log::error!(
                     "AgentHook.before_iteration panicked: {:?}",
-                    e.downcast_ref::<&str>().copied().unwrap_or("(non-string panic)")
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
                 ),
             }
         }
@@ -122,11 +123,16 @@ impl AgentHook for CompositeHook {
 
     async fn on_stream(&self, ctx: &mut AgentHookContext, delta: &str) {
         for hook in &self.hooks {
-            match AssertUnwindSafe(hook.on_stream(ctx, delta)).catch_unwind().await {
+            match AssertUnwindSafe(hook.on_stream(ctx, delta))
+                .catch_unwind()
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => log::error!(
                     "AgentHook.on_stream panicked: {:?}",
-                    e.downcast_ref::<&str>().copied().unwrap_or("(non-string panic)")
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
                 ),
             }
         }
@@ -134,11 +140,16 @@ impl AgentHook for CompositeHook {
 
     async fn on_stream_end(&self, ctx: &mut AgentHookContext, resuming: bool) {
         for hook in &self.hooks {
-            match AssertUnwindSafe(hook.on_stream_end(ctx, resuming)).catch_unwind().await {
+            match AssertUnwindSafe(hook.on_stream_end(ctx, resuming))
+                .catch_unwind()
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => log::error!(
                     "AgentHook.on_stream_end panicked: {:?}",
-                    e.downcast_ref::<&str>().copied().unwrap_or("(non-string panic)")
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
                 ),
             }
         }
@@ -146,11 +157,16 @@ impl AgentHook for CompositeHook {
 
     async fn before_execute_tools(&self, ctx: &mut AgentHookContext) {
         for hook in &self.hooks {
-            match AssertUnwindSafe(hook.before_execute_tools(ctx)).catch_unwind().await {
+            match AssertUnwindSafe(hook.before_execute_tools(ctx))
+                .catch_unwind()
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => log::error!(
                     "AgentHook.before_execute_tools panicked: {:?}",
-                    e.downcast_ref::<&str>().copied().unwrap_or("(non-string panic)")
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
                 ),
             }
         }
@@ -158,11 +174,16 @@ impl AgentHook for CompositeHook {
 
     async fn after_iteration(&self, ctx: &mut AgentHookContext) {
         for hook in &self.hooks {
-            match AssertUnwindSafe(hook.after_iteration(ctx)).catch_unwind().await {
+            match AssertUnwindSafe(hook.after_iteration(ctx))
+                .catch_unwind()
+                .await
+            {
                 Ok(()) => {}
                 Err(e) => log::error!(
                     "AgentHook.after_iteration panicked: {:?}",
-                    e.downcast_ref::<&str>().copied().unwrap_or("(non-string panic)")
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
                 ),
             }
         }
@@ -232,18 +253,28 @@ mod tests {
         }
 
         async fn on_stream_end(&self, _ctx: &mut AgentHookContext, resuming: bool) {
-            self.calls.lock().unwrap().push(format!("on_stream_end(resuming={})", resuming));
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("on_stream_end(resuming={})", resuming));
         }
 
         async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {
-            self.calls.lock().unwrap().push("before_execute_tools".into());
+            self.calls
+                .lock()
+                .unwrap()
+                .push("before_execute_tools".into());
         }
 
         async fn after_iteration(&self, _ctx: &mut AgentHookContext) {
             self.calls.lock().unwrap().push("after_iteration".into());
         }
 
-        fn finalize_content(&self, _ctx: &AgentHookContext, content: Option<String>) -> Option<String> {
+        fn finalize_content(
+            &self,
+            _ctx: &AgentHookContext,
+            content: Option<String>,
+        ) -> Option<String> {
             self.calls.lock().unwrap().push("finalize_content".into());
             content.map(|c| format!("[wrapped]{}", c))
         }
@@ -305,7 +336,10 @@ mod tests {
         hook.before_execute_tools(&mut ctx).await;
         hook.after_iteration(&mut ctx).await;
         assert!(!hook.wants_streaming());
-        assert_eq!(hook.finalize_content(&ctx, Some("hi".into())), Some("hi".into()));
+        assert_eq!(
+            hook.finalize_content(&ctx, Some("hi".into())),
+            Some("hi".into())
+        );
         assert_eq!(hook.finalize_content(&ctx, None), None);
     }
 
@@ -323,13 +357,16 @@ mod tests {
         hook.after_iteration(&mut ctx).await;
 
         let calls = hook.recorded();
-        assert_eq!(calls, vec![
-            "before_iteration",
-            "on_stream",
-            "on_stream_end(resuming=true)",
-            "before_execute_tools",
-            "after_iteration",
-        ]);
+        assert_eq!(
+            calls,
+            vec![
+                "before_iteration",
+                "on_stream",
+                "on_stream_end(resuming=true)",
+                "before_execute_tools",
+                "after_iteration",
+            ]
+        );
         assert_eq!(hook.streamed(), "hello");
     }
 
@@ -369,8 +406,14 @@ mod tests {
         let a = Arc::new(Mutex::new(Vec::<String>::new()));
         let b = Arc::new(Mutex::new(Vec::<String>::new()));
 
-        let hook_a = RecordingHook { calls: Arc::clone(&a), ..Default::default() };
-        let hook_b = RecordingHook { calls: Arc::clone(&b), ..Default::default() };
+        let hook_a = RecordingHook {
+            calls: Arc::clone(&a),
+            ..Default::default()
+        };
+        let hook_b = RecordingHook {
+            calls: Arc::clone(&b),
+            ..Default::default()
+        };
 
         let composite = CompositeHook::new(vec![Arc::new(hook_a), Arc::new(hook_b)]);
         let mut ctx = make_ctx();
@@ -405,7 +448,12 @@ mod tests {
         let mut ctx = make_ctx();
 
         composite.on_stream_end(&mut ctx, false).await;
-        assert!(calls_ref.lock().unwrap().contains(&"on_stream_end(resuming=false)".to_string()));
+        assert!(
+            calls_ref
+                .lock()
+                .unwrap()
+                .contains(&"on_stream_end(resuming=false)".to_string())
+        );
     }
 
     #[test]
@@ -443,15 +491,17 @@ mod tests {
         let calls_ref = Arc::clone(&good.calls);
 
         // PanickingHook first, then the good hook — good hook must still run
-        let composite = CompositeHook::new(vec![
-            Arc::new(PanickingHook),
-            Arc::new(good),
-        ]);
+        let composite = CompositeHook::new(vec![Arc::new(PanickingHook), Arc::new(good)]);
         let mut ctx = make_ctx();
         composite.before_iteration(&mut ctx).await;
 
-        assert!(calls_ref.lock().unwrap().contains(&"before_iteration".to_string()),
-            "good hook should still run after panicking hook");
+        assert!(
+            calls_ref
+                .lock()
+                .unwrap()
+                .contains(&"before_iteration".to_string()),
+            "good hook should still run after panicking hook"
+        );
     }
 
     #[tokio::test]
@@ -471,6 +521,11 @@ mod tests {
         let composite = CompositeHook::new(vec![Arc::new(PanickingHook), Arc::new(good)]);
         let mut ctx = make_ctx();
         composite.after_iteration(&mut ctx).await;
-        assert!(calls_ref.lock().unwrap().contains(&"after_iteration".to_string()));
+        assert!(
+            calls_ref
+                .lock()
+                .unwrap()
+                .contains(&"after_iteration".to_string())
+        );
     }
 }

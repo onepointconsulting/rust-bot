@@ -1,4 +1,4 @@
-use chat_ui::components::ChatInput;
+use chat_ui::components::{ChatHeaderActions, ChatInput};
 use chat_ui::models::{ChatEntry, OutgoingMessage};
 use leptos::prelude::*;
 
@@ -28,96 +28,18 @@ pub fn ChatShell(
     };
     view! {
         <div class=shell_class>
-            <header class="flex items-center justify-between border-b border-slate-200 bg-white px-4 py-3">
-                <div>
+            <header class="relative z-10 flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
+                <div class="min-w-0">
                     <h1 class="text-base font-semibold text-slate-900">"Rust Bot"</h1>
                     <p class="text-xs text-slate-400">"Ask AI"</p>
                 </div>
-                <div class="flex items-center gap-1">
-                    <button
-                        type="button"
-                        class="rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100"
-                        on:click=move |_| on_new_chat()
-                    >
-                        "New chat"
-                    </button>
-                    <button
-                        type="button"
-                        class="rounded-full px-3 py-1.5 text-xs font-medium text-slate-400 hover:bg-slate-100"
-                        on:click=move |_| on_logout()
-                    >
-                        "Sign out"
-                    </button>
-                    <button
-                        type="button"
-                        aria-label=move || if expanded.get() { "Contract chat" } else { "Expand chat" }
-                        title=move || if expanded.get() { "Contract" } else { "Expand" }
-                        class="ml-1 flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                        on:click=move |_| on_toggle_expand()
-                    >
-                        <Show
-                            when=move || expanded.get()
-                            fallback=|| {
-                                view! {
-                                    <svg
-                                        xmlns="http://www.w3.org/2000/svg"
-                                        viewBox="0 0 24 24"
-                                        fill="none"
-                                        stroke="currentColor"
-                                        stroke-width="2"
-                                        stroke-linecap="round"
-                                        stroke-linejoin="round"
-                                        class="h-4 w-4"
-                                        aria-hidden="true"
-                                    >
-                                        <path d="M15 3h6v6" />
-                                        <path d="M9 21H3v-6" />
-                                        <path d="M21 3l-7 7" />
-                                        <path d="M3 21l7-7" />
-                                    </svg>
-                                }
-                            }
-                        >
-                            <svg
-                                xmlns="http://www.w3.org/2000/svg"
-                                viewBox="0 0 24 24"
-                                fill="none"
-                                stroke="currentColor"
-                                stroke-width="2"
-                                stroke-linecap="round"
-                                stroke-linejoin="round"
-                                class="h-4 w-4"
-                                aria-hidden="true"
-                            >
-                                <path d="M9 3v6H3" />
-                                <path d="M15 21v-6h6" />
-                                <path d="M3 3l7 7" />
-                                <path d="M21 21l-7-7" />
-                            </svg>
-                        </Show>
-                    </button>
-                    <button
-                        type="button"
-                        aria-label="Minimize chat"
-                        title="Minimize"
-                        class="ml-1 flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                        on:click=move |_| on_minimize()
-                    >
-                        <svg
-                            xmlns="http://www.w3.org/2000/svg"
-                            viewBox="0 0 24 24"
-                            fill="none"
-                            stroke="currentColor"
-                            stroke-width="2"
-                            stroke-linecap="round"
-                            stroke-linejoin="round"
-                            class="h-4 w-4"
-                            aria-hidden="true"
-                        >
-                            <path d="M5 12h14" />
-                        </svg>
-                    </button>
-                </div>
+                <ChatHeaderActions
+                    expanded=expanded
+                    on_new_chat=on_new_chat
+                    on_logout=on_logout
+                    on_minimize=on_minimize
+                    on_toggle_expand=on_toggle_expand
+                />
             </header>
 
             <Show when=move || error.get().is_some()>

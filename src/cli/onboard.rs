@@ -4,7 +4,9 @@ use std::io::{self, Write};
 use anstyle::{AnsiColor, Color, Style};
 
 use crate::cli::commands::{CliError, OnboardArgs};
-use crate::cli::wizard::{apply_workspace_override, choose_providers, config_model, resolve_onboard_config_path, wizard};
+use crate::cli::wizard::{
+    apply_workspace_override, choose_providers, config_model, resolve_onboard_config_path, wizard,
+};
 use crate::config::loader::{load_config, save_config};
 use crate::config::schema::{Config, ModelPresetConfig};
 use crate::utils::helpers::{ensure_dir, sync_workspace_templates};
@@ -67,10 +69,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     let workspace_path = config.workspace_path();
     if !workspace_path.exists() {
         ensure_dir(&workspace_path);
-        print_onboard_ok(format!(
-            "Created workspace at {}",
-            workspace_path.display()
-        ));
+        print_onboard_ok(format!("Created workspace at {}", workspace_path.display()));
     } else {
         ensure_dir(&workspace_path);
     }
@@ -83,7 +82,10 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     println!("{LOGO} is ready!");
     println!();
     println!("Next steps:");
-    println!("  1. Change the config file to your needs at {}", config_path.display());
+    println!(
+        "  1. Change the config file to your needs at {}",
+        config_path.display()
+    );
     println!(
         "  2. a) One message chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
         config_path.display()
@@ -92,10 +94,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
         "  2. b) Interactive chat: rust-bot agent -c \"{}\" ",
         config_path.display()
     );
-    println!(
-        "  2. c) API: rust-bot api -c \"{}\"",
-        config_path.display()
-    );
+    println!("  2. c) API: rust-bot api -c \"{}\"", config_path.display());
     println!(
         "  2. d) Gateway: rust-bot gateway -c \"{}\"",
         config_path.display()
@@ -117,7 +116,10 @@ pub fn create_env_file() {
 
     let env_file_path = cwd.join(".env");
     if env_file_path.exists() {
-        print_onboard_ok(format!("Env file already exists at {}", env_file_path.display()));
+        print_onboard_ok(format!(
+            "Env file already exists at {}",
+            env_file_path.display()
+        ));
         return;
     }
 
@@ -143,20 +145,12 @@ fn confirm_overwrite() -> bool {
 
 fn print_onboard_ok(message: impl fmt::Display) {
     let green = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Green)));
-    println!(
-        "{}✓{} {message}",
-        green.render(),
-        green.render_reset()
-    );
+    println!("{}✓{} {message}", green.render(), green.render_reset());
 }
 
 fn print_onboard_err(message: impl fmt::Display) {
     let red = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Red)));
-    println!(
-        "{}✗{} {message}",
-        red.render(),
-        red.render_reset()
-    );
+    println!("{}✗{} {message}", red.render(), red.render_reset());
 }
 
 fn create_default_model_presets(config: &mut Config) {

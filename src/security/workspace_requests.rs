@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     config::paths::get_webui_dir,
     security::{
-        WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError, WORKSPACE_SCOPE_METADATA_KEY,
+        WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
         build_workspace_scope, default_workspace_scope, validate_workspace_scope_payload,
         workspace_scope_from_metadata,
     },
@@ -74,9 +74,8 @@ impl<'de> Deserialize<'de> for DefaultAccessMode {
         D: serde::Deserializer<'de>,
     {
         let raw = String::deserialize(deserializer)?;
-        Self::parse_with_legacy_remap(&raw).ok_or_else(|| {
-            serde::de::Error::custom(format!("invalid default access mode: {raw}"))
-        })
+        Self::parse_with_legacy_remap(&raw)
+            .ok_or_else(|| serde::de::Error::custom(format!("invalid default access mode: {raw}")))
     }
 }
 
@@ -100,7 +99,10 @@ impl Default for WebuiWorkspaceState {
 fn load_state_from(path: &Path) -> WebuiWorkspaceState {
     match std::fs::metadata(path) {
         Ok(meta) if meta.len() > MAX_STATE_FILE_BYTES => {
-            log::warn!("webui workspace state too large, ignoring: {}", path.display());
+            log::warn!(
+                "webui workspace state too large, ignoring: {}",
+                path.display()
+            );
             return WebuiWorkspaceState::default();
         }
         Ok(_) => {}
@@ -211,7 +213,10 @@ pub struct WorkspaceRequestHandler {
 
 impl WorkspaceRequestHandler {
     pub fn new(default_workspace: PathBuf, default_restrict_to_workspace: bool) -> Self {
-        Self { default_workspace, default_restrict_to_workspace }
+        Self {
+            default_workspace,
+            default_restrict_to_workspace,
+        }
     }
 
     pub fn default_scope(&self) -> WorkspaceScope {
@@ -270,7 +275,10 @@ impl WorkspaceRequestHandler {
             )?,
         };
         if !controls_available && !scope_change_is_non_escalating(&current, &scope) {
-            return Err(WorkspaceScopeError::new(403, "workspace controls are localhost-only"));
+            return Err(WorkspaceScopeError::new(
+                403,
+                "workspace controls are localhost-only",
+            ));
         }
         Ok(scope)
     }
@@ -298,7 +306,12 @@ impl WorkspaceRequestHandler {
             return Err(WorkspaceScopeError::new(409, "chat_running"));
         }
         let session_key = format!("websocket:{chat_id}");
-        self.scope_from_envelope(session_manager, envelope, Some(&session_key), controls_available)
+        self.scope_from_envelope(
+            session_manager,
+            envelope,
+            Some(&session_key),
+            controls_available,
+        )
     }
 
     /// Like [`Self::scope_for_set_request`], but only rejects (`409`) while
@@ -314,11 +327,18 @@ impl WorkspaceRequestHandler {
         controls_available: bool,
     ) -> Result<WorkspaceScope, WorkspaceScopeError> {
         let session_key = format!("websocket:{chat_id}");
-        let scope =
-            self.scope_from_envelope(session_manager, envelope, Some(&session_key), controls_available)?;
+        let scope = self.scope_from_envelope(
+            session_manager,
+            envelope,
+            Some(&session_key),
+            controls_available,
+        )?;
         if envelope.contains_key(WORKSPACE_SCOPE_METADATA_KEY)
             && chat_running
-            && scope.metadata() != self.scope_for_session_key(session_manager, &session_key).metadata()
+            && scope.metadata()
+                != self
+                    .scope_for_session_key(session_manager, &session_key)
+                    .metadata()
         {
             return Err(WorkspaceScopeError::new(409, "chat_running"));
         }
@@ -331,10 +351,18 @@ impl WorkspaceRequestHandler {
     /// path our `/workspace` command uses) — this one hardcodes the
     /// `websocket:{chat_id}` session-key format and the `webui` tag, both
     /// specific to the future envelope-driven caller.
-    pub fn persist_scope(&self, session_manager: &mut SessionManager, chat_id: &str, scope: &WorkspaceScope) {
+    pub fn persist_scope(
+        &self,
+        session_manager: &mut SessionManager,
+        chat_id: &str,
+        scope: &WorkspaceScope,
+    ) {
         let session_key = format!("websocket:{chat_id}");
         let session = session_manager.get_or_create_session(&session_key);
-        session.metadata.insert(SESSION_WEBUI_METADATA_KEY.to_string(), serde_json::json!(true));
+        session.metadata.insert(
+            SESSION_WEBUI_METADATA_KEY.to_string(),
+            serde_json::json!(true),
+        );
         session
             .metadata
             .insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
@@ -358,9 +386,18 @@ mod tests {
 
     #[test]
     fn default_access_mode_parses_default_full_and_legacy_restricted() {
-        assert_eq!(DefaultAccessMode::parse_with_legacy_remap("default"), Some(DefaultAccessMode::Default));
-        assert_eq!(DefaultAccessMode::parse_with_legacy_remap("full"), Some(DefaultAccessMode::Full));
-        assert_eq!(DefaultAccessMode::parse_with_legacy_remap("restricted"), Some(DefaultAccessMode::Default));
+        assert_eq!(
+            DefaultAccessMode::parse_with_legacy_remap("default"),
+            Some(DefaultAccessMode::Default)
+        );
+        assert_eq!(
+            DefaultAccessMode::parse_with_legacy_remap("full"),
+            Some(DefaultAccessMode::Full)
+        );
+        assert_eq!(
+            DefaultAccessMode::parse_with_legacy_remap("restricted"),
+            Some(DefaultAccessMode::Default)
+        );
     }
 
     #[test]
@@ -430,9 +467,11 @@ mod tests {
             DefaultAccessMode::Default => {
                 default_workspace_scope(dir.path(), true, Some(WEBUI_SCOPE_CHANNEL))
             }
-            DefaultAccessMode::Full => {
-                build_workspace_scope(dir.path(), WorkspaceAccessMode::Full, Some(WEBUI_SCOPE_CHANNEL))
-            }
+            DefaultAccessMode::Full => build_workspace_scope(
+                dir.path(),
+                WorkspaceAccessMode::Full,
+                Some(WEBUI_SCOPE_CHANNEL),
+            ),
         };
         assert_eq!(scope.access_mode, WorkspaceAccessMode::Full);
         assert!(!scope.restrict_to_workspace);
@@ -575,6 +614,9 @@ mod tests {
         assert_eq!(reloaded.access_mode, WorkspaceAccessMode::Full);
 
         let session = sessions.get_or_create_session("websocket:chat-1");
-        assert_eq!(session.metadata.get(SESSION_WEBUI_METADATA_KEY), Some(&json!(true)));
+        assert_eq!(
+            session.metadata.get(SESSION_WEBUI_METADATA_KEY),
+            Some(&json!(true))
+        );
     }
 }

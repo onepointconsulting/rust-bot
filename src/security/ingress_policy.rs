@@ -6,7 +6,7 @@
 //!
 //! Port of nanobot's `nanobot/webui/ingress_policy.py`.
 
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 /// Rejection code returned by [`WebUIIngressPolicy::validate_text`].
 pub const MESSAGE_TOO_LARGE: &str = "text_too_large";
@@ -104,8 +104,7 @@ impl WebUIIngressPolicy {
 
     /// Conservative frame size needed for every policy-valid message.
     pub fn minimum_full_policy_frame_bytes(&self) -> usize {
-        let encoded_attachments =
-            4 * self.attachments.max_total_bytes.div_ceil(3);
+        let encoded_attachments = 4 * self.attachments.max_total_bytes.div_ceil(3);
         let data_url_allowance = self.attachments.max_count * 128;
         encoded_attachments
             + data_url_allowance
@@ -148,10 +147,7 @@ mod tests {
                 "envelope_reserve_bytes": 65_536,
             })
         );
-        assert_eq!(
-            payload["message"],
-            json!({ "max_text_bytes": 65_536 })
-        );
+        assert_eq!(payload["message"], json!({ "max_text_bytes": 65_536 }));
         assert_eq!(
             payload["attachments"],
             json!({

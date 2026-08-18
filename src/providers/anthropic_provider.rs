@@ -7,7 +7,8 @@ use crate::providers::{
     registry::ProviderSpec,
 };
 use adk_anthropic::{
-    AccumulatingStream, Anthropic, ContentBlockDelta, Error as AdkError, Message, MessageStreamEvent,
+    AccumulatingStream, Anthropic, ContentBlockDelta, Error as AdkError, Message,
+    MessageStreamEvent,
 };
 use futures::StreamExt;
 use rand::seq::IndexedRandom;
@@ -24,11 +25,7 @@ const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234
 const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 
 /// Claude 5 models reject legacy `temperature` and `thinking.type.enabled`.
-const CLAUDE_5_MODEL_PREFIXES: &[&str] = &[
-    "claude-sonnet-5",
-    "claude-opus-5",
-    "claude-haiku-5",
-];
+const CLAUDE_5_MODEL_PREFIXES: &[&str] = &["claude-sonnet-5", "claude-opus-5", "claude-haiku-5"];
 
 fn gen_tool_id() -> String {
     let mut rng = rand::rng();
@@ -480,7 +477,10 @@ impl AnthropicProvider {
         };
 
         let mut args = HashMap::new();
-        args.insert("model".to_string(), serde_json::Value::String(model_name.clone()));
+        args.insert(
+            "model".to_string(),
+            serde_json::Value::String(model_name.clone()),
+        );
         args.insert(
             "messages".to_string(),
             serde_json::Value::Array(anthropic_msgs),
@@ -682,16 +682,31 @@ impl AnthropicProvider {
     }
 
     fn parse_usage(usage: &serde_json::Value) -> HashMap<String, u64> {
-        let input_tokens = usage.get("input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_creation = usage.get("cache_creation_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let cache_read = usage.get("cache_read_input_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
-        let output_tokens = usage.get("output_tokens").and_then(|v| v.as_u64()).unwrap_or(0);
+        let input_tokens = usage
+            .get("input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_creation = usage
+            .get("cache_creation_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let cache_read = usage
+            .get("cache_read_input_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+        let output_tokens = usage
+            .get("output_tokens")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
         let total_prompt_tokens = input_tokens + cache_creation + cache_read;
 
         let mut map = HashMap::new();
         map.insert("prompt_tokens".to_string(), total_prompt_tokens);
         map.insert("completion_tokens".to_string(), output_tokens);
-        map.insert("total_tokens".to_string(), total_prompt_tokens + output_tokens);
+        map.insert(
+            "total_tokens".to_string(),
+            total_prompt_tokens + output_tokens,
+        );
         if cache_creation > 0 {
             map.insert("cache_creation_input_tokens".to_string(), cache_creation);
         }
@@ -758,8 +773,7 @@ impl AnthropicProvider {
             }
         }
 
-        let stop_map =
-            serde_json::json!({"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length"});
+        let stop_map = serde_json::json!({"tool_use": "tool_calls", "end_turn": "stop", "max_tokens": "length"});
         let default_stop = serde_json::Value::String("stop".to_string());
         let finish_reason = stop_map
             .get(
@@ -779,7 +793,11 @@ impl AnthropicProvider {
 
         let joined = content_parts.join("");
         LLMResponse {
-            content: if joined.is_empty() { None } else { Some(joined) },
+            content: if joined.is_empty() {
+                None
+            } else {
+                Some(joined)
+            },
             finish_reason: finish_reason.to_string(),
             tool_calls,
             usage,
@@ -848,7 +866,9 @@ impl AnthropicProvider {
         }
     }
 
-    fn take_sse_message_event(buffer: &mut Vec<u8>) -> Option<Result<MessageStreamEvent, AdkError>> {
+    fn take_sse_message_event(
+        buffer: &mut Vec<u8>,
+    ) -> Option<Result<MessageStreamEvent, AdkError>> {
         let split_pos = buffer.windows(2).position(|window| window == b"\n\n")?;
         // Decode only the complete event block; the `\n\n` boundary falls on
         // whole bytes, so no multi-byte UTF-8 sequence is split here.
@@ -872,9 +892,7 @@ impl AnthropicProvider {
             return Some(Ok(MessageStreamEvent::Ping));
         }
 
-        Some(
-            serde_json::from_str::<MessageStreamEvent>(&data).map_err(AdkError::from),
-        )
+        Some(serde_json::from_str::<MessageStreamEvent>(&data).map_err(AdkError::from))
     }
 
     fn sse_event_stream<S, B>(
@@ -1110,7 +1128,10 @@ impl LLMProvider for AnthropicProvider {
 
         if !response.status().is_success() {
             log::error!("Response status: {:?}", response.status());
-            log::error!("API Key is set: {:?}", self.api_key.as_ref().is_some() && !self.api_key.as_ref().unwrap().is_empty());
+            log::error!(
+                "API Key is set: {:?}",
+                self.api_key.as_ref().is_some() && !self.api_key.as_ref().unwrap().is_empty()
+            );
             return AnthropicProvider::parse_response(Ok(response)).await;
         }
 
@@ -1795,7 +1816,10 @@ mod tests {
         let blocks = resp.thinking_blocks.unwrap();
         assert_eq!(blocks.len(), 1);
         assert_eq!(blocks[0]["type"], json!("thinking"));
-        assert_eq!(blocks[0]["thinking"], json!("Let me reason through this..."));
+        assert_eq!(
+            blocks[0]["thinking"],
+            json!("Let me reason through this...")
+        );
         assert_eq!(blocks[0]["signature"], json!("sig_abc"));
         assert!(resp.content.is_none());
     }
@@ -1918,7 +1942,9 @@ mod tests {
     #[test]
     fn uses_adaptive_thinking_for_claude_5_models() {
         assert!(AnthropicProvider::uses_adaptive_thinking("claude-sonnet-5"));
-        assert!(!AnthropicProvider::uses_adaptive_thinking("claude-sonnet-4-6"));
+        assert!(!AnthropicProvider::uses_adaptive_thinking(
+            "claude-sonnet-4-6"
+        ));
     }
 
     #[test]

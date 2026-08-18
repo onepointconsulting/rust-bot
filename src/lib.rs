@@ -1,18 +1,18 @@
 pub mod agent;
+pub mod api;
 pub mod bus;
+pub mod channels;
+pub mod cli;
+pub mod command;
 pub mod config;
-pub mod providers;
-pub mod utils;
+pub mod cron;
+pub mod heartbeat;
 pub mod pairing;
+pub mod providers;
+pub mod runtime_context;
 pub mod security;
 pub mod session;
-pub mod cron;
-pub mod command;
-pub mod cli;
-pub mod channels;
-pub mod api;
-pub mod heartbeat;
-pub mod runtime_context;
+pub mod utils;
 
 // src/lib.rs (or a small version.rs)
 pub const PKG_VERSION: &str = env!("CARGO_PKG_VERSION");

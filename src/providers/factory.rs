@@ -24,7 +24,15 @@ use crate::providers::registry::find_by_name;
 /// updating both.
 pub fn try_auto_provider_selection(
     config: &Config,
-) -> Result<(String, Option<String>, Option<String>, Option<HashMap<String, String>>), String> {
+) -> Result<
+    (
+        String,
+        Option<String>,
+        Option<String>,
+        Option<HashMap<String, String>>,
+    ),
+    String,
+> {
     if !config.providers.openai.api_key.is_empty() {
         return Ok((
             "openai".to_string(),
@@ -67,7 +75,10 @@ pub fn try_auto_provider_selection(
 /// back requests — i.e. `"auto"` resolved via [`try_auto_provider_selection`],
 /// anything else returned unchanged. Used as a cache key by
 /// `ModelRuntimeResolver`; does not construct a provider instance.
-pub fn resolve_concrete_provider_name(config: &Config, provider_name: &str) -> Result<String, String> {
+pub fn resolve_concrete_provider_name(
+    config: &Config,
+    provider_name: &str,
+) -> Result<String, String> {
     if provider_name == "auto" {
         Ok(try_auto_provider_selection(config)?.0)
     } else {

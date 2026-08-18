@@ -59,7 +59,12 @@ fn clear_stored_entries() {
 }
 
 fn next_entry_id(entries: &[ChatEntry]) -> u64 {
-    entries.iter().map(|e| e.id).max().map(|id| id + 1).unwrap_or(0)
+    entries
+        .iter()
+        .map(|e| e.id)
+        .max()
+        .map(|id| id + 1)
+        .unwrap_or(0)
 }
 
 /// Keep the last `max_turns` user messages and everything after the first kept user message.
@@ -214,7 +219,9 @@ pub fn App() -> impl IntoView {
 
     let do_new_chat = move || {
         let Some(jwt) = token.get() else { return };
-        let Some(email) = read_stored_email() else { return };
+        let Some(email) = read_stored_email() else {
+            return;
+        };
         clear_stored_entries();
         entries.set(Vec::new());
         next_id.set(0);

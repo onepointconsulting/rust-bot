@@ -1,12 +1,12 @@
-use async_trait::async_trait;
 use crate::agent::tools::base::Tool;
 use crate::agent::tools::sandbox::wrap_command;
 use crate::agent::workspace_context::current_tool_workspace;
 use crate::config::paths::get_media_dir;
+use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
-use std::path::{Path, PathBuf};
 use std::io::Read;
+use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
@@ -95,7 +95,8 @@ impl ShellTool {
         let mut cwd = working_dir
             .or_else(|| tw.project_path.clone())
             .unwrap_or_else(|| std::env::current_dir().unwrap());
-        let guard_error = self.guard_command(command, cwd.to_str().unwrap(), tw.restrict_to_workspace);
+        let guard_error =
+            self.guard_command(command, cwd.to_str().unwrap(), tw.restrict_to_workspace);
         if let Some(error) = guard_error {
             return error;
         }
@@ -322,7 +323,12 @@ impl ShellTool {
     /// Note: the Python implementation also calls `contains_internal_url` from
     /// an external security module.  That check is omitted here; add it at the
     /// call site if needed.
-    fn guard_command(&self, command: &str, cwd: &str, restrict_to_workspace: bool) -> Option<String> {
+    fn guard_command(
+        &self,
+        command: &str,
+        cwd: &str,
+        restrict_to_workspace: bool,
+    ) -> Option<String> {
         let cmd = command.trim();
         let lower = cmd.to_lowercase();
 
@@ -380,8 +386,12 @@ impl ShellTool {
 
                 // TODO: Media directory should also be allowed here
                 let media_path = get_media_dir(None);
-                if p.is_absolute() && !p.starts_with(&cwd_path) && p != cwd_path 
-                    && !p.starts_with(&media_path) && p != media_path {
+                if p.is_absolute()
+                    && !p.starts_with(&cwd_path)
+                    && p != cwd_path
+                    && !p.starts_with(&media_path)
+                    && p != media_path
+                {
                     return Some(
                         "Error: Command blocked by safety guard (path outside working dir)"
                             .to_string(),
@@ -510,9 +520,7 @@ impl ShellTool {
         }
         #[cfg(unix)]
         {
-            let _ = Command::new("kill")
-                .args(["-9", &pid.to_string()])
-                .output();
+            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
         }
     }
 
@@ -604,16 +612,14 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
             Some(c) => c,
             None => return "Error: missing required parameter 'command'".to_string(),
         };
-    
+
         let working_dir = params
             .get("working_dir")
             .and_then(|v| v.as_str())
             .map(PathBuf::from);
-    
-        let timeout = params
-            .get("timeout")
-            .and_then(|v| v.as_u64());
-    
+
+        let timeout = params.get("timeout").and_then(|v| v.as_u64());
+
         self.execute_command(command, working_dir, timeout).await
     }
 }
@@ -624,7 +630,7 @@ mod tests {
     use crate::agent::workspace_context::{
         bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
     };
-    use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+    use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
 
     #[test]
     fn test_extract_absolute_paths() {
@@ -745,7 +751,9 @@ mod tests {
     #[tokio::test]
     async fn test_execute_volume_info() {
         let tool = ShellTool::new(10, None, None, None, false, None, None);
-        let result = tool.execute_command(if IS_WINDOWS {"vol"} else {"lsblk -f"}, None, None).await;
+        let result = tool
+            .execute_command(if IS_WINDOWS { "vol" } else { "lsblk -f" }, None, None)
+            .await;
         println!("result: {result}");
         assert!(result.len() > 0, "result should not be empty");
     }
@@ -776,7 +784,15 @@ mod tests {
     #[tokio::test]
     async fn execute_command_cwd_falls_back_to_working_dir_when_no_ambient_scope() {
         let dir = tempfile::tempdir().unwrap();
-        let tool = ShellTool::new(10, Some(dir.path().to_path_buf()), None, None, false, None, None);
+        let tool = ShellTool::new(
+            10,
+            Some(dir.path().to_path_buf()),
+            None,
+            None,
+            false,
+            None,
+            None,
+        );
         let command = if IS_WINDOWS { "cd" } else { "pwd" };
         let result = tool.execute_command(command, None, None).await;
         let canon = dir.path().canonicalize().unwrap();

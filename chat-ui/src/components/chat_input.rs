@@ -81,7 +81,9 @@ fn queue_image_files(files: FileList, attachments: RwSignal<Vec<ImageAttachment>
 /// Snapshot pending attachments with their index, for the chip list `<For>`.
 /// Pulled into a plain function (rather than inline turbofish in the view!
 /// macro) since `::<Vec<_>>` angle brackets confuse the view! tag parser.
-fn indexed_attachments(attachments: RwSignal<Vec<ImageAttachment>>) -> Vec<(usize, ImageAttachment)> {
+fn indexed_attachments(
+    attachments: RwSignal<Vec<ImageAttachment>>,
+) -> Vec<(usize, ImageAttachment)> {
     attachments.get().into_iter().enumerate().collect()
 }
 

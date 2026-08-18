@@ -9,19 +9,16 @@ use crate::utils::helpers::stringify_text_blocks;
 
 const MAX_REPEAT_EXTERNAL_LOOKUPS: usize = 3;
 
-pub const EMPTY_FINAL_RESPONSE_MESSAGE: &str =
-    "I completed the tool steps but couldn't produce a final answer. \
+pub const EMPTY_FINAL_RESPONSE_MESSAGE: &str = "I completed the tool steps but couldn't produce a final answer. \
      Please try again or narrow the task.";
 
 pub const FINALIZATION_RETRY_PROMPT: &str =
     "Please provide your response to the user based on the conversation above.";
 
-pub const LENGTH_RECOVERY_PROMPT: &str =
-    "Output limit reached. Continue exactly where you left off \
+pub const LENGTH_RECOVERY_PROMPT: &str = "Output limit reached. Continue exactly where you left off \
      — no recap, no apology. Break remaining work into smaller steps if needed.";
 
-pub const TRUNCATED_TOOL_CALL_RECOVERY_PROMPT: &str =
-     "Your previous tool call was cut off because the output token limit was reached. \
+pub const TRUNCATED_TOOL_CALL_RECOVERY_PROMPT: &str = "Your previous tool call was cut off because the output token limit was reached. \
  The tool was NOT executed — its arguments were incomplete. \
  Do not repeat the same large tool call. \
  For write_file: write a smaller initial section first, then use edit_file to append \
@@ -219,19 +216,28 @@ mod tests {
     #[test]
     fn test_ensure_nonempty_null_replaced() {
         let result = ensure_nonempty_tool_result("tool", Value::Null);
-        assert_eq!(result, Value::String("(tool completed with no output)".into()));
+        assert_eq!(
+            result,
+            Value::String("(tool completed with no output)".into())
+        );
     }
 
     #[test]
     fn test_ensure_nonempty_blank_string_replaced() {
         let result = ensure_nonempty_tool_result("tool", Value::String("   ".into()));
-        assert_eq!(result, Value::String("(tool completed with no output)".into()));
+        assert_eq!(
+            result,
+            Value::String("(tool completed with no output)".into())
+        );
     }
 
     #[test]
     fn test_ensure_nonempty_empty_string_replaced() {
         let result = ensure_nonempty_tool_result("tool", Value::String("".into()));
-        assert_eq!(result, Value::String("(tool completed with no output)".into()));
+        assert_eq!(
+            result,
+            Value::String("(tool completed with no output)".into())
+        );
     }
 
     #[test]
@@ -244,7 +250,10 @@ mod tests {
     #[test]
     fn test_ensure_nonempty_empty_array_replaced() {
         let result = ensure_nonempty_tool_result("tool", Value::Array(vec![]));
-        assert_eq!(result, Value::String("(tool completed with no output)".into()));
+        assert_eq!(
+            result,
+            Value::String("(tool completed with no output)".into())
+        );
     }
 
     #[test]
@@ -254,7 +263,10 @@ mod tests {
             { "type": "text", "text": "" }
         ]);
         let result = ensure_nonempty_tool_result("tool", blocks);
-        assert_eq!(result, Value::String("(tool completed with no output)".into()));
+        assert_eq!(
+            result,
+            Value::String("(tool completed with no output)".into())
+        );
     }
 
     #[test]

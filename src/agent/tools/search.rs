@@ -1,6 +1,9 @@
 use async_trait::async_trait;
 use regex::Regex;
-use std::{collections::{HashMap, HashSet}, path::PathBuf};
+use std::{
+    collections::{HashMap, HashSet},
+    path::PathBuf,
+};
 
 use crate::agent::tools::{
     base::Tool,
@@ -625,10 +628,7 @@ impl Tool for GrepTool {
         let root = if target.is_dir() {
             target.clone()
         } else {
-            target
-                .parent()
-                .unwrap_or(&target)
-                .to_path_buf()
+            target.parent().unwrap_or(&target).to_path_buf()
         };
 
         let type_filter = if type_name.is_empty() {
@@ -819,7 +819,9 @@ impl Tool for GrepTool {
             notes.push(format!("(pagination: offset={offset})"));
         }
         if skipped_binary > 0 {
-            notes.push(format!("(skipped {skipped_binary} binary/unreadable files)"));
+            notes.push(format!(
+                "(skipped {skipped_binary} binary/unreadable files)"
+            ));
         }
         if skipped_large > 0 {
             notes.push(format!("(skipped {skipped_large} large files)"));
@@ -1591,6 +1593,9 @@ mod tests {
         let result = tool
             .execute(&serde_json::json!({"pattern": "[unclosed"}))
             .await;
-        assert!(result.starts_with("Error: invalid regex pattern"), "got: {result}");
+        assert!(
+            result.starts_with("Error: invalid regex pattern"),
+            "got: {result}"
+        );
     }
 }

@@ -107,7 +107,8 @@ fn abbreviate_url(url: &str, max_len: usize) -> String {
         return truncate_chars(url, max_len);
     }
 
-    let mut budget = max_len as isize - char_len(&domain) as isize - char_len(basename) as isize - 4;
+    let mut budget =
+        max_len as isize - char_len(&domain) as isize - char_len(basename) as isize - 4;
     if budget < 0 {
         let trunc = max_len as isize - char_len(&domain) as isize - 5;
         let truncated_base = if trunc > 0 {
@@ -151,8 +152,6 @@ fn truncate_chars(s: &str, max_len: usize) -> String {
     let take = max_len.saturating_sub(1);
     format!("{}{ELLIPSIS}", take_chars(s, take))
 }
-
-
 
 #[cfg(test)]
 mod tests {

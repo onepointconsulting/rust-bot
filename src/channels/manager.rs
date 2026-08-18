@@ -206,15 +206,24 @@ impl ChannelManager {
             .map(|name| {
                 let overrides = ProgressOverrides {
                     send_progress: resolve_bool_override(
-                        extra, name, "send_progress", "sendProgress",
+                        extra,
+                        name,
+                        "send_progress",
+                        "sendProgress",
                         config.channels.send_progress,
                     ),
                     send_tool_hints: resolve_bool_override(
-                        extra, name, "send_tool_hints", "sendToolHints",
+                        extra,
+                        name,
+                        "send_tool_hints",
+                        "sendToolHints",
                         config.channels.send_tool_hints,
                     ),
                     show_reasoning: resolve_bool_override(
-                        extra, name, "show_reasoning", "showReasoning",
+                        extra,
+                        name,
+                        "show_reasoning",
+                        "showReasoning",
                         config.channels.show_reasoning,
                     ),
                 };
@@ -564,8 +573,7 @@ impl ChannelManager {
                 ProgressKind::Plain | ProgressKind::ToolHint => {}
             }
         }
-        if msg.metadata.get("_stream_delta").is_some()
-            || msg.metadata.get("_stream_end").is_some()
+        if msg.metadata.get("_stream_delta").is_some() || msg.metadata.get("_stream_end").is_some()
         {
             channel
                 .send_delta(
@@ -669,7 +677,10 @@ mod tests {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
         let channels = ChannelManager::init_channels(
-            &config, bus, test_session_manager(), test_workspace_request_handler(),
+            &config,
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert!(channels.is_empty());
     }
@@ -679,7 +690,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let channels = ChannelManager::init_channels(
-            &config, Arc::clone(&bus), test_session_manager(), test_workspace_request_handler(),
+            &config,
+            Arc::clone(&bus),
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert!(channels.contains_key("email"));
         assert_eq!(
@@ -693,7 +707,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(
-            Arc::new(config), Arc::clone(&bus), test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            Arc::clone(&bus),
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         // Same Arc allocation (pointer equality).
         assert!(Arc::ptr_eq(&manager.bus, &bus));
@@ -708,7 +725,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let channels = ChannelManager::init_channels(
-            &config, bus, test_session_manager(), test_workspace_request_handler(),
+            &config,
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert!(ChannelManager::validate_allow_from(&channels).is_ok());
     }
@@ -719,7 +739,10 @@ mod tests {
         config.channels.allow_from.clear();
         let bus = Arc::new(MessageBus::new());
         let channels = ChannelManager::init_channels(
-            &config, bus, test_session_manager(), test_workspace_request_handler(),
+            &config,
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert_eq!(
             ChannelManager::validate_allow_from(&channels),
@@ -738,7 +761,10 @@ mod tests {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(
-            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         manager.start_channel("does-not-exist").await;
         assert!(manager.channels.is_empty());
@@ -749,7 +775,10 @@ mod tests {
         let config = config_with_email(false);
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(
-            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert!(manager.channels.is_empty());
         assert_eq!(
@@ -764,7 +793,10 @@ mod tests {
         config.channels.transcription_provider = Some("openai".to_string());
         let bus = Arc::new(MessageBus::new());
         let channels = ChannelManager::init_channels(
-            &config, bus, test_session_manager(), test_workspace_request_handler(),
+            &config,
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert_eq!(
             channels.get("email").unwrap().transcription_api_key(),
@@ -992,10 +1024,12 @@ mod tests {
 
     fn progress_msg(kind: ProgressKind, content: &str) -> OutboundMessage {
         OutboundMessage {
-            event: Some(OutboundEvent::Progress(crate::bus::outbound_events::ProgressEvent {
-                kind,
-                ..Default::default()
-            })),
+            event: Some(OutboundEvent::Progress(
+                crate::bus::outbound_events::ProgressEvent {
+                    kind,
+                    ..Default::default()
+                },
+            )),
             ..outbound_msg("mock", "chat1", content, HashMap::new())
         }
     }
@@ -1010,7 +1044,11 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(
-            channel.send_reasoning_delta_calls.lock().unwrap().as_slice(),
+            channel
+                .send_reasoning_delta_calls
+                .lock()
+                .unwrap()
+                .as_slice(),
             &[("chat1".to_string(), "thinking...".to_string())]
         );
         assert!(channel.send_calls.lock().unwrap().is_empty());
@@ -1053,7 +1091,13 @@ mod tests {
         let result = ChannelManager::send_once(&channel, msg).await;
 
         assert!(result.is_ok());
-        assert!(channel.send_reasoning_delta_calls.lock().unwrap().is_empty());
+        assert!(
+            channel
+                .send_reasoning_delta_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
         assert!(channel.send_reasoning_end_calls.lock().unwrap().is_empty());
     }
 
@@ -1067,7 +1111,13 @@ mod tests {
 
         assert!(result.is_ok());
         assert_eq!(channel.send_calls.lock().unwrap().len(), 1);
-        assert!(channel.send_reasoning_delta_calls.lock().unwrap().is_empty());
+        assert!(
+            channel
+                .send_reasoning_delta_calls
+                .lock()
+                .unwrap()
+                .is_empty()
+        );
     }
 
     // --- resolve_bool_override / resolve_progress_overrides ---
@@ -1075,29 +1125,59 @@ mod tests {
     #[test]
     fn resolve_bool_override_falls_back_to_default_when_section_missing() {
         let extra = HashMap::new();
-        assert!(resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
-        assert!(!resolve_bool_override(&extra, "email", "send_progress", "sendProgress", false));
+        assert!(resolve_bool_override(
+            &extra,
+            "email",
+            "send_progress",
+            "sendProgress",
+            true
+        ));
+        assert!(!resolve_bool_override(
+            &extra,
+            "email",
+            "send_progress",
+            "sendProgress",
+            false
+        ));
     }
 
     #[test]
     fn resolve_bool_override_reads_snake_case_key() {
         let mut extra = HashMap::new();
         extra.insert("email".to_string(), json!({"send_progress": false}));
-        assert!(!resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+        assert!(!resolve_bool_override(
+            &extra,
+            "email",
+            "send_progress",
+            "sendProgress",
+            true
+        ));
     }
 
     #[test]
     fn resolve_bool_override_falls_back_to_camel_case_alias() {
         let mut extra = HashMap::new();
         extra.insert("email".to_string(), json!({"sendProgress": false}));
-        assert!(!resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+        assert!(!resolve_bool_override(
+            &extra,
+            "email",
+            "send_progress",
+            "sendProgress",
+            true
+        ));
     }
 
     #[test]
     fn resolve_bool_override_ignores_non_bool_value() {
         let mut extra = HashMap::new();
         extra.insert("email".to_string(), json!({"send_progress": "nope"}));
-        assert!(resolve_bool_override(&extra, "email", "send_progress", "sendProgress", true));
+        assert!(resolve_bool_override(
+            &extra,
+            "email",
+            "send_progress",
+            "sendProgress",
+            true
+        ));
     }
 
     #[test]
@@ -1122,7 +1202,10 @@ mod tests {
     fn resolve_progress_overrides_per_channel_section_wins_over_global() {
         let bus = Arc::new(MessageBus::new());
         let mut channels: HashMap<String, SharedChannel> = HashMap::new();
-        channels.insert("websocket".to_string(), Arc::new(MockChannel::new(bus, true)));
+        channels.insert(
+            "websocket".to_string(),
+            Arc::new(MockChannel::new(bus, true)),
+        );
         let mut config = Config::default();
         config.channels.send_progress = true;
         config
@@ -1199,7 +1282,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(
-            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         let status = manager.get_status();
         assert_eq!(
@@ -1213,7 +1299,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(
-            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         );
         assert!(manager.get_channel("email").is_some());
         assert!(manager.get_channel("missing").is_none());
@@ -1224,7 +1313,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let manager = ChannelManager::new(
-            Arc::new(config), Arc::clone(&bus), test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            Arc::clone(&bus),
+            test_session_manager(),
+            test_workspace_request_handler(),
         )
         .register_channel("websocket", Arc::new(MockChannel::new(bus, true)));
 
@@ -1238,7 +1330,10 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let replacement = Arc::new(MockChannel::new(Arc::clone(&bus), true));
         let manager = ChannelManager::new(
-            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         )
         .register_channel("email", Arc::clone(&replacement) as Arc<dyn BaseChannel>);
 
@@ -1260,7 +1355,10 @@ mod tests {
         let config = config_with_email(true);
         let bus = Arc::new(MessageBus::new());
         let manager = Arc::new(ChannelManager::new(
-            Arc::new(config), bus, test_session_manager(), test_workspace_request_handler(),
+            Arc::new(config),
+            bus,
+            test_session_manager(),
+            test_workspace_request_handler(),
         ));
 
         let manager_for_start = Arc::clone(&manager);

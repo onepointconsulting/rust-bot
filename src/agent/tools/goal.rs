@@ -101,7 +101,10 @@ impl Tool for UpdateGoalTool {
         let objective = params.get("objective").and_then(Value::as_str);
         let ui_summary = params.get("ui_summary").and_then(Value::as_str);
 
-        let mut session_manager = self.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut session_manager = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         match goal_state::update_session_goal(
             &mut session_manager,
             &session_key,
@@ -129,7 +132,9 @@ mod tests {
     #[tokio::test]
     async fn execute_without_context_errors() {
         let tool = tool();
-        let result = tool.execute(&serde_json::json!({"action": "complete"})).await;
+        let result = tool
+            .execute(&serde_json::json!({"action": "complete"}))
+            .await;
         assert!(result.contains("no session context"), "{result}");
     }
 
@@ -137,7 +142,9 @@ mod tests {
     async fn execute_without_active_goal_errors() {
         let tool = tool();
         tool.set_tool_context("cli", "direct", None);
-        let result = tool.execute(&serde_json::json!({"action": "complete"})).await;
+        let result = tool
+            .execute(&serde_json::json!({"action": "complete"}))
+            .await;
         assert!(result.contains("No active goal"), "{result}");
     }
 
@@ -172,7 +179,9 @@ mod tests {
         )
         .unwrap();
 
-        let result = tool.execute(&serde_json::json!({"action": "replace"})).await;
+        let result = tool
+            .execute(&serde_json::json!({"action": "replace"}))
+            .await;
         assert!(result.contains("Error"), "{result}");
     }
 

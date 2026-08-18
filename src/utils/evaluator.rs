@@ -103,10 +103,7 @@ pub async fn evaluate_response(
         .get("should_notify")
         .and_then(|v| v.as_bool())
         .unwrap_or(true);
-    let reason = args
-        .get("reason")
-        .and_then(|v| v.as_str())
-        .unwrap_or("");
+    let reason = args.get("reason").and_then(|v| v.as_str()).unwrap_or("");
     log::info!("evaluate_response: should_notify={should_notify}, reason={reason}");
     should_notify
 }

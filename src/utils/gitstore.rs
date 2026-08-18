@@ -8,7 +8,7 @@ use git2::{DiffFormat, Repository, Signature};
 // ── CommitInfo ────────────────────────────────────────────────────────────────
 
 pub struct CommitInfo {
-    pub sha: String,       // Short SHA (8 chars)
+    pub sha: String, // Short SHA (8 chars)
     pub message: String,
     pub timestamp: String, // Formatted datetime
 }
@@ -35,7 +35,10 @@ pub struct GitStore {
 
 impl GitStore {
     pub fn new(workspace: PathBuf, tracked_files: Vec<String>) -> Self {
-        Self { workspace, tracked_files }
+        Self {
+            workspace,
+            tracked_files,
+        }
     }
 
     pub fn is_initialized(&self) -> bool {
@@ -110,7 +113,14 @@ impl GitStore {
         };
 
         let sig = Self::signature();
-        match repo.commit(Some("HEAD"), &sig, &sig, "init: rust-bot memory store", &tree, &[]) {
+        match repo.commit(
+            Some("HEAD"),
+            &sig,
+            &sig,
+            "init: rust-bot memory store",
+            &tree,
+            &[],
+        ) {
             Ok(_) => {
                 log::info!("Git store initialized at {:?}", self.workspace);
                 true
@@ -137,7 +147,8 @@ impl GitStore {
             .ok()?;
 
         // Check for any changes among tracked files
-        let statuses = repo.statuses(None)
+        let statuses = repo
+            .statuses(None)
             .map_err(|e| log::warn!("Git auto-commit: status failed: {}", e))
             .ok()?;
 
@@ -146,21 +157,25 @@ impl GitStore {
             return None;
         }
 
-        let mut index = repo.index()
+        let mut index = repo
+            .index()
             .map_err(|e| log::warn!("Git auto-commit: index error: {}", e))
             .ok()?;
 
         for rel in &self.tracked_files {
             let _ = index.add_path(Path::new(rel));
         }
-        index.write()
+        index
+            .write()
             .map_err(|e| log::warn!("Git auto-commit: index write error: {}", e))
             .ok()?;
 
-        let tree_oid = index.write_tree()
+        let tree_oid = index
+            .write_tree()
             .map_err(|e| log::warn!("Git auto-commit: write_tree error: {}", e))
             .ok()?;
-        let tree = repo.find_tree(tree_oid)
+        let tree = repo
+            .find_tree(tree_oid)
             .map_err(|e| log::warn!("Git auto-commit: find_tree error: {}", e))
             .ok()?;
 
@@ -168,7 +183,8 @@ impl GitStore {
         let parent_commit = repo.head().ok().and_then(|h| h.peel_to_commit().ok());
         let parents: Vec<&git2::Commit> = parent_commit.iter().collect();
 
-        let sha_oid = repo.commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
+        let sha_oid = repo
+            .commit(Some("HEAD"), &sig, &sig, message, &tree, &parents)
             .map_err(|e| log::warn!("Git auto-commit: commit error: {}", e))
             .ok()?;
 
@@ -243,11 +259,19 @@ impl GitStore {
         let resolve = |short: &str| -> Option<git2::Oid> {
             let mut revwalk = repo.revwalk().ok()?;
             revwalk.push_head().ok()?;
-            revwalk.filter_map(|r| r.ok()).find(|oid| oid.to_string().starts_with(short))
+            revwalk
+                .filter_map(|r| r.ok())
+                .find(|oid| oid.to_string().starts_with(short))
         };
 
-        let oid1 = match resolve(sha1) { Some(o) => o, None => return String::new() };
-        let oid2 = match resolve(sha2) { Some(o) => o, None => return String::new() };
+        let oid1 = match resolve(sha1) {
+            Some(o) => o,
+            None => return String::new(),
+        };
+        let oid2 = match resolve(sha2) {
+            Some(o) => o,
+            None => return String::new(),
+        };
 
         let tree1 = match repo.find_commit(oid1).and_then(|c| c.tree()) {
             Ok(t) => t,
@@ -280,7 +304,9 @@ impl GitStore {
 
     /// Find a commit by short SHA prefix.
     pub fn find_commit(&self, short_sha: &str) -> Option<CommitInfo> {
-        self.log(20).into_iter().find(|c| c.sha.starts_with(short_sha))
+        self.log(20)
+            .into_iter()
+            .find(|c| c.sha.starts_with(short_sha))
     }
 
     /// Find a commit and return it paired with its diff vs. the parent.
@@ -323,10 +349,12 @@ impl GitStore {
             .ok()?;
 
         // Resolve the short SHA
-        let mut revwalk = repo.revwalk()
+        let mut revwalk = repo
+            .revwalk()
             .map_err(|e| log::warn!("Git revert: revwalk error: {}", e))
             .ok()?;
-        revwalk.push_head()
+        revwalk
+            .push_head()
             .map_err(|e| log::warn!("Git revert: push_head error: {}", e))
             .ok()?;
 
@@ -334,7 +362,8 @@ impl GitStore {
             .filter_map(|r| r.ok())
             .find(|oid| oid.to_string().starts_with(commit))?;
 
-        let commit_obj = repo.find_commit(target_oid)
+        let commit_obj = repo
+            .find_commit(target_oid)
             .map_err(|e| log::warn!("Git revert: find_commit error: {}", e))
             .ok()?;
 
@@ -343,10 +372,12 @@ impl GitStore {
             return None;
         }
 
-        let parent = commit_obj.parent(0)
+        let parent = commit_obj
+            .parent(0)
             .map_err(|e| log::warn!("Git revert: parent error: {}", e))
             .ok()?;
-        let parent_tree = parent.tree()
+        let parent_tree = parent
+            .tree()
             .map_err(|e| log::warn!("Git revert: parent tree error: {}", e))
             .ok()?;
 
@@ -378,8 +409,7 @@ impl GitStore {
     // ── internal helpers ──────────────────────────────────────────────────────
 
     fn signature() -> Signature<'static> {
-        Signature::now("rust-bot", "rust-bot@dream")
-            .expect("valid hardcoded signature")
+        Signature::now("rust-bot", "rust-bot@dream").expect("valid hardcoded signature")
     }
 
     fn build_gitignore(&self) -> String {
@@ -414,7 +444,10 @@ mod tests {
     fn make_store(dir: &Path) -> GitStore {
         GitStore::new(
             dir.to_path_buf(),
-            vec!["memory/MEMORY.md".to_string(), "memory/HISTORY.md".to_string()],
+            vec![
+                "memory/MEMORY.md".to_string(),
+                "memory/HISTORY.md".to_string(),
+            ],
         )
     }
 

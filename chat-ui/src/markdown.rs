@@ -237,7 +237,12 @@ fn opening_fence(bytes: &[u8], mut i: usize) -> Option<(u8, usize, usize)> {
     Some((fence_char, fence_len, i.max(start)))
 }
 
-fn closing_fence_end(bytes: &[u8], mut i: usize, fence_char: u8, fence_len: usize) -> Option<usize> {
+fn closing_fence_end(
+    bytes: &[u8],
+    mut i: usize,
+    fence_char: u8,
+    fence_len: usize,
+) -> Option<usize> {
     let mut indent = 0;
     while i < bytes.len() && bytes[i] == b' ' && indent < 3 {
         i += 1;
@@ -294,7 +299,8 @@ fn normalize_gfm_tables(input: &str) -> String {
         }
 
         if i + 1 < lines.len() {
-            if let Some(header_cols) = table_column_count(line).filter(|_| !is_delimiter_row(line)) {
+            if let Some(header_cols) = table_column_count(line).filter(|_| !is_delimiter_row(line))
+            {
                 if is_delimiter_row(lines[i + 1]) {
                     if let Some(delim_cols) = table_column_count(lines[i + 1]) {
                         if delim_cols < header_cols {
@@ -409,7 +415,10 @@ mod tests {
         let html = render(r"Sample a joint state \(\hat x_{\mathrm{rand}}\).");
         assert!(html.contains("<math"), "expected MathML, got: {html}");
         assert!(!html.contains(r"\("), "delimiters should not leak: {html}");
-        assert!(!html.contains("\\mathrm"), "tex source should not leak: {html}");
+        assert!(
+            !html.contains("\\mathrm"),
+            "tex source should not leak: {html}"
+        );
     }
 
     #[test]
@@ -441,14 +450,20 @@ mod tests {
     fn leaves_tex_inside_code_fences_literal() {
         let html = render("```\n\\(\\varepsilon\\)\n```");
         assert!(!html.contains("<math"), "got: {html}");
-        assert!(html.contains(r"\(") || html.contains("\\varepsilon"), "got: {html}");
+        assert!(
+            html.contains(r"\(") || html.contains("\\varepsilon"),
+            "got: {html}"
+        );
     }
 
     #[test]
     fn leaves_tex_inside_inline_code_literal() {
         let html = render(r"Use `\(\hat x\)` in the paper.");
         assert!(!html.contains("<math"), "got: {html}");
-        assert!(html.contains(r"\(") || html.contains("hat x"), "got: {html}");
+        assert!(
+            html.contains(r"\(") || html.contains("hat x"),
+            "got: {html}"
+        );
     }
 
     #[test]
@@ -503,13 +518,20 @@ mod tests {
         assert!(html.contains("<table"), "expected table, got: {html}");
         assert!(html.contains("Why it matters"), "got: {html}");
         assert!(html.contains("A-MEM"), "got: {html}");
-        assert!(html.contains("href=\"https://arxiv.org/abs/2502.1210\""), "got: {html}");
-        assert!(!html.contains("|---"), "raw delimiter should not leak: {html}");
+        assert!(
+            html.contains("href=\"https://arxiv.org/abs/2502.1210\""),
+            "got: {html}"
+        );
+        assert!(
+            !html.contains("|---"),
+            "raw delimiter should not leak: {html}"
+        );
     }
 
     #[test]
     fn pads_short_delimiter_to_header_width() {
-        let rewritten = normalize_gfm_tables("| Paper | Why it matters |\n|---|\n| A-MEM | Named it. |");
+        let rewritten =
+            normalize_gfm_tables("| Paper | Why it matters |\n|---|\n| A-MEM | Named it. |");
         assert_eq!(
             rewritten,
             "| Paper | Why it matters |\n|---|---|\n| A-MEM | Named it. |"
@@ -520,6 +542,9 @@ mod tests {
     fn leaves_table_inside_code_fence_literal() {
         let html = render("```\n| Paper | Why |\n|---|\n| A | B |\n```");
         assert!(!html.contains("<table"), "got: {html}");
-        assert!(html.contains("| Paper |") || html.contains("| Paper | Why |"), "got: {html}");
+        assert!(
+            html.contains("| Paper |") || html.contains("| Paper | Why |"),
+            "got: {html}"
+        );
     }
 }

@@ -1,10 +1,6 @@
 use std::{
     collections::HashMap,
-    sync::{
-        Arc,
-        atomic::AtomicBool,
-        Mutex as StdMutex,
-    },
+    sync::{Arc, Mutex as StdMutex, atomic::AtomicBool},
 };
 
 use async_trait::async_trait;
@@ -40,7 +36,10 @@ pub async fn handle_message(
     bus: &MessageBus,
 ) -> Result<(), SendError<String>> {
     if !is_allowed {
-        let msg = format!("Sender {} is not allowed to send messages to channel {}", sender_id, channel_name);
+        let msg = format!(
+            "Sender {} is not allowed to send messages to channel {}",
+            sender_id, channel_name
+        );
         log::warn!("{}", msg);
         return Err(SendError(msg));
     }
@@ -108,7 +107,10 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
             return "".to_string();
         };
         if self.transcription_api_key().is_empty() {
-            log::error!("No transcription API key configured for channel {}", self.name());
+            log::error!(
+                "No transcription API key configured for channel {}",
+                self.name()
+            );
             return "".to_string();
         }
         let provider: Box<dyn TranscriptionProvider> = match provider_name {
@@ -314,7 +316,9 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
                     "Access denied for sender {sender_id}. Add them to allowFrom list in config to grant access."
                 );
             }
-            return Err(SendError(format!("Access denied for sender {sender_id}. Add them to allowFrom list in config to grant access.")));
+            return Err(SendError(format!(
+                "Access denied for sender {sender_id}. Add them to allowFrom list in config to grant access."
+            )));
         }
 
         handle_message(
@@ -341,7 +345,6 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     fn is_running(&self) -> bool {
         return self.running();
     }
-
 }
 
 pub struct BaseChannelCommon {

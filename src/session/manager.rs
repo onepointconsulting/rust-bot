@@ -1,5 +1,9 @@
 use std::{
-    collections::HashMap, fs::{self, File}, io::{BufRead, BufReader, Write}, path::{Path, PathBuf}, sync::{Arc, LazyLock, Mutex},
+    collections::HashMap,
+    fs::{self, File},
+    io::{BufRead, BufReader, Write},
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -9,7 +13,17 @@ use serde_json::{Map, Value, json};
 use tera::Context;
 
 use crate::{
-    config::paths::get_legacy_sessions_dir, providers::base::LLMProviderDyn, session::{SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message, keys::{COMMAND_KEY, HIDDEN_HISTORY_KEY}}, utils::helpers::{ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text}, utils::prompt_templates::render_template,
+    config::paths::get_legacy_sessions_dir,
+    providers::base::LLMProviderDyn,
+    session::{
+        SESSION_TITLE_METADATA_KEY,
+        history_visibility::is_hidden_history_message,
+        keys::{COMMAND_KEY, HIDDEN_HISTORY_KEY},
+    },
+    utils::helpers::{
+        ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
+    },
+    utils::prompt_templates::render_template,
 };
 
 /// Max stored title length in Unicode scalar values. Matches nanobot `TITLE_MAX_CHARS`.
@@ -228,7 +242,10 @@ fn title_inputs(session: &Session) -> (String, String) {
     (user_text, assistant_text)
 }
 
-fn title_generation_prompt(user_text: &str, assistant_text: &str) -> Result<(String, String), String> {
+fn title_generation_prompt(
+    user_text: &str,
+    assistant_text: &str,
+) -> Result<(String, String), String> {
     let user_text = truncate_text(user_text, TITLE_INPUT_MAX_CHARS);
     let assistant_text = if assistant_text.is_empty() {
         String::new()
@@ -459,8 +476,15 @@ impl SessionManager {
                 if let Some(line_result) = reader.lines().next() {
                     if let Ok(line) = line_result {
                         if let Ok(metadata) = serde_json::from_str::<Value>(&line) {
-                            if let Some(metadata_type) = metadata.get("_type") && let Some(metadata_type_str) = metadata_type.as_str() && metadata_type_str == "metadata" {
-                                if let Some(key) = metadata.get("key").and_then(|v| v.as_str()).filter(|k| !k.is_empty()) {
+                            if let Some(metadata_type) = metadata.get("_type")
+                                && let Some(metadata_type_str) = metadata_type.as_str()
+                                && metadata_type_str == "metadata"
+                            {
+                                if let Some(key) = metadata
+                                    .get("key")
+                                    .and_then(|v| v.as_str())
+                                    .filter(|k| !k.is_empty())
+                                {
                                     sessions.push(json!({
                                         "key": key,
                                         "created_at": metadata.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
@@ -505,11 +529,7 @@ impl SessionManager {
         }
     }
 
-    fn try_read_session_payload(
-        &self,
-        key: &str,
-        path: &Path,
-    ) -> Result<SessionPayload, String> {
+    fn try_read_session_payload(&self, key: &str, path: &Path) -> Result<SessionPayload, String> {
         let file = File::open(path).map_err(|e| e.to_string())?;
         let reader = BufReader::new(file);
 
@@ -525,13 +545,14 @@ impl SessionManager {
             if line.is_empty() {
                 continue;
             }
-            let raw_data: Value =
-                serde_json::from_str(line).map_err(|e| e.to_string())?;
+            let raw_data: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
             let data = value_as_object_map(raw_data)?;
 
             if data.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
                 metadata = match data.get("metadata") {
-                    Some(Value::Object(map)) => map.iter().map(|(k, v)| (k.clone(), v.clone())).collect(),
+                    Some(Value::Object(map)) => {
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
                     Some(_) => HashMap::new(),
                     None => HashMap::new(),
                 };
@@ -794,7 +815,10 @@ impl SessionManager {
         let text = text.split_whitespace().collect::<Vec<_>>().join(" ");
         let text = text
             .trim_end_matches(|c: char| {
-                matches!(c, '。' | '.' | '!' | '！' | '?' | '？' | ',' | '，' | ';' | '；' | ':')
+                matches!(
+                    c,
+                    '。' | '.' | '!' | '！' | '?' | '？' | ',' | '，' | ';' | '；' | ':'
+                )
             })
             .to_string();
 
@@ -808,7 +832,6 @@ impl SessionManager {
             text
         }
     }
-
 }
 
 /// Title stored on the JSONL metadata line (`metadata.title`), if any.
@@ -825,9 +848,8 @@ fn parse_session_timestamp(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }
-    let parsed = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f").or_else(|_| {
-        NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S")
-    });
+    let parsed = NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S%.f")
+        .or_else(|_| NaiveDateTime::parse_from_str(s, "%Y-%m-%dT%H:%M:%S"));
     parsed.ok().map(|naive| Utc.from_utc_datetime(&naive))
 }
 
@@ -976,9 +998,7 @@ mod tests {
         command.insert("timestamp".into(), json!("2026-01-01T00:00:00Z"));
         command.insert(COMMAND_KEY.to_string(), json!(true));
         session.messages.push(Value::Object(command));
-        session
-            .messages
-            .push(fixture_message("assistant", "hi"));
+        session.messages.push(fixture_message("assistant", "hi"));
 
         let h = session.get_history(None);
         assert_eq!(h.len(), 2);
@@ -1382,11 +1402,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mgr = SessionManager::new(dir.path().join("ws"));
         let path = mgr.sessions_dir.join("partial.jsonl");
-        fs::write(
-            &path,
-            r#"{"_type":"metadata","key":"partial"}"#,
-        )
-        .unwrap();
+        fs::write(&path, r#"{"_type":"metadata","key":"partial"}"#).unwrap();
 
         let listed = mgr.list_sessions();
         assert_eq!(listed.len(), 1);
@@ -1407,11 +1423,7 @@ mod tests {
         )
         .unwrap();
         let path_b = mgr.sessions_dir.join("b.jsonl");
-        fs::write(
-            &path_b,
-            r#"{"_type":"metadata","key":"no_ts"}"#,
-        )
-        .unwrap();
+        fs::write(&path_b, r#"{"_type":"metadata","key":"no_ts"}"#).unwrap();
 
         let listed = mgr.list_sessions();
         assert_eq!(listed.len(), 2);
@@ -1444,7 +1456,9 @@ mod tests {
             "title": "Fix the login bug",
         })];
         let text = format_sessions_list(&sessions, None);
-        assert!(text.contains("- Fix the login bug [websocket:chat-1] — updated 2026-06-01T00:00:00Z"));
+        assert!(
+            text.contains("- Fix the login bug [websocket:chat-1] — updated 2026-06-01T00:00:00Z")
+        );
     }
 
     #[test]
@@ -1556,7 +1570,10 @@ mod tests {
     #[test]
     fn clean_generated_title_empty_and_none() {
         assert_eq!(SessionManager::clean_generated_title(None), "");
-        assert_eq!(SessionManager::clean_generated_title(Some("   ".into())), "");
+        assert_eq!(
+            SessionManager::clean_generated_title(Some("   ".into())),
+            ""
+        );
     }
 
     #[test]
@@ -1588,7 +1605,10 @@ mod tests {
         assert_eq!(cleaned.chars().count(), TITLE_MAX_CHARS);
         assert!(cleaned.ends_with('…'));
         assert_eq!(
-            cleaned.chars().take(TITLE_MAX_CHARS - 1).collect::<String>(),
+            cleaned
+                .chars()
+                .take(TITLE_MAX_CHARS - 1)
+                .collect::<String>(),
             "a".repeat(TITLE_MAX_CHARS - 1)
         );
     }
@@ -1603,9 +1623,13 @@ mod tests {
     fn title_inputs_takes_first_user_and_assistant() {
         let mut session = Session::new("s1".into());
         session.messages.push(fixture_message("user", "  hello  "));
-        session.messages.push(fixture_message("assistant", "hi there"));
+        session
+            .messages
+            .push(fixture_message("assistant", "hi there"));
         session.messages.push(fixture_message("user", "later user"));
-        session.messages.push(fixture_message("assistant", "later assistant"));
+        session
+            .messages
+            .push(fixture_message("assistant", "later assistant"));
         assert_eq!(
             title_inputs(&session),
             ("hello".to_string(), "hi there".to_string())
@@ -1631,7 +1655,9 @@ mod tests {
             "_hidden_history": true,
         }));
         session.messages.push(fixture_message("user", "   "));
-        session.messages.push(fixture_message("user", "<think>secret</think>"));
+        session
+            .messages
+            .push(fixture_message("user", "<think>secret</think>"));
         session.messages.push(json!({
             "role": "user",
             "content": ["not", "a", "string"],
@@ -1640,7 +1666,9 @@ mod tests {
             "user",
             "<think>scratch</think> real question",
         ));
-        session.messages.push(fixture_message("assistant", "real answer"));
+        session
+            .messages
+            .push(fixture_message("assistant", "real answer"));
         assert_eq!(session.messages[0][COMMAND_KEY], json!(true));
         assert_eq!(session.messages[2][HIDDEN_HISTORY_KEY], json!(true));
         assert_eq!(
@@ -1652,7 +1680,9 @@ mod tests {
     #[test]
     fn title_inputs_user_only_leaves_assistant_empty() {
         let mut session = Session::new("s1".into());
-        session.messages.push(fixture_message("user", "just a question"));
+        session
+            .messages
+            .push(fixture_message("user", "just a question"));
         assert_eq!(
             title_inputs(&session),
             ("just a question".to_string(), String::new())
@@ -1661,7 +1691,8 @@ mod tests {
 
     #[test]
     fn title_generation_prompt_includes_user_and_assistant() {
-        let (system, user) = title_generation_prompt("Fix the login bug", "Reset the token").unwrap();
+        let (system, user) =
+            title_generation_prompt("Fix the login bug", "Reset the token").unwrap();
         assert!(system.contains("Return only the title text"));
         assert!(!system.contains("User:"));
         assert!(user.contains("User: Fix the login bug"));

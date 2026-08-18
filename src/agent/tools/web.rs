@@ -67,7 +67,8 @@ fn extract_with_readability(html: &str, url: &str, extract_mode: &str) -> Result
             ..Default::default()
         }
     };
-    let mut readability = Readability::new(html, Some(url), Some(cfg)).map_err(|e| e.to_string())?;
+    let mut readability =
+        Readability::new(html, Some(url), Some(cfg)).map_err(|e| e.to_string())?;
     let article = readability.parse().map_err(|e| e.to_string())?;
     let content = if extract_mode == "markdown" {
         article.text_content.to_string()
@@ -112,10 +113,6 @@ fn format_fetch_payload(
 async fn validate_url_safe(url: &str) -> (bool, String) {
     return validate_url_target(url).await;
 }
-
-
-
-
 
 /// Format provider results into shared plaintext output.
 fn format_results(query: &str, items: &[Value], n: usize) -> String {
@@ -162,7 +159,10 @@ fn ddg_topic_to_result(topic: &Value) -> Value {
 }
 
 fn brave_result_to_value(result: &Value) -> Value {
-    let content = result.get("description").and_then(Value::as_str).unwrap_or("");
+    let content = result
+        .get("description")
+        .and_then(Value::as_str)
+        .unwrap_or("");
     let age = result.get("age").and_then(Value::as_str).unwrap_or("");
     let content = if age.is_empty() {
         content.to_string()
@@ -201,15 +201,13 @@ fn build_http_client(proxy: Option<&str>, timeout_secs: u64) -> reqwest::Client 
         }
     }
 
-    builder
-        .build()
-        .unwrap_or_else(|err| {
-            log::warn!("Failed to build web HTTP client: {err}");
-            reqwest::Client::builder()
-                .timeout(timeout)
-                .build()
-                .unwrap_or_else(|_| reqwest::Client::new())
-        })
+    builder.build().unwrap_or_else(|err| {
+        log::warn!("Failed to build web HTTP client: {err}");
+        reqwest::Client::builder()
+            .timeout(timeout)
+            .build()
+            .unwrap_or_else(|_| reqwest::Client::new())
+    })
 }
 
 /// Search the web using configured provider.
@@ -276,11 +274,7 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
         let count_str = count.to_string();
         let url = Url::parse_with_params(
             "https://api.search.brave.com/res/v1/web/search",
-            &[
-                ("q", query),
-                ("offset", "0"),
-                ("count", count_str.as_str()),
-            ],
+            &[("q", query), ("offset", "0"), ("count", count_str.as_str())],
         )
         .expect("brave base url failed");
         let response = self
@@ -391,11 +385,7 @@ pub struct WebFetchTool {
 }
 
 impl WebFetchTool {
-    pub fn new(
-        max_chars: Option<usize>,
-        proxy: Option<String>,
-        timeout_secs: Option<u64>,
-    ) -> Self {
+    pub fn new(max_chars: Option<usize>, proxy: Option<String>, timeout_secs: Option<u64>) -> Self {
         Self {
             name: "web_fetch".to_string(),
             description: format!("Fetch a URL and extract readable content (HTML → markdown/text).
@@ -419,22 +409,14 @@ impl WebFetchTool {
             Ok(bytes) => bytes,
             Err(e) => return format!("Error: failed to read image from {url}: {e}"),
         };
-        let mime = content_type
-            .split(';')
-            .next()
-            .unwrap_or("")
-            .trim();
+        let mime = content_type.split(';').next().unwrap_or("").trim();
         let mime = if mime.starts_with("image/") {
             mime
         } else {
             detect_image_mime(&raw).unwrap_or("application/octet-stream")
         };
-        let blocks = build_image_content_blocks(
-            &raw,
-            mime,
-            url,
-            &format!("(Image fetched from: {url})"),
-        );
+        let blocks =
+            build_image_content_blocks(&raw, mime, url, &format!("(Image fetched from: {url})"));
         serde_json::to_string(&blocks)
             .unwrap_or_else(|e| format!("Error: failed to encode image content: {e}"))
     }
@@ -462,10 +444,7 @@ impl WebFetchTool {
         let ctype = content_type.unwrap_or("");
         let (text, extractor) = if ctype.contains("application/json") {
             match serde_json::from_str::<Value>(&body) {
-                Ok(value) => (
-                    serde_json::to_string_pretty(&value).unwrap_or(body),
-                    "json",
-                ),
+                Ok(value) => (serde_json::to_string_pretty(&value).unwrap_or(body), "json"),
                 Err(_) => (body, "raw"),
             }
         } else if ctype.contains("text/html") || looks_like_html(&body) {
@@ -483,7 +462,6 @@ impl WebFetchTool {
 
 #[async_trait]
 impl Tool for WebFetchTool {
-
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -527,8 +505,10 @@ impl Tool for WebFetchTool {
         if url.is_empty() {
             return "Error: missing required parameter 'url'".to_string();
         }
-        let extract_mode =
-            params.get("extract_mode").and_then(Value::as_str).unwrap_or("markdown");
+        let extract_mode = params
+            .get("extract_mode")
+            .and_then(Value::as_str)
+            .unwrap_or("markdown");
         let max_chars = std::cmp::min(
             params
                 .get("max_chars")
@@ -841,7 +821,9 @@ mod tests {
 
     #[test]
     fn looks_like_html_detects_doctype_and_html_prefix() {
-        assert!(looks_like_html("<!DOCTYPE html><html><body>x</body></html>"));
+        assert!(looks_like_html(
+            "<!DOCTYPE html><html><body>x</body></html>"
+        ));
         assert!(looks_like_html("<HTML><head></head></html>"));
         assert!(!looks_like_html("plain text"));
         assert!(!looks_like_html("{\"key\": \"value\"}"));

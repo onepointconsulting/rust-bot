@@ -149,9 +149,7 @@ pub trait Tool: std::any::Any + Send + Sync {
     /// override this to perform real casting / validation.
     fn _cast_value(&self, val: serde_json::Value, schema: &serde_json::Value) -> serde_json::Value {
         let default_target = serde_json::Value::String("any".to_string());
-        let target_type = schema
-            .get("type")
-            .unwrap_or(&default_target);
+        let target_type = schema.get("type").unwrap_or(&default_target);
         if target_type == "boolean" && val.is_boolean() {
             return val;
         }
@@ -524,7 +522,11 @@ mod tests {
         });
         let errors = tool.validate_params(&params);
         assert!(errors.len() > 0);
-        assert!(errors.iter().any(|e| e.contains("mode must be one of [\"fast\",\"full\"]")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("mode must be one of [\"fast\",\"full\"]"))
+        );
     }
 
     #[test]
@@ -537,8 +539,16 @@ mod tests {
         });
         let errors = tool.validate_params(&params);
         assert!(errors.len() > 0);
-        assert!(errors.iter().any(|e| e.contains("missing required meta.tag")));
-        assert!(errors.iter().any(|e| e.contains("meta.flags[0] should be string")));
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("missing required meta.tag"))
+        );
+        assert!(
+            errors
+                .iter()
+                .any(|e| e.contains("meta.flags[0] should be string"))
+        );
     }
 
     #[test]

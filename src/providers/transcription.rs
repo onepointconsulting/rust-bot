@@ -8,7 +8,8 @@ use reqwest::multipart;
 
 pub const GROQ_DEFAULT_MODEL: &'static str = "whisper-large-v3";
 pub const OPENAI_DEFAULT_MODEL: &'static str = "whisper-1";
-pub const GROQ_DEFAULT_API_URL: &'static str = "https://api.groq.com/openai/v1/audio/transcriptions";
+pub const GROQ_DEFAULT_API_URL: &'static str =
+    "https://api.groq.com/openai/v1/audio/transcriptions";
 pub const OPENAI_DEFAULT_API_URL: &'static str = "https://api.openai.com/v1/audio/transcriptions";
 
 fn convert_path(file_path: PathLike) -> PathBuf {
@@ -26,12 +27,7 @@ pub enum PathLike {
 
 #[async_trait]
 pub trait TranscriptionProvider: Send + Sync {
-
-    fn new(
-        api_url: impl Into<String>,
-        api_key: Option<String>,
-        model: Option<String>,
-    ) -> Self
+    fn new(api_url: impl Into<String>, api_key: Option<String>, model: Option<String>) -> Self
     where
         Self: Sized;
 
@@ -63,10 +59,7 @@ pub trait TranscriptionProvider: Send + Sync {
             .to_string();
 
         let form = multipart::Form::new()
-            .part(
-                "file",
-                multipart::Part::bytes(buffer).file_name(file_name),
-            )
+            .part("file", multipart::Part::bytes(buffer).file_name(file_name))
             .text("model", self.get_model());
 
         let client = match reqwest::Client::builder()
@@ -111,12 +104,12 @@ pub struct OpenAITranscriptionProvider {
 
 #[async_trait]
 impl TranscriptionProvider for OpenAITranscriptionProvider {
-
     fn new(api_url: impl Into<String>, api_key: Option<String>, model: Option<String>) -> Self {
         Self {
             api_key: api_key.unwrap_or_else(|| {
-                std::env::var("OPENAI_TRANSCRIPTION_API_KEY")
-                    .expect("OPENAI_TRANSCRIPTION_API_KEY is not set for OpenAI transcription provider")
+                std::env::var("OPENAI_TRANSCRIPTION_API_KEY").expect(
+                    "OPENAI_TRANSCRIPTION_API_KEY is not set for OpenAI transcription provider",
+                )
             }),
             api_url: api_url.into(),
             model: model.unwrap_or_else(|| OPENAI_DEFAULT_MODEL.to_string()),
@@ -146,7 +139,6 @@ pub struct GroqTranscriptionProvider {
 
 #[async_trait]
 impl TranscriptionProvider for GroqTranscriptionProvider {
-
     fn new(api_url: impl Into<String>, api_key: Option<String>, model: Option<String>) -> Self {
         let api_key = api_key.unwrap_or_else(|| {
             std::env::var("GROQ_TRANSCRIPTION_API_KEY")
@@ -158,7 +150,7 @@ impl TranscriptionProvider for GroqTranscriptionProvider {
             model: model.unwrap_or_else(|| GROQ_DEFAULT_MODEL.to_string()),
         }
     }
-    
+
     fn get_api_key(&self) -> String {
         self.api_key.clone()
     }

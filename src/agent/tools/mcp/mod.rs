@@ -1,24 +1,23 @@
 use async_trait::async_trait;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
-use std::collections::HashSet;
-use std::time::Duration;
+use crate::agent::tools::base::Tool;
+use crate::config::schema::{McpServerConfig, McpTransportType};
 use http::HeaderName;
-use rmcp::{Peer, RoleClient, ServiceExt};
-use rmcp::service::ServiceError;
 use rmcp::model::{CallToolRequestParams, RawContent, Tool as McpToolDef};
+use rmcp::service::ServiceError;
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
     StreamableHttpClientTransport, StreamableHttpClientTransportConfig,
 };
-use crate::agent::tools::base::Tool;
-use crate::config::schema::{McpServerConfig, McpTransportType};
+use rmcp::{Peer, RoleClient, ServiceExt};
+use std::collections::HashSet;
+use std::time::Duration;
 
 pub mod mcp_file_ref;
 pub mod mcp_presets_api;
 
-use mcp_file_ref::{has_file_reference, FileRefResolver};
-
+use mcp_file_ref::{FileRefResolver, has_file_reference};
 
 /// Return the single non-null branch for nullable unions.
 fn extract_nullable_branch(options: Value) -> Option<(Value, bool)> {
@@ -32,7 +31,9 @@ fn extract_nullable_branch(options: Value) -> Option<(Value, bool)> {
             return None;
         }
         if let Some(type_value) = option.get("type") {
-            if let Some(type_str) = type_value.as_str() && type_str == "null" {
+            if let Some(type_str) = type_value.as_str()
+                && type_str == "null"
+            {
                 saw_null = true;
                 continue;
             }
@@ -155,7 +156,6 @@ fn inline_refs_node(
     }
 }
 
-
 /// Normalize only nullable JSON Schema patterns for tool definitions.
 ///
 /// Mirrors the Python helper `_normalize_schema_for_openai`:
@@ -229,7 +229,10 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
     // Recursively normalize items schema
     if let Some(items) = normalized.get("items").cloned() {
         if items.is_object() {
-            normalized.insert("items".to_string(), normalize_schema_for_openai_inner(&items));
+            normalized.insert(
+                "items".to_string(),
+                normalize_schema_for_openai_inner(&items),
+            );
         }
     }
 
@@ -273,8 +276,6 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
 
     Value::Object(normalized)
 }
-
-
 
 // ── MCP client connection ─────────────────────────────────────────────────────
 
@@ -324,15 +325,20 @@ pub struct McpClient {
 /// Returns a [`McpClient`] whose `peer` field can be passed directly to
 /// [`MCPToolWrapper::new`].
 pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpClient, ConnectMcpError> {
-    let transport_type = config.transport_type.as_ref().cloned().or_else(|| {
-        if !config.command.is_empty() {
-            Some(McpTransportType::Stdio)
-        } else if !config.url.is_empty() {
-            Some(McpTransportType::StreamableHttp)
-        } else {
-            None
-        }
-    }).ok_or(ConnectMcpError::UnknownTransport)?;
+    let transport_type = config
+        .transport_type
+        .as_ref()
+        .cloned()
+        .or_else(|| {
+            if !config.command.is_empty() {
+                Some(McpTransportType::Stdio)
+            } else if !config.url.is_empty() {
+                Some(McpTransportType::StreamableHttp)
+            } else {
+                None
+            }
+        })
+        .ok_or(ConnectMcpError::UnknownTransport)?;
 
     match transport_type {
         McpTransportType::Stdio => connect_stdio(config).await,
@@ -350,10 +356,16 @@ async fn connect_stdio(config: &McpServerConfig) -> Result<McpClient, ConnectMcp
 
     let transport = TokioChildProcess::new(cmd).map_err(ConnectMcpError::Io)?;
     let service = ().serve(transport).await.map_err(ConnectMcpError::Handshake)?;
-    Ok(McpClient { peer: service.peer().clone(), _service: service })
+    Ok(McpClient {
+        peer: service.peer().clone(),
+        _service: service,
+    })
 }
 
-async fn connect_http(config: &McpServerConfig, allow_stateless: bool) -> Result<McpClient, ConnectMcpError> {
+async fn connect_http(
+    config: &McpServerConfig,
+    allow_stateless: bool,
+) -> Result<McpClient, ConnectMcpError> {
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str())
         .reinit_on_expired_session(true);
 
@@ -381,9 +393,11 @@ async fn connect_http(config: &McpServerConfig, allow_stateless: bool) -> Result
 
     let transport = StreamableHttpClientTransport::from_config(transport_config);
     let service = ().serve(transport).await.map_err(ConnectMcpError::Handshake)?;
-    Ok(McpClient { peer: service.peer().clone(), _service: service })
+    Ok(McpClient {
+        peer: service.peer().clone(),
+        _service: service,
+    })
 }
-
 
 /// Keeps the MCP session alive while [`MCPToolWrapper`] values are in use.
 ///
@@ -440,7 +454,9 @@ pub async fn load_mcp_tools_with_file_refs(
     server_name: &str,
     file_refs: Option<FileRefResolver>,
 ) -> Result<LoadedMcpTools, LoadMcpToolsError> {
-    let client = connect_mcp_server(config).await.map_err(LoadMcpToolsError::Connect)?;
+    let client = connect_mcp_server(config)
+        .await
+        .map_err(LoadMcpToolsError::Connect)?;
     let tools_result = client
         .peer
         .list_tools(None)
@@ -463,7 +479,6 @@ pub async fn load_mcp_tools_with_file_refs(
         .collect();
     Ok(LoadedMcpTools { client, tools })
 }
-
 
 pub struct MCPToolWrapper {
     session: Peer<RoleClient>,
@@ -519,11 +534,8 @@ impl MCPToolWrapper {
     }
 }
 
-
-
 #[async_trait]
 impl Tool for MCPToolWrapper {
-
     fn name(&self) -> String {
         self.name.clone()
     }
@@ -568,24 +580,25 @@ impl Tool for MCPToolWrapper {
             }
         };
 
-        let result = match tokio::time::timeout(self.tool_timeout, self.session.call_tool(req)).await {
-            Err(_elapsed) => {
-                log::warn!(
-                    "MCP tool '{}' timed out after {}s",
-                    self.name,
-                    self.tool_timeout.as_secs()
-                );
-                return format!(
-                    "(MCP tool call timed out after {}s)",
-                    self.tool_timeout.as_secs()
-                );
-            }
-            Ok(Err(e)) => {
-                log::error!("MCP tool '{}' failed: {}", self.name, e);
-                return format!("(MCP tool call failed: {})", e);
-            }
-            Ok(Ok(r)) => r,
-        };
+        let result =
+            match tokio::time::timeout(self.tool_timeout, self.session.call_tool(req)).await {
+                Err(_elapsed) => {
+                    log::warn!(
+                        "MCP tool '{}' timed out after {}s",
+                        self.name,
+                        self.tool_timeout.as_secs()
+                    );
+                    return format!(
+                        "(MCP tool call timed out after {}s)",
+                        self.tool_timeout.as_secs()
+                    );
+                }
+                Ok(Err(e)) => {
+                    log::error!("MCP tool '{}' failed: {}", self.name, e);
+                    return format!("(MCP tool call failed: {})", e);
+                }
+                Ok(Ok(r)) => r,
+            };
 
         let parts: Vec<String> = result
             .content
@@ -602,7 +615,7 @@ impl Tool for MCPToolWrapper {
             parts.join("\n")
         }
     }
-    
+
     /// MCP servers validate their own arguments and their advertised schemas are
     /// often lossy (e.g. Java byte[] rendered as array-of-string while the server
     /// also accepts base64). Do not pre-reject; let the server decide.
@@ -647,9 +660,6 @@ fn mcp_validate_params(_params: &serde_json::Value) -> Vec<String> {
 fn mcp_cast_params(params: &serde_json::Value) -> serde_json::Value {
     params.clone()
 }
-
-
-
 
 #[cfg(test)]
 mod tests {
@@ -1064,7 +1074,9 @@ mod tests {
         let cfg = McpServerConfig::default();
         assert!(matches!(
             load_mcp_tools_from_config(&cfg, "test").await,
-            Err(LoadMcpToolsError::Connect(ConnectMcpError::UnknownTransport)),
+            Err(LoadMcpToolsError::Connect(
+                ConnectMcpError::UnknownTransport
+            )),
         ));
     }
 }

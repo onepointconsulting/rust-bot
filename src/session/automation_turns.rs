@@ -14,5 +14,8 @@ pub fn has_message_value(message: &Value, key: &str) -> bool {
     if map.is_empty() {
         return false;
     }
-    matches!(map.get(key), Some(Value::Bool(true)) | Some(Value::Object(_)))
+    matches!(
+        map.get(key),
+        Some(Value::Bool(true)) | Some(Value::Object(_))
+    )
 }

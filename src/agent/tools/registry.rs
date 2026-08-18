@@ -14,7 +14,9 @@ pub struct ToolRegistry {
 
 impl ToolRegistry {
     pub fn new() -> Self {
-        Self { tools: HashMap::new() }
+        Self {
+            tools: HashMap::new(),
+        }
     }
 
     // ── lifecycle ─────────────────────────────────────────────────────────────
@@ -175,11 +177,14 @@ mod tests {
 
     struct EchoTool;
 
-
     #[async_trait]
     impl Tool for EchoTool {
-        fn name(&self) -> String { "echo".to_string() }
-        fn description(&self) -> String { "Echoes the input message.".to_string() }
+        fn name(&self) -> String {
+            "echo".to_string()
+        }
+        fn description(&self) -> String {
+            "Echoes the input message.".to_string()
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({
                 "type": "object",
@@ -198,8 +203,12 @@ mod tests {
 
     #[async_trait]
     impl Tool for AddTool {
-        fn name(&self) -> String { "add".to_string() }
-        fn description(&self) -> String { "Adds two integers.".to_string() }
+        fn name(&self) -> String {
+            "add".to_string()
+        }
+        fn description(&self) -> String {
+            "Adds two integers.".to_string()
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({
                 "type": "object",
@@ -222,12 +231,18 @@ mod tests {
 
     #[async_trait]
     impl Tool for McpSearchTool {
-        fn name(&self) -> String { "mcp_search".to_string() }
-        fn description(&self) -> String { "MCP search tool.".to_string() }
+        fn name(&self) -> String {
+            "mcp_search".to_string()
+        }
+        fn description(&self) -> String {
+            "MCP search tool.".to_string()
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({ "type": "object", "properties": {}, "required": [] })
         }
-        async fn execute(&self, _params: &serde_json::Value) -> String { "results".to_string() }
+        async fn execute(&self, _params: &serde_json::Value) -> String {
+            "results".to_string()
+        }
     }
 
     /// A tool that always returns an error string.
@@ -235,8 +250,12 @@ mod tests {
 
     #[async_trait]
     impl Tool for FailTool {
-        fn name(&self) -> String { "fail".to_string() }
-        fn description(&self) -> String { "Always errors.".to_string() }
+        fn name(&self) -> String {
+            "fail".to_string()
+        }
+        fn description(&self) -> String {
+            "Always errors.".to_string()
+        }
         fn parameters(&self) -> serde_json::Value {
             serde_json::json!({ "type": "object", "properties": {}, "required": [] })
         }
@@ -316,8 +335,8 @@ mod tests {
     fn test_get_definitions_builtins_before_mcp() {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(McpSearchTool)); // mcp_ prefix
-        reg.register(Box::new(EchoTool));       // builtin
-        reg.register(Box::new(AddTool));         // builtin
+        reg.register(Box::new(EchoTool)); // builtin
+        reg.register(Box::new(AddTool)); // builtin
 
         let defs = reg.get_definitions();
         assert_eq!(defs.len(), 3);
@@ -392,14 +411,18 @@ mod tests {
     #[tokio::test]
     async fn test_execute_success() {
         let reg = registry_with_defaults();
-        let result = reg.execute("echo", &serde_json::json!({ "message": "hi" })).await;
+        let result = reg
+            .execute("echo", &serde_json::json!({ "message": "hi" }))
+            .await;
         assert_eq!(result, "hi");
     }
 
     #[tokio::test]
     async fn test_execute_add_tool() {
         let reg = registry_with_defaults();
-        let result = reg.execute("add", &serde_json::json!({ "a": 3, "b": 7 })).await;
+        let result = reg
+            .execute("add", &serde_json::json!({ "a": 3, "b": 7 }))
+            .await;
         assert_eq!(result, "10");
     }
 

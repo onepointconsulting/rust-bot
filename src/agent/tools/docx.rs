@@ -6,7 +6,10 @@ use rdocx::Document;
 use regex::Regex;
 use serde_json::json;
 
-use crate::agent::tools::{base::Tool, filesystem::{FsToolConfig, ResolvePathError}};
+use crate::agent::tools::{
+    base::Tool,
+    filesystem::{FsToolConfig, ResolvePathError},
+};
 
 static OUTPUT_EXT_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"(?i)\.(pdf|md|html)$").unwrap());
@@ -38,13 +41,9 @@ impl DocxConversionTool {
     }
 
     fn output_extension(output_path: &str) -> Result<&'static str, String> {
-        let caps = OUTPUT_EXT_RE
-            .captures(output_path)
-            .ok_or_else(|| {
-                format!(
-                    "Error: output path must end with .pdf, .md or .html, got: {output_path}"
-                )
-            })?;
+        let caps = OUTPUT_EXT_RE.captures(output_path).ok_or_else(|| {
+            format!("Error: output path must end with .pdf, .md or .html, got: {output_path}")
+        })?;
         match caps.get(1).unwrap().as_str().to_ascii_lowercase().as_str() {
             "pdf" => Ok("pdf"),
             "md" => Ok("md"),

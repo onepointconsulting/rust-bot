@@ -47,7 +47,10 @@ struct PairingData {
 }
 
 fn now_secs() -> f64 {
-    SystemTime::now().duration_since(UNIX_EPOCH).unwrap_or_default().as_secs_f64()
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 fn store_path() -> PathBuf {
@@ -158,7 +161,9 @@ mod tests {
         assert_eq!(&second[..1], "-");
         let chars: String = first.chars().chain(second[1..].chars()).collect();
         assert!(
-            chars.chars().all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
+            chars
+                .chars()
+                .all(|c| c.is_ascii_uppercase() || c.is_ascii_digit()),
             "unexpected characters in code: {code}"
         );
     }
@@ -242,7 +247,8 @@ mod tests {
         let path = dir.path().join("pairing.json");
 
         let mut data = PairingData::default();
-        data.approved.insert("email".to_string(), vec!["alice@example.com".to_string()]);
+        data.approved
+            .insert("email".to_string(), vec!["alice@example.com".to_string()]);
         save_to(&path, &data).unwrap();
 
         // generate_code_at loads, mutates only `pending`, and saves again —

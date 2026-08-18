@@ -13,7 +13,9 @@ use crate::utils::helpers::{
 };
 
 use crate::utils::runtime::{
-    EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message, build_truncated_tool_call_recovery_message, coerce_tool_execute_result, ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,
+    EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
+    build_truncated_tool_call_recovery_message, coerce_tool_execute_result,
+    ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
@@ -526,7 +528,10 @@ impl AgentRunner {
 
         for batch in batches {
             if spec.concurrent_tools && batch.len() > 1 {
-                let results = futures::future::join_all(batch.iter().map(|tool_call| Self::run_tool(spec, tool_call, Arc::clone(&external_lookup_counts)))).await;
+                let results = futures::future::join_all(batch.iter().map(|tool_call| {
+                    Self::run_tool(spec, tool_call, Arc::clone(&external_lookup_counts))
+                }))
+                .await;
                 tool_results.extend(results);
             } else {
                 for tool_call in batch {
@@ -542,7 +547,10 @@ impl AgentRunner {
         let mut fatal_error: Option<String> = None;
 
         for (result, event, error) in tool_results {
-            log::info!("Tool result: {}", result.chars().take(100).collect::<String>());
+            log::info!(
+                "Tool result: {}",
+                result.chars().take(100).collect::<String>()
+            );
             results.push(result);
             events.push(event);
             if error.is_some() && fatal_error.is_none() {
@@ -764,30 +772,54 @@ impl AgentRunner {
         if content.is_none() {
             return;
         }
-        if !messages.is_empty() 
-            && messages.last().and_then(|m| m.get("role").and_then(Value::as_str)) == Some("assistant") 
-            && messages.last().and_then(|m| m.get("tool_calls").and_then(Value::as_array)).is_none() {
-            if messages.last().and_then(|m| m.get("content").and_then(Value::as_str)) == content {
+        if !messages.is_empty()
+            && messages
+                .last()
+                .and_then(|m| m.get("role").and_then(Value::as_str))
+                == Some("assistant")
+            && messages
+                .last()
+                .and_then(|m| m.get("tool_calls").and_then(Value::as_array))
+                .is_none()
+        {
+            if messages
+                .last()
+                .and_then(|m| m.get("content").and_then(Value::as_str))
+                == content
+            {
                 return;
             }
             let last_idx = messages.len() - 1;
-            messages[last_idx] = build_assistant_message(content, Option::None, Option::None, Option::None);
+            messages[last_idx] =
+                build_assistant_message(content, Option::None, Option::None, Option::None);
             return;
         }
-        messages.push(build_assistant_message(content, Option::None, Option::None, Option::None));
+        messages.push(build_assistant_message(
+            content,
+            Option::None,
+            Option::None,
+            Option::None,
+        ));
     }
 
-    async fn request_finalization_retry(&self, spec: &AgentRunSpec, messages: &[Value]) -> LLMResponse {
+    async fn request_finalization_retry(
+        &self,
+        spec: &AgentRunSpec,
+        messages: &[Value],
+    ) -> LLMResponse {
         let mut retry_messages = messages.to_vec();
         retry_messages.push(build_finalization_retry_message());
-        self.provider.chat_with_retry(
-            retry_messages, 
-            Option::None, 
-            Some(spec.model.clone()), 
-            spec.max_tokens.clone(), 
-            spec.temperature.clone(), 
-            spec.reasoning_effort.clone(), 
-            Option::None).await
+        self.provider
+            .chat_with_retry(
+                retry_messages,
+                Option::None,
+                Some(spec.model.clone()),
+                spec.max_tokens.clone(),
+                spec.temperature.clone(),
+                spec.reasoning_effort.clone(),
+                Option::None,
+            )
+            .await
     }
 
     /// Main agent iteration loop.
@@ -797,10 +829,7 @@ impl AgentRunner {
     /// is exhausted.  Returns a fully-populated [`AgentRunResult`].
     pub async fn run(&self, spec: AgentRunSpec) -> AgentRunResult {
         // ── Initialise per-run state ──────────────────────────────────────────
-        let hook: Arc<dyn AgentHook> = spec
-            .hook
-            .clone()
-            .unwrap_or_else(|| Arc::new(NoopHook));
+        let hook: Arc<dyn AgentHook> = spec.hook.clone().unwrap_or_else(|| Arc::new(NoopHook));
 
         let mut messages = spec.initial_messages.clone();
         let mut usage: HashMap<String, u64> = HashMap::new();
@@ -829,12 +858,34 @@ impl AgentRunner {
             let mut ctx = AgentHookContext::new(iteration, messages.clone());
             hook.before_iteration(&mut ctx).await;
 
-            log::debug!("Messages for model: {}", messages_for_model.clone().iter().map(|m| m.to_string().chars().take(400).collect::<String>()).collect::<Vec<String>>().join("\n"));
+            log::debug!(
+                "Messages for model: {}",
+                messages_for_model
+                    .clone()
+                    .iter()
+                    .map(|m| m.to_string().chars().take(400).collect::<String>())
+                    .collect::<Vec<String>>()
+                    .join("\n")
+            );
             // ── LLM call ──────────────────────────────────────────────────────
             let response = self
-                .request_model(&spec, messages_for_model.clone(), Arc::clone(&hook), &mut ctx)
+                .request_model(
+                    &spec,
+                    messages_for_model.clone(),
+                    Arc::clone(&hook),
+                    &mut ctx,
+                )
                 .await;
-            log::info!("Response: {}", response.content.clone().unwrap_or("".to_string()).chars().take(400).collect::<String>());
+            log::info!(
+                "Response: {}",
+                response
+                    .content
+                    .clone()
+                    .unwrap_or("".to_string())
+                    .chars()
+                    .take(400)
+                    .collect::<String>()
+            );
 
             Self::accumulate_usage(&mut usage, &response.usage);
             ctx.usage = response
@@ -856,7 +907,15 @@ impl AgentRunner {
                     hook.after_iteration(&mut ctx).await;
                     continue;
                 }
-                log::info!("Tool calls: {}", response.tool_calls.iter().map(|tc| tc.to_string()).collect::<Vec<String>>().join("\n"));
+                log::info!(
+                    "Tool calls: {}",
+                    response
+                        .tool_calls
+                        .iter()
+                        .map(|tc| tc.to_string())
+                        .collect::<Vec<String>>()
+                        .join("\n")
+                );
                 hook.on_stream_end(&mut ctx, true).await;
 
                 let tool_calls_json: Vec<Value> = response
@@ -871,7 +930,15 @@ impl AgentRunner {
                     response.reasoning_content.as_deref(),
                     thinking,
                 );
-                log::info!("Assistant message: {}", assistant_msg.clone().to_string().chars().take(400).collect::<String>());
+                log::info!(
+                    "Assistant message: {}",
+                    assistant_msg
+                        .clone()
+                        .to_string()
+                        .chars()
+                        .take(400)
+                        .collect::<String>()
+                );
                 messages.push(assistant_msg);
                 Self::emit_checkpoint(&spec, serde_json::json!({"type": "awaiting_tools"}));
 
@@ -895,7 +962,13 @@ impl AgentRunner {
 
                 if let Some(err) = fatal_error {
                     log::error!("Fatal tool error: {}", err);
-                    let error_msg = format!("Error: {}\n{}", err, spec.error_message.as_deref().unwrap_or(DEFAULT_ERROR_MESSAGE));
+                    let error_msg = format!(
+                        "Error: {}\n{}",
+                        err,
+                        spec.error_message
+                            .as_deref()
+                            .unwrap_or(DEFAULT_ERROR_MESSAGE)
+                    );
                     stop_reason = "tool_error".to_string();
                     Self::append_final_message(&mut messages, Some(&error_msg));
                     ctx.stop_reason = Some("tool_error".to_string());
@@ -980,7 +1053,13 @@ impl AgentRunner {
 
             // Provider-signalled error.
             if finish_reason == "error" {
-                let error_msg = format!("Error: {}\n{}", "Provider-signalled error", spec.error_message.as_deref().unwrap_or(DEFAULT_ERROR_MESSAGE));
+                let error_msg = format!(
+                    "Error: {}\n{}",
+                    "Provider-signalled error",
+                    spec.error_message
+                        .as_deref()
+                        .unwrap_or(DEFAULT_ERROR_MESSAGE)
+                );
                 stop_reason = "error".to_string();
                 Self::append_final_message(&mut messages, Some(&error_msg));
                 log::error!("Provider-signalled error: {}", error_msg);
@@ -1050,7 +1129,6 @@ impl AgentRunner {
                 .collect()
         })
     }
-
 }
 
 /// No-op fallback hook used when `AgentRunSpec::hook` is `None`.
@@ -1662,10 +1740,15 @@ mod tests {
         // legal (every tool result's call id is declared by a preceding
         // assistant message within the kept window).
         assert!(
-            result.iter().any(|m| m.get("role").and_then(Value::as_str) == Some("user")),
+            result
+                .iter()
+                .any(|m| m.get("role").and_then(Value::as_str) == Some("user")),
             "current user turn was dropped by snip_history: {result:?}"
         );
-        assert_eq!(result, messages, "the whole single turn should be kept intact");
+        assert_eq!(
+            result, messages,
+            "the whole single turn should be kept intact"
+        );
     }
 
     // ── run_tool ──────────────────────────────────────────────────────────────
@@ -1686,8 +1769,12 @@ mod tests {
             function_provider_specific_fields: None,
         };
         let external_lookup_counts = HashMap::<String, usize>::new();
-        let (result, event, fatal_error) =
-            AgentRunner::run_tool(&spec, &tool_call, Arc::new(Mutex::new(external_lookup_counts))).await;
+        let (result, event, fatal_error) = AgentRunner::run_tool(
+            &spec,
+            &tool_call,
+            Arc::new(Mutex::new(external_lookup_counts)),
+        )
+        .await;
         assert_eq!(
             result,
             "Error: Tool 'dummy_tool' not found. Available: \n\n[Analyze the error above and try a different approach.]"
@@ -1728,8 +1815,12 @@ mod tests {
             function_provider_specific_fields: None,
         };
         let external_lookup_counts = HashMap::<String, usize>::new();
-        let (result, event, fatal_error) =
-            AgentRunner::run_tool(&spec, &tool_call, Arc::new(Mutex::new(external_lookup_counts))).await;
+        let (result, event, fatal_error) = AgentRunner::run_tool(
+            &spec,
+            &tool_call,
+            Arc::new(Mutex::new(external_lookup_counts)),
+        )
+        .await;
         assert!(result.contains("Error: malformed tool arguments JSON for 'write_file'"));
         assert!(result.contains("expected `,` at line 1 column 17"));
         assert_eq!(event.get("name").unwrap(), &"write_file".to_string());
@@ -1948,24 +2039,57 @@ mod tests {
         let mut messages = Vec::new();
         AgentRunner::append_final_message(&mut messages, Some("Hello, world!"));
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages, vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)]);
+        assert_eq!(
+            messages,
+            vec![build_assistant_message(
+                Some("Hello, world!"),
+                Option::None,
+                Option::None,
+                Option::None
+            )]
+        );
     }
 
-    
     #[test]
     fn test_assistant_message_unchanged() {
-        let mut messages = vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)];
+        let mut messages = vec![build_assistant_message(
+            Some("Hello, world!"),
+            Option::None,
+            Option::None,
+            Option::None,
+        )];
         AgentRunner::append_final_message(&mut messages, Some("Hello, world!"));
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages, vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)]);
+        assert_eq!(
+            messages,
+            vec![build_assistant_message(
+                Some("Hello, world!"),
+                Option::None,
+                Option::None,
+                Option::None
+            )]
+        );
     }
 
     #[test]
     fn test_assistant_message_changed() {
-        let mut messages = vec![build_assistant_message(Some("Hello, world!"), Option::None, Option::None, Option::None)];
+        let mut messages = vec![build_assistant_message(
+            Some("Hello, world!"),
+            Option::None,
+            Option::None,
+            Option::None,
+        )];
         AgentRunner::append_final_message(&mut messages, Some("Hello, universe!"));
         assert_eq!(messages.len(), 1);
-        assert_eq!(messages, vec![build_assistant_message(Some("Hello, universe!"), Option::None, Option::None, Option::None)]);
+        assert_eq!(
+            messages,
+            vec![build_assistant_message(
+                Some("Hello, universe!"),
+                Option::None,
+                Option::None,
+                Option::None
+            )]
+        );
     }
 
     #[tokio::test]
@@ -1979,8 +2103,9 @@ mod tests {
             ..Default::default()
         };
         let mut messages = Vec::new();
-        let result = runner.request_finalization_retry(&spec, &mut messages).await;
+        let result = runner
+            .request_finalization_retry(&spec, &mut messages)
+            .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }
-
 }

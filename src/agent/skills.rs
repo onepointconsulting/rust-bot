@@ -189,7 +189,9 @@ impl SkillsLoader {
             .into_iter()
             .filter(|entry| {
                 let name = entry["name"].as_str().unwrap_or("");
-                let meta = self.get_skill_metadata(name).unwrap_or(serde_json::json!({}));
+                let meta = self
+                    .get_skill_metadata(name)
+                    .unwrap_or(serde_json::json!({}));
 
                 // Check parsed metadata JSON for "always"
                 let meta_str = meta.get("metadata").and_then(|v| v.as_str()).unwrap_or("");
@@ -249,10 +251,6 @@ impl SkillsLoader {
         lines.join("\n")
     }
 
-    
-
-
-
     /// Get the description of a skill from its frontmatter.
     fn get_skill_description(&self, name: &str) -> String {
         let Some(meta) = self.get_skill_metadata(name) else {
@@ -306,7 +304,7 @@ impl SkillsLoader {
         return serde_json::json!({});
     }
 
-        /// Returns whether skill requirements are met (executables on `PATH`, non-empty env vars).
+    /// Returns whether skill requirements are met (executables on `PATH`, non-empty env vars).
     ///
     /// Expects `skill_meta["requires"]` shaped like `{ "bins": [...], "env": [...] }`, matching
     /// Python's `skill_meta.get("requires", {})` with list defaults for `bins` and `env`.
@@ -342,7 +340,6 @@ impl SkillsLoader {
         bins_ok && env_ok
     }
 
-    
     /// Get rust-bot metadata for a skill (cached in frontmatter).
     fn get_skill_meta(&self, name: &str) -> serde_json::Value {
         let meta = self
@@ -415,10 +412,8 @@ impl SkillsLoader {
                                 continue;
                             }
                             let (key, value) = line.split_once(':').unwrap();
-                            metadata.insert(
-                                key.trim().to_string(),
-                                strip_surrounding_quotes(value),
-                            );
+                            metadata
+                                .insert(key.trim().to_string(), strip_surrounding_quotes(value));
                         }
                     }
                     return Some(serde_json::json!(metadata));
@@ -1273,7 +1268,11 @@ metadata:
     #[test]
     fn get_always_skills_excludes_skills_without_always_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_skill(dir.path(), "normal", "---\ndescription: Normal\n---\n# Normal");
+        write_skill(
+            dir.path(),
+            "normal",
+            "---\ndescription: Normal\n---\n# Normal",
+        );
         let missing = dir.path().join("_no_builtins_");
         let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
         assert!(loader.get_always_skills().is_empty());
@@ -1335,7 +1334,11 @@ metadata:
     #[test]
     fn get_always_skills_returns_only_those_with_flag() {
         let dir = tempfile::tempdir().expect("tempdir");
-        write_skill(dir.path(), "normal", "---\ndescription: Normal\n---\n# Normal");
+        write_skill(
+            dir.path(),
+            "normal",
+            "---\ndescription: Normal\n---\n# Normal",
+        );
         write_skill(
             dir.path(),
             "always-one",

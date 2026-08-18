@@ -18,16 +18,17 @@ use tokio::task::JoinHandle;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
-use crate::runtime_context::RUNTIME_CONTEXT_TAG;
 use crate::agent::memory::{Consolidator, Dream};
-use crate::agent::model_runtime::{ModelRuntime, ModelRuntimeResolver, SESSION_MODEL_PRESET_METADATA_KEY};
+use crate::agent::model_runtime::{
+    ModelRuntime, ModelRuntimeResolver, SESSION_MODEL_PRESET_METADATA_KEY,
+};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::FsToolConfig;
 use crate::agent::tools::goal::UpdateGoalTool;
-use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_with_file_refs};
 use crate::agent::tools::mcp::mcp_file_ref::FileRefResolver;
+use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_with_file_refs};
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
@@ -45,13 +46,16 @@ use crate::command::CommandContext;
 use crate::command::types::ChatCommand;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
+    ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig,
+    ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, RESERVED_MODEL_PRESET_NAME,
+    WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::LLMProviderDyn;
+use crate::runtime_context::RUNTIME_CONTEXT_TAG;
 use crate::security::workspace_access::{
-    validate_workspace_scope_payload, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
-    WorkspaceScopeResolver, WORKSPACE_SCOPE_METADATA_KEY,
+    WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
+    WorkspaceScopeResolver, validate_workspace_scope_payload,
 };
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::goal_state;
@@ -59,7 +63,8 @@ use crate::session::keys::{COMMAND_KEY, RUNTIME_CHECKPOINT_KEY};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
-    filesystem_tool_scope, register_conversion_tools, register_filesystem_tools, register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
+    filesystem_tool_scope, register_conversion_tools, register_filesystem_tools,
+    register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
 };
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
@@ -376,7 +381,8 @@ impl AgentLoop {
         let docx_config = tools_cfg.docx.clone();
         let image_generation_config = tools_cfg.image_generation.clone();
         let restrict_to_workspace = tools_cfg.restrict_to_workspace;
-        let workspace_scopes = WorkspaceScopeResolver::new(workspace.clone(), restrict_to_workspace);
+        let workspace_scopes =
+            WorkspaceScopeResolver::new(workspace.clone(), restrict_to_workspace);
         let mcp_servers = tools_cfg.mcp_servers.clone();
 
         let context_window_tokens = agents_cfg.context_window_tokens;
@@ -397,7 +403,8 @@ impl AgentLoop {
         };
         let session_manager = session_manager
             .unwrap_or_else(|| Arc::new(Mutex::new(SessionManager::new(workspace.clone()))));
-        let runtime_resolver = Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
+        let runtime_resolver =
+            Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
         let subagents = Arc::new(SubagentManager::new(
             runtime_resolver.clone(),
             session_manager.clone(),
@@ -516,7 +523,9 @@ impl AgentLoop {
     /// The process-wide default context window (read-through onto the
     /// resolver's current default).
     pub fn context_window_tokens(&self) -> u64 {
-        self.runtime_resolver.current_default().context_window_tokens
+        self.runtime_resolver
+            .current_default()
+            .context_window_tokens
     }
 
     /// Change the process-wide default model without reconstructing any
@@ -585,7 +594,8 @@ impl AgentLoop {
     /// stored override, if any, else the process-wide default) without
     /// mutating anything — used by `/workspace` with no arguments.
     pub fn workspace_scope_for_session(&self, session: Option<&Session>) -> WorkspaceScope {
-        self.workspace_scopes.for_session(session.map(|s| &s.metadata))
+        self.workspace_scopes
+            .for_session(session.map(|s| &s.metadata))
     }
 
     /// Builds a fresh `WorkspaceRequestHandler` for this loop's default workspace/restriction —
@@ -619,7 +629,9 @@ impl AgentLoop {
         )?;
 
         let session = session_manager.get_or_create_session(session_key);
-        session.metadata.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
+        session
+            .metadata
+            .insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
         let snapshot = session.clone();
         session_manager
             .save(snapshot)
@@ -629,7 +641,11 @@ impl AgentLoop {
 
     /// Clear a session's workspace-scope override, reverting to the
     /// process-wide default on its next turn.
-    pub fn clear_session_workspace_scope(&self, session_manager: &mut SessionManager, session_key: &str) {
+    pub fn clear_session_workspace_scope(
+        &self,
+        session_manager: &mut SessionManager,
+        session_key: &str,
+    ) {
         let session = session_manager.get_or_create_session(session_key);
         session.metadata.remove(WORKSPACE_SCOPE_METADATA_KEY);
         let snapshot = session.clone();
@@ -662,7 +678,14 @@ impl AgentLoop {
         objective: Option<&str>,
         ui_summary: Option<&str>,
     ) -> Result<String, goal_state::GoalError> {
-        goal_state::update_session_goal(session_manager, session_key, action, recap, objective, ui_summary)
+        goal_state::update_session_goal(
+            session_manager,
+            session_key,
+            action,
+            recap,
+            objective,
+            ui_summary,
+        )
     }
 
     /// Register the default set of tools.
@@ -682,17 +705,9 @@ impl AgentLoop {
         session_manager: Arc<Mutex<SessionManager>>,
     ) {
         log::info!("Registering default tools");
-        let (allowed_dir, extra_read) = filesystem_tool_scope(
-            workspace,
-            restrict_to_workspace,
-            &exec_config.sandbox,
-        );
-        register_filesystem_tools(
-            tools,
-            workspace,
-            allowed_dir.clone(),
-            extra_read.clone(),
-        );
+        let (allowed_dir, extra_read) =
+            filesystem_tool_scope(workspace, restrict_to_workspace, &exec_config.sandbox);
+        register_filesystem_tools(tools, workspace, allowed_dir.clone(), extra_read.clone());
         if exec_config.enable {
             log::debug!("Registering exec tool");
             tools.register(Box::new(ShellTool::new(
@@ -707,12 +722,17 @@ impl AgentLoop {
         }
         register_web_tools(web_config, tools);
         register_gmail_tools(gmail_config, workspace, tools);
-        register_ocr_tools(ocr_config, workspace, allowed_dir.clone(), extra_read.clone(), tools);
+        register_ocr_tools(
+            ocr_config,
+            workspace,
+            allowed_dir.clone(),
+            extra_read.clone(),
+            tools,
+        );
         register_conversion_tools(
-            docx_config, 
-            &FsToolConfig::new(
-                Some(workspace.clone()),
-                 allowed_dir, Some(extra_read)), tools
+            docx_config,
+            &FsToolConfig::new(Some(workspace.clone()), allowed_dir, Some(extra_read)),
+            tools,
         );
         register_image_generation_tools(image_generation_config, workspace, tools);
         tools.register(Box::new(MessageTool::new(
@@ -751,10 +771,7 @@ impl AgentLoop {
             Ok(mut sessions) => {
                 let mut mcp_tool_count = 0usize;
                 {
-                    let mut registry = self
-                        .tools
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
+                    let mut registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
                     for session in &mut sessions {
                         mcp_tool_count += session.tools.len();
                         for tool in session.tools.drain(..) {
@@ -764,7 +781,10 @@ impl AgentLoop {
                 }
                 *self.mcp_sessions.lock().unwrap_or_else(|e| e.into_inner()) = sessions;
                 self.mcp_connected.store(true, Ordering::Relaxed);
-                log::info!("{} MCP server(s) connected successfully", self.mcp_servers.len());
+                log::info!(
+                    "{} MCP server(s) connected successfully",
+                    self.mcp_servers.len()
+                );
                 log::info!("{mcp_tool_count} MCP tools registered");
             }
             Err(e) => {
@@ -792,8 +812,7 @@ impl AgentLoop {
     ) -> Result<Vec<LoadedMcpTools>, LoadMcpToolsError> {
         let mut sessions = Vec::with_capacity(servers.len());
         for (name, config) in servers {
-            sessions
-                .push(load_mcp_tools_with_file_refs(config, name, file_refs.clone()).await?);
+            sessions.push(load_mcp_tools_with_file_refs(config, name, file_refs.clone()).await?);
         }
         Ok(sessions)
     }
@@ -933,7 +952,7 @@ impl AgentLoop {
                     this.set_runtime_checkpoint(&key, payload);
                 }) as Arc<dyn Fn(Value) + Send + Sync>
             });
-        
+
         let run_tools = self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone();
         log::info!("Running agent loop with {} tools", run_tools.len());
 
@@ -947,7 +966,9 @@ impl AgentLoop {
             runtime.preset_name,
             runtime.max_tokens
         );
-        let scope = self.workspace_scopes.for_session(session.as_ref().map(|s| &s.metadata));
+        let scope = self
+            .workspace_scopes
+            .for_session(session.as_ref().map(|s| &s.metadata));
         let workspace_scope_token = bind_workspace_scope(scope);
 
         let runner = AgentRunner::new(runtime.provider.clone());
@@ -1033,7 +1054,14 @@ impl AgentLoop {
             if self.commands.is_priority(raw) {
                 // Priority commands (/stop, /restart) run inline so they can't be
                 // queued behind the very work they're meant to interrupt.
-                let ctx = CommandContext::with_options(msg.clone(), None, msg.session_key(), raw, "", Some(Arc::clone(self)));
+                let ctx = CommandContext::with_options(
+                    msg.clone(),
+                    None,
+                    msg.session_key(),
+                    raw,
+                    "",
+                    Some(Arc::clone(self)),
+                );
                 if let Some(result) = self.commands.dispatch_priority(&ctx).await {
                     self.persist_command_turn(&msg.session_key(), &msg.content, raw, &result);
                     if let Err(error) = self.bus.publish_outbound(result) {
@@ -1683,7 +1711,12 @@ impl AgentLoop {
             msg.chat_id.as_str(),
             msg.metadata.get("message_id").and_then(Value::as_str),
         );
-        if let Some(message_tool) = self.tools.lock().unwrap_or_else(|e| e.into_inner()).get("message") {
+        if let Some(message_tool) = self
+            .tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("message")
+        {
             // `isinstance(message_tool, MessageTool)` → downcast the trait object.
             if let Some(message_tool) =
                 (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
@@ -1808,27 +1841,34 @@ impl AgentLoop {
                 .await;
         })
         .await;
-        if let Some(message_tool) = self.tools.lock().unwrap_or_else(|e| e.into_inner()).get("message") {
+        if let Some(message_tool) = self
+            .tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get("message")
+        {
             if let Some(message_tool) =
                 (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
             {
-                if *message_tool.sent_in_turn.lock().unwrap_or_else(|e| e.into_inner()) {
+                if *message_tool
+                    .sent_in_turn
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                {
                     return None;
                 }
             }
         }
         let limit: usize = 120;
-        let preview = if final_content.len() > limit { 
-            format!("{}...", final_content.get(..limit).unwrap_or(&final_content))
+        let preview = if final_content.len() > limit {
+            format!(
+                "{}...",
+                final_content.get(..limit).unwrap_or(&final_content)
+            )
         } else {
             final_content.clone()
         };
-        log::info!(
-            "Response to {}:{}: {}",
-            msg.channel,
-            msg.sender_id,
-            preview
-        );
+        log::info!("Response to {}:{}: {}", msg.channel, msg.sender_id, preview);
 
         let mut meta = msg.metadata.clone();
         let event = if on_stream.is_some() {
@@ -2018,7 +2058,7 @@ impl AgentLoop {
         media: Option<Vec<String>>,
         on_progress: Option<ProgressCallback>,
         on_stream: Option<StreamCallback>,
-        on_stream_end: Option<StreamEndCallback>
+        on_stream_end: Option<StreamEndCallback>,
     ) -> Option<OutboundMessage> {
         let session_key = session_key.unwrap_or("cli:direct");
         let channel = channel.unwrap_or("cli");
@@ -2041,7 +2081,8 @@ impl AgentLoop {
             session_key_override: None,
             metadata: HashMap::new(),
         };
-        self.process_message(msg, session_key, on_progress, on_stream, on_stream_end).await
+        self.process_message(msg, session_key, on_progress, on_stream, on_stream_end)
+            .await
     }
 
     fn subagent_announce_role(model: &str) -> &'static str {
@@ -2062,7 +2103,9 @@ impl AgentLoop {
             .into_iter()
             .map(|(key, value)| (key, Value::Number(serde_json::Number::from(value))))
             .collect();
-        outbound.metadata.insert(OutboundMessage::TOKEN_USAGE_KEY.into(), usage_obj);
+        outbound
+            .metadata
+            .insert(OutboundMessage::TOKEN_USAGE_KEY.into(), usage_obj);
     }
 }
 
@@ -2361,16 +2404,27 @@ mod tests {
     fn persist_command_turn_writes_marked_messages_omitted_from_get_history() {
         let loop_ = make_save_turn_loop(1000);
         let key = "test:persist_command_turn";
-        loop_.persist_command_turn(key, "/help", "/help", &command_reply("Available commands..."));
+        loop_.persist_command_turn(
+            key,
+            "/help",
+            "/help",
+            &command_reply("Available commands..."),
+        );
 
-        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session(key);
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0]["role"], json!("user"));
         assert_eq!(session.messages[0]["content"], json!("/help"));
         assert_eq!(session.messages[0][COMMAND_KEY], json!(true));
         assert_eq!(session.messages[1]["role"], json!("assistant"));
-        assert_eq!(session.messages[1]["content"], json!("Available commands..."));
+        assert_eq!(
+            session.messages[1]["content"],
+            json!("Available commands...")
+        );
         assert_eq!(session.messages[1][COMMAND_KEY], json!(true));
         assert!(session.get_history(None).is_empty());
     }
@@ -2381,7 +2435,10 @@ mod tests {
         let key = "test:persist_command_turn_new";
         loop_.persist_command_turn(key, "/NEW", "/NEW", &command_reply("New session started."));
 
-        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session(key);
         assert!(session.messages.is_empty());
     }
@@ -2394,7 +2451,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         let scope = {
-            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             loop_
                 .set_session_workspace_scope(
                     &mut manager,
@@ -2407,7 +2467,10 @@ mod tests {
         assert_eq!(scope.project_path, dir.path());
         assert_eq!(scope.access_mode, WorkspaceAccessMode::Restricted);
 
-        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session("test:workspace_scope");
         let stored = session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).unwrap();
         assert_eq!(stored, &scope.metadata());
@@ -2417,7 +2480,10 @@ mod tests {
     fn set_session_workspace_scope_rejects_relative_path() {
         let loop_ = make_save_turn_loop(1000);
         let err = {
-            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             loop_
                 .set_session_workspace_scope(
                     &mut manager,
@@ -2429,7 +2495,10 @@ mod tests {
         };
         assert_eq!(err.status, 400);
 
-        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session("test:workspace_scope_relative");
         assert!(session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).is_none());
     }
@@ -2440,7 +2509,10 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
 
         {
-            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             loop_
                 .set_session_workspace_scope(
                     &mut manager,
@@ -2451,11 +2523,17 @@ mod tests {
                 .unwrap();
         }
         {
-            let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
             loop_.clear_session_workspace_scope(&mut manager, "test:workspace_scope_clear");
         }
 
-        let mut manager = loop_.session_manager.lock().unwrap_or_else(|e| e.into_inner());
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session("test:workspace_scope_clear");
         assert!(session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).is_none());
     }

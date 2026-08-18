@@ -76,7 +76,11 @@ pub fn normalize_webui_quote(value: Option<&str>) -> Option<String> {
         return None;
     }
     let truncated: String = trimmed.chars().take(MAX_WEBUI_QUOTE_CHARS).collect();
-    if truncated.is_empty() { None } else { Some(truncated) }
+    if truncated.is_empty() {
+        None
+    } else {
+        Some(truncated)
+    }
 }
 
 /// Project one WebUI-selected assistant excerpt into model-only context.
@@ -89,7 +93,9 @@ pub fn normalize_webui_quote(value: Option<&str>) -> Option<String> {
 pub fn webui_quote_runtime_context(raw_quote: Option<&Value>) -> Option<RuntimeContextBlock> {
     let quote = normalize_webui_quote(raw_quote.and_then(Value::as_str))?;
     let encoded_quote = serde_json::to_string(&quote).unwrap_or_default();
-    let encoded_quote = encoded_quote.replace('[', "\\u005b").replace(']', "\\u005d");
+    let encoded_quote = encoded_quote
+        .replace('[', "\\u005b")
+        .replace(']', "\\u005d");
     let content = wrap_runtime_context_lines(&[
         "The user selected this JSON-encoded excerpt from an earlier assistant response:",
         &encoded_quote,
@@ -158,7 +164,10 @@ mod tests {
     #[test]
     fn normalize_webui_quote_strips_control_characters_but_keeps_tab_and_newline() {
         let value = "a\u{0000}b\tc\nd\u{0007}e";
-        assert_eq!(normalize_webui_quote(Some(value)), Some("ab\tc\nde".to_string()));
+        assert_eq!(
+            normalize_webui_quote(Some(value)),
+            Some("ab\tc\nde".to_string())
+        );
     }
 
     #[test]

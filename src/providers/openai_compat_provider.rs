@@ -3,6 +3,7 @@ use crate::providers::{
     cache_control::apply_cache_control,
     registry::ProviderSpec,
 };
+use async_openai::types::chat::ImageUrl;
 use async_openai::types::chat::{
     ChatCompletionMessageToolCall, ChatCompletionMessageToolCalls,
     ChatCompletionRequestAssistantMessageArgs, ChatCompletionRequestAssistantMessageContent,
@@ -15,7 +16,6 @@ use async_openai::types::chat::{
     ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest,
     CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall,
 };
-use async_openai::types::chat::ImageUrl;
 use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
 use futures::StreamExt;
 use std::collections::HashMap;
@@ -100,10 +100,15 @@ impl OpenAICompatProvider {
             Ok(args) => args,
             Err(err) => {
                 log::error!(
-                    "Failed to parse tool arguments: {}. Arguments length: {}", err, arguments_json.len()
+                    "Failed to parse tool arguments: {}. Arguments length: {}",
+                    err,
+                    arguments_json.len()
                 );
                 let mut args = HashMap::new();
-                let raw: String = arguments_json.chars().take(Self::ARG_PARSE_RAW_LIMIT).collect();
+                let raw: String = arguments_json
+                    .chars()
+                    .take(Self::ARG_PARSE_RAW_LIMIT)
+                    .collect();
                 args.insert(
                     Self::ARG_PARSE_ERROR_KEY.to_string(),
                     serde_json::Value::String(err.to_string()),
@@ -138,7 +143,6 @@ impl OpenAICompatProvider {
     pub fn coerce_map(
         value: &serde_json::Value,
     ) -> Option<serde_json::Map<String, serde_json::Value>> {
-
         // If value is null, return None
         if value.is_null() {
             return None;
@@ -405,7 +409,9 @@ impl OpenAICompatProvider {
     /// Convert a JSON `content` value into typed system-message content.
     ///
     /// Supports both plain strings and content-part arrays.
-    fn system_message_content(content: Option<&serde_json::Value>) -> ChatCompletionRequestSystemMessageContent {
+    fn system_message_content(
+        content: Option<&serde_json::Value>,
+    ) -> ChatCompletionRequestSystemMessageContent {
         match content {
             Some(serde_json::Value::String(text)) => {
                 ChatCompletionRequestSystemMessageContent::Text(text.clone())
@@ -438,9 +444,9 @@ impl OpenAICompatProvider {
         content: Option<&serde_json::Value>,
     ) -> Option<ChatCompletionRequestAssistantMessageContent> {
         match content {
-            Some(serde_json::Value::String(text)) if !text.is_empty() => {
-                Some(ChatCompletionRequestAssistantMessageContent::Text(text.clone()))
-            }
+            Some(serde_json::Value::String(text)) if !text.is_empty() => Some(
+                ChatCompletionRequestAssistantMessageContent::Text(text.clone()),
+            ),
             Some(serde_json::Value::Array(blocks)) => {
                 let parts: Vec<ChatCompletionRequestAssistantMessageContentPart> =
                     Self::content_text_parts(blocks)
@@ -686,7 +692,9 @@ impl OpenAICompatProvider {
     /// `"type": "annotation"` (or a flattened citation), which otherwise
     /// errors as `unknown variant 'annotation', expected 'url_citation'`.
     fn sanitize_message_annotations(message: &mut serde_json::Map<String, serde_json::Value>) {
-        let Some(annotations) = message.get_mut("annotations").and_then(|a| a.as_array_mut())
+        let Some(annotations) = message
+            .get_mut("annotations")
+            .and_then(|a| a.as_array_mut())
         else {
             return;
         };
@@ -766,26 +774,34 @@ impl OpenAICompatProvider {
                 thinking_blocks: None,
             };
         }
-  
+
         let choice0 = &response.choices[0];
         let mut content = choice0.message.content.clone();
         let reasoning_content = Self::extract_reasoning_content(&combined_response.raw_json);
 
-        let mut finish_reason = choice0.finish_reason
-            .map(|r| serde_json::to_value(r).ok()
-                .and_then(|v| v.as_str().map(str::to_string))
-                .unwrap_or_else(|| "stop".to_string()))
+        let mut finish_reason = choice0
+            .finish_reason
+            .map(|r| {
+                serde_json::to_value(r)
+                    .ok()
+                    .and_then(|v| v.as_str().map(str::to_string))
+                    .unwrap_or_else(|| "stop".to_string())
+            })
             .unwrap_or_else(|| "stop".to_string());
-  
+
         // Collect tool calls across all choices (mirrors the Python loop)
         let mut raw_tool_calls = vec![];
         for ch in &response.choices {
             if let Some(tcs) = &ch.message.tool_calls {
                 if !tcs.is_empty() {
                     raw_tool_calls.extend(tcs.iter());
-                    if matches!(ch.finish_reason, Some(FinishReason::ToolCalls) | Some(FinishReason::Stop)) {
+                    if matches!(
+                        ch.finish_reason,
+                        Some(FinishReason::ToolCalls) | Some(FinishReason::Stop)
+                    ) {
                         finish_reason = serde_json::to_value(ch.finish_reason)
-                            .ok().and_then(|v| v.as_str().map(str::to_string))
+                            .ok()
+                            .and_then(|v| v.as_str().map(str::to_string))
                             .unwrap_or(finish_reason);
                     }
                 }
@@ -794,26 +810,34 @@ impl OpenAICompatProvider {
                 content = ch.message.content.clone();
             }
         }
-  
+
         // Parse tool calls
-        let tool_calls = raw_tool_calls.into_iter().filter_map(|tc| {
-            let ChatCompletionMessageToolCalls::Function(tc) = tc else { return None; };
-            let args = Self::parse_tool_arguments(&tc.function.arguments);
-            Some(ToolCallRequest {
-                id: Self::short_tool_id(),
-                name: tc.function.name.clone(),
-                arguments: args,
-                extra_content: None,
-                provider_specific_fields: None,
-                function_provider_specific_fields: None,
+        let tool_calls = raw_tool_calls
+            .into_iter()
+            .filter_map(|tc| {
+                let ChatCompletionMessageToolCalls::Function(tc) = tc else {
+                    return None;
+                };
+                let args = Self::parse_tool_arguments(&tc.function.arguments);
+                Some(ToolCallRequest {
+                    id: Self::short_tool_id(),
+                    name: tc.function.name.clone(),
+                    arguments: args,
+                    extra_content: None,
+                    provider_specific_fields: None,
+                    function_provider_specific_fields: None,
+                })
             })
-        }).collect();
-        
+            .collect();
+
         let mut usage_map = HashMap::new();
         match response.usage {
             Some(usage) => {
                 usage_map.insert("prompt_tokens".to_string(), usage.prompt_tokens as u64);
-                usage_map.insert("completion_tokens".to_string(), usage.completion_tokens as u64);
+                usage_map.insert(
+                    "completion_tokens".to_string(),
+                    usage.completion_tokens as u64,
+                );
                 usage_map.insert("total_tokens".to_string(), usage.total_tokens as u64);
             }
             None => {
@@ -822,7 +846,7 @@ impl OpenAICompatProvider {
                 usage_map.insert("total_tokens".to_string(), 0);
             }
         }
-  
+
         LLMResponse {
             content,
             tool_calls,
@@ -859,8 +883,8 @@ impl OpenAICompatProvider {
 
         if reasoning_content.is_none() {
             if let Some(reasoning) = msg0.get("reasoning") {
-                reasoning_content = Self::extract_text_content(reasoning.clone())
-                    .filter(|s| !s.is_empty());
+                reasoning_content =
+                    Self::extract_text_content(reasoning.clone()).filter(|s| !s.is_empty());
             }
         }
 
@@ -892,12 +916,14 @@ impl OpenAICompatProvider {
         if value.is_string() {
             Some(value.as_str().unwrap_or("").to_string())
         } else if value.is_array() {
-            let mut parts :Vec<String> = vec![];
+            let mut parts: Vec<String> = vec![];
             for item in value.as_array().unwrap() {
                 let item_map_option = maybe_mapping(item);
                 if let Some(item_map) = item_map_option {
                     let text_option = item_map.get("text");
-                    if let Some(text) = text_option && text.is_string() {
+                    if let Some(text) = text_option
+                        && text.is_string()
+                    {
                         parts.push(text.as_str().unwrap_or("").to_string());
                         continue;
                     }
@@ -908,8 +934,7 @@ impl OpenAICompatProvider {
                 }
             }
             Some(parts.join(""))
-        }
-        else {
+        } else {
             None
         }
     }
@@ -919,21 +944,30 @@ impl OpenAICompatProvider {
         finish_reason: String,
         raw_tool_calls: Vec<ChatCompletionMessageToolCalls>,
     ) -> LLMResponse {
-        let tool_calls = raw_tool_calls.into_iter().filter_map(|tc| {
-            let ChatCompletionMessageToolCalls::Function(tc) = tc else { return None; };
-            let args = Self::parse_tool_arguments(&tc.function.arguments);
-            Some(ToolCallRequest {
-                id: Self::short_tool_id(),
-                name: tc.function.name.clone(),
-                arguments: args,
-                extra_content: None,
-                provider_specific_fields: None,
-                function_provider_specific_fields: None,
+        let tool_calls = raw_tool_calls
+            .into_iter()
+            .filter_map(|tc| {
+                let ChatCompletionMessageToolCalls::Function(tc) = tc else {
+                    return None;
+                };
+                let args = Self::parse_tool_arguments(&tc.function.arguments);
+                Some(ToolCallRequest {
+                    id: Self::short_tool_id(),
+                    name: tc.function.name.clone(),
+                    arguments: args,
+                    extra_content: None,
+                    provider_specific_fields: None,
+                    function_provider_specific_fields: None,
+                })
             })
-        }).collect();
+            .collect();
 
         LLMResponse {
-            content: if content.is_empty() { None } else { Some(content) },
+            content: if content.is_empty() {
+                None
+            } else {
+                Some(content)
+            },
             finish_reason,
             tool_calls,
             usage: HashMap::new(),
@@ -975,7 +1009,8 @@ impl LLMProvider for OpenAICompatProvider {
         // client, etc., must be handled in the struct definition, but are omitted/handled elsewhere for clarity.
         let default_model =
             default_model.unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string());
-        let extra_headers: std::collections::HashMap<String, String> = extra_headers.unwrap_or_default();
+        let extra_headers: std::collections::HashMap<String, String> =
+            extra_headers.unwrap_or_default();
         let spec: Option<ProviderSpec> = spec.clone();
 
         // Compute effective_base.
@@ -1106,7 +1141,7 @@ impl LLMProvider for OpenAICompatProvider {
             .clone()
             .unwrap_or_else(|| OpenAICompatProvider::DEFAULT_MODEL.to_string())
     }
-    
+
     async fn chat(
         &self,
         messages: Vec<serde_json::Value>,
@@ -1158,7 +1193,6 @@ impl LLMProvider for OpenAICompatProvider {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send,
     {
-
         let request_args = self.build_request(
             &messages,
             tools,
@@ -1205,9 +1239,10 @@ impl LLMProvider for OpenAICompatProvider {
                                     if let Some(ref tcs) = choice.delta.tool_calls {
                                         for tc in tcs {
                                             // (id, name, arguments) accumulated per index.
-                                            let entry = tool_call_acc
-                                                .entry(tc.index)
-                                                .or_insert_with(|| (None, String::new(), String::new()));
+                                            let entry =
+                                                tool_call_acc.entry(tc.index).or_insert_with(
+                                                    || (None, String::new(), String::new()),
+                                                );
                                             if let Some(id) = &tc.id {
                                                 if !id.is_empty() {
                                                     entry.0 = Some(id.clone());
@@ -1245,7 +1280,11 @@ impl LLMProvider for OpenAICompatProvider {
                                 )
                             })
                             .collect();
-                        return Self::parse_stream_response(content_buf, finish_reason, raw_tool_calls);
+                        return Self::parse_stream_response(
+                            content_buf,
+                            finish_reason,
+                            raw_tool_calls,
+                        );
                     }
                     Err(e) => {
                         return OpenAICompatProvider::handle_error(Box::new(e));
@@ -1387,14 +1426,20 @@ mod tests {
             args.get("content").and_then(serde_json::Value::as_str),
             Some("hi")
         );
-        assert!(args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY).is_none());
+        assert!(
+            args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY)
+                .is_none()
+        );
     }
 
     #[test]
     fn test_parse_tool_arguments_malformed_json_adds_markers() {
         let malformed = r#"{"path":"a.txt","content":"hi""#;
         let args = OpenAICompatProvider::parse_tool_arguments(malformed);
-        assert!(args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY).is_some());
+        assert!(
+            args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY)
+                .is_some()
+        );
         assert_eq!(
             args.get(OpenAICompatProvider::ARG_PARSE_RAW_KEY)
                 .and_then(serde_json::Value::as_str),

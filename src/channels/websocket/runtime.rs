@@ -1,8 +1,8 @@
 use std::collections::{HashMap, HashSet};
-use std::str::FromStr;
 use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
+use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, atomic::Ordering};
 
 use async_trait::async_trait;
@@ -29,7 +29,7 @@ use crate::channels::websocket::types::{
     WsOutboundEvent, WsShared, WsUpgradeQuery,
 };
 use crate::channels::websocket::webui::metadata::{
-    WEBUI_TURN_METADATA_KEY, WEBSOCKET_TURN_OWNER_METADATA_KEY,
+    WEBSOCKET_TURN_OWNER_METADATA_KEY, WEBUI_TURN_METADATA_KEY,
 };
 use crate::channels::websocket::webui::transcript::client_turn_metadata;
 use crate::command::normalize_command_text;
@@ -489,7 +489,8 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
     // `None` here (not `Some(&new_id)`): mirrors nanobot's `new_chat` handler,
     // which omits `chat_id` from a rejected new-chat's scope error — the
     // chat was never attached to anything, so there is no id worth reporting.
-    let scope = workspace_scope_or_error(shared, None, None, connection_id, scope_for_new_chat).await;
+    let scope =
+        workspace_scope_or_error(shared, None, None, connection_id, scope_for_new_chat).await;
     let Some(scope) = scope else {
         return;
     };
@@ -502,10 +503,23 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        shared._workspace_request_handler.persist_scope(&mut session_manager, &new_id, &scope);
+        shared
+            ._workspace_request_handler
+            .persist_scope(&mut session_manager, &new_id, &scope);
     }
-    shared.connections.lock().await.attach(connection_id, &new_id);
-    send_event(shared, connection_id, WsOutboundEvent::Attached, None, serde_json::json!({"chat_id": new_id})).await;
+    shared
+        .connections
+        .lock()
+        .await
+        .attach(connection_id, &new_id);
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Attached,
+        None,
+        serde_json::json!({"chat_id": new_id}),
+    )
+    .await;
     send_event(
         shared,
         connection_id,
@@ -750,7 +764,8 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
                 as Pin<Box<dyn Future<Output = Result<WorkspaceScope, WorkspaceScopeError>> + Send>>
         })
     };
-    let Some(scope) = workspace_scope_or_error(shared, Some(cid), turn_id, connection_id, resolver).await
+    let Some(scope) =
+        workspace_scope_or_error(shared, Some(cid), turn_id, connection_id, resolver).await
     else {
         return;
     };
@@ -778,26 +793,19 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     // Mirror Python's `envelope.get("webui") is True` — only a JSON boolean
     // true counts; presence of other values must not set the webui flag.
     if envelope.get("webui").and_then(|v| v.as_bool()) == Some(true) {
-        metadata.insert(
-            "webui".to_string(),
-            serde_json::json!(true),
-        );
+        metadata.insert("webui".to_string(), serde_json::json!(true));
         metadata.extend(client_turn_metadata(envelope.get("turn_id")));
     }
     let cli_apps_raw = envelope.get("cli_apps");
     let cli_apps = normalize_cli_app_mentions(cli_apps_raw);
     if !cli_apps.is_empty() {
-        metadata.insert(
-            "cli_apps".to_string(),
-            serde_json::json!(cli_apps),
-        );
+        metadata.insert("cli_apps".to_string(), serde_json::json!(cli_apps));
     }
-    let mcp_presets = crate::agent::tools::mcp::mcp_presets_api::normalize_mcp_preset_mentions(envelope.get("mcp_presets"));
+    let mcp_presets = crate::agent::tools::mcp::mcp_presets_api::normalize_mcp_preset_mentions(
+        envelope.get("mcp_presets"),
+    );
     if !mcp_presets.is_empty() {
-        metadata.insert(
-            "mcp_presets".to_string(),
-            serde_json::json!(mcp_presets),
-        );
+        metadata.insert("mcp_presets".to_string(), serde_json::json!(mcp_presets));
     }
     metadata.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
     {
@@ -813,12 +821,20 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     }
 
     let is_webui = metadata.get("webui").and_then(|v| v.as_bool()) == Some(true);
-    let webui_quote_allowed = webui_quote_allowed(is_webui, envelope_dispatch_context.webui_authenticated);
+    let webui_quote_allowed =
+        webui_quote_allowed(is_webui, envelope_dispatch_context.webui_authenticated);
     let mut queued_owner_metadata: Option<String> = None;
     if is_webui && builtin_command_starts_agent_turn(content) {
-        let mut turn_registry = shared.gateway_services.turn_registry.lock().unwrap_or_else(|e| e.into_inner());
+        let mut turn_registry = shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
         if let Some(queued_owner) = turn_registry.register_queued_turn_if_idle(cid, turn_id) {
-            metadata.insert(WEBSOCKET_TURN_OWNER_METADATA_KEY.to_string(), serde_json::json!(queued_owner));
+            metadata.insert(
+                WEBSOCKET_TURN_OWNER_METADATA_KEY.to_string(),
+                serde_json::json!(queued_owner),
+            );
             queued_owner_metadata = Some(queued_owner);
         }
     }
@@ -1414,13 +1430,12 @@ impl BaseChannel for WebSocketChannel {
                     payload["tool_events"] =
                         serde_json::to_value(tool_events).unwrap_or(serde_json::Value::Null);
                 }
-                payload["kind"] = serde_json::json!(
-                    if progress_event.kind == ProgressKind::ToolHint {
+                payload["kind"] =
+                    serde_json::json!(if progress_event.kind == ProgressKind::ToolHint {
                         "tool_hint"
                     } else {
                         "progress"
-                    }
-                );
+                    });
                 payload
             }
             None => Self::build_message_payload(&msg),
@@ -1484,7 +1499,10 @@ impl BaseChannel for WebSocketChannel {
             // `merge_next` peeks (keeps the buffer alive for a following
             // segment); otherwise the buffer is drained for this stream.
             let full_text = {
-                let mut buffers = self.stream_buffers.lock().unwrap_or_else(|e| e.into_inner());
+                let mut buffers = self
+                    .stream_buffers
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
                 if merge_next {
                     let buffer = buffers.entry(stream_key.clone()).or_default();
                     if !delta.is_empty() {
@@ -1774,8 +1792,9 @@ mod tests {
 
     #[test]
     fn normalize_cli_app_mentions_caps_at_eight_entries() {
-        let items: Vec<serde_json::Value> =
-            (0..12).map(|i| serde_json::json!({"name": format!("app{i}")})).collect();
+        let items: Vec<serde_json::Value> = (0..12)
+            .map(|i| serde_json::json!({"name": format!("app{i}")}))
+            .collect();
         let raw = serde_json::Value::Array(items);
         assert_eq!(normalize_cli_app_mentions(Some(&raw)).len(), 8);
     }
@@ -1911,12 +1930,14 @@ mod tests {
             aud: String::new(),
             ..JwtConfig::default()
         };
-        shared.jwt_public_key_pem =
-            Some(Arc::new(std::fs::read(&keys.public_key_path).unwrap()));
+        shared.jwt_public_key_pem = Some(Arc::new(std::fs::read(&keys.public_key_path).unwrap()));
         (shared, keys.private_key_path)
     }
 
-    fn mint_token_with_purpose(private_key_path: &std::path::Path, purpose: Option<&str>) -> String {
+    fn mint_token_with_purpose(
+        private_key_path: &std::path::Path,
+        purpose: Option<&str>,
+    ) -> String {
         let private_pem = std::fs::read(private_key_path).unwrap();
         let now = chrono::Utc::now().timestamp();
         let claims = crate::security::jwt::Claims {
@@ -2079,7 +2100,8 @@ mod tests {
         };
 
         let resolved =
-            workspace_scope_or_error(&shared, Some("chat-1"), Some("turn-1"), "conn-1", resolver).await;
+            workspace_scope_or_error(&shared, Some("chat-1"), Some("turn-1"), "conn-1", resolver)
+                .await;
 
         assert_eq!(resolved, Some(scope));
     }
@@ -2098,7 +2120,8 @@ mod tests {
         });
 
         let resolved =
-            workspace_scope_or_error(&shared, Some("chat-1"), Some("turn-1"), "conn-1", resolver).await;
+            workspace_scope_or_error(&shared, Some("chat-1"), Some("turn-1"), "conn-1", resolver)
+                .await;
 
         assert!(resolved.is_none());
         let msg = rx.try_recv().expect("expected a rejection frame");
@@ -2212,7 +2235,11 @@ mod tests {
 
         let chats = list_websocket_chats(sessions);
 
-        assert_eq!(chats.len(), 1, "only the websocket:-prefixed session should survive");
+        assert_eq!(
+            chats.len(),
+            1,
+            "only the websocket:-prefixed session should survive"
+        );
         assert_eq!(chats[0]["chat_id"], "chat-1");
         assert!(
             chats[0].get("key").is_none(),
@@ -2236,7 +2263,10 @@ mod tests {
 
         let chats = list_websocket_chats(sessions);
 
-        assert!(chats.is_empty(), "empty/invalid chat ids must not reach the wire: {chats:?}");
+        assert!(
+            chats.is_empty(),
+            "empty/invalid chat ids must not reach the wire: {chats:?}"
+        );
     }
 
     #[tokio::test]
@@ -2248,13 +2278,19 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             session_manager
-                .save(crate::session::manager::Session::new("websocket:chat-a".to_string()))
+                .save(crate::session::manager::Session::new(
+                    "websocket:chat-a".to_string(),
+                ))
                 .unwrap();
             session_manager
-                .save(crate::session::manager::Session::new("websocket:chat-b".to_string()))
+                .save(crate::session::manager::Session::new(
+                    "websocket:chat-b".to_string(),
+                ))
                 .unwrap();
             session_manager
-                .save(crate::session::manager::Session::new("cli:direct".to_string()))
+                .save(crate::session::manager::Session::new(
+                    "cli:direct".to_string(),
+                ))
                 .unwrap();
         }
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -2478,7 +2514,11 @@ mod tests {
     async fn send_plain_message_has_no_kind_field() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         BaseChannel::send(&channel, outbound("chat-1", "hi", None))
             .await
@@ -2496,7 +2536,11 @@ mod tests {
     async fn send_tool_hint_progress_sets_kind_tool_hint() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let event = Some(OutboundEvent::Progress(ProgressEvent {
             kind: ProgressKind::ToolHint,
             tool_events: Some(vec![]),
@@ -2516,7 +2560,11 @@ mod tests {
     async fn send_plain_progress_sets_kind_progress_and_includes_tool_events() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let event = Some(OutboundEvent::Progress(ProgressEvent {
             kind: ProgressKind::Plain,
             tool_events: Some(vec![crate::bus::outbound_events::ToolEvent {
@@ -2541,7 +2589,11 @@ mod tests {
     async fn send_progress_with_file_edit_events_delegates_instead_of_sending_message() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let mut edit = FileEditEvent::new();
         edit.insert("path".to_string(), "foo.rs".to_string());
         let event = Some(OutboundEvent::Progress(ProgressEvent {
@@ -2563,7 +2615,11 @@ mod tests {
     async fn send_unmapped_event_kind_is_skipped_without_erroring() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let event = Some(OutboundEvent::RetryWait(Default::default()));
 
         let result = BaseChannel::send(&channel, outbound("chat-1", "", event)).await;
@@ -2576,7 +2632,11 @@ mod tests {
     async fn send_turn_end_clears_registry_and_announces_idle() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         channel
             .gateway_services
             .turn_registry
@@ -2630,7 +2690,11 @@ mod tests {
 
         let result = BaseChannel::send(
             &channel,
-            outbound("chat-1", "", Some(OutboundEvent::TurnEnd(Default::default()))),
+            outbound(
+                "chat-1",
+                "",
+                Some(OutboundEvent::TurnEnd(Default::default())),
+            ),
         )
         .await;
         assert_eq!(result, Ok(()));
@@ -2656,7 +2720,11 @@ mod tests {
     async fn send_delta_non_end_sends_delta_event_and_buffers() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let mut meta = HashMap::new();
         meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
 
@@ -2675,7 +2743,11 @@ mod tests {
     async fn send_delta_stream_end_flushes_buffered_text() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let mut meta = HashMap::new();
         meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
         BaseChannel::send_delta(&channel, "chat-1", "Hello ", Some(meta.clone()))
@@ -2698,7 +2770,11 @@ mod tests {
     async fn send_delta_stream_end_with_empty_delta_omits_text_when_buffer_already_sent() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let mut meta = HashMap::new();
         meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
         BaseChannel::send_delta(&channel, "chat-1", "Hello", Some(meta.clone()))
@@ -2721,7 +2797,11 @@ mod tests {
     async fn send_delta_merge_next_keeps_buffer_for_next_segment() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
         let mut meta = HashMap::new();
         meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
         meta.insert("_stream_end".to_string(), serde_json::json!(true));
@@ -2753,7 +2833,11 @@ mod tests {
     async fn send_reasoning_delta_skips_empty_delta() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         BaseChannel::send_reasoning_delta(&channel, "chat-1", "", None)
             .await
@@ -2766,7 +2850,11 @@ mod tests {
     async fn send_reasoning_delta_and_end_wire_shapes() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         BaseChannel::send_reasoning_delta(&channel, "chat-1", "thinking", None)
             .await
@@ -2799,7 +2887,11 @@ mod tests {
     async fn start_waits_for_shutdown_signal_then_stops_and_clears_connections() {
         let channel = Arc::new(test_channel());
         let (tx, _rx) = mpsc::unbounded_channel::<Message>();
-        channel.connections.lock().await.register("conn-1", "chat-1", tx);
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
 
         assert!(!BaseChannel::running(channel.as_ref()));
 
@@ -2823,7 +2915,12 @@ mod tests {
 
         assert!(!BaseChannel::running(channel.as_ref()));
         assert!(
-            channel.connections.lock().await.senders_for_chat("chat-1").is_empty(),
+            channel
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("chat-1")
+                .is_empty(),
             "connections must be cleared once start() observes shutdown"
         );
     }

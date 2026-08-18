@@ -11,7 +11,7 @@ use std::path::{Path, PathBuf};
 use std::str::FromStr;
 
 use serde::{Deserialize, Serialize};
-use serde_json::{json, Value};
+use serde_json::{Value, json};
 
 pub use crate::session::keys::WORKSPACE_SCOPE_METADATA_KEY;
 
@@ -69,7 +69,10 @@ pub struct WorkspaceScopeError {
 
 impl WorkspaceScopeError {
     pub fn new(status: u16, message: impl Into<String>) -> Self {
-        Self { status, message: message.into() }
+        Self {
+            status,
+            message: message.into(),
+        }
     }
 }
 
@@ -182,7 +185,10 @@ impl WorkspaceScope {
         let mut v = self.metadata();
         if let Value::Object(ref mut m) = v {
             m.insert("project_name".into(), json!(self.project_name()));
-            m.insert("restrict_to_workspace".into(), json!(self.restrict_to_workspace));
+            m.insert(
+                "restrict_to_workspace".into(),
+                json!(self.restrict_to_workspace),
+            );
             m.insert(
                 "sandbox_status".into(),
                 serde_json::to_value(&self.sandbox_status).unwrap_or(Value::Null),
@@ -202,7 +208,11 @@ pub struct ToolWorkspace {
 
 impl ToolWorkspace {
     pub fn allowed_root(&self) -> Option<PathBuf> {
-        if self.restrict_to_workspace { self.project_path.clone() } else { None }
+        if self.restrict_to_workspace {
+            self.project_path.clone()
+        } else {
+            None
+        }
     }
 }
 
@@ -233,7 +243,11 @@ impl WorkspaceScopeResolver {
     }
 
     pub fn default(&self) -> WorkspaceScope {
-        default_workspace_scope(&self.default_workspace, self.default_restrict_to_workspace, None)
+        default_workspace_scope(
+            &self.default_workspace,
+            self.default_restrict_to_workspace,
+            None,
+        )
     }
 
     /// Resolve the effective scope for a turn from persisted session
@@ -248,7 +262,11 @@ impl WorkspaceScopeResolver {
 }
 
 pub fn default_access_mode(restrict: bool) -> WorkspaceAccessMode {
-    if restrict { WorkspaceAccessMode::Restricted } else { WorkspaceAccessMode::Full }
+    if restrict {
+        WorkspaceAccessMode::Restricted
+    } else {
+        WorkspaceAccessMode::Full
+    }
 }
 
 pub fn build_workspace_scope(
@@ -288,7 +306,10 @@ pub fn validate_workspace_scope_payload(
     source_channel: Option<&str>,
 ) -> Result<WorkspaceScope, WorkspaceScopeError> {
     if !raw.is_null() && !raw.is_object() {
-        return Err(WorkspaceScopeError::new(400, "workspace_scope must be an object"));
+        return Err(WorkspaceScopeError::new(
+            400,
+            "workspace_scope must be an object",
+        ));
     }
 
     let project_path_str = raw
@@ -323,7 +344,11 @@ pub fn validate_workspace_scope_payload(
         None => default_access_mode(default_restrict_to_workspace),
     };
 
-    Ok(build_workspace_scope(&project_path, access_mode, source_channel))
+    Ok(build_workspace_scope(
+        &project_path,
+        access_mode,
+        source_channel,
+    ))
 }
 
 /// Read a persisted scope from metadata. Never propagates
@@ -342,10 +367,18 @@ pub fn workspace_scope_from_metadata(
             default_restrict_to_workspace,
             source_channel,
         )
-            .unwrap_or_else(|_| {
-                default_workspace_scope(default_workspace, default_restrict_to_workspace, source_channel)
-            }),
-        None => default_workspace_scope(default_workspace, default_restrict_to_workspace, source_channel),
+        .unwrap_or_else(|_| {
+            default_workspace_scope(
+                default_workspace,
+                default_restrict_to_workspace,
+                source_channel,
+            )
+        }),
+        None => default_workspace_scope(
+            default_workspace,
+            default_restrict_to_workspace,
+            source_channel,
+        ),
     }
 }
 
@@ -358,9 +391,12 @@ pub fn resolve_effective_workspace_scope(
     default_restrict_to_workspace: bool,
 ) -> WorkspaceScope {
     match session_metadata {
-        Some(meta) => {
-            workspace_scope_from_metadata(meta, default_workspace, default_restrict_to_workspace, None)
-        }
+        Some(meta) => workspace_scope_from_metadata(
+            meta,
+            default_workspace,
+            default_restrict_to_workspace,
+            None,
+        ),
         None => default_workspace_scope(default_workspace, default_restrict_to_workspace, None),
     }
 }
@@ -370,13 +406,22 @@ mod tests {
     use super::*;
 
     fn env_map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
-        pairs.iter().map(|(k, v)| (k.to_string(), v.to_string())).collect()
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
     }
 
     #[test]
     fn access_mode_from_str_roundtrip_and_rejects_unknown() {
-        assert_eq!("restricted".parse::<WorkspaceAccessMode>().unwrap(), WorkspaceAccessMode::Restricted);
-        assert_eq!("full".parse::<WorkspaceAccessMode>().unwrap(), WorkspaceAccessMode::Full);
+        assert_eq!(
+            "restricted".parse::<WorkspaceAccessMode>().unwrap(),
+            WorkspaceAccessMode::Restricted
+        );
+        assert_eq!(
+            "full".parse::<WorkspaceAccessMode>().unwrap(),
+            WorkspaceAccessMode::Full
+        );
         let err = "bogus".parse::<WorkspaceAccessMode>().unwrap_err();
         assert_eq!(err.status, 400);
     }
@@ -406,7 +451,8 @@ mod tests {
     }
 
     #[test]
-    fn validate_workspace_scope_payload_falls_back_to_default_workspace_when_project_path_omitted() {
+    fn validate_workspace_scope_payload_falls_back_to_default_workspace_when_project_path_omitted()
+    {
         let default_dir = tempfile::tempdir().unwrap();
         let scope =
             validate_workspace_scope_payload(&json!({}), default_dir.path(), false, None).unwrap();
@@ -425,8 +471,9 @@ mod tests {
         .unwrap_err();
         assert_eq!(err.status, 400);
 
-        let err = validate_workspace_scope_payload(&json!([1, 2, 3]), default_dir.path(), false, None)
-            .unwrap_err();
+        let err =
+            validate_workspace_scope_payload(&json!([1, 2, 3]), default_dir.path(), false, None)
+                .unwrap_err();
         assert_eq!(err.status, 400);
     }
 

@@ -4,7 +4,11 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    providers::{anthropic_provider::AnthropicProvider, registry::{find_by_name, providers}}, utils::helpers::expand_tilde_path,
+    providers::{
+        anthropic_provider::AnthropicProvider,
+        registry::{find_by_name, providers},
+    },
+    utils::helpers::expand_tilde_path,
 };
 
 // ── ProviderConfig ────────────────────────────────────────────────────────────
@@ -65,7 +69,6 @@ fn default_transcription_provider() -> Option<String> {
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelsConfig {
-
     /// Stream agent's text progress to the channel.
     #[serde(alias = "streaming")]
     #[garde(skip)]
@@ -768,7 +771,7 @@ impl Default for ApiConfig {
             jwt: JwtConfig::default(),
             users_file: default_users_file(),
             cors: CorsConfig::default(),
-            web_root: None
+            web_root: None,
         }
     }
 }
@@ -976,7 +979,10 @@ pub struct GmailToolConfig {
     pub enable: bool,
 
     /// OAuth client secret file (client_secret.json). Default: `~/.rust-bot/credentials/client_secret.json`.
-    #[serde(alias = "client_secret_path", default = "default_gmail_client_secret_path")]
+    #[serde(
+        alias = "client_secret_path",
+        default = "default_gmail_client_secret_path"
+    )]
     #[garde(skip)]
     pub client_secret_path: String,
 
@@ -1022,11 +1028,9 @@ pub struct DocxToolConfig {
     #[serde(alias = "enable", default = "default_docx_tool_enable")]
     #[garde(skip)]
     pub enable: bool,
-
 }
 
 impl Default for DocxToolConfig {
-
     fn default() -> Self {
         Self {
             enable: default_docx_tool_enable(),
@@ -1523,7 +1527,10 @@ impl Config {
             }
             let api_base = p.api_base.as_deref().unwrap_or("");
             log::info!("api_base: {}", api_base);
-            log::info!("spec.detect_by_base_keyword: {}", spec.detect_by_base_keyword);
+            log::info!(
+                "spec.detect_by_base_keyword: {}",
+                spec.detect_by_base_keyword
+            );
             if !spec.detect_by_base_keyword.is_empty()
                 && api_base.contains(&spec.detect_by_base_keyword)
             {
@@ -1621,7 +1628,10 @@ pub const RESERVED_MODEL_PRESET_NAME: &str = "default";
 /// actually exists. Mirrors nanobot's pydantic `model_validator(mode="after")`
 /// on `Config`. Called from `load_config()`.
 pub fn validate_model_presets(config: &Config) -> Result<(), String> {
-    if config.model_presets.contains_key(RESERVED_MODEL_PRESET_NAME) {
+    if config
+        .model_presets
+        .contains_key(RESERVED_MODEL_PRESET_NAME)
+    {
         return Err(format!(
             "model_presets: the name '{RESERVED_MODEL_PRESET_NAME}' is reserved (it is \
              synthesized automatically from agents.model/provider/... for backward \
@@ -2168,8 +2178,14 @@ mod tests {
     fn test_jwt_defaults() {
         let cfg = JwtConfig::default();
         assert!(!cfg.enabled);
-        assert_eq!(cfg.private_key_path, "./.rust-bot/credentials/private_key.pem");
-        assert_eq!(cfg.public_key_path, "./.rust-bot/credentials/public_key.pem");
+        assert_eq!(
+            cfg.private_key_path,
+            "./.rust-bot/credentials/private_key.pem"
+        );
+        assert_eq!(
+            cfg.public_key_path,
+            "./.rust-bot/credentials/public_key.pem"
+        );
         assert_eq!(cfg.iss, "rust-bot");
         assert_eq!(cfg.aud, "");
         assert!(cfg.validate().is_ok());
@@ -2706,7 +2722,10 @@ mod tests {
         let cfg: Config = serde_json::from_str(json).unwrap();
         assert!(!cfg.channels.send_progress);
         assert_eq!(cfg.channels.send_max_retries, 5);
-        assert_eq!(cfg.channels.transcription_provider, Some("test".to_string()));
+        assert_eq!(
+            cfg.channels.transcription_provider,
+            Some("test".to_string())
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -2754,7 +2773,10 @@ mod tests {
         assert_eq!(cfg.model, "");
         assert_eq!(cfg.provider, "auto");
         assert_eq!(cfg.max_tokens, default_agent_max_tokens());
-        assert_eq!(cfg.context_window_tokens, default_agent_context_window_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
         assert_eq!(cfg.temperature, default_agent_temperature());
         assert_eq!(cfg.reasoning_effort, None);
         assert_eq!(cfg.label, None);
@@ -2768,7 +2790,10 @@ mod tests {
         assert_eq!(cfg.provider, "anthropic");
         assert_eq!(cfg.temperature, 0.5);
         assert_eq!(cfg.max_tokens, default_agent_max_tokens());
-        assert_eq!(cfg.context_window_tokens, default_agent_context_window_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
         assert!(cfg.validate().is_ok());
     }
 
@@ -2788,7 +2813,8 @@ mod tests {
     #[test]
     fn test_config_rejects_empty_model_in_preset() {
         let mut cfg = Config::default();
-        cfg.model_presets.insert("fast".to_string(), ModelPresetConfig::default());
+        cfg.model_presets
+            .insert("fast".to_string(), ModelPresetConfig::default());
         let err = validate_model_presets(&cfg).unwrap_err();
         assert!(err.contains("fast"));
         assert!(err.contains("must not be empty"));

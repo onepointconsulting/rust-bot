@@ -5,7 +5,7 @@
 use std::sync::LazyLock;
 use std::time::Duration;
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use uuid::Uuid;
 
 use crate::config::paths::get_media_dir;
@@ -42,8 +42,11 @@ fn validate_image_bytes(raw: &[u8]) -> Result<&'static str, ApiError> {
             "Image exceeds the maximum allowed size of {MAX_IMAGE_BYTES} bytes"
         )));
     }
-    detect_image_mime(raw)
-        .ok_or_else(|| ApiError::bad_request("image_url does not reference a supported image type (png, jpeg, gif, webp)"))
+    detect_image_mime(raw).ok_or_else(|| {
+        ApiError::bad_request(
+            "image_url does not reference a supported image type (png, jpeg, gif, webp)",
+        )
+    })
 }
 
 /// Write validated image bytes to the API media directory and return the path.
@@ -88,11 +91,10 @@ async fn materialize_http_url(url: &str) -> Result<String, ApiError> {
         )));
     }
 
-    let response = HTTP_CLIENT
-        .get(url)
-        .send()
-        .await
-        .map_err(|e| ApiError::bad_request(format!("Failed to fetch image_url '{url}': {e}")))?;
+    let response =
+        HTTP_CLIENT.get(url).send().await.map_err(|e| {
+            ApiError::bad_request(format!("Failed to fetch image_url '{url}': {e}"))
+        })?;
 
     if !response.status().is_success() {
         return Err(ApiError::bad_request(format!(
@@ -184,7 +186,11 @@ mod tests {
         let url = format!("data:image/png;base64,{b64}");
 
         let err = materialize_image_urls(&[url]).await.unwrap_err();
-        assert!(err.message().contains("exceeds the maximum allowed size"), "{}", err.message());
+        assert!(
+            err.message().contains("exceeds the maximum allowed size"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -193,7 +199,11 @@ mod tests {
         let url = format!("data:text/plain;base64,{b64}");
 
         let err = materialize_image_urls(&[url]).await.unwrap_err();
-        assert!(err.message().contains("supported image type"), "{}", err.message());
+        assert!(
+            err.message().contains("supported image type"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]
@@ -207,13 +217,21 @@ mod tests {
     async fn http_url_private_target_rejected() {
         let url = "http://127.0.0.1/image.png".to_string();
         let err = materialize_image_urls(&[url]).await.unwrap_err();
-        assert!(err.message().contains("Refusing to fetch"), "{}", err.message());
+        assert!(
+            err.message().contains("Refusing to fetch"),
+            "{}",
+            err.message()
+        );
     }
 
     #[tokio::test]
     async fn unsupported_scheme_rejected() {
         let url = "ftp://example.com/a.png".to_string();
         let err = materialize_image_urls(&[url]).await.unwrap_err();
-        assert!(err.message().contains("Unsupported image_url scheme"), "{}", err.message());
+        assert!(
+            err.message().contains("Unsupported image_url scheme"),
+            "{}",
+            err.message()
+        );
     }
 }

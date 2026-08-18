@@ -6,8 +6,8 @@ use serde_json::Value;
 use crate::agent::cron_context::{self, CronContextToken};
 use crate::agent::tools::base::Tool;
 use crate::cron::{
-    CronJob, CronJobState, CronPayloadKind, CronRunStatus, CronSchedule, CronScheduleKind, CronService,
-    RemoveJobResult,
+    CronJob, CronJobState, CronPayloadKind, CronRunStatus, CronSchedule, CronScheduleKind,
+    CronService, RemoveJobResult,
 };
 
 /// Tool to schedule reminders and recurring tasks.
@@ -261,7 +261,9 @@ impl CronTool {
             let mut parts = vec![format!("- {} (id: {}, {timing})", j.name, j.id)];
             if j.payload.kind == CronPayloadKind::SystemEvent {
                 parts.push(format!("  Purpose: {}", Self::system_job_purpose(&j)));
-                parts.push("  Protected: visible for inspection, but cannot be removed.".to_string());
+                parts.push(
+                    "  Protected: visible for inspection, but cannot be removed.".to_string(),
+                );
             }
             parts.extend(self.format_state(&j.state, &j.schedule));
             lines.push(parts.join("\n"));
@@ -566,7 +568,8 @@ mod tests {
         let job_id = tool.cron_service.list_jobs(false).await[0].id.clone();
 
         assert_eq!(
-            tool.execute(&serde_json::json!({ "action": "remove" })).await,
+            tool.execute(&serde_json::json!({ "action": "remove" }))
+                .await,
             "Error: job_id is required for remove"
         );
 

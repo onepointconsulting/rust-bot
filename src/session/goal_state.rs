@@ -8,7 +8,7 @@
 use std::collections::HashMap;
 
 use chrono::Utc;
-use serde_json::{json, Map, Value};
+use serde_json::{Map, Value, json};
 
 use crate::session::manager::{Session, SessionManager};
 
@@ -63,17 +63,26 @@ fn goal_object(metadata: &HashMap<String, Value>) -> Option<&Map<String, Value>>
 /// Whether this session has an active sustained objective. Mirrors
 /// `sustained_goal_active`.
 pub fn sustained_goal_active(metadata: &HashMap<String, Value>) -> bool {
-    goal_object(metadata).and_then(|g| g.get("status")).and_then(Value::as_str) == Some("active")
+    goal_object(metadata)
+        .and_then(|g| g.get("status"))
+        .and_then(Value::as_str)
+        == Some("active")
 }
 
 /// Lines appended inside the runtime context block when a goal is active.
 /// Mirrors `goal_state_runtime_lines`.
 pub fn goal_state_runtime_lines(metadata: &HashMap<String, Value>) -> Vec<String> {
-    let Some(goal) = goal_object(metadata) else { return Vec::new() };
+    let Some(goal) = goal_object(metadata) else {
+        return Vec::new();
+    };
     if goal.get("status").and_then(Value::as_str) != Some("active") {
         return Vec::new();
     }
-    let objective = goal.get("objective").and_then(Value::as_str).unwrap_or("").trim();
+    let objective = goal
+        .get("objective")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
     if objective.is_empty() {
         return vec!["Goal: active (no objective text stored).".to_string()];
     }
@@ -98,7 +107,9 @@ pub fn goal_state_runtime_lines(metadata: &HashMap<String, Value>) -> Vec<String
 /// see the plan) — kept as a self-contained primitive for when it does.
 /// Mirrors `goal_state_ws_blob`.
 pub fn goal_state_ws_blob(metadata: &HashMap<String, Value>) -> Value {
-    let Some(goal) = goal_object(metadata) else { return json!({"active": false}) };
+    let Some(goal) = goal_object(metadata) else {
+        return json!({"active": false});
+    };
     if goal.get("status").and_then(Value::as_str) != Some("active") {
         return json!({"active": false});
     }
@@ -114,8 +125,10 @@ pub fn goal_state_ws_blob(metadata: &HashMap<String, Value>) -> Value {
         let objective = objective.trim();
         if !objective.is_empty() {
             let objective = if objective.chars().count() > MAX_GOAL_OBJECTIVE_WS_CHARS {
-                let truncated: String =
-                    objective.chars().take(MAX_GOAL_OBJECTIVE_WS_CHARS).collect();
+                let truncated: String = objective
+                    .chars()
+                    .take(MAX_GOAL_OBJECTIVE_WS_CHARS)
+                    .collect();
                 format!("{}…", truncated.trim_end())
             } else {
                 objective.to_string()
@@ -148,8 +161,13 @@ pub fn create_goal(
     if let Some(summary) = ui_summary.map(str::trim).filter(|s| !s.is_empty()) {
         blob.insert("ui_summary".to_string(), Value::String(summary.to_string()));
     }
-    blob.insert("started_at".to_string(), Value::String(Utc::now().to_rfc3339()));
-    session.metadata.insert(GOAL_STATE_KEY.to_string(), Value::Object(blob));
+    blob.insert(
+        "started_at".to_string(),
+        Value::String(Utc::now().to_rfc3339()),
+    );
+    session
+        .metadata
+        .insert(GOAL_STATE_KEY.to_string(), Value::Object(blob));
     Ok(())
 }
 
@@ -174,8 +192,10 @@ pub fn update_goal(
             .map(str::trim)
             .filter(|s| !s.is_empty())
             .ok_or(GoalError::EmptyObjective)?;
-        let new_objective: String =
-            new_objective.chars().take(MAX_GOAL_OBJECTIVE_CHARS).collect();
+        let new_objective: String = new_objective
+            .chars()
+            .take(MAX_GOAL_OBJECTIVE_CHARS)
+            .collect();
 
         // The existing objective becomes `previous_objective` on the fresh blob.
         let previous_objective = session
@@ -198,22 +218,36 @@ pub fn update_goal(
         if let Some(recap) = recap {
             blob.insert("recap".to_string(), Value::String(recap.to_string()));
         }
-        blob.insert("replaced_at".to_string(), Value::String(Utc::now().to_rfc3339()));
-        session.metadata.insert(GOAL_STATE_KEY.to_string(), Value::Object(blob));
+        blob.insert(
+            "replaced_at".to_string(),
+            Value::String(Utc::now().to_rfc3339()),
+        );
+        session
+            .metadata
+            .insert(GOAL_STATE_KEY.to_string(), Value::Object(blob));
         return Ok("Goal replaced.".to_string());
     }
 
     let ended_at = Utc::now().to_rfc3339();
     let status_label = action.status_label();
-    if let Some(goal) = session.metadata.get_mut(GOAL_STATE_KEY).and_then(Value::as_object_mut) {
-        goal.insert("status".to_string(), Value::String(status_label.to_string()));
+    if let Some(goal) = session
+        .metadata
+        .get_mut(GOAL_STATE_KEY)
+        .and_then(Value::as_object_mut)
+    {
+        goal.insert(
+            "status".to_string(),
+            Value::String(status_label.to_string()),
+        );
         goal.insert("ended_at".to_string(), Value::String(ended_at.clone()));
         if let Some(recap) = recap {
             goal.insert("recap".to_string(), Value::String(recap.to_string()));
         }
     }
     let tail = recap.unwrap_or("(none)");
-    Ok(format!("Goal marked {status_label} ({ended_at}). Recap:\n{tail}"))
+    Ok(format!(
+        "Goal marked {status_label} ({ended_at}). Recap:\n{tail}"
+    ))
 }
 
 /// Get-or-create `session_key`, run [`create_goal`], and persist. Shared by
@@ -265,7 +299,10 @@ mod tests {
     #[test]
     fn create_goal_rejects_empty_objective() {
         let mut s = session();
-        assert_eq!(create_goal(&mut s, "   ", None), Err(GoalError::EmptyObjective));
+        assert_eq!(
+            create_goal(&mut s, "   ", None),
+            Err(GoalError::EmptyObjective)
+        );
     }
 
     #[test]
@@ -337,11 +374,20 @@ mod tests {
     fn update_goal_replace_carries_previous_objective_and_stays_active() {
         let mut s = session();
         create_goal(&mut s, "old objective", None).unwrap();
-        update_goal(&mut s, GoalUpdateAction::Replace, Some("pivoting"), Some("new objective"), None)
-            .unwrap();
+        update_goal(
+            &mut s,
+            GoalUpdateAction::Replace,
+            Some("pivoting"),
+            Some("new objective"),
+            None,
+        )
+        .unwrap();
         assert!(sustained_goal_active(&s.metadata));
         assert_eq!(s.metadata[GOAL_STATE_KEY]["objective"], "new objective");
-        assert_eq!(s.metadata[GOAL_STATE_KEY]["previous_objective"], "old objective");
+        assert_eq!(
+            s.metadata[GOAL_STATE_KEY]["previous_objective"],
+            "old objective"
+        );
         assert_eq!(s.metadata[GOAL_STATE_KEY]["recap"], "pivoting");
     }
 
@@ -375,13 +421,22 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut manager = SessionManager::new(dir.path().to_path_buf());
         create_session_goal(&mut manager, "cli:direct", "ship the feature", None).unwrap();
-        assert!(sustained_goal_active(&manager.get_or_create_session("cli:direct").metadata));
+        assert!(sustained_goal_active(
+            &manager.get_or_create_session("cli:direct").metadata
+        ));
 
         let msg = update_session_goal(
-            &mut manager, "cli:direct", GoalUpdateAction::Complete, Some("shipped"), None, None,
+            &mut manager,
+            "cli:direct",
+            GoalUpdateAction::Complete,
+            Some("shipped"),
+            None,
+            None,
         )
         .unwrap();
         assert!(msg.contains("completed"));
-        assert!(!sustained_goal_active(&manager.get_or_create_session("cli:direct").metadata));
+        assert!(!sustained_goal_active(
+            &manager.get_or_create_session("cli:direct").metadata
+        ));
     }
 }

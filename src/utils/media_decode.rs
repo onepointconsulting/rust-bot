@@ -10,7 +10,7 @@
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
-use base64::{engine::general_purpose::STANDARD, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD};
 use regex::Regex;
 use uuid::Uuid;
 
@@ -78,7 +78,11 @@ pub struct FileSizeExceeded {
 
 impl std::fmt::Display for FileSizeExceeded {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "File exceeds {}MB limit", self.limit_bytes / (1024 * 1024))
+        write!(
+            f,
+            "File exceeds {}MB limit",
+            self.limit_bytes / (1024 * 1024)
+        )
     }
 }
 
@@ -136,7 +140,9 @@ pub fn save_base64_data_url(
 
     let limit = max_bytes.unwrap_or(DEFAULT_MAX_BYTES);
     if raw.len() > limit {
-        return Err(SaveDataUrlError::TooLarge(FileSizeExceeded { limit_bytes: limit }));
+        return Err(SaveDataUrlError::TooLarge(FileSizeExceeded {
+            limit_bytes: limit,
+        }));
     }
 
     let ext = extension_for_mime(&mime_type);
@@ -251,9 +257,14 @@ mod tests {
     fn invalid_base64_payload_returns_none() {
         let dir = tempfile::tempdir().unwrap();
         assert!(
-            save_base64_data_url("data:text/plain;base64,not-valid-base64!!", dir.path(), None, None)
-                .unwrap()
-                .is_none()
+            save_base64_data_url(
+                "data:text/plain;base64,not-valid-base64!!",
+                dir.path(),
+                None,
+                None
+            )
+            .unwrap()
+            .is_none()
         );
     }
 

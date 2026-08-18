@@ -1,7 +1,6 @@
-use std::path::PathBuf;
 use dotenv::dotenv;
 use rust_bot::agent::tools::{base::Tool, docx::DocxConversionTool, filesystem::FsToolConfig};
-
+use std::path::PathBuf;
 
 #[tokio::test]
 async fn test_docx_tool() {
@@ -13,10 +12,12 @@ async fn test_docx_tool() {
     };
     let docx_conversion_tool = DocxConversionTool::new(fs_tool_config);
     let output_path = "./docs/Newsletter_Brief.pdf";
-    let result = docx_conversion_tool.execute(&serde_json::json!({
-        "docx_path": "./docs/Newsletter_Brief.docx",
-        "output_path": output_path,
-    })).await;
+    let result = docx_conversion_tool
+        .execute(&serde_json::json!({
+            "docx_path": "./docs/Newsletter_Brief.docx",
+            "output_path": output_path,
+        }))
+        .await;
     println!("{}", result);
     assert!(PathBuf::from(output_path).exists());
 }

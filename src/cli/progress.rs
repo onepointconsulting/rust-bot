@@ -81,9 +81,7 @@ pub(crate) fn create_on_progress(
                 ProgressKind::Reasoning
                 | ProgressKind::ReasoningDelta
                 | ProgressKind::ReasoningEnd => {
-                    log::warn!(
-                        "create_on_progress: ignoring unsupported {kind:?} progress event"
-                    );
+                    log::warn!("create_on_progress: ignoring unsupported {kind:?} progress event");
                     return;
                 }
             };

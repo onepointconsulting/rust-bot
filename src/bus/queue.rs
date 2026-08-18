@@ -1,5 +1,5 @@
-use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use tokio::sync::Mutex;
 use tokio::sync::mpsc;
@@ -113,7 +113,10 @@ impl<T> AsyncQueue<T> {
 
     pub fn try_recv(&self) -> Result<T, mpsc::error::TryRecvError> {
         // Prefer try_lock so an empty/busy queue doesn't await
-        let mut rx = self.rx.try_lock().map_err(|_| mpsc::error::TryRecvError::Empty)?;
+        let mut rx = self
+            .rx
+            .try_lock()
+            .map_err(|_| mpsc::error::TryRecvError::Empty)?;
         rx.try_recv()
     }
 }
@@ -155,7 +158,10 @@ impl MessageBus {
     }
 
     /// Publish a message from a channel to the agent.
-    pub fn publish_inbound(&self, msg: InboundMessage) -> Result<(), mpsc::error::SendError<InboundMessage>> {
+    pub fn publish_inbound(
+        &self,
+        msg: InboundMessage,
+    ) -> Result<(), mpsc::error::SendError<InboundMessage>> {
         self.inbound.send(msg)
     }
 
@@ -165,7 +171,10 @@ impl MessageBus {
     }
 
     /// Publish a response from the agent to channels.
-    pub fn publish_outbound(&self, msg: OutboundMessage) -> Result<(), mpsc::error::SendError<OutboundMessage>> {
+    pub fn publish_outbound(
+        &self,
+        msg: OutboundMessage,
+    ) -> Result<(), mpsc::error::SendError<OutboundMessage>> {
         self.outbound.send(msg)
     }
 

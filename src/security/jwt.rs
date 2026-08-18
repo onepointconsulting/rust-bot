@@ -5,11 +5,9 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use chrono::{Duration, Utc};
-use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
 use ed25519_dalek::SigningKey;
-use jsonwebtoken::{
-    decode, encode, Algorithm, DecodingKey, EncodingKey, Header, Validation,
-};
+use ed25519_dalek::pkcs8::{EncodePrivateKey, EncodePublicKey};
+use jsonwebtoken::{Algorithm, DecodingKey, EncodingKey, Header, Validation, decode, encode};
 use pkcs8::LineEnding;
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
@@ -346,9 +344,12 @@ mod tests {
             DEFAULT_EXPIRES_IN_MONTHS,
         )
         .unwrap();
-        let validated =
-            validate_jwt_token_from_path(&minted.token, &keys.public_key_path, &opts("rust-bot", ""))
-                .unwrap();
+        let validated = validate_jwt_token_from_path(
+            &minted.token,
+            &keys.public_key_path,
+            &opts("rust-bot", ""),
+        )
+        .unwrap();
         assert!(validated.purpose.is_none());
     }
 
@@ -398,12 +399,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(validate_jwt_token_from_path(
-            &minted.token,
-            &keys.public_key_path,
-            &opts("other-issuer", "aud-1"),
-        )
-        .is_err());
+        assert!(
+            validate_jwt_token_from_path(
+                &minted.token,
+                &keys.public_key_path,
+                &opts("other-issuer", "aud-1"),
+            )
+            .is_err()
+        );
     }
 
     #[test]
@@ -419,12 +422,14 @@ mod tests {
         )
         .unwrap();
 
-        assert!(validate_jwt_token_from_path(
-            &minted.token,
-            &keys.public_key_path,
-            &opts("rust-bot", "aud-2"),
-        )
-        .is_err());
+        assert!(
+            validate_jwt_token_from_path(
+                &minted.token,
+                &keys.public_key_path,
+                &opts("rust-bot", "aud-2"),
+            )
+            .is_err()
+        );
     }
 
     #[test]

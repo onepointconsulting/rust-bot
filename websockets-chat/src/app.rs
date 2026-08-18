@@ -95,7 +95,12 @@ fn clear_stored_entries() {
 }
 
 fn next_entry_id(entries: &[ChatEntry]) -> u64 {
-    entries.iter().map(|e| e.id).max().map(|id| id + 1).unwrap_or(0)
+    entries
+        .iter()
+        .map(|e| e.id)
+        .max()
+        .map(|id| id + 1)
+        .unwrap_or(0)
 }
 
 /// Keep the last `max_turns` user messages and everything after the first kept user message.
@@ -184,7 +189,14 @@ fn build_gateway_ws_url(client_id: &str, token: &str, ws_base_override: Option<&
             (scheme.trim_end_matches(':').to_string(), host)
         })
         .unwrap_or_else(|| ("http".to_string(), String::new()));
-    state::build_ws_url(&scheme, &host, GATEWAY_WS_PATH, client_id, token, ws_base_override)
+    state::build_ws_url(
+        &scheme,
+        &host,
+        GATEWAY_WS_PATH,
+        client_id,
+        token,
+        ws_base_override,
+    )
 }
 
 /// The gateway's websocket ingestion (`store_inbound_attachments` in
@@ -279,7 +291,10 @@ struct WsContext {
 /// assistant entry looked like the instant its empty placeholder was
 /// created (streaming, no content) — exactly what a refresh would then
 /// restore, regardless of how the turn actually finished.
-fn update_entries(ctx: &WsContext, mutator: impl FnOnce(&mut Vec<ChatEntry>, &HashMap<String, u64>)) {
+fn update_entries(
+    ctx: &WsContext,
+    mutator: impl FnOnce(&mut Vec<ChatEntry>, &HashMap<String, u64>),
+) {
     let index = ctx.turn_index.get_untracked();
     let mut entries = ctx.entries.get_untracked();
     mutator(&mut entries, &index);
@@ -410,7 +425,11 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         return;
     }
     match event {
-        ServerEvent::Ready { chat_id, client_id, streaming } => {
+        ServerEvent::Ready {
+            chat_id,
+            client_id,
+            streaming,
+        } => {
             log::info!(
                 "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming}"
             );
@@ -425,12 +444,23 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::MessageAccepted { chat_id, turn_id } => {
             log::info!("message accepted: chat_id={chat_id} turn_id={turn_id}");
         }
-        ServerEvent::GoalStatus { chat_id, status, started_at, turn_id } => {
+        ServerEvent::GoalStatus {
+            chat_id,
+            status,
+            started_at,
+            turn_id,
+        } => {
             log::info!(
                 "goal status: chat_id={chat_id} status={status} started_at={started_at:?} turn_id={turn_id:?}"
             );
         }
-        ServerEvent::Message { text, reply_to, kind, tool_events, .. } => {
+        ServerEvent::Message {
+            text,
+            reply_to,
+            kind,
+            tool_events,
+            ..
+        } => {
             handle_message_event(ctx, text, reply_to, kind, tool_events);
         }
         ServerEvent::Delta { text, .. } => {
@@ -440,7 +470,12 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 });
             }
         }
-        ServerEvent::StreamEnd { text, resuming, merge_next, .. } => {
+        ServerEvent::StreamEnd {
+            text,
+            resuming,
+            merge_next,
+            ..
+        } => {
             handle_stream_end(ctx, text, resuming, merge_next);
         }
         ServerEvent::ReasoningDelta { text, .. } => {
@@ -457,7 +492,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 });
             }
         }
-        ServerEvent::Error { turn_id, detail, .. } => {
+        ServerEvent::Error {
+            turn_id, detail, ..
+        } => {
             ctx.chat_error.set(Some(detail));
             let turn_id = turn_id.or_else(|| ctx.active_turn_id.get_untracked());
             if let Some(turn_id) = turn_id {
@@ -475,7 +512,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.chat_error.set(None);
         }
         ServerEvent::SessionUpdated(value) => log::info!("session updated: {value}"),
-        ServerEvent::GoalState(value) => log::info!("goal state (shape not finalized server-side): {value}"),
+        ServerEvent::GoalState(value) => {
+            log::info!("goal state (shape not finalized server-side): {value}")
+        }
         ServerEvent::FileEdit { chat_id, edits } => {
             log::info!("file_edit for chat_id={chat_id}: {edits:?}");
         }
@@ -490,9 +529,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
 /// pass so the user still sees the rejection.
 fn should_drop_event(ctx: &WsContext, event: &ServerEvent) -> bool {
     match event {
-        ServerEvent::Attached { .. } | ServerEvent::Ready { .. } | ServerEvent::Unknown(_) => {
-            false
-        }
+        ServerEvent::Attached { .. } | ServerEvent::Ready { .. } | ServerEvent::Unknown(_) => false,
         _ => match event.chat_id() {
             None => false,
             Some(cid) => ctx.chat_id.get_untracked().as_deref() != Some(cid),
@@ -646,12 +683,10 @@ pub fn App() -> impl IntoView {
     let token = RwSignal::new(read_stored_token());
     let login_error = RwSignal::new(None::<String>);
     let login_pending = RwSignal::new(false);
-    let chat_open = RwSignal::new(
-        BrowserLocalStorage::get::<bool>(CHAT_OPEN_STORAGE_KEY).unwrap_or(false),
-    );
-    let expanded = RwSignal::new(
-        BrowserLocalStorage::get::<bool>(EXPANDED_STORAGE_KEY).unwrap_or(false),
-    );
+    let chat_open =
+        RwSignal::new(BrowserLocalStorage::get::<bool>(CHAT_OPEN_STORAGE_KEY).unwrap_or(false));
+    let expanded =
+        RwSignal::new(BrowserLocalStorage::get::<bool>(EXPANDED_STORAGE_KEY).unwrap_or(false));
 
     let client_id = RwSignal::new(read_or_create_client_id());
     let chat_id = RwSignal::new(read_stored_chat_id());
@@ -706,7 +741,11 @@ pub fn App() -> impl IntoView {
         open_connection(ws_context);
     }
 
-    let push_entry = move |role: Role, content: String, attachments: Vec<ImageAttachment>, streaming: bool| -> u64 {
+    let push_entry = move |role: Role,
+                           content: String,
+                           attachments: Vec<ImageAttachment>,
+                           streaming: bool|
+          -> u64 {
         let id = next_id.get_untracked();
         next_id.set(id + 1);
         entries.update(|list| {

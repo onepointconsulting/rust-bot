@@ -1,5 +1,21 @@
+use crate::{
+    bus::{events::OutboundMessage, queue::MessageBus},
+    channels::base::{BaseChannel, BaseChannelCommon},
+    config::schema::ChannelsConfig,
+    security::workspace_requests::WorkspaceRequestHandler,
+    session::manager::SessionManager,
+    utils::helpers::expand_tilde_path,
+};
 use async_trait::async_trait;
 use qrcode::{QrCode, render::unicode, types::QrError};
+use serde::{Deserialize, Serialize};
+use std::{
+    collections::{HashMap, HashSet, VecDeque},
+    path::PathBuf,
+    str::FromStr,
+    sync::{Arc, Mutex, atomic::Ordering},
+    time::Duration,
+};
 use whatsapp_rust::{
     Client, Jid, Server, TokioRuntime,
     bot::{Bot, BotHandle},
@@ -10,25 +26,6 @@ use whatsapp_rust::{
 };
 use whatsapp_rust_tokio_transport::TokioWebSocketTransportFactory;
 use whatsapp_rust_ureq_http_client::UreqHttpClient;
-use std::{
-    collections::{HashMap, HashSet, VecDeque},
-    path::PathBuf,
-    str::FromStr,
-    sync::{
-        Arc, Mutex,
-        atomic::Ordering,
-    },
-    time::Duration,
-};
-use serde::{Deserialize, Serialize};
-use crate::{
-    bus::{events::OutboundMessage, queue::MessageBus},
-    channels::base::{BaseChannel, BaseChannelCommon},
-    config::schema::ChannelsConfig,
-    security::workspace_requests::WorkspaceRequestHandler,
-    session::manager::SessionManager,
-    utils::helpers::expand_tilde_path,
-};
 
 /// Inbound WhatsApp message forwarded from the bot event handler to `start()`.
 struct IncomingWaMessage {
@@ -352,8 +349,7 @@ impl WhatsAppChannel {
     /// True when the message text contains a bare `@all` token (case-insensitive).
     fn text_mentions_all(text: &str) -> bool {
         text.split_whitespace().any(|tok| {
-            let cleaned =
-                tok.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '@'));
+            let cleaned = tok.trim_matches(|c: char| !(c.is_ascii_alphanumeric() || c == '@'));
             cleaned.eq_ignore_ascii_case("@all")
         })
     }
@@ -449,10 +445,7 @@ impl WhatsAppChannel {
                     return;
                 }
                 if let Err(e) = signal.assert_sessions(&devices).await {
-                    log::warn!(
-                        "WhatsApp session warm-up for {} failed: {e}",
-                        to
-                    );
+                    log::warn!("WhatsApp session warm-up for {} failed: {e}", to);
                 }
             }
             Err(e) => {
@@ -486,13 +479,14 @@ impl WhatsAppChannel {
 
     async fn create_store(&self) -> Result<SqliteStore, String> {
         let session_db_path = self.session_db_path();
-        let store = match SqliteStore::new(session_db_path.as_path().to_str().unwrap_or_default()).await {
-            Ok(store) => store,
-            Err(e) => {
-                log::error!("Failed to create store: {}", e);
-                return Err(e.to_string());
-            }
-        };
+        let store =
+            match SqliteStore::new(session_db_path.as_path().to_str().unwrap_or_default()).await {
+                Ok(store) => store,
+                Err(e) => {
+                    log::error!("Failed to create store: {}", e);
+                    return Err(e.to_string());
+                }
+            };
         Ok(store)
     }
 }
@@ -739,14 +733,10 @@ impl BaseChannel for WhatsAppChannel {
                                 info.source.chat.to_string()
                             };
                             let mut metadata = HashMap::new();
-                            metadata.insert(
-                                "message_id".to_string(),
-                                serde_json::json!(message_id),
-                            );
-                            metadata.insert(
-                                "push_name".to_string(),
-                                serde_json::json!(info.push_name),
-                            );
+                            metadata
+                                .insert("message_id".to_string(), serde_json::json!(message_id));
+                            metadata
+                                .insert("push_name".to_string(), serde_json::json!(info.push_name));
                             metadata.insert(
                                 "is_group".to_string(),
                                 serde_json::json!(info.source.is_group),
@@ -930,13 +920,10 @@ impl BaseChannel for WhatsAppChannel {
         }
 
         let resolved_chat_id = self.resolve_outbound_chat_id(chat_id);
-        let to = Jid::from_str(&resolved_chat_id).map_err(|e| {
-            format!("Invalid WhatsApp chat_id '{resolved_chat_id}': {e}")
-        })?;
+        let to = Jid::from_str(&resolved_chat_id)
+            .map_err(|e| format!("Invalid WhatsApp chat_id '{resolved_chat_id}': {e}"))?;
         if resolved_chat_id != chat_id {
-            log::info!(
-                "WhatsApp self-chat send remapped {chat_id} -> {resolved_chat_id}"
-            );
+            log::info!("WhatsApp self-chat send remapped {chat_id} -> {resolved_chat_id}");
         }
 
         let content = msg.content.trim();

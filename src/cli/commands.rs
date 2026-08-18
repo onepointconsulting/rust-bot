@@ -40,10 +40,6 @@ use axum::Router;
 use axum::routing::post;
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
-use tokio::net::TcpListener;
-use tower_http::services::{ServeDir, ServeFile};
-use utoipa::OpenApi;
-use utoipa_swagger_ui::SwaggerUi;
 use reedline::{
     EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Prompt, PromptEditMode,
     PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal,
@@ -51,17 +47,19 @@ use reedline::{
 };
 use serde_json::Value;
 use termimad::MadSkin;
+use tokio::net::TcpListener;
+use tower_http::services::{ServeDir, ServeFile};
+use utoipa::OpenApi;
+use utoipa_swagger_ui::SwaggerUi;
 
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
 use crate::bus::queue::MessageBus;
 use crate::cli::paste_edit_mode::{
     PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
 };
-use crate::cli::progress::{create_on_progress, print_cli_progress_line, ProgressType};
+use crate::cli::progress::{ProgressType, create_on_progress, print_cli_progress_line};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
-use crate::config::loader::{
-    load_config, resolve_config_env_vars, set_config_path,
-};
+use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
 use crate::config::schema::{ChannelsConfig, Config};
@@ -396,7 +394,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 &config.channels,
                 &session_id,
                 Arc::clone(&agent_loop),
-                true
+                true,
             )
             .await
         }
@@ -442,10 +440,8 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
     // `channel.login(force)` — so these throwaway values exist solely to
     // satisfy the (now-uniform) channel constructor signature.
     let session_manager = Arc::new(StdMutex::new(SessionManager::new(config.workspace_path())));
-    let workspace_request_handler = WorkspaceRequestHandler::new(
-        config.workspace_path(),
-        config.tools.restrict_to_workspace,
-    );
+    let workspace_request_handler =
+        WorkspaceRequestHandler::new(config.workspace_path(), config.tools.restrict_to_workspace);
     let channel: Arc<dyn BaseChannel> = match channel_name.as_str() {
         "whatsapp" => {
             let whatsapp_cfg = config
@@ -490,7 +486,10 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
 /// priority, then `api.webRoot` from the config file, then `./web` if that
 /// directory happens to exist. Returns `None` when nothing is configured
 /// and no default directory is present (the API then runs without a UI).
-fn resolve_web_root(cli_web_root: Option<PathBuf>, config_web_root: Option<String>) -> Option<PathBuf> {
+fn resolve_web_root(
+    cli_web_root: Option<PathBuf>,
+    config_web_root: Option<String>,
+) -> Option<PathBuf> {
     if let Some(path) = cli_web_root {
         return Some(path);
     }
@@ -625,7 +624,9 @@ async fn serve_combined_login_and_gateway(
         .with_state(login_state);
 
     let mut app: Router = login_router
-        .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", GatewayApiDoc::openapi()))
+        .merge(
+            SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", GatewayApiDoc::openapi()),
+        )
         .layer(build_cors_layer(&config.api.cors))
         .merge(ws_channel.router());
 
@@ -636,7 +637,9 @@ async fn serve_combined_login_and_gateway(
     let web_ui_status = match web_root {
         Some(root) if web_root_has_ui(root) => {
             let index_html = root.join("index.html");
-            app = app.fallback_service(ServeDir::new(root).not_found_service(ServeFile::new(index_html)));
+            app = app.fallback_service(
+                ServeDir::new(root).not_found_service(ServeFile::new(index_html)),
+            );
             Some(format!("serving `{}`", root.display()))
         }
         Some(root) if root.is_dir() => {
@@ -665,9 +668,12 @@ async fn serve_combined_login_and_gateway(
         None => log::info!("Web UI disabled (no valid --web-root / gateway.webRoot configured)"),
     }
 
-    axum::serve(listener, app.into_make_service_with_connect_info::<std::net::SocketAddr>())
-        .with_graceful_shutdown(wait_for_websocket_shutdown(Arc::clone(ws_channel)))
-        .await
+    axum::serve(
+        listener,
+        app.into_make_service_with_connect_info::<std::net::SocketAddr>(),
+    )
+    .with_graceful_shutdown(wait_for_websocket_shutdown(Arc::clone(ws_channel)))
+    .await
 }
 
 /// `ws_channel`'s `WebSocketConfig.jwt` isn't exposed directly (only via the
@@ -894,15 +900,11 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             let channels = Arc::clone(&channels);
             let config = Arc::clone(&config);
             Box::pin(async move {
-                let (channel, chat_id) = pick_heartbeat_target(
-                    Arc::clone(&channels),
-                    Arc::clone(&session_manager),
-                )
-                .await;
+                let (channel, chat_id) =
+                    pick_heartbeat_target(Arc::clone(&channels), Arc::clone(&session_manager))
+                        .await;
                 // Suppress progress publishing during heartbeat (matches Python `_silent`).
-                let silent: ProgressCallback = Arc::new(|_message, _kind| {
-                    Box::pin(async {})
-                });
+                let silent: ProgressCallback = Arc::new(|_message, _kind| Box::pin(async {}));
                 let resp = Arc::clone(&agent_loop)
                     .process_direct(
                         &tasks,
@@ -917,9 +919,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                     .await;
                 // Keep a small tail of heartbeat history so the loop stays bounded
                 // without losing all short-term context between runs.
-                let mut manager = session_manager
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let mut manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
                 let session = {
                     let session = manager.get_or_create_session("heartbeat");
                     session.retain_recent_legal_suffix(
@@ -943,8 +943,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             let session_manager = Arc::clone(&session_manager);
             let channels = Arc::clone(&channels);
             Box::pin(async move {
-                let (channel, chat_id) =
-                    pick_heartbeat_target(channels, session_manager).await;
+                let (channel, chat_id) = pick_heartbeat_target(channels, session_manager).await;
                 if channel == "cli" {
                     return Ok(());
                 }
@@ -982,8 +981,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let web_root = resolve_web_root(web_root_override, config.gateway.web_root.clone());
     if let Some(web_root) = &web_root {
         if !web_root.exists() {
-            std::fs::create_dir_all(web_root)
-                .map_err(CliError::FailedToCreateWebRootDirectory)?;
+            std::fs::create_dir_all(web_root).map_err(CliError::FailedToCreateWebRootDirectory)?;
         }
     }
 
@@ -1041,7 +1039,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         let dream_cfg = agent_loop.config.agents.dream.clone();
         let timezone = agent_loop.config.agents.timezone.clone();
         let now = now_ms();
-        let schedule = dream_cfg.build_schedule(&timezone); 
+        let schedule = dream_cfg.build_schedule(&timezone);
         cron.register_system_job(crate::cron::types::CronJob {
             id: "dream".to_string(),
             name: "dream".to_string(),
@@ -1057,8 +1055,9 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             state: CronJobState {
                 next_run_at_ms: compute_next_run(&schedule, now),
                 ..Default::default()
-            }
-        }).await;
+            },
+        })
+        .await;
         println!(
             "{}✓{} Dream: {}",
             green.render(),
@@ -1434,9 +1433,7 @@ impl Prompt for CliPrompt {
     fn render_prompt_left(&self) -> Cow<'_, str> {
         let path = std::env::current_dir();
         match path {
-            Ok(path) => {
-                Cow::Owned(format!("{}", path.to_string_lossy()))
-            }
+            Ok(path) => Cow::Owned(format!("{}", path.to_string_lossy())),
             Err(_) => Cow::Borrowed("rust-bot"),
         }
     }
@@ -1781,10 +1778,10 @@ mod tests {
     #[test]
     fn resolve_websocket_channel_is_none_when_present_but_disabled() {
         let mut config = Config::default();
-        config
-            .channels
-            .extra
-            .insert("websocket".to_string(), serde_json::json!({"enabled": false}));
+        config.channels.extra.insert(
+            "websocket".to_string(),
+            serde_json::json!({"enabled": false}),
+        );
 
         let resolved = resolve_websocket_channel(
             &config,
@@ -1799,10 +1796,10 @@ mod tests {
     #[test]
     fn resolve_websocket_channel_is_some_when_present_and_enabled() {
         let mut config = Config::default();
-        config
-            .channels
-            .extra
-            .insert("websocket".to_string(), serde_json::json!({"enabled": true}));
+        config.channels.extra.insert(
+            "websocket".to_string(),
+            serde_json::json!({"enabled": true}),
+        );
 
         let resolved = resolve_websocket_channel(
             &config,
@@ -1817,10 +1814,10 @@ mod tests {
     #[test]
     fn resolve_websocket_channel_is_none_when_malformed() {
         let mut config = Config::default();
-        config
-            .channels
-            .extra
-            .insert("websocket".to_string(), serde_json::json!({"port": "not-a-number"}));
+        config.channels.extra.insert(
+            "websocket".to_string(),
+            serde_json::json!({"port": "not-a-number"}),
+        );
 
         let resolved = resolve_websocket_channel(
             &config,

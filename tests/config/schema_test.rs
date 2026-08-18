@@ -1,11 +1,13 @@
-use rust_bot::config::{loader::save_config, schema::{Config, McpServerConfig, McpTransportType, ToolsConfig}};
+use rust_bot::config::{
+    loader::save_config,
+    schema::{Config, McpServerConfig, McpTransportType, ToolsConfig},
+};
 use std::collections::HashMap;
 
 use crate::config::helpers::read_mcp_env;
 
 #[test]
 fn test_create_mcp_server_config() {
-    
     let mut headers = HashMap::new();
     let (mcp_server_url, mcp_headers_jwt, _mcp_test_prompt) = read_mcp_env();
     headers.insert("Authorization".to_string(), mcp_headers_jwt.to_string());
@@ -27,9 +29,7 @@ fn test_create_mcp_server_config() {
         ..Config::default()
     };
     assert_eq!(cfg.tools.mcp_servers.len(), 1);
-    let temp_path = std::env::temp_dir().join(format!(
-        "rust-bot-mcp-config-{}.json",
-        uuid::Uuid::new_v4()
-    ));
+    let temp_path =
+        std::env::temp_dir().join(format!("rust-bot-mcp-config-{}.json", uuid::Uuid::new_v4()));
     let _ = save_config(&cfg, Some(temp_path));
 }

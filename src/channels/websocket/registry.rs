@@ -130,7 +130,10 @@ mod tests {
 
         let recipients = registry.senders_for_chat("chat-1");
         let ids: HashSet<_> = recipients.into_iter().map(|(id, _)| id).collect();
-        assert_eq!(ids, HashSet::from(["conn-1".to_string(), "conn-2".to_string()]));
+        assert_eq!(
+            ids,
+            HashSet::from(["conn-1".to_string(), "conn-2".to_string()])
+        );
     }
 
     #[test]

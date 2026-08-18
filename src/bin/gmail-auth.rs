@@ -1,6 +1,6 @@
+use rust_bot::utils::exit_codes::{self, GENERAL_ERROR};
 use std::path::Path;
 use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
-use rust_bot::utils::exit_codes::{self, GENERAL_ERROR};
 
 // Gmail API base URL
 const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1";
@@ -10,7 +10,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // --- Step 1: Load the client secret JSON downloaded from Google Cloud Console ---
     let secret_path = "./credentials/client_secret.json";
     if !Path::new(secret_path).exists() {
-        eprintln!("ERROR: {} not found. Place your downloaded client secret JSON in the project root.", secret_path);
+        eprintln!(
+            "ERROR: {} not found. Place your downloaded client secret JSON in the project root.",
+            secret_path
+        );
         exit_codes::exit(GENERAL_ERROR);
     }
 
@@ -29,7 +32,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // --- Step 3: Request an access token for the Gmail read-only scope ---
     let scopes = &[
-        "https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/gmail.send"
+        "https://www.googleapis.com/auth/gmail.readonly",
+        "https://www.googleapis.com/auth/gmail.send",
     ];
     let token = auth.token(scopes).await?;
     let access_token = token.token().expect("No access token returned");
@@ -43,10 +47,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let response = client
         .get(format!("{}/users/me/messages", GMAIL_API))
         .bearer_auth(access_token)
-        .query(&[
-            ("labelIds", "INBOX"),
-            ("maxResults", "10"),
-        ])
+        .query(&[("labelIds", "INBOX"), ("maxResults", "10")])
         .send()
         .await?;
 
@@ -70,7 +71,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         return Ok(());
     }
 
-    println!("\nFetching subjects for {} messages...\n", message_list.len());
+    println!(
+        "\nFetching subjects for {} messages...\n",
+        message_list.len()
+    );
 
     for msg in message_list {
         let msg_id = msg["id"].as_str().unwrap_or_default();
@@ -93,7 +97,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
             .as_array()
             .and_then(|headers| {
                 headers.iter().find(|h| {
-                    h["name"].as_str().map(|n| n.eq_ignore_ascii_case("subject")).unwrap_or(false)
+                    h["name"]
+                        .as_str()
+                        .map(|n| n.eq_ignore_ascii_case("subject"))
+                        .unwrap_or(false)
                 })
             })
             .and_then(|h| h["value"].as_str())

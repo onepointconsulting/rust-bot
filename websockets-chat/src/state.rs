@@ -234,7 +234,10 @@ pub fn apply_tool_hint(
     };
     let existing = entry.tool_events.get_or_insert_with(Vec::new);
     for incoming in tool_events {
-        match existing.iter_mut().find(|event| event.name == incoming.name) {
+        match existing
+            .iter_mut()
+            .find(|event| event.name == incoming.name)
+        {
             Some(slot) => *slot = incoming,
             None => existing.push(incoming),
         }
@@ -474,7 +477,12 @@ mod tests {
         let index = index_with("turn-1", 0);
 
         apply_delta(&mut entries, &index, "turn-1", "partial");
-        apply_stream_end(&mut entries, &index, "turn-1", Some("authoritative full text"));
+        apply_stream_end(
+            &mut entries,
+            &index,
+            "turn-1",
+            Some("authoritative full text"),
+        );
 
         assert_eq!(entries[0].content, "authoritative full text");
         assert!(!entries[0].streaming);
@@ -571,7 +579,11 @@ mod tests {
         );
 
         let events = entries[0].tool_events.clone().expect("tool_events set");
-        assert_eq!(events.len(), 2, "search should be updated in place, not duplicated");
+        assert_eq!(
+            events.len(),
+            2,
+            "search should be updated in place, not duplicated"
+        );
         assert_eq!(events[0].name, "search");
         assert_eq!(events[0].status, "done");
         assert_eq!(events[0].detail, Some("3 results".to_string()));
@@ -604,7 +616,10 @@ mod tests {
         apply_stream_end(&mut entries, &index, "turn-1", Some("final answer"));
 
         let events = entries[0].tool_events.clone().expect("tool_events set");
-        assert_eq!(events[0].status, "done", "running chip should be closed out");
+        assert_eq!(
+            events[0].status, "done",
+            "running chip should be closed out"
+        );
         assert_eq!(
             events[1].status, "failed",
             "an already-terminal status must not be overwritten"
@@ -640,10 +655,7 @@ mod tests {
         finish_orphaned_entries(&mut entries);
 
         assert!(!entries[0].streaming);
-        assert_eq!(
-            entries[0].tool_events.clone().unwrap()[0].status,
-            "done"
-        );
+        assert_eq!(entries[0].tool_events.clone().unwrap()[0].status, "done");
     }
 
     #[test]
@@ -661,7 +673,10 @@ mod tests {
     #[test]
     fn classify_tool_status_buckets_by_substring_with_fail_checked_first() {
         assert_eq!(classify_tool_status("running"), ToolStatusBucket::Running);
-        assert_eq!(classify_tool_status("in_progress"), ToolStatusBucket::Running);
+        assert_eq!(
+            classify_tool_status("in_progress"),
+            ToolStatusBucket::Running
+        );
         assert_eq!(classify_tool_status("failed"), ToolStatusBucket::Failed);
         assert_eq!(classify_tool_status("error"), ToolStatusBucket::Failed);
         assert_eq!(
@@ -764,10 +779,7 @@ mod tests {
     #[test]
     fn build_ws_url_translates_https_to_wss() {
         let url = build_ws_url("https", "example.com", "/ws", "client-1", "secret", None);
-        assert_eq!(
-            url,
-            "wss://example.com/ws?client_id=client-1&token=secret"
-        );
+        assert_eq!(url, "wss://example.com/ws?client_id=client-1&token=secret");
     }
 
     #[test]

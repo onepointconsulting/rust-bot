@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use base64::{engine::general_purpose::STANDARD as BASE64, Engine};
+use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use regex::Regex;
 use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
@@ -83,12 +83,7 @@ pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
 }
 
 /// Build native image content blocks plus a short text label.
-pub fn build_image_content_blocks(
-    raw: &[u8],
-    mime: &str,
-    path: &str,
-    label: &str,
-) -> Vec<Value> {
+pub fn build_image_content_blocks(raw: &[u8], mime: &str, path: &str, label: &str) -> Vec<Value> {
     let b64 = BASE64.encode(raw);
     vec![
         json!({
@@ -153,7 +148,13 @@ const UNSAFE_PATH_CHARS: &[char] = &['<', '>', ':', '"', '/', '\\', '|', '?', '*
 /// Replace unsafe path characters with underscores.
 pub fn safe_filename(name: &str) -> String {
     name.chars()
-        .map(|c| if UNSAFE_PATH_CHARS.contains(&c) { '_' } else { c })
+        .map(|c| {
+            if UNSAFE_PATH_CHARS.contains(&c) {
+                '_'
+            } else {
+                c
+            }
+        })
         .collect::<String>()
         .trim()
         .to_string()
@@ -280,9 +281,7 @@ pub fn build_assistant_message(
         msg["tool_calls"] = Value::Array(tc);
     }
     if reasoning_content.is_some() || thinking_blocks.is_some() {
-        msg["reasoning_content"] = Value::String(
-            reasoning_content.unwrap_or("").to_string(),
-        );
+        msg["reasoning_content"] = Value::String(reasoning_content.unwrap_or("").to_string());
     }
     if let Some(tb) = thinking_blocks {
         msg["thinking_blocks"] = Value::Array(tb);
@@ -338,14 +337,22 @@ fn cleanup_tool_result_buckets(root: &Path, current_bucket: &Path) {
     if siblings.len() <= keep {
         return;
     }
-    siblings.sort_by(|a, b| bucket_mtime(b).partial_cmp(&bucket_mtime(a)).unwrap_or(std::cmp::Ordering::Equal));
+    siblings.sort_by(|a, b| {
+        bucket_mtime(b)
+            .partial_cmp(&bucket_mtime(a))
+            .unwrap_or(std::cmp::Ordering::Equal)
+    });
     for path in &siblings[keep..] {
         let _ = fs::remove_dir_all(path);
     }
 }
 
 pub(crate) fn write_text_atomic(path: &Path, content: &str) -> std::io::Result<()> {
-    let tmp_name = format!(".{}.{}.tmp", path.file_name().unwrap_or_default().to_string_lossy(), Uuid::new_v4().simple());
+    let tmp_name = format!(
+        ".{}.{}.tmp",
+        path.file_name().unwrap_or_default().to_string_lossy(),
+        Uuid::new_v4().simple()
+    );
     let tmp = path.with_file_name(tmp_name);
     fs::write(&tmp, content)?;
     fs::rename(&tmp, path).map_err(|e| {
@@ -393,12 +400,10 @@ pub fn maybe_persist_tool_result(
 
     let (text_payload, is_json) = match &content {
         Value::String(s) => (s.clone(), false),
-        Value::Array(blocks) => {
-            match stringify_text_blocks(blocks) {
-                Some(text) => (text, true),
-                None => return content,
-            }
-        }
+        Value::Array(blocks) => match stringify_text_blocks(blocks) {
+            Some(text) => (text, true),
+            None => return content,
+        },
         _ => return content,
     };
 
@@ -410,7 +415,11 @@ pub fn maybe_persist_tool_result(
     let bucket = ensure_dir(root.join(safe_filename(session_key.unwrap_or("default"))));
 
     if let Err(e) = std::panic::catch_unwind(|| cleanup_tool_result_buckets(&root, &bucket)) {
-        log::warn!("Failed to clean stale tool result buckets in {:?}: {:?}", root, e);
+        log::warn!(
+            "Failed to clean stale tool result buckets in {:?}: {:?}",
+            root,
+            e
+        );
     }
 
     let ext = if is_json { "json" } else { "txt" };
@@ -500,7 +509,10 @@ pub fn estimate_message_tokens(message: &Value) -> usize {
     }
 }
 
-pub fn estimate_prompt_tokens_chain(messages: &[Value], tools: Option<&[Value]>) -> (usize, String) {
+pub fn estimate_prompt_tokens_chain(
+    messages: &[Value],
+    tools: Option<&[Value]>,
+) -> (usize, String) {
     let estimated = estimate_prompt_tokens(messages, tools);
     if estimated > 0 {
         return (estimated, "tiktoken".to_string());
@@ -512,11 +524,7 @@ pub fn estimate_prompt_tokens_chain(messages: &[Value], tools: Option<&[Value]>)
 ///
 /// Uses a character ÷ 4 approximation with a 4-token-per-message overhead,
 /// matching the tiktoken fallback in the Python implementation.
-pub fn estimate_prompt_tokens(
-    messages: &[Value],
-    tools: Option<&[Value]>,
-) -> usize {
-
+pub fn estimate_prompt_tokens(messages: &[Value], tools: Option<&[Value]>) -> usize {
     let mut parts: Vec<String> = Vec::new();
 
     for msg in messages {
@@ -615,7 +623,10 @@ pub fn build_status_content(
         format!("{LOGO} v{version}"),
         format!("🧠 Model: {}", model),
         token_line,
-        format!("📚 Context: {}/{} ({}%)", ctx_used_str, ctx_total_str, ctx_pct),
+        format!(
+            "📚 Context: {}/{} ({}%)",
+            ctx_used_str, ctx_total_str, ctx_pct
+        ),
         format!("💬 Session: {} messages", session_msg_count),
         format!("⏱ Uptime: {}", uptime),
     ];
@@ -717,7 +728,12 @@ fn sync_workspace_templates_with_root(
 
     for name in top_level_bootstrap_names(templates_root) {
         if let Some(content) = read_bootstrap_file(templates_root, &name) {
-            write_dest_if_missing(workspace, &workspace.join(&name), Some(&content), &mut added);
+            write_dest_if_missing(
+                workspace,
+                &workspace.join(&name),
+                Some(&content),
+                &mut added,
+            );
         }
     }
 
@@ -835,7 +851,10 @@ mod tests {
 
     #[test]
     fn strip_surrounding_quotes_double_quoted_yaml_scalar() {
-        assert_eq!(strip_surrounding_quotes("  \"Quoted Title\"  "), "Quoted Title");
+        assert_eq!(
+            strip_surrounding_quotes("  \"Quoted Title\"  "),
+            "Quoted Title"
+        );
     }
 
     #[test]
@@ -891,7 +910,12 @@ mod tests {
         let blocks = build_image_content_blocks(b"fake", "image/png", "/img.png", "a photo");
         assert_eq!(blocks.len(), 2);
         assert_eq!(blocks[0]["type"], "image_url");
-        assert!(blocks[0]["image_url"]["url"].as_str().unwrap().starts_with("data:image/png;base64,"));
+        assert!(
+            blocks[0]["image_url"]["url"]
+                .as_str()
+                .unwrap()
+                .starts_with("data:image/png;base64,")
+        );
         assert_eq!(blocks[0]["_meta"]["path"], "/img.png");
         assert_eq!(blocks[1]["type"], "text");
         assert_eq!(blocks[1]["text"], "a photo");
@@ -902,7 +926,11 @@ mod tests {
     #[test]
     fn test_timestamp_is_rfc3339() {
         let ts = timestamp();
-        assert!(chrono::DateTime::parse_from_rfc3339(&ts).is_ok(), "not RFC3339: {}", ts);
+        assert!(
+            chrono::DateTime::parse_from_rfc3339(&ts).is_ok(),
+            "not RFC3339: {}",
+            ts
+        );
     }
 
     // ── current_time_str ──────────────────────────────────────────────────────
@@ -912,7 +940,12 @@ mod tests {
         let s = current_time_str(None);
         println!("s: {}", s);
         assert!(s.contains("UTC"), "expected UTC offset: {}", s);
-        assert_eq!(s.find("(").unwrap(), 17, "expected at least one ( in the string: {}", s);
+        assert_eq!(
+            s.find("(").unwrap(),
+            17,
+            "expected at least one ( in the string: {}",
+            s
+        );
     }
 
     #[test]
@@ -926,7 +959,11 @@ mod tests {
     fn test_current_time_str_with_invalid_timezone_falls_back() {
         // Should not panic; falls back to local time
         let s = current_time_str(Some("Not/ATimezone"));
-        assert!(s.contains("UTC"), "expected fallback with UTC offset: {}", s);
+        assert!(
+            s.contains("UTC"),
+            "expected fallback with UTC offset: {}",
+            s
+        );
     }
 
     // ── safe_filename ─────────────────────────────────────────────────────────
@@ -942,8 +979,6 @@ mod tests {
         assert_eq!(safe_filename("  hello  "), "hello");
     }
 
-
-
     #[test]
     fn test_safe_filename_clean() {
         assert_eq!(safe_filename("clean-name_123"), "clean-name_123");
@@ -953,7 +988,10 @@ mod tests {
 
     #[test]
     fn test_image_placeholder_with_path() {
-        assert_eq!(image_placeholder_text(Some("/img.png"), "[image]"), "[image: /img.png]");
+        assert_eq!(
+            image_placeholder_text(Some("/img.png"), "[image]"),
+            "[image: /img.png]"
+        );
     }
 
     #[test]
@@ -1028,14 +1066,15 @@ mod tests {
             json!({ "type": "text", "text": "hello" }),
             json!({ "type": "text", "text": "world" }),
         ];
-        assert_eq!(stringify_text_blocks(&blocks), Some("hello\nworld".to_string()));
+        assert_eq!(
+            stringify_text_blocks(&blocks),
+            Some("hello\nworld".to_string())
+        );
     }
 
     #[test]
     fn test_stringify_text_blocks_non_text_returns_none() {
-        let blocks = vec![
-            json!({ "type": "image_url", "url": "..." }),
-        ];
+        let blocks = vec![json!({ "type": "image_url", "url": "..." })];
         assert_eq!(stringify_text_blocks(&blocks), None);
     }
 
@@ -1060,7 +1099,11 @@ mod tests {
     fn test_split_message_breaks_at_newline() {
         let text = "line1\nline2\nline3";
         let chunks = split_message(text, 12);
-        assert!(chunks.iter().all(|c| c.len() <= 12), "chunk too long: {:?}", chunks);
+        assert!(
+            chunks.iter().all(|c| c.len() <= 12),
+            "chunk too long: {:?}",
+            chunks
+        );
         assert_eq!(chunks.join("\n"), text);
     }
 
@@ -1142,7 +1185,8 @@ mod tests {
         usage.insert("prompt_tokens".to_string(), 100);
         usage.insert("completion_tokens".to_string(), 50);
         let status = build_status_content(
-            "1.0", "gpt-4o",
+            "1.0",
+            "gpt-4o",
             unix_now() - 130.0,
             &usage,
             128_000,
@@ -1153,7 +1197,7 @@ mod tests {
         assert!(status.contains("gpt-4o"));
         assert!(status.contains("100 in"));
         assert!(status.contains("50 out"));
-        assert!(status.contains("2m"));  // ~130s uptime
+        assert!(status.contains("2m")); // ~130s uptime
         assert!(status.contains("10 messages"));
     }
 
@@ -1161,21 +1205,40 @@ mod tests {
     fn test_build_status_content_hours_uptime() {
         let usage = HashMap::new();
         let status = build_status_content(
-            "1.0", "model",
+            "1.0",
+            "model",
             unix_now() - 7200.0, // 2 hours
-            &usage, 0, 0, 0, None,
+            &usage,
+            0,
+            0,
+            0,
+            None,
         );
-        assert!(status.contains("2h"), "expected hours in uptime: {}", status);
+        assert!(
+            status.contains("2h"),
+            "expected hours in uptime: {}",
+            status
+        );
     }
 
     #[test]
     fn test_build_status_content_search_usage_appended() {
         let usage = HashMap::new();
         let status = build_status_content(
-            "1.0", "m", unix_now(), &usage, 0, 0, 0,
+            "1.0",
+            "m",
+            unix_now(),
+            &usage,
+            0,
+            0,
+            0,
             Some("🔍 Web search: 3 queries"),
         );
-        assert!(status.contains("Web search"), "search line missing: {}", status);
+        assert!(
+            status.contains("Web search"),
+            "search line missing: {}",
+            status
+        );
     }
 
     // ── maybe_persist_tool_result ─────────────────────────────────────────────
@@ -1255,7 +1318,13 @@ mod tests {
             );
         }
         assert!(workspace.path().join("memory").join("MEMORY.md").is_file());
-        assert!(workspace.path().join("memory").join("history.jsonl").is_file());
+        assert!(
+            workspace
+                .path()
+                .join("memory")
+                .join("history.jsonl")
+                .is_file()
+        );
         assert!(workspace.path().join(".git").is_dir());
     }
 
@@ -1273,7 +1342,10 @@ mod tests {
         // Pre-existing bootstrap files must be left untouched.
         for name in BOOTSTRAP_FILES {
             assert!(!added.contains(&name.to_string()));
-            assert_eq!(fs::read_to_string(workspace.path().join(name)).unwrap(), "# test");
+            assert_eq!(
+                fs::read_to_string(workspace.path().join(name)).unwrap(),
+                "# test"
+            );
         }
         assert!(
             added.contains(&"memory/history.jsonl".to_string())
@@ -1310,9 +1382,11 @@ mod tests {
 
     #[test]
     fn test_strip_surrounding_quotes() {
-        assert_eq!(strip_surrounding_quotes("  \"Quoted Title\"  "), "Quoted Title");
+        assert_eq!(
+            strip_surrounding_quotes("  \"Quoted Title\"  "),
+            "Quoted Title"
+        );
         assert_eq!(strip_surrounding_quotes("'Alice'"), "Alice");
         assert_eq!(strip_surrounding_quotes("  plain  "), "plain");
     }
 }
-

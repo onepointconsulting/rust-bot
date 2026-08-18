@@ -3,15 +3,18 @@ use std::{
     path::PathBuf,
     pin::Pin,
     sync::{
-        atomic::{AtomicBool, Ordering},
         Arc, LazyLock,
+        atomic::{AtomicBool, Ordering},
     },
 };
 
 use tokio::sync::Mutex;
 use tokio::task::JoinHandle;
 
-use crate::{providers::base::LLMProviderDyn, utils::{evaluator::evaluate_response, helpers::current_time_str}};
+use crate::{
+    providers::base::LLMProviderDyn,
+    utils::{evaluator::evaluate_response, helpers::current_time_str},
+};
 
 /// Async handler invoked when a heartbeat is executed.
 ///
@@ -200,7 +203,7 @@ impl HeartbeatService {
 
     /// Main heartbeat loop.
     ///
-    /// dead simple — sleep(interval_s) then _tick(), forever, swallowing exceptions so one bad tick doesn't kill the loop. 
+    /// dead simple — sleep(interval_s) then _tick(), forever, swallowing exceptions so one bad tick doesn't kill the loop.
     /// Note the sleep happens first, so the first check is one interval after startup, not immediately.
     ///
     /// `CancelledError` has no direct analogue here: `stop()` calls `JoinHandle::abort()`,
@@ -254,13 +257,8 @@ impl HeartbeatService {
             return Ok(());
         }
 
-        let should_notify = evaluate_response(
-            &response,
-            &tasks,
-            Arc::clone(&self.provider),
-            &self.model,
-        )
-        .await;
+        let should_notify =
+            evaluate_response(&response, &tasks, Arc::clone(&self.provider), &self.model).await;
 
         if should_notify && let Some(on_notify) = self.on_notify.as_ref() {
             log::info!("Heartbeat: completed, delivering response");

@@ -5,7 +5,6 @@ pub const RESTART_NOTIFY_CHANNEL_ENV: &str = "RUST_BOT_RESTART_NOTIFY_CHANNEL";
 pub const RESTART_NOTIFY_CHAT_ID_ENV: &str = "RUST_BOT_RESTART_NOTIFY_CHAT_ID";
 pub const RESTART_STARTED_AT_ENV: &str = "RUST_BOT_RESTART_STARTED_AT";
 
-
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RestartNotice {
     pub channel: String,
@@ -74,7 +73,7 @@ pub fn should_show_cli_restart_notice(notice: RestartNotice, session_id: &str) -
         .map(|(_, chat_id)| chat_id)
         .unwrap_or(session_id);
     notice.chat_id.is_empty() || notice.chat_id == cli_chat_id
-} 
+}
 
 /// Build restart completion text and include elapsed time when available.
 pub fn format_restart_completed_message(started_at_raw: &str) -> String {
@@ -109,9 +108,6 @@ mod tests {
 
     #[test]
     fn format_restart_completed_message_without_timestamp() {
-        assert_eq!(
-            format_restart_completed_message(""),
-            "Restart completed."
-        );
+        assert_eq!(format_restart_completed_message(""), "Restart completed.");
     }
 }

@@ -94,7 +94,13 @@ pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
     };
 
     if logs {
-        let has_debug = if let Some(debug) = debug && debug { true } else { false };
+        let has_debug = if let Some(debug) = debug
+            && debug
+        {
+            true
+        } else {
+            false
+        };
         if !has_rust_log || !rust_log_mentions_target(RUNTIME_LOG_TARGET) {
             let level = if has_debug {
                 LevelFilter::Debug

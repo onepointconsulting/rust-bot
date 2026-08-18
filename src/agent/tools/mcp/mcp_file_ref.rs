@@ -87,7 +87,11 @@ pub enum FileRefError {
     /// File missing or unreadable.
     Unreadable { path: PathBuf, reason: String },
     /// File exceeds the configured ceiling.
-    TooLarge { path: PathBuf, size: u64, limit: u64 },
+    TooLarge {
+        path: PathBuf,
+        size: u64,
+        limit: u64,
+    },
     /// `encoding` was not one of the supported values.
     UnknownEncoding(String),
     /// `$file` present but not a string.
@@ -103,7 +107,11 @@ impl std::fmt::Display for FileRefError {
                  Copy the file into the workspace or disable restrictToWorkspace."
             ),
             Self::Unreadable { path, reason } => {
-                write!(f, "cannot read file reference '{}': {reason}", path.display())
+                write!(
+                    f,
+                    "cannot read file reference '{}': {reason}",
+                    path.display()
+                )
             }
             Self::TooLarge { path, size, limit } => write!(
                 f,
@@ -158,11 +166,7 @@ impl FileRefResolver {
         Ok((expanded, notes))
     }
 
-    fn expand_value(
-        &self,
-        value: &Value,
-        notes: &mut Vec<String>,
-    ) -> Result<Value, FileRefError> {
+    fn expand_value(&self, value: &Value, notes: &mut Vec<String>) -> Result<Value, FileRefError> {
         match value {
             Value::String(text) => {
                 if let Some(path) = text.strip_prefix(FILE_URI_PREFIX) {
@@ -231,10 +235,13 @@ impl FileRefResolver {
         // where the absolute path already starts with a drive letter.
         let cleaned = normalize_uri_path(raw_path);
 
-        let path = self.fs.resolve(&cleaned).map_err(|e| FileRefError::Denied {
-            path: cleaned.clone(),
-            reason: describe_resolve_error(&e),
-        })?;
+        let path = self
+            .fs
+            .resolve(&cleaned)
+            .map_err(|e| FileRefError::Denied {
+                path: cleaned.clone(),
+                reason: describe_resolve_error(&e),
+            })?;
 
         let metadata = std::fs::metadata(&path).map_err(|e| FileRefError::Unreadable {
             path: path.clone(),
@@ -593,8 +600,7 @@ mod tests {
     #[test]
     fn enforces_size_limit() {
         let path = write_temp("big.bin", &[0u8; 512]);
-        let resolver =
-            FileRefResolver::new(FsToolConfig::new(None, None, None), 16);
+        let resolver = FileRefResolver::new(FsToolConfig::new(None, None, None), 16);
         let params = json!({"content": format!("file://{}", path_arg(&path))});
 
         let err = resolver.expand(&params).expect_err("must exceed limit");

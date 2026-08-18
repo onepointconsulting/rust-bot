@@ -247,7 +247,12 @@ async fn save_email_to_disk(
         }
     }
 
-    Ok((email_dir, body_filename.to_string(), saved_attachments, attachment_errors))
+    Ok((
+        email_dir,
+        body_filename.to_string(),
+        saved_attachments,
+        attachment_errors,
+    ))
 }
 
 fn format_download_summary(result: &GmailEmailDownloadResult) -> String {
@@ -498,14 +503,8 @@ impl GmailEmailsTool {
         let mut final_output: Vec<String> = Vec::new();
         for msg in message_list {
             let msg_id = msg["id"].as_str().unwrap_or_default();
-            let result = download_email(
-                client,
-                access_token,
-                msg_id,
-                only_subject,
-                body_limit,
-                None,
-            ).await;
+            let result =
+                download_email(client, access_token, msg_id, only_subject, body_limit, None).await;
             match result {
                 Ok(result) => {
                     final_output.push(GmailEmailsTool::format_message_line(
@@ -540,8 +539,7 @@ impl GmailEmailsTool {
     }
 
     fn decode_gmail_body_data(data: &str) -> Option<String> {
-        Self::decode_gmail_body_data_bytes(data)
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
+        Self::decode_gmail_body_data_bytes(data).map(|b| String::from_utf8_lossy(&b).into_owned())
     }
 
     fn decode_gmail_body_data_bytes(data: &str) -> Option<Vec<u8>> {
@@ -624,9 +622,7 @@ impl GmailEmailsTool {
                     *index += 1;
                     let filename = Self::extract_filename_from_part(part)
                         .unwrap_or_else(|| format!("attachment-{index}"));
-                    let attachment_id = part["body"]["attachmentId"]
-                        .as_str()
-                        .map(str::to_string);
+                    let attachment_id = part["body"]["attachmentId"].as_str().map(str::to_string);
                     let inline_data = if attachment_id.is_none() {
                         part["body"]["data"].as_str().map(str::to_string)
                     } else {
@@ -1315,14 +1311,15 @@ mod tests {
 
     #[test]
     fn unique_attachment_path_deduplicates_collisions() {
-        let dir = std::env::temp_dir().join(format!(
-            "gmail-attachment-test-{}",
-            std::process::id()
-        ));
+        let dir =
+            std::env::temp_dir().join(format!("gmail-attachment-test-{}", std::process::id()));
         let _ = std::fs::create_dir_all(&dir);
         std::fs::write(dir.join("report.pdf"), b"1").unwrap();
         let second = unique_attachment_path(&dir, "report.pdf");
-        assert_eq!(second.file_name().unwrap().to_str().unwrap(), "report-2.pdf");
+        assert_eq!(
+            second.file_name().unwrap().to_str().unwrap(),
+            "report-2.pdf"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

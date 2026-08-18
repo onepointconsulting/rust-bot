@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-use crate::{config::loader::get_config_path, utils::helpers::{ensure_dir, expand_tilde_path}};
+use crate::{
+    config::loader::get_config_path,
+    utils::helpers::{ensure_dir, expand_tilde_path},
+};
 
 /// Return the instance-level runtime data directory.
 pub fn get_data_dir() -> PathBuf {
@@ -50,9 +53,11 @@ pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
     let path = if let Some(workspace) = workspace {
         PathBuf::from(expand_tilde_path(workspace).as_ref())
     } else {
-        home::home_dir().unwrap_or_else(|| {
-            panic!("Home directory not found. Please set the HOME environment variable.")
-        }).join(".rust-bot/workspace")
+        home::home_dir()
+            .unwrap_or_else(|| {
+                panic!("Home directory not found. Please set the HOME environment variable.")
+            })
+            .join(".rust-bot/workspace")
     };
     ensure_dir(path)
 }
@@ -60,7 +65,9 @@ pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
 /// Return whether a workspace path resolves to the default workspace.
 pub fn is_default_workspace(workspace: Option<&str>) -> bool {
     let default = home::home_dir()
-        .unwrap_or_else(|| panic!("Home directory not found. Please set the HOME environment variable."))
+        .unwrap_or_else(|| {
+            panic!("Home directory not found. Please set the HOME environment variable.")
+        })
         .join(".rust-bot/workspace");
 
     let current = match workspace {
@@ -75,7 +82,9 @@ pub fn is_default_workspace(workspace: Option<&str>) -> bool {
 
 fn rust_bot_home() -> PathBuf {
     home::home_dir()
-        .unwrap_or_else(|| panic!("Home directory not found. Please set the HOME environment variable."))
+        .unwrap_or_else(|| {
+            panic!("Home directory not found. Please set the HOME environment variable.")
+        })
         .join(".rust-bot")
 }
 

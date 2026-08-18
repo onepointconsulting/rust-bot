@@ -24,7 +24,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::api::login::{
-    JwtAuthState, LoginState, __path_login, jwt_auth_state_from_config, login,
+    __path_login, JwtAuthState, LoginState, jwt_auth_state_from_config, login,
 };
 use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
 use crate::api::user_registry::UserRegistry;

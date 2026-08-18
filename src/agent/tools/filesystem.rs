@@ -1,15 +1,15 @@
-use async_trait::async_trait;
-use std::path::{Component, Path, PathBuf};
-use similar::TextDiff;
 use super::base::Tool;
-use globwalk::GlobWalkerBuilder;
 use crate::agent::workspace_context::current_tool_workspace;
+use async_trait::async_trait;
+use globwalk::GlobWalkerBuilder;
+use similar::TextDiff;
+use std::path::{Component, Path, PathBuf};
 
 #[derive(Debug)]
 pub enum ResolvePathError {
     HomeDirUnavailable,
     NotUnderAllowedDir { path: PathBuf, allowed: PathBuf },
-    NotUnderAnyAllowedDir { path: PathBuf }
+    NotUnderAnyAllowedDir { path: PathBuf },
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -41,7 +41,8 @@ fn normalize_lexically(path: &Path) -> PathBuf {
                     out.push(Component::ParentDir.as_os_str());
                 }
                 // At a drive/root — ignore further `..`.
-                Some(Component::Prefix(_)) | Some(Component::RootDir) | Some(Component::CurDir) => {}
+                Some(Component::Prefix(_)) | Some(Component::RootDir) | Some(Component::CurDir) => {
+                }
             },
             Component::Normal(c) => out.push(c),
         }
@@ -158,7 +159,10 @@ fn _resolve_path(
             }
             None => {
                 if !_is_under(&resolved, ws) {
-                    return Result::Err(ResolvePathError::NotUnderAllowedDir { path: resolved, allowed: ws.clone() });
+                    return Result::Err(ResolvePathError::NotUnderAllowedDir {
+                        path: resolved,
+                        allowed: ws.clone(),
+                    });
                 }
                 return Result::Ok(resolved);
             }
@@ -216,7 +220,11 @@ impl FsToolConfig {
         allowed_dir: Option<PathBuf>,
         extra_allowed_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
-        Self { workspace, allowed_dir, extra_allowed_dirs }
+        Self {
+            workspace,
+            allowed_dir,
+            extra_allowed_dirs,
+        }
     }
 
     /// Equivalent to `self._resolve(path)` in the Python base class.
@@ -232,19 +240,29 @@ impl FsToolConfig {
     pub fn resolve(&self, path: &str) -> Result<PathBuf, ResolvePathError> {
         let scope_applies = self.allowed_dir.is_none() || self.allowed_dir == self.workspace;
         let (workspace, allowed_dir) = if scope_applies {
-            let tw = current_tool_workspace(self.workspace.clone(), self.allowed_dir.is_some(), false);
+            let tw =
+                current_tool_workspace(self.workspace.clone(), self.allowed_dir.is_some(), false);
             let allowed = tw.allowed_root();
             (tw.project_path, allowed)
         } else {
             (self.workspace.clone(), self.allowed_dir.clone())
         };
-        _resolve_path(path, workspace, allowed_dir, self.extra_allowed_dirs.clone())
+        _resolve_path(
+            path,
+            workspace,
+            allowed_dir,
+            self.extra_allowed_dirs.clone(),
+        )
     }
 }
 
 impl Default for FsToolConfig {
     fn default() -> Self {
-        Self { workspace: Some(PathBuf::from("~/workspace")), allowed_dir: None, extra_allowed_dirs: None }
+        Self {
+            workspace: Some(PathBuf::from("~/workspace")),
+            allowed_dir: None,
+            extra_allowed_dirs: None,
+        }
     }
 }
 
@@ -278,44 +296,49 @@ impl ReadFileTool {
         allowed_dir: Option<PathBuf>,
         extra_allowed_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
-        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+        Self {
+            fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs),
+        }
     }
 }
 
 impl WriteFileTool {
-
     pub fn new(
         workspace: Option<PathBuf>,
         allowed_dir: Option<PathBuf>,
         extra_allowed_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
-        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+        Self {
+            fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs),
+        }
     }
 }
 
 impl ListDirTool {
     const DEFAULT_MAX: usize = 200;
-    pub(crate) const IGNORE_DIRS: &'static [&'static str] = &[
-        ".git", "node_modules", "__pycache__", ".venv", "target",
-    ];
+    pub(crate) const IGNORE_DIRS: &'static [&'static str] =
+        &[".git", "node_modules", "__pycache__", ".venv", "target"];
 
     pub fn new(
         workspace: Option<PathBuf>,
         allowed_dir: Option<PathBuf>,
         extra_allowed_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
-        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+        Self {
+            fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs),
+        }
     }
 }
 
 impl EditFileTool {
-
     pub fn new(
         workspace: Option<PathBuf>,
         allowed_dir: Option<PathBuf>,
         extra_allowed_dirs: Option<Vec<PathBuf>>,
     ) -> Self {
-        Self { fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs) }
+        Self {
+            fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs),
+        }
     }
 
     fn _not_found_msg(&self, old_text: &str, content: &str, path: &str) -> String {
@@ -337,7 +360,8 @@ impl EditFileTool {
         }
 
         if best_ratio > 0.5 {
-            let actual_window = lines[best_start..(best_start + window).min(lines.len())].join("\n");
+            let actual_window =
+                lines[best_start..(best_start + window).min(lines.len())].join("\n");
             let diff = TextDiff::from_lines(old_text, &actual_window);
             let unified = diff
                 .unified_diff()
@@ -398,14 +422,16 @@ impl Tool for ReadFileTool {
 
     /// Input is a JSON object string: `{"path": "...", "offset": 1, "limit": 100}`.
     async fn execute(&self, params: &serde_json::Value) -> String {
-
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: missing required parameter 'path'".to_string(),
         };
 
         let mut offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(1) as usize;
-        let limit = params.get("limit").and_then(|v| v.as_u64()).map(|v| v as usize);
+        let limit = params
+            .get("limit")
+            .and_then(|v| v.as_u64())
+            .map(|v| v as usize);
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
@@ -465,7 +491,10 @@ impl Tool for ReadFileTool {
             result = trimmed.join("\n");
             result += &format!(
                 "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
-                offset, end_trimmed, total, end_trimmed + 1
+                offset,
+                end_trimmed,
+                total,
+                end_trimmed + 1
             );
             return result;
         }
@@ -473,7 +502,10 @@ impl Tool for ReadFileTool {
         if end < total {
             result += &format!(
                 "\n\n(Showing lines {}-{} of {}. Use offset={} to continue.)",
-                offset, end, total, end + 1
+                offset,
+                end,
+                total,
+                end + 1
             );
         } else {
             result += &format!("\n\n(End of file — {} lines total)", total);
@@ -484,11 +516,10 @@ impl Tool for ReadFileTool {
 
 #[async_trait]
 impl Tool for WriteFileTool {
-
     fn name(&self) -> String {
         "write_file".to_string()
     }
-    
+
     fn description(&self) -> String {
         "Write content to a file at the given path. Creates parent directories if needed. \
 For large files, write an initial chunk with this tool, then append further sections with edit_file."
@@ -533,7 +564,11 @@ For large files, write an initial chunk with this tool, then append further sect
         }
 
         match std::fs::write(&fp, content.as_bytes()) {
-            Ok(_) => format!("Successfully wrote {} bytes to {}", content.len(), fp.display()),
+            Ok(_) => format!(
+                "Successfully wrote {} bytes to {}",
+                content.len(),
+                fp.display()
+            ),
             Err(e) if e.kind() == std::io::ErrorKind::PermissionDenied => {
                 format!("Error: {}", e)
             }
@@ -555,7 +590,7 @@ impl Tool for EditFileTool {
     fn read_only(&self) -> bool {
         false
     }
-    
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -588,7 +623,10 @@ impl Tool for EditFileTool {
             None => return "Error: missing required parameter 'new_text'".to_string(),
         };
 
-        let replace_all = params.get("replace_all").and_then(|v| v.as_bool()).unwrap_or(false);
+        let replace_all = params
+            .get("replace_all")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
@@ -658,12 +696,10 @@ impl Tool for EditFileTool {
             Err(e) => format!("Error editing file: {}", e),
         }
     }
-
 }
 
 #[async_trait]
 impl Tool for ListDirTool {
-
     fn name(&self) -> String {
         "list_dir".to_string()
     }
@@ -671,7 +707,7 @@ impl Tool for ListDirTool {
     fn description(&self) -> String {
         "List the contents of a directory".to_string()
     }
-    
+
     fn parameters(&self) -> serde_json::Value {
         serde_json::json!({
             "type": "object",
@@ -692,13 +728,15 @@ impl Tool for ListDirTool {
     }
 
     async fn execute(&self, params: &serde_json::Value) -> String {
-
         let path = match params.get("path").and_then(|v| v.as_str()) {
             Some(p) => p,
             None => return "Error: missing required parameter 'path'".to_string(),
         };
 
-        let recursive = params.get("recursive").and_then(|v| v.as_bool()).unwrap_or(false);
+        let recursive = params
+            .get("recursive")
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
         let cap = params
             .get("max_entries")
             .and_then(|v| v.as_u64())
@@ -711,7 +749,11 @@ impl Tool for ListDirTool {
         };
 
         if !dp.exists() {
-            return format!("Error: Directory not found: {}. Path: {}", dp.display(), path);
+            return format!(
+                "Error: Directory not found: {}. Path: {}",
+                dp.display(),
+                path
+            );
         }
         if !dp.is_dir() {
             return format!("Error: Not a directory: {}", path);
@@ -748,8 +790,9 @@ impl Tool for ListDirTool {
                     continue;
                 }
                 total += 1;
-                
-                let posix_rel = rel.components()
+
+                let posix_rel = rel
+                    .components()
                     .map(|c| c.as_os_str().to_string_lossy())
                     .collect::<Vec<_>>()
                     .join("/");
@@ -759,7 +802,6 @@ impl Tool for ListDirTool {
                 } else {
                     items.push(format!("{}", posix_rel));
                 }
-                
             }
         } else {
             let mut entries: Vec<std::fs::DirEntry> = match std::fs::read_dir(&dp) {
@@ -857,13 +899,18 @@ mod tests {
         assert!(resolved.ends_with("notes.txt"));
     }
 
-
     #[test]
     fn test_resolve_allowed_dir() {
         let allowed_dir = unique_temp_dir();
         let path = "notes.txt";
         let allowed_path = allowed_dir.join(path);
-        let resolved = _resolve_path(allowed_path.to_str().unwrap(), None, Some(allowed_dir.clone()), None).unwrap();
+        let resolved = _resolve_path(
+            allowed_path.to_str().unwrap(),
+            None,
+            Some(allowed_dir.clone()),
+            None,
+        )
+        .unwrap();
         assert!(resolved.starts_with(allowed_dir));
         assert!(resolved.ends_with("notes.txt"));
     }
@@ -874,14 +921,24 @@ mod tests {
         let extra_allowed_dir = unique_temp_dir().join("allowed");
         let path = "notes.txt";
         let allowed_path = allowed_dir.join(path);
-        let resolved = _resolve_path(allowed_path.to_str().unwrap(), None, Some(allowed_dir.clone()), Some(vec![extra_allowed_dir.clone()])).unwrap();
+        let resolved = _resolve_path(
+            allowed_path.to_str().unwrap(),
+            None,
+            Some(allowed_dir.clone()),
+            Some(vec![extra_allowed_dir.clone()]),
+        )
+        .unwrap();
         assert!(resolved.starts_with(allowed_dir));
         assert!(resolved.ends_with("notes.txt"));
     }
 
     #[test]
     fn test_normalize_lexically_collapses_parent_dirs() {
-        let base = PathBuf::from(if cfg!(windows) { r"C:\workspace" } else { "/workspace" });
+        let base = PathBuf::from(if cfg!(windows) {
+            r"C:\workspace"
+        } else {
+            "/workspace"
+        });
         let sneaky = base.join("..").join("outside").join("new_file.txt");
         let normalized = normalize_lexically(&sneaky);
         let expected = if cfg!(windows) {
@@ -927,7 +984,10 @@ mod tests {
         )
         .expect("new file inside workspace should be allowed");
         assert!(soft_resolve(&resolved).starts_with(&soft_resolve(&workspace)));
-        assert_eq!(resolved.file_name().and_then(|n| n.to_str()), Some("new_file.txt"));
+        assert_eq!(
+            resolved.file_name().and_then(|n| n.to_str()),
+            Some("new_file.txt")
+        );
 
         let _ = fs::remove_dir_all(base);
     }
@@ -947,14 +1007,16 @@ mod tests {
     #[tokio::test]
     async fn test_read_missing_file_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "missing.txt" })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": "missing.txt" }))
+            .await;
         assert!(result.contains("Error: File not found: missing.txt"));
     }
 
     #[tokio::test]
     async fn test_read_missing_path_tool() {
         let tool = ReadFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ })).await;
+        let result = tool.execute(&serde_json::json!({})).await;
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'path'"));
     }
@@ -966,7 +1028,9 @@ mod tests {
         // Find the notes.txt file in the docs directory
         let notes_path = docs_path.join("notes.txt");
         assert!(notes_path.exists());
-        let result = tool.execute(&serde_json::json!({ "path": notes_path.to_str().unwrap() })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": notes_path.to_str().unwrap() }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains("rust-bot is for educational, research, and technical exchange purposes only. It is unrelated to crypto and does not involve any official token or coin."));
     }
@@ -974,7 +1038,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_missing_path_tool() {
         let tool = WriteFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "content": "Hello, world!" })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "content": "Hello, world!" }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'path'"));
     }
@@ -982,7 +1048,9 @@ mod tests {
     #[tokio::test]
     async fn test_write_missing_content() {
         let tool = WriteFileTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "notes.txt" })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": "notes.txt" }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains("Error: missing required parameter 'content'"));
     }
@@ -991,12 +1059,14 @@ mod tests {
     async fn test_write_tool_success() {
         let tool = WriteFileTool::new(None, None, None);
         let notes_text = "notes.txt";
-        let result = tool.execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains(format!("Successfully wrote").as_str()));
         assert!(Path::new(notes_text).exists());
     }
-    
+
     #[test]
     fn test_find_match() {
         let content = "Hello, world!\nHello, rust!\nHello, world!";
@@ -1031,13 +1101,15 @@ mod tests {
         let sample_file = sample_file();
         let content = std::fs::read_to_string(&sample_file).unwrap();
         assert!(content.contains("1| line 1"));
-        let result = tool.execute(&serde_json::json!(
-            { 
+        let result = tool
+            .execute(&serde_json::json!(
+            {
                 "path": sample_file.to_str().unwrap(),
                 "old_text": "1| line 1",
                 "new_text": "---1| line 1---",
                 "replace_all": true
-            })).await;
+            }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains(format!("Successfully edited").as_str()));
         assert!(sample_file.exists());
@@ -1052,13 +1124,15 @@ mod tests {
         let sample_file = sample_file();
         let content = std::fs::read_to_string(&sample_file).unwrap();
         assert!(content.contains("1| line 1"));
-        let result = tool.execute(&serde_json::json!(
-            { 
+        let result = tool
+            .execute(&serde_json::json!(
+            {
                 "path": sample_file.to_str().unwrap(),
                 "old_text": "1| line 1",
                 "new_text": "---1| line 1---, but only the first occurrence",
                 "replace_all": false
-            })).await;
+            }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
     }
@@ -1066,7 +1140,9 @@ mod tests {
     #[tokio::test]
     async fn test_list_dir_tool() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": "docs", "recursive": false }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits"));
@@ -1079,10 +1155,13 @@ mod tests {
         println!("workspace absolute: {}", workspace.is_absolute());
         let docs = Path::new("docs");
         let tool = ListDirTool::new(
-            Some(workspace.to_path_buf()), 
-            Some(docs.to_path_buf()), 
-            None);
-        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": false })).await;
+            Some(workspace.to_path_buf()),
+            Some(docs.to_path_buf()),
+            None,
+        );
+        let result = tool
+            .execute(&serde_json::json!({ "path": "docs", "recursive": false }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits"));
@@ -1091,7 +1170,9 @@ mod tests {
     #[tokio::test]
     async fn test_list_dir_tool_recursive() {
         let tool = ListDirTool::new(None, None, None);
-        let result = tool.execute(&serde_json::json!({ "path": "docs", "recursive": true })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": "docs", "recursive": true }))
+            .await;
         println!("result: {}", result);
         assert!(result.contains("notes.txt"));
         assert!(result.contains("credits/"));
@@ -1102,7 +1183,9 @@ mod tests {
     async fn test_list_dir_tool_expression() {
         let tool = ListDirTool::new(None, None, None);
         let limit = 10000;
-        let result = tool.execute(&serde_json::json!({ "path": "src", "recursive": true, "max_entries": limit })).await;
+        let result = tool
+            .execute(&serde_json::json!({ "path": "src", "recursive": true, "max_entries": limit }))
+            .await;
         println!("result count: {}", result.split("\n").count());
         println!("result: {}", result);
         assert!(result.contains("agent/mod.rs"));
@@ -1117,7 +1200,7 @@ mod tests {
         use crate::agent::workspace_context::{
             bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
         };
-        use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
 
         let dir_a = unique_temp_dir();
         fs::create_dir_all(&dir_a).unwrap();
@@ -1146,7 +1229,7 @@ mod tests {
         use crate::agent::workspace_context::{
             bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
         };
-        use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
 
         let dir_a = unique_temp_dir();
         let sub_a = dir_a.join("narrow");
@@ -1195,7 +1278,7 @@ mod tests {
         use crate::agent::workspace_context::{
             bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
         };
-        use crate::security::workspace_access::{build_workspace_scope, WorkspaceAccessMode};
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
 
         let dir_a = unique_temp_dir();
         fs::create_dir_all(&dir_a).unwrap();
@@ -1208,14 +1291,18 @@ mod tests {
         // A single tool instance, constructed once — never reconstructed below.
         let tool = ReadFileTool::new(Some(dir_a.clone()), Some(dir_a.clone()), None);
 
-        let result_a = tool.execute(&serde_json::json!({ "path": "marker.txt" })).await;
+        let result_a = tool
+            .execute(&serde_json::json!({ "path": "marker.txt" }))
+            .await;
         assert!(result_a.contains("from A"));
 
         with_workspace_scope_stack(|| async {
             let scope = build_workspace_scope(&dir_b, WorkspaceAccessMode::Restricted, None);
             let token = bind_workspace_scope(scope);
 
-            let result_b = tool.execute(&serde_json::json!({ "path": "marker.txt" })).await;
+            let result_b = tool
+                .execute(&serde_json::json!({ "path": "marker.txt" }))
+                .await;
             assert!(result_b.contains("from B"));
 
             reset_workspace_scope(token);
@@ -1226,4 +1313,3 @@ mod tests {
         let _ = fs::remove_dir_all(&dir_b);
     }
 }
-

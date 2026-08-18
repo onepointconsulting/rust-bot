@@ -136,13 +136,11 @@ pub fn validate_schedule_for_add(schedule: &CronSchedule) -> Result<(), String> 
     Ok(())
 }
 
-
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chrono::{TimeZone, Utc};
     use crate::cron::CronSchedule;
+    use chrono::{TimeZone, Utc};
 
     fn cron_schedule(expr: &str, tz: Option<&str>) -> CronSchedule {
         CronSchedule {
@@ -235,10 +233,7 @@ mod tests {
     #[test]
     fn compute_next_run_invalid_tz_returns_none() {
         let schedule = cron_schedule("0 9 * * *", Some("Not/A/Zone"));
-        assert_eq!(
-            compute_next_run(&schedule, 1_704_000_000_000),
-            None
-        );
+        assert_eq!(compute_next_run(&schedule, 1_704_000_000_000), None);
     }
 
     #[test]
@@ -275,7 +270,11 @@ mod tests {
 
     #[test]
     fn parse_at_iso_invalid_format() {
-        assert!(parse_at_iso("not-a-date", "UTC").unwrap_err().contains("invalid ISO"));
+        assert!(
+            parse_at_iso("not-a-date", "UTC")
+                .unwrap_err()
+                .contains("invalid ISO")
+        );
     }
 
     #[test]

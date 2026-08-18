@@ -396,7 +396,10 @@ impl MemoryStore {
     }
 
     pub fn read_unprocessed_history(&self, since_cursor: u64) -> Vec<serde_json::Value> {
-        log::info!("Dream: reading unprocessed history since cursor: {}", since_cursor);
+        log::info!(
+            "Dream: reading unprocessed history since cursor: {}",
+            since_cursor
+        );
         self.read_entries()
             .into_iter()
             .filter(|e| {
@@ -425,7 +428,10 @@ impl MemoryStore {
 
     /// Read all entries from self.history_file as JSONL lines line by line skipping blank lines.
     fn read_entries(&self) -> Vec<serde_json::Value> {
-        log::info!("Dream: reading entries from history file: {}", self.history_file.display());
+        log::info!(
+            "Dream: reading entries from history file: {}",
+            self.history_file.display()
+        );
         let file_result = File::open(&self.history_file);
         let mut entries = Vec::new();
         if let Ok(f) = file_result {
@@ -1034,7 +1040,11 @@ impl Dream {
     pub async fn run(&self) -> bool {
         log::info!("Dream: running");
         let runtime = self.resolve_runtime();
-        log::info!("Dream run using model={} (preset={})", runtime.model, runtime.preset_name);
+        log::info!(
+            "Dream run using model={} (preset={})",
+            runtime.model,
+            runtime.preset_name
+        );
         let last_cursor = self.store.get_last_dream_cursor();
         let entries = self.store.read_unprocessed_history(last_cursor);
         if entries.is_empty() {
@@ -1093,21 +1103,27 @@ impl Dream {
                 return false;
             }
         };
-        let phase1_response = runtime.provider.chat_with_retry(
-                vec![serde_json::json!({
-                    "role": "system",
-                    "content": phase1_system,
-                }), serde_json::json!({
-                    "role": "user",
-                    "content": phase1_prompt,
-                })],
+        let phase1_response = runtime
+            .provider
+            .chat_with_retry(
+                vec![
+                    serde_json::json!({
+                        "role": "system",
+                        "content": phase1_system,
+                    }),
+                    serde_json::json!({
+                        "role": "user",
+                        "content": phase1_prompt,
+                    }),
+                ],
                 None,
-            Some(runtime.model.clone()),
-            None,
-            None,
-            None,
-            None,
-        ).await;
+                Some(runtime.model.clone()),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await;
         if Self::finish_reason_fail(&phase1_response) {
             log::error!(
                 "Dream Phase 1 failed: finish_reason={}, has_content={}",
@@ -1203,7 +1219,11 @@ impl Dream {
         if !changelog.is_empty() && self.store.git.is_initialized() {
             let ts_raw = &batch[batch.len() - 1]["timestamp"];
             let ts = ts_raw.as_str().unwrap_or("");
-            let commit_ts = if ts.is_empty() { Local::now().format("%Y-%m-%d %H:%M").to_string() } else { ts.to_string() };
+            let commit_ts = if ts.is_empty() {
+                Local::now().format("%Y-%m-%d %H:%M").to_string()
+            } else {
+                ts.to_string()
+            };
             if let Some(sha) = self.store.git.auto_commit(&format!(
                 "dream: {}, {} change(s)",
                 commit_ts,
@@ -1371,7 +1391,6 @@ mod tests {
             8192,
         )
     }
-
 
     // ── maybe_consolidate_by_tokens tests ─────────────────────────────────────
 
@@ -2756,7 +2775,10 @@ mod tests {
         let runtime = dream.resolve_runtime();
         assert_eq!(runtime.model, "raw-override-model");
         // Provider is still the process default's — only the model string is overridden.
-        assert!(Arc::ptr_eq(&runtime.provider, &resolver.current_default().provider));
+        assert!(Arc::ptr_eq(
+            &runtime.provider,
+            &resolver.current_default().provider
+        ));
     }
 
     #[test]

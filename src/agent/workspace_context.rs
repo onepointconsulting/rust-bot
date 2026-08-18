@@ -25,7 +25,9 @@ where
     F: FnOnce() -> Fut,
     Fut: Future,
 {
-    WORKSPACE_SCOPE_STACK.scope(RefCell::new(Vec::new()), f()).await
+    WORKSPACE_SCOPE_STACK
+        .scope(RefCell::new(Vec::new()), f())
+        .await
 }
 
 /// The currently bound scope, if any (`ContextVar.get()`, default `None`).
@@ -76,8 +78,8 @@ pub fn current_tool_workspace(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::security::workspace_access::build_workspace_scope;
     use crate::security::workspace_access::WorkspaceAccessMode;
+    use crate::security::workspace_access::build_workspace_scope;
 
     fn scope_at(path: &std::path::Path, restricted: bool) -> WorkspaceScope {
         let mode = if restricted {
@@ -105,13 +107,22 @@ mod tests {
 
         with_workspace_scope_stack(|| async {
             let t1 = bind_workspace_scope(scope_a.clone());
-            assert_eq!(current_workspace_scope().unwrap().project_path, dir_a.path());
+            assert_eq!(
+                current_workspace_scope().unwrap().project_path,
+                dir_a.path()
+            );
 
             let t2 = bind_workspace_scope(scope_b.clone());
-            assert_eq!(current_workspace_scope().unwrap().project_path, dir_b.path());
+            assert_eq!(
+                current_workspace_scope().unwrap().project_path,
+                dir_b.path()
+            );
 
             reset_workspace_scope(t2);
-            assert_eq!(current_workspace_scope().unwrap().project_path, dir_a.path());
+            assert_eq!(
+                current_workspace_scope().unwrap().project_path,
+                dir_a.path()
+            );
 
             reset_workspace_scope(t1);
             assert!(current_workspace_scope().is_none());

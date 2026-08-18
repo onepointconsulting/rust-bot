@@ -14,7 +14,9 @@ pub struct HelloServer {
 
 impl HelloServer {
     pub fn new() -> Self {
-        Self { tool_router: Self::tool_router() }
+        Self {
+            tool_router: Self::tool_router(),
+        }
     }
 }
 
@@ -27,7 +29,10 @@ struct SayHelloRequest {
 #[tool_router]
 impl HelloServer {
     #[tool(description = "Say hello to someone by name")]
-    fn say_hello(&self, Parameters(SayHelloRequest { name }): Parameters<SayHelloRequest>) -> String {
+    fn say_hello(
+        &self,
+        Parameters(SayHelloRequest { name }): Parameters<SayHelloRequest>,
+    ) -> String {
         format!("Hello, {}!", name)
     }
 }

@@ -66,10 +66,7 @@ fn entry_render_key(entry: &ChatEntry) -> (u64, String, bool, String) {
 /// entirely, hence the two separate `view!` branches below rather than one
 /// with a conditional prop value.
 #[component]
-fn ChatEntryBubble(
-    entry: ChatEntry,
-    #[prop(into)] token_streaming: Signal<bool>,
-) -> impl IntoView {
+fn ChatEntryBubble(entry: ChatEntry, #[prop(into)] token_streaming: Signal<bool>) -> impl IntoView {
     let streaming = entry.streaming;
     let tool_events = entry.tool_events.clone().unwrap_or_default();
     let reasoning = entry.reasoning.clone().unwrap_or_default();
@@ -136,8 +133,7 @@ pub fn MessageList(
     // just entry count) so the list also re-scrolls as streamed text grows
     // an existing bubble, not only when a new entry is pushed.
     Effect::new(move |_| {
-        let total_content_len: usize =
-            entries.get().iter().map(|entry| entry.content.len()).sum();
+        let total_content_len: usize = entries.get().iter().map(|entry| entry.content.len()).sum();
         let _ = total_content_len;
         scroll_list_to_bottom(list_ref);
     });

@@ -1,20 +1,22 @@
+use ipnet::IpNet;
 use std::net::IpAddr;
 use std::sync::{LazyLock, OnceLock};
-use ipnet::IpNet;
 use url::Url;
 
-static BLOCKED_NETWORKS: LazyLock<Vec<IpNet>> = LazyLock::new(|| vec![
-    "0.0.0.0/8".parse().unwrap(),
-    "10.0.0.0/8".parse().unwrap(),
-    "100.64.0.0/10".parse().unwrap(),   // carrier-grade NAT
-    "127.0.0.0/8".parse().unwrap(),
-    "169.254.0.0/16".parse().unwrap(),  // link-local / cloud metadata
-    "172.16.0.0/12".parse().unwrap(),
-    "192.168.0.0/16".parse().unwrap(),
-    "::1/128".parse().unwrap(),
-    "fc00::/7".parse().unwrap(),        // unique local
-    "fe80::/10".parse().unwrap(),       // link-local v6
-]);
+static BLOCKED_NETWORKS: LazyLock<Vec<IpNet>> = LazyLock::new(|| {
+    vec![
+        "0.0.0.0/8".parse().unwrap(),
+        "10.0.0.0/8".parse().unwrap(),
+        "100.64.0.0/10".parse().unwrap(), // carrier-grade NAT
+        "127.0.0.0/8".parse().unwrap(),
+        "169.254.0.0/16".parse().unwrap(), // link-local / cloud metadata
+        "172.16.0.0/12".parse().unwrap(),
+        "192.168.0.0/16".parse().unwrap(),
+        "::1/128".parse().unwrap(),
+        "fc00::/7".parse().unwrap(),  // unique local
+        "fe80::/10".parse().unwrap(), // link-local v6
+    ]
+});
 
 static ALLOWED_NETWORKS: OnceLock<Vec<IpNet>> = OnceLock::new();
 
@@ -42,8 +44,6 @@ pub fn is_private(addr: IpAddr) -> bool {
     }
     BLOCKED_NETWORKS.iter().any(|net| net.contains(&addr))
 }
-
-
 
 /// Validate that a URL is safe to fetch: checks scheme, hostname presence, and
 /// that all resolved IP addresses are public (not private/internal).
@@ -85,7 +85,6 @@ pub async fn validate_url_target(url: &str) -> (bool, String) {
     (true, String::new())
 }
 
-
 /// Validate an already-fetched URL (e.g. after redirect). Only checks the IP, skips DNS.
 pub async fn validate_resolved_url(url: &str) -> (bool, String) {
     let parsed = match Url::parse(url) {
@@ -98,7 +97,10 @@ pub async fn validate_resolved_url(url: &str) -> (bool, String) {
     };
     if let Ok(addr) = hostname.parse::<IpAddr>() {
         if is_private(addr) {
-            return (false, format!("Redirect target is a private address: {addr}"));
+            return (
+                false,
+                format!("Redirect target is a private address: {addr}"),
+            );
         }
         return (true, String::new());
     }
@@ -126,7 +128,7 @@ mod tests {
     use std::net::Ipv4Addr;
 
     use super::*;
-    
+
     // #[test]
     // fn test_configure_ssrf_whitelist() {
     //     let whitelist = vec!["100.64.0.0/10", "192.168.0.0/16"];
@@ -155,7 +157,10 @@ mod tests {
         // 100.64.0.0/10 is set by test_configure_ssrf_whitelist when tests run
         // together, and by this call when running in isolation. Either way the
         // whitelist contains this range, so the address must not be considered private.
-        configure_ssrf_whitelist(vec!["100.64.0.0/10".to_string(), "192.168.0.0/16".to_string()]);
+        configure_ssrf_whitelist(vec![
+            "100.64.0.0/10".to_string(),
+            "192.168.0.0/16".to_string(),
+        ]);
         let addr = IpAddr::V4(Ipv4Addr::new(100, 64, 0, 0));
         println!("ALLOWED_NETWORKS: {:?}", ALLOWED_NETWORKS.get().unwrap());
         assert!(!is_private(addr));
@@ -205,13 +210,11 @@ mod tests {
         assert!(!ok);
         assert!(msg.contains("private address"), "got: {msg}");
     }
-    
+
     #[tokio::test]
     async fn test_validate_resolved_url_literal_public_ip_allowed() {
         let (ok, msg) = validate_resolved_url("https://google.com").await;
         assert!(ok);
         assert!(msg.is_empty());
     }
-    
 }
-

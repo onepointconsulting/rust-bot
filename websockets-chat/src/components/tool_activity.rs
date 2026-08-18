@@ -10,7 +10,7 @@
 use chat_ui::models::ToolEvent;
 use leptos::prelude::*;
 
-use crate::state::{ToolStatusBucket, classify_tool_status};
+use crate::state::{classify_tool_status, ToolStatusBucket};
 
 /// Tailwind component class for a chip in the given status bucket (see the
 /// `.tool-chip--*` rules in `style/input.css`; `--running` carries the

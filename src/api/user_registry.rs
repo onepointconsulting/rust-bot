@@ -11,8 +11,8 @@ use std::fmt;
 use std::fs;
 use std::path::PathBuf;
 
-use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use argon2::Argon2;
+use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
@@ -123,7 +123,6 @@ pub struct JsonUserRegistry {
 }
 
 impl JsonUserRegistry {
-
     pub fn empty() -> Self {
         Self {
             path: PathBuf::new(),
@@ -186,7 +185,8 @@ impl UserRegistry for JsonUserRegistry {
             .get(user_email)
             .map(|stored| to_user(user_email, stored))
             .ok_or_else(|| {
-                Box::new(UserRegistryError::NotFound(user_email.to_string())) as Box<dyn std::error::Error>
+                Box::new(UserRegistryError::NotFound(user_email.to_string()))
+                    as Box<dyn std::error::Error>
             })
     }
 
@@ -284,7 +284,9 @@ mod tests {
     fn get_user_by_email_missing_errors() {
         let dir = tempdir().unwrap();
         let registry = JsonUserRegistry::open(registry_path(&dir)).unwrap();
-        let err = registry.get_user_by_email("missing@example.com").unwrap_err();
+        let err = registry
+            .get_user_by_email("missing@example.com")
+            .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 
@@ -342,7 +344,9 @@ mod tests {
             password_hash: None,
             token: "token-abc".to_string(),
         };
-        let err = registry.update_user("alice@example.com", &user).unwrap_err();
+        let err = registry
+            .update_user("alice@example.com", &user)
+            .unwrap_err();
         assert!(err.to_string().contains("not found"));
     }
 

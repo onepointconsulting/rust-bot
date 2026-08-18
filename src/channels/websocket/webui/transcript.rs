@@ -63,7 +63,9 @@ pub fn normalize_webui_turn_id(value: Option<&serde_json::Value>) -> String {
 /// `metadata.update(self._transcripts.client_turn_metadata(...))`.
 /// Mirrors `WebUiTranscriptRecorder.client_turn_metadata`
 /// (`webui/transcript.py:681-682`).
-pub fn client_turn_metadata(turn_id: Option<&serde_json::Value>) -> HashMap<String, serde_json::Value> {
+pub fn client_turn_metadata(
+    turn_id: Option<&serde_json::Value>,
+) -> HashMap<String, serde_json::Value> {
     HashMap::from([(
         WEBUI_TURN_METADATA_KEY.to_string(),
         serde_json::Value::String(normalize_webui_turn_id(turn_id)),
@@ -130,8 +132,7 @@ impl WebUiTranscriptRecorder {
             Value::from(self.next_turn_seq(chat_id, &turn_id)),
         );
         if phase == "complete" {
-            self.turn_sequences
-                .remove(&(chat_id.to_string(), turn_id));
+            self.turn_sequences.remove(&(chat_id.to_string(), turn_id));
         }
     }
 
@@ -190,7 +191,8 @@ impl WebUiTranscriptRecorder {
         if text.trim() == "/stop" && media_paths.is_none_or(<[String]>::is_empty) {
             return false;
         }
-        let Some(payload) = build_user_transcript_event(chat_id, text, media_paths, cli_apps, mcp_presets)
+        let Some(payload) =
+            build_user_transcript_event(chat_id, text, media_paths, cli_apps, mcp_presets)
         else {
             return false;
         };
@@ -429,7 +431,10 @@ mod tests {
     fn build_user_transcript_event_text_only() {
         let event = build_user_transcript_event("chat-1", "hi", None, None, None).unwrap();
         assert_eq!(event.get("event"), Some(&Value::String("user".to_string())));
-        assert_eq!(event.get("chat_id"), Some(&Value::String("chat-1".to_string())));
+        assert_eq!(
+            event.get("chat_id"),
+            Some(&Value::String("chat-1".to_string()))
+        );
         assert_eq!(event.get("text"), Some(&Value::String("hi".to_string())));
         assert!(!event.contains_key("media_paths"));
         assert!(!event.contains_key("cli_apps"));
@@ -458,7 +463,8 @@ mod tests {
 
     #[test]
     fn build_user_transcript_event_omits_empty_cli_apps_and_mcp_presets() {
-        let event = build_user_transcript_event("chat-1", "hi", None, Some(&[]), Some(&[])).unwrap();
+        let event =
+            build_user_transcript_event("chat-1", "hi", None, Some(&[]), Some(&[])).unwrap();
         assert!(!event.contains_key("cli_apps"));
         assert!(!event.contains_key("mcp_presets"));
     }
@@ -513,7 +519,10 @@ mod tests {
     fn record_for_append_replaces_invalid_timestamp() {
         let obj = HashMap::from([("created_at_ms".to_string(), Value::Bool(true))]);
         let record = record_for_append(obj);
-        assert!(matches!(record.get("created_at_ms"), Some(Value::Number(_))));
+        assert!(matches!(
+            record.get("created_at_ms"),
+            Some(Value::Number(_))
+        ));
     }
 
     // --- webui_transcript_path ---
@@ -611,8 +620,14 @@ mod tests {
         )]);
         let mut event = HashMap::new();
         recorder.annotate_turn("chat-1", &mut event, Some(&metadata), Some("user"));
-        assert_eq!(event.get("turn_id"), Some(&Value::String("turn-1".to_string())));
-        assert_eq!(event.get("turn_phase"), Some(&Value::String("user".to_string())));
+        assert_eq!(
+            event.get("turn_id"),
+            Some(&Value::String("turn-1".to_string()))
+        );
+        assert_eq!(
+            event.get("turn_phase"),
+            Some(&Value::String("user".to_string()))
+        );
         assert_eq!(event.get("turn_seq"), Some(&Value::from(1)));
         assert!(
             recorder
@@ -621,7 +636,12 @@ mod tests {
         );
 
         let mut complete_event = HashMap::new();
-        recorder.annotate_turn("chat-1", &mut complete_event, Some(&metadata), Some("complete"));
+        recorder.annotate_turn(
+            "chat-1",
+            &mut complete_event,
+            Some(&metadata),
+            Some("complete"),
+        );
         assert_eq!(complete_event.get("turn_seq"), Some(&Value::from(2)));
         assert!(
             !recorder
@@ -647,7 +667,14 @@ mod tests {
         let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
         let metadata = HashMap::new();
         let media = vec!["a.png".to_string()];
-        assert!(recorder.append_user_message("chat-1", "/stop", &metadata, Some(&media), None, None));
+        assert!(recorder.append_user_message(
+            "chat-1",
+            "/stop",
+            &metadata,
+            Some(&media),
+            None,
+            None
+        ));
     }
 
     #[test]
