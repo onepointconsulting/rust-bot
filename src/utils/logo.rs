@@ -1,1 +1,1 @@
-pub const LOGO: &'static str = "🦀 rust-bot";
+pub const LOGO: &str = "🦀 rust-bot";

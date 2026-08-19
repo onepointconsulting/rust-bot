@@ -6,7 +6,7 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, and `list_chats`.
+//!   `attach`, `list_chats`, and `rename_chat`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -24,7 +24,8 @@ use serde::{Deserialize, Serialize};
 /// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) has six
 /// variants (`new_chat`, `fork_chat`, `attach`, `set_workspace_scope`,
 /// `transcribe_audio`, `message`). This struct covers the ones the frontend
-/// actually sends (`message`, `new_chat`, `attach`, `list_chats`); constructors
+/// actually sends (`message`, `new_chat`, `attach`, `list_chats`,
+/// `rename_chat`); constructors
 /// pin `type_` so callers cannot invent a shape the gateway would reject
 /// with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -39,6 +40,8 @@ pub struct ClientEnvelope {
     pub content: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub media: Option<Vec<serde_json::Value>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub title: Option<String>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -60,6 +63,7 @@ impl ClientEnvelope {
             turn_id,
             content: Some(content.into()),
             media,
+            title: None,
             webui: true,
         }
     }
@@ -76,6 +80,7 @@ impl ClientEnvelope {
             turn_id: None,
             content: None,
             media: None,
+            title: None,
             webui: true,
         }
     }
@@ -91,6 +96,7 @@ impl ClientEnvelope {
             turn_id: None,
             content: None,
             media: None,
+            title: None,
             webui: true,
         }
     }
@@ -104,6 +110,24 @@ impl ClientEnvelope {
             turn_id: None,
             content: None,
             media: None,
+            title: None,
+            webui: true,
+        }
+    }
+
+    /// Persist a new display title on an existing `chat_id`.
+    ///
+    /// The reply is a `chat_renamed` event carrying that `chat_id` and the
+    /// stored `title`. Rejections come back as `error` (`missing title`,
+    /// `session_not_found`, `access_denied`, `rename_failed`).
+    pub fn rename_chat(chat_id: impl Into<String>, title: impl Into<String>) -> Self {
+        Self {
+            type_: "rename_chat",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: Some(title.into()),
             webui: true,
         }
     }
@@ -229,6 +253,8 @@ pub enum ServerEvent {
     /// connection, most-recently-updated first. Not scoped to any one
     /// `chat_id` — see [`ServerEvent::chat_id`].
     ChatsList { chats: Vec<ChatSummary> },
+    /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
+    ChatRenamed { chat_id: String, title: String },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -238,8 +264,9 @@ impl ServerEvent {
     /// The `chat_id` this event is scoped to, if the payload carries one.
     ///
     /// Used by the app to ignore leftover frames from a previous chat after
-    /// `new_chat` switches the connection onto a new id. `Unknown` and
-    /// unscoped errors (no `chat_id`) return `None`.
+    /// `new_chat` switches the connection onto a new id. `Unknown`,
+    /// [`ServerEvent::ChatsList`], [`ServerEvent::ChatRenamed`] (a rename
+    /// can target any sidebar row), and unscoped errors return `None`.
     pub fn chat_id(&self) -> Option<&str> {
         match self {
             ServerEvent::Ready { chat_id, .. }
@@ -256,7 +283,12 @@ impl ServerEvent {
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
             }
-            ServerEvent::ChatsList { .. } | ServerEvent::Unknown(_) => None,
+            // A rename can target any sidebar row, not just the active chat,
+            // so this event is unscoped for drop purposes (see
+            // `should_drop_event`). The payload still carries `chat_id`.
+            ServerEvent::ChatsList { .. }
+            | ServerEvent::ChatRenamed { .. }
+            | ServerEvent::Unknown(_) => None,
         }
     }
 }
@@ -436,6 +468,12 @@ struct ChatsListWire {
     chats: Vec<ChatSummary>,
 }
 
+#[derive(Deserialize)]
+struct ChatRenamedWire {
+    chat_id: String,
+    title: String,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -527,6 +565,10 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "chats" => {
             decode::<ChatsListWire>(&value).map(|w| ServerEvent::ChatsList { chats: w.chats })
         }
+        "chat_renamed" => decode::<ChatRenamedWire>(&value).map(|w| ServerEvent::ChatRenamed {
+            chat_id: w.chat_id,
+            title: w.title,
+        }),
         _ => Ok(ServerEvent::Unknown(value)),
     }
 }
@@ -910,6 +952,35 @@ mod tests {
                 "webui": true,
             })
         );
+    }
+
+    #[test]
+    fn client_envelope_rename_chat_serializes_expected_shape() {
+        let envelope = ClientEnvelope::rename_chat("chat-1", "Fix the login bug");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "rename_chat",
+                "chat_id": "chat-1",
+                "title": "Fix the login bug",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_chat_renamed() {
+        let raw = r#"{"event":"chat_renamed","chat_id":"chat-1","title":"Fix the login bug"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ChatRenamed {
+                chat_id: "chat-1".to_string(),
+                title: "Fix the login bug".to_string(),
+            }
+        );
+        assert_eq!(event.chat_id(), None);
     }
 
     #[test]

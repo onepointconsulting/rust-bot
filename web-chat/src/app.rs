@@ -153,6 +153,7 @@ pub fn App() -> impl IntoView {
     let chat_error = RwSignal::new(None::<String>);
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
+    let user_email = RwSignal::new(read_stored_email());
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
     let sidebar_open = RwSignal::new(false);
 
@@ -217,6 +218,7 @@ pub fn App() -> impl IntoView {
                 Ok(jwt) => {
                     let _ = SessionStorage::set(TOKEN_STORAGE_KEY, &jwt);
                     persist_email(&email);
+                    user_email.set(Some(email.clone()));
                     let session = session_id_for(&email);
                     persist_session(&session);
                     session_id.set(session);
@@ -239,6 +241,7 @@ pub fn App() -> impl IntoView {
         SessionStorage::delete(EMAIL_STORAGE_KEY);
         clear_stored_entries();
         token.set(None);
+        user_email.set(None);
         entries.set(Vec::new());
         next_id.set(0);
         example_prompts.set(Vec::new());
@@ -365,6 +368,7 @@ pub fn App() -> impl IntoView {
                     sessions=Signal::derive(move || sessions.get())
                     active_session_id=Signal::derive(move || Some(session_id.get()))
                     sidebar_open=Signal::derive(move || sidebar_open.get())
+                    user_email=Signal::derive(move || user_email.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat

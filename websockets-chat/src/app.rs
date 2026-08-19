@@ -33,6 +33,7 @@ use crate::storage_keys::CHAT_OPEN_STORAGE_KEY;
 use crate::storage_keys::EXPANDED_STORAGE_KEY;
 
 const TOKEN_STORAGE_KEY: &str = "rust-bot-websockets-chat-token";
+const EMAIL_STORAGE_KEY: &str = "rust-bot-websockets-chat-email";
 const ENTRIES_STORAGE_KEY: &str = "rust-bot-websockets-chat-entries";
 
 /// Persisted in `LocalStorage` (survives across tabs and reloads, unlike
@@ -63,6 +64,14 @@ const MAX_STORED_TURNS: usize = 10;
 
 fn read_stored_token() -> Option<String> {
     SessionStorage::get::<String>(TOKEN_STORAGE_KEY).ok()
+}
+
+fn read_stored_email() -> Option<String> {
+    SessionStorage::get::<String>(EMAIL_STORAGE_KEY).ok()
+}
+
+fn persist_email(email: &str) {
+    let _ = SessionStorage::set(EMAIL_STORAGE_KEY, email);
 }
 
 fn read_stored_entries() -> Vec<ChatEntry> {
@@ -574,6 +583,12 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::Error {
             turn_id, detail, ..
         } => {
+            if matches!(
+                detail.as_str(),
+                "session_not_found" | "missing title" | "rename_failed"
+            ) {
+                request_chat_list(ctx);
+            }
             ctx.chat_error.set(Some(detail));
             let turn_id = turn_id.or_else(|| ctx.active_turn_id.get_untracked());
             if let Some(turn_id) = turn_id {
@@ -627,6 +642,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 })
                 .collect();
             ctx.sessions.set(items);
+        }
+        ServerEvent::ChatRenamed { chat_id, title } => {
+            apply_session_title(ctx, &chat_id, &title);
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
@@ -802,6 +820,23 @@ fn request_chat_list(ctx: &WsContext) {
     );
 }
 
+fn apply_session_title(ctx: &WsContext, chat_id: &str, title: &str) {
+    ctx.sessions.update(|sessions| {
+        if let Some(session) = sessions.iter_mut().find(|session| session.id == chat_id) {
+            session.title = title.to_string();
+        }
+    });
+}
+
+fn request_rename(ctx: &WsContext, chat_id: String, title: String) {
+    apply_session_title(ctx, &chat_id, &title);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::rename_chat(chat_id, title),
+        "Failed to encode the rename request.",
+    );
+}
+
 /// How long after a turn finishes to re-request the chat list, to pick up a
 /// title that was still generating when [`request_chat_list`]'s
 /// immediately-on-completion call ran. See [`schedule_delayed_chat_list_refresh`].
@@ -896,6 +931,7 @@ pub fn App() -> impl IntoView {
     // empty-state suggestion list simply stays empty for now.
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
+    let user_email = RwSignal::new(read_stored_email());
     let token_streaming = RwSignal::new(false);
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
     let sidebar_open = RwSignal::new(false);
@@ -959,6 +995,8 @@ pub fn App() -> impl IntoView {
             match login(&email, &password).await {
                 Ok(jwt) => {
                     let _ = SessionStorage::set(TOKEN_STORAGE_KEY, &jwt);
+                    persist_email(&email);
+                    user_email.set(Some(email));
                     clear_stored_entries();
                     entries.set(Vec::new());
                     next_id.set(0);
@@ -979,9 +1017,11 @@ pub fn App() -> impl IntoView {
     let do_logout = move || {
         close_connection(&ws_context);
         SessionStorage::delete(TOKEN_STORAGE_KEY);
+        SessionStorage::delete(EMAIL_STORAGE_KEY);
         clear_stored_entries();
         clear_stored_chat_id();
         token.set(None);
+        user_email.set(None);
         chat_id.set(None);
         pending_attach.set(None);
         entries.set(Vec::new());
@@ -1074,6 +1114,9 @@ pub fn App() -> impl IntoView {
     };
     let toggle_sidebar = move || sidebar_open.update(|open| *open = !*open);
     let close_sidebar = move || sidebar_open.set(false);
+    let on_rename_session = move |id: String, title: String| {
+        request_rename(&ws_context, id, title);
+    };
     let on_select_session = move |selected_id: String| {
         if chat_id.get_untracked().as_deref() == Some(selected_id.as_str()) {
             return;
@@ -1145,6 +1188,7 @@ pub fn App() -> impl IntoView {
                     sessions=Signal::derive(move || sessions.get())
                     active_session_id=Signal::derive(move || chat_id.get())
                     sidebar_open=Signal::derive(move || sidebar_open.get())
+                    user_email=Signal::derive(move || user_email.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat
@@ -1156,6 +1200,7 @@ pub fn App() -> impl IntoView {
                     on_toggle_sidebar=toggle_sidebar
                     on_close_sidebar=close_sidebar
                     on_select_session=on_select_session
+                    on_rename_session=on_rename_session
                 />
             </Show>
         </Show>

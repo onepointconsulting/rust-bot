@@ -266,6 +266,15 @@ fn title_generation_prompt(
     Ok((system, user))
 }
 
+/// Failure from [`SessionManager::rename_session`].
+#[derive(Debug)]
+pub enum RenameSessionError {
+    /// No session file (and nothing in cache) for this key.
+    NotFound,
+    /// The title was written in memory but could not be flushed to disk.
+    Save(std::io::Error),
+}
+
 pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
@@ -777,6 +786,23 @@ impl SessionManager {
 
         let mut manager = sessions.lock().unwrap_or_else(|e| e.into_inner());
         manager.persist_generated_title(session_key, title)
+    }
+
+    /// Persist a new display title on an existing session. Does not create a
+    /// session — missing keys return [`RenameSessionError::NotFound`].
+    pub fn rename_session(
+        &mut self,
+        session_key: &str,
+        title: &str,
+    ) -> Result<(), RenameSessionError> {
+        let Some(mut session) = self.get_session_internal(session_key) else {
+            return Err(RenameSessionError::NotFound);
+        };
+        session
+            .metadata
+            .insert(SESSION_TITLE_METADATA_KEY.to_string(), json!(title));
+        session.updated_at = Utc::now();
+        self.save(session).map_err(RenameSessionError::Save)
     }
 
     fn persist_generated_title(&mut self, session_key: &str, title: String) -> Option<String> {
@@ -1511,6 +1537,39 @@ mod tests {
         let listed = mgr.list_sessions();
         assert_eq!(listed.len(), 1);
         assert_eq!(listed[0]["title"], json!("Fix the login bug"));
+    }
+
+    #[test]
+    fn rename_session_persists_title_and_overwrites_existing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        mgr.save(Session::new("chat".to_string())).unwrap();
+
+        mgr.rename_session("chat", "First title").unwrap();
+        {
+            let session = mgr.get_session_internal("chat").expect("session");
+            assert_eq!(
+                session.metadata.get(SESSION_TITLE_METADATA_KEY),
+                Some(&json!("First title"))
+            );
+        }
+
+        mgr.rename_session("chat", "Renamed").unwrap();
+        mgr.cache.clear();
+        let listed = mgr.list_sessions();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0]["title"], json!("Renamed"));
+    }
+
+    #[test]
+    fn rename_session_errors_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        assert!(matches!(
+            mgr.rename_session("missing", "Nope"),
+            Err(RenameSessionError::NotFound)
+        ));
+        assert!(mgr.list_sessions().is_empty());
     }
 
     #[test]

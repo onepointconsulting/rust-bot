@@ -41,6 +41,10 @@ pub enum EnvelopeType {
     /// Added so a UI can offer "fork one of my other chats", not just "fork
     /// the one I'm currently in".
     ListChats,
+    /// Persist a new display title on an existing `websocket:{chat_id}`
+    /// session. Rust-side addition with no nanobot precedent — the Python
+    /// reference has no rename envelope; titles are LLM-generated only.
+    RenameChat,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
@@ -59,6 +63,7 @@ impl From<&str> for EnvelopeType {
         match value {
             "new_chat" => Self::NewChat,
             "fork_chat" => Self::ForkChat,
+            "rename_chat" => Self::RenameChat,
             "attach" => Self::Attach,
             "set_workspace_scope" => Self::SetWorkspaceScope,
             "transcribe_audio" => Self::TranscribeAudio,
@@ -89,6 +94,9 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::ListChats`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatsList,
+    /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    ChatRenamed,
 }
 
 impl WsOutboundEvent {
@@ -102,6 +110,7 @@ impl WsOutboundEvent {
             Self::GoalState => "goal_state",
             Self::GoalStatus => "goal_status",
             Self::ChatsList => "chats",
+            Self::ChatRenamed => "chat_renamed",
         }
     }
 }
@@ -356,6 +365,7 @@ mod tests {
         );
         assert_eq!(EnvelopeType::from("message"), EnvelopeType::Message);
         assert_eq!(EnvelopeType::from("list_chats"), EnvelopeType::ListChats);
+        assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
     }
 
     #[test]
@@ -385,5 +395,10 @@ mod tests {
         // Not part of the previous test's "matches nanobot wire names" set —
         // this event is a Rust-side addition (see `EnvelopeType::ListChats`).
         assert_eq!(WsOutboundEvent::ChatsList.as_str(), "chats");
+    }
+
+    #[test]
+    fn ws_outbound_event_chat_renamed_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::ChatRenamed.as_str(), "chat_renamed");
     }
 }

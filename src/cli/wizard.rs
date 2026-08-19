@@ -476,7 +476,6 @@ fn configure_mail_channel(config: &mut Config) -> Result<Config, CliError> {
     Ok(config.clone())
 }
 
-
 pub fn configure_websocket_channel(
     config: &mut Config,
     config_path: PathBuf,

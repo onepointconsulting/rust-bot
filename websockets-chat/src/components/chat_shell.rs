@@ -29,6 +29,7 @@ pub fn ChatShell(
     #[prop(into)] sessions: Signal<Vec<SessionListItem>>,
     #[prop(into)] active_session_id: Signal<Option<String>>,
     #[prop(into)] sidebar_open: Signal<bool>,
+    #[prop(into)] user_email: Signal<Option<String>>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Send + Sync + Copy,
@@ -44,6 +45,7 @@ pub fn ChatShell(
     on_toggle_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_close_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
     let shell_class = move || {
@@ -59,8 +61,10 @@ pub fn ChatShell(
                 sessions=sessions
                 active_id=active_session_id
                 open=sidebar_open
+                user_email=user_email
                 on_close=on_close_sidebar
                 on_select=on_select_session
+                on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
             />
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
                 <header class="relative z-10 flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">

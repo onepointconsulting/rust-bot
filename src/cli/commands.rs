@@ -436,7 +436,11 @@ fn run_generate_keypair(args: GenerateJwtKeypairArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-pub fn run_generate_keypair_with_config(config: &mut Config, credentials_dir: PathBuf, force: bool) -> Result<(), CliError> {
+pub fn run_generate_keypair_with_config(
+    config: &mut Config,
+    credentials_dir: PathBuf,
+    force: bool,
+) -> Result<(), CliError> {
     let keys = generate_jwt_keypair(credentials_dir, force)?;
 
     let private_key_path = path_for_config(keys.private_key_path);

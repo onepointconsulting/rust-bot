@@ -10,3 +10,4 @@ pub mod components;
 pub mod markdown;
 pub mod models;
 pub mod session_groups;
+pub mod user_display;

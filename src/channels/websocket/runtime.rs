@@ -54,7 +54,7 @@ use crate::{
     security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
-    session::manager::{Session, SessionManager},
+    session::manager::{RenameSessionError, Session, SessionManager},
 };
 
 const MAX_HISTORY_MESSAGES: usize = 200;
@@ -143,6 +143,34 @@ static CHAT_ID_RE: LazyLock<Regex> =
 /// client-supplied chat_ids (e.g. `attach`/`message` envelopes).
 fn is_valid_chat_id(value: &str) -> bool {
     CHAT_ID_RE.is_match(value)
+}
+
+/// Pull `chat_id` off an inbound envelope, sending an unscoped
+/// `invalid chat_id` error and returning `None` when it's missing or
+/// malformed. The error is deliberately unscoped (no `chat_id` field):
+/// a client mid-session-switch has already cleared its local chat_id,
+/// so a chat-scoped error frame would be filtered out as belonging to
+/// the previous subscription.
+async fn require_valid_chat_id<'a>(
+    envelope_dispatch_context: &EnvelopeDispatchContext<'a>,
+) -> Option<&'a str> {
+    let cid = envelope_dispatch_context
+        .envelope
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if is_valid_chat_id(cid) {
+        return Some(cid);
+    }
+    send_event(
+        envelope_dispatch_context.shared,
+        envelope_dispatch_context.connection_id,
+        WsOutboundEvent::Error,
+        None,
+        serde_json::json!({"detail": "invalid chat_id"}),
+    )
+    .await;
+    None
 }
 
 impl<'a> EnvelopeDispatchContext<'a> {
@@ -441,6 +469,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
             handle_envelope_new_chat(envelope_dispatch_context).await;
         }
         EnvelopeType::ForkChat => { /* ... */ }
+        EnvelopeType::RenameChat => {
+            handle_envelope_rename_chat(envelope_dispatch_context).await;
+        }
         EnvelopeType::Attach => {
             handle_envelope_attach(envelope_dispatch_context).await;
         }
@@ -472,34 +503,21 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
 /// file is not required — subscribe is idempotent, `history` is `[]` when
 /// nothing is persisted, and hydrate is a no-op in that case.
 async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let envelope = envelope_dispatch_context.envelope;
     let connection_id = envelope_dispatch_context.connection_id;
     let client_id = envelope_dispatch_context.client_id;
     let shared = envelope_dispatch_context.shared;
 
-    let cid = envelope
-        .get("chat_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !is_valid_chat_id(cid) {
-        send_event(
-            shared,
-            connection_id,
-            WsOutboundEvent::Error,
-            None,
-            serde_json::json!({"detail": "invalid chat_id"}),
-        )
-        .await;
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
-    }
+    };
 
     // `attached` carries a transcript snapshot, so this envelope reads chat
     // content and must clear the same allowlist bar as `message` — the
     // upgrade only proves the JWT was valid (and `authorize` returns `false`
     // rather than erroring when JWT is disabled entirely).
     //
-    // The rejection stays unscoped (no `chat_id` field), like the
-    // `invalid chat_id` one above: a client mid-session-switch has already
+    // The rejection stays unscoped (no `chat_id` field), like
+    // `require_valid_chat_id`: a client mid-session-switch has already
     // cleared its local chat_id, so a chat-scoped error frame would be
     // filtered out as belonging to the previous subscription.
     if !sender_allowed(&shared.channels_config, client_id) {
@@ -621,6 +639,95 @@ fn list_websocket_chats(sessions: Vec<serde_json::Value>) -> Vec<serde_json::Val
             Some(entry)
         })
         .collect()
+}
+
+/// Handle a `rename_chat` envelope: persist a new display `title` on an
+/// existing `websocket:{chat_id}` session and ack with `chat_renamed`.
+/// Existence of a session file *is* required — unlike `attach`, renaming
+/// a chat that was never persisted would create a title-only ghost session.
+/// Rust-side protocol addition with no nanobot precedent — see
+/// [`EnvelopeType::RenameChat`].
+async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let shared = envelope_dispatch_context.shared;
+    let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let mut rejection_fields = serde_json::Map::new();
+    rejection_fields.insert(
+        "chat_id".to_string(),
+        serde_json::Value::String(cid.to_string()),
+    );
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let title = envelope_dispatch_context
+        .envelope
+        .get("title")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(title) = title else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing title"}),
+        )
+        .await;
+        return;
+    };
+
+    let rename_result = {
+        // Drop the `MutexGuard` before `send_event`'s `.await` — same
+        // discipline as every other `session_manager` use in this file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.rename_session(&get_session_id(cid), title)
+    };
+    if let Err(e) = rename_result {
+        let detail = match e {
+            RenameSessionError::NotFound => "session_not_found",
+            RenameSessionError::Save(e) => {
+                log::error!("Failed to rename session {cid}: {e}");
+                "rename_failed"
+            }
+        };
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": detail}),
+        )
+        .await;
+        return;
+    }
+
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ChatRenamed,
+        None,
+        serde_json::json!({"chat_id": cid, "title": title}),
+    )
+    .await;
 }
 
 /// Handle a `list_chats` envelope: reply with every `websocket:`-keyed
@@ -752,7 +859,7 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let session = session_manager.get_session_internal(&format!("websocket:{chat_id}"));
+        let session = session_manager.get_session_internal(&get_session_id(chat_id));
         websocket_chat_history(session.as_ref(), MAX_HISTORY_MESSAGES)
     };
     send_event(
@@ -772,21 +879,9 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     let client_id = envelope_dispatch_context.client_id;
     let shared = envelope_dispatch_context.shared;
 
-    let cid = envelope
-        .get("chat_id")
-        .and_then(|v| v.as_str())
-        .unwrap_or_default();
-    if !is_valid_chat_id(cid) {
-        send_event(
-            shared,
-            connection_id,
-            WsOutboundEvent::Error,
-            None,
-            serde_json::json!({"detail": "invalid chat_id"}),
-        )
-        .await;
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
-    }
+    };
 
     let raw_turn_id = envelope.get("turn_id").and_then(|v| v.as_str());
     let turn_id = raw_turn_id.filter(|t| !t.is_empty());
@@ -1803,6 +1898,10 @@ fn builtin_command_starts_agent_turn(text: &str) -> bool {
         Some(CommandLifecycle::AgentTurnWithArgs) => !args.trim().is_empty(),
         _ => false,
     }
+}
+
+fn get_session_id(chat_id: &str) -> String {
+    format!("websocket:{chat_id}")
 }
 
 #[cfg(test)]
@@ -2928,6 +3027,262 @@ mod tests {
             chats.iter().filter_map(|c| c["chat_id"].as_str()).collect();
         assert!(chat_ids.contains("chat-a"));
         assert!(chat_ids.contains("chat-b"));
+    }
+
+    // --- handle_envelope_rename_chat ---
+
+    async fn dispatch_rename(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+        title: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("rename_chat"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        if let Some(title) = title {
+            envelope.insert("title".to_string(), title);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_rename_chat must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_rename_chat_persists_title_and_sends_chat_renamed() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_rename(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("  Fix the login bug  ")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "chat_renamed");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["title"], "Fix the login bug");
+        assert!(rx.try_recv().is_err(), "rename must send exactly one frame");
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::session::SESSION_TITLE_METADATA_KEY),
+            Some(&serde_json::json!("Fix the login bug"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_rename_chat_rejects_invalid_or_missing_chat_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        for chat_id in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("has space")),
+            Some(serde_json::json!(123)),
+        ] {
+            dispatch_rename(
+                &shared,
+                "conn-1",
+                chat_id.clone(),
+                Some(serde_json::json!("A title")),
+            )
+            .await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected payload: {chat_id:?}");
+            assert_eq!(body["detail"], "invalid chat_id");
+            assert!(
+                body.get("chat_id").is_none(),
+                "invalid rename must omit chat_id, matching attach: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_rename_chat_rejects_missing_or_empty_title() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        for title in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("   ")),
+            Some(serde_json::json!(123)),
+        ] {
+            dispatch_rename(
+                &shared,
+                "conn-1",
+                Some(serde_json::json!("chat-1")),
+                title.clone(),
+            )
+            .await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected payload: {title:?}");
+            assert_eq!(body["detail"], "missing title");
+            assert_eq!(body["chat_id"], "chat-1");
+        }
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert!(
+            session
+                .metadata
+                .get(crate::session::SESSION_TITLE_METADATA_KEY)
+                .is_none(),
+            "a rejected rename must not persist a title: {:?}",
+            session.metadata
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_rename_chat_rejects_unknown_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_rename(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("missing-chat")),
+            Some(serde_json::json!("A title")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "session_not_found");
+        assert_eq!(body["chat_id"], "missing-chat");
+        assert!(
+            !body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("websocket:"),
+            "wire error must not leak the internal session key: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_rename_chat_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                crate::session::SESSION_TITLE_METADATA_KEY.to_string(),
+                serde_json::json!("Keep me"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_rename(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("Hijacked")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["chat_id"], "chat-1");
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::session::SESSION_TITLE_METADATA_KEY),
+            Some(&serde_json::json!("Keep me"))
+        );
     }
 
     #[tokio::test]

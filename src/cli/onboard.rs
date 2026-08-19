@@ -1,7 +1,7 @@
+use inquire::Confirm;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::PathBuf;
-use inquire::Confirm;
 
 use anstyle::{AnsiColor, Color, Style};
 
