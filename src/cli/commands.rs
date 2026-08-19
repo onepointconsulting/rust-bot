@@ -14,7 +14,9 @@ use crate::api::login::{GatewayApiDoc, LoginState, jwt_auth_state_from_config, l
 use crate::api::rest::ApiServer;
 use crate::api::rest::build_cors_layer;
 use crate::api::rest::create_api_server;
-use crate::api::user_registry::JsonUserRegistry;
+use crate::api::user_registry::{
+    JsonUserRegistry, User, UserRegistry, UserRegistryError, hash_password,
+};
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
 use crate::channels::manager::ChannelManager;
@@ -30,6 +32,9 @@ use crate::cron::CronPayloadKind;
 use crate::cron::compute_next_run;
 use crate::cron::service::now_ms;
 use crate::heartbeat::service::HeartbeatService;
+use crate::security::jwt::{
+    DEFAULT_EXPIRES_IN_MONTHS, JwtError, generate_jwt_keypair, generate_jwt_token,
+};
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::manager::SessionManager;
 use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
@@ -59,7 +64,7 @@ use crate::cli::paste_edit_mode::{
 };
 use crate::cli::progress::{ProgressType, create_on_progress, print_cli_progress_line};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
-use crate::config::loader::{load_config, resolve_config_env_vars, set_config_path};
+use crate::config::loader::{load_config, resolve_config_env_vars, save_config, set_config_path};
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
 use crate::config::schema::{ChannelsConfig, Config};
@@ -106,6 +111,12 @@ pub enum Commands {
 
     /// Initialize configuration and workspace
     Onboard(OnboardArgs),
+
+    /// Generate an Ed25519 keypair and update api.jwt key paths in the config file
+    GenerateJwtKeypair(GenerateJwtKeypairArgs),
+
+    /// Mint an EdDSA JWT using the private key path from the config file
+    GenerateJwtToken(GenerateJwtTokenArgs),
 }
 
 #[derive(Debug, Parser)]
@@ -236,11 +247,65 @@ pub struct LoginArgs {
     pub config: PathBuf,
 }
 
+#[derive(Debug, Parser)]
+pub struct GenerateJwtKeypairArgs {
+    /// Path to the rust-bot JSON configuration file
+    #[arg(short, long)]
+    pub config: PathBuf,
+
+    /// Directory where private_key.pem and public_key.pem are written
+    #[arg(long, default_value = "./.rust-bot/credentials")]
+    pub credentials_dir: PathBuf,
+
+    /// Overwrite existing key files
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub force: bool,
+}
+
+#[derive(Debug, Parser)]
+pub struct GenerateJwtTokenArgs {
+    /// Path to the rust-bot JSON configuration file
+    #[arg(short, long)]
+    pub config: PathBuf,
+
+    /// Override issuer (defaults to api.jwt.iss from config)
+    #[arg(long)]
+    pub iss: Option<String>,
+
+    /// Override audience (defaults to api.jwt.aud from config; empty omits claim)
+    #[arg(long)]
+    pub aud: Option<String>,
+
+    /// Purpose claim marking what this token was minted for (e.g. "webui"
+    /// for a WebSocket-connecting WebUI frontend); omitted when unset
+    #[arg(long)]
+    pub purpose: Option<String>,
+
+    /// Token lifetime in months (default: 6)
+    #[arg(long, default_value_t = DEFAULT_EXPIRES_IN_MONTHS)]
+    pub expires_in_months: u32,
+
+    /// The email of the user for whom the token is being generated
+    #[arg(long, required = true)]
+    pub user_email: String,
+
+    /// Optional password; stored as an Argon2id hash in the users file
+    #[arg(long)]
+    pub password: Option<String>,
+
+    /// Path to the JSON user registry file (email -> token map)
+    #[arg(long, required = true)]
+    pub users_file: PathBuf,
+}
+
 #[derive(Debug)]
 pub enum CliError {
     FailedToCreateWebRootDirectory(std::io::Error),
     InteractiveNotImplemented,
     Inquire(inquire::InquireError),
+    Jwt(JwtError),
+    UserRegistry(UserRegistryError),
+    Other(String),
 }
 
 impl fmt::Display for CliError {
@@ -258,6 +323,9 @@ impl fmt::Display for CliError {
             Self::FailedToCreateWebRootDirectory(err) => {
                 write!(f, "Failed to create web root directory: {err}")
             }
+            Self::Jwt(err) => write!(f, "{err}"),
+            Self::UserRegistry(err) => write!(f, "{err}"),
+            Self::Other(err) => write!(f, "{err}"),
         }
     }
 }
@@ -265,6 +333,18 @@ impl fmt::Display for CliError {
 impl From<inquire::InquireError> for CliError {
     fn from(err: inquire::InquireError) -> Self {
         Self::Inquire(err)
+    }
+}
+
+impl From<JwtError> for CliError {
+    fn from(err: JwtError) -> Self {
+        Self::Jwt(err)
+    }
+}
+
+impl From<UserRegistryError> for CliError {
+    fn from(err: UserRegistryError) -> Self {
+        Self::UserRegistry(err)
     }
 }
 
@@ -329,7 +409,176 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Gateway(args) => run_gateway(args).await,
         Commands::Login(args) => run_login(args).await,
         Commands::Onboard(args) => run_onboard(args),
+        Commands::GenerateJwtKeypair(args) => run_generate_keypair(args),
+        Commands::GenerateJwtToken(args) => run_generate_token(args),
     }
+}
+
+fn path_for_config(path: PathBuf) -> PathBuf {
+    let canonical = path.canonicalize().unwrap_or(path);
+    #[cfg(windows)]
+    {
+        let as_str = canonical.to_string_lossy();
+        if let Some(stripped) = as_str.strip_prefix(r"\\?\") {
+            return PathBuf::from(stripped);
+        }
+    }
+    canonical
+}
+
+fn run_generate_keypair(args: GenerateJwtKeypairArgs) -> Result<(), CliError> {
+    let mut config = load_config(Some(args.config.clone()));
+    run_generate_keypair_with_config(&mut config, args.credentials_dir, args.force)?;
+
+    save_config(&config, Some(args.config.clone()))?;
+
+    eprintln!("Updated api.jwt key paths in {}", args.config.display());
+    Ok(())
+}
+
+pub fn run_generate_keypair_with_config(config: &mut Config, credentials_dir: PathBuf, force: bool) -> Result<(), CliError> {
+    let keys = generate_jwt_keypair(credentials_dir, force)?;
+
+    let private_key_path = path_for_config(keys.private_key_path);
+    let public_key_path = path_for_config(keys.public_key_path);
+
+    config.api.jwt.private_key_path = private_key_path.display().to_string();
+    config.api.jwt.public_key_path = public_key_path.display().to_string();
+
+    eprintln!("Wrote private key: {}", private_key_path.display());
+    eprintln!("Wrote public key:  {}", public_key_path.display());
+    Ok(())
+}
+
+/// Resolves the `aud` claim for a minted token.
+///
+/// Precedence, checked in order:
+/// 1. An explicit `--aud` override always wins — the caller knows best.
+/// 2. `purpose == "webui"` mints a token meant to authenticate a WebUI
+///    frontend's *WebSocket* connection, not a REST API call — so it must
+///    carry the WebSocket channel's own audience, or
+///    `validate_jwt_aud_matches_path` (`channels::websocket::types`) will
+///    401 it at WS upgrade since that channel checks incoming tokens'
+///    `aud` against its own `path`, not `api.jwt.aud`. That audience is:
+///    - `existing_websocket_config.jwt.aud` if a `websocket` entry already
+///      exists in `channels.extra` and its `jwt.aud` is non-empty; else
+///    - that same existing entry's `path`; else, if no `websocket` entry
+///      exists yet,
+///    - `WebSocketConfig::default().path` — the value `run_generate_token`
+///      is about to write into a freshly created entry, so the minted token
+///      and the config it's paired with always agree.
+/// 3. Any other purpose (or none) keeps the REST API's own audience,
+///    `api_jwt_aud` (i.e. `api.jwt.aud`) — unchanged from prior behavior.
+fn resolve_aud(
+    aud_override: Option<&str>,
+    purpose: Option<&str>,
+    api_jwt_aud: &str,
+    existing_websocket_config: Option<&WebSocketConfig>,
+) -> String {
+    if let Some(explicit) = aud_override {
+        return explicit.to_string();
+    }
+
+    if purpose == Some("webui") {
+        return match existing_websocket_config {
+            Some(cfg) if !cfg.jwt.aud.trim().is_empty() => cfg.jwt.aud.clone(),
+            Some(cfg) => cfg.path.clone(),
+            None => WebSocketConfig::default().path,
+        };
+    }
+
+    api_jwt_aud.to_string()
+}
+
+fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
+    let mut config = load_config(Some(args.config.clone()));
+    let jwt = &config.api.jwt;
+
+    let iss = args.iss.unwrap_or_else(|| jwt.iss.clone());
+
+    // Deserialize the existing `websocket` entry (if any) so `resolve_aud`
+    // can mirror the audience the gateway will actually validate against,
+    // rather than always falling back to the REST API's own `api.jwt.aud`.
+    // A malformed existing entry (fails to deserialize as `WebSocketConfig`)
+    // is treated as absent — `resolve_aud` then falls back to the default
+    // WebSocket path, the same value used when writing a fresh entry below.
+    let existing_websocket_config: Option<WebSocketConfig> = config
+        .channels
+        .extra
+        .get("websocket")
+        .and_then(|value| serde_json::from_value(value.clone()).ok());
+
+    let aud = resolve_aud(
+        args.aud.as_deref(),
+        args.purpose.as_deref(),
+        &jwt.aud,
+        existing_websocket_config.as_ref(),
+    );
+    let purpose = args.purpose.unwrap_or_default();
+
+    let minted = generate_jwt_token(
+        &jwt.private_key_path,
+        iss,
+        aud,
+        purpose,
+        args.expires_in_months,
+    )?;
+
+    let mut registry = JsonUserRegistry::open(args.users_file.clone())?;
+    registry
+        .register_user(&User {
+            email: args.user_email,
+            password_hash: hash_password(args.password)?,
+            token: minted.token.clone(),
+        })
+        .map_err(|e| CliError::Other(e.to_string()))?;
+    // Canonicalize after register_user so the file exists on disk.
+    config.api.users_file = path_for_config(args.users_file).display().to_string();
+
+    let websocket_config = WebSocketConfig::default();
+    if !config.channels.extra.contains_key("websocket") {
+        config.channels.extra.insert(
+            "websocket".to_string(),
+            serde_json::json!({
+                "enabled": websocket_config.enabled,
+                "host": websocket_config.host,
+                "port": websocket_config.port,
+                "path": websocket_config.path,
+                "jwt": serde_json::json!({
+                    "enabled": true,
+                    "privateKeyPath": config.api.jwt.private_key_path,
+                    "publicKeyPath": config.api.jwt.public_key_path,
+                    "iss": config.api.jwt.iss,
+                    "aud": websocket_config.path,
+                }),
+                "allowFrom": websocket_config.allow_from,
+                "streaming": websocket_config.streaming,
+                "maxMessageBytes": websocket_config.max_message_bytes,
+                "pingIntervalS": websocket_config.ping_interval_s,
+                "pingTimeoutS": websocket_config.ping_timeout_s,
+                "sslCertfile": websocket_config.ssl_certfile,
+            }),
+        );
+    }
+
+    eprintln!("Updated websocket config in {}", args.config.display());
+
+    save_config(&config, Some(args.config.clone()))?;
+
+    eprintln!("sub: {}", minted.claims.sub);
+    eprintln!("exp: {} (unix)", minted.claims.exp);
+    if let Some(aud) = &minted.claims.aud {
+        eprintln!("aud: {aud}");
+    } else {
+        eprintln!("aud: (omitted)");
+    }
+    if let Some(purpose) = &minted.claims.purpose {
+        eprintln!("purpose: {purpose}");
+    } else {
+        eprintln!("purpose: (omitted)");
+    }
+    println!("{}", minted.token);
+    Ok(())
 }
 
 fn prepare_workspace(config: PathBuf, workspace: Option<PathBuf>) -> (Config, PathBuf) {
@@ -1911,5 +2160,105 @@ mod tests {
         let file = dir.path().join("not-a-dir");
         fs::write(&file, "x").unwrap();
         assert!(!web_root_has_ui(&file));
+    }
+
+    /// `purpose = "webui"`, no `--aud` override, no existing `websocket`
+    /// entry in `channels.extra` yet: falls back to
+    /// `WebSocketConfig::default().path`, matching what `run_generate_token`
+    /// is about to write into a freshly created entry.
+    #[test]
+    fn webui_purpose_with_no_existing_websocket_config_uses_default_path() {
+        let aud = resolve_aud(None, Some("webui"), "https://api.example.com", None);
+        assert_eq!(aud, WebSocketConfig::default().path);
+    }
+
+    /// `purpose = "webui"`, no `--aud` override, an existing `websocket`
+    /// entry whose `jwt.aud` is already set: that existing `jwt.aud` wins,
+    /// not the default path.
+    #[test]
+    fn webui_purpose_with_existing_jwt_aud_uses_that_aud() {
+        let existing = WebSocketConfig {
+            path: "/ws".to_string(),
+            jwt: crate::config::schema::JwtConfig {
+                aud: "/ws".to_string(),
+                ..Default::default()
+            },
+            ..WebSocketConfig::default()
+        };
+
+        let aud = resolve_aud(
+            None,
+            Some("webui"),
+            "https://api.example.com",
+            Some(&existing),
+        );
+        assert_eq!(aud, "/ws");
+    }
+
+    /// `purpose = "webui"`, no `--aud` override, an existing `websocket`
+    /// entry whose `path` was customized but `jwt.aud` is left empty: falls
+    /// back to that existing entry's `path`, not the global default.
+    #[test]
+    fn webui_purpose_with_existing_config_and_empty_jwt_aud_uses_existing_path() {
+        let existing = WebSocketConfig {
+            path: "/custom-ws".to_string(),
+            jwt: crate::config::schema::JwtConfig {
+                aud: String::new(),
+                ..Default::default()
+            },
+            ..WebSocketConfig::default()
+        };
+        assert!(existing.jwt.aud.trim().is_empty(), "test assumes empty aud");
+
+        let aud = resolve_aud(
+            None,
+            Some("webui"),
+            "https://api.example.com",
+            Some(&existing),
+        );
+        assert_eq!(aud, "/custom-ws");
+    }
+
+    /// An explicit `--aud` override always wins, even for `purpose = "webui"`
+    /// and even when an existing `websocket` config entry would otherwise
+    /// resolve to a different audience.
+    #[test]
+    fn explicit_override_wins_even_for_webui_purpose() {
+        let existing = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+
+        let aud = resolve_aud(
+            Some("explicit-aud"),
+            Some("webui"),
+            "https://api.example.com",
+            Some(&existing),
+        );
+        assert_eq!(aud, "explicit-aud");
+    }
+
+    /// No purpose (or some other purpose) keeps the prior behavior: fall
+    /// back to `api.jwt.aud`, regardless of any existing `websocket` config.
+    #[test]
+    fn non_webui_purpose_falls_back_to_api_jwt_aud() {
+        let existing = WebSocketConfig {
+            path: "/ws".to_string(),
+            ..WebSocketConfig::default()
+        };
+
+        assert_eq!(
+            resolve_aud(None, None, "https://api.example.com", Some(&existing)),
+            "https://api.example.com"
+        );
+        assert_eq!(
+            resolve_aud(
+                None,
+                Some("some-other-purpose"),
+                "https://api.example.com",
+                Some(&existing)
+            ),
+            "https://api.example.com"
+        );
     }
 }

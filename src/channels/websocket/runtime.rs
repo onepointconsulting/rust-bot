@@ -176,7 +176,7 @@ fn sender_allowed(channels_config: &ChannelsConfig, sender_id: &str) -> bool {
 /// Custom JWT claim value marking a token as minted for the WebUI frontend
 /// specifically, distinct from `aud` (which, for this channel, is already
 /// pinned to the route path — see `validate_jwt_aud_matches_path`). Checked
-/// by [`authorize`]; mint one via `generate-jwt generate-jwt-token --purpose
+/// by [`authorize`]; mint one via `rust-bot generate-jwt-token --purpose
 /// webui` — see `security::jwt::Claims::purpose`.
 const WEBUI_JWT_PURPOSE: &str = "webui";
 
@@ -2681,15 +2681,13 @@ mod tests {
     fn websocket_chat_history_maps_user_and_assistant_and_drops_internal_keys() {
         let mut session = Session::new("websocket:chat-1".to_string());
         session.messages.push(history_message("user", "hello"));
-        session
-            .messages
-            .push(serde_json::json!({
-                "role": "assistant",
-                "content": "hi",
-                "timestamp": "2026-01-01T00:00:01Z",
-                "reasoning_content": "think",
-                "tool_calls": [{"id": "c1"}],
-            }));
+        session.messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "hi",
+            "timestamp": "2026-01-01T00:00:01Z",
+            "reasoning_content": "think",
+            "tool_calls": [{"id": "c1"}],
+        }));
 
         let history = websocket_chat_history(Some(&session), 500);
 
@@ -2721,7 +2719,9 @@ mod tests {
             "content": "hidden prompt",
             "_hidden_history": true,
         }));
-        session.messages.push(history_message("tool", "tool output"));
+        session
+            .messages
+            .push(history_message("tool", "tool output"));
         session.messages.push(history_message("system", "sys"));
         session
             .messages
@@ -2760,9 +2760,13 @@ mod tests {
         let mut session = Session::new("websocket:chat-1".to_string());
         session.messages.push(history_message("user", "old"));
         session.messages.push(history_message("assistant", "old-a"));
-        session.messages.push(history_message("assistant", "dangling"));
+        session
+            .messages
+            .push(history_message("assistant", "dangling"));
         session.messages.push(history_message("user", "keep"));
-        session.messages.push(history_message("assistant", "keep-a"));
+        session
+            .messages
+            .push(history_message("assistant", "keep-a"));
 
         let history = websocket_chat_history(Some(&session), 3);
 

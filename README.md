@@ -10,6 +10,7 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 - [Quick start](#quick-start)
 - [Command line](#command-line)
   - `agent` [subcommand](#agent-subcommand)
+  - [JWT keypair and tokens](#jwt-keypair-and-tokens)
   - [Exit codes](#exit-codes)
   - [Examples](#examples)
 - [Interactive console](#interactive-console)
@@ -132,6 +133,45 @@ cargo run -- agent --help
 | `--logs` / `--no-logs`         | `false`                   | Show runtime logs during chat                                                                |
 
 
+### JWT keypair and tokens
+
+JWT auth for the REST API and WebSocket gateway is configured through two
+`rust-bot` subcommands (no separate helper binary).
+
+Generate an Ed25519 keypair and write the key paths into the config:
+
+```
+cargo run -- generate-jwt-keypair --config ./path/to/config.json
+```
+
+After a release build:
+
+```
+rust-bot generate-jwt-keypair --config ./path/to/config.json
+```
+
+Keys are written to `./.rust-bot/credentials/` by default. Pass
+`--credentials-dir` to choose another directory, or `--force` to overwrite
+existing keys.
+
+Mint a bearer token and register a user:
+
+```
+cargo run -- generate-jwt-token --config ./path/to/config.json \
+  --user-email user@example.com --users-file ./path/to/users.json
+```
+
+`--user-email` and `--users-file` are required. Optional flags: `--iss`,
+`--aud`, `--purpose` (e.g. `webui` for the WebSocket chat UI),
+`--expires-in-months` (default: 6), and `--password`. The JWT is printed to
+stdout. Pass `--password` to store an Argon2id hash for `/v1/login`.
+
+For the full option list:
+
+```
+cargo run -- generate-jwt-keypair --help
+cargo run -- generate-jwt-token --help
+```
 
 
 ### Exit codes

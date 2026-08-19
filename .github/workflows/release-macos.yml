@@ -68,7 +68,7 @@ jobs:
         run: trunk build --release
 
       - name: Build release binaries
-        run: cargo build --release --bin rust-bot --bin generate-jwt --bin gmail-auth --target aarch64-apple-darwin
+        run: cargo build --release --bin rust-bot --bin gmail-auth --target aarch64-apple-darwin
 
       - name: Assemble package
         id: package
@@ -80,13 +80,12 @@ jobs:
 
           mkdir -p "${stage_name}/configuration/samples"
           cp "target/aarch64-apple-darwin/release/rust-bot" "${stage_name}/rust-bot"
-          cp "target/aarch64-apple-darwin/release/generate-jwt" "${stage_name}/generate-jwt"
           cp "target/aarch64-apple-darwin/release/gmail-auth" "${stage_name}/gmail-auth"
           cp "packaging/INSTALL.md" "${stage_name}/INSTALL.md"
           cp packaging/samples/* "${stage_name}/configuration/samples/"
           cp -r web-chat/dist "${stage_name}/web"
           cp -r websockets-chat/dist "${stage_name}/websockets"
-          chmod +x "${stage_name}/rust-bot" "${stage_name}/generate-jwt" "${stage_name}/gmail-auth"
+          chmod +x "${stage_name}/rust-bot" "${stage_name}/gmail-auth"
 
           tar czf "$archive_name" "$stage_name"
 
@@ -106,7 +105,7 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
-            Each package bundles the `rust-bot`, `generate-jwt`, and
+            Each package bundles the `rust-bot` and
             `gmail-auth` binaries, the web-chat UI assets under `web/`,
             the websockets-chat UI assets under `websockets/`,
             sample configurations under `configuration/samples/`, and an

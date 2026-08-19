@@ -28,8 +28,9 @@ pub struct Claims {
     /// distinct from `aud` (which, for the WebSocket channel, is already
     /// pinned to the route path — see `validate_jwt_aud_matches_path`). Set
     /// via `generate_jwt_token`'s `purpose` argument (empty omits the claim,
-    /// same convention as `aud`); the `generate-jwt` CLI exposes it as
-    /// `--purpose`. Checked by `channels::websocket::runtime::authorize`.
+    /// same convention as `aud`); the `rust-bot generate-jwt-token` CLI
+    /// exposes it as `--purpose`. Checked by
+    /// `channels::websocket::runtime::authorize`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub purpose: Option<String>,
 }
@@ -331,8 +332,9 @@ mod tests {
 
     #[test]
     fn missing_purpose_claim_deserializes_to_none() {
-        // Tokens minted without a purpose (e.g. /v1/login, or the
-        // `generate-jwt` CLI without `--purpose`) must still validate, with
+        // Tokens minted without a purpose (e.g. /v1/login, or
+        // `rust-bot generate-jwt-token` without `--purpose`) must still
+        // validate, with
         // `purpose: None` — backward compatible.
         let dir = tempdir().unwrap();
         let keys = generate_jwt_keypair(dir.path(), false).unwrap();

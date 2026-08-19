@@ -14,7 +14,7 @@ use tera::Context;
 
 use crate::{
     config::paths::get_legacy_sessions_dir,
-    providers::base::LLMProviderDyn,
+    providers::base::{LLMProviderDyn, LLMResponse},
     session::{
         SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message,
         keys::COMMAND_KEY,
@@ -27,7 +27,10 @@ use crate::{
 
 /// Max stored title length in Unicode scalar values. Matches nanobot `TITLE_MAX_CHARS`.
 const TITLE_MAX_CHARS: usize = 60;
-const TITLE_GENERATION_MAX_TOKENS: usize = 96;
+/// Reasoning models count thinking tokens against this budget. 96 was enough
+/// for a 3–8 word title from a non-reasoning model, but thinking-only replies
+/// hit `finish_reason=length` with `content: None` and never persist a title.
+const TITLE_GENERATION_MAX_TOKENS: usize = 512;
 const TITLE_GENERATION_TEMPERATURE: f32 = 0.2;
 const TITLE_INPUT_MAX_CHARS: usize = 1_000;
 
@@ -763,7 +766,7 @@ impl SessionManager {
             )
             .await;
         log::info!("Title generation response: {:?}", response);
-        let title = Self::clean_generated_title(response.content);
+        let title = Self::title_from_llm_response(&response);
         if title.is_empty() || title.to_lowercase().starts_with("error") {
             log::debug!(
                 "Title generation returned no usable title for {session_key} (finish_reason={})",
@@ -794,6 +797,34 @@ impl SessionManager {
             log::error!("Failed to save generated title for {session_key}: {e}");
         }
         Some(title)
+    }
+
+    /// Prefer the model's visible `content`. When a reasoning model burns the
+    /// token budget on thinking (`content: None`, `finish_reason=length`),
+    /// fall back to the last 3–8 word quoted phrase in `reasoning_content`.
+    fn title_from_llm_response(response: &LLMResponse) -> String {
+        let from_content = Self::clean_generated_title(response.content.clone());
+        if !from_content.is_empty() {
+            return from_content;
+        }
+        Self::title_from_reasoning(response.reasoning_content.as_deref())
+    }
+
+    fn title_from_reasoning(reasoning: Option<&str>) -> String {
+        let Some(reasoning) = reasoning.filter(|s| !s.is_empty()) else {
+            return String::new();
+        };
+        static QUOTE_RE: LazyLock<Regex> =
+            LazyLock::new(|| Regex::new(r#"["“]([^"”]+)["”]"#).expect("title quote regex"));
+        let mut last = String::new();
+        for caps in QUOTE_RE.captures_iter(reasoning) {
+            let candidate = Self::clean_generated_title(Some(caps[1].to_string()));
+            let words = candidate.split_whitespace().count();
+            if (3..=8).contains(&words) {
+                last = candidate;
+            }
+        }
+        last
     }
 
     fn clean_generated_title(raw: Option<String>) -> String {
@@ -1612,6 +1643,62 @@ mod tests {
                 .collect::<String>(),
             "a".repeat(TITLE_MAX_CHARS - 1)
         );
+    }
+
+    #[test]
+    fn title_from_llm_response_prefers_content_over_reasoning() {
+        let response = LLMResponse {
+            content: Some("Athens Weather Right Now".into()),
+            tool_calls: Vec::new(),
+            finish_reason: "stop".into(),
+            usage: HashMap::new(),
+            reasoning_content: Some(
+                "Possible: \"Current Weather in Athens Greece\". Use \"Weather in Athens Greece Now\"."
+                    .into(),
+            ),
+            thinking_blocks: None,
+        };
+        assert_eq!(
+            SessionManager::title_from_llm_response(&response),
+            "Athens Weather Right Now"
+        );
+    }
+
+    #[test]
+    fn title_from_llm_response_extracts_last_quoted_title_from_reasoning() {
+        let response = LLMResponse {
+            content: None,
+            tool_calls: Vec::new(),
+            finish_reason: "length".into(),
+            usage: HashMap::new(),
+            reasoning_content: Some(
+                "We need a concise title. Possible: \"Current Weather in Athens Greece\" \
+                 but that's 4 words. Or \"Athens Weather Right Now\" that's 4. \
+                 Use \"Weather in Athens Greece Now\" 4."
+                    .into(),
+            ),
+            thinking_blocks: None,
+        };
+        assert_eq!(
+            SessionManager::title_from_llm_response(&response),
+            "Weather in Athens Greece Now"
+        );
+    }
+
+    #[test]
+    fn title_from_llm_response_ignores_short_or_long_quoted_reasoning() {
+        let response = LLMResponse {
+            content: Some("   ".into()),
+            tool_calls: Vec::new(),
+            finish_reason: "length".into(),
+            usage: HashMap::new(),
+            reasoning_content: Some(
+                "Too short: \"Hi\". Too long: \"This is a nine word candidate that should not win\"."
+                    .into(),
+            ),
+            thinking_blocks: None,
+        };
+        assert_eq!(SessionManager::title_from_llm_response(&response), "");
     }
 
     #[test]

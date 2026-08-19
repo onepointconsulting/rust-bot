@@ -586,7 +586,10 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.split_stream_on_next_delta.set(false);
         }
         ServerEvent::Attached { chat_id, history } => {
-            log::info!("attached to chat_id={chat_id} history_len={}", history.len());
+            log::info!(
+                "attached to chat_id={chat_id} history_len={}",
+                history.len()
+            );
             adopt_chat_id(ctx, chat_id);
             ctx.chat_error.set(None);
             ctx.turn_index.set(HashMap::new());
@@ -802,6 +805,9 @@ fn request_chat_list(ctx: &WsContext) {
 /// title that was still generating when [`request_chat_list`]'s
 /// immediately-on-completion call ran. See [`schedule_delayed_chat_list_refresh`].
 const TITLE_REFRESH_DELAY_MS: u32 = 4_000;
+/// Second follow-up after [`TITLE_REFRESH_DELAY_MS`], for slower reasoning
+/// models whose title call is still in flight at the first refresh.
+const TITLE_REFRESH_RETRY_DELAY_MS: u32 = 8_000;
 
 /// Follow-up [`request_chat_list`] a few seconds after a turn completes.
 ///
@@ -810,13 +816,18 @@ const TITLE_REFRESH_DELAY_MS: u32 = 4_000;
 /// finishes — it is not remotely done by the time this connection's own
 /// `stream_end`/final `message` arrives, so the immediate refresh at
 /// completion almost always still shows the "New chat" placeholder. There is
-/// no push notification for "title ready", so this is a one-shot,
-/// best-effort timer rather than a guarantee: if the LLM call is unusually
-/// slow, the real title only shows up on the *next* refresh (another turn,
-/// a new chat, or a reconnect).
+/// no push notification for "title ready", so this is a best-effort pair of
+/// timers rather than a guarantee: if the LLM call is unusually slow, the
+/// real title only shows up on the *next* refresh (another turn, a new chat,
+/// or a reconnect).
 fn schedule_delayed_chat_list_refresh(ctx: WsContext) {
     spawn_local(async move {
         gloo_timers::future::sleep(Duration::from_millis(u64::from(TITLE_REFRESH_DELAY_MS))).await;
+        request_chat_list(&ctx);
+        gloo_timers::future::sleep(Duration::from_millis(u64::from(
+            TITLE_REFRESH_RETRY_DELAY_MS,
+        )))
+        .await;
         request_chat_list(&ctx);
     });
 }

@@ -26,11 +26,11 @@ required.
 ## Mint a usable token
 
 The gateway validates a token's `aud` claim against its own WebSocket
-channel path, not the REST API's `aud` — `generate-jwt-token --purpose
-webui` resolves that automatically, so no `--aud` flag is needed:
+channel path, not the REST API's `aud` — `rust-bot generate-jwt-token
+--purpose webui` resolves that automatically, so no `--aud` flag is needed:
 
 ```bash
-cargo run --bin generate-jwt -- generate-jwt-token \
+cargo run -- generate-jwt-token \
   --config ./configs/simple1/config.json \
   --purpose webui \
   --user-email you@example.com \
@@ -71,7 +71,7 @@ browser always hits the upgrade handler instead of the SPA and fails with
 ```
 
 (`jwt.aud` must always equal `path` exactly — the gateway validates that at
-startup. `generate-jwt-token --purpose webui`, per the step above, already
+startup. `rust-bot generate-jwt-token --purpose webui`, per the step above, already
 resolves its own `--aud` from whatever `path` your config has.)
 
 In another terminal, serve the UI with live reload:

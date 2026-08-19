@@ -25,10 +25,11 @@ const MAX_STORED_TURNS: usize = 10;
 /// is a fire-and-forget background LLM call kicked off only once the turn
 /// finishes server-side, so it is essentially never done by the time this
 /// request's own response comes back. There is no push notification for
-/// "title ready", so this is a one-shot, best-effort timer rather than a
+/// "title ready", so this is a best-effort pair of timers rather than a
 /// guarantee: if the LLM call is unusually slow, the real title only shows
 /// up on the *next* refresh (another message, a new chat, or a reload).
 const TITLE_REFRESH_DELAY_MS: u32 = 4_000;
+const TITLE_REFRESH_RETRY_DELAY_MS: u32 = 8_000;
 
 fn read_stored_token() -> Option<String> {
     SessionStorage::get::<String>(TOKEN_STORAGE_KEY).ok()
@@ -269,6 +270,11 @@ pub fn App() -> impl IntoView {
                         spawn_local(async move {
                             gloo_timers::future::sleep(Duration::from_millis(u64::from(
                                 TITLE_REFRESH_DELAY_MS,
+                            )))
+                            .await;
+                            load_sessions(jwt_for_refresh.clone(), email.clone());
+                            gloo_timers::future::sleep(Duration::from_millis(u64::from(
+                                TITLE_REFRESH_RETRY_DELAY_MS,
                             )))
                             .await;
                             load_sessions(jwt_for_refresh, email);

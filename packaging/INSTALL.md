@@ -1,8 +1,8 @@
 # Rust Bot - Installation
 
-This package contains a pre-built `rust-bot` binary, helper tools
-(`generate-jwt` and `gmail-auth`), the `web-chat` web UI assets, and two
-sample configurations. Follow these steps to get started.
+This package contains a pre-built `rust-bot` binary, a `gmail-auth` helper
+for Gmail OAuth, the `web-chat` web UI assets, and two sample
+configurations. Follow these steps to get started.
 
 ## 1. Unpack
 
@@ -11,7 +11,6 @@ Extract the archive:
 ```text
 rust-bot-<version>-<platform>/
   rust-bot[.exe]
-  generate-jwt[.exe]
   gmail-auth[.exe]
   INSTALL.md
   templates/
@@ -92,9 +91,66 @@ If you want to create a new configuration though, you can run this command, that
 rust-bot.exe onboard --config ./rust-bot/config.json
 ```
 
-## 5. Helper tools
+## 5. API JWT keys and tokens
 
-The package also includes two optional utilities.
+Use the `rust-bot` CLI when you enable the REST API (`rust-bot api`) with JWT
+auth.
+
+1. In your config, set `api.jwt.enabled` to `true` and a non-empty
+   `api.jwt.aud` (audience). Optionally set `api.jwt.iss` (default:
+   `rust-bot`).
+2. Generate an Ed25519 keypair and write the key paths into the config:
+
+```bash
+# Windows
+.\rust-bot.exe generate-jwt-keypair --config .\path\to\config.json
+
+# Linux / macOS
+./rust-bot generate-jwt-keypair --config ./path/to/config.json
+```
+
+Keys are written to `./.rust-bot/credentials/` by default
+(`private_key.pem` and `public_key.pem`). Pass `--credentials-dir` to choose
+another directory, or `--force` to overwrite existing keys.
+
+3. Mint a bearer token for API clients:
+
+```bash
+# Windows
+.\rust-bot.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json
+
+# Linux / macOS
+./rust-bot generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json
+```
+
+The JWT is printed to stdout. `--user-email` and `--users-file` are
+required: the email identifies the user (it is not embedded in the token
+itself), and `--users-file` points to a JSON file mapping emails to their
+minted tokens. The file is created if it does not exist. Registration fails
+if the email is already present in the file. Optional flags: `--iss`,
+`--aud`, `--expires-in-months` (default: 6), and `--password`. Send the
+token as `Authorization: Bearer <token>` when calling the API.
+
+Pass `--password` to also store a credential for the user:
+
+```bash
+# Windows
+.\rust-bot.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json --password "correct horse battery staple"
+
+# Linux / macOS
+./rust-bot generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json --password "correct horse battery staple"
+```
+
+The password is never stored or printed in plaintext; it is hashed with
+Argon2id before being written to the users file as `password_hash`. Users
+registered without `--password` simply omit that field.
+
+Keep private keys, minted tokens, and the users file secret; do not commit
+them.
+
+## 6. Helper tools
+
+The package also includes an optional Gmail OAuth utility.
 
 ### Gmail OAuth (`gmail-auth`)
 
@@ -135,63 +191,7 @@ Copy-Item .\token_cache.json "$HOME\.rust-bot\workspace\credentials\"
 Then set `tools.gmail.enable` to `true` in your config. Re-run `gmail-auth`
 if tokens are revoked or scopes change.
 
-### API JWT keys and tokens (`generate-jwt`)
-
-Use this when you enable the REST API (`rust-bot api`) with JWT auth.
-
-1. In your config, set `api.jwt.enabled` to `true` and a non-empty
-   `api.jwt.aud` (audience). Optionally set `api.jwt.iss` (default:
-   `rust-bot`).
-2. Generate an Ed25519 keypair and write the key paths into the config:
-
-```bash
-# Windows
-.\generate-jwt.exe generate-jwt-keypair --config .\path\to\config.json
-
-# Linux / macOS
-./generate-jwt generate-jwt-keypair --config ./path/to/config.json
-```
-
-Keys are written to `./.rust-bot/credentials/` by default
-(`private_key.pem` and `public_key.pem`). Pass `--credentials-dir` to choose
-another directory, or `--force` to overwrite existing keys.
-
-3. Mint a bearer token for API clients:
-
-```bash
-# Windows
-.\generate-jwt.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json
-
-# Linux / macOS
-./generate-jwt generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json
-```
-
-The JWT is printed to stdout. `--user-email` and `--users-file` are
-required: the email identifies the user (it is not embedded in the token
-itself), and `--users-file` points to a JSON file mapping emails to their
-minted tokens. The file is created if it does not exist. Registration fails
-if the email is already present in the file. Optional flags: `--iss`,
-`--aud`, `--expires-in-months` (default: 6), and `--password`. Send the
-token as `Authorization: Bearer <token>` when calling the API.
-
-Pass `--password` to also store a credential for the user:
-
-```bash
-# Windows
-.\generate-jwt.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json --password "correct horse battery staple"
-
-# Linux / macOS
-./generate-jwt generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json --password "correct horse battery staple"
-```
-
-The password is never stored or printed in plaintext; it is hashed with
-Argon2id before being written to the users file as `password_hash`. Users
-registered without `--password` simply omit that field.
-
-Keep private keys, minted tokens, and the users file secret; do not commit
-them.
-
-## 6. Web chat UI
+## 7. Web chat UI
 
 The package includes a pre-built `web-chat` UI (`web/index.html`, `*.js`,
 `*.wasm`) — a small login + chat interface for the REST API. It's served
@@ -211,10 +211,10 @@ file instead of passing `--web-root` every time; if `./web` exists next to
 the binary and neither is set, it is used automatically.
 
 The UI needs `api.jwt.enabled: true` to log in (see "API JWT keys and
-tokens" above) and a user registered via `generate-jwt generate-jwt-token
+tokens" above) and a user registered via `rust-bot generate-jwt-token
 --password ...` so it has an email/password to sign in with.
 
-## 7. Next steps
+## 8. Next steps
 
 - Copy a sample config to a location of your choice and adjust it (workspace
   path, ports, tool settings) once you are up and running.

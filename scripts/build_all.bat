@@ -2,7 +2,7 @@
 setlocal
 cd /d "%~dp0.."
 
-cargo build -r
+cargo build -r -j 4
 if errorlevel 1 exit /b 1
 
 cd web-chat

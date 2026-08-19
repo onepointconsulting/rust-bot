@@ -338,10 +338,7 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                 attachments: Vec::new(),
                 streaming: false,
                 tool_events: None,
-                reasoning: message
-                    .reasoning_content
-                    .clone()
-                    .filter(|s| !s.is_empty()),
+                reasoning: message.reasoning_content.clone().filter(|s| !s.is_empty()),
             })
         })
         .enumerate()

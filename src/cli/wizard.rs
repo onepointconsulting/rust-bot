@@ -5,6 +5,8 @@ use anstyle::Style;
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, Password, Select, Text};
 
+use crate::channels::websocket::types::WebSocketConfig;
+use crate::cli::commands::run_generate_keypair_with_config;
 use crate::cli::onboard::create_env_file;
 use crate::{
     cli::{CliError, commands::OnboardArgs, eprint_error},
@@ -61,10 +63,11 @@ const MODEL_PRESETS_MENU: [&str; 2] = [CREATE_MODEL_PRESET, SET_DEFAULT_MODEL_PR
 const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
 
 const CHANNEL_EMAIL: &'static str = "email";
+const CHANNEL_WEBSOCKET: &'static str = "websocket";
 const CHANNEL_OPTIONS_CHOICE: &'static str = "Channel Options";
 const CHANNELS: &'static str = "Channels";
 const CHANNELS_MENU: [&str; 2] = [CHANNEL_OPTIONS_CHOICE, CHANNELS];
-const AVAILABLE_CHANNELS: [&str; 1] = [CHANNEL_EMAIL];
+const AVAILABLE_CHANNELS: [&str; 2] = [CHANNEL_EMAIL, CHANNEL_WEBSOCKET];
 const TRANSCRIPTION_PROVIDERS_NONE: &'static str = "none";
 const TRANSCRIPTION_PROVIDERS: [&str; 3] = [TRANSCRIPTION_PROVIDERS_NONE, "groq", "openai"];
 
@@ -105,7 +108,7 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
                 choose_providers(&mut config)?;
             }
             CHAT_CHANNELS => {
-                configure_channels_menu(&mut config)?;
+                configure_channels_menu(&mut config, config_path.clone())?;
             }
             AGENT_SETTINGS => {
                 configure_agent_settings(&mut config)?;
@@ -309,14 +312,14 @@ pub fn apply_workspace_override(mut config: Config, workspace: PathBuf) -> Confi
     config
 }
 
-fn configure_channels_menu(config: &mut Config) -> Result<Config, CliError> {
+fn configure_channels_menu(config: &mut Config, config_path: PathBuf) -> Result<Config, CliError> {
     let selected = Select::new("Channels menu", CHANNELS_MENU.to_vec()).prompt()?;
     match selected {
         CHANNEL_OPTIONS_CHOICE => {
             configure_channels_options(&mut config.channels)?;
         }
         CHANNELS => {
-            configure_chat_channel(config)?;
+            configure_chat_channels(config, config_path)?;
         }
         _ => return Ok(config.clone()),
     }
@@ -389,12 +392,15 @@ fn configure_channels_options(channels: &mut ChannelsConfig) -> Result<(), CliEr
     Ok(())
 }
 
-fn configure_chat_channel(config: &mut Config) -> Result<Config, CliError> {
+fn configure_chat_channels(config: &mut Config, config_path: PathBuf) -> Result<Config, CliError> {
     let channel =
         Select::new("Select a channel to configure", AVAILABLE_CHANNELS.to_vec()).prompt()?;
     match channel {
         CHANNEL_EMAIL => {
             configure_mail_channel(config)?;
+        }
+        CHANNEL_WEBSOCKET => {
+            configure_websocket_channel(config, config_path, false)?;
         }
         _ => return Ok(config.clone()),
     }
@@ -467,6 +473,60 @@ fn configure_mail_channel(config: &mut Config) -> Result<Config, CliError> {
         .channels
         .extra
         .insert(CHANNEL_EMAIL.to_string(), value);
+    Ok(config.clone())
+}
+
+
+pub fn configure_websocket_channel(
+    config: &mut Config,
+    config_path: PathBuf,
+    jwt_default: bool,
+) -> Result<Config, CliError> {
+    let mut websocket = WebSocketConfig::default();
+    websocket.streaming = Confirm::new("Enable streaming?")
+        .with_default(websocket.streaming)
+        .with_help_message("Stream the agent's text output to the channel as it is generated")
+        .prompt()?;
+    // Gateway streaming is gated on channels.streaming, not the per-channel field.
+    if websocket.streaming {
+        config.channels.streaming = true;
+    }
+    websocket.host = Text::new("Enter WebSocket host")
+        .with_default("127.0.0.1")
+        .with_help_message("127.0.0.1")
+        .prompt()?;
+    websocket.port = CustomType::<u16>::new("Enter WebSocket port")
+        .with_default(8765)
+        .with_help_message("8765")
+        .prompt()?;
+    let enable_jwt = Confirm::new("Enable JWT authentication?")
+        .with_default(jwt_default)
+        .with_help_message("Required for the gateway web UI login; generates an Ed25519 keypair")
+        .prompt()?;
+    websocket.jwt.enabled = enable_jwt;
+    if enable_jwt {
+        websocket.jwt.aud = websocket.path.clone();
+        let Some(parent) = config_path.parent() else {
+            eprint_error("Could not determine credentials directory");
+            return Err(CliError::Inquire(
+                inquire::InquireError::InvalidConfiguration(String::from(
+                    "Could not determine credentials directory",
+                )),
+            ));
+        };
+        let credentials_dir = parent.join("credentials");
+        run_generate_keypair_with_config(config, credentials_dir, false)?;
+        // Minting uses api.jwt; the WebSocket channel validates with its own jwt key paths.
+        websocket.jwt.private_key_path = config.api.jwt.private_key_path.clone();
+        websocket.jwt.public_key_path = config.api.jwt.public_key_path.clone();
+        websocket.jwt.iss = config.api.jwt.iss.clone();
+    }
+    config.channels.extra.insert(
+        CHANNEL_WEBSOCKET.to_string(),
+        serde_json::to_value(&websocket).map_err(|e| {
+            CliError::Inquire(inquire::InquireError::InvalidConfiguration(e.to_string()))
+        })?,
+    );
     Ok(config.clone())
 }
 
@@ -1380,7 +1440,7 @@ fn configure_api(config: &mut Config) -> Result<(), CliError> {
     Ok(())
 }
 
-fn configure_gateway(config: &mut Config) -> Result<(), CliError> {
+pub fn configure_gateway(config: &mut Config) -> Result<(), CliError> {
     let gateway = &mut config.gateway;
 
     let current_host = gateway.host.clone();

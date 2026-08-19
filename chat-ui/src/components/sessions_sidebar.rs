@@ -16,9 +16,13 @@
 //! already-rendered "Today" group, or a title that finishes generating,
 //! changes a group's *contents* without changing which group labels exist —
 //! `<For>` would keep showing whatever it rendered for "Today" the first
-//! time, forever. Recomputing the whole grouped list on every `sessions`
-//! change instead (a plain reactive closure, not `<For>`) sidesteps that;
-//! the list is small enough that this is cheap.
+//! time, forever.
+//!
+//! Same class of freeze applies to `<Show when=|| !sessions.is_empty()>`:
+//! Leptos memos the boolean, so once the list is non-empty the children are
+//! not rebuilt when a later `list_chats` refresh only changes titles. The
+//! grouped list is therefore a plain reactive closure that reads `sessions`
+//! on every run (cheap: the list is small).
 
 use std::collections::HashSet;
 
@@ -231,16 +235,16 @@ pub fn SessionsSidebar(
                     </button>
                 </div>
                 <div class="flex-1 overflow-y-auto px-2 py-2">
-                    <Show
-                        when=move || !sessions.get().is_empty()
-                        fallback=|| {
+                    {move || {
+                        if sessions.get().is_empty() {
                             view! {
                                 <p class="px-2 py-4 text-xs text-slate-400">"No chats yet"</p>
                             }
+                            .into_any()
+                        } else {
+                            group_sections().into_any()
                         }
-                    >
-                        {group_sections}
-                    </Show>
+                    }}
                 </div>
             </div>
         }

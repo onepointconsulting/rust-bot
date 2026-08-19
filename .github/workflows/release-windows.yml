@@ -85,7 +85,7 @@ jobs:
         run: trunk build --release
 
       - name: Build release binaries
-        run: cargo build --release --bin rust-bot --bin generate-jwt --bin gmail-auth --target x86_64-pc-windows-msvc
+        run: cargo build --release --bin rust-bot --bin gmail-auth --target x86_64-pc-windows-msvc
 
       - name: Assemble package
         id: package
@@ -99,7 +99,6 @@ jobs:
           New-Item -ItemType Directory -Path "$stageName\configuration\samples" -Force | Out-Null
 
           Copy-Item "target\x86_64-pc-windows-msvc\release\rust-bot.exe" -Destination "$stageName\rust-bot.exe"
-          Copy-Item "target\x86_64-pc-windows-msvc\release\generate-jwt.exe" -Destination "$stageName\generate-jwt.exe"
           Copy-Item "target\x86_64-pc-windows-msvc\release\gmail-auth.exe" -Destination "$stageName\gmail-auth.exe"
           Copy-Item "packaging\INSTALL.md" -Destination "$stageName\INSTALL.md"
           Copy-Item "packaging\samples\*" -Destination "$stageName\configuration\samples\"
@@ -124,7 +123,7 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
-            Each package bundles the `rust-bot`, `generate-jwt`, and
+            Each package bundles the `rust-bot` and
             `gmail-auth` binaries, the web-chat UI assets under `web/`,
             the websockets-chat UI assets under `websockets/`,
             sample configurations under `configuration/samples/`, and an

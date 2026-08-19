@@ -1,11 +1,14 @@
 use std::fmt;
 use std::io::{self, Write};
+use std::path::PathBuf;
+use inquire::Confirm;
 
 use anstyle::{AnsiColor, Color, Style};
 
 use crate::cli::commands::{CliError, OnboardArgs};
 use crate::cli::wizard::{
-    apply_workspace_override, choose_providers, config_model, resolve_onboard_config_path, wizard,
+    apply_workspace_override, choose_providers, config_model, configure_websocket_channel,
+    resolve_onboard_config_path, wizard,
 };
 use crate::config::loader::{load_config, save_config};
 use crate::config::schema::{Config, ModelPresetConfig};
@@ -60,6 +63,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
         choose_providers(&mut config)?;
         config_model(&mut config.agents)?;
         create_default_model_presets(&mut config);
+        configure_web_app(&mut config, config_path.clone())?;
         save_config(&config, Some(config_path.clone()))?;
         print_onboard_ok(format!("Created config at {}", config_path.display()));
         config
@@ -99,6 +103,13 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
         "  2. d) Gateway: rust-bot gateway -c \"{}\"",
         config_path.display()
     );
+    if websocket_jwt_enabled(&config) {
+        println!(
+            "  3. Mint a web UI user: rust-bot generate-jwt-token -c \"{}\" --user-email you@example.com --users-file \"{}\" --purpose webui",
+            config_path.display(),
+            config.api.users_file
+        );
+    }
     Ok(())
 }
 
@@ -170,4 +181,29 @@ fn create_default_model_presets(config: &mut Config) {
         },
     );
     config.agents.model_preset = Some("primary".to_string());
+}
+
+fn websocket_jwt_enabled(config: &Config) -> bool {
+    config
+        .channels
+        .extra
+        .get("websocket")
+        .and_then(|value| value.get("jwt"))
+        .and_then(|value| value.get("enabled"))
+        .and_then(|value| value.as_bool())
+        .unwrap_or(false)
+}
+
+fn configure_web_app(config: &mut Config, config_path: PathBuf) -> Result<(), CliError> {
+    let configure_web_app = Confirm::new("Configure the gateway web UI?")
+        .with_default(false)
+        .with_help_message(
+            "Adds a WebSocket channel for rust-bot gateway and can generate a JWT keypair for login",
+        )
+        .prompt()?;
+    if configure_web_app {
+        // JWT defaults to on: the web UI's /v1/login will not mint tokens without it.
+        configure_websocket_channel(config, config_path, true)?;
+    }
+    Ok(())
 }
