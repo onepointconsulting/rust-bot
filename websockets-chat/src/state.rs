@@ -79,12 +79,20 @@ pub fn reopen_streaming(
 ///
 /// Matches how the session file stores one assistant message per round —
 /// the view `websocket_chat_history` sends on `attached`.
+///
+/// Closes any still-running tool chips on the previous segment first: a
+/// `resuming` split only happens after that round's tools have finished, and
+/// the following `stream_end` will target this new bubble, so leaving those
+/// chips alone would strand the last one in the amber "running" state.
 pub fn begin_next_stream_segment(
     entries: &mut Vec<ChatEntry>,
     turn_index: &mut HashMap<String, u64>,
     turn_id: &str,
     new_id: u64,
 ) {
+    if let Some(entry) = find_entry_for_turn(entries, turn_index, turn_id) {
+        finish_any_running_tool_events(entry);
+    }
     entries.push(ChatEntry {
         id: new_id,
         role: Role::Assistant,
@@ -103,8 +111,12 @@ pub fn begin_next_stream_segment(
 /// source-of-truth final content, which may differ slightly from a naive
 /// concatenation of every delta it streamed, so an override always wins over
 /// the accumulated content; when no override is supplied, the accumulated
-/// content is left as-is. Also closes out any still-`"running"` tool-activity
-/// chip on the entry — see [`finish_any_running_tool_events`].
+/// content is left as-is.
+///
+/// Running tool-activity chips are closed on **every** entry, not only the
+/// current segment. After a `resuming` split, `turn_index` already points at
+/// the new bubble while the last tool hint still lives on the previous one —
+/// see [`finish_any_running_tool_events`].
 pub fn apply_stream_end(
     entries: &mut Vec<ChatEntry>,
     turn_index: &HashMap<String, u64>,
@@ -116,6 +128,8 @@ pub fn apply_stream_end(
         if let Some(text) = final_text {
             entry.content = text.to_string();
         }
+    }
+    for entry in entries.iter_mut() {
         finish_any_running_tool_events(entry);
     }
 }
@@ -666,6 +680,71 @@ mod tests {
             events[1].status, "failed",
             "an already-terminal status must not be overwritten"
         );
+    }
+
+    #[test]
+    fn begin_next_stream_segment_closes_running_chips_on_the_previous_bubble() {
+        let mut entries = vec![assistant_entry(0)];
+        let mut index = index_with("turn-1", 0);
+
+        apply_tool_hint(
+            &mut entries,
+            &index,
+            "turn-1",
+            vec![ToolEvent {
+                name: "read README.md".to_string(),
+                status: "running".to_string(),
+                detail: None,
+            }],
+        );
+        begin_next_stream_segment(&mut entries, &mut index, "turn-1", 1);
+
+        assert_eq!(
+            entries[0].tool_events.clone().unwrap()[0].status,
+            "done",
+            "last tool hint on the previous segment must not stay running after the split"
+        );
+        assert_eq!(entries[1].tool_events, None);
+        assert_eq!(index.get("turn-1"), Some(&1));
+    }
+
+    #[test]
+    fn apply_stream_end_closes_running_chips_left_on_a_previous_segment() {
+        let mut entries = vec![assistant_entry(0), assistant_entry(1)];
+        entries[0].streaming = false;
+        entries[0].tool_events = Some(vec![
+            ToolEvent {
+                name: "ls src × 3".to_string(),
+                status: "done".to_string(),
+                detail: None,
+            },
+            ToolEvent {
+                name: "grep pattern".to_string(),
+                status: "done".to_string(),
+                detail: None,
+            },
+            ToolEvent {
+                name: "read README.md".to_string(),
+                status: "running".to_string(),
+                detail: None,
+            },
+        ]);
+        let index = index_with("turn-1", 1);
+
+        apply_stream_end(&mut entries, &index, "turn-1", Some("Here is the summary."));
+
+        let events = entries[0]
+            .tool_events
+            .clone()
+            .expect("tool_events on first bubble");
+        assert_eq!(events[0].status, "done");
+        assert_eq!(events[1].status, "done");
+        assert_eq!(
+            events[2].status, "done",
+            "the last chip must turn green even though stream_end targeted the new bubble"
+        );
+        assert!(!entries[1].streaming);
+        assert_eq!(entries[1].content, "Here is the summary.");
     }
 
     #[test]

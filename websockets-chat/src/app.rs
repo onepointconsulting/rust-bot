@@ -280,9 +280,10 @@ struct WsContext {
     /// a redundant reconnect. See [`handle_connection_closed`].
     generation: RwSignal<u64>,
     /// From the gateway `ready` event: whether this channel will stream
-    /// token `delta`s. Drives the in-progress indicator (cursor vs spinner).
-    /// Defaults to `false` until `ready` arrives, matching the server's
-    /// `WebSocketConfig.streaming` default.
+    /// token `delta`s. After the first visible token, drives the in-progress
+    /// indicator (blinking cursor vs nothing); the thinking spinner is shown
+    /// until then in either mode. Defaults to `false` until `ready` arrives,
+    /// matching the server's `WebSocketConfig.streaming` default.
     token_streaming: RwSignal<bool>,
     /// This connection's `websocket:*` chats, for the sessions sidebar.
     /// Refreshed by [`request_chat_list`] on `ready`/`attached` and after

@@ -139,8 +139,9 @@ pub fn MessageList(
     });
 
     // No separate "pending" flag needed: the streaming placeholder entry
-    // itself (empty/partial content + blinking cursor) is the pending
-    // indicator, so suggestions only need to check for an empty transcript.
+    // itself (spinner until the first token, then a blinking cursor) is the
+    // pending indicator, so suggestions only need to check for an empty
+    // transcript.
     let show_suggestions = move || entries.get().is_empty() && !example_prompts.get().is_empty();
 
     view! {

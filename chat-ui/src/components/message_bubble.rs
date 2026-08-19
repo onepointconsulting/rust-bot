@@ -21,10 +21,11 @@ fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
 /// reasoning panels without this crate knowing anything about them; `chat-ui`
 /// itself renders nothing there when `None`.
 ///
-/// While `streaming` is true, the in-progress indicator is either a blinking
-/// token cursor (`token_streaming` true / omitted) or a thinking spinner
-/// (`token_streaming` false) — see `.streaming-cursor` / `.thinking-indicator`
-/// in `chat-ui/style/shared.css`.
+/// While `streaming` is true, the in-progress indicator is the thinking
+/// spinner until the first visible token arrives, then a blinking cursor
+/// when `token_streaming` is true (omitted defaults to true). Non-streaming
+/// turns keep the spinner for the whole wait. See `.streaming-cursor` /
+/// `.thinking-indicator` in `chat-ui/style/shared.css`.
 #[component]
 pub fn MessageBubble(
     entry: ChatEntry,
@@ -37,15 +38,16 @@ pub fn MessageBubble(
     let attachments = entry.attachments.clone();
     let extra_view = extra.map(|children| children());
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
-    let content_empty = content.is_empty();
+    let awaiting_first_token = !markdown::has_visible_chars(&content);
 
     let pending_view = move || {
         if !streaming.get() {
             return ().into_any();
         }
-        if token_streaming.get() {
-            view! { <span class="streaming-cursor" aria-hidden="true"></span> }.into_any()
-        } else if content_empty {
+        // Token streaming still waits on the model before the first delta.
+        // A lone blinking caret in an empty bubble looks like a stuck input
+        // cursor; reuse the non-streaming spinner until visible text exists.
+        if awaiting_first_token {
             view! {
                 <div class="thinking-indicator" role="status" aria-live="polite">
                     <span class="thinking-spinner" aria-hidden="true"></span>
@@ -53,6 +55,8 @@ pub fn MessageBubble(
                 </div>
             }
             .into_any()
+        } else if token_streaming.get() {
+            view! { <span class="streaming-cursor" aria-hidden="true"></span> }.into_any()
         } else {
             ().into_any()
         }
