@@ -84,6 +84,9 @@ use crate::utils::restart::{
     should_show_cli_restart_notice,
 };
 
+/// Default `--config` path when the flag is omitted.
+pub const DEFAULT_CONFIG_PATH: &str = "./.rust-bot/config.json";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rust-bot",
@@ -135,7 +138,7 @@ pub struct AgentArgs {
     pub workspace: Option<PathBuf>,
 
     /// JSON configuration file path
-    #[arg(short, long)]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
     /// Render assistant output as Markdown
@@ -181,7 +184,7 @@ pub struct ApiArgs {
     pub web_root: Option<PathBuf>,
 
     /// JSON configuration file path (workspace is taken from `agents.workspace`)
-    #[arg(short, long)]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 }
 
@@ -196,7 +199,7 @@ pub struct GatewayArgs {
     pub verbose: bool,
 
     /// JSON configuration file path
-    #[arg(short, long)]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
     /// Bind address for the combined login + WebSocket gateway server.
@@ -225,7 +228,7 @@ pub struct OnboardArgs {
     pub workspace: PathBuf,
 
     /// JSON configuration file path
-    #[arg(short, long, default_value = "./.rust-bot/config.json")]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
     /// Use interactive setup wizard
@@ -244,14 +247,14 @@ pub struct LoginArgs {
     pub force: bool,
 
     /// JSON configuration file path
-    #[arg(short, long, default_value = "./rust-bot/config.json")]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub struct GenerateJwtKeypairArgs {
     /// Path to the rust-bot JSON configuration file
-    #[arg(short, long)]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
     /// Directory where private_key.pem and public_key.pem are written
@@ -266,7 +269,7 @@ pub struct GenerateJwtKeypairArgs {
 #[derive(Debug, Parser)]
 pub struct GenerateJwtTokenArgs {
     /// Path to the rust-bot JSON configuration file
-    #[arg(short, long)]
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
     pub config: PathBuf,
 
     /// Override issuer (defaults to api.jwt.iss from config)
@@ -290,9 +293,9 @@ pub struct GenerateJwtTokenArgs {
     #[arg(long, required = true)]
     pub user_email: String,
 
-    /// Optional password; stored as an Argon2id hash in the users file
-    #[arg(long)]
-    pub password: Option<String>,
+    /// Password; stored as an Argon2id hash in the users file
+    #[arg(long, required = true)]
+    pub password: String,
 
     /// Path to the JSON user registry file (email -> token map)
     #[arg(long, required = true)]
@@ -415,7 +418,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
     }
 }
 
-fn path_for_config(path: PathBuf) -> PathBuf {
+pub(crate) fn path_for_config(path: PathBuf) -> PathBuf {
     let canonical = path.canonicalize().unwrap_or(path);
     #[cfg(windows)]
     {
@@ -495,7 +498,7 @@ fn resolve_aud(
     api_jwt_aud.to_string()
 }
 
-fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
+pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
     let mut config = load_config(Some(args.config.clone()));
     let jwt = &config.api.jwt;
 
@@ -533,7 +536,7 @@ fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
     registry
         .register_user(&User {
             email: args.user_email,
-            password_hash: hash_password(args.password)?,
+            password_hash: Some(hash_password(args.password)?),
             token: minted.token.clone(),
         })
         .map_err(|e| CliError::Other(e.to_string()))?;
@@ -1942,7 +1945,7 @@ fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel};
+    use crate::{channels::websocket::types::DEFAULT_AUD, utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel}};
 
     #[test]
     fn extract_images_resolves_captures_by_index_and_strips_sentinels() {
@@ -2193,9 +2196,9 @@ mod tests {
     #[test]
     fn webui_purpose_with_existing_jwt_aud_uses_that_aud() {
         let existing = WebSocketConfig {
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             jwt: crate::config::schema::JwtConfig {
-                aud: "/ws".to_string(),
+                aud: DEFAULT_AUD.to_string(),
                 ..Default::default()
             },
             ..WebSocketConfig::default()
@@ -2207,7 +2210,7 @@ mod tests {
             "https://api.example.com",
             Some(&existing),
         );
-        assert_eq!(aud, "/ws");
+        assert_eq!(aud, DEFAULT_AUD);
     }
 
     /// `purpose = "webui"`, no `--aud` override, an existing `websocket`
@@ -2240,7 +2243,7 @@ mod tests {
     #[test]
     fn explicit_override_wins_even_for_webui_purpose() {
         let existing = WebSocketConfig {
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             ..WebSocketConfig::default()
         };
 
@@ -2258,7 +2261,7 @@ mod tests {
     #[test]
     fn non_webui_purpose_falls_back_to_api_jwt_aud() {
         let existing = WebSocketConfig {
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             ..WebSocketConfig::default()
         };
 

@@ -158,13 +158,15 @@ Mint a bearer token and register a user:
 
 ```
 cargo run -- generate-jwt-token --config ./path/to/config.json \
-  --user-email user@example.com --users-file ./path/to/users.json
+  --user-email user@example.com --users-file ./path/to/users.json \
+  --password "correct horse battery staple"
 ```
 
-`--user-email` and `--users-file` are required. Optional flags: `--iss`,
-`--aud`, `--purpose` (e.g. `webui` for the WebSocket chat UI),
-`--expires-in-months` (default: 6), and `--password`. The JWT is printed to
-stdout. Pass `--password` to store an Argon2id hash for `/v1/login`.
+`--user-email`, `--users-file`, and `--password` are required. Optional
+flags: `--iss`, `--aud`, `--purpose` (e.g. `webui` for the WebSocket chat
+UI), `--expires-in-months` (default: 6). The JWT is printed to stdout. The
+password is hashed with Argon2id and stored in the users file for
+`/v1/login`.
 
 For the full option list:
 

@@ -100,12 +100,12 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     );
     println!("  2. c) API: rust-bot api -c \"{}\"", config_path.display());
     println!(
-        "  2. d) Gateway: rust-bot gateway -c \"{}\"",
+        "  2. d) Gateway: rust-bot gateway -c \"{}\" --web-root websockets",
         config_path.display()
     );
     if websocket_jwt_enabled(&config) {
         println!(
-            "  3. Mint a web UI user: rust-bot generate-jwt-token -c \"{}\" --user-email you@example.com --users-file \"{}\" --purpose webui",
+            "  3. Mint a web UI user: rust-bot generate-jwt-token -c \"{}\" --user-email you@example.com --users-file \"{}\" --purpose webui --password <password>",
             config_path.display(),
             config.api.users_file
         );
@@ -196,7 +196,7 @@ fn websocket_jwt_enabled(config: &Config) -> bool {
 
 fn configure_web_app(config: &mut Config, config_path: PathBuf) -> Result<(), CliError> {
     let configure_web_app = Confirm::new("Configure the gateway web UI?")
-        .with_default(false)
+        .with_default(true)
         .with_help_message(
             "Adds a WebSocket channel for rust-bot gateway and can generate a JWT keypair for login",
         )

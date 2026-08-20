@@ -5,9 +5,10 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -r
+cargo build -r || exit 1
+
 cd web-chat
-trunk build --release
+trunk build --release  || exit 1
 
 cd ..
 

@@ -236,7 +236,7 @@ mod tests {
         registry
             .register_user(&User {
                 email: "a@b.com".to_string(),
-                password_hash: hash_password(Some("correct horse".to_string())).unwrap(),
+                password_hash: Some(hash_password("correct horse".to_string()).unwrap()),
                 token: String::new(),
             })
             .unwrap();

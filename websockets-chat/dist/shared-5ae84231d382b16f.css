@@ -94,7 +94,7 @@
   align-items: center;
   justify-content: space-between;
   gap: 0.75rem;
-  background-color: #1e293b; /* bg-slate-800 — slightly lighter than the body */
+  background-color: #545557;
   padding: 0.375rem 0.75rem; /* py-1.5 px-3 */
   font-family: ui-sans-serif, system-ui, sans-serif;
   font-size: 0.75rem; /* text-xs */

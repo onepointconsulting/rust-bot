@@ -4,11 +4,10 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    providers::{
+    channels::websocket::types::DEFAULT_AUD, providers::{
         anthropic_provider::AnthropicProvider,
         registry::{find_by_name, providers},
-    },
-    utils::helpers::expand_tilde_path,
+    }, utils::helpers::expand_tilde_path,
 };
 
 // ── ProviderConfig ────────────────────────────────────────────────────────────
@@ -602,7 +601,7 @@ fn default_jwt_iss() -> String {
 }
 
 fn default_jwt_aud() -> String {
-    "/ws".to_string()
+    DEFAULT_AUD.to_string()
 }
 
 fn validate_jwt_aud_when_enabled(value: &JwtConfig, _ctx: &()) -> garde::Result {
@@ -2187,7 +2186,7 @@ mod tests {
             "./.rust-bot/credentials/public_key.pem"
         );
         assert_eq!(cfg.iss, "rust-bot");
-        assert_eq!(cfg.aud, "/ws");
+        assert_eq!(cfg.aud, DEFAULT_AUD);
         assert!(cfg.validate().is_ok());
     }
 

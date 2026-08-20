@@ -3,8 +3,8 @@
 //! The token itself never carries the email (see [`crate::security::jwt::Claims`]);
 //! this registry provides the out-of-band mapping so operators can look up which
 //! token is current for a given user. Tokens are minted by `rust-bot generate-jwt-token` at
-//! registration time and refreshed on each successful `/v1/login`. An optional
-//! Argon2id password hash can be stored alongside the token for login.
+//! registration time and refreshed on each successful `/v1/login`. An
+//! Argon2id password hash is stored alongside the token for login.
 
 use std::collections::HashMap;
 use std::fmt;
@@ -82,16 +82,13 @@ impl From<argon2::password_hash::Error> for UserRegistryError {
 }
 
 /// Hash `password` with Argon2id using a freshly generated random salt,
-/// returning the encoded PHC string. `None` passes through as `None`.
-pub fn hash_password(password: Option<String>) -> Result<Option<String>, UserRegistryError> {
-    let Some(password) = password else {
-        return Ok(None);
-    };
+/// returning the encoded PHC string.
+pub fn hash_password(password: String) -> Result<String, UserRegistryError> {
     let salt = SaltString::generate(&mut OsRng);
     let hash = Argon2::default()
         .hash_password(password.as_bytes(), &salt)?
         .to_string();
-    Ok(Some(hash))
+    Ok(hash)
 }
 
 /// Verify `password` against a previously generated Argon2id `password_hash`.
@@ -116,7 +113,8 @@ pub trait UserRegistry {
 
 /// A [`UserRegistry`] persisted as a single JSON file containing a map of
 /// `{ "email": { "token": "...", "password_hash": "..." } }`. `password_hash`
-/// is omitted for users registered without a password.
+/// is omitted when absent (legacy entries registered before a password was
+/// required).
 pub struct JsonUserRegistry {
     path: PathBuf,
     users: HashMap<String, StoredUser>,
@@ -371,15 +369,8 @@ mod tests {
     }
 
     #[test]
-    fn hash_password_none_passes_through() {
-        assert_eq!(hash_password(None).unwrap(), None);
-    }
-
-    #[test]
     fn hash_password_produces_verifiable_argon2id_hash() {
-        let hash = hash_password(Some("hunter2".to_string()))
-            .unwrap()
-            .expect("hash for Some password");
+        let hash = hash_password("hunter2".to_string()).unwrap();
         assert!(hash.starts_with("$argon2id$"));
         assert!(verify_password("hunter2", &hash).unwrap());
         assert!(!verify_password("wrong-password", &hash).unwrap());
@@ -389,13 +380,13 @@ mod tests {
     fn register_with_password_hash_persists_across_reopen() {
         let dir = tempdir().unwrap();
         let path = registry_path(&dir);
-        let hash = hash_password(Some("hunter2".to_string())).unwrap();
+        let hash = hash_password("hunter2".to_string()).unwrap();
         {
             let mut registry = JsonUserRegistry::open(&path).unwrap();
             registry
                 .register_user(&User {
                     email: "alice@example.com".to_string(),
-                    password_hash: hash.clone(),
+                    password_hash: Some(hash.clone()),
                     token: "token-abc".to_string(),
                 })
                 .unwrap();
@@ -403,7 +394,7 @@ mod tests {
 
         let reopened = JsonUserRegistry::open(&path).unwrap();
         let fetched = reopened.get_user_by_email("alice@example.com").unwrap();
-        assert_eq!(fetched.password_hash, hash);
+        assert_eq!(fetched.password_hash.as_ref(), Some(&hash));
     }
 
     #[test]

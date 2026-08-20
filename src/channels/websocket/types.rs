@@ -206,13 +206,15 @@ pub struct WebSocketConfig {
     pub runtime_surface: String,
 }
 
+pub const DEFAULT_AUD: &str = "/ws";
+
 impl Default for WebSocketConfig {
     fn default() -> Self {
         Self {
             enabled: true,
             host: "127.0.0.1".to_string(),
             port: 8765,
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             jwt: JwtConfig::default(),
             allow_from: vec![],
             streaming: false,
@@ -323,13 +325,13 @@ mod tests {
     fn path_is_normalized_on_deserialize() {
         let cfg: WebSocketConfig =
             serde_json::from_str(r#"{"path":"/ws/"}"#).expect("valid path should deserialize");
-        assert_eq!(cfg.path, "/ws");
+        assert_eq!(cfg.path, DEFAULT_AUD);
     }
 
     #[test]
     fn jwt_aud_must_match_path_when_enabled() {
         let mut cfg = WebSocketConfig {
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             ..WebSocketConfig::default()
         };
         cfg.jwt.enabled = true;
@@ -344,7 +346,7 @@ mod tests {
     #[test]
     fn jwt_aud_matching_path_ok_when_enabled() {
         let mut cfg = WebSocketConfig {
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             ..WebSocketConfig::default()
         };
         cfg.jwt.enabled = true;
@@ -356,7 +358,7 @@ mod tests {
     #[test]
     fn jwt_enabled_requires_non_empty_aud() {
         let mut cfg = WebSocketConfig {
-            path: "/ws".to_string(),
+            path: DEFAULT_AUD.to_string(),
             ..WebSocketConfig::default()
         };
         cfg.jwt.enabled = true;

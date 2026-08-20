@@ -5,9 +5,11 @@ use anstyle::Style;
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, Password, Select, Text};
 
+use crate::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_password};
 use crate::channels::websocket::types::WebSocketConfig;
-use crate::cli::commands::run_generate_keypair_with_config;
+use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
 use crate::cli::onboard::create_env_file;
+use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_token};
 use crate::{
     cli::{CliError, commands::OnboardArgs, eprint_error},
     config::{
@@ -203,18 +205,22 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
 }
 
 pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
-    let endpoint = Text::new("Enter endpoint")
-        .with_help_message(if provider_name == PROVIDER_OPENROUTER {
-            "e.g. https://openrouter.ai/api/v1, https://api.edenai.run/v3"
+    fn default_endpoint(provider_name: &str) -> String {
+        if provider_name == PROVIDER_OPENROUTER {
+            "https://openrouter.ai/api/v1".to_string()
         } else if provider_name == PROVIDER_EDENAI {
-            "e.g. https://api.edenai.run/v3"
+            "https://api.edenai.run/v3".to_string()
         } else if provider_name == PROVIDER_ANTHROPIC {
-            "e.g. https://api.anthropic.com/v1"
+            "https://api.anthropic.com/v1".to_string()
         } else if provider_name == PROVIDER_REQUESTY {
-            "e.g. https://router.requesty.ai/v1"
+            "https://router.requesty.ai/v1".to_string()
         } else {
-            ""
-        })
+            "".to_string()
+        }
+    }
+    let endpoint = Text::new("Enter endpoint")
+        .with_default(&default_endpoint(provider_name))
+        .with_help_message(&default_endpoint(provider_name))
         .prompt()?;
     match provider_name {
         PROVIDER_OPENROUTER => {
@@ -490,13 +496,19 @@ pub fn configure_websocket_channel(
     if websocket.streaming {
         config.channels.streaming = true;
     }
-    websocket.host = Text::new("Enter WebSocket host")
+    let websocket_host = Text::new("Enter WebSocket host")
         .with_default("127.0.0.1")
         .with_help_message("127.0.0.1")
         .prompt()?;
+    websocket.host = websocket_host.clone();
     websocket.port = CustomType::<u16>::new("Enter WebSocket port")
         .with_default(8765)
         .with_help_message("8765")
+        .prompt()?;
+    config.gateway.host = websocket_host;
+    config.gateway.port = CustomType::<u16>::new("Enter WebSocket port")
+        .with_default(config.gateway.port)
+        .with_help_message("The port the gateway will listen on")
         .prompt()?;
     let enable_jwt = Confirm::new("Enable JWT authentication?")
         .with_default(jwt_default)
@@ -519,6 +531,7 @@ pub fn configure_websocket_channel(
         websocket.jwt.private_key_path = config.api.jwt.private_key_path.clone();
         websocket.jwt.public_key_path = config.api.jwt.public_key_path.clone();
         websocket.jwt.iss = config.api.jwt.iss.clone();
+        create_users_file(config, config_path, &websocket)?;
     }
     config.channels.extra.insert(
         CHANNEL_WEBSOCKET.to_string(),
@@ -527,6 +540,63 @@ pub fn configure_websocket_channel(
         })?,
     );
     Ok(config.clone())
+}
+
+fn create_users_file(
+    config: &mut Config,
+    config_path: PathBuf,
+    websocket: &WebSocketConfig,
+) -> Result<(), CliError> {
+    let user_email = Text::new("Enter user email for login")
+        .with_help_message("e.g. user@example.com")
+        .with_validator(|email: &str| {
+            if email.trim().is_empty() {
+                Ok(Validation::Invalid("Email cannot be empty".into()))
+            } else {
+                Ok(Validation::Valid)
+            }
+        })
+        .prompt()?
+        .trim()
+        .to_string();
+    // Masked + confirmed so the plaintext password is never echoed. Storage is
+    // Argon2id only — see hash_password / users.json below.
+    let password = Password::new("Enter user password for login")
+        .with_help_message("Hidden as you type; stored as an Argon2id hash, never in plaintext")
+        .with_validator(|password: &str| {
+            if password.is_empty() {
+                Ok(Validation::Invalid("Password cannot be empty".into()))
+            } else {
+                Ok(Validation::Valid)
+            }
+        })
+        .prompt()?;
+    let parent = config_path
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let users_file = parent.join("users.json");
+
+    let minted = generate_jwt_token(
+        &config.api.jwt.private_key_path,
+        config.api.jwt.iss.clone(),
+        websocket.jwt.aud.clone(),
+        "webui",
+        DEFAULT_EXPIRES_IN_MONTHS,
+    )?;
+
+    let mut registry = JsonUserRegistry::open(users_file.clone())?;
+    registry
+        .register_user(&User {
+            email: user_email,
+            password_hash: Some(hash_password(password)?),
+            token: minted.token,
+        })
+        .map_err(|e| CliError::Other(e.to_string()))?;
+
+    config.api.users_file = path_for_config(users_file).display().to_string();
+    eprintln!("Wrote users file: {}", config.api.users_file);
+    Ok(())
 }
 
 fn parse_csv_list(input: &str) -> Vec<String> {

@@ -1,8 +1,8 @@
 # Rust Bot - Installation
 
 This package contains a pre-built `rust-bot` binary, a `gmail-auth` helper
-for Gmail OAuth, the `web-chat` web UI assets, and two sample
-configurations. Follow these steps to get started.
+for Gmail OAuth, the `web` (REST API) and `websockets` (gateway) UI assets,
+and two sample configurations. The recommended first run is `rust-bot onboard`.
 
 ## 1. Unpack
 
@@ -13,8 +13,12 @@ rust-bot-<version>-<platform>/
   rust-bot[.exe]
   gmail-auth[.exe]
   INSTALL.md
-  templates/
-  web/
+  web/                 REST API chat UI (rust-bot api)
+    index.html
+    *.js
+    *.wasm
+    *.css
+  websockets/          Gateway chat UI (rust-bot gateway)
     index.html
     *.js
     *.wasm
@@ -27,46 +31,9 @@ rust-bot-<version>-<platform>/
 The binary has its prompt templates and workspace seed files (`AGENTS.md`,
 `SOUL.md`, `TOOLS.md`, `USER.md`, …) compiled in, so it works standalone —
 you can move `rust-bot` (or `rust-bot.exe`) anywhere, including away from
-this folder. The bundled `templates/` folder is only needed if you want to
-customize those defaults: keep it next to the binary, or set
-`RUST_BOT_TEMPLATES_DIR` to point at it from elsewhere, and your copies will
-be used instead of the built-in ones.
+this folder.
 
-## 2. Choose a sample configuration
-
-Two ready-to-use configs are provided in `configuration/samples/`:
-
-- `openai-compat.json` - uses an OpenAI-compatible provider (e.g. OpenRouter)
-- `anthropic.json` - uses the Anthropic API directly
-
-Both reference environment variables for secrets, so no keys are stored in
-the files themselves.
-
-## 3. Set the required environment variables
-
-For `openai-compat.json`:
-
-| Variable | Description |
-|----------|--------------|
-| `OPENAI_API_KEY` | API key for your OpenAI-compatible provider |
-| `OPENAI_API_BASE` | Base URL, e.g. `https://openrouter.ai/api/v1` |
-| `OPENAI_API_MODEL` | Model name, e.g. `google/gemini-3-flash-preview` |
-
-For `anthropic.json`:
-
-| Variable | Description |
-|----------|--------------|
-| `ANTHROPIC_API_KEY` | Your Anthropic API key |
-| `ANTHROPIC_API_BASE` | Base URL, e.g. `https://api.anthropic.com` |
-| `ANTHROPIC_API_MODEL` | Model name, e.g. `claude-sonnet-5` |
-
-Both configs also reference `BRAVE_API_KEY` for web search; leave it unset
-(or set `tools.web.enable` to `false` in the config) if you don't need it.
-
-You can either export these variables in your shell, or place them in a
-`.env` file next to the binary (it is loaded automatically on startup).
-
-## 4. Onboard and run
+## 2. Onboard (recommended)
 
 From inside the unpacked folder:
 
@@ -78,77 +45,194 @@ From inside the unpacked folder:
 ./rust-bot onboard
 ```
 
-This will help you through a minimal setup.
+This writes a config at `./.rust-bot/config.json` by default, creates
+`./.rust-bot/workspace`, and (if missing) a `.env` file next to the binary
+with `RUST_LOG` settings.
 
-Swap in `configuration/samples/anthropic.json` to use the Anthropic sample
-instead.
+On a first run it asks for:
 
-Omit `-m/--message` to start the interactive console.
+1. **Provider** — `openrouter`, `anthropic`, `edenai`, or `requesty`
+2. **API key** and **endpoint** (the endpoint is pre-filled for that provider)
+3. Optional extra HTTP headers
+4. **Model** (for example `anthropic/claude-opus-5`)
+5. Whether to **configure the gateway web UI** (default: yes)
 
-If you want to create a new configuration though, you can run this command, that will create a new default configuration that you can edit yourself:
+If you enable the gateway web UI it then asks for streaming, WebSocket host,
+WebSocket channel port (default `8765`), gateway listen port (default `18790`),
+and JWT authentication (default: yes). JWT writes an Ed25519 keypair under
+`.rust-bot/credentials/` and registers the first login user in
+`.rust-bot/users.json` (password stored as an Argon2id hash, never in
+plaintext).
 
-```bash
-rust-bot.exe onboard --config ./rust-bot/config.json
+Useful flags:
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `-c`, `--config` | `./.rust-bot/config.json` | Config file to create or update |
+| `-w`, `--workspace` | `./.rust-bot/workspace` | Agent workspace directory |
+| `--wizard` | off | Full interactive wizard instead of the short onboard flow |
+
+If the config file already exists, onboard asks whether to overwrite it with
+defaults (`y`) or refresh it while keeping existing values (`N`).
+
+The API key is stored in the config file. Keep `config.json`, the
+credentials directory, and `users.json` private; do not commit them.
+
+### Example: OpenRouter + gateway web UI (Windows)
+
+This is a typical first install. Prompts are shown as `>`, with example
+answers after each one. Use your own API key, email, and password.
+
+```text
+C:\temp\rust-bot-temp> rust-bot.exe onboard
+Using config: C:\temp\rust-bot-temp\.\.rust-bot\config.json
+> Select a provider to configure API key and endpoint  openrouter
+> Enter API key  sk-or-v1-<your-openrouter-key>
+> Enter endpoint  https://openrouter.ai/api/v1
+> Add an extra HTTP header?  No
+> Model  anthropic/claude-opus-5
+> Configure the gateway web UI?  Yes
+> Enable streaming?  Yes
+> Enter WebSocket host  127.0.0.1
+> Enter WebSocket port  8765          (WebSocket channel port)
+> Enter WebSocket port  18790         (gateway listen port)
+> Enable JWT authentication?  Yes
+Wrote private key: C:\temp\rust-bot-temp\.rust-bot\credentials\private_key.pem
+Wrote public key:  C:\temp\rust-bot-temp\.rust-bot\credentials\public_key.pem
+> Enter user email for login  you@example.com
+> Enter user password for login  ********
+Wrote users file: C:\temp\rust-bot-temp\.rust-bot\users.json
 ```
 
-## 5. API JWT keys and tokens
+Onboard then creates the workspace, writes `.env` if needed, and prints
+next-step commands. After this session the important paths are:
 
-Use the `rust-bot` CLI when you enable the REST API (`rust-bot api`) with JWT
-auth.
+| Path | Purpose |
+|------|---------|
+| `.rust-bot/config.json` | Main config (provider, model, gateway, JWT paths) |
+| `.rust-bot/workspace/` | Agent files and memory |
+| `.rust-bot/credentials/` | JWT private/public keys |
+| `.rust-bot/users.json` | Login email + password hash |
+| `.env` | Log level (`RUST_LOG=info`) and log file path |
+
+### Run after onboard
+
+From the same folder:
+
+```bash
+# Windows — gateway + websockets chat UI
+.\rust-bot.exe gateway -c .\.rust-bot\config.json --web-root .\websockets
+
+# Linux / macOS
+./rust-bot gateway -c ./.rust-bot/config.json --web-root ./websockets
+```
+
+Open `http://127.0.0.1:18790/` and sign in with the email and password you
+entered during onboard.
+
+Other modes:
+
+```bash
+# One-shot chat
+.\rust-bot.exe agent -c .\.rust-bot\config.json -m "Hello!"
+
+# Interactive console
+.\rust-bot.exe agent -c .\.rust-bot\config.json
+
+# REST API + web-chat UI
+.\rust-bot.exe api -c .\.rust-bot\config.json --web-root .\web
+```
+
+On Linux / macOS, use `./rust-bot` instead of `.\rust-bot.exe` and forward
+slashes in paths.
+
+## 3. Optional: sample configurations
+
+If you prefer not to use onboard, two ready-to-use configs are in
+`configuration/samples/`:
+
+- `openai-compat.json` — OpenAI-compatible provider (for example OpenRouter)
+- `anthropic.json` — Anthropic API directly
+
+Both reference environment variables for secrets, so no keys are stored in
+the files themselves.
+
+For `openai-compat.json`:
+
+| Variable | Description |
+|----------|-------------|
+| `OPENAI_API_KEY` | API key for your OpenAI-compatible provider |
+| `OPENAI_API_BASE` | Base URL, e.g. `https://openrouter.ai/api/v1` |
+| `OPENAI_API_MODEL` | Model name, e.g. `google/gemini-3-flash-preview` |
+
+For `anthropic.json`:
+
+| Variable | Description |
+|----------|-------------|
+| `ANTHROPIC_API_KEY` | Your Anthropic API key |
+| `ANTHROPIC_API_BASE` | Base URL, e.g. `https://api.anthropic.com` |
+| `ANTHROPIC_API_MODEL` | Model name, e.g. `claude-sonnet-5` |
+
+Both configs also reference `BRAVE_API_KEY` for web search; leave it unset
+(or set `tools.web.enable` to `false` in the config) if you don't need it.
+
+You can either export these variables in your shell, or place them in a
+`.env` file next to the binary (it is loaded automatically on startup).
+
+Then copy a sample to a working location and pass it with `-c` / `--config`.
+To add JWT keys and a login user to a sample config, use the CLI commands
+in the next section (onboard already does this when you enable JWT).
+
+## 4. Extra JWT users and tokens
+
+Onboard with JWT enabled already generates a keypair and the first web UI
+user. Use these commands to mint extra users, or to add JWT to a config
+that was created without onboard.
 
 1. In your config, set `api.jwt.enabled` to `true` and a non-empty
    `api.jwt.aud` (audience). Optionally set `api.jwt.iss` (default:
    `rust-bot`).
-2. Generate an Ed25519 keypair and write the key paths into the config:
+2. Generate an Ed25519 keypair and write the key paths into the config
+   (skip this if onboard already wrote `.rust-bot/credentials/`):
 
 ```bash
 # Windows
-.\rust-bot.exe generate-jwt-keypair --config .\path\to\config.json
+.\rust-bot.exe generate-jwt-keypair --config .\.rust-bot\config.json
 
 # Linux / macOS
-./rust-bot generate-jwt-keypair --config ./path/to/config.json
+./rust-bot generate-jwt-keypair --config ./.rust-bot/config.json
 ```
 
 Keys are written to `./.rust-bot/credentials/` by default
 (`private_key.pem` and `public_key.pem`). Pass `--credentials-dir` to choose
 another directory, or `--force` to overwrite existing keys.
 
-3. Mint a bearer token for API clients:
+3. Mint a bearer token and register a user:
 
 ```bash
 # Windows
-.\rust-bot.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json
+.\rust-bot.exe generate-jwt-token --config .\.rust-bot\config.json --user-email user@example.com --users-file .\.rust-bot\users.json --purpose webui --password "correct horse battery staple"
 
 # Linux / macOS
-./rust-bot generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json
+./rust-bot generate-jwt-token --config ./.rust-bot/config.json --user-email user@example.com --users-file ./.rust-bot/users.json --purpose webui --password "correct horse battery staple"
 ```
 
-The JWT is printed to stdout. `--user-email` and `--users-file` are
-required: the email identifies the user (it is not embedded in the token
-itself), and `--users-file` points to a JSON file mapping emails to their
-minted tokens. The file is created if it does not exist. Registration fails
-if the email is already present in the file. Optional flags: `--iss`,
-`--aud`, `--expires-in-months` (default: 6), and `--password`. Send the
-token as `Authorization: Bearer <token>` when calling the API.
+The JWT is printed to stdout. `--user-email`, `--users-file`, and
+`--password` are required: the email identifies the user (it is not
+embedded in the token itself), `--users-file` points to a JSON file mapping
+emails to their minted tokens, and `--password` is hashed with Argon2id
+before being written to that file as `password_hash`. The file is created
+if it does not exist. Registration fails if the email is already present in
+the file. Optional flags: `--iss`, `--aud`, `--purpose` (`webui` for the
+gateway chat UI), `--expires-in-months` (default: 6). Send the token as
+`Authorization: Bearer <token>` when calling the REST API.
 
-Pass `--password` to also store a credential for the user:
-
-```bash
-# Windows
-.\rust-bot.exe generate-jwt-token --config .\path\to\config.json --user-email user@example.com --users-file .\path\to\users.json --password "correct horse battery staple"
-
-# Linux / macOS
-./rust-bot generate-jwt-token --config ./path/to/config.json --user-email user@example.com --users-file ./path/to/users.json --password "correct horse battery staple"
-```
-
-The password is never stored or printed in plaintext; it is hashed with
-Argon2id before being written to the users file as `password_hash`. Users
-registered without `--password` simply omit that field.
+The password is never stored or printed in plaintext.
 
 Keep private keys, minted tokens, and the users file secret; do not commit
 them.
 
-## 6. Helper tools
+## 5. Helper tools
 
 The package also includes an optional Gmail OAuth utility.
 
@@ -191,33 +275,55 @@ Copy-Item .\token_cache.json "$HOME\.rust-bot\workspace\credentials\"
 Then set `tools.gmail.enable` to `true` in your config. Re-run `gmail-auth`
 if tokens are revoked or scopes change.
 
-## 7. Web chat UI
+## 6. Web chat UIs
 
-The package includes a pre-built `web-chat` UI (`web/index.html`, `*.js`,
-`*.wasm`) — a small login + chat interface for the REST API. It's served
-automatically by `rust-bot api` when a web root is configured.
+The package includes two pre-built UIs:
+
+- `websockets/` — login + streaming chat for `rust-bot gateway` (this is
+  what onboard configures when you answer **Configure the gateway web UI?**)
+- `web/` — login + chat for the REST `rust-bot api` server
+
+### Gateway (`websockets/`)
 
 ```bash
 # Windows
-.\rust-bot.exe api --config .\path\to\config.json --web-root .\web
+.\rust-bot.exe gateway --config .\.rust-bot\config.json --web-root .\websockets
 
 # Linux / macOS
-./rust-bot api --config ./path/to/config.json --web-root ./web
+./rust-bot gateway --config ./.rust-bot/config.json --web-root ./websockets
 ```
 
-Then open `http://<host>:<port>/` in a browser (the default is
+Then open `http://<host>:<port>/` in a browser. With the example onboard
+session above that is `http://127.0.0.1:18790/`. You can also set
+`gateway.webRoot` in the config instead of passing `--web-root` every time.
+
+Sign in with the email and password created during onboard (or with a user
+added later via `rust-bot generate-jwt-token --purpose webui`).
+
+### REST API (`web/`)
+
+```bash
+# Windows
+.\rust-bot.exe api --config .\.rust-bot\config.json --web-root .\web
+
+# Linux / macOS
+./rust-bot api --config ./.rust-bot/config.json --web-root ./web
+```
+
+Then open `http://<host>:<port>/` (the API default is
 `http://127.0.0.1:8900/`). You can also set `api.webRoot` in the config
 file instead of passing `--web-root` every time; if `./web` exists next to
 the binary and neither is set, it is used automatically.
 
-The UI needs `api.jwt.enabled: true` to log in (see "API JWT keys and
-tokens" above) and a user registered via `rust-bot generate-jwt-token
---password ...` so it has an email/password to sign in with.
+The REST UI needs `api.jwt.enabled: true` and a registered user.
 
-## 8. Next steps
+## 7. Next steps
 
-- Copy a sample config to a location of your choice and adjust it (workspace
-  path, ports, tool settings) once you are up and running.
+- Edit `.rust-bot/config.json` (workspace path, ports, tools) once you are
+  up and running.
+- Add more login users with `rust-bot generate-jwt-token` (see above).
+- For a full walkthrough of every config section, run
+  `rust-bot onboard --wizard`.
 - See the main [README](https://github.com/onepointconsulting/rust-bot#readme)
   for full CLI documentation, the interactive console, Gmail setup, and the
   configuration reference.
