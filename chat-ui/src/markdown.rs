@@ -3,7 +3,7 @@
 //! The bot's replies are Markdown; user-authored text is shown as plain
 //! (escaped) text and never passed through this path.
 
-use pulldown_cmark::{html, CowStr, Event, Options, Parser};
+use pulldown_cmark::{html, CodeBlockKind, CowStr, Event, Options, Parser, Tag, TagEnd};
 use pulldown_latex::config::DisplayMode;
 use pulldown_latex::{push_mathml, Parser as LatexParser, RenderConfig, Storage};
 
@@ -70,7 +70,9 @@ fn strip_tags(html: &str) -> String {
 ///
 /// TeX math (`$…$`, `$$…$$`, `\(…\)`, `\[…\]`) is turned into MathML and
 /// spliced in *after* sanitization so the MathML tag set never has to be
-/// allowlisted in ammonia.
+/// allowlisted in ammonia. Fenced/indented code blocks are likewise
+/// replaced with a chrome wrapper (language label + Copy) after
+/// sanitization, so the `<button>` never has to be allowlisted either.
 pub fn render(markdown: &str) -> String {
     let prepared = rewrite_tex_delimiters(markdown);
     let prepared = normalize_gfm_tables(&prepared);
@@ -83,20 +85,88 @@ pub fn render(markdown: &str) -> String {
     options.insert(Options::ENABLE_MATH);
 
     let mut math_slots = Vec::new();
-    let parser = Parser::new_ext(&prepared, options).map(|event| match event {
-        Event::InlineMath(tex) => slot_event(&mut math_slots, &tex, false),
-        Event::DisplayMath(tex) => slot_event(&mut math_slots, &tex, true),
-        other => other,
-    });
+    let mut code_slots = Vec::new();
+    let mut code_buf: Option<(CodeBlockKind, String)> = None;
+    let mut events = Vec::new();
+
+    for event in Parser::new_ext(&prepared, options) {
+        if let Some((_, body)) = code_buf.as_mut() {
+            match event {
+                Event::Text(text) => {
+                    body.push_str(&text);
+                    continue;
+                }
+                Event::End(TagEnd::CodeBlock) => {
+                    let (kind, body) = code_buf.take().expect("code block opened");
+                    let index = code_slots.len();
+                    code_slots.push(CodeSlot {
+                        lang: code_block_language(&kind),
+                        body,
+                    });
+                    events.push(Event::Html(CowStr::from(code_placeholder(index))));
+                    continue;
+                }
+                _ => {}
+            }
+        }
+        match event {
+            Event::Start(Tag::CodeBlock(kind)) => {
+                code_buf = Some((kind, String::new()));
+            }
+            Event::InlineMath(tex) => events.push(slot_event(&mut math_slots, &tex, false)),
+            Event::DisplayMath(tex) => events.push(slot_event(&mut math_slots, &tex, true)),
+            other => events.push(other),
+        }
+    }
 
     let mut unsafe_html = String::new();
-    html::push_html(&mut unsafe_html, parser);
+    html::push_html(&mut unsafe_html, events.into_iter());
 
     let mut sanitized = ammonia::clean(&unsafe_html);
     for (index, mathml) in math_slots.iter().enumerate() {
         sanitized = sanitized.replace(&math_placeholder(index), mathml);
     }
+    for (index, slot) in code_slots.iter().enumerate() {
+        sanitized = sanitized.replace(&code_placeholder(index), &code_block_html(slot));
+    }
     sanitized
+}
+
+struct CodeSlot {
+    lang: String,
+    body: String,
+}
+
+fn code_placeholder(index: usize) -> String {
+    format!("\u{E000}CODE{index}\u{E001}")
+}
+
+/// First whitespace-separated token of a fenced info string (`rust`, `c++`,
+/// `sh`). Empty for indented blocks and bare fences, so the header still
+/// renders a Copy button with nothing on the left.
+fn code_block_language(kind: &CodeBlockKind<'_>) -> String {
+    match kind {
+        CodeBlockKind::Fenced(info) => info.split_whitespace().next().unwrap_or("").to_string(),
+        CodeBlockKind::Indented => String::new(),
+    }
+}
+
+fn code_block_html(slot: &CodeSlot) -> String {
+    let lang_escaped = escape_html(&slot.lang);
+    let lang_label = if slot.lang.is_empty() {
+        String::new()
+    } else {
+        format!(r#"<span class="code-block__lang">{lang_escaped}</span>"#)
+    };
+    let code_class = if slot.lang.is_empty() {
+        String::new()
+    } else {
+        format!(r#" class="language-{lang_escaped}""#)
+    };
+    format!(
+        r#"<div class="code-block"><div class="code-block__header">{lang_label}<button type="button" class="code-block__copy" title="Copy">Copy</button></div><pre><code{code_class}>{}</code></pre></div>"#,
+        escape_html(&slot.body)
+    )
 }
 
 fn slot_event<'a>(slots: &mut Vec<String>, tex: &str, display: bool) -> Event<'a> {
@@ -509,6 +579,57 @@ mod tests {
             html.contains(r"\(") || html.contains("\\varepsilon"),
             "got: {html}"
         );
+    }
+
+    #[test]
+    fn fenced_code_block_gets_language_label_and_copy_button() {
+        let html = render("```sh\ndsh --profile web --dump-config\n```");
+        assert!(
+            html.contains(r#"class="code-block""#),
+            "expected chrome wrapper, got: {html}"
+        );
+        assert!(
+            html.contains(r#"class="code-block__lang""#) && html.contains(">sh<"),
+            "expected language label, got: {html}"
+        );
+        assert!(
+            html.contains(r#"class="code-block__copy""#) && html.contains(">Copy<"),
+            "expected Copy button, got: {html}"
+        );
+        assert!(
+            html.contains("dsh --profile web --dump-config"),
+            "code body missing, got: {html}"
+        );
+        assert!(
+            html.contains(r#"class="language-sh""#),
+            "expected language class on <code>, got: {html}"
+        );
+    }
+
+    #[test]
+    fn unlabeled_fence_still_has_copy_button() {
+        let html = render("```\nfoo\n```");
+        assert!(html.contains("code-block__copy"), "got: {html}");
+        assert!(
+            !html.contains("code-block__lang"),
+            "bare fence should not invent a language, got: {html}"
+        );
+        assert!(html.contains("foo"), "got: {html}");
+    }
+
+    #[test]
+    fn inline_code_is_not_wrapped_as_a_block() {
+        let html = render("use `foo` please");
+        assert!(!html.contains("code-block"), "got: {html}");
+        assert!(html.contains("<code>foo</code>"), "got: {html}");
+    }
+
+    #[test]
+    fn fenced_html_is_escaped_inside_the_block() {
+        let html = render("```html\n<script>alert(1)</script>\n```");
+        assert!(!html.contains("<script"), "got: {html}");
+        assert!(html.contains("&lt;script&gt;"), "got: {html}");
+        assert!(html.contains(">html<"), "got: {html}");
     }
 
     #[test]

@@ -75,6 +75,25 @@ impl ConnectionRegistry {
             .collect()
     }
 
+    /// Unsubscribe every connection from `chat_id` (the inverse of
+    /// [`Self::attach`]) and return the senders that were subscribed, so a
+    /// caller (`delete_chat`) can fan a `chat_deleted` event out to exactly
+    /// the connections that need to know the chat is gone. Unlike
+    /// [`Self::cleanup_connection`], the connections themselves stay
+    /// registered — they may still be subscribed to other chats, or send a
+    /// fresh `new_chat`/`attach` next.
+    pub fn detach_chat(&mut self, chat_id: &str) -> Vec<(String, mpsc::UnboundedSender<Message>)> {
+        let recipients = self.senders_for_chat(chat_id);
+        if let Some(conn_ids) = self.subs.remove(chat_id) {
+            for connection_id in conn_ids {
+                if let Some(chats) = self.conn_chats.get_mut(&connection_id) {
+                    chats.remove(chat_id);
+                }
+            }
+        }
+        recipients
+    }
+
     /// The sender for one specific connection, regardless of what it's
     /// subscribed to. Mirrors nanobot's `_send_event(connection, ...)` —
     /// replying to *the connection that sent an envelope*, as opposed to
@@ -205,6 +224,37 @@ mod tests {
         registry.cleanup_connection("conn-1");
 
         assert!(registry.sender_for("conn-1").is_none());
+    }
+
+    #[test]
+    fn detach_chat_removes_only_that_chats_subscriptions() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+        registry.register("conn-2", "chat-2", dummy_sender());
+        registry.attach("conn-1", "chat-2");
+
+        let recipients = registry.detach_chat("chat-1");
+        let ids: HashSet<_> = recipients.into_iter().map(|(id, _)| id).collect();
+        assert_eq!(ids, HashSet::from(["conn-1".to_string()]));
+
+        assert!(registry.senders_for_chat("chat-1").is_empty());
+        assert!(!registry.subs.contains_key("chat-1"));
+        // conn-1 stays registered and still subscribed to chat-2.
+        assert!(registry.sender_for("conn-1").is_some());
+        assert_eq!(registry.senders_for_chat("chat-2").len(), 2);
+    }
+
+    #[test]
+    fn detach_chat_is_idempotent_and_empty_for_unknown_chat() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+
+        assert!(registry.detach_chat("no-such-chat").is_empty());
+
+        let first = registry.detach_chat("chat-1");
+        assert_eq!(first.len(), 1);
+        let second = registry.detach_chat("chat-1");
+        assert!(second.is_empty());
     }
 
     #[test]

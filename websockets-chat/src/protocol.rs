@@ -6,7 +6,7 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, and `rename_chat`.
+//!   `attach`, `list_chats`, `rename_chat`, `delete_chat`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -21,11 +21,11 @@ use serde::{Deserialize, Serialize};
 
 /// Outbound envelope sent to the gateway.
 ///
-/// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) has six
-/// variants (`new_chat`, `fork_chat`, `attach`, `set_workspace_scope`,
-/// `transcribe_audio`, `message`). This struct covers the ones the frontend
-/// actually sends (`message`, `new_chat`, `attach`, `list_chats`,
-/// `rename_chat`); constructors
+/// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) covers
+/// more inbound types than this crate has a use for (`fork_chat`,
+/// `set_workspace_scope`, `transcribe_audio`). This struct covers the ones
+/// the frontend actually sends (`message`, `new_chat`, `attach`,
+/// `list_chats`, `rename_chat`, `delete_chat`, `abort_turn`); constructors
 /// pin `type_` so callers cannot invent a shape the gateway would reject
 /// with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -128,6 +128,46 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: Some(title.into()),
+            webui: true,
+        }
+    }
+
+    /// Permanently delete an existing `chat_id`'s session.
+    ///
+    /// The reply is a `chat_deleted` event carrying that `chat_id` — sent to
+    /// every connection subscribed to it, not just the requester. Rejections
+    /// come back as `error` (`session_not_found`, `access_denied`, `delete_failed`).
+    pub fn delete_chat(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "delete_chat",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            webui: true,
+        }
+    }
+
+    /// Cancel the in-flight agent turn on `chat_id`, leaving the chat and its
+    /// history intact.
+    ///
+    /// `turn_id` is the id this client minted when it sent the message being
+    /// cancelled. The gateway treats it as a staleness guard: an abort naming
+    /// a turn that is no longer the running one comes back as `error` with
+    /// `turn_not_active` instead of cancelling whatever ran next. Omitting it
+    /// aborts whatever is currently running on the chat.
+    ///
+    /// The reply is a `turn_aborted` event — fanned out to every connection
+    /// attached to `chat_id`, since they were all rendering the same stream.
+    pub fn abort_turn(chat_id: impl Into<String>, turn_id: Option<String>) -> Self {
+        Self {
+            type_: "abort_turn",
+            chat_id: Some(chat_id.into()),
+            turn_id,
+            content: None,
+            media: None,
+            title: None,
             webui: true,
         }
     }
@@ -255,6 +295,18 @@ pub enum ServerEvent {
     ChatsList { chats: Vec<ChatSummary> },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
+    /// Reply to a `delete_chat` envelope, fanned out to every connection
+    /// that was subscribed to `chat_id` — not just the requester.
+    ChatDeleted { chat_id: String },
+    /// Reply to an `abort_turn` envelope: the in-flight turn on `chat_id` was
+    /// cancelled, so no `stream_end` or final `message` is coming for it.
+    /// Fanned out to every connection attached to `chat_id`. `turn_id` is
+    /// absent when the gateway had no turn identity to name (see
+    /// [`ClientEnvelope::abort_turn`]).
+    TurnAborted {
+        chat_id: String,
+        turn_id: Option<String>,
+    },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -265,8 +317,9 @@ impl ServerEvent {
     ///
     /// Used by the app to ignore leftover frames from a previous chat after
     /// `new_chat` switches the connection onto a new id. `Unknown`,
-    /// [`ServerEvent::ChatsList`], [`ServerEvent::ChatRenamed`] (a rename
-    /// can target any sidebar row), and unscoped errors return `None`.
+    /// [`ServerEvent::ChatsList`], [`ServerEvent::ChatRenamed`]/
+    /// [`ServerEvent::ChatDeleted`] (both can target any sidebar row), and
+    /// unscoped errors return `None`.
     pub fn chat_id(&self) -> Option<&str> {
         match self {
             ServerEvent::Ready { chat_id, .. }
@@ -278,16 +331,18 @@ impl ServerEvent {
             | ServerEvent::StreamEnd { chat_id, .. }
             | ServerEvent::ReasoningDelta { chat_id, .. }
             | ServerEvent::ReasoningEnd { chat_id, .. }
-            | ServerEvent::FileEdit { chat_id, .. } => Some(chat_id.as_str()),
+            | ServerEvent::FileEdit { chat_id, .. }
+            | ServerEvent::TurnAborted { chat_id, .. } => Some(chat_id.as_str()),
             ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
             }
-            // A rename can target any sidebar row, not just the active chat,
-            // so this event is unscoped for drop purposes (see
-            // `should_drop_event`). The payload still carries `chat_id`.
+            // A rename/delete can target any sidebar row, not just the
+            // active chat, so these events are unscoped for drop purposes
+            // (see `should_drop_event`). The payload still carries `chat_id`.
             ServerEvent::ChatsList { .. }
             | ServerEvent::ChatRenamed { .. }
+            | ServerEvent::ChatDeleted { .. }
             | ServerEvent::Unknown(_) => None,
         }
     }
@@ -474,6 +529,18 @@ struct ChatRenamedWire {
     title: String,
 }
 
+#[derive(Deserialize)]
+struct ChatDeletedWire {
+    chat_id: String,
+}
+
+#[derive(Deserialize)]
+struct TurnAbortedWire {
+    chat_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -568,6 +635,12 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "chat_renamed" => decode::<ChatRenamedWire>(&value).map(|w| ServerEvent::ChatRenamed {
             chat_id: w.chat_id,
             title: w.title,
+        }),
+        "chat_deleted" => decode::<ChatDeletedWire>(&value)
+            .map(|w| ServerEvent::ChatDeleted { chat_id: w.chat_id }),
+        "turn_aborted" => decode::<TurnAbortedWire>(&value).map(|w| ServerEvent::TurnAborted {
+            chat_id: w.chat_id,
+            turn_id: w.turn_id,
         }),
         _ => Ok(ServerEvent::Unknown(value)),
     }
@@ -981,6 +1054,91 @@ mod tests {
             }
         );
         assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_delete_chat_serializes_expected_shape() {
+        let envelope = ClientEnvelope::delete_chat("chat-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "delete_chat",
+                "chat_id": "chat-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_chat_deleted() {
+        let raw = r#"{"event":"chat_deleted","chat_id":"chat-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ChatDeleted {
+                chat_id: "chat-1".to_string(),
+            }
+        );
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_abort_turn_serializes_expected_shape() {
+        let envelope = ClientEnvelope::abort_turn("chat-1", Some("turn-1".to_string()));
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "abort_turn",
+                "chat_id": "chat-1",
+                "turn_id": "turn-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_abort_turn_omits_an_absent_turn_id() {
+        let envelope = ClientEnvelope::abort_turn("chat-1", None);
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "abort_turn",
+                "chat_id": "chat-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_turn_aborted() {
+        let raw = r#"{"event":"turn_aborted","chat_id":"chat-1","turn_id":"turn-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::TurnAborted {
+                chat_id: "chat-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+            }
+        );
+        // Scoped, unlike rename/delete: an abort only ever concerns the chat
+        // whose stream this connection is rendering.
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn parses_turn_aborted_without_turn_id() {
+        let raw = r#"{"event":"turn_aborted","chat_id":"chat-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::TurnAborted {
+                chat_id: "chat-1".to_string(),
+                turn_id: None,
+            }
+        );
     }
 
     #[test]

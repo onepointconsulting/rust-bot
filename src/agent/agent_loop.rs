@@ -897,6 +897,36 @@ impl AgentLoop {
         }
     }
 
+    /// Cancel all active tasks and subagents for `msg`'s session, then
+    /// publish a `TurnEnd` so channels/the UI don't stay stuck "running" —
+    /// aborting drops `dispatch` before its own post-`process_message`
+    /// `TurnEnd`. Returns the number of tasks (agent turns + subagents)
+    /// cancelled.
+    ///
+    /// Extracted from `/stop`'s handler (`command::builtin::CmdStop`) so
+    /// other callers with no real [`crate::command::CommandContext`] — e.g.
+    /// the WebSocket `delete_chat` envelope, which builds a minimal,
+    /// synthetic `msg` just to carry `channel`/`chat_id` — can reuse the
+    /// same cancellation body instead of duplicating it.
+    pub async fn abort_session(&self, msg: &InboundMessage) -> u32 {
+        let session_key = msg.session_key();
+        let tasks = self
+            .active_tasks
+            .lock()
+            .await
+            .remove(&session_key)
+            .unwrap_or_default();
+        let mut cancelled: u32 = 0;
+        for handle in tasks.into_values() {
+            handle.abort();
+            cancelled += 1;
+        }
+        let sub_cancelled = self.subagents.cancel_by_session(&session_key).await;
+        let total = cancelled + sub_cancelled;
+        self.publish_turn_end(msg, None);
+        total
+    }
+
     /// Update context for all tools that need routing info.
     pub fn set_tool_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
         let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
@@ -1291,7 +1321,7 @@ impl AgentLoop {
     /// call runs in [`Self::schedule_background`] so it does not block the
     /// turn or hold the session-manager lock.
     async fn maybe_schedule_title_generation(&self, session_key: &str) {
-        let (provider, model) = {
+        let runtime = {
             let manager = self
                 .session_manager
                 .lock()
@@ -1300,13 +1330,12 @@ impl AgentLoop {
                 return;
             }
             let session = manager.get_session_internal(session_key);
-            let runtime = self.runtime_resolver.runtime_for_session(session.as_ref());
-            (runtime.provider, runtime.model)
+            self.runtime_resolver.runtime_for_session(session.as_ref())
         };
         let sessions = Arc::clone(&self.session_manager);
         let key = session_key.to_string();
         self.schedule_background(async move {
-            SessionManager::generate_title(sessions.as_ref(), &key, provider, &model).await;
+            SessionManager::generate_title(sessions.as_ref(), &key, &runtime).await;
         })
         .await;
     }

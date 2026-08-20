@@ -19,6 +19,7 @@ use crate::api::user_registry::{
 };
 use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
+use crate::channels::gateway_services::SessionWorkCanceller;
 use crate::channels::manager::ChannelManager;
 use crate::channels::websocket::runtime::WebSocketChannel;
 use crate::channels::websocket::types::WebSocketConfig;
@@ -1095,6 +1096,16 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         Arc::clone(&session_manager),
         agent_loop.workspace_request_handler(),
     );
+    // Give the WebSocket channel's `delete_chat` handler something to abort
+    // in-flight work through. Must happen before `ws_channel.router()` is
+    // ever called (see `GatewayServices::set_work_canceller`'s doc comment) —
+    // no `router()` call has happened yet at this point in `run_gateway`.
+    if let Some(ws_channel) = &ws_channel {
+        ws_channel
+            .shared()
+            .gateway_services
+            .set_work_canceller(SessionWorkCanceller::new(Arc::clone(&agent_loop)));
+    }
     let mut channel_manager = ChannelManager::new(
         Arc::clone(&config),
         Arc::clone(&agent_loop.bus()),

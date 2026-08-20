@@ -1,9 +1,10 @@
 //! Cursor-style sessions sidebar shared by `web-chat` and `websockets-chat`.
 //!
 //! Rows highlight the active session; clicking one invokes `on_select`.
-//! When `on_rename` is provided (websockets-chat), each row also has a
-//! kebab that opens a one-item "Rename" menu and a small dialog to edit
-//! the title.
+//! When `on_rename` and/or `on_delete` is provided (websockets-chat), each
+//! row also has a kebab that opens a menu with "Rename" and/or a red
+//! "Delete" item. Delete opens a confirmation dialog before actually
+//! calling `on_delete`; rename opens a small dialog to edit the title.
 //!
 //! Open/collapsed is a single `open: Signal<bool>` shared across every
 //! breakpoint (not "always docked on `sm+`, toggle-only on mobile" like an
@@ -110,6 +111,29 @@ fn IconPencil() -> impl IntoView {
 }
 
 #[component]
+fn IconTrash() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <path d="M3 6h18" />
+            <path d="M19 6v14a2 2 0 0 1-2 2H7a2 2 0 0 1-2-2V6" />
+            <path d="M8 6V4a2 2 0 0 1 2-2h4a2 2 0 0 1 2 2v2" />
+            <line x1="10" x2="10" y1="11" y2="17" />
+            <line x1="14" x2="14" y1="11" y2="17" />
+        </svg>
+    }
+}
+
+#[component]
 fn IconClose() -> impl IntoView {
     view! {
         <svg
@@ -171,6 +195,7 @@ fn SessionRow(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     let id_for_class = id.clone();
     let id_for_title_class = id.clone();
@@ -182,6 +207,8 @@ fn SessionRow(
     let id_for_toggle = id.clone();
     let display_title_for_menu = display_title.clone();
     let show_rename = on_open_rename.is_some();
+    let show_delete = on_open_delete.is_some();
+    let show_menu = show_rename || show_delete;
 
     view! {
         <li class="group relative">
@@ -213,7 +240,7 @@ fn SessionRow(
                 >
                     {display_title}
                 </button>
-                {show_rename.then(|| {
+                {show_menu.then(|| {
                     view! {
                         <button
                             type="button"
@@ -253,9 +280,10 @@ fn SessionRow(
                     }
                 })}
             </div>
-            {show_rename.then(|| {
+            {show_menu.then(|| {
                 let id_for_menu_visible = id.clone();
                 let id_for_rename = id.clone();
+                let id_for_delete = id.clone();
                 let title_for_rename = display_title_for_menu;
                 view! {
                     <div class=move || {
@@ -274,21 +302,48 @@ fn SessionRow(
                             role="menu"
                             class="absolute right-1 z-30 mt-0.5 w-40 overflow-hidden rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
                         >
-                            <button
-                                type="button"
-                                role="menuitem"
-                                class=MENU_ITEM
-                                on:click=move |_| {
-                                    open_menu_id.set(None);
-                                    if let Some(on_open_rename) = on_open_rename {
-                                        on_open_rename
-                                            .run((id_for_rename.clone(), title_for_rename.clone()));
-                                    }
+                            {show_rename.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class=MENU_ITEM
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_rename) = on_open_rename {
+                                                on_open_rename
+                                                    .run((
+                                                        id_for_rename.clone(),
+                                                        title_for_rename.clone(),
+                                                    ));
+                                            }
+                                        }
+                                    >
+                                        <IconPencil />
+                                        "Rename"
+                                    </button>
                                 }
-                            >
-                                <IconPencil />
-                                "Rename"
-                            </button>
+                            })}
+                            {(show_rename && show_delete)
+                                .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
+                            {show_delete.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class="flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm font-medium text-red-600 hover:bg-red-50"
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_delete) = on_open_delete {
+                                                on_open_delete.run(id_for_delete.clone());
+                                            }
+                                        }
+                                    >
+                                        <IconTrash />
+                                        "Delete"
+                                    </button>
+                                }
+                            })}
                         </div>
                     </div>
                 }
@@ -315,6 +370,7 @@ fn SessionGroupSection(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     let total = items.len();
     let visible_count = if is_expanded || total <= COLLAPSE_THRESHOLD {
@@ -342,6 +398,7 @@ fn SessionGroupSection(
                     on_select=on_select
                     open_menu_id=open_menu_id
                     on_open_rename=on_open_rename
+                    on_open_delete=on_open_delete
                 />
             }
         })
@@ -390,6 +447,10 @@ pub fn SessionsSidebar(
     /// `web-chat`, which has no rename API yet.
     #[prop(optional)]
     on_rename: Option<Callback<(String, String)>>,
+    /// When set, each row's kebab also gets a red "Delete" item → confirm
+    /// dialog. Omitted by `web-chat`, which has no delete API yet.
+    #[prop(optional)]
+    on_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     // Which groups' "··· More" disclosure has been opened. Hoisted above
     // `body` (rather than living inside `SessionGroupSection`, as it used
@@ -400,6 +461,7 @@ pub fn SessionsSidebar(
     let rename_id = RwSignal::new(None::<String>);
     let rename_draft = RwSignal::new(String::new());
     let rename_input = NodeRef::<Input>::new();
+    let delete_id = RwSignal::new(None::<String>);
 
     let open_rename = Callback::new(move |(id, title): (String, String)| {
         open_menu_id.set(None);
@@ -438,6 +500,28 @@ pub fn SessionsSidebar(
         }
     });
 
+    let open_delete = Callback::new(move |id: String| {
+        open_menu_id.set(None);
+        delete_id.set(Some(id));
+    });
+    let on_open_delete = on_delete.map(|_| open_delete);
+
+    let close_delete = move || delete_id.set(None);
+    let only_session = Signal::derive(move || sessions.get().len() <= 1);
+
+    let confirm_delete = move || {
+        let Some(id) = delete_id.get() else {
+            return;
+        };
+        if only_session.get() {
+            return;
+        }
+        if let Some(on_delete) = on_delete {
+            on_delete.run(id);
+        }
+        close_delete();
+    };
+
     let body = move || {
         let group_sections = move || {
             group_sessions(&sessions.get(), js_sys::Date::now() as i64)
@@ -458,6 +542,7 @@ pub fn SessionsSidebar(
                             on_select=on_select
                             open_menu_id=open_menu_id
                             on_open_rename=on_open_rename
+                            on_open_delete=on_open_delete
                         />
                     }
                 })
@@ -475,7 +560,9 @@ pub fn SessionsSidebar(
                         aria-label="Collapse chats panel"
                         title="Collapse"
                         class="flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                        on:click=move |_| on_close()
+                        on:click=move |_| {
+                            on_close()
+                        }
                     >
                         <IconSidebarPanel />
                     </button>
@@ -581,6 +668,91 @@ pub fn SessionsSidebar(
                             >
                                 "Save"
                             </button>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || delete_id.get().is_some()>
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    <div
+                        class="absolute inset-0 bg-slate-900/40"
+                        aria-hidden="true"
+                        on:click=move |_| close_delete()
+                    ></div>
+                    <div
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="delete-session-title"
+                        class="relative w-full max-w-sm rounded-2xl bg-white p-5 shadow-2xl ring-1 ring-slate-200"
+                        on:keydown=move |ev| {
+                            let key = ev.key();
+                            if key == "Escape" {
+                                close_delete();
+                            }
+                        }
+                    >
+                        <div class="mb-4 flex items-start justify-between gap-3">
+                            <h2
+                                id="delete-session-title"
+                                class="text-base font-semibold text-slate-900"
+                            >
+                                {move || {
+                                    if only_session.get() {
+                                        "Cannot delete session"
+                                    } else {
+                                        "Delete session"
+                                    }
+                                }}
+                            </h2>
+                            <button
+                                type="button"
+                                aria-label="Close"
+                                class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                                on:click=move |_| close_delete()
+                            >
+                                <IconClose />
+                            </button>
+                        </div>
+                        <p class="mb-5 text-sm text-slate-600">
+                            {move || {
+                                if only_session.get() {
+                                    "It is not possible to delete the only session."
+                                } else {
+                                    "Are you sure you want to delete this session?"
+                                }
+                            }}
+                        </p>
+                        <div class="flex justify-end gap-2">
+                            <Show
+                                when=move || only_session.get()
+                                fallback=move || {
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class="rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-200"
+                                            on:click=move |_| close_delete()
+                                        >
+                                            "Cancel"
+                                        </button>
+                                        <button
+                                            type="button"
+                                            class="rounded-lg bg-red-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-red-700"
+                                            on:click=move |_| confirm_delete()
+                                        >
+                                            "Delete"
+                                        </button>
+                                    }
+                                }
+                            >
+                                <button
+                                    type="button"
+                                    class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
+                                    on:click=move |_| close_delete()
+                                >
+                                    "OK"
+                                </button>
+                            </Show>
                         </div>
                     </div>
                 </div>

@@ -45,6 +45,15 @@ pub enum EnvelopeType {
     /// session. Rust-side addition with no nanobot precedent — the Python
     /// reference has no rename envelope; titles are LLM-generated only.
     RenameChat,
+    /// Delete an existing `websocket:{chat_id}` session.
+    /// Rust-side addition with no nanobot precedent — the Python reference has no delete envelope.
+    DeleteChat,
+    /// Cancel the in-flight agent turn for an existing `websocket:{chat_id}`
+    /// session, leaving the session itself intact. Rust-side addition with no
+    /// nanobot precedent — the Python reference has no cancel envelope; its
+    /// only cancellation path is the `/stop` chat command, which costs a
+    /// visible user message and an agent reply just to stop a turn.
+    AbortTurn,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
@@ -64,6 +73,8 @@ impl From<&str> for EnvelopeType {
             "new_chat" => Self::NewChat,
             "fork_chat" => Self::ForkChat,
             "rename_chat" => Self::RenameChat,
+            "delete_chat" => Self::DeleteChat,
+            "abort_turn" => Self::AbortTurn,
             "attach" => Self::Attach,
             "set_workspace_scope" => Self::SetWorkspaceScope,
             "transcribe_audio" => Self::TranscribeAudio,
@@ -97,6 +108,14 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatRenamed,
+    /// Fan-out for [`EnvelopeType::DeleteChat`], sent to every connection
+    /// that was subscribed to the deleted chat (not just the requester).
+    /// Rust-side addition, no nanobot wire-name precedent to mirror (see
+    /// that variant's doc comment).
+    ChatDeleted,
+    /// Reply to [`EnvelopeType::AbortTurn`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    TurnAborted,
 }
 
 impl WsOutboundEvent {
@@ -111,6 +130,8 @@ impl WsOutboundEvent {
             Self::GoalStatus => "goal_status",
             Self::ChatsList => "chats",
             Self::ChatRenamed => "chat_renamed",
+            Self::ChatDeleted => "chat_deleted",
+            Self::TurnAborted => "turn_aborted",
         }
     }
 }
@@ -366,6 +387,8 @@ mod tests {
         assert_eq!(EnvelopeType::from("message"), EnvelopeType::Message);
         assert_eq!(EnvelopeType::from("list_chats"), EnvelopeType::ListChats);
         assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
+        assert_eq!(EnvelopeType::from("delete_chat"), EnvelopeType::DeleteChat);
+        assert_eq!(EnvelopeType::from("abort_turn"), EnvelopeType::AbortTurn);
     }
 
     #[test]
@@ -400,5 +423,15 @@ mod tests {
     #[test]
     fn ws_outbound_event_chat_renamed_has_no_nanobot_precedent() {
         assert_eq!(WsOutboundEvent::ChatRenamed.as_str(), "chat_renamed");
+    }
+
+    #[test]
+    fn ws_outbound_event_chat_deleted_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::ChatDeleted.as_str(), "chat_deleted");
+    }
+
+    #[test]
+    fn ws_outbound_event_turn_aborted_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::TurnAborted.as_str(), "turn_aborted");
     }
 }

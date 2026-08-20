@@ -113,11 +113,19 @@ fn AttachmentChip(
     }
 }
 
+/// The composer.
+///
+/// `on_abort`, when supplied, turns the send button into a Stop button for as
+/// long as `pending` is true, so a caller whose backend can cancel an
+/// in-flight turn gets that affordance and one that cannot (`web-chat`,
+/// whose HTTP request has nothing to cancel) simply omits the prop and keeps
+/// today's disabled-while-pending button.
 #[component]
 pub fn ChatInput(
     #[prop(into)] pending: Signal<bool>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
+    #[prop(optional)] on_abort: Option<Callback<()>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -181,6 +189,9 @@ pub fn ChatInput(
             }
         });
     };
+
+    let can_abort = on_abort.is_some();
+    let show_stop_button = move || can_abort && pending.get();
 
     let composer_class = move || {
         if drag_over.get() {
@@ -361,16 +372,39 @@ pub fn ChatInput(
                         <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
                     </svg>
                 </button>
-                <button
-                    type="submit"
-                    disabled=move || {
-                        pending.get()
-                            || (draft.get().trim().is_empty() && attachments.get().is_empty())
+                <Show
+                    when=move || show_stop_button()
+                    fallback=move || {
+                        view! {
+                            <button
+                                type="submit"
+                                disabled=move || {
+                                    pending.get()
+                                        || (draft.get().trim().is_empty()
+                                            && attachments.get().is_empty())
+                                }
+                                class="rounded-full bg-orange-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-orange-700 disabled:cursor-not-allowed disabled:opacity-50"
+                            >
+                                "Send"
+                            </button>
+                        }
                     }
-                    class="rounded-full bg-orange-600 px-4 py-2 text-sm font-semibold text-white transition hover:bg-orange-700 disabled:cursor-not-allowed disabled:opacity-50"
                 >
-                    "Send"
-                </button>
+                    <button
+                        type="button"
+                        aria-label="Stop generating"
+                        title="Stop generating"
+                        class="flex items-center gap-1.5 rounded-full bg-slate-800 px-4 py-2 text-sm font-semibold text-white transition hover:bg-slate-900"
+                        on:click=move |_| {
+                            if let Some(on_abort) = on_abort {
+                                on_abort.run(());
+                            }
+                        }
+                    >
+                        <span class="h-2.5 w-2.5 rounded-sm bg-white" aria-hidden="true"></span>
+                        "Stop"
+                    </button>
+                </Show>
             </form>
             <p class="mt-2 text-center text-xs text-slate-400">
                 "AI-powered. The assistant can make mistakes."

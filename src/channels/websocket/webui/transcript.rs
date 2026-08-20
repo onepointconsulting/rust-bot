@@ -20,7 +20,8 @@
 //! - The rest of the read/replay side of `webui/transcript.py` (fork, replay,
 //!   pagination, incomplete-turn recovery) — out of scope for the write path.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
@@ -86,6 +87,13 @@ pub struct WebUiTranscriptRecorder {
     webui_dir: PathBuf,
     /// `(chat_id, turn_id) -> next turn_seq`. Mirrors `_turn_sequences`.
     turn_sequences: HashMap<(String, String), u64>,
+    /// Session keys tombstoned by [`Self::forget_session`]. Same reasoning
+    /// as `SessionManager`'s `deleted` set (`session::manager`): a `delete_chat`
+    /// unlinks the active transcript file, but a write in flight when the
+    /// delete ran (built its event before, calls `append` after) would
+    /// otherwise resurrect it — `append_to_active_transcript` opens with
+    /// `create(true)`.
+    forgotten: HashSet<String>,
 }
 
 impl WebUiTranscriptRecorder {
@@ -93,6 +101,7 @@ impl WebUiTranscriptRecorder {
         Self {
             webui_dir,
             turn_sequences: HashMap::new(),
+            forgotten: HashSet::new(),
         }
     }
 
@@ -208,12 +217,37 @@ impl WebUiTranscriptRecorder {
     /// already guarantees this call has an uncontested copy.
     pub fn append(&mut self, chat_id: &str, event: HashMap<String, Value>) -> bool {
         let session_key = format!("websocket:{chat_id}");
+        if self.forgotten.contains(&session_key) {
+            return false;
+        }
         match append_transcript_object(&self.webui_dir, &session_key, event) {
             Ok(()) => true,
             Err(e) => {
                 log::warn!("webui transcript append failed: {e}");
                 false
             }
+        }
+    }
+
+    /// Best-effort: unlink `chat_id`'s active transcript file and tombstone
+    /// its session key so a later, in-flight [`Self::append`] cannot
+    /// recreate it (see the [`Self::forgotten`] field doc comment). Called
+    /// from the WebSocket `delete_chat` handler alongside
+    /// `SessionManager::delete_session`; a missing file is not an error —
+    /// there may never have been a WebUI transcript for this chat.
+    pub fn forget_session(&mut self, chat_id: &str) {
+        let session_key = format!("websocket:{chat_id}");
+        self.forgotten.insert(session_key.clone());
+        self.turn_sequences.retain(|(c, _), _| c != chat_id);
+
+        let path = webui_transcript_path(&self.webui_dir, &session_key);
+        if let Err(e) = fs::remove_file(&path)
+            && e.kind() != std::io::ErrorKind::NotFound
+        {
+            log::warn!(
+                "webui transcript: failed to unlink {} for delete_chat: {e}",
+                path.display()
+            );
         }
     }
 }
@@ -706,5 +740,69 @@ mod tests {
         assert_eq!(parsed["turn_phase"], "user");
         assert_eq!(parsed["turn_seq"], 1);
         assert!(parsed.get("created_at_ms").is_some());
+    }
+
+    // --- forget_session ---
+
+    #[test]
+    fn forget_session_unlinks_existing_transcript_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        recorder.append_user_message("chat-1", "hello", &HashMap::new(), None, None, None);
+        let path = webui_transcript_path(dir.path(), "websocket:chat-1");
+        assert!(path.exists());
+
+        recorder.forget_session("chat-1");
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn forget_session_on_never_written_chat_does_not_error() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        recorder.forget_session("never-written");
+        assert!(!webui_transcript_path(dir.path(), "websocket:never-written").exists());
+    }
+
+    #[test]
+    fn append_after_forget_session_is_a_no_op_and_does_not_recreate_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        recorder.append_user_message("chat-1", "hello", &HashMap::new(), None, None, None);
+        recorder.forget_session("chat-1");
+        let path = webui_transcript_path(dir.path(), "websocket:chat-1");
+        assert!(!path.exists());
+
+        // A late write that raced past the delete must not resurrect it.
+        assert!(!recorder.append_user_message(
+            "chat-1",
+            "late write",
+            &HashMap::new(),
+            None,
+            None,
+            None
+        ));
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn forget_session_only_affects_the_named_chat() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        recorder.append_user_message("chat-1", "hello", &HashMap::new(), None, None, None);
+        recorder.append_user_message("chat-2", "hi", &HashMap::new(), None, None, None);
+
+        recorder.forget_session("chat-1");
+
+        assert!(!webui_transcript_path(dir.path(), "websocket:chat-1").exists());
+        assert!(webui_transcript_path(dir.path(), "websocket:chat-2").exists());
+        assert!(recorder.append_user_message(
+            "chat-2",
+            "still alive",
+            &HashMap::new(),
+            None,
+            None,
+            None
+        ));
     }
 }

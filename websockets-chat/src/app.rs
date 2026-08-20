@@ -31,6 +31,7 @@ use crate::state::{self, ConnectionStatus};
 use crate::storage_keys::CHAT_ID_STORAGE_KEY;
 use crate::storage_keys::CHAT_OPEN_STORAGE_KEY;
 use crate::storage_keys::EXPANDED_STORAGE_KEY;
+use crate::storage_keys::SIDEBAR_OPEN_STORAGE_KEY;
 
 const TOKEN_STORAGE_KEY: &str = "rust-bot-websockets-chat-token";
 const EMAIL_STORAGE_KEY: &str = "rust-bot-websockets-chat-email";
@@ -258,11 +259,11 @@ struct WsContext {
     /// the gateway (see `protocol::ServerEvent`) carry only a `stream_id`,
     /// never a `turn_id` — those streaming events aren't scoped to a turn
     /// on the wire at all. Since this UI only ever has one turn in flight
-    /// at a time (`ChatInput`'s `pending` prop, driven by whether any entry
-    /// is still `streaming`, disables sending until it resolves), the
-    /// active turn is unambiguous, so those events are routed to whichever
-    /// turn_id is recorded here rather than to anything parsed from the
-    /// event's own payload.
+    /// at a time (`ChatInput`'s `pending` prop is `true` while this signal
+    /// is `Some`, which also keeps the Stop button up across tool waits),
+    /// the active turn is unambiguous, so those events are routed to
+    /// whichever turn_id is recorded here rather than to anything parsed
+    /// from the event's own payload.
     active_turn_id: RwSignal<Option<String>>,
     chat_error: RwSignal<Option<String>>,
     /// 0-indexed count of reconnect attempts since the last successful
@@ -282,11 +283,12 @@ struct WsContext {
     /// ever runs on the browser's single JS thread.
     ws_sender: RwSignal<Rc<RefCell<Option<WsSender>>>, LocalStorage>,
     /// Bumped by every [`open_connection`]/[`close_connection`] call. A
-    /// receive loop's `on_close` callback captures the generation value at
-    /// the time its connection was opened and compares it against the
-    /// current one; a mismatch means a newer connection has already
-    /// superseded it, so its close is a stale no-op rather than triggering
-    /// a redundant reconnect. See [`handle_connection_closed`].
+    /// receive loop captures this value at open and ignores both inbound
+    /// events and `on_close` when it no longer matches — otherwise a
+    /// superseded socket whose receive half is still alive would keep
+    /// applying `delta`s onto the same transcript (doubled streaming text)
+    /// and its close would trigger a redundant reconnect.
+    /// See [`handle_connection_closed`].
     generation: RwSignal<u64>,
     /// From the gateway `ready` event: whether this channel will stream
     /// token `delta`s. After the first visible token, drives the in-progress
@@ -435,6 +437,11 @@ fn handle_message_event(
 /// and a later LLM round will continue this turn — that round is stored as
 /// its own assistant message in the session file, so live UI opens a new
 /// bubble on the next token rather than concatenating ("onGood").
+///
+/// When `text` is present it replaces the live bubble (the gateway's
+/// assembled buffer), so a doubled append from a stale second socket still
+/// snaps back at the end of the stream. Tokens themselves still arrived as
+/// incremental `delta` frames.
 fn handle_stream_end(
     ctx: &WsContext,
     text: Option<String>,
@@ -479,6 +486,33 @@ fn maybe_begin_next_stream_segment(ctx: &WsContext, turn_id: &str) {
     });
     persist_entries(&entries);
     ctx.entries.set(entries);
+}
+
+/// Handle a `turn_aborted` event: close out the cancelled turn, since nothing
+/// else is coming for it — no `stream_end`, no final `message` — and the
+/// bubble would otherwise stream forever.
+///
+/// Keyed off the locally tracked turn rather than the event's own `turn_id`:
+/// this client only ever renders a turn it sent itself (see
+/// [`WsContext::active_turn_id`]), and that handle is already cleared the
+/// moment a turn ends normally. So an abort that lost the race against
+/// completion finds nothing to close, instead of stamping a finished answer as
+/// stopped. When the event does name a turn, it must be that same one.
+fn handle_turn_aborted(ctx: &WsContext, turn_id: Option<String>) {
+    let Some(active_turn_id) = ctx.active_turn_id.get_untracked() else {
+        return;
+    };
+    if turn_id.is_some_and(|named| named != active_turn_id) {
+        return;
+    }
+    update_entries(ctx, |entries, index| {
+        state::apply_turn_aborted(entries, index, &active_turn_id);
+    });
+    ctx.active_turn_id.set(None);
+    ctx.split_stream_on_next_delta.set(false);
+    // The aborted turn still persisted its user message, so the chat's
+    // sidebar ordering (and possibly its generated title) has moved on.
+    request_chat_list(ctx);
 }
 
 /// Route one parsed [`ServerEvent`] to the appropriate `state.rs` reducer
@@ -583,9 +617,18 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::Error {
             turn_id, detail, ..
         } => {
+            // A Stop click that lost the race against turn completion. Not
+            // worth a banner — the turn the user wanted stopped is already
+            // over — and it must not fall through to the generic handling
+            // below, which would close out and forget whichever turn the
+            // gateway says *is* running.
+            if detail == "turn_not_active" {
+                log::info!("abort ignored: {detail}");
+                return;
+            }
             if matches!(
                 detail.as_str(),
-                "session_not_found" | "missing title" | "rename_failed"
+                "session_not_found" | "missing title" | "rename_failed" | "delete_failed"
             ) {
                 request_chat_list(ctx);
             }
@@ -646,6 +689,13 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
         }
+        ServerEvent::ChatDeleted { chat_id } => {
+            handle_chat_deleted(ctx, chat_id);
+        }
+        ServerEvent::TurnAborted { chat_id, turn_id } => {
+            log::info!("turn aborted: chat_id={chat_id} turn_id={turn_id:?}");
+            handle_turn_aborted(ctx, turn_id);
+        }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
 }
@@ -668,6 +718,10 @@ fn should_drop_event(ctx: &WsContext, event: &ServerEvent) -> bool {
 /// Open a new gateway WebSocket connection for `ctx.token`, wiring its
 /// receive loop into [`dispatch_server_event`] and [`handle_connection_closed`].
 /// No-ops if there is no token (logged out).
+///
+/// Any previous socket is closed first. Dropping only the send half is not
+/// enough: the old receive loop keeps the connection subscribed, so both
+/// sockets would fan in `delta`s onto the same `entries` signal.
 fn open_connection(ctx: WsContext) {
     let Some(token) = ctx.token.get_untracked() else {
         return;
@@ -682,6 +736,7 @@ fn open_connection(ctx: WsContext) {
 
     let generation = ctx.generation.get_untracked() + 1;
     ctx.generation.set(generation);
+    close_current_sender(&ctx);
 
     let url = build_gateway_ws_url(
         &ctx.client_id.get_untracked(),
@@ -699,7 +754,12 @@ fn open_connection(ctx: WsContext) {
             let close_ctx = ctx;
             api::spawn_receive_loop(
                 receiver,
-                move |event| dispatch_server_event(&event_ctx, event),
+                move |event| {
+                    if event_ctx.generation.get_untracked() != generation {
+                        return;
+                    }
+                    dispatch_server_event(&event_ctx, event);
+                },
                 move || handle_connection_closed(close_ctx, generation),
             );
         }
@@ -837,6 +897,146 @@ fn request_rename(ctx: &WsContext, chat_id: String, title: String) {
     );
 }
 
+/// Ask the gateway to permanently delete `chat_id`'s session.
+///
+/// Refuses locally when this connection only has one chat left — the UI
+/// also blocks that path, but the list can shrink between opening the
+/// confirm dialog and confirming. No optimistic local removal from
+/// `ctx.sessions` here (unlike [`request_rename`]'s optimistic title
+/// update): the gateway always fans `chat_deleted` back to the requester
+/// too (see the backend's `handle_envelope_delete_chat`), so
+/// [`dispatch_server_event`] removing the row then is the single source of
+/// truth — no risk of a row vanishing from the sidebar on a request that
+/// then comes back `session_not_found` / `delete_failed`.
+fn request_delete(ctx: &WsContext, chat_id: String) {
+    if ctx.sessions.get_untracked().len() <= 1 {
+        ctx.chat_error.set(Some(
+            "It is not possible to delete the only session.".to_string(),
+        ));
+        return;
+    }
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::delete_chat(chat_id),
+        "Failed to encode the delete request.",
+    );
+}
+
+/// Ask the gateway to cancel the in-flight turn on the active chat.
+///
+/// No optimistic local close (same reasoning as [`request_delete`]): the
+/// gateway fans `turn_aborted` back to the requester too (see the backend's
+/// `handle_envelope_abort_turn`), so [`dispatch_server_event`] closing the
+/// bubble then is the single source of truth. Closing it here instead would
+/// leave the transcript claiming the turn ended even when the abort came back
+/// rejected and the stream is in fact still running.
+fn request_abort_turn(ctx: &WsContext) {
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::abort_turn(chat_id, ctx.active_turn_id.get_untracked()),
+        "Failed to encode the abort request.",
+    );
+}
+
+/// Drop local transcript/turn state so leftover frames from the previous
+/// `chat_id` are ignored until a new `attached` (or `ready`) lands.
+fn reset_local_transcript(ctx: &WsContext) {
+    clear_stored_entries();
+    clear_stored_chat_id();
+    ctx.entries.set(Vec::new());
+    ctx.next_id.set(0);
+    ctx.turn_index.set(HashMap::new());
+    ctx.active_turn_id.set(None);
+    ctx.chat_id.set(None);
+    ctx.chat_error.set(None);
+    ctx.split_stream_on_next_delta.set(false);
+}
+
+/// Subscribe this connection to an existing `chat_id`, clearing the local
+/// transcript first so `should_drop_event` ignores leftover frames from the
+/// previous subscription until `attached` arrives with this chat's history.
+fn attach_to_session(ctx: &WsContext, selected_id: String) {
+    if ctx.chat_id.get_untracked().as_deref() == Some(selected_id.as_str()) {
+        return;
+    }
+    reset_local_transcript(ctx);
+
+    let connected = ctx.ws_sender.get_untracked().borrow().as_ref().is_some();
+    if connected {
+        send_client_envelope(
+            *ctx,
+            protocol::ClientEnvelope::attach(selected_id),
+            "Failed to encode the attach request.",
+        );
+    } else {
+        // Nothing to send on yet. Reopen and let `ready` attach, rather
+        // than stranding the user on a cleared transcript with no chat
+        // — the same fallback `start_new_chat` uses.
+        ctx.pending_attach.set(Some(selected_id));
+        ctx.reconnect_attempt.set(0);
+        ctx.reconnect_exhausted.set(false);
+        open_connection(*ctx);
+    }
+}
+
+/// Apply a `chat_deleted` event: drop the row from the sidebar, and if it
+/// was the chat this connection is looking at, attach to the next remaining
+/// session instead of minting a replacement "New chat".
+fn handle_chat_deleted(ctx: &WsContext, chat_id: String) {
+    let was_active = ctx.chat_id.get_untracked().as_deref() == Some(chat_id.as_str());
+    let next_id = if was_active {
+        state::next_session_id_after(&ctx.sessions.get_untracked(), &chat_id)
+    } else {
+        None
+    };
+    ctx.sessions.update(|sessions| {
+        sessions.retain(|session| session.id != chat_id);
+    });
+    // Every connection subscribed to the deleted chat gets this event (see
+    // the backend's `handle_envelope_delete_chat`), not just the one that
+    // asked for the delete — so only switch away when it was actually the
+    // chat this connection is looking at.
+    if !was_active {
+        return;
+    }
+    match next_id {
+        Some(next_id) => attach_to_session(ctx, next_id),
+        None => {
+            // Last remaining chat disappeared (e.g. another tab deleted it).
+            // Leave a blank transcript rather than auto-creating a new one;
+            // the user can click "New chat" themselves.
+            reset_local_transcript(ctx);
+            ctx.pending_attach.set(None);
+        }
+    }
+}
+
+/// Reset every piece of local per-chat state and ask the gateway for a
+/// brand-new chat. Used by the "New chat" header action — not by delete,
+/// which switches to a remaining session instead of minting a replacement.
+fn start_new_chat(ctx: &WsContext) {
+    reset_local_transcript(ctx);
+    ctx.pending_attach.set(None);
+
+    let connected = ctx.ws_sender.get_untracked().borrow().as_ref().is_some();
+    if connected {
+        send_client_envelope(
+            *ctx,
+            protocol::ClientEnvelope::new_chat(),
+            "Failed to encode the new-chat request.",
+        );
+    } else {
+        // Nothing to send on yet. Reopen and let `ready` mint a fresh
+        // chat_id once the socket comes back up.
+        ctx.reconnect_attempt.set(0);
+        ctx.reconnect_exhausted.set(false);
+        open_connection(*ctx);
+    }
+}
+
 /// How long after a turn finishes to re-request the chat list, to pick up a
 /// title that was still generating when [`request_chat_list`]'s
 /// immediately-on-completion call ran. See [`schedule_delayed_chat_list_refresh`].
@@ -868,16 +1068,25 @@ fn schedule_delayed_chat_list_refresh(ctx: WsContext) {
     });
 }
 
-/// Tear down the current socket without letting [`handle_connection_closed`]
-/// schedule an automatic reconnect (bumping `generation` makes its
-/// eventual, stale `on_close` callback a no-op). Used by logout.
-fn close_connection(ctx: &WsContext) {
-    ctx.generation.set(ctx.generation.get_untracked() + 1);
+/// Close the current send half, if any, so the paired receive loop ends.
+/// Used by [`open_connection`] (replace the live socket) and
+/// [`close_connection`] (logout). Closing is async; [`WsContext::generation`]
+/// is what actually drops events from a socket that has not finished
+/// tearing down yet.
+fn close_current_sender(ctx: &WsContext) {
     if let Some(mut sender) = ctx.ws_sender.get_untracked().borrow_mut().take() {
         spawn_local(async move {
             let _ = sender.close().await;
         });
     }
+}
+
+/// Tear down the current socket without letting [`handle_connection_closed`]
+/// schedule an automatic reconnect (bumping `generation` makes its
+/// eventual, stale `on_close` callback a no-op). Used by logout.
+fn close_connection(ctx: &WsContext) {
+    ctx.generation.set(ctx.generation.get_untracked() + 1);
+    close_current_sender(ctx);
 }
 
 #[component]
@@ -934,7 +1143,8 @@ pub fn App() -> impl IntoView {
     let user_email = RwSignal::new(read_stored_email());
     let token_streaming = RwSignal::new(false);
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
-    let sidebar_open = RwSignal::new(false);
+    let sidebar_open =
+        RwSignal::new(BrowserLocalStorage::get::<bool>(SIDEBAR_OPEN_STORAGE_KEY).unwrap_or(false));
     let pending_attach = RwSignal::new(None::<String>);
     let split_stream_on_next_delta = RwSignal::new(false);
 
@@ -1067,36 +1277,7 @@ pub fn App() -> impl IntoView {
         );
     };
 
-    let do_new_chat = move || {
-        clear_stored_entries();
-        clear_stored_chat_id();
-        entries.set(Vec::new());
-        next_id.set(0);
-        turn_index.set(HashMap::new());
-        active_turn_id.set(None);
-        chat_id.set(None);
-        chat_error.set(None);
-        pending_attach.set(None);
-        split_stream_on_next_delta.set(false);
-
-        let connected = ws_context
-            .ws_sender
-            .get_untracked()
-            .borrow()
-            .as_ref()
-            .is_some();
-        if connected {
-            send_client_envelope(
-                ws_context,
-                protocol::ClientEnvelope::new_chat(),
-                "Failed to encode the new-chat request.",
-            );
-        } else {
-            reconnect_attempt.set(0);
-            reconnect_exhausted.set(false);
-            open_connection(ws_context);
-        }
-    };
+    let do_new_chat = move || start_new_chat(&ws_context);
 
     let do_retry = move || manual_retry(ws_context);
 
@@ -1112,52 +1293,32 @@ pub fn App() -> impl IntoView {
         expanded.update(|value| *value = !*value);
         let _ = BrowserLocalStorage::set(EXPANDED_STORAGE_KEY, &expanded.get());
     };
-    let toggle_sidebar = move || sidebar_open.update(|open| *open = !*open);
-    let close_sidebar = move || sidebar_open.set(false);
+    let toggle_sidebar = move || {
+        sidebar_open.update(|open| *open = !*open);
+        let _ = BrowserLocalStorage::set(SIDEBAR_OPEN_STORAGE_KEY, &sidebar_open.get());
+    };
+    // The header button only *opens* the sidebar; collapsing goes through here.
+    let close_sidebar = move || {
+        sidebar_open.set(false);
+        let _ = BrowserLocalStorage::set(SIDEBAR_OPEN_STORAGE_KEY, &sidebar_open.get());
+    };
     let on_rename_session = move |id: String, title: String| {
         request_rename(&ws_context, id, title);
     };
-    let on_select_session = move |selected_id: String| {
-        if chat_id.get_untracked().as_deref() == Some(selected_id.as_str()) {
-            return;
-        }
-        // Same local reset as "New chat" so leftover frames from the old
-        // subscription are dropped (`should_drop_event`) until `attached`
-        // lands with this chat's history.
-        clear_stored_entries();
-        clear_stored_chat_id();
-        entries.set(Vec::new());
-        next_id.set(0);
-        turn_index.set(HashMap::new());
-        active_turn_id.set(None);
-        chat_id.set(None);
-        chat_error.set(None);
-        split_stream_on_next_delta.set(false);
-
-        let connected = ws_context
-            .ws_sender
-            .get_untracked()
-            .borrow()
-            .as_ref()
-            .is_some();
-        if connected {
-            send_client_envelope(
-                ws_context,
-                protocol::ClientEnvelope::attach(selected_id),
-                "Failed to encode the attach request.",
-            );
-        } else {
-            // Nothing to send on yet. Reopen and let `ready` attach, rather
-            // than stranding the user on a cleared transcript with no chat
-            // — the same fallback `do_new_chat` uses.
-            pending_attach.set(Some(selected_id));
-            reconnect_attempt.set(0);
-            reconnect_exhausted.set(false);
-            open_connection(ws_context);
-        }
+    let on_delete_session = move |id: String| {
+        request_delete(&ws_context, id);
     };
+    let on_select_session = move |selected_id: String| {
+        attach_to_session(&ws_context, selected_id);
+    };
+    let on_abort_turn = move || request_abort_turn(&ws_context);
 
-    let pending = Signal::derive(move || entries.get().iter().any(|entry| entry.streaming));
+    // A turn stays in flight across tool waits, even though those pauses
+    // clear `streaming` on the current bubble so the next LLM round can
+    // open a new one. Key the composer off `active_turn_id` rather than
+    // any-entry-streaming, or Stop would flip back to a disabled Send
+    // between rounds.
+    let pending = Signal::derive(move || active_turn_id.get().is_some());
 
     view! {
         <Show
@@ -1201,6 +1362,8 @@ pub fn App() -> impl IntoView {
                     on_close_sidebar=close_sidebar
                     on_select_session=on_select_session
                     on_rename_session=on_rename_session
+                    on_delete_session=on_delete_session
+                    on_abort_turn=on_abort_turn
                 />
             </Show>
         </Show>

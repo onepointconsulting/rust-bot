@@ -54,7 +54,7 @@ use crate::{
     security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
-    session::manager::{RenameSessionError, Session, SessionManager},
+    session::manager::{DeleteSessionError, RenameSessionError, Session, SessionManager},
 };
 
 const MAX_HISTORY_MESSAGES: usize = 200;
@@ -472,6 +472,12 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::RenameChat => {
             handle_envelope_rename_chat(envelope_dispatch_context).await;
         }
+        EnvelopeType::DeleteChat => {
+            handle_envelope_delete_chat(envelope_dispatch_context).await;
+        }
+        EnvelopeType::AbortTurn => {
+            handle_envelope_abort_turn(envelope_dispatch_context).await;
+        }
         EnvelopeType::Attach => {
             handle_envelope_attach(envelope_dispatch_context).await;
         }
@@ -728,6 +734,274 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
         serde_json::json!({"chat_id": cid, "title": title}),
     )
     .await;
+}
+
+/// Handle an `abort_turn` envelope: cancel the in-flight agent turn for
+/// `chat_id` — leaving the session and its history intact, unlike
+/// `delete_chat` — then announce `turn_aborted` to everyone watching that
+/// chat. New protocol surface with no nanobot precedent — see
+/// [`EnvelopeType::AbortTurn`]'s doc comment.
+///
+/// Cancellation is session-scoped rather than turn-scoped: `abort_session`
+/// keys off `websocket:{chat_id}` and `register_queued_turn_if_idle` admits
+/// only one in-flight turn per chat, so there is never a second turn on the
+/// same chat to spare. A supplied `turn_id` is therefore only a staleness
+/// guard — it stops a Stop click that lost the race against turn completion
+/// from reaching whatever turn ran next.
+async fn handle_envelope_abort_turn<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let shared = envelope_dispatch_context.shared;
+    let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let requested_turn_id = envelope_dispatch_context
+        .envelope
+        .get("turn_id")
+        .and_then(|v| v.as_str())
+        .filter(|t| !t.is_empty());
+
+    // Read the live turn identity before the abort below clears it, so the
+    // ack can name the turn it ended even when the client sent no `turn_id`.
+    // Scoped so the `MutexGuard` is dropped before any `.await` — same
+    // discipline as every other `turn_registry` use in this file.
+    let active_turn_id = {
+        let turn_registry = shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        turn_registry.websocket_turn_id(cid)
+    };
+
+    // Reject only a *positive* mismatch: the projection carries a `turn_id`
+    // solely for turns that came in over a WebUI envelope that supplied one
+    // (see `register_queued_turn_if_idle`'s call site), so a `None` here is
+    // just as likely to mean "running, identity unknown" as "idle". Aborting
+    // on `None` keeps the button working in that case, and costs nothing when
+    // the chat really is idle — `abort_session` is a no-op with no tasks.
+    if let Some(requested) = requested_turn_id
+        && let Some(active) = active_turn_id.as_deref()
+        && requested != active
+    {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "turn_not_active", "turn_id": requested}),
+        )
+        .await;
+        return;
+    }
+
+    // Abort in-flight agent tasks and subagents for this chat, the same body
+    // `/stop` and `delete_chat` run (see `SessionWorkCanceller`). `None` in
+    // every test fixture and whenever no live `AgentLoop` was wired in — see
+    // `GatewayServices::set_work_canceller`.
+    if let Some(canceller) = shared.gateway_services.work_canceller() {
+        canceller.abort("websocket", cid).await;
+    }
+    // The abort above publishes a `TurnEnd`, which clears the projection via
+    // `WebSocketChannel::send` — but only when there *was* a canceller to run
+    // it. Clear directly too so the chat can never be left reading as
+    // "running" with nothing behind it.
+    shared
+        .gateway_services
+        .turn_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear_chat(cid);
+
+    // Fanned out rather than sent to the requester alone: every connection
+    // attached to `cid` was rendering this turn's stream, so all of them need
+    // to stop waiting on it — same reasoning as `chat_deleted`.
+    send_turn_aborted(
+        cid,
+        active_turn_id.as_deref().or(requested_turn_id),
+        connection_id,
+        shared,
+    )
+    .await;
+}
+
+/// Tell every connection subscribed to `chat_id` that its in-flight turn was
+/// cancelled, plus `requester_id` itself — a client that asked to abort a chat
+/// it isn't attached to still needs the ack to stop showing a Stop button.
+/// Fan-out + cleanup-on-failure follows [`send_goal_status`].
+async fn send_turn_aborted(
+    chat_id: &str,
+    turn_id: Option<&str>,
+    requester_id: &str,
+    ws_shared: &WsShared,
+) {
+    let recipients = {
+        let connections = ws_shared.connections.lock().await;
+        let mut recipients = connections.senders_for_chat(chat_id);
+        if !recipients.iter().any(|(id, _)| id == requester_id)
+            && let Some(sender) = connections.sender_for(requester_id)
+        {
+            recipients.push((requester_id.to_string(), sender));
+        }
+        recipients
+    };
+    let mut body = serde_json::json!({
+        "event": WsOutboundEvent::TurnAborted.as_str(),
+        "chat_id": chat_id,
+    });
+    if let Some(turn_id) = turn_id {
+        body["turn_id"] = serde_json::json!(turn_id);
+    }
+    let raw = body.to_string();
+    for (connection_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            log::warn!(
+                "WebSocket channel: connection '{connection_id}' gone while sending turn_aborted, cleaning up"
+            );
+            ws_shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&connection_id);
+        }
+    }
+}
+
+/// Handle a `delete_chat` envelope: permanently delete a `websocket:{chat_id}`
+/// session — tombstone + unlink its JSONL, abort any in-flight agent work,
+/// detach every connection subscribed to it, and fan a `chat_deleted` event
+/// out to all of them (not just the requester, unlike rename — other tabs/
+/// connections attached to a shared chat need to know it's gone too). New
+/// protocol surface with no nanobot precedent — see
+/// [`EnvelopeType::DeleteChat`]'s doc comment.
+async fn handle_envelope_delete_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let shared = envelope_dispatch_context.shared;
+    let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let delete_result = {
+        // Drop the `MutexGuard` before any `.await` below — same discipline
+        // as every other `session_manager` use in this file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.delete_session(&get_session_id(cid))
+    };
+    if let Err(e) = delete_result {
+        let detail = match e {
+            DeleteSessionError::NotFound => "session_not_found",
+            DeleteSessionError::Io(e) => {
+                log::error!("Failed to delete session {cid}: {e}");
+                "delete_failed"
+            }
+        };
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": detail}),
+        )
+        .await;
+        return;
+    }
+
+    // Cancel any in-flight agent turn/subagents for this chat so a stale
+    // write doesn't keep landing on the tombstoned session (see
+    // `SessionManager::delete_session`'s doc comment). `None` in every test
+    // fixture and whenever no live `AgentLoop` was wired in — see
+    // `GatewayServices::set_work_canceller`.
+    if let Some(canceller) = shared.gateway_services.work_canceller() {
+        canceller.abort("websocket", cid).await;
+    }
+    // The abort above may publish a `TurnEnd`, but that only clears the
+    // *agent's* bookkeeping — also clear the WebSocket-side turn projection
+    // directly so a client that queries it after `chat_deleted` never sees
+    // this chat_id as still "running".
+    shared
+        .gateway_services
+        .turn_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear_chat(cid);
+
+    // Best-effort: unlink the WebUI transcript too. Never blocks the
+    // deletion itself — a missing/never-created transcript is not an error.
+    shared
+        .gateway_services
+        .transcripts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .forget_session(cid);
+
+    // `detach_chat` only returns connections currently *subscribed* to
+    // `cid` (i.e. attached to it as their active chat). The requester may
+    // be deleting a different, inactive sidebar row — e.g. any chat but
+    // the one it's currently viewing — in which case it wouldn't be in
+    // that list at all and would never learn the delete succeeded, leaving
+    // the row stuck in its sidebar. Always include the requester.
+    let recipients = {
+        let mut connections = shared.connections.lock().await;
+        let mut recipients = connections.detach_chat(cid);
+        if !recipients.iter().any(|(id, _)| id == connection_id)
+            && let Some(sender) = connections.sender_for(connection_id)
+        {
+            recipients.push((connection_id.to_string(), sender));
+        }
+        recipients
+    };
+    let raw = serde_json::json!({
+        "event": WsOutboundEvent::ChatDeleted.as_str(),
+        "chat_id": cid,
+    })
+    .to_string();
+    for (recipient_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            log::warn!(
+                "WebSocket channel: connection '{recipient_id}' gone while sending chat_deleted, cleaning up"
+            );
+            shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&recipient_id);
+        }
+    }
 }
 
 /// Handle a `list_chats` envelope: reply with every `websocket:`-keyed
@@ -1424,6 +1698,15 @@ async fn send_goal_status(
     }
 }
 
+fn create_rejection_fields(cid: &str) -> serde_json::Map<String, serde_json::Value> {
+    let mut rejection_fields = serde_json::Map::new();
+    rejection_fields.insert(
+        "chat_id".to_string(),
+        serde_json::Value::String(cid.to_string()),
+    );
+    rejection_fields
+}
+
 /// WebSocket server channel: rust-bot acts as a WebSocket server, serving
 /// connected clients over `axum`'s `ws` feature (a thin wrapper around
 /// `tokio-tungstenite`).
@@ -1785,11 +2068,14 @@ impl BaseChannel for WebSocketChannel {
                 }
             };
             let mut payload = serde_json::json!({"event": "stream_end", "chat_id": chat_id});
-            // No `rewrite_local_markdown_images` equivalent exists in
-            // rust-bot (see module-level plan notes) — nanobot's
-            // `rewritten != full_text` disjunct never fires here, so this
-            // simplifies to "only a non-empty delta warrants echoing text".
-            if !delta.is_empty() {
+            // Always echo the assembled buffer when we have one, even if this
+            // end frame's own `delta` is empty (the usual case: every token
+            // already went out as a `delta` event). The client treats `text`
+            // as the authoritative replacement for the live bubble, so a
+            // doubled in-memory append still snaps back at stream_end.
+            // Incremental `delta` frames are unchanged — this is not a
+            // substitute for token streaming.
+            if !full_text.is_empty() {
                 payload["text"] = serde_json::json!(full_text);
             }
             payload
@@ -3229,6 +3515,586 @@ mod tests {
         );
     }
 
+    async fn dispatch_delete(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("delete_chat"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_delete_chat must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_unlinks_session_and_sends_chat_deleted() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "chat_deleted");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert!(
+            rx.try_recv().is_err(),
+            "delete must send exactly one frame to the requester"
+        );
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .is_none(),
+            "deleted session must be gone from cache"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_notifies_requester_even_when_not_subscribed() {
+        // The requester's connection is attached to "chat-1" (its currently
+        // active chat) but asks to delete "chat-2" — some other row in its
+        // sidebar list. `detach_chat` alone would not return this
+        // connection since it isn't subscribed to "chat-2", so the fix
+        // must fall back to notifying the requester directly.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-2".to_string()))
+                .unwrap();
+        }
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-2"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "chat_deleted");
+        assert_eq!(body["chat_id"], "chat-2");
+        assert!(
+            rx.try_recv().is_err(),
+            "delete must send exactly one frame to the requester"
+        );
+
+        // The requester's own subscription to "chat-1" must be untouched.
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("chat-1")
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_notifies_every_subscribed_connection() {
+        let shared = test_shared("browser");
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body1 = recv_json(&mut rx1);
+        assert_eq!(body1["event"], "chat_deleted");
+        assert_eq!(body1["chat_id"], "chat-1");
+        let body2 = recv_json(&mut rx2);
+        assert_eq!(body2["event"], "chat_deleted");
+        assert_eq!(body2["chat_id"], "chat-1");
+
+        assert!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("chat-1")
+                .is_empty(),
+            "every connection must be detached from the deleted chat"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_rejects_invalid_or_missing_chat_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        for chat_id in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("has space")),
+            Some(serde_json::json!(123)),
+        ] {
+            dispatch_delete(&shared, "conn-1", chat_id.clone()).await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected payload: {chat_id:?}");
+            assert_eq!(body["detail"], "invalid chat_id");
+            assert!(
+                body.get("chat_id").is_none(),
+                "invalid delete must omit chat_id, matching attach/rename: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_rejects_unknown_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("missing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "session_not_found");
+        assert_eq!(body["chat_id"], "missing-chat");
+        assert!(
+            !body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("websocket:"),
+            "wire error must not leak the internal session key: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["chat_id"], "chat-1");
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .is_some(),
+            "a denied delete must not remove the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_delete_chat_then_save_does_not_recreate_the_jsonl() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let snapshot = {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session_manager.save(session.clone()).unwrap();
+            session
+        };
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+        let _ = recv_json(&mut rx);
+
+        // A write that raced past the delete (e.g. a turn that cloned the
+        // session before `delete_chat` ran) must not resurrect the file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager
+            .save(snapshot)
+            .expect("save after delete must not error");
+        assert!(
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .is_none(),
+            "save on a tombstoned key must not resurrect the cache entry"
+        );
+        let path = session_manager.sessions_dir.join(format!(
+            "{}.jsonl",
+            crate::utils::helpers::safe_filename("websocket:chat-1")
+        ));
+        assert!(
+            !path.exists(),
+            "save on a tombstoned key must not recreate the jsonl file"
+        );
+    }
+
+    async fn dispatch_abort_turn(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+        turn_id: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("abort_turn"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        if let Some(turn_id) = turn_id {
+            envelope.insert("turn_id".to_string(), turn_id);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_abort_turn must not hang");
+    }
+
+    fn start_registry_turn(shared: &WsShared, chat_id: &str, turn_id: Option<&str>) {
+        shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .start_turn(chat_id, "owner-a", turn_id);
+    }
+
+    fn chat_is_running(shared: &WsShared, chat_id: &str) -> bool {
+        shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .websocket_turn_wall_started_at(chat_id)
+            .is_some()
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_clears_the_turn_and_acks() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        start_registry_turn(&shared, "chat-1", Some("turn-1"));
+
+        dispatch_abort_turn(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "turn_aborted");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(
+            body["turn_id"], "turn-1",
+            "the ack must name the turn it ended even when the client sent no turn_id"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "abort must send exactly one frame per connection"
+        );
+        assert!(!chat_is_running(&shared, "chat-1"));
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_notifies_every_subscribed_connection() {
+        // A second tab attached to the same chat was rendering the same
+        // stream, so it has to stop waiting on it too.
+        let shared = test_shared("browser");
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+        start_registry_turn(&shared, "chat-1", Some("turn-1"));
+
+        dispatch_abort_turn(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
+
+        assert_eq!(recv_json(&mut rx1)["event"], "turn_aborted");
+        assert_eq!(recv_json(&mut rx2)["event"], "turn_aborted");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_keeps_the_session_intact() {
+        // The whole point of a separate envelope: unlike `delete_chat`, an
+        // abort must leave the chat and its history behind.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_abort_turn(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
+        assert_eq!(recv_json(&mut rx)["event"], "turn_aborted");
+
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("chat-1")
+                .len(),
+            1,
+            "abort must not detach the connection from the chat"
+        );
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .is_some(),
+            "abort must not delete the session"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_rejects_a_stale_turn_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        start_registry_turn(&shared, "chat-1", Some("turn-2"));
+
+        dispatch_abort_turn(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("turn-1")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "turn_not_active");
+        assert_eq!(body["turn_id"], "turn-1");
+        assert!(
+            chat_is_running(&shared, "chat-1"),
+            "a stale abort must leave the turn that actually is running alone"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_accepts_a_turn_id_the_projection_does_not_know() {
+        // `turn_id` only reaches the projection for turns that arrived over a
+        // WebUI envelope carrying one, so `None` there means "identity
+        // unknown", not "idle" — the abort must still go through.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        start_registry_turn(&shared, "chat-1", None);
+
+        dispatch_abort_turn(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("turn-1")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "turn_aborted");
+        assert_eq!(
+            body["turn_id"], "turn-1",
+            "with nothing to echo, the ack falls back to the requested turn_id"
+        );
+        assert!(!chat_is_running(&shared, "chat-1"));
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_on_an_idle_chat_still_acks() {
+        // Losing the race against turn completion must not leave the client
+        // without a reply — otherwise its Stop button spins forever.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_abort_turn(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "turn_aborted");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert!(
+            body.get("turn_id").is_none(),
+            "no turn to name, so no turn_id on the wire: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_rejects_invalid_or_missing_chat_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        for chat_id in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("has space")),
+            Some(serde_json::json!(123)),
+        ] {
+            dispatch_abort_turn(&shared, "conn-1", chat_id.clone(), None).await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected payload: {chat_id:?}");
+            assert_eq!(body["detail"], "invalid chat_id");
+            assert!(
+                body.get("chat_id").is_none(),
+                "invalid abort must omit chat_id, matching attach/rename/delete: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_abort_turn_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        start_registry_turn(&shared, "chat-1", Some("turn-1"));
+
+        dispatch_abort_turn(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert!(
+            chat_is_running(&shared, "chat-1"),
+            "a denied abort must not cancel the turn"
+        );
+    }
+
     #[tokio::test]
     async fn handle_envelope_rename_chat_denies_a_sender_outside_the_allow_list() {
         let mut shared = test_shared("browser");
@@ -3728,7 +4594,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_delta_stream_end_with_empty_delta_omits_text_when_buffer_already_sent() {
+    async fn send_delta_stream_end_with_empty_delta_still_echoes_buffered_text() {
         let channel = test_channel();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
         channel
@@ -3743,6 +4609,28 @@ mod tests {
             .unwrap();
         rx.try_recv().unwrap();
 
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+        BaseChannel::send_delta(&channel, "chat-1", "", Some(meta))
+            .await
+            .unwrap();
+
+        let msg = rx.try_recv().expect("expected a delivered frame");
+        let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "stream_end");
+        assert_eq!(body["text"], "Hello");
+    }
+
+    #[tokio::test]
+    async fn send_delta_stream_end_omits_text_when_nothing_was_buffered() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut meta = HashMap::new();
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
         meta.insert("_stream_end".to_string(), serde_json::json!(true));
         BaseChannel::send_delta(&channel, "chat-1", "", Some(meta))
             .await

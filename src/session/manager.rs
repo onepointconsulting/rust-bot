@@ -1,9 +1,9 @@
 use std::{
-    collections::HashMap,
+    collections::{HashMap, HashSet},
     fs::{self, File},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock, Mutex},
+    sync::{LazyLock, Mutex},
 };
 
 use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
@@ -13,8 +13,9 @@ use serde_json::{Map, Value, json};
 use tera::Context;
 
 use crate::{
+    agent::model_runtime::ModelRuntime,
     config::paths::get_legacy_sessions_dir,
-    providers::base::{LLMProviderDyn, LLMResponse},
+    providers::base::LLMResponse,
     session::{
         SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message,
         keys::COMMAND_KEY,
@@ -275,11 +276,30 @@ pub enum RenameSessionError {
     Save(std::io::Error),
 }
 
+/// Failure from [`SessionManager::delete_session`].
+#[derive(Debug)]
+pub enum DeleteSessionError {
+    /// No session file (and nothing in cache) for this key.
+    NotFound,
+    /// The session file exists but could not be removed from disk.
+    Io(std::io::Error),
+}
+
 pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
     pub legacy_sessions_dir: PathBuf,
     cache: HashMap<String, Session>,
+    /// Keys tombstoned by [`Self::delete_session`], for the lifetime of this
+    /// process. Not persisted anywhere — if the process restarts, a deleted
+    /// key simply has no file left to reload, which is enough on its own.
+    /// While the process is alive, this is what stops a write that raced
+    /// past the delete (title generation, consolidation, workspace-scope
+    /// persistence — anything that cloned the session, dropped this mutex,
+    /// then calls back into [`Self::save`] or [`Self::get_or_create_session`]
+    /// after the delete already ran) from recreating the file or resurrecting
+    /// the key in the cache.
+    deleted: HashSet<String>,
 }
 
 impl SessionManager {
@@ -289,6 +309,7 @@ impl SessionManager {
             sessions_dir: ensure_dir(workspace.join("sessions")),
             legacy_sessions_dir: get_legacy_sessions_dir(),
             cache: HashMap::new(),
+            deleted: HashSet::new(),
         }
     }
 
@@ -323,7 +344,19 @@ impl SessionManager {
     /// Get an existing session or create a new one.
     ///
     /// Cache first; on a miss, load from disk or insert a fresh session.
+    ///
+    /// A tombstoned key (see [`Self::deleted`]) never reloads from disk —
+    /// there may be nothing left to reload anyway, but more importantly a
+    /// caller that raced past the delete must not resurrect it. It gets a
+    /// fresh in-memory placeholder instead, which [`Self::save`] silently
+    /// refuses to flush.
     pub fn get_or_create_session(&mut self, key: &str) -> &mut Session {
+        if self.deleted.contains(key) {
+            self.cache
+                .entry(key.to_string())
+                .or_insert_with(|| Session::new(key.to_string()));
+            return self.cache.get_mut(key).expect("session is in cache");
+        }
         if !self.cache.contains_key(key) {
             let session = self
                 .load(key)
@@ -438,7 +471,14 @@ impl SessionManager {
     ///
     /// Writes a single metadata line followed by one line per message (JSONL).
     /// Returns an error if the file cannot be created or written.
+    ///
+    /// A no-op (`Ok(())`, no `File::create`, no cache write) if this key was
+    /// tombstoned by [`Self::delete_session`] — see the [`Self::deleted`]
+    /// field doc comment for why this check exists.
     pub fn save(&mut self, session: Session) -> std::io::Result<()> {
+        if self.deleted.contains(&session.key) {
+            return Ok(());
+        }
         let path = self.get_session_path(&session.key);
 
         let mut file = File::create(&path)?;
@@ -464,6 +504,40 @@ impl SessionManager {
 
     pub fn invalidate(&mut self, key: &str) -> Option<Session> {
         self.cache.remove(key)
+    }
+
+    /// Permanently delete a session: tombstone the key, drop it from the
+    /// cache, and unlink its JSONL file (current path and, if present, the
+    /// legacy path). Missing keys return [`DeleteSessionError::NotFound`] —
+    /// same "don't pretend to act on nothing" bar as [`Self::rename_session`].
+    ///
+    /// The tombstone (not just the unlink) is what makes this safe against a
+    /// session that is shared or has in-flight work: see the [`Self::deleted`]
+    /// field doc comment. This method only has to win the race against a
+    /// write that is *already past* this call's mutex hold (this method runs
+    /// under the same `Mutex<SessionManager>` every other session mutation
+    /// does); callers are still responsible for aborting/cancelling any
+    /// active turn for this key so a stale write does not keep happening
+    /// indefinitely into an inert placeholder.
+    pub fn delete_session(&mut self, key: &str) -> Result<(), DeleteSessionError> {
+        let path = self.get_session_path(key);
+        let legacy_path = self.get_legacy_session_path(key);
+        let exists = self.cache.contains_key(key) || path.exists() || legacy_path.exists();
+        if !exists {
+            return Err(DeleteSessionError::NotFound);
+        }
+
+        self.deleted.insert(key.to_string());
+        self.invalidate(key);
+
+        for candidate in [&path, &legacy_path] {
+            if let Err(e) = fs::remove_file(candidate)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(DeleteSessionError::Io(e));
+            }
+        }
+        Ok(())
     }
 
     pub fn list_sessions(&self) -> Vec<Value> {
@@ -731,8 +805,7 @@ impl SessionManager {
     pub async fn generate_title(
         sessions: &Mutex<SessionManager>,
         session_key: &str,
-        provider: Arc<dyn LLMProviderDyn>,
-        model: &str,
+        model_runtime: &ModelRuntime,
     ) -> Option<String> {
         let (system, user) = {
             let manager = sessions.lock().unwrap_or_else(|e| e.into_inner());
@@ -760,17 +833,18 @@ impl SessionManager {
                 }
             }
         };
-        let response = provider
+        let response = model_runtime
+            .provider
             .chat_with_retry(
                 vec![
                     json!({ "role": "system", "content": system }),
                     json!({ "role": "user", "content": user }),
                 ],
                 None,
-                Some(model.to_string()),
+                Some(model_runtime.model.clone()),
                 Some(TITLE_GENERATION_MAX_TOKENS),
                 Some(TITLE_GENERATION_TEMPERATURE),
-                Some("none".to_string()),
+                model_runtime.reasoning_effort.clone(),
                 None,
             )
             .await;
@@ -1570,6 +1644,91 @@ mod tests {
             Err(RenameSessionError::NotFound)
         ));
         assert!(mgr.list_sessions().is_empty());
+    }
+
+    // ── delete_session ────────────────────────────────────────────────────
+
+    #[test]
+    fn delete_session_removes_file_and_cache_and_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        mgr.save(Session::new("chat".to_string())).unwrap();
+        let path = mgr.get_session_path("chat");
+        assert!(path.exists());
+
+        mgr.delete_session("chat").expect("delete");
+
+        assert!(!path.exists(), "session file must be unlinked");
+        assert!(
+            mgr.get_session_internal("chat").is_none(),
+            "cache entry must be dropped"
+        );
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn delete_session_errors_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        assert!(matches!(
+            mgr.delete_session("missing"),
+            Err(DeleteSessionError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn delete_session_finds_cache_only_session_with_no_file_yet() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        mgr.get_or_create_session("never-saved");
+        assert!(mgr.delete_session("never-saved").is_ok());
+    }
+
+    #[test]
+    fn save_after_delete_is_a_silent_no_op_and_does_not_recreate_the_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut session = Session::new("chat".to_string());
+        session.add_message("user", "hello", Map::new());
+        mgr.save(session.clone()).unwrap();
+        let path = mgr.get_session_path("chat");
+
+        mgr.delete_session("chat").expect("delete");
+        assert!(!path.exists());
+
+        // A write that raced past the delete (e.g. title generation that had
+        // already cloned the session before the delete ran) must not bring
+        // the file — or the cache entry — back.
+        mgr.save(session).expect("save after delete must not error");
+        assert!(
+            !path.exists(),
+            "save on a tombstoned key must not recreate the file"
+        );
+        assert!(mgr.get_session_internal("chat").is_none());
+    }
+
+    #[test]
+    fn get_or_create_after_delete_returns_inert_placeholder_not_resurrected_from_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut session = Session::new("chat".to_string());
+        session.add_message("user", "hello", Map::new());
+        mgr.save(session).unwrap();
+
+        mgr.delete_session("chat").expect("delete");
+
+        let placeholder = mgr.get_or_create_session("chat");
+        assert!(
+            placeholder.messages.is_empty(),
+            "placeholder must not reload the deleted session's messages"
+        );
+        placeholder.add_message("user", "post-delete write", Map::new());
+
+        let path = mgr.get_session_path("chat");
+        assert!(
+            !path.exists(),
+            "mutating the placeholder must not touch disk without a save"
+        );
     }
 
     #[test]

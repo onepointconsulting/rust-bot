@@ -94,24 +94,7 @@ impl CommandHandler for CmdStop {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/stop");
         };
-        let agent_loop = Arc::clone(agent_loop);
-        let session_key = ctx.msg.session_key();
-        let tasks = agent_loop
-            .active_tasks
-            .lock()
-            .await
-            .remove(&session_key)
-            .unwrap_or_default();
-        let mut cancelled: u32 = 0;
-        for handle in tasks.into_values() {
-            handle.abort();
-            cancelled += 1;
-        }
-        let sub_cancelled = agent_loop.subagents.cancel_by_session(&session_key).await;
-        let total = cancelled + sub_cancelled;
-        // Abort drops `dispatch` before its post-`process_message` TurnEnd, so
-        // the registry/UI would stay "running" unless we publish it here.
-        agent_loop.publish_turn_end(&ctx.msg, None);
+        let total = agent_loop.abort_session(&ctx.msg).await;
         let content = if total > 0 {
             format!("Stopped {total} task(s).")
         } else {

@@ -2187,7 +2187,7 @@ mod tests {
             "./.rust-bot/credentials/public_key.pem"
         );
         assert_eq!(cfg.iss, "rust-bot");
-        assert_eq!(cfg.aud, "");
+        assert_eq!(cfg.aud, "/ws");
         assert!(cfg.validate().is_ok());
     }
 

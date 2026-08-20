@@ -46,6 +46,8 @@ pub fn ChatShell(
     on_close_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
+    on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
     let shell_class = move || {
@@ -65,6 +67,7 @@ pub fn ChatShell(
                 on_close=on_close_sidebar
                 on_select=on_select_session
                 on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
+                on_delete=Callback::new(move |id| on_delete_session(id))
             />
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
                 <header class="relative z-10 flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
@@ -112,7 +115,12 @@ pub fn ChatShell(
                     token_streaming=token_streaming
                     on_use_prompt=on_use_prompt
                 />
-                <ChatInput pending=pending draft=draft on_send=on_send />
+                <ChatInput
+                    pending=pending
+                    draft=draft
+                    on_send=on_send
+                    on_abort=Callback::new(move |()| on_abort_turn())
+                />
             </div>
         </div>
     }

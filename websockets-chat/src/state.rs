@@ -14,7 +14,21 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, Role, ToolEvent};
+use chat_ui::models::{ChatEntry, Role, SessionListItem, ToolEvent};
+
+/// After deleting `deleted_id` from the sidebar list (most-recent first),
+/// the session that should become active: the row immediately after the
+/// deleted one, or the previous row if it was last. `None` when the list
+/// is empty or `deleted_id` is the only remaining session.
+pub fn next_session_id_after(sessions: &[SessionListItem], deleted_id: &str) -> Option<String> {
+    let index = sessions
+        .iter()
+        .position(|session| session.id == deleted_id)?;
+    sessions
+        .get(index + 1)
+        .or_else(|| index.checked_sub(1).and_then(|prev| sessions.get(prev)))
+        .map(|session| session.id.clone())
+}
 
 /// Look up the entry tracking `turn_id` and hand back a mutable reference to
 /// it, if both the turn is known and its entry still exists.
@@ -132,6 +146,33 @@ pub fn apply_stream_end(
     for entry in entries.iter_mut() {
         finish_any_running_tool_events(entry);
     }
+}
+
+/// Appended to an aborted turn's bubble by [`apply_turn_aborted`]. Markdown
+/// italics, since bubble content is rendered through `chat_ui::markdown`.
+pub const ABORTED_TURN_MARKER: &str = "_Stopped._";
+
+/// Apply a `turn_aborted` event: close the turn like a final [`apply_stream_end`]
+/// would, then mark the bubble as user-cancelled.
+///
+/// The marker is what distinguishes an abort from a completed answer. Without
+/// it a cancelled turn is indistinguishable from a model that simply stopped
+/// mid-sentence — and when the abort lands before the first token, from an
+/// empty bubble with nothing in it at all.
+pub fn apply_turn_aborted(
+    entries: &mut Vec<ChatEntry>,
+    turn_index: &HashMap<String, u64>,
+    turn_id: &str,
+) {
+    apply_stream_end(entries, turn_index, turn_id, None);
+    let Some(entry) = find_entry_for_turn(entries, turn_index, turn_id) else {
+        return;
+    };
+    entry.content = if entry.content.trim().is_empty() {
+        ABORTED_TURN_MARKER.to_string()
+    } else {
+        format!("{}\n\n{ABORTED_TURN_MARKER}", entry.content.trim_end())
+    };
 }
 
 /// Coarse lifecycle bucket a [`ToolEvent`]'s free-form `status` string maps
@@ -528,6 +569,81 @@ mod tests {
 
         assert_eq!(entries[0].content, "authoritative full text");
         assert!(!entries[0].streaming);
+    }
+
+    #[test]
+    fn apply_stream_end_override_snaps_back_doubled_deltas() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+
+        apply_delta(&mut entries, &index, "turn-1", "I'll");
+        apply_delta(&mut entries, &index, "turn-1", "I'll");
+        apply_delta(&mut entries, &index, "turn-1", " find that");
+        apply_delta(&mut entries, &index, "turn-1", " find that");
+        apply_stream_end(&mut entries, &index, "turn-1", Some("I'll find that"));
+
+        assert_eq!(entries[0].content, "I'll find that");
+    }
+
+    #[test]
+    fn apply_turn_aborted_closes_the_turn_and_marks_partial_content() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+
+        apply_delta(&mut entries, &index, "turn-1", "I was halfway through");
+        apply_turn_aborted(&mut entries, &index, "turn-1");
+
+        assert_eq!(
+            entries[0].content,
+            format!("I was halfway through\n\n{ABORTED_TURN_MARKER}")
+        );
+        assert!(!entries[0].streaming);
+    }
+
+    #[test]
+    fn apply_turn_aborted_before_the_first_token_leaves_only_the_marker() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+
+        apply_turn_aborted(&mut entries, &index, "turn-1");
+
+        assert_eq!(
+            entries[0].content, ABORTED_TURN_MARKER,
+            "an empty bubble must not be left blank"
+        );
+        assert!(!entries[0].streaming);
+    }
+
+    #[test]
+    fn apply_turn_aborted_closes_running_tool_chips() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+        apply_tool_hint(
+            &mut entries,
+            &index,
+            "turn-1",
+            vec![ToolEvent {
+                name: "web_search(...)".to_string(),
+                status: "running".to_string(),
+                detail: None,
+            }],
+        );
+
+        apply_turn_aborted(&mut entries, &index, "turn-1");
+
+        assert_eq!(entries[0].tool_events.clone().unwrap()[0].status, "done");
+    }
+
+    #[test]
+    fn apply_turn_aborted_is_a_no_op_for_unknown_turn() {
+        let mut entries = vec![assistant_entry(0)];
+        let index = index_with("turn-1", 0);
+
+        apply_delta(&mut entries, &index, "turn-1", "keep me");
+        apply_turn_aborted(&mut entries, &index, "some-other-turn");
+
+        assert_eq!(entries[0].content, "keep me");
+        assert!(entries[0].streaming);
     }
 
     #[test]
@@ -938,6 +1054,52 @@ mod tests {
         }
         assert!(reconnect_attempts_exhausted(MAX_RECONNECT_ATTEMPTS));
         assert!(reconnect_attempts_exhausted(MAX_RECONNECT_ATTEMPTS + 10));
+    }
+
+    fn session_item(id: &str) -> SessionListItem {
+        SessionListItem {
+            id: id.to_string(),
+            title: format!("chat {id}"),
+            created_at: String::new(),
+            updated_at: String::new(),
+        }
+    }
+
+    #[test]
+    fn next_session_id_after_picks_the_row_below_the_deleted_one() {
+        let sessions = vec![
+            session_item("top"),
+            session_item("next"),
+            session_item("older"),
+        ];
+
+        assert_eq!(
+            next_session_id_after(&sessions, "top").as_deref(),
+            Some("next"),
+            "deleting the top row should select the session after it"
+        );
+        assert_eq!(
+            next_session_id_after(&sessions, "next").as_deref(),
+            Some("older")
+        );
+    }
+
+    #[test]
+    fn next_session_id_after_falls_back_to_the_previous_row_when_deleting_the_last() {
+        let sessions = vec![session_item("top"), session_item("last")];
+
+        assert_eq!(
+            next_session_id_after(&sessions, "last").as_deref(),
+            Some("top")
+        );
+    }
+
+    #[test]
+    fn next_session_id_after_is_none_for_the_only_session() {
+        let sessions = vec![session_item("only")];
+        assert_eq!(next_session_id_after(&sessions, "only"), None);
+        assert_eq!(next_session_id_after(&sessions, "missing"), None);
+        assert_eq!(next_session_id_after(&[], "only"), None);
     }
 
     #[test]
