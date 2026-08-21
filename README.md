@@ -83,16 +83,25 @@ To build both the CLI and the web-chat UI in one step (requires [Trunk](https://
 
 ## Quick start
 
-```bash
-# Run a single prompt
-cargo run -- agent -m "What files are in the workspace?" \
-    --config ./configs/openai-compat/config.json
+Pre-built packages are on [GitHub Releases](https://github.com/onepointconsulting/rust-bot/releases). Linux example:
 
-# Or, after a release build:
-./target/release/rust-bot agent -m "Hello!"
+```bash
+# Download the binary distribution with wget
+VERSION=0.1.8
+wget "https://github.com/onepointconsulting/rust-bot/releases/download/v${VERSION}/rust-bot-${VERSION}-linux-x86_64.tar.gz"
+
+# Unpack
+tar xzf "rust-bot-${VERSION}-linux-x86_64.tar.gz"
+cd "rust-bot-${VERSION}-linux-x86_64"
+
+# Run onboard and follow prompted instructions
+./rust-bot onboard
+
+# Run on the command line
+./rust-bot agent -c ./.rust-bot/config.json -m "Hello!"
 ```
 
-The agent will use the workspace directory (`~/.rust-bot/workspace` by default) for reading and writing files.
+Omit `-m` to enter the [interactive console](#interactive-console). Windows and macOS archives are `rust-bot-<version>-windows-x86_64.zip` and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
 
 ---
 
