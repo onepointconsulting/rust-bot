@@ -828,18 +828,19 @@ impl Default for GatewayConfig {
 
 /// Search backend used by the `web_search` tool.
 ///
-/// Only `DuckDuckGo` and `Brave` are implemented today (see
-/// `WebSearchTool::execute` in `src/agent/tools/web.rs`); `Exa` is a
-/// recognized, reserved value with an implementation still to come — picking
-/// it currently just returns "no results found" from the tool rather than
-/// failing config validation.
+/// `DuckDuckGo` requires no registration/API key and is the default. `Brave`
+/// and `Exa` require an API key (read from `BRAVE_API_KEY` / `EXA_API_KEY`
+/// respectively, or the `api_key` config field). See `WebSearchTool::execute`
+/// in `src/agent/tools/web.rs` for the dispatch logic.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSearchProvider {
     /// No registration/API key required — the default.
     #[default]
     DuckDuckGo,
+    /// Requires a Brave Search API key.
     Brave,
+    /// Requires an Exa API key.
     Exa,
 }
 

@@ -176,6 +176,35 @@ fn brave_result_to_value(result: &Value) -> Value {
     })
 }
 
+fn exa_result_to_value(result: &Value) -> Value {
+    // Exa returns `text` (a snippet) and optionally `highlights` (a list of
+    // relevant excerpts). Prefer highlights when present, falling back to text.
+    let content = result
+        .get("highlights")
+        .and_then(Value::as_array)
+        .filter(|h| !h.is_empty())
+        .map(|highlights| {
+            highlights
+                .iter()
+                .filter_map(Value::as_str)
+                .collect::<Vec<_>>()
+                .join("\n")
+        })
+        .filter(|s| !s.is_empty())
+        .or_else(|| {
+            result
+                .get("text")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .unwrap_or_default();
+    serde_json::json!({
+        "url": result.get("url").and_then(Value::as_str).unwrap_or(""),
+        "title": result.get("title").and_then(Value::as_str).unwrap_or(""),
+        "content": content,
+    })
+}
+
 /// Build an HTTP client for web tools, optionally routing through a proxy.
 ///
 /// Supports HTTP and SOCKS5 proxy URLs such as `http://127.0.0.1:7890` or
@@ -306,6 +335,67 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
         }
         vec![]
     }
+
+    async fn search_exa(&self, query: &str, count: usize) -> Vec<Value> {
+        log::info!("Searching web with Exa provider: {query}, count: {count}");
+        let api_key = if self.config.api_key.is_empty() {
+            std::env::var("EXA_API_KEY").unwrap_or_default()
+        } else {
+            self.config.api_key.clone()
+        };
+        if api_key.is_empty() {
+            log::warn!("Exa provider selected but no EXA_API_KEY is set");
+            return vec![];
+        }
+
+        // Exa's REST search endpoint. `base_url` may override the host for
+        // self-hosted/proxied deployments; otherwise the public API is used.
+        let base_url = if self.config.base_url.is_empty() {
+            "https://api.exa.ai".to_string()
+        } else {
+            self.config.base_url.trim_end_matches('/').to_string()
+        };
+        let url = format!("{base_url}/search");
+
+        let body = serde_json::json!({
+            "query": query,
+            "numResults": count,
+            "type": "neural",
+            "contents": {
+                "text": true,
+                "highlights": true,
+            },
+        });
+
+        let response = self
+            .client
+            .post(url)
+            .header("Content-Type", "application/json")
+            .header("x-api-key", api_key)
+            .json(&body)
+            .send()
+            .await;
+        if let Ok(response) = response {
+            if !response.status().is_success() {
+                log::warn!("Exa search failed with status {}", response.status());
+                return vec![];
+            }
+            if let Ok(body) = response.text().await {
+                let json: Value = serde_json::from_str(&body).unwrap_or(Value::Null);
+                let results = json
+                    .get("results")
+                    .and_then(Value::as_array)
+                    .cloned()
+                    .unwrap_or_default();
+                return results
+                    .iter()
+                    .take(count)
+                    .map(exa_result_to_value)
+                    .collect();
+            }
+        }
+        vec![]
+    }
 }
 
 #[async_trait]
@@ -369,8 +459,10 @@ impl Tool for WebSearchTool {
                 let results = self.search_brave(query, count).await;
                 format_results(query, &results, count)
             }
-            // Not implemented yet — see `WebSearchProvider`'s doc comment.
-            WebSearchProvider::Exa => format!("No results found for provider: {provider}"),
+            WebSearchProvider::Exa => {
+                let results = self.search_exa(query, count).await;
+                format_results(query, &results, count)
+            }
         }
     }
 }
@@ -581,6 +673,10 @@ mod tests {
             self.search_brave(query, count).await
         }
 
+        async fn call_search_exa(&self, query: &str, count: usize) -> Vec<Value> {
+            self.search_exa(query, count).await
+        }
+
         async fn call_execute(&self, params: &serde_json::Value) -> String {
             Tool::execute(self, params).await
         }
@@ -618,6 +714,41 @@ mod tests {
         assert!(
             out.starts_with("Results for:"),
             "expected formatted brave results, got: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn search_exa_live_api() {
+        let _ = dotenv::dotenv();
+        if std::env::var("EXA_API_KEY").is_err() {
+            return;
+        }
+        let config = WebSearchConfig {
+            provider: WebSearchProvider::Exa,
+            ..Default::default()
+        };
+        let tool = WebSearchTool::new(Some(config), None, None);
+        let results = tool.call_search_exa("rust programming", 3).await;
+        assert!(!results.is_empty(), "expected exa results");
+    }
+
+    #[tokio::test]
+    async fn execute_exa_provider_live_api() {
+        let _ = dotenv::dotenv();
+        if std::env::var("EXA_API_KEY").is_err() {
+            return;
+        }
+        let config = WebSearchConfig {
+            provider: WebSearchProvider::Exa,
+            ..Default::default()
+        };
+        let tool = WebSearchTool::new(Some(config), None, None);
+        let out = tool
+            .call_execute(&serde_json::json!({"query": "rust programming", "count": 3}))
+            .await;
+        assert!(
+            out.starts_with("Results for:"),
+            "expected formatted exa results, got: {out}"
         );
     }
 
@@ -677,6 +808,41 @@ mod tests {
         });
         let mapped = brave_result_to_value(&result);
         assert_eq!(mapped["content"], "A snippet\n\nAge: 2 days ago");
+    }
+
+    #[test]
+    fn exa_result_to_value_prefers_highlights_over_text() {
+        let result = serde_json::json!({
+            "url": "https://example.com",
+            "title": "Example",
+            "text": "Full text snippet",
+            "highlights": ["Highlight one", "Highlight two"],
+        });
+        let mapped = exa_result_to_value(&result);
+        assert_eq!(mapped["content"], "Highlight one\nHighlight two");
+    }
+
+    #[test]
+    fn exa_result_to_value_falls_back_to_text() {
+        let result = serde_json::json!({
+            "url": "https://example.com",
+            "title": "Example",
+            "text": "Full text snippet",
+        });
+        let mapped = exa_result_to_value(&result);
+        assert_eq!(mapped["content"], "Full text snippet");
+    }
+
+    #[test]
+    fn exa_result_to_value_empty_highlights_falls_back_to_text() {
+        let result = serde_json::json!({
+            "url": "https://example.com",
+            "title": "Example",
+            "text": "Full text snippet",
+            "highlights": [],
+        });
+        let mapped = exa_result_to_value(&result);
+        assert_eq!(mapped["content"], "Full text snippet");
     }
 
     #[test]

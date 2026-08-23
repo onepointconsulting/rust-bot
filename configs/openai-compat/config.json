@@ -93,8 +93,8 @@
       "proxy": null,
       "timeout": 60,
       "search": {
-        "provider": "brave",
-        "apiKey": "${BRAVE_API_KEY}",
+        "provider": "exa",
+        "apiKey": "${EXA_API_KEY}",
         "baseUrl": "",
         "maxResults": 5,
         "timeout": 30
