@@ -197,10 +197,10 @@ impl CommandHandler for CmdStatus {
 
         let web_config = agent_loop.web_config.clone();
         let search_config = web_config.search.clone();
-        let provider = search_config.provider.clone();
+        let provider = search_config.provider.as_str();
         let api_key = search_config.api_key.clone();
         let usage = fetch_search_usage(
-            &provider,
+            provider,
             if api_key.is_empty() {
                 None
             } else {

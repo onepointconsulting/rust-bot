@@ -18,7 +18,7 @@ use crate::{
         schema::{
             AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType,
             ModelPresetConfig, OcrProvider, ProviderRetryMode, RESERVED_MODEL_PRESET_NAME,
-            ToolsConfig,
+            ToolsConfig, WebSearchProvider,
         },
     },
     providers::registry::providers,
@@ -90,7 +90,7 @@ const AVAILABLE_TOOLS: [&str; 7] = [
     TOOL_IMAGE_GENERATION,
 ];
 
-const WEB_SEARCH_PROVIDERS: [&str; 5] = ["brave", "tavily", "duckduckgo", "searxng", "jina"];
+const WEB_SEARCH_PROVIDERS: [&str; 3] = ["duckduckgo", "brave", "exa"];
 const EXEC_SANDBOX_OPTIONS: [&str; 2] = ["none", "bwrap"];
 const OCR_PROVIDERS: [&str; 1] = ["anthropic"];
 const MCP_TRANSPORT_OPTIONS: [&str; 4] = ["auto", "stdio", "sse", "streamableHttp"];
@@ -1107,26 +1107,30 @@ fn configure_web_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
         .iter()
         .position(|p| *p == web.search.provider.as_str())
         .unwrap_or(0);
-    web.search.provider = Select::new("Web search provider", WEB_SEARCH_PROVIDERS.to_vec())
+    let provider = Select::new("Web search provider", WEB_SEARCH_PROVIDERS.to_vec())
         .with_starting_cursor(provider_idx)
-        .with_help_message("brave, tavily, duckduckgo, searxng, or jina")
-        .prompt()?
-        .to_string();
+        .with_help_message("duckduckgo (no registration required), brave, or exa")
+        .prompt()?;
+    web.search.provider = match provider {
+        "brave" => WebSearchProvider::Brave,
+        "exa" => WebSearchProvider::Exa,
+        _ => WebSearchProvider::DuckDuckGo,
+    };
 
-    if web.search.provider == "duckduckgo" {
+    if web.search.provider == WebSearchProvider::DuckDuckGo {
         web.search.api_key.clear();
     } else {
         let api_key = web.search.api_key.clone();
         web.search.api_key = Text::new("Search provider API key")
             .with_default(api_key.as_str())
-            .with_help_message("Required for brave/tavily/jina; leave empty if unused")
+            .with_help_message("Required for brave/exa; leave empty if unused")
             .prompt()?;
     }
 
     let base_url = web.search.base_url.clone();
     web.search.base_url = Text::new("Search provider base URL")
         .with_default(base_url.as_str())
-        .with_help_message("Used by self-hosted backends like SearXNG; leave empty for defaults")
+        .with_help_message("Optional endpoint override; leave empty for provider defaults")
         .prompt()?;
 
     web.search.max_results = CustomType::<u32>::new("Web search max results")

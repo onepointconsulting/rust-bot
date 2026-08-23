@@ -14,7 +14,7 @@ use rust_bot::{
             web::{WebFetchTool, WebSearchTool},
         },
     },
-    config::schema::{McpServerConfig, McpTransportType, WebSearchConfig},
+    config::schema::{McpServerConfig, McpTransportType, WebSearchConfig, WebSearchProvider},
     cron::CronService,
 };
 use serde_json::Value;
@@ -483,7 +483,7 @@ async fn test_web_search_tool() {
         "content": "Can you please search the web for information about the weather in London?"
     })];
     let config = WebSearchConfig {
-        provider: "brave".to_string(),
+        provider: WebSearchProvider::Brave,
         api_key: std::env::var("BRAVE_API_KEY").unwrap_or_default(),
         ..WebSearchConfig::default()
     };
@@ -502,7 +502,7 @@ async fn test_web_search_fetch_tool() {
         then fetch from the first result the content of the page and write it to a file called weather_in_london.txt?"
     })];
     let config = WebSearchConfig {
-        provider: "brave".to_string(),
+        provider: WebSearchProvider::Brave,
         api_key: std::env::var("BRAVE_API_KEY").unwrap_or_default(),
         ..WebSearchConfig::default()
     };

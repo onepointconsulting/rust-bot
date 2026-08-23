@@ -9,7 +9,7 @@ use url::Url;
 
 use crate::{
     agent::tools::base::Tool,
-    config::schema::WebSearchConfig,
+    config::schema::{WebSearchConfig, WebSearchProvider},
     security::network::{validate_resolved_url, validate_url_target},
     utils::helpers::{build_image_content_blocks, detect_image_mime},
 };
@@ -346,10 +346,7 @@ impl Tool for WebSearchTool {
     }
 
     async fn execute(&self, params: &serde_json::Value) -> String {
-        let mut provider = self.config.provider.trim().to_lowercase();
-        if provider.is_empty() {
-            provider = "brave".to_string();
-        }
+        let provider = self.config.provider;
         let query = params.get("query").and_then(Value::as_str).unwrap_or("");
         if query.is_empty() {
             return "Error: missing required parameter 'query'".to_string();
@@ -363,15 +360,18 @@ impl Tool for WebSearchTool {
             .clamp(1, max_results) as usize;
 
         log::info!("Searching web with provider: {provider}");
-        if provider == "duckduckgo" {
-            let results = self.search_duckduckgo(query, count).await;
-            return format_results(query, &results, count);
+        match provider {
+            WebSearchProvider::DuckDuckGo => {
+                let results = self.search_duckduckgo(query, count).await;
+                format_results(query, &results, count)
+            }
+            WebSearchProvider::Brave => {
+                let results = self.search_brave(query, count).await;
+                format_results(query, &results, count)
+            }
+            // Not implemented yet — see `WebSearchProvider`'s doc comment.
+            WebSearchProvider::Exa => format!("No results found for provider: {provider}"),
         }
-        if provider == "brave" {
-            let results = self.search_brave(query, count).await;
-            return format_results(query, &results, count);
-        }
-        format!("No results found for provider: {provider}").to_string()
     }
 }
 
@@ -593,7 +593,7 @@ mod tests {
             return;
         }
         let config = WebSearchConfig {
-            provider: "brave".to_string(),
+            provider: WebSearchProvider::Brave,
             ..Default::default()
         };
         let tool = WebSearchTool::new(Some(config), None, None);
@@ -608,7 +608,7 @@ mod tests {
             return;
         }
         let config = WebSearchConfig {
-            provider: "brave".to_string(),
+            provider: WebSearchProvider::Brave,
             ..Default::default()
         };
         let tool = WebSearchTool::new(Some(config), None, None);

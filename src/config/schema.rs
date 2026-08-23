@@ -826,8 +826,41 @@ impl Default for GatewayConfig {
 
 // ── WebSearchConfig ───────────────────────────────────────────────────────────
 
-fn default_web_search_provider() -> String {
-    "duckduckgo".to_string()
+/// Search backend used by the `web_search` tool.
+///
+/// Only `DuckDuckGo` and `Brave` are implemented today (see
+/// `WebSearchTool::execute` in `src/agent/tools/web.rs`); `Exa` is a
+/// recognized, reserved value with an implementation still to come — picking
+/// it currently just returns "no results found" from the tool rather than
+/// failing config validation.
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchProvider {
+    /// No registration/API key required — the default.
+    #[default]
+    DuckDuckGo,
+    Brave,
+    Exa,
+}
+
+impl std::fmt::Display for WebSearchProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl WebSearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Brave => "brave",
+            Self::Exa => "exa",
+        }
+    }
+}
+
+fn default_web_search_provider() -> WebSearchProvider {
+    WebSearchProvider::DuckDuckGo
 }
 fn default_web_search_max_results() -> u32 {
     20
@@ -840,17 +873,18 @@ fn default_web_search_timeout() -> u32 {
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebSearchConfig {
-    /// Search backend: `"brave"`, `"tavily"`, `"duckduckgo"`, `"searxng"`, or `"jina"`.
+    /// Search backend: `"duckduckgo"` (default, no registration required),
+    /// `"brave"`, or `"exa"`.
     #[serde(alias = "provider", default = "default_web_search_provider")]
     #[garde(skip)]
-    pub provider: String,
+    pub provider: WebSearchProvider,
 
     /// API key for providers that require authentication.
     #[serde(alias = "api_key")]
     #[garde(skip)]
     pub api_key: String,
 
-    /// Base URL for self-hosted backends such as SearXNG.
+    /// Base URL override for providers that support a custom endpoint.
     #[serde(alias = "base_url")]
     #[garde(skip)]
     pub base_url: String,
@@ -2314,7 +2348,7 @@ mod tests {
     #[test]
     fn test_web_search_defaults() {
         let cfg = WebSearchConfig::default();
-        assert_eq!(cfg.provider, "duckduckgo");
+        assert_eq!(cfg.provider, WebSearchProvider::DuckDuckGo);
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.base_url, "");
         assert_eq!(cfg.max_results, 20);
@@ -2326,7 +2360,7 @@ mod tests {
     fn test_web_search_deserialize_camel_case() {
         let json = r#"{"provider": "brave", "apiKey": "bk-123", "maxResults": 10, "timeout": 60}"#;
         let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.provider, "brave");
+        assert_eq!(cfg.provider, WebSearchProvider::Brave);
         assert_eq!(cfg.api_key, "bk-123");
         assert_eq!(cfg.max_results, 10);
         assert_eq!(cfg.timeout, 60);
@@ -2335,9 +2369,9 @@ mod tests {
 
     #[test]
     fn test_web_search_deserialize_snake_case_aliases() {
-        let json = r#"{"provider": "searxng", "api_key": "", "base_url": "http://localhost:8080", "max_results": 3, "timeout": 15}"#;
+        let json = r#"{"provider": "exa", "api_key": "", "base_url": "http://localhost:8080", "max_results": 3, "timeout": 15}"#;
         let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.provider, "searxng");
+        assert_eq!(cfg.provider, WebSearchProvider::Exa);
         assert_eq!(cfg.base_url, "http://localhost:8080");
         assert_eq!(cfg.max_results, 3);
         assert_eq!(cfg.timeout, 15);
@@ -2346,13 +2380,19 @@ mod tests {
 
     #[test]
     fn test_web_search_absent_fields_use_defaults() {
-        let json = r#"{"provider": "tavily"}"#;
+        let json = r#"{"provider": "exa"}"#;
         let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.provider, "tavily");
+        assert_eq!(cfg.provider, WebSearchProvider::Exa);
         assert_eq!(cfg.max_results, default_web_search_max_results());
         assert_eq!(cfg.timeout, default_web_search_timeout());
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.base_url, "");
+    }
+
+    #[test]
+    fn test_web_search_deserialize_rejects_unknown_provider() {
+        let json = r#"{"provider": "tavily"}"#;
+        assert!(serde_json::from_str::<WebSearchConfig>(json).is_err());
     }
 
     #[test]
@@ -2378,7 +2418,7 @@ mod tests {
         assert_eq!(cfg.proxy, None);
         assert_eq!(cfg.timeout, 60);
         // nested search should carry WebSearchConfig defaults
-        assert_eq!(cfg.search.provider, "duckduckgo");
+        assert_eq!(cfg.search.provider, WebSearchProvider::DuckDuckGo);
         assert_eq!(cfg.search.max_results, 20);
         assert_eq!(cfg.search.timeout, 30);
         assert!(cfg.validate().is_ok());
@@ -2391,7 +2431,7 @@ mod tests {
         assert!(!cfg.enable);
         assert_eq!(cfg.proxy, None);
         assert_eq!(cfg.timeout, 60);
-        assert_eq!(cfg.search.provider, "duckduckgo");
+        assert_eq!(cfg.search.provider, WebSearchProvider::DuckDuckGo);
         assert!(cfg.validate().is_ok());
     }
 
@@ -2431,7 +2471,7 @@ mod tests {
     fn test_web_tools_deserialize_nested_search() {
         let json = r#"{"search": {"provider": "brave", "apiKey": "bk-key", "maxResults": 8}}"#;
         let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
-        assert_eq!(cfg.search.provider, "brave");
+        assert_eq!(cfg.search.provider, WebSearchProvider::Brave);
         assert_eq!(cfg.search.api_key, "bk-key");
         assert_eq!(cfg.search.max_results, 8);
         assert!(cfg.validate().is_ok());
@@ -2660,7 +2700,7 @@ mod tests {
         let json = r#"{"web": {"enable": false, "search": {"provider": "brave"}}}"#;
         let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.web.enable);
-        assert_eq!(cfg.web.search.provider, "brave");
+        assert_eq!(cfg.web.search.provider, WebSearchProvider::Brave);
         assert!(cfg.validate().is_ok());
     }
 
