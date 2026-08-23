@@ -274,7 +274,7 @@ pub struct WsShared {
     pub supports_streaming: bool,
     pub gateway_services: Arc<GatewayServices>,
     pub session_manager: Arc<StdMutex<SessionManager>>,
-    pub _workspace_request_handler: WorkspaceRequestHandler,
+    pub workspace_request_handler: WorkspaceRequestHandler,
     pub runtime_surface: String,
 }
 

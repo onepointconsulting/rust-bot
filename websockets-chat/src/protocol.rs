@@ -6,7 +6,8 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, `rename_chat`, `delete_chat`, and `abort_turn`.
+//!   `attach`, `list_chats`, `rename_chat`, `delete_chat`, `fork_chat`, and
+//!   `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -22,12 +23,12 @@ use serde::{Deserialize, Serialize};
 /// Outbound envelope sent to the gateway.
 ///
 /// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) covers
-/// more inbound types than this crate has a use for (`fork_chat`,
-/// `set_workspace_scope`, `transcribe_audio`). This struct covers the ones
-/// the frontend actually sends (`message`, `new_chat`, `attach`,
-/// `list_chats`, `rename_chat`, `delete_chat`, `abort_turn`); constructors
-/// pin `type_` so callers cannot invent a shape the gateway would reject
-/// with "unknown type".
+/// more inbound types than this crate has a use for (`set_workspace_scope`,
+/// `transcribe_audio`). This struct covers the ones the frontend actually
+/// sends (`message`, `new_chat`, `attach`, `list_chats`, `rename_chat`,
+/// `delete_chat`, `fork_chat`, `abort_turn`); constructors pin `type_` so
+/// callers cannot invent a shape the gateway would reject with "unknown
+/// type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClientEnvelope {
     #[serde(rename = "type")]
@@ -92,6 +93,24 @@ impl ClientEnvelope {
     pub fn attach(chat_id: impl Into<String>) -> Self {
         Self {
             type_: "attach",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            webui: true,
+        }
+    }
+
+    /// Ask the gateway to fork `chat_id`'s entire history into a brand-new
+    /// chat. The reply is an `attached` event carrying the new chat's id and
+    /// full history — same shape as `attach`'s reply, just for a chat that
+    /// didn't exist a moment ago. No `before_user_index` is sent: omitting
+    /// it tells the gateway to fork the whole chat (see
+    /// `handle_envelope_fork_chat` server-side).
+    pub fn fork_chat(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "fork_chat",
             chat_id: Some(chat_id.into()),
             turn_id: None,
             content: None,
@@ -395,6 +414,17 @@ struct ErrorWire {
     detail: String,
 }
 
+/// One tool-hint/progress line the backend buffered against the answer row
+/// it precedes chronologically — see `transcript_chat_history`'s doc comment
+/// in `src/channels/websocket/webui/transcript.rs`. `kind` is always
+/// `"tool_hint"` or `"progress"`, matching the live `ServerEvent::Message`
+/// `kind` values these were originally recorded from.
+#[derive(Debug, Clone, PartialEq, Deserialize)]
+struct HistoryActivity {
+    kind: String,
+    text: String,
+}
+
 /// One row of the `attached` event's `history` array — mirrors
 /// `websocket_chat_history` in `src/channels/websocket/runtime.rs`.
 #[derive(Debug, Clone, PartialEq, Deserialize)]
@@ -404,6 +434,40 @@ struct HistoryMessage {
     content: String,
     #[serde(default)]
     reasoning_content: Option<String>,
+    #[serde(default)]
+    activity: Option<Vec<HistoryActivity>>,
+}
+
+/// Rebuild the tool-activity chips for one history row from its buffered
+/// `activity` lines, reusing the exact synthesizers the live path uses for
+/// `kind: "tool_hint"`/`"progress"` messages (`state::synthesize_*`) so a
+/// replayed chip renders identically to the live one it replaced.
+///
+/// Tool-hint chips are forced to `"done"` rather than the `"running"` status
+/// [`crate::state::synthesize_tool_hint_event`] normally returns: that
+/// status models a tool call in flight, which by definition cannot still be
+/// true for a turn already fully recorded in history (mirrors
+/// `state::finish_any_running_tool_events`'s treatment of orphaned live
+/// chips). Progress notes already synthesize as a static `"note"` chip, so
+/// no override is needed there.
+fn history_activity_to_tool_events(activity: &[HistoryActivity]) -> Option<Vec<ToolEvent>> {
+    if activity.is_empty() {
+        return None;
+    }
+    Some(
+        activity
+            .iter()
+            .map(|item| {
+                if item.kind == "progress" {
+                    crate::state::synthesize_progress_note_event(&item.text)
+                } else {
+                    let mut event = crate::state::synthesize_tool_hint_event(&item.text);
+                    event.status = "done".to_string();
+                    event
+                }
+            })
+            .collect(),
+    )
 }
 
 /// Map a gateway history snapshot into transcript [`ChatEntry`]s, skipping
@@ -424,7 +488,10 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                 content: message.content.clone(),
                 attachments: Vec::new(),
                 streaming: false,
-                tool_events: None,
+                tool_events: message
+                    .activity
+                    .as_deref()
+                    .and_then(history_activity_to_tool_events),
                 reasoning: message.reasoning_content.clone().filter(|s| !s.is_empty()),
             })
         })
@@ -759,6 +826,34 @@ mod tests {
     }
 
     #[test]
+    fn parses_attached_history_activity_into_tool_events() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"hello"},
+            {"role":"assistant","content":"hi","activity":[
+                {"kind":"tool_hint","text":"read foo.rs"},
+                {"kind":"progress","text":"thinking..."}
+            ]}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { history, .. } => {
+                assert_eq!(history.len(), 2);
+                assert!(history[0].tool_events.is_none());
+                let tool_events = history[1]
+                    .tool_events
+                    .as_ref()
+                    .expect("expected tool_events");
+                assert_eq!(tool_events.len(), 2);
+                assert_eq!(tool_events[0].name, "⚙ read foo.rs");
+                assert_eq!(tool_events[0].status, "done");
+                assert_eq!(tool_events[1].name, "↳ thinking...");
+                assert_eq!(tool_events[1].status, "note");
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn client_envelope_attach_serializes_expected_shape() {
         let envelope = ClientEnvelope::attach("chat-1");
         let value = serde_json::to_value(&envelope).expect("should serialize");
@@ -766,6 +861,20 @@ mod tests {
             value,
             serde_json::json!({
                 "type": "attach",
+                "chat_id": "chat-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_fork_chat_serializes_expected_shape() {
+        let envelope = ClientEnvelope::fork_chat("chat-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "fork_chat",
                 "chat_id": "chat-1",
                 "webui": true,
             })

@@ -46,6 +46,7 @@ pub fn ChatShell(
     on_close_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
+    on_fork_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
@@ -67,6 +68,7 @@ pub fn ChatShell(
                 on_close=on_close_sidebar
                 on_select=on_select_session
                 on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
+                on_fork=Callback::new(move |id| on_fork_session(id))
                 on_delete=Callback::new(move |id| on_delete_session(id))
             />
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">

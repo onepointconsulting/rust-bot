@@ -23,6 +23,7 @@ use uuid::Uuid;
 
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
+use crate::channels::websocket::get_session_id;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
@@ -174,6 +175,12 @@ async fn require_valid_chat_id<'a>(
 }
 
 impl<'a> EnvelopeDispatchContext<'a> {
+    /// `(shared, connection_id, client_id)` — the three fields every handler
+    /// needs to send events and check the sender allowlist.
+    fn connection_fields(&self) -> (&'a WsShared, &'a str, &'a str) {
+        (self.shared, self.connection_id, self.client_id)
+    }
+
     /// See [`workspace_controls_available`].
     ///
     /// Not yet called: workspace-scope escalation over the websocket envelope
@@ -468,7 +475,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::NewChat => {
             handle_envelope_new_chat(envelope_dispatch_context).await;
         }
-        EnvelopeType::ForkChat => { /* ... */ }
+        EnvelopeType::ForkChat => { 
+            handle_envelope_fork_chat(envelope_dispatch_context).await;
+        }
         EnvelopeType::RenameChat => {
             handle_envelope_rename_chat(envelope_dispatch_context).await;
         }
@@ -509,9 +518,7 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
 /// file is not required — subscribe is idempotent, `history` is `[]` when
 /// nothing is persisted, and hydrate is a no-op in that case.
 async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let connection_id = envelope_dispatch_context.connection_id;
-    let client_id = envelope_dispatch_context.client_id;
-    let shared = envelope_dispatch_context.shared;
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
@@ -558,7 +565,7 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
                     .session_manager
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                ws_shared._workspace_request_handler.scope_for_new_chat(
+                ws_shared.workspace_request_handler.scope_for_new_chat(
                     &mut session_manager,
                     &envelope,
                     controls_available,
@@ -586,7 +593,7 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         shared
-            ._workspace_request_handler
+            .workspace_request_handler
             .persist_scope(&mut session_manager, &new_id, &scope);
     }
     shared
@@ -654,9 +661,7 @@ fn list_websocket_chats(sessions: Vec<serde_json::Value>) -> Vec<serde_json::Val
 /// Rust-side protocol addition with no nanobot precedent — see
 /// [`EnvelopeType::RenameChat`].
 async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let shared = envelope_dispatch_context.shared;
-    let connection_id = envelope_dispatch_context.connection_id;
-    let client_id = envelope_dispatch_context.client_id;
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
@@ -749,9 +754,7 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
 /// guard — it stops a Stop click that lost the race against turn completion
 /// from reaching whatever turn ran next.
 async fn handle_envelope_abort_turn<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let shared = envelope_dispatch_context.shared;
-    let connection_id = envelope_dispatch_context.connection_id;
-    let client_id = envelope_dispatch_context.client_id;
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
@@ -883,6 +886,105 @@ async fn send_turn_aborted(
     }
 }
 
+/// Handle a `fork_chat` envelope: branch a new `websocket:{chat_id}` session
+/// from an existing one at a zero-based user-message index, then attach and
+/// hydrate the requesting connection on the new chat. Mirrors nanobot's
+/// `create_webui_chat_fork` + `attach_webui_fork`
+/// (`webui/forking.py`), except the `attached` ack here also carries a
+/// `history` snapshot — nanobot's WebUI instead reloads a thread over HTTP,
+/// which rust-bot's `websockets-chat` client doesn't have.
+///
+/// Title metadata, `session_updated`, and `append_fork_marker` (nanobot
+/// marks the fork boundary in the new transcript once it starts accepting
+/// turns) aren't ported yet — out of scope for wiring `attached.history`.
+///
+/// A missing `before_user_index` means "fork the whole chat" (computed as
+/// the source session's total user-message count) rather than "fork
+/// nothing" — the `websockets-chat` UI's "Fork session" menu item has no
+/// partial-fork picker, so it never sends this field.
+async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let envelope = envelope_dispatch_context.envelope;
+    let key = get_session_id(cid);
+    let before_user_index = match envelope.get("before_user_index").and_then(|v| v.as_u64()) {
+        Some(v) => v as usize,
+        None => {
+            // No frontend UI for partial fork yet — omitting the field means
+            // "fork the whole chat". Both `fork_session_before_user_index`
+            // and `fork_transcript_before_user_index` already treat an index
+            // equal to the total user-message count as "copy everything".
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal(&key)
+                .map(|session| {
+                    session
+                        .messages
+                        .iter()
+                        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                        .count()
+                })
+                .unwrap_or(0)
+        }
+    };
+
+    let new_id = Uuid::new_v4().to_string();
+    let new_session_key = get_session_id(&new_id);
+    let fork_result = {
+        // Drop the `MutexGuard` before any `.await` below — same discipline
+        // as every other `session_manager` use in this file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.fork_session_before_user_index(&key, &new_session_key, before_user_index)
+    };
+    let Ok(forked) = fork_result else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "invalid fork source or index"}),
+        )
+        .await;
+        return;
+    };
+
+    let transcripts = Arc::clone(&shared.gateway_services.transcripts);
+    // Scoped so each `MutexGuard` drops before this function's `.await`s
+    // below — same discipline as every other `gateway_services.transcripts`
+    // use in this file.
+    let history = {
+        let recorder = transcripts.lock().unwrap_or_else(|e| e.into_inner());
+        let transcript_ok =
+            recorder.fork_transcript_before_user_index(&key, &new_session_key, before_user_index);
+        if transcript_ok {
+            recorder.chat_history(&new_session_key, MAX_HISTORY_MESSAGES)
+        } else {
+            websocket_chat_history(Some(&forked), MAX_HISTORY_MESSAGES)
+        }
+    };
+
+    shared.connections.lock().await.attach(connection_id, &new_id);
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Attached,
+        None,
+        serde_json::json!({"chat_id": new_id, "history": history}),
+    )
+    .await;
+    hydrate_after_subscribe(&new_id, shared).await;
+}
+
 /// Handle a `delete_chat` envelope: permanently delete a `websocket:{chat_id}`
 /// session — tombstone + unlink its JSONL, abort any in-flight agent work,
 /// detach every connection subscribed to it, and fan a `chat_deleted` event
@@ -891,9 +993,7 @@ async fn send_turn_aborted(
 /// protocol surface with no nanobot precedent — see
 /// [`EnvelopeType::DeleteChat`]'s doc comment.
 async fn handle_envelope_delete_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let shared = envelope_dispatch_context.shared;
-    let connection_id = envelope_dispatch_context.connection_id;
-    let client_id = envelope_dispatch_context.client_id;
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
@@ -1119,21 +1219,43 @@ fn websocket_chat_history(
 /// a display `history` snapshot), then replay any in-flight goal/turn
 /// strip. Argument order matches [`ConnectionRegistry::attach`] /
 /// nanobot's `_attach(connection, chat_id)`.
+///
+/// History prefers the durable WebUI transcript — same
+/// `chat_history`/`MAX_HISTORY_MESSAGES` source `handle_envelope_fork_chat`
+/// reads from — over the `Session`, falling back to the `Session` only when
+/// the transcript has no rows (e.g. a chat that predates the transcript
+/// write path, or was never driven through the webui-flagged envelope
+/// path).
 async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
     shared
         .connections
         .lock()
         .await
         .attach(connection_id, chat_id);
-    let history = {
+    let session_key = get_session_id(chat_id);
+    let transcript_history = {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before
+        // `send_event`'s `.await` below — same discipline as every other
+        // `gateway_services.transcripts` use in this file.
+        let recorder = shared
+            .gateway_services
+            .transcripts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        recorder.chat_history(&session_key, MAX_HISTORY_MESSAGES)
+    };
+    let history = if !transcript_history.is_empty() {
+        transcript_history
+    } else {
         // Scoped so the (synchronous) `MutexGuard` is dropped before
         // `send_event`'s `.await` below — same discipline as every other
         // `session_manager` use in this file.
+        log::info!("websocket: no transcript history found for chat {chat_id}, using session history");
         let session_manager = shared
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let session = session_manager.get_session_internal(&get_session_id(chat_id));
+        let session = session_manager.get_session_internal(&session_key);
         websocket_chat_history(session.as_ref(), MAX_HISTORY_MESSAGES)
     };
     send_event(
@@ -1149,9 +1271,7 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
 
 async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let envelope = envelope_dispatch_context.envelope;
-    let connection_id = envelope_dispatch_context.connection_id;
-    let client_id = envelope_dispatch_context.client_id;
-    let shared = envelope_dispatch_context.shared;
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
@@ -1293,7 +1413,7 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
                     .turn_registry
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
-                ws_shared._workspace_request_handler.scope_for_message(
+                ws_shared.workspace_request_handler.scope_for_message(
                     &mut session_manager,
                     &envelope,
                     &cid,
@@ -1357,7 +1477,7 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         shared
-            ._workspace_request_handler
+            .workspace_request_handler
             .persist_scope(&mut session_manager, cid, &scope);
     }
 
@@ -1588,7 +1708,7 @@ async fn maybe_push_active_goal_state(chat_id: &str, ws_shared: &WsShared) {
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        session_manager.read_session_file(format!("websocket:{chat_id}").as_str())
+        session_manager.read_session_file(&get_session_id(chat_id))
     };
     let row_data = if let Some(row) = row_option {
         row.metadata
@@ -1735,6 +1855,11 @@ pub struct WebSocketChannel {
     /// can reconstruct the full message on `stream_end`. Mirrors nanobot's
     /// `self._stream_text_buffers` (`channels/websocket/runtime.py:1188-1198`).
     stream_buffers: StdMutex<HashMap<(String, String), Vec<String>>>,
+    /// Accumulated reasoning-delta text per `(chat_id, stream_id)`, so
+    /// `send_reasoning_end` can persist the fully assembled reasoning trace
+    /// instead of a wire chunk. Mirrors nanobot's `self._reasoning_text_buffers`
+    /// (`channels/websocket/runtime.py:1869-1870, 1900-1901`).
+    reasoning_buffers: StdMutex<HashMap<(String, String), Vec<String>>>,
 }
 
 impl WebSocketChannel {
@@ -1769,6 +1894,7 @@ impl WebSocketChannel {
             gateway_services: Arc::new(GatewayServices::default()),
             shutdown: Arc::new(Notify::new()),
             stream_buffers: StdMutex::new(HashMap::new()),
+            reasoning_buffers: StdMutex::new(HashMap::new()),
         }
     }
 
@@ -1840,7 +1966,7 @@ impl WebSocketChannel {
             connections: Arc::clone(&self.connections),
             supports_streaming: BaseChannel::supports_streaming(self),
             session_manager: Arc::clone(&self.base.session_manager),
-            _workspace_request_handler: self.base.workspace_request_handler.clone(),
+            workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
             gateway_services: Arc::clone(&self.gateway_services),
         }
@@ -1934,7 +2060,37 @@ impl BaseChannel for WebSocketChannel {
         // variants fail safe with a logged skip rather than reusing the wrong
         // shape.
         let payload = match &msg.event {
-            Some(OutboundEvent::TurnEnd(_)) => {
+            Some(OutboundEvent::TurnEnd(turn_end_event)) => {
+                let turn_id = msg
+                    .metadata
+                    .get(WEBUI_TURN_METADATA_KEY)
+                    .and_then(|v| v.as_str())
+                    .filter(|t| !t.is_empty())
+                    .map(str::to_string);
+                // Persist the canonical turn boundary — this is also what
+                // makes `append_transcript_object`'s rotate-on-`turn_end`
+                // check (`webui/transcript.rs`) actually fire in production.
+                if is_webui_metadata(&msg.metadata) {
+                    let mut body: HashMap<String, serde_json::Value> = HashMap::from([
+                        ("event".to_string(), serde_json::json!("turn_end")),
+                        ("chat_id".to_string(), serde_json::json!(msg.chat_id)),
+                    ]);
+                    if let Some(turn_id) = &turn_id {
+                        body.insert("turn_id".to_string(), serde_json::json!(turn_id));
+                    }
+                    if let Some(latency_ms) = turn_end_event.latency_ms {
+                        body.insert("latency_ms".to_string(), serde_json::json!(latency_ms));
+                    }
+                    if let Some(goal_state) = &turn_end_event.goal_state {
+                        body.insert("goal_state".to_string(), serde_json::json!(goal_state));
+                    }
+                    let mut transcripts = self
+                        .gateway_services
+                        .transcripts
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner());
+                    transcripts.append_turn_event(&msg.chat_id, body, &msg.metadata, "complete");
+                }
                 let owner = msg
                     .metadata
                     .get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
@@ -1951,12 +2107,6 @@ impl BaseChannel for WebSocketChannel {
                         turn_registry.clear_chat(&msg.chat_id);
                     }
                 }
-                let turn_id = msg
-                    .metadata
-                    .get(WEBUI_TURN_METADATA_KEY)
-                    .and_then(|v| v.as_str())
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string);
                 let shared = self.shared();
                 send_goal_status(&msg.chat_id, "idle", None, turn_id, &shared).await;
                 return Ok(());
@@ -1998,6 +2148,28 @@ impl BaseChannel for WebSocketChannel {
                 return Ok(());
             }
         };
+
+        // Persist before fan-out (matches nanobot's ordering) so a durable
+        // record exists even if delivery to live connections fails. Mirrors
+        // the `phase = "activity" if payload.get("kind") in (...) else
+        // "answer"` split in `send()` (`channels/websocket/runtime.py:1830`).
+        if is_webui_metadata(&msg.metadata) {
+            let phase = match payload.get("kind").and_then(serde_json::Value::as_str) {
+                Some("tool_hint") | Some("progress") => "activity",
+                _ => "answer",
+            };
+            let mut transcripts = self
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_turn_event(
+                &msg.chat_id,
+                json_object_to_map(&payload),
+                &msg.metadata,
+                phase,
+            );
+        }
 
         let raw = payload.to_string();
         let delivered = self.fan_out_to_chat(&msg.chat_id, &raw).await;
@@ -2045,6 +2217,7 @@ impl BaseChannel for WebSocketChannel {
             .unwrap_or(false);
         let stream_key = (chat_id.to_string(), stream_id.clone().unwrap_or_default());
 
+        let mut completed_text: Option<String> = None;
         let mut payload = if stream_end {
             // `merge_next` peeks (keeps the buffer alive for a following
             // segment); otherwise the buffer is drained for this stream.
@@ -2078,6 +2251,7 @@ impl BaseChannel for WebSocketChannel {
             if !full_text.is_empty() {
                 payload["text"] = serde_json::json!(full_text);
             }
+            completed_text = Some(full_text);
             payload
         } else {
             self.stream_buffers
@@ -2098,6 +2272,35 @@ impl BaseChannel for WebSocketChannel {
             payload["merge_next"] = serde_json::json!(true);
         }
 
+        // Persist only the completed reply, never a wire chunk — same
+        // "canonical end of a live stream" rule as `send_reasoning_end`.
+        // Written as a plain `event: "message"` record (not the wire
+        // `"stream_end"` shape) so streamed and non-streamed replies land
+        // identically for `is_assistant_transcript_row`/`transcript_chat_history`
+        // (`webui/transcript.rs`), which only recognize `"message"` rows.
+        if let Some(text) = completed_text.filter(|t| !t.is_empty())
+            && is_webui_metadata(&meta)
+        {
+            let mut event: HashMap<String, serde_json::Value> = HashMap::from([
+                ("event".to_string(), serde_json::json!("message")),
+                ("chat_id".to_string(), serde_json::json!(chat_id)),
+                ("text".to_string(), serde_json::json!(text)),
+            ]);
+            if let Some(turn_id) = meta
+                .get(WEBUI_TURN_METADATA_KEY)
+                .and_then(|v| v.as_str())
+                .filter(|t| !t.is_empty())
+            {
+                event.insert("turn_id".to_string(), serde_json::json!(turn_id));
+            }
+            let mut transcripts = self
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_turn_event(chat_id, event, &meta, "answer");
+        }
+
         self.fan_out_to_chat(chat_id, &payload.to_string()).await;
         Ok(())
     }
@@ -2116,10 +2319,8 @@ impl BaseChannel for WebSocketChannel {
         if delta.is_empty() {
             return Ok(());
         }
-        let stream_id = metadata
-            .as_ref()
-            .and_then(|m| m.get("_stream_id"))
-            .and_then(|v| v.as_str());
+        let meta = metadata.unwrap_or_default();
+        let stream_id = meta.get("_stream_id").and_then(|v| v.as_str());
         let mut payload = serde_json::json!({
             "event": "reasoning_delta",
             "chat_id": chat_id,
@@ -2128,6 +2329,15 @@ impl BaseChannel for WebSocketChannel {
         if let Some(stream_id) = stream_id {
             payload["stream_id"] = serde_json::json!(stream_id);
         }
+        // Buffer only — never persisted as a chunk. `send_reasoning_end`
+        // pops and joins this to durably record the completed trace.
+        let stream_key = (chat_id.to_string(), stream_id.unwrap_or_default().to_string());
+        self.reasoning_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(stream_key)
+            .or_default()
+            .push(delta.to_string());
         self.fan_out_to_chat(chat_id, &payload.to_string()).await;
         Ok(())
     }
@@ -2138,13 +2348,37 @@ impl BaseChannel for WebSocketChannel {
         metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<(), String> {
         // Mirrors `send_reasoning_end` (`channels/websocket/runtime.py:1122-1148`).
-        let stream_id = metadata
-            .as_ref()
-            .and_then(|m| m.get("_stream_id"))
-            .and_then(|v| v.as_str());
+        let meta = metadata.unwrap_or_default();
+        let stream_id = meta.get("_stream_id").and_then(|v| v.as_str());
         let mut payload = serde_json::json!({"event": "reasoning_end", "chat_id": chat_id});
         if let Some(stream_id) = stream_id {
             payload["stream_id"] = serde_json::json!(stream_id);
+        }
+        let stream_key = (chat_id.to_string(), stream_id.unwrap_or_default().to_string());
+        let reasoning_text = self
+            .reasoning_buffers
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .remove(&stream_key)
+            .unwrap_or_default()
+            .join("");
+        if !reasoning_text.is_empty() && is_webui_metadata(&meta) {
+            let event: HashMap<String, serde_json::Value> = HashMap::from([
+                ("event".to_string(), serde_json::json!("reasoning_end")),
+                ("chat_id".to_string(), serde_json::json!(chat_id)),
+            ]);
+            let mut transcripts = self
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_stream_event(
+                chat_id,
+                event,
+                Some(&reasoning_text),
+                &meta,
+                "reasoning",
+            );
         }
         self.fan_out_to_chat(chat_id, &payload.to_string()).await;
         Ok(())
@@ -2154,7 +2388,7 @@ impl BaseChannel for WebSocketChannel {
         &self,
         chat_id: &str,
         edits: Vec<FileEditEvent>,
-        _metadata: Option<HashMap<String, serde_json::Value>>,
+        metadata: Option<HashMap<String, serde_json::Value>>,
     ) -> Result<(), String> {
         // Mirrors `send_file_edit_events` (`channels/websocket/runtime.py:1150-1172`).
         let payload = serde_json::json!({
@@ -2162,9 +2396,43 @@ impl BaseChannel for WebSocketChannel {
             "chat_id": chat_id,
             "edits": edits,
         });
+        let meta = metadata.unwrap_or_default();
+        if is_webui_metadata(&meta) {
+            let mut transcripts = self
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_turn_event(
+                chat_id,
+                json_object_to_map(&payload),
+                &meta,
+                "activity",
+            );
+        }
         self.fan_out_to_chat(chat_id, &payload.to_string()).await;
         Ok(())
     }
+}
+
+/// Mirror Python's `metadata.get("webui") is True` — only a JSON boolean
+/// `true` counts. Used to gate every outbound WebUI-transcript write the
+/// same way `handle_envelope_message` gates the inbound one (`is_webui`),
+/// so a chat's transcript never ends up with assistant rows and no matching
+/// user rows, or vice versa.
+fn is_webui_metadata(metadata: &HashMap<String, serde_json::Value>) -> bool {
+    metadata.get("webui").and_then(serde_json::Value::as_bool) == Some(true)
+}
+
+/// Convert a `serde_json::Value` object into the `HashMap` shape
+/// [`WebUiTranscriptRecorder`](crate::channels::websocket::webui::transcript::WebUiTranscriptRecorder)'s
+/// append methods take. Non-object input (shouldn't happen for any wire
+/// payload built in this module) becomes an empty map.
+fn json_object_to_map(value: &serde_json::Value) -> HashMap<String, serde_json::Value> {
+    value
+        .as_object()
+        .map(|obj| obj.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
+        .unwrap_or_default()
 }
 
 /// Return whether WebUI ingress should expect a normal agent lifecycle.
@@ -2184,10 +2452,6 @@ fn builtin_command_starts_agent_turn(text: &str) -> bool {
         Some(CommandLifecycle::AgentTurnWithArgs) => !args.trim().is_empty(),
         _ => false,
     }
-}
-
-fn get_session_id(chat_id: &str) -> String {
-    format!("websocket:{chat_id}")
 }
 
 #[cfg(test)]
@@ -2459,7 +2723,7 @@ mod tests {
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
             session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
-            _workspace_request_handler: WorkspaceRequestHandler::new(
+            workspace_request_handler: WorkspaceRequestHandler::new(
                 tempfile::tempdir().unwrap().keep(),
                 true,
             ),
@@ -3002,6 +3266,63 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_envelope_attach_prefers_transcript_history_over_a_divergent_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:existing-chat".to_string());
+            session.add_message("user", "session-hello", serde_json::Map::new());
+            session.add_message("assistant", "session-reply", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+        {
+            let mut transcripts = shared
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let meta = webui_meta("turn-1");
+            transcripts.append_user_message("existing-chat", "transcript-hello", &meta, None, None, None);
+            transcripts.append_turn_event(
+                "existing-chat",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("message")),
+                    ("text".to_string(), serde_json::json!("transcript-reply")),
+                ]),
+                &meta,
+                "complete",
+            );
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["chat_id"], "existing-chat");
+        let history = body["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["transcript-hello", "transcript-reply"],
+            "the transcript must win over a diverging Session when both exist"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_envelope_attach_denies_a_sender_outside_the_allow_list() {
         let mut shared = test_shared("browser");
         shared.channels_config = ChannelsConfig {
@@ -3045,6 +3366,377 @@ mod tests {
                 .is_empty(),
             "a denied attach must not subscribe the connection"
         );
+    }
+
+    // --- handle_envelope_fork_chat ---
+
+    async fn dispatch_fork_chat(
+        shared: &WsShared,
+        connection_id: &str,
+        source_chat_id: &str,
+        before_user_index: u64,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("fork_chat"));
+        envelope.insert("chat_id".to_string(), serde_json::json!(source_chat_id));
+        envelope.insert(
+            "before_user_index".to_string(),
+            serde_json::json!(before_user_index),
+        );
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_fork_chat must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_sends_attached_with_transcript_history_for_new_chat_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.add_message("assistant", "hi there", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+        {
+            let mut transcripts = shared
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append(
+                "src",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("user")),
+                    ("text".to_string(), serde_json::json!("hello")),
+                ]),
+            );
+            transcripts.append(
+                "src",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("message")),
+                    ("text".to_string(), serde_json::json!("hi there")),
+                ]),
+            );
+        }
+
+        // `before_user_index: 1` == the source's total user-message count,
+        // i.e. forking from the end of a completed turn.
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        let new_chat_id = attached["chat_id"]
+            .as_str()
+            .expect("attached frame should carry the new chat_id")
+            .to_string();
+        assert_ne!(
+            new_chat_id, "src",
+            "fork must attach the connection to the new chat, not rewrite the source"
+        );
+
+        let history = attached["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"], "hi there");
+
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat(&new_chat_id)
+                .len(),
+            1,
+            "fork must subscribe the requesting connection to the new chat_id"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_without_before_user_index_forks_the_whole_chat() {
+        // `websockets-chat`'s "Fork session" menu item has no partial-fork
+        // picker, so its `fork_chat` envelope never sends `before_user_index`
+        // at all — this must fork the entire conversation, not nothing.
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.add_message("assistant", "hi there", serde_json::Map::new());
+            session.add_message("user", "how are you", serde_json::Map::new());
+            session.add_message("assistant", "great, thanks", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+        {
+            let mut transcripts = shared
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append(
+                "src",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("user")),
+                    ("text".to_string(), serde_json::json!("hello")),
+                ]),
+            );
+            transcripts.append(
+                "src",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("message")),
+                    ("text".to_string(), serde_json::json!("hi there")),
+                ]),
+            );
+            transcripts.append(
+                "src",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("user")),
+                    ("text".to_string(), serde_json::json!("how are you")),
+                ]),
+            );
+            transcripts.append(
+                "src",
+                HashMap::from([
+                    ("event".to_string(), serde_json::json!("message")),
+                    ("text".to_string(), serde_json::json!("great, thanks")),
+                ]),
+            );
+        }
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("fork_chat"));
+        envelope.insert("chat_id".to_string(), serde_json::json!("src"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_fork_chat must not hang");
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        let history = attached["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            vec!["hello", "hi there", "how are you", "great, thanks"],
+            "omitting before_user_index must fork the entire conversation"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_falls_back_to_session_history_when_transcript_fork_fails()
+    {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.add_message("assistant", "hi there", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+        // No transcript rows are written for "src", so
+        // `fork_transcript_before_user_index` returns `false` and the
+        // handler must fall back to the forked `Session`'s messages.
+
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        let history = attached["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|m| m["content"].as_str())
+            .collect();
+        assert_eq!(contents, vec!["hello", "hi there"]);
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_rejects_an_invalid_index() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+
+        // Only one user message exists (index 0), so `before_user_index: 5`
+        // is past the end and must be rejected rather than silently
+        // producing an empty fork.
+        dispatch_fork_chat(&shared, "conn-1", "src", 5).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "invalid fork source or index");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_after_a_real_turn_includes_the_assistant_reply() {
+        // Unlike the fork tests above (which seed the transcript directly via
+        // `transcripts.append`), this drives both sides of a turn through
+        // their real production entry points — `handle_envelope_message` for
+        // the user's half, `BaseChannel::send` for the assistant's half — to
+        // guard the write path this plan added, not just the fork/read side.
+        let channel = test_channel();
+        let shared = channel.shared();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("message"));
+        envelope.insert("chat_id".to_string(), serde_json::json!("src"));
+        envelope.insert("content".to_string(), serde_json::json!("hello"));
+        envelope.insert("webui".to_string(), serde_json::json!(true));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_message must not hang");
+        // Drain whatever attach/hydration frames this produced — this test
+        // only cares about what lands in the transcript, not the live wire
+        // frames from the inbound half of the turn.
+        while rx.try_recv().is_ok() {}
+
+        let mut assistant_msg = outbound("src", "hi there", None);
+        assistant_msg.metadata = webui_meta("turn-1");
+        BaseChannel::send(&channel, assistant_msg).await.unwrap();
+        rx.try_recv().expect("expected the assistant's message frame");
+
+        // `fork_session_before_user_index`'s user-turn count comes from the
+        // `Session` file, which only the (not-running-here) `AgentLoop`
+        // would normally populate as it drains the bus. Seed it directly so
+        // the fork's index check succeeds — this test is about the
+        // transcript write path, not session persistence.
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        let history = attached["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"], "hi there");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_after_a_real_turn_reads_history_from_the_transcript() {
+        // Mirrors `handle_envelope_fork_chat_after_a_real_turn_includes_the_assistant_reply`
+        // above, but for `attach` instead of `fork_chat`: drives both sides of
+        // a turn through their real production entry points, then attaches a
+        // fresh connection to the same chat and checks the resulting history
+        // came from the transcript this plan makes `attach_chat` prefer.
+        let channel = test_channel();
+        let shared = channel.shared();
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx1);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("message"));
+        envelope.insert("chat_id".to_string(), serde_json::json!("src"));
+        envelope.insert("content".to_string(), serde_json::json!("hello"));
+        envelope.insert("webui".to_string(), serde_json::json!(true));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_message must not hang");
+        while rx1.try_recv().is_ok() {}
+
+        let mut assistant_msg = outbound("src", "hi there", None);
+        assistant_msg.metadata = webui_meta("turn-1");
+        BaseChannel::send(&channel, assistant_msg).await.unwrap();
+        rx1.try_recv().expect("expected the assistant's message frame");
+
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "initial-chat", tx2);
+
+        dispatch_attach(&shared, "conn-2", Some(serde_json::json!("src"))).await;
+
+        let attached = recv_json(&mut rx2);
+        assert_eq!(attached["event"], "attached");
+        assert_eq!(attached["chat_id"], "src");
+        let history = attached["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[0]["role"], "user");
+        assert_eq!(history[0]["content"], "hello");
+        assert_eq!(history[1]["role"], "assistant");
+        assert_eq!(history[1]["content"], "hi there");
     }
 
     // --- websocket_chat_history ---
@@ -4316,13 +5008,30 @@ mod tests {
 
     fn test_channel() -> WebSocketChannel {
         let dir = tempfile::tempdir().unwrap();
-        WebSocketChannel::new(
+        let mut channel = WebSocketChannel::new(
             WebSocketConfig::default(),
             Arc::new(MessageBus::new()),
             ChannelsConfig::default(),
             Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
             WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true),
-        )
+        );
+        // `WebSocketChannel::new` defaults `gateway_services` to the real
+        // `get_webui_dir()` (production behavior). Tests that exercise
+        // transcript persistence (`send`/`send_delta`/etc.) must not touch
+        // that real directory, so point it at a tempdir instead — same
+        // isolation `test_shared()` already gives `WsShared`.
+        channel.gateway_services = Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep()));
+        channel
+    }
+
+    fn webui_meta(turn_id: &str) -> HashMap<String, serde_json::Value> {
+        HashMap::from([
+            ("webui".to_string(), serde_json::json!(true)),
+            (
+                WEBUI_TURN_METADATA_KEY.to_string(),
+                serde_json::json!(turn_id),
+            ),
+        ])
     }
 
     fn outbound(chat_id: &str, content: &str, event: Option<OutboundEvent>) -> OutboundMessage {
@@ -4719,6 +5428,276 @@ mod tests {
         let msg = rx.try_recv().expect("expected a second delivered frame");
         let body: serde_json::Value = serde_json::from_str(&msg.into_text().unwrap()).unwrap();
         assert_eq!(body["event"], "reasoning_end");
+    }
+
+    // --- outbound transcript persistence ---
+
+    fn transcript_rows(channel: &WebSocketChannel, chat_id: &str) -> Vec<serde_json::Value> {
+        channel
+            .gateway_services
+            .transcripts
+            .lock()
+            .unwrap()
+            .read_transcript_lines(&get_session_id(chat_id))
+    }
+
+    #[tokio::test]
+    async fn send_plain_message_persists_answer_row_when_webui() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut msg = outbound("chat-1", "hi there", None);
+        msg.metadata = webui_meta("turn-1");
+
+        BaseChannel::send(&channel, msg).await.unwrap();
+        rx.try_recv().unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event"], "message");
+        assert_eq!(rows[0]["text"], "hi there");
+        assert_eq!(rows[0]["turn_phase"], "answer");
+    }
+
+    #[tokio::test]
+    async fn send_tool_hint_progress_persists_activity_row() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut msg = outbound(
+            "chat-1",
+            "reading foo.rs",
+            Some(OutboundEvent::Progress(ProgressEvent {
+                kind: ProgressKind::ToolHint,
+                ..Default::default()
+            })),
+        );
+        msg.metadata = webui_meta("turn-1");
+
+        BaseChannel::send(&channel, msg).await.unwrap();
+        rx.try_recv().unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["kind"], "tool_hint");
+        assert_eq!(rows[0]["turn_phase"], "activity");
+    }
+
+    #[tokio::test]
+    async fn send_skips_transcript_write_without_webui_metadata() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        BaseChannel::send(&channel, outbound("chat-1", "hi there", None))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        assert!(transcript_rows(&channel, "chat-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_file_edit_events_persists_activity_row() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut edit = FileEditEvent::new();
+        edit.insert("path".to_string(), "foo.rs".to_string());
+        let mut msg = outbound(
+            "chat-1",
+            "",
+            Some(OutboundEvent::Progress(ProgressEvent {
+                file_edit_events: Some(vec![edit]),
+                ..Default::default()
+            })),
+        );
+        msg.metadata = webui_meta("turn-1");
+
+        BaseChannel::send(&channel, msg).await.unwrap();
+        rx.try_recv().unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event"], "file_edit");
+        assert_eq!(rows[0]["turn_phase"], "activity");
+    }
+
+    #[tokio::test]
+    async fn send_turn_end_persists_turn_end_row_when_webui() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        channel
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap()
+            .start_turn("chat-1", "owner-1", Some("turn-1"));
+
+        let mut msg = outbound(
+            "chat-1",
+            "",
+            Some(OutboundEvent::TurnEnd(
+                crate::bus::outbound_events::TurnEndEvent {
+                    latency_ms: Some(42),
+                    goal_state: None,
+                },
+            )),
+        );
+        msg.metadata.insert(
+            WEBSOCKET_TURN_OWNER_METADATA_KEY.to_string(),
+            serde_json::json!("owner-1"),
+        );
+        msg.metadata.extend(webui_meta("turn-1"));
+
+        BaseChannel::send(&channel, msg).await.unwrap();
+        rx.try_recv().unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event"], "turn_end");
+        assert_eq!(rows[0]["turn_id"], "turn-1");
+        assert_eq!(rows[0]["latency_ms"], 42);
+    }
+
+    #[tokio::test]
+    async fn send_delta_non_end_chunk_does_not_persist() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut meta = webui_meta("turn-1");
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+
+        BaseChannel::send_delta(&channel, "chat-1", "Hello", Some(meta))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        assert!(transcript_rows(&channel, "chat-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_delta_stream_end_persists_completed_text_as_message_row() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut meta = webui_meta("turn-1");
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+        BaseChannel::send_delta(&channel, "chat-1", "Hello ", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+        BaseChannel::send_delta(&channel, "chat-1", "world", Some(meta))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event"], "message");
+        assert_eq!(rows[0]["text"], "Hello world");
+        assert_eq!(rows[0]["turn_id"], "turn-1");
+    }
+
+    #[tokio::test]
+    async fn send_delta_stream_end_with_no_text_does_not_persist() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let mut meta = webui_meta("turn-1");
+        meta.insert("_stream_id".to_string(), serde_json::json!("s1"));
+        meta.insert("_stream_end".to_string(), serde_json::json!(true));
+
+        BaseChannel::send_delta(&channel, "chat-1", "", Some(meta))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        assert!(transcript_rows(&channel, "chat-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_reasoning_delta_does_not_persist() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        BaseChannel::send_reasoning_delta(&channel, "chat-1", "thinking", Some(webui_meta("turn-1")))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        assert!(transcript_rows(&channel, "chat-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn send_reasoning_end_persists_assembled_reasoning_text() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let meta = webui_meta("turn-1");
+
+        BaseChannel::send_reasoning_delta(&channel, "chat-1", "thinking ", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+        BaseChannel::send_reasoning_delta(&channel, "chat-1", "hard", Some(meta.clone()))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+        BaseChannel::send_reasoning_end(&channel, "chat-1", Some(meta))
+            .await
+            .unwrap();
+        rx.try_recv().unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["event"], "reasoning_end");
+        assert_eq!(rows[0]["text"], "thinking hard");
+        assert_eq!(rows[0]["turn_phase"], "reasoning");
     }
 
     #[tokio::test]

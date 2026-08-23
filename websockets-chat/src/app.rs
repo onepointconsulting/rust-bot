@@ -897,6 +897,20 @@ fn request_rename(ctx: &WsContext, chat_id: String, title: String) {
     );
 }
 
+/// Ask the gateway to fork `chat_id`'s entire history into a new chat. The
+/// reply is an `attached` event for the new chat — handled by the existing
+/// `ServerEvent::Attached` branch below, which already adopts the new
+/// `chat_id`, loads its history, and refreshes the chat list, so no
+/// fork-specific reply handling is needed here.
+fn request_fork(ctx: &WsContext, chat_id: String) {
+    reset_local_transcript(ctx);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::fork_chat(chat_id),
+        "Failed to encode the fork request.",
+    );
+}
+
 /// Ask the gateway to permanently delete `chat_id`'s session.
 ///
 /// Refuses locally when this connection only has one chat left — the UI
@@ -1305,6 +1319,9 @@ pub fn App() -> impl IntoView {
     let on_rename_session = move |id: String, title: String| {
         request_rename(&ws_context, id, title);
     };
+    let on_fork_session = move |id: String| {
+        request_fork(&ws_context, id);
+    };
     let on_delete_session = move |id: String| {
         request_delete(&ws_context, id);
     };
@@ -1362,6 +1379,7 @@ pub fn App() -> impl IntoView {
                     on_close_sidebar=close_sidebar
                     on_select_session=on_select_session
                     on_rename_session=on_rename_session
+                    on_fork_session=on_fork_session
                     on_delete_session=on_delete_session
                     on_abort_turn=on_abort_turn
                 />

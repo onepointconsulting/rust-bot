@@ -501,15 +501,12 @@ pub fn configure_websocket_channel(
         .with_help_message("127.0.0.1")
         .prompt()?;
     websocket.host = websocket_host.clone();
-    websocket.port = CustomType::<u16>::new("Enter WebSocket port")
-        .with_default(8765)
-        .with_help_message("8765")
-        .prompt()?;
     config.gateway.host = websocket_host;
     config.gateway.port = CustomType::<u16>::new("Enter WebSocket port")
         .with_default(config.gateway.port)
         .with_help_message("The port the gateway will listen on")
         .prompt()?;
+    websocket.port = config.gateway.port;
     let enable_jwt = Confirm::new("Enable JWT authentication?")
         .with_default(jwt_default)
         .with_help_message("Required for the gateway web UI login; generates an Ed25519 keypair")

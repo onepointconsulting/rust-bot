@@ -16,6 +16,11 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Persisted on a history message so injected runtime context can be
+/// stripped for user-visible copies. Mirrors nanobot's
+/// `RUNTIME_CONTEXT_HISTORY_META` (`runtime_context.py:15`).
+pub const RUNTIME_CONTEXT_HISTORY_META: &str = "_runtime_context";
+
 /// Metadata key a channel stamps onto an inbound message to carry
 /// pre-resolved runtime-context blocks for the current turn. Mirrors
 /// nanobot's `RUNTIME_CONTEXT_INPUT_META` (`runtime_context.py:16`).

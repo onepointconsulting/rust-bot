@@ -14,6 +14,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    channels::websocket::get_session_id,
     config::paths::get_webui_dir,
     security::{
         WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
@@ -305,7 +306,7 @@ impl WorkspaceRequestHandler {
         if chat_running {
             return Err(WorkspaceScopeError::new(409, "chat_running"));
         }
-        let session_key = format!("websocket:{chat_id}");
+        let session_key = get_session_id(chat_id);
         self.scope_from_envelope(
             session_manager,
             envelope,
@@ -326,7 +327,7 @@ impl WorkspaceRequestHandler {
         chat_running: bool,
         controls_available: bool,
     ) -> Result<WorkspaceScope, WorkspaceScopeError> {
-        let session_key = format!("websocket:{chat_id}");
+        let session_key = get_session_id(chat_id);
         let scope = self.scope_from_envelope(
             session_manager,
             envelope,
@@ -348,16 +349,16 @@ impl WorkspaceRequestHandler {
     /// Persist `scope` for `chat_id`'s websocket session, tagging it as a
     /// WebUI session. Deliberately separate from
     /// `AgentLoop::set_session_workspace_scope` (the generic, channel-agnostic
-    /// path our `/workspace` command uses) — this one hardcodes the
-    /// `websocket:{chat_id}` session-key format and the `webui` tag, both
-    /// specific to the future envelope-driven caller.
+    /// path our `/workspace` command uses) — this one uses
+    /// `get_session_id` (`websocket:{chat_id}`) and the `webui` tag, both
+    /// specific to the envelope-driven caller.
     pub fn persist_scope(
         &self,
         session_manager: &mut SessionManager,
         chat_id: &str,
         scope: &WorkspaceScope,
     ) {
-        let session_key = format!("websocket:{chat_id}");
+        let session_key = get_session_id(chat_id);
         let session = session_manager.get_or_create_session(&session_key);
         session.metadata.insert(
             SESSION_WEBUI_METADATA_KEY.to_string(),

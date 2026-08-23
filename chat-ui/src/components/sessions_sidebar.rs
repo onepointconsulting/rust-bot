@@ -1,10 +1,12 @@
 //! Cursor-style sessions sidebar shared by `web-chat` and `websockets-chat`.
 //!
 //! Rows highlight the active session; clicking one invokes `on_select`.
-//! When `on_rename` and/or `on_delete` is provided (websockets-chat), each
-//! row also has a kebab that opens a menu with "Rename" and/or a red
-//! "Delete" item. Delete opens a confirmation dialog before actually
-//! calling `on_delete`; rename opens a small dialog to edit the title.
+//! When `on_rename`, `on_fork`, and/or `on_delete` is provided
+//! (websockets-chat), each row also has a kebab that opens a menu with
+//! "Rename", "Fork session", and/or a red "Delete" item. Delete opens a
+//! confirmation dialog before actually calling `on_delete`; rename opens a
+//! small dialog to edit the title; fork fires immediately (non-destructive —
+//! it only ever creates a new chat).
 //!
 //! Open/collapsed is a single `open: Signal<bool>` shared across every
 //! breakpoint (not "always docked on `sm+`, toggle-only on mobile" like an
@@ -134,6 +136,29 @@ fn IconTrash() -> impl IntoView {
 }
 
 #[component]
+fn IconFork() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <circle cx="12" cy="18" r="3" />
+            <circle cx="6" cy="6" r="3" />
+            <circle cx="18" cy="6" r="3" />
+            <path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9" />
+            <path d="M12 12v3" />
+        </svg>
+    }
+}
+
+#[component]
 fn IconClose() -> impl IntoView {
     view! {
         <svg
@@ -195,6 +220,7 @@ fn SessionRow(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_fork: Option<Callback<String>>,
     on_open_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     let id_for_class = id.clone();
@@ -207,8 +233,9 @@ fn SessionRow(
     let id_for_toggle = id.clone();
     let display_title_for_menu = display_title.clone();
     let show_rename = on_open_rename.is_some();
+    let show_fork = on_open_fork.is_some();
     let show_delete = on_open_delete.is_some();
-    let show_menu = show_rename || show_delete;
+    let show_menu = show_rename || show_fork || show_delete;
 
     view! {
         <li class="group relative">
@@ -283,6 +310,7 @@ fn SessionRow(
             {show_menu.then(|| {
                 let id_for_menu_visible = id.clone();
                 let id_for_rename = id.clone();
+                let id_for_fork = id.clone();
                 let id_for_delete = id.clone();
                 let title_for_rename = display_title_for_menu;
                 view! {
@@ -324,7 +352,27 @@ fn SessionRow(
                                     </button>
                                 }
                             })}
-                            {(show_rename && show_delete)
+                            {(show_rename && (show_fork || show_delete))
+                                .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
+                            {show_fork.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class=MENU_ITEM
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_fork) = on_open_fork {
+                                                on_open_fork.run(id_for_fork.clone());
+                                            }
+                                        }
+                                    >
+                                        <IconFork />
+                                        "Fork session"
+                                    </button>
+                                }
+                            })}
+                            {(show_fork && show_delete)
                                 .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
                             {show_delete.then(|| {
                                 view! {
@@ -370,6 +418,7 @@ fn SessionGroupSection(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_fork: Option<Callback<String>>,
     on_open_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     let total = items.len();
@@ -398,6 +447,7 @@ fn SessionGroupSection(
                     on_select=on_select
                     open_menu_id=open_menu_id
                     on_open_rename=on_open_rename
+                    on_open_fork=on_open_fork
                     on_open_delete=on_open_delete
                 />
             }
@@ -447,6 +497,12 @@ pub fn SessionsSidebar(
     /// `web-chat`, which has no rename API yet.
     #[prop(optional)]
     on_rename: Option<Callback<(String, String)>>,
+    /// When set, each row's kebab also gets a "Fork session" item that fires
+    /// immediately (no confirmation dialog — forking is non-destructive, it
+    /// only ever creates a new chat). Omitted by `web-chat`, which has no
+    /// fork API yet.
+    #[prop(optional)]
+    on_fork: Option<Callback<String>>,
     /// When set, each row's kebab also gets a red "Delete" item → confirm
     /// dialog. Omitted by `web-chat`, which has no delete API yet.
     #[prop(optional)]
@@ -469,6 +525,16 @@ pub fn SessionsSidebar(
         rename_draft.set(title);
     });
     let on_open_rename = on_rename.map(|_| open_rename);
+
+    // No dialog/confirm step for fork — unlike rename/delete, this just
+    // fires the callback immediately.
+    let open_fork = Callback::new(move |id: String| {
+        open_menu_id.set(None);
+        if let Some(on_fork) = on_fork {
+            on_fork.run(id);
+        }
+    });
+    let on_open_fork = on_fork.map(|_| open_fork);
 
     let close_rename = move || {
         rename_id.set(None);
@@ -542,6 +608,7 @@ pub fn SessionsSidebar(
                             on_select=on_select
                             open_menu_id=open_menu_id
                             on_open_rename=on_open_rename
+                            on_open_fork=on_open_fork
                             on_open_delete=on_open_delete
                         />
                     }

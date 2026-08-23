@@ -1,1 +1,21 @@
-rust-bot is for educational, research, and technical exchange purposes only. It is unrelated to crypto and does not involve any official token or coin.
+Current state (21:03 UTC):
+
+Progress — 6 of 13 patches installed:
+  1. 10.5.0 SP-1.0.0  ✅ build 11000
+  2. 11.0.0 SP-1.0.0  ✅ build 11100
+  3. 11.1.0 SP-1.0.0  ✅ build 11200
+  4. 11.3.0 SP-1.0.0  ✅ build 12000
+  5. 12.0.0 SP-1.0.0  ✅ build 13000
+  6. 14.2.0 SP-0.5.0  ✅ build 14205
+  7. 14.2.0 SP-1.0.0  🔄 installing now (doing pre-upgrade postgres backup)
+  8-13. pending: 14.4.0 SP-1, 14600 SP-1, 14840 SP-6, 15100 SP-11, 15200 SP-7, 15310 SP-0
+
+Health:
+- Runner process alive (apply_patches.sh, started from patch #4)
+- Service is stopped during patching, as required; the script does a full start/stop cycle before each patch (waits for complete "Server started", which was the fix for the earlier validator rejections)
+- Disk: 34G free (script auto-cleans old patch backups below 8G)
+- logs: /root/sdp_migration/migration.log + per-patch logs in /root/sdp_migration/logs/
+
+Note: logs/STATUS still shows the old failure from patch #2; it gets overwritten when the run finishes. Each patch takes ~15-20 min, so roughly 2-2.5h remain. I can check again later or set a reminder to verify completion.
+
+Error: Interactive mode is not yet implemented; use -m/--message

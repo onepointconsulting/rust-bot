@@ -16,6 +16,7 @@ use crate::{
     agent::model_runtime::ModelRuntime,
     config::paths::get_legacy_sessions_dir,
     providers::base::LLMResponse,
+    runtime_context::RUNTIME_CONTEXT_HISTORY_META,
     session::{
         SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message,
         keys::COMMAND_KEY,
@@ -35,8 +36,17 @@ const TITLE_GENERATION_MAX_TOKENS: usize = 512;
 const TITLE_GENERATION_TEMPERATURE: f32 = 0.2;
 const TITLE_INPUT_MAX_CHARS: usize = 1_000;
 
+const FORK_VOLATILE_METADATA_KEYS: &[&str] = &[
+    "goal_state",
+    "pending_user_turn",
+    "runtime_checkpoint",
+    "thread_goal",
+    "title",
+    "title_user_edited",
+];
+
 /// In-memory conversation session record.
-#[derive(Clone)]
+#[derive(Debug, Clone)]
 pub struct Session {
     pub key: String,
     pub messages: Vec<Value>,
@@ -282,6 +292,16 @@ pub enum DeleteSessionError {
     /// No session file (and nothing in cache) for this key.
     NotFound,
     /// The session file exists but could not be removed from disk.
+    Io(std::io::Error),
+}
+
+#[derive(Debug)]
+pub enum ForkSessionError {
+    /// No session file (and nothing in cache) for this key.
+    NotFound,
+    /// `before_user_index` is past the source session's user-message count.
+    InvalidIndex,
+    /// The session file exists but could not be read or written.
     Io(std::io::Error),
 }
 
@@ -538,6 +558,110 @@ impl SessionManager {
             }
         }
         Ok(())
+    }
+
+    /// Create `target_key` from `source_key` before a global user-message index.
+    ///
+    /// `before_user_index` is zero-based over user messages in the full session:
+    /// `0` means "before the first user message", `1` means "before the
+    /// second user message", and so on. A value equal to the total user-message
+    /// count copies the full session prefix. WebUI assistant-reply forks pass
+    /// the next user index so the selected completed assistant turn is included.
+    pub fn fork_session_before_user_index(
+        &mut self,
+        source_key: &str,
+        target_key: &str,
+        before_user_index: usize,
+    ) -> Result<Session, ForkSessionError> {
+        let source = self
+            .get_session_internal(source_key)
+            .ok_or(ForkSessionError::NotFound)?;
+
+        let mut copied: Vec<Value> = Vec::new();
+        let mut user_index = 0;
+        let mut found_target = false;
+        for message in &source.messages {
+            if message.get("role").and_then(Value::as_str) == Some("user") {
+                if user_index == before_user_index {
+                    found_target = true;
+                    break;
+                }
+                user_index += 1;
+            }
+            copied.push(Self::public_history_message(message.clone()));
+        }
+        if user_index == before_user_index {
+            found_target = true;
+        }
+        if !found_target {
+            return Err(ForkSessionError::InvalidIndex);
+        }
+
+        let mut metadata = source.metadata.clone();
+        for &key in FORK_VOLATILE_METADATA_KEYS {
+            metadata.remove(key);
+        }
+
+        let mut last_consolidated = source.last_consolidated.min(copied.len());
+        if source.last_consolidated > copied.len() {
+            metadata.remove("_last_summary");
+            last_consolidated = 0;
+        }
+
+        let mut new_session = Session::new(target_key.to_string());
+        new_session.messages = copied;
+        new_session.metadata = metadata;
+        new_session.last_consolidated = last_consolidated;
+
+        self.save(new_session.clone()).map_err(ForkSessionError::Io)?;
+        Ok(new_session)
+    }
+
+    /// Return a user-visible copy with trusted runtime context removed exactly.
+    fn public_history_message(mut message: Value) -> Value {
+        let Some(obj) = message.as_object_mut() else {
+            return message;
+        };
+        let Some(marker) = obj.remove(RUNTIME_CONTEXT_HISTORY_META) else {
+            return message;
+        };
+        let Some(marker_data) = marker.as_object() else {
+            return message;
+        };
+        if marker_data.get("version").and_then(Value::as_i64) != Some(1) {
+            return message;
+        }
+
+        let suffix = marker_data
+            .get("suffix")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty())
+            .map(str::to_owned);
+        let expected_blocks = match marker_data.get("blocks") {
+            Some(Value::Array(blocks)) if !blocks.is_empty() => Some(blocks.clone()),
+            _ => None,
+        };
+
+        if let Some(suffix) = suffix
+            && let Some(content) = obj.get("content").and_then(Value::as_str).map(str::to_owned)
+        {
+            if content == suffix {
+                obj.insert("content".into(), Value::String(String::new()));
+            } else if let Some(stripped) = content.strip_suffix(&format!("\n\n{suffix}")) {
+                obj.insert("content".into(), Value::String(stripped.to_owned()));
+            }
+            return message;
+        }
+
+        if let Some(expected) = expected_blocks
+            && let Some(Value::Array(content)) = obj.get_mut("content")
+        {
+            let count = expected.len();
+            if content.len() >= count && content[content.len() - count..] == expected[..] {
+                content.truncate(content.len() - count);
+            }
+        }
+        message
     }
 
     pub fn list_sessions(&self) -> Vec<Value> {
@@ -1029,6 +1153,65 @@ mod tests {
             "content": content,
             "timestamp": "2026-01-01T00:00:00Z",
         })
+    }
+
+    #[test]
+    fn public_history_message_leaves_unmarked_messages_unchanged() {
+        let message = json!({"role": "user", "content": "hello"});
+        assert_eq!(
+            SessionManager::public_history_message(message.clone()),
+            message
+        );
+    }
+
+    #[test]
+    fn public_history_message_always_strips_the_history_marker() {
+        let mut message = json!({"role": "user", "content": "hello"});
+        message[RUNTIME_CONTEXT_HISTORY_META] = json!("not a mapping");
+        let cleaned = SessionManager::public_history_message(message);
+        assert_eq!(cleaned, json!({"role": "user", "content": "hello"}));
+    }
+
+    #[test]
+    fn public_history_message_strips_matching_string_suffix() {
+        let suffix = "[Runtime Context]\nquoted";
+        let mut message = json!({
+            "role": "user",
+            "content": format!("hello\n\n{suffix}"),
+        });
+        message[RUNTIME_CONTEXT_HISTORY_META] = json!({"version": 1, "suffix": suffix});
+        let cleaned = SessionManager::public_history_message(message);
+        assert_eq!(cleaned["content"], json!("hello"));
+        assert!(cleaned.get(RUNTIME_CONTEXT_HISTORY_META).is_none());
+    }
+
+    #[test]
+    fn public_history_message_clears_content_when_it_is_only_the_suffix() {
+        let suffix = "[Runtime Context]\nquoted";
+        let mut message = json!({"content": suffix});
+        message[RUNTIME_CONTEXT_HISTORY_META] = json!({"version": 1, "suffix": suffix});
+        let cleaned = SessionManager::public_history_message(message);
+        assert_eq!(cleaned["content"], json!(""));
+    }
+
+    #[test]
+    fn public_history_message_strips_matching_trailing_blocks() {
+        let block = json!({"type": "text", "text": "quoted"});
+        let mut message = json!({
+            "content": [
+                {"type": "text", "text": "hello"},
+                block,
+            ],
+        });
+        message[RUNTIME_CONTEXT_HISTORY_META] = json!({
+            "version": 1,
+            "blocks": [block],
+        });
+        let cleaned = SessionManager::public_history_message(message);
+        assert_eq!(
+            cleaned["content"],
+            json!([{"type": "text", "text": "hello"}])
+        );
     }
 
     #[test]
@@ -2041,5 +2224,92 @@ mod tests {
             session.messages.push(fixture_message("user", "hello"));
         }
         assert!(mgr.session_needs_title("chat"));
+    }
+
+    fn save_two_turn_session(mgr: &mut SessionManager, key: &str, last_consolidated: usize) {
+        let mut session = Session::new(key.into());
+        session.add_message("user", "u0", Map::new());
+        session.add_message("assistant", "a0", Map::new());
+        session.add_message("user", "u1", Map::new());
+        session.add_message("assistant", "a1", Map::new());
+        session.last_consolidated = last_consolidated;
+        session.metadata.insert("keep".into(), json!("yes"));
+        session.metadata.insert("title".into(), json!("old title"));
+        session.metadata.insert("_last_summary".into(), json!("stale"));
+        mgr.save(session).unwrap();
+    }
+
+    #[test]
+    fn fork_session_before_user_index_zero_stops_before_first_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 0);
+
+        mgr.fork_session_before_user_index("src", "dst", 0).unwrap();
+        let forked = mgr.get_session_internal("dst").unwrap();
+        assert!(forked.messages.is_empty());
+    }
+
+    #[test]
+    fn fork_session_before_user_index_copies_prefix_before_second_user() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 0);
+
+        mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
+        let forked = mgr.get_session_internal("dst").unwrap();
+        assert_eq!(forked.messages.len(), 2);
+        assert_eq!(forked.messages[0]["content"], json!("u0"));
+        assert_eq!(forked.messages[1]["content"], json!("a0"));
+        assert_eq!(forked.metadata.get("keep"), Some(&json!("yes")));
+        assert!(!forked.metadata.contains_key("title"));
+    }
+
+    #[test]
+    fn fork_session_before_user_index_at_user_count_copies_full_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 1);
+
+        mgr.fork_session_before_user_index("src", "dst", 2).unwrap();
+        let forked = mgr.get_session_internal("dst").unwrap();
+        assert_eq!(forked.messages.len(), 4);
+        assert_eq!(forked.last_consolidated, 1);
+    }
+
+    #[test]
+    fn fork_session_before_user_index_past_user_count_is_invalid() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 0);
+
+        let err = mgr
+            .fork_session_before_user_index("src", "dst", 3)
+            .unwrap_err();
+        assert!(matches!(err, ForkSessionError::InvalidIndex));
+        assert!(mgr.get_session_internal("dst").is_none());
+    }
+
+    #[test]
+    fn fork_session_before_user_index_missing_source_is_not_found() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let err = mgr
+            .fork_session_before_user_index("missing", "dst", 0)
+            .unwrap_err();
+        assert!(matches!(err, ForkSessionError::NotFound));
+    }
+
+    #[test]
+    fn fork_session_before_user_index_resets_last_consolidated_when_prefix_is_shorter() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 4);
+
+        mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
+        let forked = mgr.get_session_internal("dst").unwrap();
+        assert_eq!(forked.messages.len(), 2);
+        assert_eq!(forked.last_consolidated, 0);
+        assert!(!forked.metadata.contains_key("_last_summary"));
     }
 }
