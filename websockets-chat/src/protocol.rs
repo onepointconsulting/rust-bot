@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, Role, ToolEvent};
+use chat_ui::models::{ChatEntry, ImageAttachment, Role, ToolEvent};
 use serde::{Deserialize, Serialize};
 
 /// Outbound envelope sent to the gateway.
@@ -427,6 +427,14 @@ struct HistoryActivity {
 
 /// One row of the `attached` event's `history` array — mirrors
 /// `websocket_chat_history` in `src/channels/websocket/runtime.rs`.
+///
+/// `media` is a list of already browser-reachable URLs: either
+/// `/v1/media/...` (rewritten server-side from a stored file path by
+/// `resolve_history_media`, needing a `?token=` before it's fetchable — see
+/// `state::authorize_media_attachments`) or a surviving `http(s)://`
+/// reference. Never a `data:` URL — restored history has no in-memory bytes
+/// to embed; only a just-sent, not-yet-persisted message shows those (see
+/// `build_media_payload`).
 #[derive(Debug, Clone, PartialEq, Deserialize)]
 struct HistoryMessage {
     role: String,
@@ -436,6 +444,8 @@ struct HistoryMessage {
     reasoning_content: Option<String>,
     #[serde(default)]
     activity: Option<Vec<HistoryActivity>>,
+    #[serde(default)]
+    media: Vec<String>,
 }
 
 /// Rebuild the tool-activity chips for one history row from its buffered
@@ -486,7 +496,14 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                 id: 0,
                 role,
                 content: message.content.clone(),
-                attachments: Vec::new(),
+                attachments: message
+                    .media
+                    .iter()
+                    .map(|url| ImageAttachment {
+                        url: url.clone(),
+                        label: None,
+                    })
+                    .collect(),
                 streaming: false,
                 tool_events: message
                     .activity
@@ -848,6 +865,39 @@ mod tests {
                 assert_eq!(tool_events[0].status, "done");
                 assert_eq!(tool_events[1].name, "↳ thinking...");
                 assert_eq!(tool_events[1].status, "note");
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attached_history_media_into_attachments() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"look at this","media":["/v1/media/websocket/abc.png"]},
+            {"role":"assistant","content":"a cat"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { history, .. } => {
+                assert_eq!(history.len(), 2);
+                assert_eq!(history[0].attachments.len(), 1);
+                assert_eq!(history[0].attachments[0].url, "/v1/media/websocket/abc.png");
+                assert!(history[0].attachments[0].label.is_none());
+                assert!(history[1].attachments.is_empty());
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attached_history_row_without_media_has_no_attachments() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"hello"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { history, .. } => {
+                assert!(history[0].attachments.is_empty());
             }
             other => panic!("expected Attached, got {other:?}"),
         }

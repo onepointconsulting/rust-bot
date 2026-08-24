@@ -661,6 +661,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // reconnect. A genuine session switch still lands on a blank
             // transcript because `on_select_session` clears entries itself.
             if !history.is_empty() {
+                let history =
+                    state::authorize_media_attachments(history, ctx.token.get_untracked().as_deref());
                 ctx.next_id.set(next_entry_id(&history));
                 persist_entries(&history);
                 ctx.entries.set(history);

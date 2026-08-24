@@ -16,6 +16,11 @@ use std::collections::HashMap;
 
 use chat_ui::models::{ChatEntry, Role, SessionListItem, ToolEvent};
 
+/// Prefix identifying a gateway-served media URL (`serve_media` in
+/// `src/channels/websocket/webui/media.rs`) rather than a `data:` or
+/// arbitrary `http(s)://` reference — see [`authorize_media_attachments`].
+const GATEWAY_MEDIA_URL_PREFIX: &str = "/v1/media/";
+
 /// After deleting `deleted_id` from the sidebar list (most-recent first),
 /// the session that should become active: the row immediately after the
 /// deleted one, or the previous row if it was last. `None` when the list
@@ -457,6 +462,35 @@ fn percent_encode_query_value(value: &str) -> String {
     encoded
 }
 
+/// Append `?token=<token>` to every gateway-served (`/v1/media/...`)
+/// attachment URL on `entries`, leaving `data:` and other `http(s)://` URLs
+/// untouched.
+///
+/// Called once, right after `attach`/`fork_chat`/reconnect turns a history
+/// snapshot into `entries` (see `app.rs`'s `ServerEvent::Attached` handler) —
+/// never on a live, just-uploaded `data:` bubble, which was never rewritten
+/// to `/v1/media/...` in the first place (`protocol::history_to_entries`
+/// only ever produces gateway or passthrough `http(s)://` URLs from
+/// `history[].media`, never `data:`). A native `<img src>` can't set an
+/// `Authorization` header, so the token travels as a query param instead —
+/// same convention [`build_ws_url`] uses for the WebSocket upgrade itself.
+/// No-op (URLs are returned unchanged) when `token` is `None`/empty, e.g.
+/// JWT disabled server-side.
+pub fn authorize_media_attachments(mut entries: Vec<ChatEntry>, token: Option<&str>) -> Vec<ChatEntry> {
+    let Some(token) = token.filter(|t| !t.is_empty()) else {
+        return entries;
+    };
+    for entry in &mut entries {
+        for attachment in &mut entry.attachments {
+            if attachment.url.starts_with(GATEWAY_MEDIA_URL_PREFIX) {
+                attachment.url =
+                    format!("{}?token={}", attachment.url, percent_encode_query_value(token));
+            }
+        }
+    }
+    entries
+}
+
 /// Build the gateway WebSocket URL.
 ///
 /// Translates the page's `http(s)` origin `scheme` to the matching `ws(s)`
@@ -500,7 +534,7 @@ pub fn build_ws_url(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use chat_ui::models::Role;
+    use chat_ui::models::{ImageAttachment, Role};
 
     fn assistant_entry(id: u64) -> ChatEntry {
         ChatEntry {
@@ -1002,6 +1036,72 @@ mod tests {
         // Once the cap is hit it should stay there for larger attempts too.
         assert_eq!(compute_backoff_delay_ms(20), cap);
         assert_eq!(compute_backoff_delay_ms(1_000), cap);
+    }
+
+    #[test]
+    fn authorize_media_attachments_appends_token_to_gateway_media_urls_only() {
+        let entries = vec![
+            ChatEntry {
+                id: 0,
+                role: Role::User,
+                content: "restored".to_string(),
+                attachments: vec![
+                    ImageAttachment {
+                        url: "/v1/media/websocket/abc.png".to_string(),
+                        label: None,
+                    },
+                    ImageAttachment {
+                        url: "https://example.com/a.png".to_string(),
+                        label: None,
+                    },
+                ],
+                streaming: false,
+                tool_events: None,
+                reasoning: None,
+            },
+            ChatEntry {
+                id: 1,
+                role: Role::User,
+                content: "just uploaded".to_string(),
+                attachments: vec![ImageAttachment {
+                    url: "data:image/png;base64,AAAA".to_string(),
+                    label: None,
+                }],
+                streaming: false,
+                tool_events: None,
+                reasoning: None,
+            },
+        ];
+
+        let result = authorize_media_attachments(entries, Some("tok en"));
+
+        assert_eq!(
+            result[0].attachments[0].url,
+            "/v1/media/websocket/abc.png?token=tok%20en"
+        );
+        assert_eq!(result[0].attachments[1].url, "https://example.com/a.png");
+        assert_eq!(result[1].attachments[0].url, "data:image/png;base64,AAAA");
+    }
+
+    #[test]
+    fn authorize_media_attachments_no_op_without_a_token() {
+        let entries = vec![ChatEntry {
+            id: 0,
+            role: Role::User,
+            content: "restored".to_string(),
+            attachments: vec![ImageAttachment {
+                url: "/v1/media/websocket/abc.png".to_string(),
+                label: None,
+            }],
+            streaming: false,
+            tool_events: None,
+            reasoning: None,
+        }];
+
+        let result = authorize_media_attachments(entries.clone(), None);
+        assert_eq!(result, entries);
+        let result = authorize_media_attachments(entries.clone(), Some(""));
+        assert_eq!(result, entries);
     }
 
     #[test]

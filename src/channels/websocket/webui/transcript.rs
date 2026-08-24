@@ -1193,6 +1193,19 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             if !activity.is_empty() {
                 entry["activity"] = serde_json::json!(activity);
             }
+            // Raw (unresolved) media refs: still the absolute on-disk paths
+            // `build_user_transcript_event` recorded under `media_paths`, not
+            // yet turned into `/v1/media/...` URLs. Kept as a pure, filesystem-
+            // free projection here — path -> URL resolution (which needs to
+            // check the file still exists) happens once, afterward, in
+            // `channels::websocket::runtime::resolve_history_media`, so this
+            // function's own tests stay filesystem-free.
+            if is_user_row(row)
+                && let Some(media_paths) = row.get("media_paths").and_then(Value::as_array)
+                && !media_paths.is_empty()
+            {
+                entry["media"] = serde_json::json!(media_paths);
+            }
             entry
         })
         .collect()
@@ -2339,6 +2352,41 @@ mod tests {
         assert_eq!(history[0]["content"], "hi");
         assert_eq!(history[1]["role"], "assistant");
         assert_eq!(history[1]["content"], "hello there");
+    }
+
+    #[test]
+    fn transcript_chat_history_carries_raw_media_paths_on_user_rows() {
+        let rows = vec![
+            serde_json::json!({
+                "event": "user",
+                "text": "look at this",
+                "media_paths": ["/data/media/websocket/abc.png"],
+            }),
+            serde_json::json!({"event": "message", "text": "a cat"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(
+            history[0]["media"],
+            serde_json::json!(["/data/media/websocket/abc.png"])
+        );
+        // Assistant rows never carry `media` — it's user-only.
+        assert!(history[1].get("media").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_omits_media_when_media_paths_absent_or_empty() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi"}),
+            serde_json::json!({"event": "user", "text": "hi again", "media_paths": []}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert!(history[0].get("media").is_none());
+        assert!(history[1].get("media").is_none());
     }
 
     #[test]

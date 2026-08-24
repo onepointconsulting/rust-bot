@@ -7,6 +7,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use garde::{Report, Validate};
@@ -276,6 +277,16 @@ pub struct WsShared {
     pub session_manager: Arc<StdMutex<SessionManager>>,
     pub workspace_request_handler: WorkspaceRequestHandler,
     pub runtime_surface: String,
+    /// Root directory uploaded WebUI attachments are stored under
+    /// (`config::paths::get_media_dir(None)`), resolved once per [`WsShared`]
+    /// snapshot rather than re-resolved per request — see
+    /// `webui::media::serve_media` (confines every request's `key` to this
+    /// root) and `channels::websocket::runtime::resolve_history_media`
+    /// (rewrites `attached.history` `media` refs into `/v1/media/...` URLs
+    /// under it). Explicit rather than read from the process-wide config
+    /// singleton at request time so tests can point it at an isolated
+    /// tempdir instead of racing other tests' `set_config_path` calls.
+    pub media_root: PathBuf,
 }
 
 /// Everything one envelope-dispatch call needs, bundled so per-type handler

@@ -213,7 +213,7 @@ fn sender_allowed(channels_config: &ChannelsConfig, sender_id: &str) -> bool {
 /// pinned to the route path — see `validate_jwt_aud_matches_path`). Checked
 /// by [`authorize`]; mint one via `rust-bot generate-jwt-token --purpose
 /// webui` — see `security::jwt::Claims::purpose`.
-const WEBUI_JWT_PURPOSE: &str = "webui";
+pub(crate) const WEBUI_JWT_PURPOSE: &str = "webui";
 
 /// Outbound metadata key carrying an opaque WebUI-rendered "agent UI" blob to
 /// echo verbatim onto the wire message. Mirrors nanobot's
@@ -962,7 +962,7 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
     // Scoped so each `MutexGuard` drops before this function's `.await`s
     // below — same discipline as every other `gateway_services.transcripts`
     // use in this file.
-    let history = {
+    let mut history = {
         let recorder = transcripts.lock().unwrap_or_else(|e| e.into_inner());
         let transcript_ok =
             recorder.fork_transcript_before_user_index(&key, &new_session_key, before_user_index);
@@ -972,6 +972,7 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
             websocket_chat_history(Some(&forked), MAX_HISTORY_MESSAGES)
         }
     };
+    resolve_history_media(&mut history, &shared.media_root);
 
     shared.connections.lock().await.attach(connection_id, &new_id);
     send_event(
@@ -1138,7 +1139,11 @@ async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispa
 /// [`AgentLoop::save_turn`] writes a block array (not a string) whenever the
 /// turn carried media, so a plain `as_str()` would silently blank out every
 /// message that had an image attached. Non-text blocks have no transcript
-/// representation here and are dropped.
+/// representation here and are dropped. Text blocks that are themselves an
+/// `[image: <path>]`/`[image]` placeholder (`sanitize_persisted_blocks`'
+/// stand-in for a stripped `data:` image — see `image_placeholder_text`) are
+/// dropped too: [`extract_media_refs`] recovers the thumbnail from the same
+/// placeholder, so showing it as literal text as well would duplicate it.
 fn display_text(content: Option<&serde_json::Value>) -> String {
     match content {
         Some(serde_json::Value::String(text)) => text.clone(),
@@ -1146,10 +1151,96 @@ fn display_text(content: Option<&serde_json::Value>) -> String {
             .iter()
             .filter(|block| block.get("type").and_then(|v| v.as_str()) == Some("text"))
             .filter_map(|block| block.get("text").and_then(|v| v.as_str()))
-            .filter(|text| !text.is_empty())
+            .filter(|text| !text.is_empty() && !is_image_placeholder_text(text))
             .collect::<Vec<&str>>()
             .join("\n"),
         _ => String::new(),
+    }
+}
+
+/// Whether `text` is exactly the placeholder [`image_placeholder_text`]
+/// produces for a sanitized `data:` image block (`"[image: <path>]"` when a
+/// path was recorded, bare `"[image]"` otherwise).
+fn is_image_placeholder_text(text: &str) -> bool {
+    text == "[image]" || (text.starts_with("[image: ") && text.ends_with(']'))
+}
+
+/// Recover the placeholder's stored path, or `None` for a pathless
+/// `"[image]"` placeholder (nothing on disk to link back to).
+fn image_placeholder_path(text: &str) -> Option<&str> {
+    text.strip_prefix("[image: ")?.strip_suffix(']')
+}
+
+/// Extract raw (unresolved) media references from a persisted message's
+/// content blocks: local file paths recovered from `[image: <path>]`
+/// placeholders (the `sanitize_persisted_blocks` stand-in for a stripped
+/// `data:` image) and any `image_url` blocks that survived sanitization
+/// because they were already an `http(s)://` reference rather than a
+/// `data:` one. Kept pure/filesystem-free — same reasoning as
+/// [`crate::channels::websocket::webui::transcript::transcript_chat_history`]'s
+/// own raw `media` field — with actual path -> URL resolution left to
+/// [`resolve_history_media`].
+fn extract_media_refs(content: Option<&serde_json::Value>) -> Vec<String> {
+    let Some(serde_json::Value::Array(blocks)) = content else {
+        return Vec::new();
+    };
+    blocks
+        .iter()
+        .filter_map(|block| {
+            match block.get("type").and_then(|v| v.as_str())? {
+                "text" => {
+                    let text = block.get("text").and_then(|v| v.as_str())?;
+                    image_placeholder_path(text).map(str::to_string)
+                }
+                "image_url" => block
+                    .get("image_url")
+                    .and_then(|v| v.as_object())
+                    .and_then(|iu| iu.get("url"))
+                    .and_then(|v| v.as_str())
+                    .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                    .map(str::to_string),
+                _ => None,
+            }
+        })
+        .collect()
+}
+
+/// Resolve raw `media` refs on each display-history row (as attached by
+/// [`crate::channels::websocket::webui::transcript::WebUiTranscriptRecorder::chat_history`]
+/// / [`websocket_chat_history`] below — still either an absolute on-disk
+/// path or a passthrough `http(s)://` URL) into browser-reachable
+/// `/v1/media/...` URLs, dropping refs that don't resolve (file missing, or
+/// outside `media_root`) and removing the `media` key entirely when nothing
+/// resolves. The one place in the attach/fork history pipeline that touches
+/// the filesystem, kept separate from the pure projector functions above so
+/// their own unit tests stay filesystem-free.
+fn resolve_history_media(history: &mut [serde_json::Value], media_root: &std::path::Path) {
+    for entry in history.iter_mut() {
+        let Some(raw) = entry.get("media").and_then(|v| v.as_array()).cloned() else {
+            continue;
+        };
+        let resolved: Vec<serde_json::Value> = raw
+            .iter()
+            .filter_map(|v| v.as_str())
+            .filter_map(|raw_ref| {
+                if raw_ref.starts_with("http://") || raw_ref.starts_with("https://") {
+                    Some(raw_ref.to_string())
+                } else {
+                    crate::channels::websocket::webui::media::media_url_from_stored_path(
+                        raw_ref, media_root,
+                    )
+                }
+            })
+            .map(serde_json::Value::String)
+            .collect();
+        let Some(obj) = entry.as_object_mut() else {
+            continue;
+        };
+        if resolved.is_empty() {
+            obj.remove("media");
+        } else {
+            obj.insert("media".to_string(), serde_json::json!(resolved));
+        }
     }
 }
 
@@ -1210,6 +1301,10 @@ fn websocket_chat_history(
             {
                 entry["reasoning_content"] = serde_json::json!(reasoning);
             }
+            let media = extract_media_refs(message.get("content"));
+            if !media.is_empty() {
+                entry["media"] = serde_json::json!(media);
+            }
             entry
         })
         .collect()
@@ -1244,7 +1339,7 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
             .unwrap_or_else(|e| e.into_inner());
         recorder.chat_history(&session_key, MAX_HISTORY_MESSAGES)
     };
-    let history = if !transcript_history.is_empty() {
+    let mut history = if !transcript_history.is_empty() {
         transcript_history
     } else {
         // Scoped so the (synchronous) `MutexGuard` is dropped before
@@ -1258,6 +1353,7 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
         let session = session_manager.get_session_internal(&session_key);
         websocket_chat_history(session.as_ref(), MAX_HISTORY_MESSAGES)
     };
+    resolve_history_media(&mut history, &shared.media_root);
     send_event(
         shared,
         connection_id,
@@ -1969,6 +2065,7 @@ impl WebSocketChannel {
             workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
             gateway_services: Arc::clone(&self.gateway_services),
+            media_root: get_media_dir(None),
         }
     }
 
@@ -1979,6 +2076,10 @@ impl WebSocketChannel {
     pub(crate) fn router(&self) -> Router {
         Router::new()
             .route(&self.config.path, get(ws_upgrade_handler))
+            .route(
+                "/v1/media/{*key}",
+                get(crate::channels::websocket::webui::media::serve_media),
+            )
             .with_state(self.shared())
     }
 
@@ -2729,6 +2830,7 @@ mod tests {
             ),
             runtime_surface: runtime_surface.to_string(),
             gateway_services: Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep())),
+            media_root: tempfile::tempdir().unwrap().keep(),
         }
     }
 
@@ -3266,6 +3368,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_envelope_attach_resolves_session_image_placeholder_into_media_url() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        let sub = shared.media_root.join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        let image_path = sub.join("abc.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:existing-chat".to_string());
+            session.messages.push(serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "text", "text": format!("[image: {}]", image_path.display())},
+                ],
+            }));
+            session.add_message("assistant", "a cat", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        let history = body["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        assert_eq!(history[0]["content"], "look at this");
+        assert_eq!(
+            history[0]["media"],
+            serde_json::json!(["/v1/media/websocket/abc.png"])
+        );
+        assert!(history[1].get("media").is_none());
+    }
+
+    #[tokio::test]
     async fn handle_envelope_attach_prefers_transcript_history_over_a_divergent_session() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -3591,6 +3739,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_envelope_fork_chat_resolves_session_image_placeholder_into_media_url() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+
+        let sub = shared.media_root.join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        let image_path = sub.join("abc.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.messages.push(serde_json::json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "text", "text": format!("[image: {}]", image_path.display())},
+                ],
+            }));
+            session.add_message("assistant", "a cat", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+        // No transcript rows written for "src", so the fork falls back to
+        // the session-file path (`websocket_chat_history`), same as above.
+
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let attached = recv_json(&mut rx);
+        let history = attached["history"]
+            .as_array()
+            .expect("attached frame should carry history");
+        assert_eq!(history[0]["content"], "look at this");
+        assert_eq!(
+            history[0]["media"],
+            serde_json::json!(["/v1/media/websocket/abc.png"])
+        );
+    }
+
+    #[tokio::test]
     async fn handle_envelope_fork_chat_rejects_an_invalid_index() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -3898,6 +4089,147 @@ mod tests {
         let mut session = Session::new("websocket:chat-1".to_string());
         session.messages.push(history_message("user", "hello"));
         assert!(websocket_chat_history(Some(&session), 0).is_empty());
+    }
+
+    // --- websocket_chat_history: media (session-file fallback) ---
+
+    #[test]
+    fn websocket_chat_history_turns_image_placeholder_into_media_and_strips_it_from_content() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "look at this"},
+                {"type": "text", "text": "[image: C:\\data\\media\\websocket\\abc.png]"},
+            ],
+        }));
+        session.messages.push(history_message("assistant", "a cat"));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        assert_eq!(history[0]["content"], "look at this");
+        assert_eq!(
+            history[0]["media"],
+            serde_json::json!(["C:\\data\\media\\websocket\\abc.png"])
+        );
+        assert!(history[1].get("media").is_none());
+    }
+
+    #[test]
+    fn websocket_chat_history_keeps_surviving_http_image_url_as_media() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "what is in this picture?"},
+                {"type": "image_url", "image_url": {"url": "https://example.com/a.png"}},
+            ],
+        }));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        assert_eq!(
+            history[0]["media"],
+            serde_json::json!(["https://example.com/a.png"])
+        );
+    }
+
+    #[test]
+    fn websocket_chat_history_pathless_image_placeholder_yields_no_media() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": [{"type": "text", "text": "[image]"}],
+        }));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        assert!(history[0].get("media").is_none());
+        assert_eq!(history[0]["content"], "");
+    }
+
+    // --- is_image_placeholder_text / image_placeholder_path ---
+
+    #[test]
+    fn is_image_placeholder_text_matches_both_shapes() {
+        assert!(is_image_placeholder_text("[image]"));
+        assert!(is_image_placeholder_text("[image: /tmp/a.png]"));
+        assert!(!is_image_placeholder_text("[image tag"));
+        assert!(!is_image_placeholder_text("just some text"));
+    }
+
+    #[test]
+    fn image_placeholder_path_extracts_inner_path() {
+        assert_eq!(
+            image_placeholder_path("[image: /tmp/a.png]"),
+            Some("/tmp/a.png")
+        );
+        assert_eq!(image_placeholder_path("[image]"), None);
+        assert_eq!(image_placeholder_path("plain text"), None);
+    }
+
+    // --- extract_media_refs ---
+
+    #[test]
+    fn extract_media_refs_empty_for_string_or_missing_content() {
+        assert!(extract_media_refs(Some(&serde_json::json!("plain"))).is_empty());
+        assert!(extract_media_refs(None).is_empty());
+    }
+
+    #[test]
+    fn extract_media_refs_ignores_data_url_image_blocks() {
+        // sanitize_persisted_blocks never actually persists a `data:` image_url
+        // block (it rewrites it to a text placeholder first), but guard the
+        // extractor against one anyway rather than leaking a huge data URI.
+        let content = serde_json::json!([
+            {"type": "image_url", "image_url": {"url": "data:image/png;base64,AAAA"}},
+        ]);
+        assert!(extract_media_refs(Some(&content)).is_empty());
+    }
+
+    // --- resolve_history_media ---
+
+    #[test]
+    fn resolve_history_media_converts_local_path_and_passes_through_http_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("abc.png");
+        std::fs::write(&file, b"fake-png").unwrap();
+
+        let mut history = vec![serde_json::json!({
+            "role": "user",
+            "content": "hi",
+            "media": [file.to_str().unwrap(), "https://example.com/a.png"],
+        })];
+        resolve_history_media(&mut history, dir.path());
+
+        let media = history[0]["media"].as_array().unwrap();
+        assert_eq!(media.len(), 2);
+        assert_eq!(media[0], "/v1/media/websocket/abc.png");
+        assert_eq!(media[1], "https://example.com/a.png");
+    }
+
+    #[test]
+    fn resolve_history_media_drops_missing_file_and_removes_empty_media_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = vec![serde_json::json!({
+            "role": "user",
+            "content": "hi",
+            "media": ["C:\\nope\\gone.png"],
+        })];
+        resolve_history_media(&mut history, dir.path());
+
+        assert!(history[0].get("media").is_none());
+    }
+
+    #[test]
+    fn resolve_history_media_no_op_when_no_media_field() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut history = vec![serde_json::json!({"role": "assistant", "content": "hi"})];
+        resolve_history_media(&mut history, dir.path());
+
+        assert!(history[0].get("media").is_none());
     }
 
     // --- list_websocket_chats / handle_envelope_list_chats ---
