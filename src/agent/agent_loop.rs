@@ -2433,6 +2433,14 @@ mod tests {
     fn persist_command_turn_writes_marked_messages_omitted_from_get_history() {
         let loop_ = make_save_turn_loop(1000);
         let key = "test:persist_command_turn";
+        let _ = {
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            manager.delete_session(key)
+        };
+        
         loop_.persist_command_turn(
             key,
             "/help",
@@ -2440,11 +2448,13 @@ mod tests {
             &command_reply("Available commands..."),
         );
 
-        let mut manager = loop_
-            .session_manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let session = manager.get_or_create_session(key);
+        let session = {
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            manager.get_or_create_session(key).clone()
+        };
         assert_eq!(session.messages.len(), 2);
         assert_eq!(session.messages[0]["role"], json!("user"));
         assert_eq!(session.messages[0]["content"], json!("/help"));

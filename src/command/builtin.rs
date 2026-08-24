@@ -1689,6 +1689,8 @@ mod tests {
     async fn cmd_goal_start_status_and_cancel_round_trip() {
         let loop_ = model_cmd_test_loop_with_preset();
 
+        let clear_ctx = goal_cmd_ctx(loop_.clone(), "clear");
+        CmdGoal.handle(&clear_ctx).await;
         let start_ctx = goal_cmd_ctx(loop_.clone(), "ship the feature");
         let started = CmdGoal.handle(&start_ctx).await;
         assert!(

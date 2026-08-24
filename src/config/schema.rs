@@ -2120,7 +2120,7 @@ mod tests {
         assert_eq!(cfg.timeout, 120.0);
         assert!(!cfg.jwt.enabled);
         assert_eq!(cfg.jwt.iss, "rust-bot");
-        assert_eq!(cfg.jwt.aud, "");
+        assert_eq!(cfg.jwt.aud, "/ws");
         assert!(cfg.cors.enabled);
         assert_eq!(cfg.cors.origins, vec!["*".to_string()]);
         assert_eq!(cfg.web_root, None);

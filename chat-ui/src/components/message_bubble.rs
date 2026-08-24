@@ -1,3 +1,4 @@
+use leptos::html::Div;
 use leptos::prelude::*;
 use leptos::task::spawn_local;
 use wasm_bindgen::closure::Closure;
@@ -40,6 +41,21 @@ pub fn MessageBubble(
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
     let awaiting_first_token = !markdown::has_visible_chars(&content);
 
+    // One lightbox per bubble instance: only ever holds the URL of the
+    // attachment most recently clicked in *this* bubble, so no lifted/global
+    // state is needed even though multiple bubbles can have attachments.
+    let lightbox_url: RwSignal<Option<String>> = RwSignal::new(None);
+    let lightbox_panel: NodeRef<Div> = NodeRef::new();
+
+    Effect::new(move |_| {
+        if lightbox_url.get().is_none() {
+            return;
+        }
+        if let Some(el) = lightbox_panel.get() {
+            let _ = el.focus();
+        }
+    });
+
     let pending_view = move || {
         if !streaming.get() {
             return ().into_any();
@@ -62,7 +78,7 @@ pub fn MessageBubble(
         }
     };
 
-    if is_user {
+    let main_view = if is_user {
         let has_text = markdown::has_visible_chars(&content);
         let text_view = if has_text {
             view! {
@@ -91,29 +107,41 @@ pub fn MessageBubble(
                         key=|attachment| attachment.url.clone()
                         let(attachment)
                     >
-                        <img
-                            src=attachment.url.clone()
-                            alt=attachment.label.clone().unwrap_or_default()
-                            class="h-24 max-w-full rounded-lg object-cover"
-                        />
+                        {
+                            let open_url = attachment.url.clone();
+                            view! {
+                                <button
+                                    type="button"
+                                    class="block cursor-pointer rounded-lg transition hover:opacity-90"
+                                    on:click=move |_| lightbox_url.set(Some(open_url.clone()))
+                                >
+                                    <img
+                                        src=attachment.url.clone()
+                                        alt=attachment.label.clone().unwrap_or_default()
+                                        class="h-24 max-w-full rounded-lg object-cover"
+                                    />
+                                </button>
+                            }
+                        }
                     </For>
                 </div>
             }
             .into_any()
         };
         if !has_text && !has_attachments && extra_view.is_none() && !streaming.get() {
-            return ().into_any();
-        }
-        view! {
-            <div class="flex justify-end">
-                <div class="max-w-[80%] rounded-2xl bg-orange-600 px-4 py-2 text-sm text-white shadow-sm">
-                    {text_view}
-                    {attachments_view}
-                    {extra_view}
+            ().into_any()
+        } else {
+            view! {
+                <div class="flex justify-end">
+                    <div class="max-w-[80%] rounded-2xl bg-orange-600 px-4 py-2 text-sm text-white shadow-sm">
+                        {text_view}
+                        {attachments_view}
+                        {extra_view}
+                    </div>
                 </div>
-            </div>
+            }
+            .into_any()
         }
-        .into_any()
     } else {
         // `trim().is_empty()` is not enough: markdown like `****` or a
         // zero-width fragment still produces a padded bubble + copy button
@@ -144,6 +172,68 @@ pub fn MessageBubble(
         } else {
             ().into_any()
         }
+    };
+
+    view! {
+        <>
+            {main_view}
+            <Show when=move || lightbox_url.get().is_some()>
+                <div class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+                    <div
+                        class="absolute inset-0 bg-slate-900/80"
+                        aria-hidden="true"
+                        on:click=move |_| lightbox_url.set(None)
+                    ></div>
+                    <div
+                        node_ref=lightbox_panel
+                        role="dialog"
+                        aria-modal="true"
+                        aria-label="Image preview"
+                        tabindex="-1"
+                        class="relative max-h-[90vh] max-w-[90vw] outline-none"
+                        on:keydown=move |ev| {
+                            if ev.key() == "Escape" {
+                                lightbox_url.set(None);
+                            }
+                        }
+                    >
+                        <img
+                            src=move || lightbox_url.get().unwrap_or_default()
+                            alt=""
+                            class="max-h-[90vh] max-w-[90vw] rounded-lg object-contain shadow-2xl"
+                        />
+                        <button
+                            type="button"
+                            aria-label="Close image preview"
+                            class="absolute -top-3 -right-3 flex h-8 w-8 items-center justify-center rounded-full bg-white text-slate-600 shadow-lg transition hover:bg-slate-100 hover:text-slate-900"
+                            on:click=move |_| lightbox_url.set(None)
+                        >
+                            <IconClose />
+                        </button>
+                    </div>
+                </div>
+            </Show>
+        </>
+    }
+}
+
+#[component]
+fn IconClose() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-4 w-4"
+            aria-hidden="true"
+        >
+            <path d="M18 6L6 18" />
+            <path d="M6 6l12 12" />
+        </svg>
     }
 }
 

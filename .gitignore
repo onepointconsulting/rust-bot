@@ -1,5 +1,6 @@
 /target
 /web-chat/dist
+/websockets-chat/dist
 notes.txt
 .env
 
