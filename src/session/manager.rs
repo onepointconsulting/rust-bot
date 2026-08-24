@@ -219,6 +219,34 @@ fn json_value_as_last_consolidated(v: &Value) -> usize {
         .unwrap_or(0)
 }
 
+/// True for persisted image placeholders (`[image]` or `[image: path]`).
+fn is_image_placeholder(text: &str) -> bool {
+    let text = text.trim();
+    text == "[image]" || (text.starts_with("[image:") && text.ends_with(']'))
+}
+
+/// Plain-string content, or text blocks with image placeholders stripped.
+fn title_message_text(content: &Value) -> String {
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(blocks) => {
+            let mut parts = Vec::new();
+            for block in blocks {
+                let Some(text) = block.get("text").and_then(Value::as_str) else {
+                    continue;
+                };
+                let text = text.trim();
+                if text.is_empty() || is_image_placeholder(text) {
+                    continue;
+                }
+                parts.push(text);
+            }
+            parts.join(" ")
+        }
+        _ => String::new(),
+    }
+}
+
 fn title_inputs(session: &Session) -> (String, String) {
     let mut user_text = String::new();
     let mut assistant_text = String::new();
@@ -233,13 +261,14 @@ fn title_inputs(session: &Session) -> (String, String) {
             .get("role")
             .and_then(Value::as_str)
             .unwrap_or_default();
-        let Some(content) = message.get("content").and_then(Value::as_str) else {
+        let Some(raw) = message.get("content") else {
             continue;
         };
+        let content = title_message_text(raw);
         if content.trim().is_empty() {
             continue;
         }
-        let content = strip_think(content);
+        let content = strip_think(&content);
         if content.is_empty() {
             continue;
         }
@@ -931,6 +960,7 @@ impl SessionManager {
         session_key: &str,
         model_runtime: &ModelRuntime,
     ) -> Option<String> {
+        log::info!("Generating title for session: {session_key}");
         let (system, user) = {
             let manager = sessions.lock().unwrap_or_else(|e| e.into_inner());
             let Some(session) = manager.get_session_internal(session_key) else {
@@ -2179,6 +2209,49 @@ mod tests {
     }
 
     #[test]
+    fn title_inputs_extracts_text_from_multimodal_blocks() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "[image: C:\\\\temp\\\\shot.png]"},
+                {"type": "text", "text": "[image]"},
+                {"type": "text", "text": "  Explain this ranking chart  "},
+                {"type": "text", "text": "from OpenRouter."},
+            ],
+        }));
+        session
+            .messages
+            .push(fixture_message("assistant", "It shows model share."));
+        assert_eq!(
+            title_inputs(&session),
+            (
+                "Explain this ranking chart from OpenRouter.".to_string(),
+                "It shows model share.".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn title_inputs_skips_image_only_blocks() {
+        let mut session = Session::new("s1".into());
+        session.messages.push(json!({
+            "role": "user",
+            "content": [
+                {"type": "text", "text": "[image: C:\\\\temp\\\\shot.png]"},
+                {"type": "text", "text": "[image]"},
+            ],
+        }));
+        session
+            .messages
+            .push(fixture_message("user", "follow-up without an image"));
+        assert_eq!(
+            title_inputs(&session),
+            ("follow-up without an image".to_string(), String::new())
+        );
+    }
+
+    #[test]
     fn title_generation_prompt_includes_user_and_assistant() {
         let (system, user) =
             title_generation_prompt("Fix the login bug", "Reset the token").unwrap();
@@ -2222,6 +2295,23 @@ mod tests {
         {
             let session = mgr.get_or_create_session("chat");
             session.messages.push(fixture_message("user", "hello"));
+        }
+        assert!(mgr.session_needs_title("chat"));
+    }
+
+    #[test]
+    fn session_needs_title_true_for_multimodal_user_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().to_path_buf());
+        {
+            let session = mgr.get_or_create_session("chat");
+            session.messages.push(json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "[image: C:\\\\temp\\\\shot.png]"},
+                    {"type": "text", "text": "Explain this chart"},
+                ],
+            }));
         }
         assert!(mgr.session_needs_title("chat"));
     }

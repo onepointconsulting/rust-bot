@@ -305,21 +305,18 @@ pub struct GenerateJwtTokenArgs {
 #[derive(Debug)]
 pub enum CliError {
     FailedToCreateWebRootDirectory(std::io::Error),
-    InteractiveNotImplemented,
     Inquire(inquire::InquireError),
     Jwt(JwtError),
     UserRegistry(UserRegistryError),
+    Readline(reedline::ReedlineError),
     Other(String),
 }
 
 impl fmt::Display for CliError {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::InteractiveNotImplemented => {
-                write!(
-                    f,
-                    "Interactive mode is not yet implemented; use -m/--message"
-                )
+            Self::Readline(err) => {
+                write!(f, "Readline error: {err}")
             }
             Self::Inquire(err) => {
                 write!(f, "Inquire error: {err}")
@@ -1746,7 +1743,7 @@ async fn interactive_session(
     let prompt = CliPrompt;
     loop {
         let sig = tokio::task::block_in_place(|| line_editor.read_line(&prompt))
-            .map_err(|_| CliError::InteractiveNotImplemented)?;
+            .map_err(|e| CliError::Readline(e.into()))?;
         match sig {
             Signal::HostCommand(cmd) if cmd == TEXT_PASTE_COMMAND => {
                 let captured = try_get_clipboard_text().unwrap_or_default();
