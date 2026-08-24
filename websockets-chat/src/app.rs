@@ -313,6 +313,15 @@ struct WsContext {
     /// requested the tools — matching session history, which stores one
     /// assistant message per LLM round.
     split_stream_on_next_delta: RwSignal<bool>,
+    /// The process/session model-preset catalog, from the active chat's
+    /// `attached` frame. Empty until the first attach ack (or on an older
+    /// gateway that doesn't send it), which hides `ChatInput`'s picker.
+    model_presets: RwSignal<Vec<String>>,
+    /// This chat's resolved preset selection ("default" when there's no
+    /// session override). Applied optimistically by
+    /// [`request_set_model_preset`] and reconciled by the `attached` /
+    /// `model_preset_set` acks.
+    model_preset: RwSignal<String>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -644,7 +653,12 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.active_turn_id.set(None);
             ctx.split_stream_on_next_delta.set(false);
         }
-        ServerEvent::Attached { chat_id, history } => {
+        ServerEvent::Attached {
+            chat_id,
+            history,
+            model_presets,
+            model_preset,
+        } => {
             log::info!(
                 "attached to chat_id={chat_id} history_len={}",
                 history.len()
@@ -654,6 +668,15 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.turn_index.set(HashMap::new());
             ctx.active_turn_id.set(None);
             ctx.split_stream_on_next_delta.set(false);
+            // Older gateway with no catalog yet: leave whatever was last
+            // known rather than flashing the picker away. The selection
+            // itself is still always set below — a chat switch must not
+            // keep showing the *previous* session's preset.
+            if !model_presets.is_empty() {
+                ctx.model_presets.set(model_presets);
+            }
+            ctx.model_preset
+                .set(model_preset.unwrap_or_else(|| "default".to_string()));
             // An empty snapshot means the gateway has nothing *persisted*
             // for this chat (brand new, or a first turn still in flight) —
             // not that the transcript is empty. Adopting it verbatim would
@@ -697,6 +720,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::TurnAborted { chat_id, turn_id } => {
             log::info!("turn aborted: chat_id={chat_id} turn_id={turn_id:?}");
             handle_turn_aborted(ctx, turn_id);
+        }
+        ServerEvent::ModelPresetSet { model_preset, .. } => {
+            ctx.model_preset.set(model_preset);
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
@@ -957,6 +983,29 @@ fn request_abort_turn(ctx: &WsContext) {
     );
 }
 
+/// Ask the gateway to change the active chat's model-preset override.
+///
+/// Applies `name` optimistically (before the ack) so the trigger label
+/// updates instantly; a rejection still lands as a generic `error` banner
+/// via [`dispatch_server_event`]'s `ServerEvent::Error` arm — same as every
+/// other request in this file — rather than reverting the optimistic value,
+/// since the next `attached` (chat switch) or a retried selection both
+/// naturally reconcile it.
+fn request_set_model_preset(ctx: &WsContext, name: String) {
+    if ctx.model_preset.get_untracked() == name {
+        return;
+    }
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    ctx.model_preset.set(name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_model_preset(chat_id, name),
+        "Failed to encode the set-model-preset request.",
+    );
+}
+
 /// Drop local transcript/turn state so leftover frames from the previous
 /// `chat_id` are ignored until a new `attached` (or `ready`) lands.
 fn reset_local_transcript(ctx: &WsContext) {
@@ -1163,6 +1212,8 @@ pub fn App() -> impl IntoView {
         RwSignal::new(BrowserLocalStorage::get::<bool>(SIDEBAR_OPEN_STORAGE_KEY).unwrap_or(false));
     let pending_attach = RwSignal::new(None::<String>);
     let split_stream_on_next_delta = RwSignal::new(false);
+    let model_presets = RwSignal::new(Vec::<String>::new());
+    let model_preset = RwSignal::new("default".to_string());
 
     let ws_context = WsContext {
         token,
@@ -1183,6 +1234,8 @@ pub fn App() -> impl IntoView {
         sessions,
         pending_attach,
         split_stream_on_next_delta,
+        model_presets,
+        model_preset,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -1263,6 +1316,8 @@ pub fn App() -> impl IntoView {
         token_streaming.set(false);
         sessions.set(Vec::new());
         sidebar_open.set(false);
+        model_presets.set(Vec::new());
+        model_preset.set("default".to_string());
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -1331,6 +1386,7 @@ pub fn App() -> impl IntoView {
         attach_to_session(&ws_context, selected_id);
     };
     let on_abort_turn = move || request_abort_turn(&ws_context);
+    let on_select_model_preset = move |name: String| request_set_model_preset(&ws_context, name);
 
     // A turn stays in flight across tool waits, even though those pauses
     // clear `streaming` on the current bubble so the next LLM round can
@@ -1384,6 +1440,9 @@ pub fn App() -> impl IntoView {
                     on_fork_session=on_fork_session
                     on_delete_session=on_delete_session
                     on_abort_turn=on_abort_turn
+                    model_presets=Signal::derive(move || model_presets.get())
+                    selected_model_preset=Signal::derive(move || model_preset.get())
+                    on_select_model_preset=on_select_model_preset
                 />
             </Show>
         </Show>

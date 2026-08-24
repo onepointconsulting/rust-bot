@@ -8,6 +8,7 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::agent::cron_context::with_cron_context_stack;
+use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
 use crate::api::login::{GatewayApiDoc, LoginState, jwt_auth_state_from_config, login};
@@ -822,6 +823,7 @@ fn resolve_websocket_channel(
     bus: Arc<MessageBus>,
     session_manager: Arc<StdMutex<SessionManager>>,
     workspace_request_handler: WorkspaceRequestHandler,
+    runtime_resolver: Arc<ModelRuntimeResolver>,
 ) -> Option<Arc<WebSocketChannel>> {
     let raw = config.channels.extra.get("websocket")?.clone();
     let cfg: WebSocketConfig = serde_json::from_value(raw)
@@ -836,6 +838,7 @@ fn resolve_websocket_channel(
         config.channels.clone(),
         session_manager,
         workspace_request_handler,
+        runtime_resolver,
     )))
 }
 
@@ -1095,6 +1098,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         Arc::clone(&agent_loop.bus()),
         Arc::clone(&session_manager),
         agent_loop.workspace_request_handler(),
+        Arc::clone(&agent_loop.runtime_resolver),
     );
     // Give the WebSocket channel's `delete_chat` handler something to abort
     // in-flight work through. Must happen before `ws_channel.router()` is
@@ -1942,7 +1946,7 @@ fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{channels::websocket::types::DEFAULT_AUD, utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel}};
+    use crate::{agent::model_runtime::ModelRuntimeResolver, channels::websocket::types::DEFAULT_AUD, utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel}};
 
     #[test]
     fn extract_images_resolves_captures_by_index_and_strips_sentinels() {
@@ -2020,6 +2024,10 @@ mod tests {
         WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true)
     }
 
+    fn test_runtime_resolver() -> Arc<ModelRuntimeResolver> {
+        ModelRuntimeResolver::for_tests()
+    }
+
     #[test]
     fn resolve_websocket_channel_is_none_when_key_absent() {
         let config = Config::default();
@@ -2030,6 +2038,7 @@ mod tests {
             test_bus(),
             test_session_manager(),
             test_workspace_request_handler(),
+            test_runtime_resolver(),
         );
 
         assert!(
@@ -2052,6 +2061,7 @@ mod tests {
             test_bus(),
             test_session_manager(),
             test_workspace_request_handler(),
+            test_runtime_resolver(),
         );
 
         assert!(resolved.is_none());
@@ -2070,6 +2080,7 @@ mod tests {
             test_bus(),
             test_session_manager(),
             test_workspace_request_handler(),
+            test_runtime_resolver(),
         );
 
         assert!(resolved.is_some());
@@ -2088,6 +2099,7 @@ mod tests {
             test_bus(),
             test_session_manager(),
             test_workspace_request_handler(),
+            test_runtime_resolver(),
         );
 
         assert!(resolved.is_none());

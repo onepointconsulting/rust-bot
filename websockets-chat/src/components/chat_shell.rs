@@ -49,6 +49,9 @@ pub fn ChatShell(
     on_fork_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
+    #[prop(into)] model_presets: Signal<Vec<String>>,
+    #[prop(into)] selected_model_preset: Signal<String>,
+    on_select_model_preset: impl Fn(String) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
     let shell_class = move || {
@@ -122,6 +125,9 @@ pub fn ChatShell(
                     draft=draft
                     on_send=on_send
                     on_abort=Callback::new(move |()| on_abort_turn())
+                    model_presets=model_presets
+                    selected_model_preset=selected_model_preset
+                    on_select_model_preset=Callback::new(move |name| on_select_model_preset(name))
                 />
             </div>
         </div>

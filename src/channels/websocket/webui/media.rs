@@ -317,6 +317,7 @@ mod tests {
             runtime_surface: "browser".to_string(),
             gateway_services: Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep())),
             media_root: tempfile::tempdir().unwrap().keep(),
+            runtime_resolver: crate::agent::model_runtime::ModelRuntimeResolver::for_tests(),
         }
     }
 

@@ -87,6 +87,92 @@ fn indexed_attachments(
     attachments.get().into_iter().enumerate().collect()
 }
 
+/// Model-preset drop-up trigger + menu, rendered on the toolbar row under
+/// the composer. Opens **upward** (`bottom-full`) since the composer sits at
+/// the bottom of the chat — same overlay + click-outside pattern as
+/// [`crate::components::ChatHeaderActions`]'s mobile menu, just flipped.
+///
+/// Absent entirely (not just disabled) when `presets` is empty: `web-chat`
+/// passes no picker props at all, and an older/HTTP gateway with no catalog
+/// yet shouldn't show a trigger with nothing to pick.
+#[component]
+fn ModelPresetPicker(
+    presets: Signal<Vec<String>>,
+    selected: Signal<String>,
+    on_select: Callback<String>,
+) -> impl IntoView {
+    let menu_open = RwSignal::new(false);
+
+    view! {
+        <Show when=move || !presets.get().is_empty()>
+            <div class="relative">
+                <button
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                    class="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                    on:click=move |_| menu_open.update(|open| *open = !*open)
+                >
+                    <span>{move || selected.get()}</span>
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        class="h-3 w-3"
+                        aria-hidden="true"
+                    >
+                        <path d="m18 15-6-6-6 6" />
+                    </svg>
+                </button>
+                <div class=move || {
+                    if menu_open.get() { "block" } else { "hidden" }
+                }>
+                    <div
+                        class="fixed inset-0 z-10"
+                        aria-hidden="true"
+                        on:click=move |_| menu_open.set(false)
+                    ></div>
+                    <div
+                        role="menu"
+                        class="absolute bottom-full z-20 mb-1 w-40 overflow-hidden rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
+                    >
+                        <For
+                            each=move || presets.get()
+                            key=|name| name.clone()
+                            let(name)
+                        >
+                            {
+                                let name_for_click = name.clone();
+                                let name_for_check = name.clone();
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class="flex w-full items-center justify-between gap-2.5 px-3 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50"
+                                        on:click=move |_| {
+                                            menu_open.set(false);
+                                            on_select.run(name_for_click.clone());
+                                        }
+                                    >
+                                        <span>{name.clone()}</span>
+                                        <Show when=move || selected.get() == name_for_check>
+                                            <span aria-hidden="true">"\u{2713}"</span>
+                                        </Show>
+                                    </button>
+                                }
+                            }
+                        </For>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
 #[component]
 fn AttachmentChip(
     index: usize,
@@ -126,6 +212,16 @@ pub fn ChatInput(
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     #[prop(optional)] on_abort: Option<Callback<()>>,
+    /// The process/session model-preset catalog, e.g. `["default", "fast"]`.
+    /// Omitted or empty hides the picker entirely — `web-chat` (no gateway
+    /// preset protocol) never sets this.
+    #[prop(into, optional)]
+    model_presets: Option<Signal<Vec<String>>>,
+    /// Currently-selected preset name, resolved server-side (never a raw
+    /// stale/unknown name — see `model_preset_attached_fields`).
+    #[prop(into, optional)]
+    selected_model_preset: Option<Signal<String>>,
+    #[prop(optional)] on_select_model_preset: Option<Callback<String>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -307,71 +403,6 @@ pub fn ChatInput(
                         }
                     }
                 ></textarea>
-                <input
-                    node_ref=file_input_ref
-                    type="file"
-                    accept="image/*"
-                    multiple
-                    class="hidden"
-                    on:change=move |ev| {
-                        if let Some(input) = ev
-                            .target()
-                            .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
-                        {
-                            if let Some(files) = input.files() {
-                                queue_image_files(files, attachments);
-                            }
-                            input.set_value("");
-                        }
-                    }
-                />
-                <button
-                    type="button"
-                    aria-label="Attach image file"
-                    title="Attach image file"
-                    class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                    on:click=move |_| {
-                        if let Some(el) = file_input_ref.get() {
-                            el.click();
-                        }
-                    }
-                >
-                    <svg
-                        xmlns="http://www.w3.org/2000/svg"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        class="h-4 w-4"
-                        aria-hidden="true"
-                    >
-                        <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
-                    </svg>
-                </button>
-                <button
-                    type="button"
-                    aria-label="Attach image URL"
-                    title="Attach image URL"
-                    class="flex h-9 w-9 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                    on:click=move |_| show_url_field.update(|value| *value = !*value)
-                >
-                    <svg
-                        xmlns="http://www.w3.org/2000/svg"
-                        viewBox="0 0 24 24"
-                        fill="none"
-                        stroke="currentColor"
-                        stroke-width="2"
-                        stroke-linecap="round"
-                        stroke-linejoin="round"
-                        class="h-4 w-4"
-                        aria-hidden="true"
-                    >
-                        <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
-                        <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
-                    </svg>
-                </button>
                 <Show
                     when=move || show_stop_button()
                     fallback=move || {
@@ -406,9 +437,92 @@ pub fn ChatInput(
                     </button>
                 </Show>
             </form>
-            <p class="mt-2 text-center text-xs text-slate-400">
-                "AI-powered. The assistant can make mistakes."
-            </p>
+
+            <div class="mt-1.5 flex items-center gap-1.5">
+                <div class="flex items-center gap-1">
+                    <input
+                        node_ref=file_input_ref
+                        type="file"
+                        accept="image/*"
+                        multiple
+                        class="hidden"
+                        on:change=move |ev| {
+                            if let Some(input) = ev
+                                .target()
+                                .and_then(|t| t.dyn_into::<HtmlInputElement>().ok())
+                            {
+                                if let Some(files) = input.files() {
+                                    queue_image_files(files, attachments);
+                                }
+                                input.set_value("");
+                            }
+                        }
+                    />
+                    <button
+                        type="button"
+                        aria-label="Attach image file"
+                        title="Attach image file"
+                        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                        on:click=move |_| {
+                            if let Some(el) = file_input_ref.get() {
+                                el.click();
+                            }
+                        }
+                    >
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            class="h-4 w-4"
+                            aria-hidden="true"
+                        >
+                            <path d="m21.44 11.05-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+                        </svg>
+                    </button>
+                    <button
+                        type="button"
+                        aria-label="Attach image URL"
+                        title="Attach image URL"
+                        class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                        on:click=move |_| show_url_field.update(|value| *value = !*value)
+                    >
+                        <svg
+                            xmlns="http://www.w3.org/2000/svg"
+                            viewBox="0 0 24 24"
+                            fill="none"
+                            stroke="currentColor"
+                            stroke-width="2"
+                            stroke-linecap="round"
+                            stroke-linejoin="round"
+                            class="h-4 w-4"
+                            aria-hidden="true"
+                        >
+                            <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
+                            <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+                        </svg>
+                    </button>
+                </div>
+
+                {move || {
+                    match (model_presets, selected_model_preset, on_select_model_preset) {
+                        (Some(presets), Some(selected), Some(on_select)) => {
+                            view! {
+                                <ModelPresetPicker
+                                    presets=presets
+                                    selected=selected
+                                    on_select=on_select
+                                />
+                            }
+                                .into_any()
+                        }
+                        _ => view! { <></> }.into_any(),
+                    }
+                }}
+            </div>
         </div>
     }
 }

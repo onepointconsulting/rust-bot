@@ -14,6 +14,7 @@ use garde::{Report, Validate};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::{
     bus::queue::MessageBus,
     channels::gateway_services::GatewayServices,
@@ -61,6 +62,7 @@ pub enum EnvelopeType {
     /// reaches dispatch, `_parse_envelope` has already guaranteed `type` is
     /// a string (not missing, not some other JSON value), so `String` here
     /// (not `Option<String>` or `serde_json::Value`) is the right shape.
+    SetModelPreset,
     Unrecognized(String),
 }
 
@@ -81,6 +83,7 @@ impl From<&str> for EnvelopeType {
             "transcribe_audio" => Self::TranscribeAudio,
             "message" => Self::Message,
             "list_chats" => Self::ListChats,
+            "set_model_preset" => Self::SetModelPreset,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -117,6 +120,9 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::AbortTurn`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     TurnAborted,
+    /// Reply to [`EnvelopeType::SetModelPreset`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    ModelPresetSet,
 }
 
 impl WsOutboundEvent {
@@ -133,6 +139,7 @@ impl WsOutboundEvent {
             Self::ChatRenamed => "chat_renamed",
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
+            Self::ModelPresetSet => "model_preset_set",
         }
     }
 }
@@ -287,6 +294,12 @@ pub struct WsShared {
     /// singleton at request time so tests can point it at an isolated
     /// tempdir instead of racing other tests' `set_config_path` calls.
     pub media_root: PathBuf,
+    /// Same `Arc` as [`crate::agent::agent_loop::AgentLoop::runtime_resolver`],
+    /// cloned into every snapshot so envelope handlers (e.g. `set_model_preset`)
+    /// resolve and validate presets against the process catalog without going
+    /// through the agent loop. Per-session persistence still writes
+    /// `model_preset` on the session via [`Self::session_manager`].
+    pub runtime_resolver: Arc<ModelRuntimeResolver>,
 }
 
 /// Everything one envelope-dispatch call needs, bundled so per-type handler
@@ -402,6 +415,10 @@ mod tests {
         assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
         assert_eq!(EnvelopeType::from("delete_chat"), EnvelopeType::DeleteChat);
         assert_eq!(EnvelopeType::from("abort_turn"), EnvelopeType::AbortTurn);
+        assert_eq!(
+            EnvelopeType::from("set_model_preset"),
+            EnvelopeType::SetModelPreset
+        );
     }
 
     #[test]
@@ -446,5 +463,10 @@ mod tests {
     #[test]
     fn ws_outbound_event_turn_aborted_has_no_nanobot_precedent() {
         assert_eq!(WsOutboundEvent::TurnAborted.as_str(), "turn_aborted");
+    }
+
+    #[test]
+    fn ws_outbound_event_model_preset_set_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::ModelPresetSet.as_str(), "model_preset_set");
     }
 }

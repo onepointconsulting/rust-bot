@@ -291,6 +291,22 @@ impl ModelRuntimeResolver {
             }
         }
     }
+
+    /// Resolver for tests that never issue an LLM call. Uses a dummy Anthropic
+    /// provider so construction does not depend on real credentials.
+    #[cfg(test)]
+    pub(crate) fn for_tests() -> Arc<Self> {
+        let mut config = Config::default();
+        config.agents.provider = "anthropic".to_string();
+        config.providers.anthropic.api_key = "test-key".to_string();
+        let provider = crate::providers::factory::create_provider_for(
+            &config,
+            &config.agents.model,
+            &config.agents.provider,
+        )
+        .expect("test provider");
+        Arc::new(Self::new(config, provider))
+    }
 }
 
 #[cfg(test)]

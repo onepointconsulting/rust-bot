@@ -43,6 +43,11 @@ pub struct ClientEnvelope {
     pub media: Option<Vec<serde_json::Value>>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub title: Option<String>,
+    /// Set only by [`Self::set_model_preset`] — a preset name (or `"default"`
+    /// to clear the session's override), never sent alongside any other
+    /// envelope type.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub model_preset: Option<String>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -65,6 +70,7 @@ impl ClientEnvelope {
             content: Some(content.into()),
             media,
             title: None,
+            model_preset: None,
             webui: true,
         }
     }
@@ -82,6 +88,7 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: None,
+            model_preset: None,
             webui: true,
         }
     }
@@ -98,6 +105,7 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: None,
+            model_preset: None,
             webui: true,
         }
     }
@@ -116,6 +124,7 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: None,
+            model_preset: None,
             webui: true,
         }
     }
@@ -130,6 +139,7 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: None,
+            model_preset: None,
             webui: true,
         }
     }
@@ -147,6 +157,7 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: Some(title.into()),
+            model_preset: None,
             webui: true,
         }
     }
@@ -164,6 +175,7 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: None,
+            model_preset: None,
             webui: true,
         }
     }
@@ -187,6 +199,25 @@ impl ClientEnvelope {
             content: None,
             media: None,
             title: None,
+            model_preset: None,
+            webui: true,
+        }
+    }
+
+    /// Set (or clear, via `"default"`) `chat_id`'s model-preset override.
+    ///
+    /// The reply is a `model_preset_set` event carrying the resolved
+    /// `model_preset`/`model`. Rejections come back as `error` (e.g.
+    /// `invalid_model_preset`, `session_not_found`, `missing_model_preset`).
+    pub fn set_model_preset(chat_id: impl Into<String>, model_preset: impl Into<String>) -> Self {
+        Self {
+            type_: "set_model_preset",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: Some(model_preset.into()),
             webui: true,
         }
     }
@@ -241,12 +272,19 @@ pub enum ServerEvent {
         detail: String,
     },
     /// The connection is now attached to `chat_id` — the reply to a
-    /// `new_chat` or `attach` envelope. `history` is the display snapshot
-    /// from the gateway (`[]` when the chat is new or has no messages, and
-    /// when an older gateway omits the field).
+    /// `new_chat`, `attach`, or `fork_chat` envelope. `history` is the
+    /// display snapshot from the gateway (`[]` when the chat is new or has
+    /// no messages, and when an older gateway omits the field).
+    ///
+    /// `model_presets`/`model_preset` are the process-wide preset catalog
+    /// and this chat's resolved selection (`"default"` when there's no
+    /// session override) — see `model_preset_attached_fields` server-side.
+    /// Empty/`None` on an older gateway that doesn't send them yet.
     Attached {
         chat_id: String,
         history: Vec<ChatEntry>,
+        model_presets: Vec<String>,
+        model_preset: Option<String>,
     },
     /// Sent when the server-side session state changes. Shape not yet
     /// finalized server-side, so the raw JSON is kept as-is.
@@ -326,6 +364,13 @@ pub enum ServerEvent {
         chat_id: String,
         turn_id: Option<String>,
     },
+    /// Reply to a [`ClientEnvelope::set_model_preset`] envelope: `chat_id`'s
+    /// session now resolves to `model_preset`/`model`.
+    ModelPresetSet {
+        chat_id: String,
+        model_preset: String,
+        model: String,
+    },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -351,7 +396,8 @@ impl ServerEvent {
             | ServerEvent::ReasoningDelta { chat_id, .. }
             | ServerEvent::ReasoningEnd { chat_id, .. }
             | ServerEvent::FileEdit { chat_id, .. }
-            | ServerEvent::TurnAborted { chat_id, .. } => Some(chat_id.as_str()),
+            | ServerEvent::TurnAborted { chat_id, .. }
+            | ServerEvent::ModelPresetSet { chat_id, .. } => Some(chat_id.as_str()),
             ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
@@ -526,6 +572,13 @@ struct AttachedWire {
     /// Absent on `new_chat`'s `attached` ack and on older gateways.
     #[serde(default)]
     history: Vec<HistoryMessage>,
+    /// Absent on an older gateway that doesn't send the preset catalog yet.
+    #[serde(default)]
+    model_presets: Vec<String>,
+    /// Absent on an older gateway; also `None` when `model_presets` is
+    /// empty (nothing resolved, since there was nothing to resolve).
+    #[serde(default)]
+    model_preset: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -625,6 +678,13 @@ struct TurnAbortedWire {
     turn_id: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ModelPresetSetWire {
+    chat_id: String,
+    model_preset: String,
+    model: String,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -662,6 +722,8 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "attached" => decode::<AttachedWire>(&value).map(|w| ServerEvent::Attached {
             chat_id: w.chat_id,
             history: history_to_entries(&w.history),
+            model_presets: w.model_presets,
+            model_preset: w.model_preset,
         }),
         "session_updated" => Ok(ServerEvent::SessionUpdated(value)),
         "message_accepted" => {
@@ -726,6 +788,13 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             chat_id: w.chat_id,
             turn_id: w.turn_id,
         }),
+        "model_preset_set" => {
+            decode::<ModelPresetSetWire>(&value).map(|w| ServerEvent::ModelPresetSet {
+                chat_id: w.chat_id,
+                model_preset: w.model_preset,
+                model: w.model,
+            })
+        }
         _ => Ok(ServerEvent::Unknown(value)),
     }
 }
@@ -814,6 +883,23 @@ mod tests {
             ServerEvent::Attached {
                 chat_id: "chat-1".to_string(),
                 history: vec![],
+                model_presets: vec![],
+                model_preset: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_attached_with_model_preset_catalog_and_selection() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","model_presets":["default","fast"],"model_preset":"fast"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::Attached {
+                chat_id: "chat-1".to_string(),
+                history: vec![],
+                model_presets: vec!["default".to_string(), "fast".to_string()],
+                model_preset: Some("fast".to_string()),
             }
         );
     }
@@ -827,7 +913,7 @@ mod tests {
         ]}"#;
         let event = parse_server_event(raw).expect("should parse");
         match event {
-            ServerEvent::Attached { chat_id, history } => {
+            ServerEvent::Attached { chat_id, history, .. } => {
                 assert_eq!(chat_id, "chat-1");
                 assert_eq!(history.len(), 2);
                 assert_eq!(history[0].id, 0);
@@ -1298,6 +1384,38 @@ mod tests {
                 turn_id: None,
             }
         );
+    }
+
+    #[test]
+    fn client_envelope_set_model_preset_serializes_expected_shape() {
+        let envelope = ClientEnvelope::set_model_preset("chat-1", "fast");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_model_preset",
+                "chat_id": "chat-1",
+                "model_preset": "fast",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_model_preset_set() {
+        let raw = r#"{"event":"model_preset_set","chat_id":"chat-1","model_preset":"fast","model":"claude-haiku"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ModelPresetSet {
+                chat_id: "chat-1".to_string(),
+                model_preset: "fast".to_string(),
+                model: "claude-haiku".to_string(),
+            }
+        );
+        // Scoped, like `turn_aborted`: an ack only ever concerns the chat it
+        // was requested for.
+        assert_eq!(event.chat_id(), Some("chat-1"));
     }
 
     #[test]

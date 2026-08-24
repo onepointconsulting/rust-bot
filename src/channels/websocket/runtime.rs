@@ -21,6 +21,7 @@ use regex::Regex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use uuid::Uuid;
 
+use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::get_session_id;
@@ -37,6 +38,7 @@ use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
 use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
+use crate::session::SESSION_MODEL_PRESET_METADATA_KEY;
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
@@ -51,7 +53,7 @@ use crate::{
     },
     channels::base::{BaseChannel, BaseChannelCommon},
     config::paths::get_media_dir,
-    config::schema::ChannelsConfig,
+    config::schema::{ChannelsConfig, RESERVED_MODEL_PRESET_NAME},
     security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
@@ -498,6 +500,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::ListChats => {
             handle_envelope_list_chats(envelope_dispatch_context).await;
         }
+        EnvelopeType::SetModelPreset => {
+            handle_envelope_set_model_preset(envelope_dispatch_context).await;
+        }
         EnvelopeType::Unrecognized(t) => {
             send_event(
                 envelope_dispatch_context.shared,
@@ -509,6 +514,132 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
             .await;
         }
     }
+}
+
+/// Handle a `set_model_preset` envelope: persist a named model-preset
+/// override on an existing `websocket:{chat_id}` session and ack with
+/// `model_preset_set`. `"default"` clears the override so later turns use
+/// the process-wide default — same as `/model-preset default`. Existence of
+/// a session file *is* required — unlike `attach`, setting a preset on a
+/// chat that was never persisted would create a metadata-only ghost session.
+/// Rust-side protocol addition with no nanobot precedent — see
+/// [`EnvelopeType::SetModelPreset`].
+async fn handle_envelope_set_model_preset<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let mut rejection_fields = serde_json::Map::new();
+    rejection_fields.insert(
+        "chat_id".to_string(),
+        serde_json::Value::String(cid.to_string()),
+    );
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let model_preset = envelope_dispatch_context
+        .envelope
+        .get("model_preset")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(model_preset) = model_preset else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing_model_preset"}),
+        )
+        .await;
+        return;
+    };
+
+    // Validate *before* touching the session. `"default"` is the reserved
+    // clear-override name and must not be stored — `runtime_for_session`
+    // treats a missing key as "use `current_default()`", which tracks
+    // process-wide `/model` changes; storing `"default"` would pin the
+    // session to `config.agents.*` instead.
+    let runtime = if model_preset == RESERVED_MODEL_PRESET_NAME {
+        shared.runtime_resolver.current_default()
+    } else {
+        match shared.runtime_resolver.resolve_preset(model_preset) {
+            Ok(runtime) => runtime,
+            Err(_) => {
+                send_event(
+                    shared,
+                    connection_id,
+                    WsOutboundEvent::Error,
+                    Some(&rejection_fields),
+                    serde_json::json!({"detail": "invalid_model_preset"}),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
+    let save_result = {
+        // Drop the `MutexGuard` before `send_event`'s `.await` — same
+        // discipline as every other `session_manager` use in this file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(mut session) = session_manager.get_session_internal(&get_session_id(cid)) {
+            if model_preset == RESERVED_MODEL_PRESET_NAME {
+                session.metadata.remove(SESSION_MODEL_PRESET_METADATA_KEY);
+            } else {
+                session.metadata.insert(
+                    SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+                    serde_json::Value::String(model_preset.to_string()),
+                );
+            }
+            session_manager.save(session).map_err(|e| {
+                log::error!("Failed to save model preset for session {cid}: {e}");
+                "failed_to_save_session"
+            })
+        } else {
+            Err("session_not_found")
+        }
+    };
+    if let Err(detail) = save_result {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": detail}),
+        )
+        .await;
+        return;
+    }
+
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ModelPresetSet,
+        Some(&rejection_fields),
+        serde_json::json!({
+            "model_preset": runtime.preset_name,
+            "model": runtime.model,
+        }),
+    )
+    .await;
 }
 
 /// Handle an `attach` envelope: subscribe this connection to an existing
@@ -583,7 +714,7 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
     let Some(scope) = scope else {
         return;
     };
-    {
+    let new_session = {
         // Run the sync work (and drop the `MutexGuard`) *before* the `.await`s
         // below: `std::sync::MutexGuard` is `!Send` and can't live across an
         // await point inside this connection's `Send` future — same pattern
@@ -595,18 +726,28 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
         shared
             .workspace_request_handler
             .persist_scope(&mut session_manager, &new_id, &scope);
-    }
+        // `persist_scope` just created/saved this session, so this always
+        // finds it — reloaded (rather than reusing a value from the closure
+        // above) since `persist_scope` only has a `SessionManager`-internal
+        // snapshot to hand back.
+        session_manager.get_session_internal(&get_session_id(&new_id))
+    };
     shared
         .connections
         .lock()
         .await
         .attach(connection_id, &new_id);
+    let mut attached_payload = serde_json::json!({"chat_id": new_id});
+    merge_json(
+        &mut attached_payload,
+        model_preset_attached_fields(shared, new_session.as_ref()),
+    );
     send_event(
         shared,
         connection_id,
         WsOutboundEvent::Attached,
         None,
-        serde_json::json!({"chat_id": new_id}),
+        attached_payload,
     )
     .await;
     send_event(
@@ -975,12 +1116,17 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
     resolve_history_media(&mut history, &shared.media_root);
 
     shared.connections.lock().await.attach(connection_id, &new_id);
+    let mut attached_payload = serde_json::json!({"chat_id": new_id, "history": history});
+    merge_json(
+        &mut attached_payload,
+        model_preset_attached_fields(shared, Some(&forked)),
+    );
     send_event(
         shared,
         connection_id,
         WsOutboundEvent::Attached,
         None,
-        serde_json::json!({"chat_id": new_id, "history": history}),
+        attached_payload,
     )
     .await;
     hydrate_after_subscribe(&new_id, shared).await;
@@ -1310,6 +1456,36 @@ fn websocket_chat_history(
         .collect()
 }
 
+/// Merge `extra`'s top-level object fields into `base`. Both `base` and
+/// `extra` are expected to be JSON objects — mirrors the same
+/// `serde_json::Map::extend` pattern [`send_event`] uses to combine a
+/// payload from several field sources.
+fn merge_json(base: &mut serde_json::Value, extra: serde_json::Value) {
+    if let (Some(base_map), serde_json::Value::Object(extra_map)) =
+        (base.as_object_mut(), extra)
+    {
+        base_map.extend(extra_map);
+    }
+}
+
+/// Model-preset catalog plus this session's resolved selection, merged into
+/// every `attached` payload (attach, fork) so the client learns both without
+/// a separate round-trip. `session: None` resolves to the process-wide
+/// default — same as a chat that was never persisted.
+///
+/// `model_preset`/`model` are the *resolved* runtime, not the raw stored
+/// metadata string: `runtime_for_session` already falls back to the process
+/// default for a stale/unknown preset name, and the wire should report that
+/// same fallback rather than a name the client can't reconcile with `model`.
+fn model_preset_attached_fields(shared: &WsShared, session: Option<&Session>) -> serde_json::Value {
+    let runtime = shared.runtime_resolver.runtime_for_session(session);
+    serde_json::json!({
+        "model_presets": shared.runtime_resolver.available_preset_names(),
+        "model_preset": runtime.preset_name,
+        "model": runtime.model,
+    })
+}
+
 /// Subscribe `connection_id` to `chat_id`, ack with `attached` (including
 /// a display `history` snapshot), then replay any in-flight goal/turn
 /// strip. Argument order matches [`ConnectionRegistry::attach`] /
@@ -1339,29 +1515,29 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
             .unwrap_or_else(|e| e.into_inner());
         recorder.chat_history(&session_key, MAX_HISTORY_MESSAGES)
     };
-    let mut history = if !transcript_history.is_empty() {
-        transcript_history
-    } else {
+    // Always loaded now (previously only on the transcript-empty fallback
+    // path below) so `model_preset_attached_fields` has the session's
+    // stored preset override regardless of which history source is used.
+    let session = {
         // Scoped so the (synchronous) `MutexGuard` is dropped before
         // `send_event`'s `.await` below — same discipline as every other
         // `session_manager` use in this file.
-        log::info!("websocket: no transcript history found for chat {chat_id}, using session history");
         let session_manager = shared
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        let session = session_manager.get_session_internal(&session_key);
+        session_manager.get_session_internal(&session_key)
+    };
+    let mut history = if !transcript_history.is_empty() {
+        transcript_history
+    } else {
+        log::info!("websocket: no transcript history found for chat {chat_id}, using session history");
         websocket_chat_history(session.as_ref(), MAX_HISTORY_MESSAGES)
     };
     resolve_history_media(&mut history, &shared.media_root);
-    send_event(
-        shared,
-        connection_id,
-        WsOutboundEvent::Attached,
-        None,
-        serde_json::json!({"chat_id": chat_id, "history": history}),
-    )
-    .await;
+    let mut payload = serde_json::json!({"chat_id": chat_id, "history": history});
+    merge_json(&mut payload, model_preset_attached_fields(shared, session.as_ref()));
+    send_event(shared, connection_id, WsOutboundEvent::Attached, None, payload).await;
     hydrate_after_subscribe(chat_id, shared).await;
 }
 
@@ -1956,6 +2132,9 @@ pub struct WebSocketChannel {
     /// instead of a wire chunk. Mirrors nanobot's `self._reasoning_text_buffers`
     /// (`channels/websocket/runtime.py:1869-1870, 1900-1901`).
     reasoning_buffers: StdMutex<HashMap<(String, String), Vec<String>>>,
+    /// Same `Arc` as `AgentLoop::runtime_resolver`, cloned into every
+    /// [`WsShared`] snapshot — see [`Self::shared`].
+    runtime_resolver: Arc<ModelRuntimeResolver>,
 }
 
 impl WebSocketChannel {
@@ -1965,6 +2144,7 @@ impl WebSocketChannel {
         channels_config: ChannelsConfig,
         session_manager: Arc<StdMutex<SessionManager>>,
         workspace_request_handler: WorkspaceRequestHandler,
+        runtime_resolver: Arc<ModelRuntimeResolver>,
     ) -> Self {
         let jwt_public_key_pem = if config.jwt.enabled {
             if config.jwt.public_key_path.trim().is_empty() {
@@ -1991,6 +2171,7 @@ impl WebSocketChannel {
             shutdown: Arc::new(Notify::new()),
             stream_buffers: StdMutex::new(HashMap::new()),
             reasoning_buffers: StdMutex::new(HashMap::new()),
+            runtime_resolver,
         }
     }
 
@@ -2066,6 +2247,7 @@ impl WebSocketChannel {
             runtime_surface: self.config.runtime_surface.clone(),
             gateway_services: Arc::clone(&self.gateway_services),
             media_root: get_media_dir(None),
+            runtime_resolver: Arc::clone(&self.runtime_resolver),
         }
     }
 
@@ -2815,9 +2997,10 @@ mod tests {
 
     fn test_shared(runtime_surface: &str) -> WsShared {
         let dir = tempfile::tempdir().unwrap();
+        let bus = MessageBus::new();
         WsShared {
             name: "websocket",
-            bus: Arc::new(MessageBus::new()),
+            bus: Arc::new(bus),
             channels_config: ChannelsConfig::default(),
             jwt: JwtConfig::default(),
             jwt_public_key_pem: None,
@@ -2831,6 +3014,7 @@ mod tests {
             runtime_surface: runtime_surface.to_string(),
             gateway_services: Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep())),
             media_root: tempfile::tempdir().unwrap().keep(),
+            runtime_resolver: ModelRuntimeResolver::for_tests(),
         }
     }
 
@@ -3127,6 +3311,15 @@ mod tests {
             .expect("attached frame should carry the new chat_id")
             .to_string();
         assert!(!new_chat_id.is_empty());
+        assert_eq!(
+            attached_body["model_preset"], "default",
+            "new_chat's attached frame must report the process-wide default \
+             preset for a session with no override: {attached_body}"
+        );
+        assert_eq!(
+            attached_body["model_presets"],
+            serde_json::json!(shared.runtime_resolver.available_preset_names())
+        );
 
         let session_updated = rx.try_recv().expect("expected a session_updated frame");
         let session_updated_body: serde_json::Value =
@@ -3215,6 +3408,66 @@ mod tests {
                 .len(),
             1
         );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_reports_default_preset_for_unpersisted_chat() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("never-persisted"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["model_preset"], "default");
+        assert_eq!(
+            body["model_presets"],
+            serde_json::json!(shared.runtime_resolver.available_preset_names())
+        );
+        assert!(
+            body["model_presets"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|v| v == "default"),
+            "catalog must include the reserved default preset: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_reports_session_preset_override() {
+        let mut shared = test_shared("browser");
+        shared.runtime_resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:existing-chat".to_string());
+            session.metadata.insert(
+                SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+                serde_json::json!("fast"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["model_preset"], "fast");
+        assert_eq!(body["model"], "claude-haiku");
     }
 
     #[tokio::test]
@@ -3736,6 +3989,38 @@ mod tests {
             .filter_map(|m| m["content"].as_str())
             .collect();
         assert_eq!(contents, vec!["hello", "hi there"]);
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_reports_source_sessions_preset_override() {
+        let mut shared = test_shared("browser");
+        shared.runtime_resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared.connections.lock().await.register("conn-1", "src", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.metadata.insert(
+                SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+                serde_json::json!("fast"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        assert_eq!(
+            attached["model_preset"], "fast",
+            "fork_session_before_user_index copies model_preset metadata, so the forked \
+             chat's attached frame must report the same resolved selection: {attached}"
+        );
+        assert_eq!(attached["model"], "claude-haiku");
     }
 
     #[tokio::test]
@@ -5175,6 +5460,340 @@ mod tests {
         );
     }
 
+    // --- handle_envelope_set_model_preset ---
+
+    async fn dispatch_set_model_preset(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+        model_preset: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("set_model_preset"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        if let Some(model_preset) = model_preset {
+            envelope.insert("model_preset".to_string(), model_preset);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_envelope(ctx),
+        )
+        .await
+        .expect("handle_envelope_set_model_preset must not hang");
+    }
+
+    fn test_runtime_resolver_with_preset(name: &str, model: &str) -> Arc<ModelRuntimeResolver> {
+        use crate::config::schema::{Config, ModelPresetConfig};
+        let mut config = Config::default();
+        config.agents.provider = "anthropic".to_string();
+        config.providers.anthropic.api_key = "test-key".to_string();
+        config.model_presets.insert(
+            name.to_string(),
+            ModelPresetConfig {
+                model: model.to_string(),
+                provider: "anthropic".to_string(),
+                ..Default::default()
+            },
+        );
+        let provider = crate::providers::factory::create_provider_for(
+            &config,
+            &config.agents.model,
+            &config.agents.provider,
+        )
+        .expect("test provider");
+        Arc::new(ModelRuntimeResolver::new(config, provider))
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_model_preset_persists_named_preset_and_acks() {
+        let mut shared = test_shared("browser");
+        shared.runtime_resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("  fast  ")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "model_preset_set");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["model_preset"], "fast");
+        assert_eq!(body["model"], "claude-haiku");
+        assert!(
+            rx.try_recv().is_err(),
+            "set_model_preset must send exactly one frame"
+        );
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert_eq!(
+            session.metadata.get(SESSION_MODEL_PRESET_METADATA_KEY),
+            Some(&serde_json::json!("fast"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_model_preset_default_clears_the_override() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+                serde_json::json!("fast"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("default")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "model_preset_set");
+        assert_eq!(body["model_preset"], "default");
+        assert!(
+            rx.try_recv().is_err(),
+            "set_model_preset must send exactly one frame"
+        );
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert!(
+            session
+                .metadata
+                .get(SESSION_MODEL_PRESET_METADATA_KEY)
+                .is_none(),
+            "default must remove the session override, not store the string"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_model_preset_rejects_unknown_preset_without_mutating() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("nope")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "invalid_model_preset");
+        assert_eq!(body["chat_id"], "chat-1");
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert!(
+            session
+                .metadata
+                .get(SESSION_MODEL_PRESET_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_model_preset_rejects_missing_or_empty_preset() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            None,
+        )
+        .await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "missing_model_preset");
+        assert_eq!(body["chat_id"], "chat-1");
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("   ")),
+        )
+        .await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "missing_model_preset");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_model_preset_rejects_unknown_session() {
+        let mut shared = test_shared("browser");
+        shared.runtime_resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("fast")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "session_not_found");
+        assert_eq!(body["chat_id"], "chat-1");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_model_preset_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.runtime_resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_model_preset(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("fast")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["chat_id"], "chat-1");
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert!(
+            session
+                .metadata
+                .get(SESSION_MODEL_PRESET_METADATA_KEY)
+                .is_none()
+        );
+    }
+
     #[tokio::test]
     async fn maybe_push_active_goal_state_noop_when_no_session_file_exists() {
         let shared = test_shared("browser");
@@ -5346,6 +5965,7 @@ mod tests {
             ChannelsConfig::default(),
             Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
             WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true),
+            ModelRuntimeResolver::for_tests(),
         );
         // `WebSocketChannel::new` defaults `gateway_services` to the real
         // `get_webui_dir()` (production behavior). Tests that exercise
