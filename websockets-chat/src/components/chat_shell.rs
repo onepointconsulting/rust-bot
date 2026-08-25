@@ -47,6 +47,7 @@ pub fn ChatShell(
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
     on_fork_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
     on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(into)] model_presets: Signal<Vec<String>>,
@@ -118,7 +119,9 @@ pub fn ChatShell(
                     entries=entries
                     example_prompts=example_prompts
                     token_streaming=token_streaming
+                    pending=pending
                     on_use_prompt=on_use_prompt
+                    on_fork_reply=on_fork_reply
                 />
                 <ChatInput
                     pending=pending

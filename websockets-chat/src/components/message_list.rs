@@ -8,7 +8,7 @@
 //! `<For>` keying strategy than a plain `entry.id`.
 
 use chat_ui::components::MessageBubble;
-use chat_ui::models::ChatEntry;
+use chat_ui::models::{ChatEntry, Role};
 use leptos::html::Div;
 use leptos::prelude::*;
 use wasm_bindgen::closure::Closure;
@@ -46,13 +46,22 @@ fn scroll_list_to_bottom(list_ref: NodeRef<Div>) {
 /// rebuilt with the current data. `content`/`tool_events`/`reasoning` are
 /// folded through `{:?}` into one string component rather than requiring
 /// `Hash` on `chat_ui::models::ToolEvent` (which doesn't derive it).
-fn entry_render_key(entry: &ChatEntry) -> (u64, String, bool, String) {
+fn entry_render_key(entry: &ChatEntry, show_fork: bool) -> (u64, String, bool, String, bool) {
     (
         entry.id,
         entry.content.clone(),
         entry.streaming,
         format!("{:?}|{:?}", entry.tool_events, entry.reasoning),
+        show_fork,
     )
+}
+
+/// Most recent completed assistant bubble, if any. Used to pin the in-transcript
+/// Fork control to that reply (and to hide it while a turn is still streaming).
+fn last_completed_assistant_id(entries: &[ChatEntry]) -> Option<u64> {
+    entries.iter().rev().find_map(|entry| {
+        (entry.role == Role::Assistant && !entry.streaming).then_some(entry.id)
+    })
 }
 
 /// One transcript entry, with a `ToolActivity`/`ReasoningPanel` slot injected
@@ -66,8 +75,18 @@ fn entry_render_key(entry: &ChatEntry) -> (u64, String, bool, String) {
 /// entirely, hence the two separate `view!` branches below rather than one
 /// with a conditional prop value.
 #[component]
-fn ChatEntryBubble(entry: ChatEntry, #[prop(into)] token_streaming: Signal<bool>) -> impl IntoView {
+fn ChatEntryBubble(
+    entry: ChatEntry,
+    #[prop(into)] token_streaming: Signal<bool>,
+    show_fork: bool,
+    on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
+) -> impl IntoView {
     let streaming = entry.streaming;
+    let entry_id = entry.id;
+    // Same optional-prop constraint as `extra` below: the generated setter
+    // takes a bare `Callback<()>`, not `Option<Callback<()>>`, so the Fork
+    // control is either passed or the prop is omitted entirely.
+    let on_fork = show_fork.then(|| Callback::new(move |_| on_fork_reply(entry_id)));
     let tool_events = entry.tool_events.clone().unwrap_or_default();
     let reasoning = entry.reasoning.clone().unwrap_or_default();
     let has_extra = !tool_events.is_empty() || !reasoning.is_empty();
@@ -99,12 +118,35 @@ fn ChatEntryBubble(entry: ChatEntry, #[prop(into)] token_streaming: Signal<bool>
             }
             .into_any()
         });
+        if let Some(on_fork) = on_fork {
+            view! {
+                <MessageBubble
+                    entry=entry
+                    streaming=Signal::derive(move || streaming)
+                    token_streaming=token_streaming
+                    extra=extra
+                    on_fork=on_fork
+                />
+            }
+            .into_any()
+        } else {
+            view! {
+                <MessageBubble
+                    entry=entry
+                    streaming=Signal::derive(move || streaming)
+                    token_streaming=token_streaming
+                    extra=extra
+                />
+            }
+            .into_any()
+        }
+    } else if let Some(on_fork) = on_fork {
         view! {
             <MessageBubble
                 entry=entry
                 streaming=Signal::derive(move || streaming)
                 token_streaming=token_streaming
-                extra=extra
+                on_fork=on_fork
             />
         }
         .into_any()
@@ -125,7 +167,9 @@ pub fn MessageList(
     #[prop(into)] entries: Signal<Vec<ChatEntry>>,
     #[prop(into)] example_prompts: Signal<Vec<String>>,
     #[prop(into)] token_streaming: Signal<bool>,
+    #[prop(into)] pending: Signal<bool>,
     on_use_prompt: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let list_ref = NodeRef::<Div>::new();
 
@@ -149,8 +193,31 @@ pub fn MessageList(
             <Show when=show_suggestions>
                 <SuggestionPrompts prompts=example_prompts on_use_prompt=on_use_prompt />
             </Show>
-            <For each=move || entries.get() key=entry_render_key let(entry)>
-                <ChatEntryBubble entry=entry token_streaming=token_streaming />
+            <For
+                each=move || {
+                    let entries = entries.get();
+                    let fork_id = if pending.get() {
+                        None
+                    } else {
+                        last_completed_assistant_id(&entries)
+                    };
+                    entries
+                        .into_iter()
+                        .map(|entry| {
+                            let show_fork = fork_id == Some(entry.id);
+                            (entry, show_fork)
+                        })
+                        .collect::<Vec<_>>()
+                }
+                key=|(entry, show_fork)| entry_render_key(entry, *show_fork)
+                let((entry, show_fork))
+            >
+                <ChatEntryBubble
+                    entry=entry
+                    token_streaming=token_streaming
+                    show_fork=show_fork
+                    on_fork_reply=on_fork_reply
+                />
             </For>
         </div>
     }

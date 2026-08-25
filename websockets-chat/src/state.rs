@@ -35,6 +35,25 @@ pub fn next_session_id_after(sessions: &[SessionListItem], deleted_id: &str) -> 
         .map(|session| session.id.clone())
 }
 
+/// 0-based user-message index to send as `before_user_index` when forking
+/// after `entry_id`'s assistant reply.
+///
+/// Counts `Role::User` rows up to and including that assistant bubble, so
+/// the gateway keeps this reply and drops later user turns. `None` when
+/// `entry_id` is missing or not an assistant row.
+pub fn before_user_index_after_entry(entries: &[ChatEntry], entry_id: u64) -> Option<u64> {
+    let mut user_count = 0u64;
+    for entry in entries {
+        if entry.role == Role::User {
+            user_count += 1;
+        }
+        if entry.id == entry_id {
+            return (entry.role == Role::Assistant).then_some(user_count);
+        }
+    }
+    None
+}
+
 /// Look up the entry tracking `turn_id` and hand back a mutable reference to
 /// it, if both the turn is known and its entry still exists.
 ///
@@ -543,6 +562,18 @@ mod tests {
             content: String::new(),
             attachments: Vec::new(),
             streaming: true,
+            tool_events: None,
+            reasoning: None,
+        }
+    }
+
+    fn user_entry(id: u64) -> ChatEntry {
+        ChatEntry {
+            id,
+            role: Role::User,
+            content: String::new(),
+            attachments: Vec::new(),
+            streaming: false,
             tool_events: None,
             reasoning: None,
         }
@@ -1200,6 +1231,21 @@ mod tests {
         assert_eq!(next_session_id_after(&sessions, "only"), None);
         assert_eq!(next_session_id_after(&sessions, "missing"), None);
         assert_eq!(next_session_id_after(&[], "only"), None);
+    }
+
+    #[test]
+    fn before_user_index_after_entry_counts_user_turns_through_the_assistant() {
+        let entries = vec![
+            user_entry(0),
+            assistant_entry(1),
+            user_entry(2),
+            assistant_entry(3),
+        ];
+
+        assert_eq!(before_user_index_after_entry(&entries, 1), Some(1));
+        assert_eq!(before_user_index_after_entry(&entries, 3), Some(2));
+        assert_eq!(before_user_index_after_entry(&entries, 0), None);
+        assert_eq!(before_user_index_after_entry(&entries, 99), None);
     }
 
     #[test]

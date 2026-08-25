@@ -925,18 +925,26 @@ fn request_rename(ctx: &WsContext, chat_id: String, title: String) {
     );
 }
 
-/// Ask the gateway to fork `chat_id`'s entire history into a new chat. The
-/// reply is an `attached` event for the new chat — handled by the existing
-/// `ServerEvent::Attached` branch below, which already adopts the new
-/// `chat_id`, loads its history, and refreshes the chat list, so no
-/// fork-specific reply handling is needed here.
-fn request_fork(ctx: &WsContext, chat_id: String) {
+/// Ask the gateway to fork `chat_id` into a new chat. `before_user_index`
+/// `None` copies the whole transcript (sidebar kebab); `Some(n)` copies up
+/// to — not including — user turn `n`, keeping the assistant reply just
+/// before it. The reply is an `attached` event for the new chat — handled
+/// by the existing `ServerEvent::Attached` branch below, which already
+/// adopts the new `chat_id`, loads its history, and refreshes the chat
+/// list, so no fork-specific reply handling is needed here.
+///
+/// Refuses while a turn is in flight: the source transcript is still
+/// moving, and a fork then would race the live stream.
+fn request_fork(ctx: &WsContext, chat_id: String, before_user_index: Option<u64>) {
+    if ctx.active_turn_id.get_untracked().is_some() {
+        return;
+    }
     reset_local_transcript(ctx);
-    send_client_envelope(
-        *ctx,
-        protocol::ClientEnvelope::fork_chat(chat_id),
-        "Failed to encode the fork request.",
-    );
+    let envelope = match before_user_index {
+        Some(index) => protocol::ClientEnvelope::fork_chat_before(chat_id, index),
+        None => protocol::ClientEnvelope::fork_chat(chat_id),
+    };
+    send_client_envelope(*ctx, envelope, "Failed to encode the fork request.");
 }
 
 /// Ask the gateway to permanently delete `chat_id`'s session.
@@ -1377,7 +1385,18 @@ pub fn App() -> impl IntoView {
         request_rename(&ws_context, id, title);
     };
     let on_fork_session = move |id: String| {
-        request_fork(&ws_context, id);
+        request_fork(&ws_context, id, None);
+    };
+    let on_fork_reply = move |entry_id: u64| {
+        let Some(current_chat_id) = chat_id.get_untracked() else {
+            return;
+        };
+        let Some(before_user_index) =
+            state::before_user_index_after_entry(&entries.get_untracked(), entry_id)
+        else {
+            return;
+        };
+        request_fork(&ws_context, current_chat_id, Some(before_user_index));
     };
     let on_delete_session = move |id: String| {
         request_delete(&ws_context, id);
@@ -1438,6 +1457,7 @@ pub fn App() -> impl IntoView {
                     on_select_session=on_select_session
                     on_rename_session=on_rename_session
                     on_fork_session=on_fork_session
+                    on_fork_reply=on_fork_reply
                     on_delete_session=on_delete_session
                     on_abort_turn=on_abort_turn
                     model_presets=Signal::derive(move || model_presets.get())

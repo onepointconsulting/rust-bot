@@ -48,6 +48,12 @@ pub struct ClientEnvelope {
     /// envelope type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_preset: Option<String>,
+    /// Set only by [`Self::fork_chat_before`]: a 0-based index into the
+    /// source chat's *user* messages. The gateway copies history up to (not
+    /// including) that user turn, so the assistant reply just before it is
+    /// kept. Omitted by [`Self::fork_chat`] to fork the whole chat.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub before_user_index: Option<u64>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -71,6 +77,7 @@ impl ClientEnvelope {
             media,
             title: None,
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -89,6 +96,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -106,6 +114,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -117,6 +126,17 @@ impl ClientEnvelope {
     /// it tells the gateway to fork the whole chat (see
     /// `handle_envelope_fork_chat` server-side).
     pub fn fork_chat(chat_id: impl Into<String>) -> Self {
+        Self::fork_chat_inner(chat_id, None)
+    }
+
+    /// Ask the gateway to fork `chat_id`'s history up to (not including) the
+    /// user turn at `before_user_index`. The assistant reply just before that
+    /// user message is kept. Same `attached` reply as [`Self::fork_chat`].
+    pub fn fork_chat_before(chat_id: impl Into<String>, before_user_index: u64) -> Self {
+        Self::fork_chat_inner(chat_id, Some(before_user_index))
+    }
+
+    fn fork_chat_inner(chat_id: impl Into<String>, before_user_index: Option<u64>) -> Self {
         Self {
             type_: "fork_chat",
             chat_id: Some(chat_id.into()),
@@ -125,6 +145,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            before_user_index,
             webui: true,
         }
     }
@@ -140,6 +161,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -158,6 +180,7 @@ impl ClientEnvelope {
             media: None,
             title: Some(title.into()),
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -176,6 +199,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -200,6 +224,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            before_user_index: None,
             webui: true,
         }
     }
@@ -218,6 +243,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: Some(model_preset.into()),
+            before_user_index: None,
             webui: true,
         }
     }
@@ -1012,6 +1038,21 @@ mod tests {
             serde_json::json!({
                 "type": "fork_chat",
                 "chat_id": "chat-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_fork_chat_before_serializes_before_user_index() {
+        let envelope = ClientEnvelope::fork_chat_before("chat-1", 2);
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "fork_chat",
+                "chat_id": "chat-1",
+                "before_user_index": 2,
                 "webui": true,
             })
         );

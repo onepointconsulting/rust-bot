@@ -22,6 +22,10 @@ fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
 /// reasoning panels without this crate knowing anything about them; `chat-ui`
 /// itself renders nothing there when `None`.
 ///
+/// `on_fork`, when set, adds a Fork control next to the copy button on an
+/// assistant bubble. The parent decides *which* bubble shows it (websockets-
+/// chat pins it to the last completed assistant reply).
+///
 /// While `streaming` is true, the in-progress indicator is the thinking
 /// spinner until the first visible token arrives, then a blinking cursor
 /// when `token_streaming` is true (omitted defaults to true). Non-streaming
@@ -33,6 +37,7 @@ pub fn MessageBubble(
     #[prop(optional)] extra: Option<Children>,
     #[prop(into)] streaming: Signal<bool>,
     #[prop(into, optional)] token_streaming: Option<Signal<bool>>,
+    #[prop(optional)] on_fork: Option<Callback<()>>,
 ) -> impl IntoView {
     let is_user = entry.role == Role::User;
     let content = entry.content.clone();
@@ -40,6 +45,9 @@ pub fn MessageBubble(
     let extra_view = extra.map(|children| children());
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
     let awaiting_first_token = !markdown::has_visible_chars(&content);
+    let fork_button = on_fork.map(|on_fork| {
+        view! { <ForkButton on_fork=on_fork /> }.into_any()
+    });
 
     // One lightbox per bubble instance: only ever holds the URL of the
     // attachment most recently clicked in *this* bubble, so no lifted/global
@@ -156,16 +164,20 @@ pub fn MessageBubble(
                         {extra_view}
                     </div>
                     <CopyButton text=content />
+                    {fork_button}
                 </div>
             }
             .into_any()
-        } else if extra_view.is_some() || streaming.get() {
+        } else if extra_view.is_some() || streaming.get() || fork_button.is_some() {
             // Keep the thinking spinner / tool+reasoning extras; only the
             // empty padded pill is dropped.
             view! {
-                <div class="flex flex-col items-start gap-2">
-                    {pending_view()}
-                    {extra_view}
+                <div class="flex items-end gap-1.5 justify-start">
+                    <div class="flex flex-col items-start gap-2">
+                        {pending_view()}
+                        {extra_view}
+                    </div>
+                    {fork_button}
                 </div>
             }
             .into_any()
@@ -234,6 +246,44 @@ fn IconClose() -> impl IntoView {
             <path d="M18 6L6 18" />
             <path d="M6 6l12 12" />
         </svg>
+    }
+}
+
+#[component]
+fn IconFork() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.75"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-4 w-4"
+            aria-hidden="true"
+        >
+            <circle cx="12" cy="18" r="3" />
+            <circle cx="6" cy="6" r="3" />
+            <circle cx="18" cy="6" r="3" />
+            <path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9" />
+            <path d="M12 12v3" />
+        </svg>
+    }
+}
+
+#[component]
+fn ForkButton(on_fork: Callback<()>) -> impl IntoView {
+    view! {
+        <button
+            type="button"
+            aria-label="Fork from this reply"
+            title="Fork from this reply"
+            class="mb-1 shrink-0 rounded-md p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus:ring-2 focus:ring-slate-300"
+            on:click=move |_| on_fork.run(())
+        >
+            <IconFork />
+        </button>
     }
 }
 

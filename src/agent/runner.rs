@@ -191,14 +191,24 @@ impl AgentRunner {
 
     /// Replace old compactable tool results with one-line summaries.
     ///
-    /// Keeps the most recent `MICROCOMPACT_KEEP_RECENT` compactable results intact
-    /// so the model retains fresh context, and collapses any older ones that exceed
-    /// `MICROCOMPACT_MIN_CHARS` down to a single placeholder line.
+    /// Tool results after the last user message (the current turn) are never
+    /// compacted — including earlier tool rounds in that turn — so the model
+    /// keeps the context it is actively using. Among older compactable results,
+    /// keeps the most recent `MICROCOMPACT_KEEP_RECENT` intact and collapses any
+    /// older ones that exceed `MICROCOMPACT_MIN_CHARS` down to a single
+    /// placeholder line.
     fn microcompact(messages: &[Value]) -> Vec<Value> {
+        let current_turn_start = messages.iter().rposition(|msg| {
+            msg.get("role").and_then(Value::as_str) == Some("user")
+        });
+
         let compactable_indices: Vec<usize> = messages
             .iter()
             .enumerate()
-            .filter(|(_, msg)| {
+            .filter(|(idx, msg)| {
+                if current_turn_start.is_some_and(|start| *idx > start) {
+                    return false;
+                }
                 msg.get("role").and_then(Value::as_str) == Some("tool")
                     && msg
                         .get("name")
@@ -1609,6 +1619,61 @@ mod tests {
 
         let result = AgentRunner::microcompact(&messages);
         assert_eq!(result, messages);
+    }
+
+    #[test]
+    fn test_microcompact_never_collapses_current_turn_results() {
+        // Tools after the last user message are the current turn, including
+        // earlier assistant rounds. They must stay intact even when they
+        // outnumber MICROCOMPACT_KEEP_RECENT.
+        let large_content = "x".repeat(MICROCOMPACT_MIN_CHARS + 1);
+        let tool =
+            serde_json::json!({"role": "tool", "name": "read_file", "content": large_content});
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "do the task"}),
+            serde_json::json!({"role": "assistant", "content": "round 1"}),
+        ];
+        messages.extend((0..MICROCOMPACT_KEEP_RECENT + 1).map(|_| tool.clone()));
+        messages.push(serde_json::json!({"role": "assistant", "content": "round 2"}));
+        messages.push(tool);
+
+        let result = AgentRunner::microcompact(&messages);
+        assert_eq!(result, messages);
+    }
+
+    #[test]
+    fn test_microcompact_still_collapses_previous_turn_results() {
+        // Compactable results before the last user message are still stale.
+        // Current-turn tools (including earlier rounds) do not count toward
+        // KEEP_RECENT and are left intact.
+        let large_content = "x".repeat(MICROCOMPACT_MIN_CHARS + 1);
+        let tool =
+            serde_json::json!({"role": "tool", "name": "read_file", "content": large_content});
+        let omitted = "[read_file result omitted from context]";
+        let previous_count = MICROCOMPACT_KEEP_RECENT + 2;
+
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "old question"})];
+        messages.extend((0..previous_count).map(|_| tool.clone()));
+        messages.push(serde_json::json!({"role": "assistant", "content": "done"}));
+        messages.push(serde_json::json!({"role": "user", "content": "next question"}));
+        messages.push(serde_json::json!({"role": "assistant", "content": "round 1"}));
+        messages.push(tool.clone());
+        messages.push(serde_json::json!({"role": "assistant", "content": "round 2"}));
+        messages.push(tool);
+
+        let result = AgentRunner::microcompact(&messages);
+        assert_eq!(result.len(), messages.len());
+
+        // First two previous-turn tools are stale and large — collapsed.
+        // previous-turn tools occupy indices 1..=previous_count.
+        assert_eq!(result[1]["content"], omitted);
+        assert_eq!(result[2]["content"], omitted);
+        for i in 3..=previous_count {
+            assert_eq!(result[i]["content"], large_content.as_str());
+        }
+        // Last user message onward is untouched.
+        let current_turn_start = previous_count + 2; // assistant after old tools, then user
+        assert_eq!(&result[current_turn_start..], &messages[current_turn_start..]);
     }
 
     // ── normalize_tool_result ─────────────────────────────────────────────────
