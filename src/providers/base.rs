@@ -1,4 +1,5 @@
 use futures::FutureExt;
+use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 use std::fmt;
 use std::future::Future;
@@ -96,6 +97,106 @@ pub enum RetryMode {
     Persistent,
 }
 
+/// Token and cost totals for one provider call (or an accumulated run).
+///
+/// `input_tokens` is the provider's uncached prompt count. Cache write/read are
+/// stored separately and folded into [`Self::prompt_tokens`]. `reasoning_tokens`
+/// is a breakdown of output, not an extra addend — OpenAI already includes it in
+/// `output_tokens`.
+///
+/// `None` means the provider did not report that field. Missing is distinct from
+/// zero so `/status` and run totals can avoid treating "unknown" as "free".
+#[derive(Debug, Clone, Copy, PartialEq, Default, Serialize, Deserialize)]
+pub struct LLMUsage {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_creation_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cache_read_input_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub reasoning_tokens: Option<u32>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_cost: Option<f64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_cost: Option<f64>,
+}
+
+impl LLMUsage {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Incoming tokens billed as prompt: uncached input plus cache write/read.
+    /// `None` when `input_tokens` itself was not reported.
+    pub fn prompt_tokens(&self) -> Option<u32> {
+        Some(
+            self.input_tokens?
+                .saturating_add(self.cache_creation_input_tokens.unwrap_or(0))
+                .saturating_add(self.cache_read_input_tokens.unwrap_or(0)),
+        )
+    }
+
+    /// Prompt plus output. Reasoning is not added; it is already inside output.
+    pub fn total_tokens(&self) -> Option<u32> {
+        Some(self.prompt_tokens()?.saturating_add(self.output_tokens?))
+    }
+
+    pub fn total_cost(&self) -> Option<f64> {
+        match (self.input_cost, self.output_cost) {
+            (None, None) => None,
+            (input, output) => Some(input.unwrap_or(0.0) + output.unwrap_or(0.0)),
+        }
+    }
+
+    pub fn add(&mut self, other: &Self) {
+        self.input_tokens = Self::add_usage(self.input_tokens, other.input_tokens);
+        self.output_tokens = Self::add_usage(self.output_tokens, other.output_tokens);
+        self.cache_creation_input_tokens = Self::add_usage(
+            self.cache_creation_input_tokens,
+            other.cache_creation_input_tokens,
+        );
+        self.cache_read_input_tokens =
+            Self::add_usage(self.cache_read_input_tokens, other.cache_read_input_tokens);
+        self.reasoning_tokens = Self::add_usage(self.reasoning_tokens, other.reasoning_tokens);
+        self.input_cost = Self::add_cost(self.input_cost, other.input_cost);
+        self.output_cost = Self::add_cost(self.output_cost, other.output_cost);
+    }
+
+    /// `None + None = None`; otherwise treat missing as zero so a known iteration
+    /// is not wiped by a later call that omitted the field.
+    fn add_usage(a: Option<u32>, b: Option<u32>) -> Option<u32> {
+        match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0).saturating_add(b.unwrap_or(0))),
+        }
+    }
+
+    fn add_cost(a: Option<f64>, b: Option<f64>) -> Option<f64> {
+        match (a, b) {
+            (None, None) => None,
+            (a, b) => Some(a.unwrap_or(0.0) + b.unwrap_or(0.0)),
+        }
+    }
+}
+
+impl fmt::Display for LLMUsage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match (self.prompt_tokens(), self.output_tokens) {
+            (Some(input), Some(output)) => write!(f, "{input} in / {output} out")?,
+            (Some(input), None) => write!(f, "{input} in / ? out")?,
+            (None, Some(output)) => write!(f, "? in / {output} out")?,
+            (None, None) => write!(f, "tokens unknown")?,
+        }
+        if let Some(cost) = self.total_cost() {
+            write!(f, " (${cost:.6})")?;
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct LLMResponse {
     /// Response content from the LLM provider.
@@ -105,7 +206,7 @@ pub struct LLMResponse {
     /// Finish reason, such as "stop" or "tool_calls".
     pub finish_reason: String,
     /// Usage metrics, e.g., token counts.
-    pub usage: HashMap<String, u64>,
+    pub usage: LLMUsage,
     /// Providers' extra reasoning content, e.g., for Kimi or DeepSeek-R1.
     pub reasoning_content: Option<String>,
     /// Extended blocks, e.g., for Anthropic's "thinking".
@@ -119,7 +220,7 @@ impl LLMResponse {
             content: None,
             tool_calls: Vec::new(),
             finish_reason: "stop".to_string(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -752,7 +853,7 @@ pub trait LLMProvider: Send + Sync {
                         content: Some(format!("Error calling LLM: {err_msg}")),
                         finish_reason: "error".to_string(),
                         tool_calls: Vec::new(),
-                        usage: HashMap::new(),
+                        usage: LLMUsage::new(),
                         reasoning_content: None,
                         thinking_blocks: None,
                     }
@@ -863,7 +964,7 @@ pub trait LLMProvider: Send + Sync {
                         content: Some(format!("Error calling LLM: {err_msg}")),
                         finish_reason: "error".to_string(),
                         tool_calls: Vec::new(),
-                        usage: HashMap::new(),
+                        usage: LLMUsage::new(),
                         reasoning_content: None,
                         thinking_blocks: None,
                     }
@@ -1095,7 +1196,7 @@ pub trait LLMProvider: Send + Sync {
             content: Some(e.to_string()),
             finish_reason: "error".to_string(),
             tool_calls: Vec::new(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
         };
@@ -1106,6 +1207,72 @@ pub trait LLMProvider: Send + Sync {
 mod tests {
     use super::*;
     use std::collections::HashSet;
+
+    #[test]
+    fn prompt_tokens_sums_input_and_cache_not_output() {
+        let usage = LLMUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            cache_creation_input_tokens: Some(20),
+            cache_read_input_tokens: Some(30),
+            ..LLMUsage::new()
+        };
+        assert_eq!(usage.prompt_tokens(), Some(150));
+        assert_eq!(usage.total_tokens(), Some(200));
+    }
+
+    #[test]
+    fn prompt_tokens_none_when_input_missing() {
+        let usage = LLMUsage {
+            output_tokens: Some(10),
+            ..LLMUsage::new()
+        };
+        assert!(usage.prompt_tokens().is_none());
+        assert!(usage.total_tokens().is_none());
+    }
+
+    #[test]
+    fn total_tokens_does_not_double_count_reasoning() {
+        let usage = LLMUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(40),
+            reasoning_tokens: Some(25),
+            ..LLMUsage::new()
+        };
+        assert_eq!(usage.total_tokens(), Some(50));
+    }
+
+    #[test]
+    fn add_treats_missing_as_zero_once_either_side_is_known() {
+        let mut acc = LLMUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            input_cost: Some(0.01),
+            ..LLMUsage::new()
+        };
+        acc.add(&LLMUsage {
+            input_tokens: Some(3),
+            output_tokens: Some(2),
+            cache_read_input_tokens: Some(7),
+            output_cost: Some(0.02),
+            ..LLMUsage::new()
+        });
+        assert_eq!(acc.input_tokens, Some(13));
+        assert_eq!(acc.output_tokens, Some(7));
+        assert_eq!(acc.cache_read_input_tokens, Some(7));
+        assert_eq!(acc.prompt_tokens(), Some(20));
+        assert_eq!(acc.input_cost, Some(0.01));
+        assert_eq!(acc.output_cost, Some(0.02));
+        assert_eq!(acc.total_cost(), Some(0.03));
+    }
+
+    #[test]
+    fn add_none_plus_none_stays_none() {
+        let mut acc = LLMUsage::new();
+        acc.add(&LLMUsage::new());
+        assert!(acc.input_tokens.is_none());
+        assert!(acc.total_cost().is_none());
+    }
 
     struct TestLLMProvider {
         api_key: Option<String>,
@@ -1166,7 +1333,7 @@ mod tests {
                 content: Some("Hello, world!".to_string()),
                 finish_reason: "stop".to_string(),
                 tool_calls: Vec::new(),
-                usage: std::collections::HashMap::new(),
+                usage: LLMUsage::new(),
                 reasoning_content: None,
                 thinking_blocks: None,
             }
@@ -1199,7 +1366,7 @@ mod tests {
                 content: Some("Hello, world!".to_string()),
                 finish_reason: "stop".to_string(),
                 tool_calls: Vec::new(),
-                usage: std::collections::HashMap::new(),
+                usage: LLMUsage::new(),
                 reasoning_content: None,
                 thinking_blocks: None,
             };
@@ -1673,7 +1840,7 @@ mod tests {
                     content: Some("ok".to_string()),
                     finish_reason: "stop".to_string(),
                     tool_calls: Vec::new(),
-                    usage: HashMap::new(),
+                    usage: LLMUsage::new(),
                     reasoning_content: None,
                     thinking_blocks: None,
                 }
@@ -1703,7 +1870,7 @@ mod tests {
                     content: Some("ok".to_string()),
                     finish_reason: "stop".to_string(),
                     tool_calls: Vec::new(),
-                    usage: HashMap::new(),
+                    usage: LLMUsage::new(),
                     reasoning_content: None,
                     thinking_blocks: None,
                 }
@@ -1843,7 +2010,7 @@ mod tests {
                     content: Some("No endpoints found that support image input".to_string()),
                     finish_reason: "error".to_string(),
                     tool_calls: Vec::new(),
-                    usage: HashMap::new(),
+                    usage: LLMUsage::new(),
                     reasoning_content: None,
                     thinking_blocks: None,
                 }

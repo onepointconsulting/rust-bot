@@ -939,7 +939,9 @@ mod tests {
         ]}"#;
         let event = parse_server_event(raw).expect("should parse");
         match event {
-            ServerEvent::Attached { chat_id, history, .. } => {
+            ServerEvent::Attached {
+                chat_id, history, ..
+            } => {
                 assert_eq!(chat_id, "chat-1");
                 assert_eq!(history.len(), 2);
                 assert_eq!(history[0].id, 0);

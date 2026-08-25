@@ -51,7 +51,7 @@ use crate::config::schema::{
     WebToolsConfig,
 };
 use crate::cron::CronService;
-use crate::providers::base::LLMProviderDyn;
+use crate::providers::base::{LLMProviderDyn, LLMUsage};
 use crate::runtime_context::RUNTIME_CONTEXT_TAG;
 use crate::security::workspace_access::{
     WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
@@ -228,9 +228,9 @@ impl AgentHook for LoopHook {
     }
 
     async fn after_iteration(&self, context: &mut AgentHookContext) {
-        let prompt = context.usage.get("prompt_tokens").copied().unwrap_or(0);
-        let completion = context.usage.get("completion_tokens").copied().unwrap_or(0);
-        let cached = context.usage.get("cached_tokens").copied().unwrap_or(0);
+        let prompt = context.usage.prompt_tokens().unwrap_or(0);
+        let completion = context.usage.output_tokens.unwrap_or(0);
+        let cached = context.usage.cache_read_input_tokens.unwrap_or(0);
         log::debug!("LLM usage: prompt={prompt} completion={completion} cached={cached}");
     }
 
@@ -336,7 +336,7 @@ pub struct AgentLoop {
     _channels_config: Option<ChannelsConfig>,
     _timezone: Option<String>,
     pub start_time: SystemTime,
-    pub last_usage: Mutex<HashMap<String, u64>>,
+    pub last_usage: Mutex<LLMUsage>,
     extra_hooks: Vec<Arc<dyn AgentHook>>,
     context: Arc<ContextBuilder>,
     pub(crate) tools: Arc<Mutex<ToolRegistry>>,
@@ -470,7 +470,7 @@ impl AgentLoop {
             workspace_scopes,
             _timezone: timezone,
             start_time: SystemTime::now(),
-            last_usage: Mutex::new(HashMap::new()),
+            last_usage: Mutex::new(LLMUsage::new()),
             extra_hooks: hooks.unwrap_or(Vec::new()),
             context: context.clone(),
             session_manager: session_manager.clone(),
@@ -1015,7 +1015,7 @@ impl AgentLoop {
                 ),
                 concurrent_tools: true,
                 workspace: Some(self.workspace.clone()),
-                session_key,
+                session_key: session_key.clone(),
                 context_window_tokens: Some(runtime.context_window_tokens),
                 context_block_limit: self.context_block_limit,
                 provider_retry_mode: self.provider_retry_mode.clone(),
@@ -1041,6 +1041,20 @@ impl AgentLoop {
                 .take(200)
                 .collect::<String>();
             log::error!("LLM returned error: {message}");
+        }
+        if let Some(session_key) = session_key {
+            if result.usage != LLMUsage::new() {
+                let mut manager = self
+                    .session_manager
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                let session = manager.get_or_create_session(&session_key);
+                session.update_usage(result.usage);
+                let snapshot = session.clone();
+                if let Err(e) = manager.save(snapshot) {
+                    log::error!("Failed to save session token usage for {session_key}: {e}");
+                }
+            }
         }
         result
     }
@@ -1433,17 +1447,13 @@ impl AgentLoop {
         let final_content = agent_run_result.final_content;
         let all_msgs = agent_run_result.messages;
 
-        // Save the turn, clear the checkpoint, and persist the session.
-        self.save_turn(&mut snapshot, all_msgs.as_slice(), 1 + history.len() as u32);
-        self.clear_runtime_checkpoint(&mut snapshot);
-        if let Err(e) = self
-            .session_manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .save(snapshot.clone())
-        {
-            log::error!("Failed to save session after processing system message: {e}");
-        }
+        self.persist_finished_turn(
+            &mut snapshot,
+            all_msgs.as_slice(),
+            1 + history.len() as u32,
+            agent_run_result.usage,
+            "processing system message",
+        );
 
         // Schedule background consolidation (Python's `_schedule_background`).
         let consolidator = Arc::clone(&self.consolidator);
@@ -1494,6 +1504,36 @@ impl AgentLoop {
         };
         if let Err(e) = session_manager.save(snapshot) {
             log::error!("Failed to save command turn for session {session_key}: {e}");
+        }
+    }
+
+    /// Persist a finished turn: fold this run's usage into `session`, append
+    /// messages, drop the runtime checkpoint, and write JSONL.
+    ///
+    /// `session` is the pre-run clone held by the caller. [`Self::run_agent_loop`]
+    /// already writes usage onto the session-manager cache, but saving this
+    /// clone afterward would replace that cache entry and wipe `token_usage`
+    /// from disk (title generation then re-saves the wiped metadata, which is
+    /// why a session file can have `title` and no usage). Apply usage here so
+    /// the snapshot we persist keeps the totals.
+    fn persist_finished_turn(
+        &self,
+        session: &mut Session,
+        messages: &[Value],
+        skip: u32,
+        usage: LLMUsage,
+        save_error_context: &str,
+    ) {
+        session.update_usage(usage);
+        self.save_turn(session, messages, skip);
+        self.clear_runtime_checkpoint(session);
+        if let Err(e) = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save(session.clone())
+        {
+            log::error!("Failed to save session after {save_error_context}: {e}");
         }
     }
 
@@ -1852,16 +1892,13 @@ impl AgentLoop {
         if final_content.trim().is_empty() {
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE.to_string();
         }
-        self.save_turn(&mut session, &all_msgs, 1 + history.len() as u32);
-        self.clear_runtime_checkpoint(&mut session);
-        if let Err(res) = self
-            .session_manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .save(session.clone())
-        {
-            log::error!("Failed to save session after processing message: {res}");
-        }
+        self.persist_finished_turn(
+            &mut session,
+            &all_msgs,
+            1 + history.len() as u32,
+            result.usage.clone(),
+            "processing message",
+        );
         let consolidator = Arc::clone(&self.consolidator);
         let consolidate_key = key.clone();
         self.schedule_background(async move {
@@ -2124,17 +2161,29 @@ impl AgentLoop {
         }
     }
 
-    fn copy_token_usage_to_outbound(outbound: &mut OutboundMessage, usage: HashMap<String, u64>) {
-        if usage.is_empty() {
+    fn copy_token_usage_to_outbound(outbound: &mut OutboundMessage, usage: LLMUsage) {
+        if usage == LLMUsage::new() {
             return;
         }
-        let usage_obj = usage
-            .into_iter()
-            .map(|(key, value)| (key, Value::Number(serde_json::Number::from(value))))
-            .collect();
+        let mut usage_obj = match serde_json::to_value(usage) {
+            Ok(Value::Object(map)) => map,
+            _ => return,
+        };
+        if let Some(n) = usage.prompt_tokens() {
+            usage_obj.insert("prompt_tokens".into(), Value::from(n));
+        }
+        if let Some(n) = usage.output_tokens {
+            usage_obj.insert("completion_tokens".into(), Value::from(n));
+        }
+        if let Some(n) = usage.total_tokens() {
+            usage_obj.insert("total_tokens".into(), Value::from(n));
+        }
+        if let Some(n) = usage.cache_read_input_tokens {
+            usage_obj.insert("cached_tokens".into(), Value::from(n));
+        }
         outbound
             .metadata
-            .insert(OutboundMessage::TOKEN_USAGE_KEY.into(), usage_obj);
+            .insert(OutboundMessage::TOKEN_USAGE_KEY.into(), Value::Object(usage_obj));
     }
 }
 
@@ -2353,6 +2402,61 @@ mod tests {
     }
 
     #[test]
+    fn persist_finished_turn_keeps_usage_that_the_pre_run_snapshot_did_not_have() {
+        let loop_ = make_save_turn_loop(1000);
+        let key = format!(
+            "test:stale-usage-{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        );
+        let mut pre_run = Session::new(key.clone());
+        let run_usage = LLMUsage {
+            input_tokens: Some(15),
+            output_tokens: Some(7),
+            ..LLMUsage::new()
+        };
+
+        {
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let live = manager.get_or_create_session(&key);
+            live.update_usage(run_usage);
+            let snap = live.clone();
+            manager.save(snap).unwrap();
+        }
+
+        loop_.persist_finished_turn(
+            &mut pre_run,
+            &[
+                json!({"role": "user", "content": "hello"}),
+                json!({"role": "assistant", "content": "Hello!"}),
+            ],
+            1,
+            run_usage,
+            "test",
+        );
+
+        let manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let live = manager
+            .get_session_internal(&key)
+            .expect("session should be cached after save");
+        let usage = live
+            .usage()
+            .expect("token_usage must survive the post-run save");
+        assert_eq!(usage.input_tokens, Some(15));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(live.messages.len(), 1);
+        assert_eq!(saved_content(&live.messages[0]), Some("Hello!"));
+    }
+
+    #[test]
     fn test_save_turn_filters_and_persists_messages() {
         const MAX_CHARS: u32 = 10;
         let loop_ = make_save_turn_loop(MAX_CHARS);
@@ -2440,7 +2544,7 @@ mod tests {
                 .unwrap_or_else(|e| e.into_inner());
             manager.delete_session(key)
         };
-        
+
         loop_.persist_command_turn(
             key,
             "/help",

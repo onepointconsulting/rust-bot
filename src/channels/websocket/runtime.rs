@@ -477,7 +477,7 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::NewChat => {
             handle_envelope_new_chat(envelope_dispatch_context).await;
         }
-        EnvelopeType::ForkChat => { 
+        EnvelopeType::ForkChat => {
             handle_envelope_fork_chat(envelope_dispatch_context).await;
         }
         EnvelopeType::RenameChat => {
@@ -1115,7 +1115,11 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
     };
     resolve_history_media(&mut history, &shared.media_root);
 
-    shared.connections.lock().await.attach(connection_id, &new_id);
+    shared
+        .connections
+        .lock()
+        .await
+        .attach(connection_id, &new_id);
     let mut attached_payload = serde_json::json!({"chat_id": new_id, "history": history});
     merge_json(
         &mut attached_payload,
@@ -1332,21 +1336,19 @@ fn extract_media_refs(content: Option<&serde_json::Value>) -> Vec<String> {
     };
     blocks
         .iter()
-        .filter_map(|block| {
-            match block.get("type").and_then(|v| v.as_str())? {
-                "text" => {
-                    let text = block.get("text").and_then(|v| v.as_str())?;
-                    image_placeholder_path(text).map(str::to_string)
-                }
-                "image_url" => block
-                    .get("image_url")
-                    .and_then(|v| v.as_object())
-                    .and_then(|iu| iu.get("url"))
-                    .and_then(|v| v.as_str())
-                    .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
-                    .map(str::to_string),
-                _ => None,
+        .filter_map(|block| match block.get("type").and_then(|v| v.as_str())? {
+            "text" => {
+                let text = block.get("text").and_then(|v| v.as_str())?;
+                image_placeholder_path(text).map(str::to_string)
             }
+            "image_url" => block
+                .get("image_url")
+                .and_then(|v| v.as_object())
+                .and_then(|iu| iu.get("url"))
+                .and_then(|v| v.as_str())
+                .filter(|url| url.starts_with("http://") || url.starts_with("https://"))
+                .map(str::to_string),
+            _ => None,
         })
         .collect()
 }
@@ -1461,9 +1463,7 @@ fn websocket_chat_history(
 /// `serde_json::Map::extend` pattern [`send_event`] uses to combine a
 /// payload from several field sources.
 fn merge_json(base: &mut serde_json::Value, extra: serde_json::Value) {
-    if let (Some(base_map), serde_json::Value::Object(extra_map)) =
-        (base.as_object_mut(), extra)
-    {
+    if let (Some(base_map), serde_json::Value::Object(extra_map)) = (base.as_object_mut(), extra) {
         base_map.extend(extra_map);
     }
 }
@@ -1531,13 +1531,25 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
     let mut history = if !transcript_history.is_empty() {
         transcript_history
     } else {
-        log::info!("websocket: no transcript history found for chat {chat_id}, using session history");
+        log::info!(
+            "websocket: no transcript history found for chat {chat_id}, using session history"
+        );
         websocket_chat_history(session.as_ref(), MAX_HISTORY_MESSAGES)
     };
     resolve_history_media(&mut history, &shared.media_root);
     let mut payload = serde_json::json!({"chat_id": chat_id, "history": history});
-    merge_json(&mut payload, model_preset_attached_fields(shared, session.as_ref()));
-    send_event(shared, connection_id, WsOutboundEvent::Attached, None, payload).await;
+    merge_json(
+        &mut payload,
+        model_preset_attached_fields(shared, session.as_ref()),
+    );
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Attached,
+        None,
+        payload,
+    )
+    .await;
     hydrate_after_subscribe(chat_id, shared).await;
 }
 
@@ -2614,7 +2626,10 @@ impl BaseChannel for WebSocketChannel {
         }
         // Buffer only — never persisted as a chunk. `send_reasoning_end`
         // pops and joins this to durably record the completed trace.
-        let stream_key = (chat_id.to_string(), stream_id.unwrap_or_default().to_string());
+        let stream_key = (
+            chat_id.to_string(),
+            stream_id.unwrap_or_default().to_string(),
+        );
         self.reasoning_buffers
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -2637,7 +2652,10 @@ impl BaseChannel for WebSocketChannel {
         if let Some(stream_id) = stream_id {
             payload["stream_id"] = serde_json::json!(stream_id);
         }
-        let stream_key = (chat_id.to_string(), stream_id.unwrap_or_default().to_string());
+        let stream_key = (
+            chat_id.to_string(),
+            stream_id.unwrap_or_default().to_string(),
+        );
         let reasoning_text = self
             .reasoning_buffers
             .lock()
@@ -2686,12 +2704,7 @@ impl BaseChannel for WebSocketChannel {
                 .transcripts
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            transcripts.append_turn_event(
-                chat_id,
-                json_object_to_map(&payload),
-                &meta,
-                "activity",
-            );
+            transcripts.append_turn_event(chat_id, json_object_to_map(&payload), &meta, "activity");
         }
         self.fan_out_to_chat(chat_id, &payload.to_string()).await;
         Ok(())
@@ -3420,7 +3433,12 @@ mod tests {
             .await
             .register("conn-1", "initial-chat", tx);
 
-        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("never-persisted"))).await;
+        dispatch_attach(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("never-persisted")),
+        )
+        .await;
 
         let body = recv_json(&mut rx);
         assert_eq!(body["event"], "attached");
@@ -3692,7 +3710,14 @@ mod tests {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let meta = webui_meta("turn-1");
-            transcripts.append_user_message("existing-chat", "transcript-hello", &meta, None, None, None);
+            transcripts.append_user_message(
+                "existing-chat",
+                "transcript-hello",
+                &meta,
+                None,
+                None,
+                None,
+            );
             transcripts.append_turn_event(
                 "existing-chat",
                 HashMap::from([
@@ -3801,7 +3826,11 @@ mod tests {
     async fn handle_envelope_fork_chat_sends_attached_with_transcript_history_for_new_chat_id() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
         {
             let mut session_manager = shared
                 .session_manager
@@ -3877,7 +3906,11 @@ mod tests {
         // at all — this must fork the entire conversation, not nothing.
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
         {
             let mut session_manager = shared
                 .session_manager
@@ -3958,11 +3991,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn handle_envelope_fork_chat_falls_back_to_session_history_when_transcript_fork_fails()
-    {
+    async fn handle_envelope_fork_chat_falls_back_to_session_history_when_transcript_fork_fails() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
         {
             let mut session_manager = shared
                 .session_manager
@@ -3996,7 +4032,11 @@ mod tests {
         let mut shared = test_shared("browser");
         shared.runtime_resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
         {
             let mut session_manager = shared
                 .session_manager
@@ -4027,7 +4067,11 @@ mod tests {
     async fn handle_envelope_fork_chat_resolves_session_image_placeholder_into_media_url() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
 
         let sub = shared.media_root.join("websocket");
         std::fs::create_dir_all(&sub).unwrap();
@@ -4070,7 +4114,11 @@ mod tests {
     async fn handle_envelope_fork_chat_rejects_an_invalid_index() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
         {
             let mut session_manager = shared
                 .session_manager
@@ -4101,7 +4149,11 @@ mod tests {
         let channel = test_channel();
         let shared = channel.shared();
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
 
         let mut envelope: Envelope = HashMap::new();
         envelope.insert("type".to_string(), serde_json::json!("message"));
@@ -4127,7 +4179,8 @@ mod tests {
         let mut assistant_msg = outbound("src", "hi there", None);
         assistant_msg.metadata = webui_meta("turn-1");
         BaseChannel::send(&channel, assistant_msg).await.unwrap();
-        rx.try_recv().expect("expected the assistant's message frame");
+        rx.try_recv()
+            .expect("expected the assistant's message frame");
 
         // `fork_session_before_user_index`'s user-turn count comes from the
         // `Session` file, which only the (not-running-here) `AgentLoop`
@@ -4168,7 +4221,11 @@ mod tests {
         let channel = test_channel();
         let shared = channel.shared();
         let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
-        shared.connections.lock().await.register("conn-1", "src", tx1);
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx1);
 
         let mut envelope: Envelope = HashMap::new();
         envelope.insert("type".to_string(), serde_json::json!("message"));
@@ -4191,7 +4248,8 @@ mod tests {
         let mut assistant_msg = outbound("src", "hi there", None);
         assistant_msg.metadata = webui_meta("turn-1");
         BaseChannel::send(&channel, assistant_msg).await.unwrap();
-        rx1.try_recv().expect("expected the assistant's message frame");
+        rx1.try_recv()
+            .expect("expected the assistant's message frame");
 
         let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
         shared
@@ -5484,12 +5542,9 @@ mod tests {
             remote_addr: addr("127.0.0.1"),
             webui_authenticated: false,
         };
-        tokio::time::timeout(
-            std::time::Duration::from_secs(5),
-            dispatch_envelope(ctx),
-        )
-        .await
-        .expect("handle_envelope_set_model_preset must not hang");
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_set_model_preset must not hang");
     }
 
     fn test_runtime_resolver_with_preset(name: &str, model: &str) -> Arc<ModelRuntimeResolver> {
@@ -5691,13 +5746,7 @@ mod tests {
                 .unwrap();
         }
 
-        dispatch_set_model_preset(
-            &shared,
-            "conn-1",
-            Some(serde_json::json!("chat-1")),
-            None,
-        )
-        .await;
+        dispatch_set_model_preset(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
         let body = recv_json(&mut rx);
         assert_eq!(body["event"], "error");
         assert_eq!(body["detail"], "missing_model_preset");
@@ -5972,7 +6021,8 @@ mod tests {
         // transcript persistence (`send`/`send_delta`/etc.) must not touch
         // that real directory, so point it at a tempdir instead — same
         // isolation `test_shared()` already gives `WsShared`.
-        channel.gateway_services = Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep()));
+        channel.gateway_services =
+            Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep()));
         channel
     }
 
@@ -6613,9 +6663,14 @@ mod tests {
             .await
             .register("conn-1", "chat-1", tx);
 
-        BaseChannel::send_reasoning_delta(&channel, "chat-1", "thinking", Some(webui_meta("turn-1")))
-            .await
-            .unwrap();
+        BaseChannel::send_reasoning_delta(
+            &channel,
+            "chat-1",
+            "thinking",
+            Some(webui_meta("turn-1")),
+        )
+        .await
+        .unwrap();
         rx.try_recv().unwrap();
 
         assert!(transcript_rows(&channel, "chat-1").is_empty());

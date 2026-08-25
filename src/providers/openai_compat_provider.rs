@@ -1,5 +1,5 @@
 use crate::providers::{
-    base::{GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest},
+    base::{GenerationSettings, LLMProvider, LLMResponse, LLMUsage, ToolCallRequest},
     cache_control::apply_cache_control,
     registry::ProviderSpec,
 };
@@ -14,8 +14,9 @@ use async_openai::types::chat::{
     ChatCompletionRequestSystemMessageContentPart, ChatCompletionRequestToolMessage,
     ChatCompletionRequestToolMessageContent, ChatCompletionRequestUserMessageArgs,
     ChatCompletionRequestUserMessageContent, ChatCompletionRequestUserMessageContentPart,
-    ChatCompletionToolChoiceOption, ChatCompletionTools, CreateChatCompletionRequest,
-    CreateChatCompletionRequestArgs, CreateChatCompletionResponse, FinishReason, FunctionCall,
+    ChatCompletionStreamOptions, ChatCompletionToolChoiceOption, ChatCompletionTools,
+    CompletionUsage, CreateChatCompletionRequest, CreateChatCompletionRequestArgs,
+    CreateChatCompletionResponse, FinishReason, FunctionCall,
 };
 use async_openai::{Client, config::OpenAIConfig, types::chat::ReasoningEffort};
 use futures::StreamExt;
@@ -763,6 +764,81 @@ impl OpenAICompatProvider {
         })
     }
 
+    fn json_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
+        let n = value.get(key)?;
+        n.as_u64()
+            .map(|n| n as u32)
+            .or_else(|| n.as_f64().map(|f| f as u32))
+    }
+
+    fn json_f64(value: &serde_json::Value, key: &str) -> Option<f64> {
+        let n = value.get(key)?;
+        n.as_f64().or_else(|| n.as_u64().map(|n| n as f64))
+    }
+
+    /// Map an OpenAI-compat `usage` object onto [`LLMUsage`].
+    ///
+    /// OpenAI `prompt_tokens` already includes cache hits. Those are stored as
+    /// `cache_read_input_tokens` and subtracted from `input_tokens` so
+    /// [`LLMUsage::prompt_tokens`] does not double-count.
+    fn parse_usage(usage: &serde_json::Value) -> LLMUsage {
+        let prompt = Self::json_u32(usage, "prompt_tokens")
+            .or_else(|| Self::json_u32(usage, "input_tokens"));
+        let output = Self::json_u32(usage, "completion_tokens")
+            .or_else(|| Self::json_u32(usage, "output_tokens"));
+
+        let details = usage.get("prompt_tokens_details");
+        let cached = details
+            .and_then(|d| Self::json_u32(d, "cached_tokens"))
+            .or_else(|| Self::json_u32(usage, "cache_read_input_tokens"))
+            .unwrap_or(0);
+        let cache_write = details
+            .and_then(|d| Self::json_u32(d, "cache_write_tokens"))
+            .or_else(|| Self::json_u32(usage, "cache_creation_input_tokens"))
+            .unwrap_or(0);
+        let reasoning = usage
+            .get("completion_tokens_details")
+            .and_then(|d| Self::json_u32(d, "reasoning_tokens"))
+            .filter(|&n| n > 0);
+
+        let input_tokens = prompt.map(|p| p.saturating_sub(cached).saturating_sub(cache_write));
+
+        let cost_details = usage.get("cost_details");
+        let split_input =
+            cost_details.and_then(|d| Self::json_f64(d, "upstream_inference_prompt_cost"));
+        let split_output =
+            cost_details.and_then(|d| Self::json_f64(d, "upstream_inference_completions_cost"));
+        let (input_cost, output_cost) = match (split_input, split_output, Self::json_f64(usage, "cost"))
+        {
+            (Some(input), Some(output), _) => (Some(input), Some(output)),
+            (Some(input), None, _) => (Some(input), None),
+            (None, Some(output), _) => (None, Some(output)),
+            (None, None, Some(total)) => (Some(total), None),
+            (None, None, None) => (None, None),
+        };
+
+        LLMUsage {
+            input_tokens,
+            output_tokens: output,
+            cache_creation_input_tokens: (cache_write > 0).then_some(cache_write),
+            cache_read_input_tokens: (cached > 0).then_some(cached),
+            reasoning_tokens: reasoning,
+            input_cost,
+            output_cost,
+        }
+    }
+
+    fn parse_completion_usage(usage: &CompletionUsage) -> LLMUsage {
+        match serde_json::to_value(usage) {
+            Ok(value) => Self::parse_usage(&value),
+            Err(_) => LLMUsage {
+                input_tokens: Some(usage.prompt_tokens),
+                output_tokens: Some(usage.completion_tokens),
+                ..LLMUsage::new()
+            },
+        }
+    }
+
     fn parse_response(combined_response: OpenAICombinedResponse) -> LLMResponse {
         let response = combined_response.response;
         if response.choices.is_empty() {
@@ -770,7 +846,7 @@ impl OpenAICompatProvider {
                 content: Some("Error: API returned empty choices.".to_string()),
                 finish_reason: "error".to_string(),
                 tool_calls: vec![],
-                usage: HashMap::new(),
+                usage: LLMUsage::new(),
                 reasoning_content: None,
                 thinking_blocks: None,
             };
@@ -831,28 +907,18 @@ impl OpenAICompatProvider {
             })
             .collect();
 
-        let mut usage_map = HashMap::new();
-        match response.usage {
-            Some(usage) => {
-                usage_map.insert("prompt_tokens".to_string(), usage.prompt_tokens as u64);
-                usage_map.insert(
-                    "completion_tokens".to_string(),
-                    usage.completion_tokens as u64,
-                );
-                usage_map.insert("total_tokens".to_string(), usage.total_tokens as u64);
-            }
-            None => {
-                usage_map.insert("prompt_tokens".to_string(), 0);
-                usage_map.insert("completion_tokens".to_string(), 0);
-                usage_map.insert("total_tokens".to_string(), 0);
-            }
-        }
+        let usage = combined_response
+            .raw_json
+            .get("usage")
+            .map(Self::parse_usage)
+            .or_else(|| response.usage.as_ref().map(Self::parse_completion_usage))
+            .unwrap_or_else(LLMUsage::new);
 
         LLMResponse {
             content,
             tool_calls,
             finish_reason,
-            usage: usage_map.clone(),
+            usage,
             reasoning_content,
             thinking_blocks: None,
         }
@@ -944,6 +1010,7 @@ impl OpenAICompatProvider {
         content: String,
         finish_reason: String,
         raw_tool_calls: Vec<ChatCompletionMessageToolCalls>,
+        usage: LLMUsage,
     ) -> LLMResponse {
         let tool_calls = raw_tool_calls
             .into_iter()
@@ -971,7 +1038,7 @@ impl OpenAICompatProvider {
             },
             finish_reason,
             tool_calls,
-            usage: HashMap::new(),
+            usage,
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -1035,7 +1102,7 @@ impl OpenAICompatProvider {
             content: Some(message),
             finish_reason: "error".to_string(),
             tool_calls: Vec::new(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -1214,7 +1281,7 @@ impl LLMProvider for OpenAICompatProvider {
                     content: Some(e),
                     finish_reason: "error".to_string(),
                     tool_calls: Vec::new(),
-                    usage: HashMap::new(),
+                    usage: LLMUsage::new(),
                     reasoning_content: None,
                     thinking_blocks: None,
                 },
@@ -1239,7 +1306,7 @@ impl LLMProvider for OpenAICompatProvider {
         F: Fn(String) -> Fut + Send + Sync,
         Fut: std::future::Future<Output = ()> + Send,
     {
-        let request_args = self.build_request(
+        let mut request_args = self.build_request(
             &messages,
             tools,
             model,
@@ -1248,6 +1315,10 @@ impl LLMProvider for OpenAICompatProvider {
             reasoning_effort,
             tool_choice,
         );
+        request_args.stream_options(ChatCompletionStreamOptions {
+            include_usage: Some(true),
+            include_obfuscation: None,
+        });
         // TODO: Uncomment this when we have a way to log the request
         // log::debug!("chat stream request: {:?}", request_args);
         match request_args.build() {
@@ -1256,6 +1327,7 @@ impl LLMProvider for OpenAICompatProvider {
                     Ok(mut stream) => {
                         let mut content_buf = String::new();
                         let mut finish_reason = "stop".to_string();
+                        let mut usage = LLMUsage::new();
                         // Streaming tool calls arrive as fragments keyed by `index`:
                         // the first fragment for an index carries the id + function
                         // name; later fragments for the same index carry only pieces
@@ -1274,6 +1346,9 @@ impl LLMProvider for OpenAICompatProvider {
                                     return Self::llm_response_from_openai_error(e);
                                 }
                             };
+                            if let Some(ref chunk_usage) = chunk.usage {
+                                usage = Self::parse_completion_usage(chunk_usage);
+                            }
                             for choice in &chunk.choices {
                                 if let Some(delta_content) = &choice.delta.content {
                                     let normalized = Self::non_overlapping_suffix(
@@ -1334,6 +1409,7 @@ impl LLMProvider for OpenAICompatProvider {
                             content_buf,
                             finish_reason,
                             raw_tool_calls,
+                            usage,
                         );
                     }
                     Err(e) => {
@@ -1728,5 +1804,110 @@ mod tests {
             response.content.as_deref(),
             Some("No endpoints found that support image input")
         );
+    }
+
+    #[test]
+    fn parse_usage_basic_token_counts() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 100,
+            "completion_tokens": 25,
+            "total_tokens": 125
+        });
+        let result = OpenAICompatProvider::parse_usage(&usage);
+        assert_eq!(result.input_tokens, Some(100));
+        assert_eq!(result.output_tokens, Some(25));
+        assert_eq!(result.prompt_tokens(), Some(100));
+        assert_eq!(result.total_tokens(), Some(125));
+        assert!(result.cache_read_input_tokens.is_none());
+        assert!(result.input_cost.is_none());
+    }
+
+    #[test]
+    fn parse_usage_subtracts_cached_tokens_from_input() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 500,
+            "completion_tokens": 10,
+            "prompt_tokens_details": {
+                "cached_tokens": 400,
+                "cache_write_tokens": 20
+            },
+            "completion_tokens_details": {
+                "reasoning_tokens": 6
+            }
+        });
+        let result = OpenAICompatProvider::parse_usage(&usage);
+        assert_eq!(result.input_tokens, Some(80));
+        assert_eq!(result.cache_read_input_tokens, Some(400));
+        assert_eq!(result.cache_creation_input_tokens, Some(20));
+        assert_eq!(result.reasoning_tokens, Some(6));
+        assert_eq!(result.prompt_tokens(), Some(500));
+        assert_eq!(result.total_tokens(), Some(510));
+    }
+
+    #[test]
+    fn parse_usage_reads_openrouter_cost_split() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "cost": 0.03,
+            "cost_details": {
+                "upstream_inference_prompt_cost": 0.01,
+                "upstream_inference_completions_cost": 0.02
+            }
+        });
+        let result = OpenAICompatProvider::parse_usage(&usage);
+        assert_eq!(result.input_cost, Some(0.01));
+        assert_eq!(result.output_cost, Some(0.02));
+        assert_eq!(result.total_cost(), Some(0.03));
+    }
+
+    #[test]
+    fn parse_usage_total_cost_without_split_goes_to_input_cost() {
+        let usage = serde_json::json!({
+            "prompt_tokens": 10,
+            "completion_tokens": 5,
+            "cost": 0.004
+        });
+        let result = OpenAICompatProvider::parse_usage(&usage);
+        assert_eq!(result.input_cost, Some(0.004));
+        assert!(result.output_cost.is_none());
+        assert_eq!(result.total_cost(), Some(0.004));
+    }
+
+    #[test]
+    fn parse_usage_missing_object_leaves_fields_none() {
+        let result = OpenAICompatProvider::parse_usage(&serde_json::json!({}));
+        assert!(result.input_tokens.is_none());
+        assert!(result.output_tokens.is_none());
+        assert!(result.prompt_tokens().is_none());
+        assert!(result.total_cost().is_none());
+    }
+
+    #[test]
+    fn parse_completion_usage_maps_typed_openai_usage() {
+        let usage = CompletionUsage {
+            prompt_tokens: 80,
+            completion_tokens: 20,
+            total_tokens: 100,
+            ..Default::default()
+        };
+        let result = OpenAICompatProvider::parse_completion_usage(&usage);
+        assert_eq!(result.input_tokens, Some(80));
+        assert_eq!(result.output_tokens, Some(20));
+        assert_eq!(result.total_tokens(), Some(100));
+    }
+
+    #[test]
+    fn parse_stream_response_keeps_captured_usage() {
+        let usage = LLMUsage {
+            input_tokens: Some(12),
+            output_tokens: Some(3),
+            ..LLMUsage::new()
+        };
+        let response =
+            OpenAICompatProvider::parse_stream_response("hello".into(), "stop".into(), vec![], usage);
+        assert_eq!(response.content.as_deref(), Some("hello"));
+        assert_eq!(response.usage.input_tokens, Some(12));
+        assert_eq!(response.usage.output_tokens, Some(3));
     }
 }

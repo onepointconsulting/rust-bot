@@ -3,7 +3,7 @@ use std::env;
 use std::time::Duration;
 
 use crate::providers::{
-    base::{GenerationSettings, LLMProvider, LLMResponse, ToolCallRequest},
+    base::{GenerationSettings, LLMProvider, LLMResponse, LLMUsage, ToolCallRequest},
     registry::ProviderSpec,
 };
 use adk_anthropic::{
@@ -681,40 +681,34 @@ impl AnthropicProvider {
         (system, new_msgs, new_tools)
     }
 
-    fn parse_usage(usage: &serde_json::Value) -> HashMap<String, u64> {
+    fn parse_usage(usage: &serde_json::Value) -> LLMUsage {
         let input_tokens = usage
             .get("input_tokens")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+            .unwrap_or(0) as u32;
         let cache_creation = usage
             .get("cache_creation_input_tokens")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+            .unwrap_or(0) as u32;
         let cache_read = usage
             .get("cache_read_input_tokens")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
+            .unwrap_or(0) as u32;
         let output_tokens = usage
             .get("output_tokens")
             .and_then(|v| v.as_u64())
-            .unwrap_or(0);
-        let total_prompt_tokens = input_tokens + cache_creation + cache_read;
+            .unwrap_or(0) as u32;
 
-        let mut map = HashMap::new();
-        map.insert("prompt_tokens".to_string(), total_prompt_tokens);
-        map.insert("completion_tokens".to_string(), output_tokens);
-        map.insert(
-            "total_tokens".to_string(),
-            total_prompt_tokens + output_tokens,
-        );
+        let mut usage = LLMUsage::new();
+        usage.input_tokens = Some(input_tokens);
+        usage.output_tokens = Some(output_tokens);
         if cache_creation > 0 {
-            map.insert("cache_creation_input_tokens".to_string(), cache_creation);
+            usage.cache_creation_input_tokens = Some(cache_creation);
         }
         if cache_read > 0 {
-            map.insert("cache_read_input_tokens".to_string(), cache_read);
-            map.insert("cached_tokens".to_string(), cache_read);
+            usage.cache_read_input_tokens = Some(cache_read);
         }
-        map
+        usage
     }
 
     fn parse_json_response(content: serde_json::Value) -> LLMResponse {
@@ -789,7 +783,7 @@ impl AnthropicProvider {
         let usage = content
             .get("usage")
             .map(Self::parse_usage)
-            .unwrap_or_default();
+            .unwrap_or_else(LLMUsage::new);
 
         let joined = content_parts.join("");
         LLMResponse {
@@ -847,7 +841,7 @@ impl AnthropicProvider {
             content: Some(message.to_string()),
             finish_reason: "error".to_string(),
             tool_calls: Vec::new(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -1630,12 +1624,9 @@ mod tests {
 
         let result = AnthropicProvider::parse_usage(&usage);
 
-        assert_eq!(result["prompt_tokens"], 100);
-        assert_eq!(result["completion_tokens"], 50);
-        assert_eq!(result["total_tokens"], 150);
-        assert!(!result.contains_key("cache_creation_input_tokens"));
-        assert!(!result.contains_key("cache_read_input_tokens"));
-        assert!(!result.contains_key("cached_tokens"));
+        assert_eq!(result.prompt_tokens().unwrap(), 100);
+        assert_eq!(result.output_tokens.unwrap(), 50);
+        assert_eq!(result.total_tokens().unwrap(), 150);
     }
 
     #[test]
@@ -1648,10 +1639,10 @@ mod tests {
 
         let result = AnthropicProvider::parse_usage(&usage);
 
-        assert_eq!(result["prompt_tokens"], 300); // 100 + 200
-        assert_eq!(result["total_tokens"], 350);
-        assert_eq!(result["cache_creation_input_tokens"], 200);
-        assert!(!result.contains_key("cached_tokens"));
+        assert_eq!(result.prompt_tokens().unwrap(), 300); // 100 + 200
+        assert_eq!(result.total_tokens().unwrap(), 350);
+        assert_eq!(result.cache_creation_input_tokens.unwrap(), 200);
+        assert!(result.cache_read_input_tokens.is_none());
     }
 
     #[test]
@@ -1664,10 +1655,10 @@ mod tests {
 
         let result = AnthropicProvider::parse_usage(&usage);
 
-        assert_eq!(result["prompt_tokens"], 500); // 100 + 400
-        assert_eq!(result["total_tokens"], 550);
-        assert_eq!(result["cache_read_input_tokens"], 400);
-        assert_eq!(result["cached_tokens"], 400);
+        assert_eq!(result.prompt_tokens().unwrap(), 500); // 100 + 400
+        assert_eq!(result.total_tokens().unwrap(), 550);
+        assert_eq!(result.cache_read_input_tokens.unwrap(), 400);
+        assert!(result.cache_creation_input_tokens.is_none());
     }
 
     #[test]
@@ -1681,12 +1672,11 @@ mod tests {
 
         let result = AnthropicProvider::parse_usage(&usage);
 
-        assert_eq!(result["prompt_tokens"], 80); // 10 + 30 + 40
-        assert_eq!(result["completion_tokens"], 20);
-        assert_eq!(result["total_tokens"], 100);
-        assert_eq!(result["cache_creation_input_tokens"], 30);
-        assert_eq!(result["cache_read_input_tokens"], 40);
-        assert_eq!(result["cached_tokens"], 40);
+        assert_eq!(result.prompt_tokens().unwrap(), 80); // 10 + 30 + 40
+        assert_eq!(result.output_tokens.unwrap(), 20);
+        assert_eq!(result.total_tokens().unwrap(), 100);
+        assert_eq!(result.cache_creation_input_tokens.unwrap(), 30);
+        assert_eq!(result.cache_read_input_tokens.unwrap(), 40);
     }
 
     #[test]
@@ -1700,18 +1690,18 @@ mod tests {
 
         let result = AnthropicProvider::parse_usage(&usage);
 
-        assert_eq!(result["prompt_tokens"], 5);
-        assert!(!result.contains_key("cache_creation_input_tokens"));
-        assert!(!result.contains_key("cached_tokens"));
+        assert_eq!(result.prompt_tokens().unwrap(), 5);
+        assert!(result.cache_creation_input_tokens.is_none());
+        assert!(result.cache_read_input_tokens.is_none());
     }
 
     #[test]
     fn parse_usage_handles_missing_fields_gracefully() {
         let result = AnthropicProvider::parse_usage(&json!({}));
 
-        assert_eq!(result["prompt_tokens"], 0);
-        assert_eq!(result["completion_tokens"], 0);
-        assert_eq!(result["total_tokens"], 0);
+        assert_eq!(result.prompt_tokens().unwrap(), 0);
+        assert_eq!(result.output_tokens.unwrap(), 0);
+        assert_eq!(result.total_tokens().unwrap(), 0);
     }
 
     // --- parse_json_response ---
@@ -1908,9 +1898,9 @@ mod tests {
 
         let resp = AnthropicProvider::parse_json_response(body);
 
-        assert_eq!(resp.usage["prompt_tokens"], 30); // 10 + 20
-        assert_eq!(resp.usage["completion_tokens"], 5);
-        assert_eq!(resp.usage["cached_tokens"], 20);
+        assert_eq!(resp.usage.prompt_tokens().unwrap(), 30); // 10 + 20
+        assert_eq!(resp.usage.output_tokens.unwrap(), 5);
+        assert_eq!(resp.usage.cache_read_input_tokens.unwrap(), 20);
     }
 
     #[test]
@@ -1922,7 +1912,7 @@ mod tests {
 
         let resp = AnthropicProvider::parse_json_response(body);
 
-        assert!(resp.usage.is_empty());
+        assert!(resp.usage.prompt_tokens().is_none());
     }
 
     #[test]

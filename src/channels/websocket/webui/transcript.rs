@@ -243,7 +243,10 @@ impl WebUiTranscriptRecorder {
         let Some(completed_text) = completed_text else {
             return true;
         };
-        event.insert("text".to_string(), Value::String(completed_text.to_string()));
+        event.insert(
+            "text".to_string(),
+            Value::String(completed_text.to_string()),
+        );
         self.prepare_and_append(chat_id, event, Some(metadata), Some(phase), false, None)
     }
 
@@ -428,7 +431,9 @@ impl WebUiTranscriptRecorder {
             if chunk_id == TRANSCRIPT_ACTIVE_CHUNK_ID {
                 lines.extend(self.read_transcript_file(&self.webui_transcript_path(session_key)));
             } else {
-                lines.extend(self.read_transcript_file(&self.segment_file_path(session_key, &chunk_id)));
+                lines.extend(
+                    self.read_transcript_file(&self.segment_file_path(session_key, &chunk_id)),
+                );
             }
         }
         lines
@@ -569,11 +574,7 @@ impl WebUiTranscriptRecorder {
 
     /// Pack turns into segment files and refresh the manifest. Mirrors
     /// `_append_segment_turns`.
-    fn append_segment_turns(
-        &self,
-        session_key: &str,
-        turns: &[Vec<Value>],
-    ) -> std::io::Result<()> {
+    fn append_segment_turns(&self, session_key: &str, turns: &[Vec<Value>]) -> std::io::Result<()> {
         if turns.is_empty() {
             return Ok(());
         }
@@ -617,12 +618,7 @@ impl WebUiTranscriptRecorder {
     fn read_segment_ids(&self, session_key: &str) -> Vec<String> {
         self.read_segment_manifest_entries(session_key)
             .into_iter()
-            .filter_map(|entry| {
-                entry
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-            })
+            .filter_map(|entry| entry.get("id").and_then(Value::as_str).map(str::to_string))
             .collect()
     }
 
@@ -655,9 +651,7 @@ impl WebUiTranscriptRecorder {
         let Some(manifest) = data.as_object() else {
             return rebuild();
         };
-        let version_ok = manifest
-            .get("version")
-            .and_then(Value::as_u64)
+        let version_ok = manifest.get("version").and_then(Value::as_u64)
             == Some(u64::from(TRANSCRIPT_SEGMENT_MANIFEST_VERSION));
         let Some(raw_segments) = manifest.get("segments").and_then(Value::as_array) else {
             return rebuild();
@@ -688,11 +682,11 @@ impl WebUiTranscriptRecorder {
         if !directory.exists() {
             return Vec::new();
         }
-    
+
         let Ok(entries) = fs::read_dir(&directory) else {
             return Vec::new();
         };
-    
+
         let mut ids: Vec<String> = entries
             .filter_map(Result::ok)
             .filter_map(|entry| {
@@ -718,13 +712,15 @@ impl WebUiTranscriptRecorder {
         let stem = crate::utils::helpers::safe_filename(session_key);
         self.webui_dir.join(format!("{stem}.segments"))
     }
-    
+
     fn webui_transcript_manifest_path(&self, session_key: &str) -> PathBuf {
-        self.webui_transcript_segments_dir(session_key).join("manifest.json")
+        self.webui_transcript_segments_dir(session_key)
+            .join("manifest.json")
     }
-    
+
     fn segment_file_path(&self, session_key: &str, segment_id: &str) -> PathBuf {
-        return self.webui_transcript_segments_dir(session_key)
+        return self
+            .webui_transcript_segments_dir(session_key)
             .join(format!("{segment_id}.jsonl"));
     }
 
@@ -874,10 +870,7 @@ impl WebUiTranscriptRecorder {
 
     /// Rebuild the manifest from disk, then return one entry per segment.
     /// Mirrors `_rebuilt_segment_manifest_entries`.
-    fn rebuilt_segment_manifest_entries(
-        &self,
-        session_key: &str,
-    ) -> std::io::Result<Vec<Value>> {
+    fn rebuilt_segment_manifest_entries(&self, session_key: &str) -> std::io::Result<Vec<Value>> {
         Ok(self
             .rebuild_segment_manifest(session_key)?
             .iter()
@@ -927,10 +920,7 @@ impl WebUiTranscriptRecorder {
         if path.is_file() {
             match fs::remove_file(&path) {
                 Ok(()) => removed = true,
-                Err(e) => log::warn!(
-                    "webui transcript: failed to delete {}: {e}",
-                    path.display()
-                ),
+                Err(e) => log::warn!("webui transcript: failed to delete {}: {e}", path.display()),
             }
         }
         let segments_dir = self.webui_transcript_segments_dir(session_key);
@@ -1142,7 +1132,10 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
                 .and_then(Value::as_str)
                 .filter(|t| !t.trim().is_empty())
             {
-                let kind = row.get("kind").and_then(Value::as_str).unwrap_or("progress");
+                let kind = row
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("progress");
                 pending_activity.push(serde_json::json!({"kind": kind, "text": text}));
             }
             continue;
@@ -1170,7 +1163,11 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
     visible
         .into_iter()
         .map(|(row, activity)| {
-            let role = if is_user_row(row) { "user" } else { "assistant" };
+            let role = if is_user_row(row) {
+                "user"
+            } else {
+                "assistant"
+            };
             let mut entry = serde_json::json!({
                 "role": role,
                 "content": row.get("text").and_then(Value::as_str).unwrap_or(""),
@@ -1760,9 +1757,7 @@ mod tests {
     #[test]
     fn split_transcript_turns_splits_on_turn_end_and_keeps_trailing_incomplete() {
         let recorder = WebUiTranscriptRecorder::new(PathBuf::from("/unused"));
-        let rec = |event: &str, text: &str| {
-            serde_json::json!({"event": event, "text": text})
-        };
+        let rec = |event: &str, text: &str| serde_json::json!({"event": event, "text": text});
         let lines = vec![
             rec("user", "a"),
             rec("turn_end", ""),
@@ -1948,7 +1943,9 @@ mod tests {
     fn write_segment_manifest_overwrites_existing_file() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
-        recorder.write_segment_manifest("websocket:chat-1", &[]).unwrap();
+        recorder
+            .write_segment_manifest("websocket:chat-1", &[])
+            .unwrap();
         recorder
             .write_segment_manifest("websocket:chat-1", &["000001".into()])
             .unwrap();
@@ -1998,9 +1995,11 @@ mod tests {
         recorder
             .rotate_active_transcript_if_needed("websocket:chat-1")
             .unwrap();
-        assert!(!recorder
-            .segment_file_path("websocket:chat-1", "000001")
-            .exists());
+        assert!(
+            !recorder
+                .segment_file_path("websocket:chat-1", "000001")
+                .exists()
+        );
         let contents = fs::read_to_string(&path).unwrap();
         assert!(contents.contains("hi"));
     }
@@ -2027,9 +2026,11 @@ mod tests {
             .collect();
         assert!(texts.iter().any(|t| t.starts_with('c')));
         assert!(!texts.iter().any(|t| t.starts_with('a')));
-        assert!(recorder
-            .segment_file_path("websocket:chat-1", "000001")
-            .exists());
+        assert!(
+            recorder
+                .segment_file_path("websocket:chat-1", "000001")
+                .exists()
+        );
     }
 
     // --- rebuild_segment_manifest ---
@@ -2038,7 +2039,9 @@ mod tests {
     fn rebuild_segment_manifest_unlinks_manifest_when_no_segments() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
-        recorder.write_segment_manifest("websocket:chat-1", &[]).unwrap();
+        recorder
+            .write_segment_manifest("websocket:chat-1", &[])
+            .unwrap();
         let path = recorder.webui_transcript_manifest_path("websocket:chat-1");
         assert!(path.exists());
 
@@ -2055,7 +2058,10 @@ mod tests {
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
         let segment = recorder.segment_file_path("websocket:chat-1", "000002");
         recorder
-            .write_records_to_path(&segment, &[serde_json::json!({"event": "user", "text": "hi"})])
+            .write_records_to_path(
+                &segment,
+                &[serde_json::json!({"event": "user", "text": "hi"})],
+            )
             .unwrap();
 
         let ids = recorder
@@ -2096,9 +2102,11 @@ mod tests {
     fn read_segment_manifest_entries_missing_dir_is_empty() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
-        assert!(recorder
-            .read_segment_manifest_entries("websocket:chat-1")
-            .is_empty());
+        assert!(
+            recorder
+                .read_segment_manifest_entries("websocket:chat-1")
+                .is_empty()
+        );
     }
 
     #[test]
@@ -2113,9 +2121,11 @@ mod tests {
         let entries = recorder.read_segment_manifest_entries("websocket:chat-1");
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["id"], "000001");
-        assert!(recorder
-            .webui_transcript_manifest_path("websocket:chat-1")
-            .is_file());
+        assert!(
+            recorder
+                .webui_transcript_manifest_path("websocket:chat-1")
+                .is_file()
+        );
     }
 
     #[test]
@@ -2170,26 +2180,32 @@ mod tests {
     fn normalize_manifest_entry_rejects_invalid_or_stale_entries() {
         let dir = tempfile::tempdir().unwrap();
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
-        assert!(recorder
-            .normalize_manifest_entry("websocket:chat-1", &serde_json::json!([]))
-            .is_none());
-        assert!(recorder
-            .normalize_manifest_entry(
-                "websocket:chat-1",
-                &serde_json::json!({"id": "bad", "bytes": 0, "turn_count": 0, "user_count": 0})
-            )
-            .is_none());
-        assert!(recorder
-            .normalize_manifest_entry(
-                "websocket:chat-1",
-                &serde_json::json!({
-                    "id": "000001",
-                    "bytes": 0,
-                    "turn_count": 0,
-                    "user_count": 0
-                })
-            )
-            .is_none());
+        assert!(
+            recorder
+                .normalize_manifest_entry("websocket:chat-1", &serde_json::json!([]))
+                .is_none()
+        );
+        assert!(
+            recorder
+                .normalize_manifest_entry(
+                    "websocket:chat-1",
+                    &serde_json::json!({"id": "bad", "bytes": 0, "turn_count": 0, "user_count": 0})
+                )
+                .is_none()
+        );
+        assert!(
+            recorder
+                .normalize_manifest_entry(
+                    "websocket:chat-1",
+                    &serde_json::json!({
+                        "id": "000001",
+                        "bytes": 0,
+                        "turn_count": 0,
+                        "user_count": 0
+                    })
+                )
+                .is_none()
+        );
     }
 
     // --- delete_webui_transcript ---
@@ -2245,23 +2261,23 @@ mod tests {
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
         write_two_user_source(&recorder, "websocket:src");
 
-        assert!(recorder.fork_transcript_before_user_index(
-            "websocket:src",
-            "websocket:dst",
-            1
-        ));
+        assert!(recorder.fork_transcript_before_user_index("websocket:src", "websocket:dst", 1));
         let forked = recorder.read_transcript_lines("websocket:dst");
         let texts: Vec<&str> = forked
             .iter()
             .filter_map(|row| row.get("text").and_then(Value::as_str))
             .collect();
         assert_eq!(texts, vec!["one"]);
-        assert!(forked
-            .iter()
-            .all(|row| row.get("chat_id").and_then(Value::as_str) == Some("dst")));
-        assert!(forked
-            .iter()
-            .all(|row| row.get("event").and_then(Value::as_str) != Some(WEBUI_FORK_MARKER_EVENT)));
+        assert!(
+            forked
+                .iter()
+                .all(|row| row.get("chat_id").and_then(Value::as_str) == Some("dst"))
+        );
+        assert!(
+            forked.iter().all(
+                |row| row.get("event").and_then(Value::as_str) != Some(WEBUI_FORK_MARKER_EVENT)
+            )
+        );
     }
 
     #[test]
@@ -2270,11 +2286,7 @@ mod tests {
         let recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
         write_two_user_source(&recorder, "websocket:src");
 
-        assert!(recorder.fork_transcript_before_user_index(
-            "websocket:src",
-            "websocket:dst",
-            2
-        ));
+        assert!(recorder.fork_transcript_before_user_index("websocket:src", "websocket:dst", 2));
         let forked = recorder.read_transcript_lines("websocket:dst");
         let texts: Vec<&str> = forked
             .iter()
@@ -2293,11 +2305,7 @@ mod tests {
             0
         ));
         write_two_user_source(&recorder, "websocket:src");
-        assert!(!recorder.fork_transcript_before_user_index(
-            "websocket:src",
-            "websocket:dst",
-            3
-        ));
+        assert!(!recorder.fork_transcript_before_user_index("websocket:src", "websocket:dst", 3));
     }
 
     #[test]
@@ -2317,11 +2325,7 @@ mod tests {
             )
             .unwrap();
 
-        assert!(recorder.fork_transcript_before_user_index(
-            "websocket:src",
-            "websocket:dst",
-            1
-        ));
+        assert!(recorder.fork_transcript_before_user_index("websocket:src", "websocket:dst", 1));
 
         let history = recorder.chat_history("websocket:dst", 500);
         assert_eq!(history.len(), 2);

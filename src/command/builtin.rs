@@ -157,6 +157,7 @@ impl CommandHandler for CmdNew {
             .map(<[_]>::to_vec);
         session.clear();
         session.metadata.remove(goal_state::GOAL_STATE_KEY);
+        session.metadata.remove(crate::session::SESSION_TOKEN_USAGE_KEY);
         if let Err(e) = session_manager.save(session) {
             log::error!("Failed to save session: {e}");
         }
@@ -188,9 +189,8 @@ impl CommandHandler for CmdStatus {
                     .last_usage
                     .lock()
                     .unwrap_or_else(|e| e.into_inner())
-                    .get("prompt_tokens")
-                    .copied()
-                    .unwrap_or(0);
+                    .prompt_tokens()
+                    .unwrap_or(0) as u64;
             }
             (session.get_history(Some(0)).len(), ctx_est)
         };
@@ -1773,6 +1773,11 @@ mod tests {
             session
                 .metadata
                 .insert("unrelated".to_string(), serde_json::json!("keep-me"));
+            session.update_usage(crate::providers::base::LLMUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                ..crate::providers::base::LLMUsage::new()
+            });
             let snapshot = session.clone();
             session_manager.save(snapshot).unwrap();
         }
@@ -1799,6 +1804,12 @@ mod tests {
         assert_eq!(
             session.metadata.get("unrelated"),
             Some(&serde_json::json!("keep-me"))
+        );
+        assert!(
+            session
+                .metadata
+                .get(crate::session::SESSION_TOKEN_USAGE_KEY)
+                .is_none()
         );
     }
 

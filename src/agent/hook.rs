@@ -6,7 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::FutureExt;
 
-use crate::providers::base::{LLMResponse, ToolCallRequest};
+use crate::providers::base::{LLMResponse, LLMUsage, ToolCallRequest};
 
 // ── AgentHookContext ──────────────────────────────────────────────────────────
 
@@ -16,7 +16,7 @@ pub struct AgentHookContext {
     pub iteration: usize,
     pub messages: Vec<serde_json::Value>,
     pub response: Option<LLMResponse>,
-    pub usage: HashMap<String, u64>,
+    pub usage: LLMUsage,
     pub tool_calls: Vec<ToolCallRequest>,
     pub tool_results: Vec<serde_json::Value>,
     pub tool_events: Vec<HashMap<String, String>>,
@@ -31,7 +31,7 @@ impl AgentHookContext {
             iteration,
             messages,
             response: None,
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             tool_calls: Vec::new(),
             tool_results: Vec::new(),
             tool_events: Vec::new(),
@@ -310,7 +310,7 @@ mod tests {
         assert_eq!(ctx.iteration, 1);
         assert!(ctx.messages.is_empty());
         assert!(ctx.response.is_none());
-        assert!(ctx.usage.is_empty());
+        assert_eq!(ctx.usage, LLMUsage::new());
         assert!(ctx.tool_calls.is_empty());
         assert!(ctx.tool_results.is_empty());
         assert!(ctx.tool_events.is_empty());

@@ -145,7 +145,10 @@ fn authorize_media_request(
     let header_token = headers
         .get(header::AUTHORIZATION)
         .and_then(|v| v.to_str().ok())
-        .and_then(|v| v.strip_prefix("Bearer ").or_else(|| v.strip_prefix("bearer ")));
+        .and_then(|v| {
+            v.strip_prefix("Bearer ")
+                .or_else(|| v.strip_prefix("bearer "))
+        });
     let token = header_token
         .or(query_token)
         .filter(|t| !t.trim().is_empty())
@@ -197,10 +200,7 @@ pub(crate) async fn serve_media(
 
     let mut response = bytes.into_response();
     let headers = response.headers_mut();
-    headers.insert(
-        header::CONTENT_TYPE,
-        header::HeaderValue::from_static(mime),
-    );
+    headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime));
     headers.insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("private, max-age=86400"),
@@ -249,8 +249,7 @@ mod tests {
         std::fs::write(&outside_file, b"fake-png").unwrap();
 
         assert!(
-            media_url_from_stored_path(outside_file.to_str().unwrap(), media_dir.path())
-                .is_none()
+            media_url_from_stored_path(outside_file.to_str().unwrap(), media_dir.path()).is_none()
         );
     }
 

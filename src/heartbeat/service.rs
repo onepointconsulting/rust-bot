@@ -297,7 +297,7 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use crate::providers::base::{
-        BoxedStreamCallback, GenerationSettings, LLMResponse, ToolCallRequest,
+        BoxedStreamCallback, GenerationSettings, LLMResponse, LLMUsage, ToolCallRequest,
     };
     use tempfile::TempDir;
 
@@ -380,7 +380,7 @@ mod tests {
                     content: Some("scripted provider exhausted".into()),
                     finish_reason: "error".into(),
                     tool_calls: vec![],
-                    usage: HashMap::new(),
+                    usage: LLMUsage::new(),
                     reasoning_content: None,
                     thinking_blocks: None,
                 })
@@ -412,7 +412,7 @@ mod tests {
                 provider_specific_fields: None,
                 function_provider_specific_fields: None,
             }],
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -594,7 +594,7 @@ mod tests {
                 content: Some("boom".into()),
                 finish_reason: "error".into(),
                 tool_calls: vec![],
-                usage: HashMap::new(),
+                usage: LLMUsage::new(),
                 reasoning_content: None,
                 thinking_blocks: None,
             }]),

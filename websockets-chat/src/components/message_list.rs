@@ -59,9 +59,10 @@ fn entry_render_key(entry: &ChatEntry, show_fork: bool) -> (u64, String, bool, S
 /// Most recent completed assistant bubble, if any. Used to pin the in-transcript
 /// Fork control to that reply (and to hide it while a turn is still streaming).
 fn last_completed_assistant_id(entries: &[ChatEntry]) -> Option<u64> {
-    entries.iter().rev().find_map(|entry| {
-        (entry.role == Role::Assistant && !entry.streaming).then_some(entry.id)
-    })
+    entries
+        .iter()
+        .rev()
+        .find_map(|entry| (entry.role == Role::Assistant && !entry.streaming).then_some(entry.id))
 }
 
 /// One transcript entry, with a `ToolActivity`/`ReasoningPanel` slot injected

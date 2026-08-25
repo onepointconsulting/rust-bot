@@ -45,9 +45,7 @@ pub fn MessageBubble(
     let extra_view = extra.map(|children| children());
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
     let awaiting_first_token = !markdown::has_visible_chars(&content);
-    let fork_button = on_fork.map(|on_fork| {
-        view! { <ForkButton on_fork=on_fork /> }.into_any()
-    });
+    let fork_button = on_fork.map(|on_fork| view! { <ForkButton on_fork=on_fork /> }.into_any());
 
     // One lightbox per bubble instance: only ever holds the URL of the
     // attachment most recently clicked in *this* bubble, so no lifted/global

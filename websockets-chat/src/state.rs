@@ -495,15 +495,21 @@ fn percent_encode_query_value(value: &str) -> String {
 /// same convention [`build_ws_url`] uses for the WebSocket upgrade itself.
 /// No-op (URLs are returned unchanged) when `token` is `None`/empty, e.g.
 /// JWT disabled server-side.
-pub fn authorize_media_attachments(mut entries: Vec<ChatEntry>, token: Option<&str>) -> Vec<ChatEntry> {
+pub fn authorize_media_attachments(
+    mut entries: Vec<ChatEntry>,
+    token: Option<&str>,
+) -> Vec<ChatEntry> {
     let Some(token) = token.filter(|t| !t.is_empty()) else {
         return entries;
     };
     for entry in &mut entries {
         for attachment in &mut entry.attachments {
             if attachment.url.starts_with(GATEWAY_MEDIA_URL_PREFIX) {
-                attachment.url =
-                    format!("{}?token={}", attachment.url, percent_encode_query_value(token));
+                attachment.url = format!(
+                    "{}?token={}",
+                    attachment.url,
+                    percent_encode_query_value(token)
+                );
             }
         }
     }

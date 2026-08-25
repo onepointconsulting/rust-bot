@@ -19,6 +19,9 @@ pub const WORKSPACE_SCOPE_METADATA_KEY: &str = "workspace_scope";
 /// In-flight turn checkpoint used to recover after a crash or `/stop`.
 pub const RUNTIME_CHECKPOINT_KEY: &str = "runtime_checkpoint";
 
+/// Accumulated LLM token/cost totals for this session's lifetime.
+pub const SESSION_TOKEN_USAGE_KEY: &str = "token_usage";
+
 /// Marks the session as originating from the WebUI / WebSocket channel.
 pub const SESSION_WEBUI_METADATA_KEY: &str = "webui";
 

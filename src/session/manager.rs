@@ -11,15 +11,16 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use tera::Context;
+use whatsapp_rust::session;
 
 use crate::{
     agent::model_runtime::ModelRuntime,
     config::paths::get_legacy_sessions_dir,
-    providers::base::LLMResponse,
+    providers::base::{LLMResponse, LLMUsage},
     runtime_context::RUNTIME_CONTEXT_HISTORY_META,
     session::{
-        SESSION_TITLE_METADATA_KEY, history_visibility::is_hidden_history_message,
-        keys::COMMAND_KEY,
+        SESSION_TITLE_METADATA_KEY, SESSION_TOKEN_USAGE_KEY,
+        history_visibility::is_hidden_history_message, keys::COMMAND_KEY,
     },
     utils::helpers::{
         ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
@@ -180,6 +181,31 @@ impl Session {
 
         self.last_consolidated = last_consolidated;
         self.updated_at = Utc::now();
+    }
+
+    /// Accumulated LLM usage for this session, if any has been recorded.
+    pub fn usage(&self) -> Option<LLMUsage> {
+        let value = self.metadata.get(SESSION_TOKEN_USAGE_KEY)?;
+        serde_json::from_value(value.clone()).ok()
+    }
+
+    /// Add one run's usage into the session lifetime totals and persist the blob
+    /// on [`Self::metadata`]. No-ops when `usage` is empty so missing provider
+    /// stats do not wipe a known total.
+    pub fn update_usage(&mut self, usage: LLMUsage) {
+        if usage == LLMUsage::new() {
+            return;
+        }
+        let mut accumulated = self.usage().unwrap_or_default();
+        accumulated.add(&usage);
+        match serde_json::to_value(accumulated) {
+            Ok(value) => {
+                self.metadata
+                    .insert(SESSION_TOKEN_USAGE_KEY.to_string(), value);
+                self.updated_at = Utc::now();
+            }
+            Err(e) => log::error!("Failed to serialize session token usage: {e}"),
+        }
     }
 }
 
@@ -642,7 +668,8 @@ impl SessionManager {
         new_session.metadata = metadata;
         new_session.last_consolidated = last_consolidated;
 
-        self.save(new_session.clone()).map_err(ForkSessionError::Io)?;
+        self.save(new_session.clone())
+            .map_err(ForkSessionError::Io)?;
         Ok(new_session)
     }
 
@@ -672,7 +699,10 @@ impl SessionManager {
         };
 
         if let Some(suffix) = suffix
-            && let Some(content) = obj.get("content").and_then(Value::as_str).map(str::to_owned)
+            && let Some(content) = obj
+                .get("content")
+                .and_then(Value::as_str)
+                .map(str::to_owned)
         {
             if content == suffix {
                 obj.insert("content".into(), Value::String(String::new()));
@@ -1176,6 +1206,51 @@ pub fn format_sessions_list(sessions: &[Value], current_key: Option<&str>) -> St
 mod tests {
     use super::*;
     use crate::session::HIDDEN_HISTORY_KEY;
+
+    #[test]
+    fn update_usage_accumulates_across_calls() {
+        let mut session = Session::new("usage-session".into());
+        session.update_usage(LLMUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(5),
+            input_cost: Some(0.01),
+            ..LLMUsage::new()
+        });
+        session.update_usage(LLMUsage {
+            input_tokens: Some(3),
+            output_tokens: Some(2),
+            cache_read_input_tokens: Some(7),
+            output_cost: Some(0.02),
+            ..LLMUsage::new()
+        });
+
+        let usage = session.usage().expect("usage should be persisted");
+        assert_eq!(usage.input_tokens, Some(13));
+        assert_eq!(usage.output_tokens, Some(7));
+        assert_eq!(usage.cache_read_input_tokens, Some(7));
+        assert_eq!(usage.prompt_tokens(), Some(20));
+        assert_eq!(usage.input_cost, Some(0.01));
+        assert_eq!(usage.output_cost, Some(0.02));
+        assert_eq!(usage.total_cost(), Some(0.03));
+        assert!(session.metadata.get(SESSION_TOKEN_USAGE_KEY).is_some());
+    }
+
+    #[test]
+    fn update_usage_ignores_empty_so_unknown_does_not_wipe_totals() {
+        let mut session = Session::new("usage-session".into());
+        session.update_usage(LLMUsage::new());
+        assert!(session.usage().is_none());
+
+        session.update_usage(LLMUsage {
+            input_tokens: Some(4),
+            output_tokens: Some(1),
+            ..LLMUsage::new()
+        });
+        session.update_usage(LLMUsage::new());
+        let usage = session.usage().unwrap();
+        assert_eq!(usage.input_tokens, Some(4));
+        assert_eq!(usage.output_tokens, Some(1));
+    }
 
     fn fixture_message(role: &str, content: &str) -> Value {
         json!({
@@ -2082,7 +2157,7 @@ mod tests {
             content: Some("Athens Weather Right Now".into()),
             tool_calls: Vec::new(),
             finish_reason: "stop".into(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: Some(
                 "Possible: \"Current Weather in Athens Greece\". Use \"Weather in Athens Greece Now\"."
                     .into(),
@@ -2101,7 +2176,7 @@ mod tests {
             content: None,
             tool_calls: Vec::new(),
             finish_reason: "length".into(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: Some(
                 "We need a concise title. Possible: \"Current Weather in Athens Greece\" \
                  but that's 4 words. Or \"Athens Weather Right Now\" that's 4. \
@@ -2122,7 +2197,7 @@ mod tests {
             content: Some("   ".into()),
             tool_calls: Vec::new(),
             finish_reason: "length".into(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: Some(
                 "Too short: \"Hi\". Too long: \"This is a nine word candidate that should not win\"."
                     .into(),
@@ -2325,7 +2400,9 @@ mod tests {
         session.last_consolidated = last_consolidated;
         session.metadata.insert("keep".into(), json!("yes"));
         session.metadata.insert("title".into(), json!("old title"));
-        session.metadata.insert("_last_summary".into(), json!("stale"));
+        session
+            .metadata
+            .insert("_last_summary".into(), json!("stale"));
         mgr.save(session).unwrap();
     }
 

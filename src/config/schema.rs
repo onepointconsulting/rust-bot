@@ -4,10 +4,12 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    channels::websocket::types::DEFAULT_AUD, providers::{
+    channels::websocket::types::DEFAULT_AUD,
+    providers::{
         anthropic_provider::AnthropicProvider,
         registry::{find_by_name, providers},
-    }, utils::helpers::expand_tilde_path,
+    },
+    utils::helpers::expand_tilde_path,
 };
 
 // ── ProviderConfig ────────────────────────────────────────────────────────────

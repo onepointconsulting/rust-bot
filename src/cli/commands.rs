@@ -1946,7 +1946,11 @@ fn init_prompt_session(text_captures: Arc<StdMutex<Vec<String>>>) -> Reedline {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{agent::model_runtime::ModelRuntimeResolver, channels::websocket::types::DEFAULT_AUD, utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel}};
+    use crate::{
+        agent::model_runtime::ModelRuntimeResolver,
+        channels::websocket::types::DEFAULT_AUD,
+        utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel},
+    };
 
     #[test]
     fn extract_images_resolves_captures_by_index_and_strips_sentinels() {

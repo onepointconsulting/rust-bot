@@ -1,5 +1,4 @@
 /// Utility functions for rust-bot.
-use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
@@ -11,6 +10,7 @@ use serde_json::{Value, json, to_string_pretty};
 use uuid::Uuid;
 
 use crate::agent::context::BOOTSTRAP_FILES;
+use crate::providers::base::LLMUsage;
 use crate::utils::embedded_templates;
 use crate::utils::gitstore::GitStore;
 use crate::utils::logo::LOGO;
@@ -582,7 +582,7 @@ pub fn build_status_content(
     version: &str,
     model: &str,
     start_time_secs: f64,
-    last_usage: &HashMap<String, u64>,
+    last_usage: &LLMUsage,
     context_window_tokens: u64,
     session_msg_count: usize,
     context_tokens_estimate: u64,
@@ -595,9 +595,9 @@ pub fn build_status_content(
         format!("{}m {}s", uptime_s / 60, uptime_s % 60)
     };
 
-    let last_in = last_usage.get("prompt_tokens").copied().unwrap_or(0);
-    let last_out = last_usage.get("completion_tokens").copied().unwrap_or(0);
-    let cached = last_usage.get("cached_tokens").copied().unwrap_or(0);
+    let last_in = last_usage.prompt_tokens().unwrap_or(0);
+    let last_out = last_usage.output_tokens.unwrap_or(0);
+    let cached = last_usage.cache_read_input_tokens.unwrap_or(0);
     let ctx_pct = if context_window_tokens > 0 {
         (context_tokens_estimate.max(0) as u64 * 100 / context_window_tokens as u64) as u64
     } else {
@@ -1181,9 +1181,11 @@ mod tests {
 
     #[test]
     fn test_build_status_content_structure() {
-        let mut usage = HashMap::new();
-        usage.insert("prompt_tokens".to_string(), 100);
-        usage.insert("completion_tokens".to_string(), 50);
+        let usage = LLMUsage {
+            input_tokens: Some(100),
+            output_tokens: Some(50),
+            ..LLMUsage::new()
+        };
         let status = build_status_content(
             "1.0",
             "gpt-4o",
@@ -1203,7 +1205,7 @@ mod tests {
 
     #[test]
     fn test_build_status_content_hours_uptime() {
-        let usage = HashMap::new();
+        let usage = LLMUsage::new();
         let status = build_status_content(
             "1.0",
             "model",
@@ -1223,7 +1225,7 @@ mod tests {
 
     #[test]
     fn test_build_status_content_search_usage_appended() {
-        let usage = HashMap::new();
+        let usage = LLMUsage::new();
         let status = build_status_content(
             "1.0",
             "m",

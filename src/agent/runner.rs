@@ -7,7 +7,7 @@ use std::sync::{Arc, Mutex};
 use crate::agent::hook::{AgentHook, AgentHookContext};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{
-    BoxedStreamCallback, LLMProviderDyn, LLMResponse, ToolCallRequest,
+    BoxedStreamCallback, LLMProviderDyn, LLMResponse, LLMUsage, ToolCallRequest,
     is_unsupported_image_input_error,
 };
 use crate::utils::helpers::{
@@ -98,7 +98,7 @@ pub struct AgentRunResult {
     pub final_content: Option<String>,
     pub messages: Vec<Value>,
     pub tools_used: Vec<String>,
-    pub usage: HashMap<String, u64>,
+    pub usage: LLMUsage,
     pub stop_reason: String,
     pub error: Option<String>,
     pub tool_events: Vec<HashMap<String, String>>,
@@ -110,7 +110,7 @@ impl Default for AgentRunResult {
             final_content: None,
             messages: Vec::new(),
             tools_used: Vec::new(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             stop_reason: "completed".to_string(),
             error: None,
             tool_events: Vec::new(),
@@ -198,9 +198,9 @@ impl AgentRunner {
     /// older ones that exceed `MICROCOMPACT_MIN_CHARS` down to a single
     /// placeholder line.
     fn microcompact(messages: &[Value]) -> Vec<Value> {
-        let current_turn_start = messages.iter().rposition(|msg| {
-            msg.get("role").and_then(Value::as_str) == Some("user")
-        });
+        let current_turn_start = messages
+            .iter()
+            .rposition(|msg| msg.get("role").and_then(Value::as_str) == Some("user"));
 
         let compactable_indices: Vec<usize> = messages
             .iter()
@@ -504,10 +504,8 @@ impl AgentRunner {
             .await
     }
 
-    fn accumulate_usage(target: &mut HashMap<String, u64>, addition: &HashMap<String, u64>) {
-        for (key, value) in addition {
-            *target.entry(key.clone()).or_insert(0) += value;
-        }
+    fn accumulate_usage(target: &mut LLMUsage, addition: &LLMUsage) {
+        target.add(addition);
     }
 
     fn emit_checkpoint(spec: &AgentRunSpec, payload: Value) {
@@ -882,7 +880,7 @@ impl AgentRunner {
         let hook: Arc<dyn AgentHook> = spec.hook.clone().unwrap_or_else(|| Arc::new(NoopHook));
 
         let mut messages = spec.initial_messages.clone();
-        let mut usage: HashMap<String, u64> = HashMap::new();
+        let mut usage = LLMUsage::new();
         let mut all_tool_events: Vec<HashMap<String, String>> = Vec::new();
         let mut tools_used: Vec<String> = Vec::new();
         let mut stop_reason = "completed".to_string();
@@ -936,13 +934,10 @@ impl AgentRunner {
                     .take(400)
                     .collect::<String>()
             );
+            log::info!("Usage: {}", response.usage);
 
             Self::accumulate_usage(&mut usage, &response.usage);
-            ctx.usage = response
-                .usage
-                .iter()
-                .map(|(k, &v)| (k.clone(), v as u64))
-                .collect();
+            ctx.usage = response.usage;
             ctx.response = Some(response.clone());
 
             // ── Tool calls branch ─────────────────────────────────────────────
@@ -1286,7 +1281,7 @@ mod tests {
                 content: Some("Hello, world!".to_string()),
                 finish_reason: "stop".to_string(),
                 tool_calls: Vec::new(),
-                usage: std::collections::HashMap::new(),
+                usage: LLMUsage::new(),
                 reasoning_content: None,
                 thinking_blocks: None,
             }
@@ -1438,7 +1433,7 @@ mod tests {
             content: Some("No endpoints found that support image input".to_string()),
             finish_reason: "error".to_string(),
             tool_calls: Vec::new(),
-            usage: HashMap::new(),
+            usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
         }
@@ -1461,7 +1456,7 @@ mod tests {
         assert_eq!(result.final_content, None);
         assert_eq!(result.messages, Vec::<Value>::new());
         assert_eq!(result.tools_used, Vec::<String>::new());
-        assert_eq!(result.usage, HashMap::<String, u64>::new());
+        assert_eq!(result.usage, LLMUsage::new());
         assert_eq!(result.stop_reason, "completed");
         assert_eq!(result.error, None);
     }
@@ -1673,7 +1668,10 @@ mod tests {
         }
         // Last user message onward is untouched.
         let current_turn_start = previous_count + 2; // assistant after old tools, then user
-        assert_eq!(&result[current_turn_start..], &messages[current_turn_start..]);
+        assert_eq!(
+            &result[current_turn_start..],
+            &messages[current_turn_start..]
+        );
     }
 
     // ── normalize_tool_result ─────────────────────────────────────────────────
