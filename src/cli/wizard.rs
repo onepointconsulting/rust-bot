@@ -9,6 +9,7 @@ use crate::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_passw
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
 use crate::cli::onboard::create_env_file;
+use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_token};
 use crate::{
     cli::{CliError, commands::OnboardArgs, eprint_error},
@@ -44,6 +45,7 @@ const PROVIDER_OPENROUTER: &'static str = "openrouter";
 const PROVIDER_EDENAI: &'static str = "edenai";
 const PROVIDER_REQUESTY: &'static str = "requesty";
 const PROVIDER_ANTHROPIC: &'static str = "anthropic";
+const PROVIDER_NANOGPT: &'static str = "nanogpt";
 
 const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
@@ -162,6 +164,7 @@ pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
         PROVIDER_ANTHROPIC,
         PROVIDER_EDENAI,
         PROVIDER_REQUESTY,
+        PROVIDER_NANOGPT,
     ];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
@@ -173,69 +176,64 @@ pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
             configure_provider(config, &provider)?;
             configure_api_base(config, &provider)?;
             configure_extra_headers(config, &provider)?;
+            if let Some(slot) = provider_config_slot(&provider) {
+                config.agents.provider = slot.to_string();
+            }
         }
         None => return Ok(config.clone()), // caller re-shows the main menu
     }
     return Ok(config.clone());
 }
 
+/// Config field that stores credentials for a wizard LLM-provider choice.
+fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
+    match provider_name {
+        PROVIDER_OPENROUTER => Some("openrouter"),
+        PROVIDER_ANTHROPIC => Some("anthropic"),
+        PROVIDER_EDENAI | PROVIDER_REQUESTY | PROVIDER_NANOGPT => Some("custom"),
+        _ => None,
+    }
+}
+
+fn invalid_provider_error() -> CliError {
+    eprint_error("Invalid provider");
+    CliError::Inquire(inquire::InquireError::InvalidConfiguration(String::from(
+        "Invalid provider",
+    )))
+}
+
 pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
     let api_key = Text::new("Enter API key").prompt()?;
-    match provider_name {
-        PROVIDER_OPENROUTER => {
-            config.providers.openrouter.api_key = api_key;
-        }
-        PROVIDER_ANTHROPIC => {
-            config.providers.anthropic.api_key = api_key;
-        }
-        PROVIDER_EDENAI => {
-            config.providers.custom.api_key = api_key;
-        }
-        PROVIDER_REQUESTY => {
-            config.providers.custom.api_key = api_key;
-        }
-        _ => {
-            eprint_error("Invalid provider");
-            return Err(CliError::Inquire(
-                inquire::InquireError::InvalidConfiguration(String::from("Invalid provider")),
-            ));
-        }
+    match provider_config_slot(provider_name) {
+        Some("openrouter") => config.providers.openrouter.api_key = api_key,
+        Some("anthropic") => config.providers.anthropic.api_key = api_key,
+        Some("custom") => config.providers.custom.api_key = api_key,
+        _ => return Err(invalid_provider_error()),
     }
     return Ok(config.clone());
 }
 
 pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
-    fn default_endpoint(provider_name: &str) -> String {
-        if provider_name == PROVIDER_OPENROUTER {
-            "https://openrouter.ai/api/v1".to_string()
-        } else if provider_name == PROVIDER_EDENAI {
-            "https://api.edenai.run/v3".to_string()
-        } else if provider_name == PROVIDER_ANTHROPIC {
-            "https://api.anthropic.com/v1".to_string()
-        } else if provider_name == PROVIDER_REQUESTY {
-            "https://router.requesty.ai/v1".to_string()
-        } else {
-            "".to_string()
+    fn default_endpoint(provider_name: &str) -> &'static str {
+        match provider_name {
+            PROVIDER_OPENROUTER => "https://openrouter.ai/api/v1",
+            PROVIDER_EDENAI => "https://api.edenai.run/v3",
+            PROVIDER_REQUESTY => "https://router.requesty.ai/v1",
+            PROVIDER_ANTHROPIC => AnthropicProvider::DEFAULT_API_BASE,
+            PROVIDER_NANOGPT => "https://nano-gpt.com/api/v1",
+            _ => "",
         }
     }
+    let default = default_endpoint(provider_name);
     let endpoint = Text::new("Enter endpoint")
-        .with_default(&default_endpoint(provider_name))
-        .with_help_message(&default_endpoint(provider_name))
+        .with_default(default)
+        .with_help_message(default)
         .prompt()?;
-    match provider_name {
-        PROVIDER_OPENROUTER => {
-            config.providers.openrouter.api_base = Some(endpoint);
-        }
-        PROVIDER_ANTHROPIC => {
-            config.providers.anthropic.api_base = Some(endpoint);
-        }
-        PROVIDER_EDENAI => {
-            config.providers.custom.api_base = Some(endpoint);
-        }
-        PROVIDER_REQUESTY => {
-            config.providers.custom.api_base = Some(endpoint);
-        }
-        _ => {}
+    match provider_config_slot(provider_name) {
+        Some("openrouter") => config.providers.openrouter.api_base = Some(endpoint),
+        Some("anthropic") => config.providers.anthropic.api_base = Some(endpoint),
+        Some("custom") => config.providers.custom.api_base = Some(endpoint),
+        _ => return Err(invalid_provider_error()),
     }
     return Ok(config.clone());
 }
@@ -271,22 +269,11 @@ pub fn configure_extra_headers(
     }
 
     let headers = Some(headers);
-    match provider_name {
-        PROVIDER_OPENROUTER => {
-            config.providers.openrouter.extra_headers = headers;
-        }
-        PROVIDER_ANTHROPIC => {
-            config.providers.anthropic.extra_headers = headers;
-        }
-        PROVIDER_EDENAI => {
-            config.providers.custom.extra_headers = headers;
-        }
-        _ => {
-            eprint_error("Invalid provider");
-            return Err(CliError::Inquire(
-                inquire::InquireError::InvalidConfiguration(String::from("Invalid provider")),
-            ));
-        }
+    match provider_config_slot(provider_name) {
+        Some("openrouter") => config.providers.openrouter.extra_headers = headers,
+        Some("anthropic") => config.providers.anthropic.extra_headers = headers,
+        Some("custom") => config.providers.custom.extra_headers = headers,
+        _ => return Err(invalid_provider_error()),
     }
     Ok(config.clone())
 }
