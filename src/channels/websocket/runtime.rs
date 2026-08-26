@@ -742,6 +742,10 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
         &mut attached_payload,
         model_preset_attached_fields(shared, new_session.as_ref()),
     );
+    merge_json(
+        &mut attached_payload,
+        token_usage_attached_fields(new_session.as_ref()),
+    );
     send_event(
         shared,
         connection_id,
@@ -1125,6 +1129,10 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
         &mut attached_payload,
         model_preset_attached_fields(shared, Some(&forked)),
     );
+    merge_json(
+        &mut attached_payload,
+        token_usage_attached_fields(Some(&forked)),
+    );
     send_event(
         shared,
         connection_id,
@@ -1486,6 +1494,20 @@ fn model_preset_attached_fields(shared: &WsShared, session: Option<&Session>) ->
     })
 }
 
+/// Session lifetime `token_usage`, merged into every `attached` payload
+/// (attach, new_chat, fork) alongside [`model_preset_attached_fields`] so the
+/// client learns the running totals without a separate round-trip.
+///
+/// Returns `{}` (nothing to merge) when the session has no usage yet — a
+/// brand new chat, or a gateway build that predates usage tracking — rather
+/// than sending an explicit `null` that would need special-casing client-side.
+fn token_usage_attached_fields(session: Option<&Session>) -> serde_json::Value {
+    let Some(usage) = session.and_then(Session::usage) else {
+        return serde_json::json!({});
+    };
+    serde_json::json!({ "token_usage": usage })
+}
+
 /// Subscribe `connection_id` to `chat_id`, ack with `attached` (including
 /// a display `history` snapshot), then replay any in-flight goal/turn
 /// strip. Argument order matches [`ConnectionRegistry::attach`] /
@@ -1542,6 +1564,7 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
         &mut payload,
         model_preset_attached_fields(shared, session.as_ref()),
     );
+    merge_json(&mut payload, token_usage_attached_fields(session.as_ref()));
     send_event(
         shared,
         connection_id,
@@ -2193,6 +2216,38 @@ impl WebSocketChannel {
     /// Mirrors nanobot's `conns = list(self._subs.get(chat_id, ()))` +
     /// per-connection `_safe_send_to` loop, shared by `send`/`send_delta`/
     /// `send_reasoning_delta`/`send_reasoning_end`/`send_file_edit_events`.
+    /// Push a `session_updated` frame carrying the freshest `token_usage`
+    /// totals to every connection subscribed to `chat_id`, right after a
+    /// turn finishes. A no-op when the session has no usage yet (nothing
+    /// changed to report) or nobody is subscribed.
+    ///
+    /// The session is already saved by the time [`Self::send`] sees the
+    /// `TurnEnd` — `persist_finished_turn` (`agent::agent_loop`) writes
+    /// `token_usage` before publishing it — so this always reads the
+    /// current totals rather than a stale snapshot.
+    async fn fan_out_session_token_usage(&self, chat_id: &str) {
+        let usage = {
+            let session_manager = self
+                .base
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal(&get_session_id(chat_id))
+                .and_then(|session| session.usage())
+        };
+        let Some(usage) = usage else {
+            return;
+        };
+        let body = serde_json::json!({
+            "event": WsOutboundEvent::SessionUpdated.as_str(),
+            "chat_id": chat_id,
+            "scope": "metadata",
+            "token_usage": usage,
+        });
+        self.fan_out_to_chat(chat_id, &body.to_string()).await;
+    }
+
     async fn fan_out_to_chat(&self, chat_id: &str, raw: &str) -> usize {
         let recipients = self.connections.lock().await.senders_for_chat(chat_id);
         let mut delivered = 0usize;
@@ -2404,6 +2459,7 @@ impl BaseChannel for WebSocketChannel {
                 }
                 let shared = self.shared();
                 send_goal_status(&msg.chat_id, "idle", None, turn_id, &shared).await;
+                self.fan_out_session_token_usage(&msg.chat_id).await;
                 return Ok(());
             }
             Some(OutboundEvent::Progress(progress_event)) => {
@@ -2755,6 +2811,7 @@ mod tests {
     use super::*;
     use crate::bus::outbound_events::ProgressEvent;
     use crate::config::schema::JwtConfig;
+    use crate::providers::base::LLMUsage;
 
     // --- parse_inbound_payload ---
 
@@ -3486,6 +3543,57 @@ mod tests {
         assert_eq!(body["event"], "attached");
         assert_eq!(body["model_preset"], "fast");
         assert_eq!(body["model"], "claude-haiku");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_includes_token_usage_when_session_has_it() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:existing-chat".to_string());
+            session.update_usage(LLMUsage {
+                input_tokens: Some(120),
+                output_tokens: Some(45),
+                ..LLMUsage::new()
+            });
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("existing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert_eq!(body["token_usage"]["input_tokens"], 120);
+        assert_eq!(body["token_usage"]["output_tokens"], 45);
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_omits_token_usage_when_session_has_none() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("never-persisted"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+        assert!(
+            body.get("token_usage").is_none(),
+            "a chat with no recorded usage must not carry a token_usage key: {body}"
+        );
     }
 
     #[tokio::test]
@@ -6244,6 +6352,87 @@ mod tests {
                 .unwrap()
                 .websocket_turn_wall_started_at("chat-1")
                 .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_turn_end_fans_out_session_updated_with_token_usage_when_session_has_it() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = channel
+                .base
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.update_usage(LLMUsage {
+                input_tokens: Some(30),
+                output_tokens: Some(10),
+                ..LLMUsage::new()
+            });
+            session_manager.save(session).unwrap();
+        }
+
+        let result = BaseChannel::send(
+            &channel,
+            outbound(
+                "chat-1",
+                "",
+                Some(OutboundEvent::TurnEnd(Default::default())),
+            ),
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+
+        let goal_status = rx.try_recv().expect("expected a goal_status idle frame");
+        let goal_status_body: serde_json::Value =
+            serde_json::from_str(&goal_status.into_text().unwrap()).unwrap();
+        assert_eq!(goal_status_body["event"], "goal_status");
+
+        let session_updated = rx.try_recv().expect("expected a session_updated frame");
+        let body: serde_json::Value =
+            serde_json::from_str(&session_updated.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "session_updated");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["scope"], "metadata");
+        assert_eq!(body["token_usage"]["input_tokens"], 30);
+        assert_eq!(body["token_usage"]["output_tokens"], 10);
+    }
+
+    #[tokio::test]
+    async fn send_turn_end_does_not_fan_out_session_updated_when_session_has_no_usage() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        let result = BaseChannel::send(
+            &channel,
+            outbound(
+                "chat-1",
+                "",
+                Some(OutboundEvent::TurnEnd(Default::default())),
+            ),
+        )
+        .await;
+        assert_eq!(result, Ok(()));
+
+        let goal_status = rx.try_recv().expect("expected a goal_status idle frame");
+        let goal_status_body: serde_json::Value =
+            serde_json::from_str(&goal_status.into_text().unwrap()).unwrap();
+        assert_eq!(goal_status_body["event"], "goal_status");
+        assert!(
+            rx.try_recv().is_err(),
+            "no session usage yet must not produce a session_updated frame"
         );
     }
 

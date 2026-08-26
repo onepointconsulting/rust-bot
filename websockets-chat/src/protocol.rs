@@ -17,7 +17,7 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, ImageAttachment, Role, ToolEvent};
+use chat_ui::models::{ChatEntry, ImageAttachment, Role, SessionTokenUsage, ToolEvent};
 use serde::{Deserialize, Serialize};
 
 /// Outbound envelope sent to the gateway.
@@ -306,14 +306,22 @@ pub enum ServerEvent {
     /// and this chat's resolved selection (`"default"` when there's no
     /// session override) — see `model_preset_attached_fields` server-side.
     /// Empty/`None` on an older gateway that doesn't send them yet.
+    ///
+    /// `token_usage` is the session's lifetime totals — `None` for a brand
+    /// new chat, a session that predates usage tracking, or an older
+    /// gateway that doesn't send the field yet (see
+    /// `token_usage_attached_fields` server-side).
     Attached {
         chat_id: String,
         history: Vec<ChatEntry>,
         model_presets: Vec<String>,
         model_preset: Option<String>,
+        token_usage: Option<SessionTokenUsage>,
     },
     /// Sent when the server-side session state changes. Shape not yet
-    /// finalized server-side, so the raw JSON is kept as-is.
+    /// finalized server-side, so the raw JSON is kept as-is (`scope` and
+    /// `workspace_scope`/`token_usage` are read directly off this value by
+    /// the app rather than a typed field here).
     SessionUpdated(serde_json::Value),
     /// Acknowledges that a `message` envelope was accepted for processing.
     MessageAccepted { chat_id: String, turn_id: String },
@@ -605,6 +613,10 @@ struct AttachedWire {
     /// empty (nothing resolved, since there was nothing to resolve).
     #[serde(default)]
     model_preset: Option<String>,
+    /// Absent when the session has no recorded usage yet, or on an older
+    /// gateway that doesn't send it.
+    #[serde(default)]
+    token_usage: Option<SessionTokenUsage>,
 }
 
 #[derive(Deserialize)]
@@ -750,6 +762,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             history: history_to_entries(&w.history),
             model_presets: w.model_presets,
             model_preset: w.model_preset,
+            token_usage: w.token_usage,
         }),
         "session_updated" => Ok(ServerEvent::SessionUpdated(value)),
         "message_accepted" => {
@@ -823,6 +836,18 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         }
         _ => Ok(ServerEvent::Unknown(value)),
     }
+}
+
+/// Pull `token_usage` off a [`ServerEvent::SessionUpdated`] payload, if
+/// present. `session_updated`'s shape isn't finalized server-side (see the
+/// variant's doc comment), so this stays a targeted field read rather than a
+/// typed wire struct — absent on scope-only updates (e.g. `new_chat`'s
+/// workspace-scope notification) or an older gateway.
+pub fn session_updated_token_usage(value: &serde_json::Value) -> Option<SessionTokenUsage> {
+    value
+        .get("token_usage")
+        .cloned()
+        .and_then(|v| serde_json::from_value(v).ok())
 }
 
 #[cfg(test)]
@@ -911,6 +936,7 @@ mod tests {
                 history: vec![],
                 model_presets: vec![],
                 model_preset: None,
+                token_usage: None,
             }
         );
     }
@@ -926,8 +952,51 @@ mod tests {
                 history: vec![],
                 model_presets: vec!["default".to_string(), "fast".to_string()],
                 model_preset: Some("fast".to_string()),
+                token_usage: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_attached_with_token_usage() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","token_usage":{"input_tokens":120,"output_tokens":45}}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { token_usage, .. } => {
+                let usage = token_usage.expect("expected token_usage");
+                assert_eq!(usage.input_tokens, Some(120));
+                assert_eq!(usage.output_tokens, Some(45));
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attached_without_token_usage_is_none() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { token_usage, .. } => {
+                assert!(token_usage.is_none());
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn session_updated_token_usage_extracts_field_when_present() {
+        let raw = r#"{"event":"session_updated","chat_id":"chat-1","scope":"metadata","token_usage":{"input_tokens":30,"output_tokens":10}}"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        let usage = session_updated_token_usage(&value).expect("expected token_usage");
+        assert_eq!(usage.input_tokens, Some(30));
+        assert_eq!(usage.output_tokens, Some(10));
+    }
+
+    #[test]
+    fn session_updated_token_usage_none_when_absent() {
+        let raw = r#"{"event":"session_updated","chat_id":"chat-1","scope":"metadata","workspace_scope":{}}"#;
+        let value: serde_json::Value = serde_json::from_str(raw).unwrap();
+        assert!(session_updated_token_usage(&value).is_none());
     }
 
     #[test]

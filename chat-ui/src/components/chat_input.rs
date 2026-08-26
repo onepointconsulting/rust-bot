@@ -4,7 +4,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{File, FileList, HtmlInputElement, HtmlTextAreaElement};
 
-use crate::models::{ImageAttachment, OutgoingMessage};
+use crate::models::{ImageAttachment, OutgoingMessage, SessionTokenUsage, format_compact_tokens};
 
 const MAX_TEXTAREA_HEIGHT_PX: f64 = 160.0;
 /// Client-side guard against attaching huge images before base64 encoding.
@@ -173,6 +173,144 @@ fn ModelPresetPicker(
     }
 }
 
+/// Compact `"38.6K in · 412 out"` summary for the chip trigger. A field the
+/// provider never reported renders as `?` rather than `0`, matching
+/// [`SessionTokenUsage`]'s "missing is not zero" convention.
+fn usage_summary_text(usage: SessionTokenUsage) -> String {
+    let input = usage
+        .prompt_tokens()
+        .map(format_compact_tokens)
+        .unwrap_or_else(|| "?".to_string());
+    let output = usage
+        .output_tokens
+        .map(format_compact_tokens)
+        .unwrap_or_else(|| "?".to_string());
+    format!("{input} in · {output} out")
+}
+
+fn format_usd(amount: f64) -> String {
+    format!("${amount:.6}")
+}
+
+/// Labeled rows for the popup detail list — only fields the provider
+/// actually reported, in roughly the order they were incurred.
+fn usage_detail_rows(usage: SessionTokenUsage) -> Vec<(&'static str, String)> {
+    let mut rows = Vec::new();
+    if let Some(v) = usage.input_tokens {
+        rows.push(("Input", v.to_string()));
+    }
+    if let Some(v) = usage.cache_creation_input_tokens {
+        rows.push(("Cache write", v.to_string()));
+    }
+    if let Some(v) = usage.cache_read_input_tokens {
+        rows.push(("Cache read", v.to_string()));
+    }
+    if let Some(v) = usage.output_tokens {
+        rows.push(("Output", v.to_string()));
+    }
+    if let Some(v) = usage.reasoning_tokens {
+        rows.push(("Reasoning", v.to_string()));
+    }
+    if let Some(v) = usage.total_tokens() {
+        rows.push(("Total tokens", v.to_string()));
+    }
+    if let Some(v) = usage.input_cost {
+        rows.push(("Input cost", format_usd(v)));
+    }
+    if let Some(v) = usage.output_cost {
+        rows.push(("Output cost", format_usd(v)));
+    }
+    if let Some(v) = usage.total_cost() {
+        rows.push(("Total cost", format_usd(v)));
+    }
+    rows
+}
+
+/// Session usage drop-up, rendered on the toolbar row right after
+/// [`ModelPresetPicker`]. Absent entirely (not just disabled) once `usage`
+/// resolves to `None`/empty — a brand new chat, or an older gateway that
+/// doesn't send `token_usage` yet — same reasoning as the preset picker's
+/// own `Show`.
+///
+/// Two triggers share one drop-up: a text chip on `sm+` (desktop) and an
+/// icon-only button below `sm` (mobile), toggled by the same `menu_open`
+/// signal — see the component doc for [`crate::components::ChatHeaderActions`]
+/// for the equivalent desktop/mobile split elsewhere in this crate.
+#[component]
+fn SessionUsageChip(usage: Signal<Option<SessionTokenUsage>>) -> impl IntoView {
+    let menu_open = RwSignal::new(false);
+    let has_usage = move || usage.get().is_some_and(|u| !u.is_empty());
+
+    view! {
+        <Show when=has_usage>
+            <div class="relative">
+                <button
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                    class="hidden items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700 sm:flex"
+                    on:click=move |_| menu_open.update(|open| *open = !*open)
+                >
+                    <span>{move || usage.get().map(usage_summary_text).unwrap_or_default()}</span>
+                </button>
+                <button
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                    aria-label="Session usage"
+                    title="Session usage"
+                    class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700 sm:hidden"
+                    on:click=move |_| menu_open.update(|open| *open = !*open)
+                >
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        class="h-4 w-4"
+                        aria-hidden="true"
+                    >
+                        <path d="M3 3v18h18" />
+                        <path d="M18 17V9" />
+                        <path d="M13 17V5" />
+                        <path d="M8 17v-3" />
+                    </svg>
+                </button>
+                <div class=move || {
+                    if menu_open.get() { "block" } else { "hidden" }
+                }>
+                    <div
+                        class="fixed inset-0 z-10"
+                        aria-hidden="true"
+                        on:click=move |_| menu_open.set(false)
+                    ></div>
+                    <div
+                        role="menu"
+                        class="absolute bottom-full right-0 z-20 mb-1 w-56 overflow-hidden rounded-xl bg-white py-2 shadow-lg ring-1 ring-slate-200"
+                    >
+                        <p class="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                            "Session usage"
+                        </p>
+                        <For
+                            each=move || usage.get().map(usage_detail_rows).unwrap_or_default()
+                            key=|(label, value)| format!("{label}:{value}")
+                            let((label, value))
+                        >
+                            <div class="flex items-center justify-between gap-3 px-3 py-1 text-sm text-slate-700">
+                                <span class="text-slate-500">{label}</span>
+                                <span class="font-medium">{value}</span>
+                            </div>
+                        </For>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
 #[component]
 fn AttachmentChip(
     index: usize,
@@ -222,6 +360,11 @@ pub fn ChatInput(
     #[prop(into, optional)]
     selected_model_preset: Option<Signal<String>>,
     #[prop(optional)] on_select_model_preset: Option<Callback<String>>,
+    /// This session's lifetime token/cost totals. Omitted, or resolving to
+    /// `None`/empty, hides the usage chip entirely — `web-chat` (no gateway
+    /// usage protocol) never sets this.
+    #[prop(into, optional)]
+    session_usage: Option<Signal<Option<SessionTokenUsage>>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -520,6 +663,12 @@ pub fn ChatInput(
                                 .into_any()
                         }
                         _ => view! { <></> }.into_any(),
+                    }
+                }}
+                {move || {
+                    match session_usage {
+                        Some(usage) => view! { <SessionUsageChip usage=usage /> }.into_any(),
+                        None => view! { <></> }.into_any(),
                     }
                 }}
             </div>

@@ -22,7 +22,9 @@ use uuid::Uuid;
 
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
-use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem};
+use chat_ui::models::{
+    ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem, SessionTokenUsage,
+};
 
 use crate::api::{self, WsSender};
 use crate::components::ChatShell;
@@ -322,6 +324,12 @@ struct WsContext {
     /// [`request_set_model_preset`] and reconciled by the `attached` /
     /// `model_preset_set` acks.
     model_preset: RwSignal<String>,
+    /// This chat's lifetime token/cost totals, from the active chat's
+    /// `attached` frame and refreshed by `session_updated` after each turn.
+    /// `None` hides the usage chip entirely — a brand new chat, a session
+    /// that predates usage tracking, or an older gateway that doesn't send
+    /// the field yet.
+    session_usage: RwSignal<Option<SessionTokenUsage>>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -658,6 +666,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             history,
             model_presets,
             model_preset,
+            token_usage,
         } => {
             log::info!(
                 "attached to chat_id={chat_id} history_len={}",
@@ -677,6 +686,10 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             ctx.model_preset
                 .set(model_preset.unwrap_or_else(|| "default".to_string()));
+            // Unlike the preset catalog, always replace — a chat switch or
+            // "New chat" must not keep showing the *previous* session's
+            // usage chip when this one has none yet.
+            ctx.session_usage.set(token_usage);
             // An empty snapshot means the gateway has nothing *persisted*
             // for this chat (brand new, or a first turn still in flight) —
             // not that the transcript is empty. Adopting it verbatim would
@@ -694,7 +707,12 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             request_chat_list(ctx);
         }
-        ServerEvent::SessionUpdated(value) => log::info!("session updated: {value}"),
+        ServerEvent::SessionUpdated(value) => {
+            log::info!("session updated: {value}");
+            if let Some(usage) = protocol::session_updated_token_usage(&value) {
+                ctx.session_usage.set(Some(usage));
+            }
+        }
         ServerEvent::GoalState(value) => {
             log::info!("goal state (shape not finalized server-side): {value}")
         }
@@ -1224,6 +1242,7 @@ pub fn App() -> impl IntoView {
     let split_stream_on_next_delta = RwSignal::new(false);
     let model_presets = RwSignal::new(Vec::<String>::new());
     let model_preset = RwSignal::new("default".to_string());
+    let session_usage = RwSignal::new(None::<SessionTokenUsage>);
 
     let ws_context = WsContext {
         token,
@@ -1246,6 +1265,7 @@ pub fn App() -> impl IntoView {
         split_stream_on_next_delta,
         model_presets,
         model_preset,
+        session_usage,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -1328,6 +1348,7 @@ pub fn App() -> impl IntoView {
         sidebar_open.set(false);
         model_presets.set(Vec::new());
         model_preset.set("default".to_string());
+        session_usage.set(None);
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -1465,6 +1486,7 @@ pub fn App() -> impl IntoView {
                     model_presets=Signal::derive(move || model_presets.get())
                     selected_model_preset=Signal::derive(move || model_preset.get())
                     on_select_model_preset=on_select_model_preset
+                    session_usage=Signal::derive(move || session_usage.get())
                 />
             </Show>
         </Show>

@@ -123,6 +123,7 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::SetModelPreset`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ModelPresetSet,
+    User
 }
 
 impl WsOutboundEvent {
@@ -140,6 +141,7 @@ impl WsOutboundEvent {
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
             Self::ModelPresetSet => "model_preset_set",
+            Self::User => "user",
         }
     }
 }
