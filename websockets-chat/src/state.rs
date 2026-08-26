@@ -14,7 +14,7 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, Role, SessionListItem, ToolEvent};
+use chat_ui::models::{ChatEntry, ImageAttachment, Role, SessionListItem, ToolEvent};
 
 /// Prefix identifying a gateway-served media URL (`serve_media` in
 /// `src/channels/websocket/webui/media.rs`) rather than a `data:` or
@@ -70,6 +70,53 @@ fn find_entry_for_turn<'a>(
 ) -> Option<&'a mut ChatEntry> {
     let entry_id = *turn_index.get(turn_id)?;
     entries.iter_mut().find(|entry| entry.id == entry_id)
+}
+
+/// Insert the user bubble and a streaming assistant placeholder for
+/// `turn_id`, recording the placeholder in `turn_index` — the pure core of
+/// `app.rs`'s `start_local_turn`, shared by a turn this tab sends
+/// (`do_send`) and one it adopts from another connection's
+/// (`ServerEvent::User`).
+///
+/// Returns `false` without touching `entries`/`next_id` if `turn_id` is
+/// already in `turn_index` — the sender's own optimistic insert already ran
+/// for a turn this tab sent, and a duplicate `ServerEvent::User` echo (or a
+/// slow reconnect replaying one) must not insert the bubble twice. Callers
+/// should skip persisting/activating the turn when this returns `false`.
+pub fn begin_turn(
+    entries: &mut Vec<ChatEntry>,
+    turn_index: &mut HashMap<String, u64>,
+    next_id: &mut u64,
+    turn_id: &str,
+    text: String,
+    attachments: Vec<ImageAttachment>,
+) -> bool {
+    if turn_index.contains_key(turn_id) {
+        return false;
+    }
+    let user_id = *next_id;
+    entries.push(ChatEntry {
+        id: user_id,
+        role: Role::User,
+        content: text,
+        attachments,
+        streaming: false,
+        tool_events: None,
+        reasoning: None,
+    });
+    let placeholder_id = user_id + 1;
+    entries.push(ChatEntry {
+        id: placeholder_id,
+        role: Role::Assistant,
+        content: String::new(),
+        attachments: Vec::new(),
+        streaming: true,
+        tool_events: None,
+        reasoning: None,
+    });
+    *next_id = placeholder_id + 1;
+    turn_index.insert(turn_id.to_string(), placeholder_id);
+    true
 }
 
 /// Append a `delta` event's text chunk onto the entry tracking `turn_id`.
@@ -481,6 +528,18 @@ fn percent_encode_query_value(value: &str) -> String {
     encoded
 }
 
+/// Append `?token=<token>` to `url` if it's gateway-served
+/// (`/v1/media/...`), leaving `data:` and other `http(s)://` URLs
+/// untouched. Shared by [`authorize_media_attachments`] (existing history
+/// rows) and [`media_urls_to_attachments`] (a live `user` event's
+/// freshly-resolved URLs) — both need the same query-param auth on the same
+/// URL shape.
+fn stamp_media_url(url: &mut String, token: &str) {
+    if url.starts_with(GATEWAY_MEDIA_URL_PREFIX) {
+        *url = format!("{url}?token={}", percent_encode_query_value(token));
+    }
+}
+
 /// Append `?token=<token>` to every gateway-served (`/v1/media/...`)
 /// attachment URL on `entries`, leaving `data:` and other `http(s)://` URLs
 /// untouched.
@@ -504,16 +563,28 @@ pub fn authorize_media_attachments(
     };
     for entry in &mut entries {
         for attachment in &mut entry.attachments {
-            if attachment.url.starts_with(GATEWAY_MEDIA_URL_PREFIX) {
-                attachment.url = format!(
-                    "{}?token={}",
-                    attachment.url,
-                    percent_encode_query_value(token)
-                );
-            }
+            stamp_media_url(&mut attachment.url, token);
         }
     }
     entries
+}
+
+/// Turn a `ServerEvent::User` event's already-resolved `/v1/media/...` URLs
+/// into [`ImageAttachment`]s, token-stamping gateway URLs the same way
+/// [`authorize_media_attachments`] does for a restored history snapshot — a
+/// remotely announced turn's attachments need the same auth query param to
+/// actually load in an `<img src>`.
+pub fn media_urls_to_attachments(media: Vec<String>, token: Option<&str>) -> Vec<ImageAttachment> {
+    let token = token.filter(|t| !t.is_empty());
+    media
+        .into_iter()
+        .map(|mut url| {
+            if let Some(token) = token {
+                stamp_media_url(&mut url, token);
+            }
+            ImageAttachment { url, label: None }
+        })
+        .collect()
 }
 
 /// Build the gateway WebSocket URL.
@@ -611,6 +682,79 @@ mod tests {
         apply_delta(&mut entries, &index, "some-other-turn", "ignored");
 
         assert_eq!(entries[0].content, "");
+    }
+
+    #[test]
+    fn begin_turn_inserts_a_user_bubble_and_a_streaming_placeholder() {
+        let mut entries = Vec::new();
+        let mut turn_index = HashMap::new();
+        let mut next_id = 0u64;
+
+        let started = begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "hello there".to_string(),
+            Vec::new(),
+        );
+
+        assert!(started);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].role, Role::User);
+        assert_eq!(entries[0].content, "hello there");
+        assert!(!entries[0].streaming);
+        assert_eq!(entries[1].role, Role::Assistant);
+        assert_eq!(entries[1].content, "");
+        assert!(entries[1].streaming);
+        assert_eq!(turn_index.get("turn-1"), Some(&entries[1].id));
+        assert_eq!(next_id, entries[1].id + 1);
+    }
+
+    #[test]
+    fn begin_turn_carries_attachments_on_the_user_bubble_only() {
+        let mut entries = Vec::new();
+        let mut turn_index = HashMap::new();
+        let mut next_id = 0u64;
+        let attachments = vec![ImageAttachment {
+            url: "/v1/media/websocket/abc.png".to_string(),
+            label: None,
+        }];
+
+        begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "look at this".to_string(),
+            attachments.clone(),
+        );
+
+        assert_eq!(entries[0].attachments, attachments);
+        assert!(entries[1].attachments.is_empty());
+    }
+
+    #[test]
+    fn begin_turn_is_a_no_op_when_turn_id_is_already_known() {
+        let mut entries = vec![assistant_entry(7)];
+        let mut turn_index = index_with("turn-1", 7);
+        let mut next_id = 8u64;
+
+        let started = begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "duplicate echo".to_string(),
+            Vec::new(),
+        );
+
+        assert!(
+            !started,
+            "a turn_id already in turn_index must not be inserted twice"
+        );
+        assert_eq!(entries.len(), 1, "no new bubbles should have been added");
+        assert_eq!(next_id, 8, "next_id must be untouched on a no-op");
     }
 
     #[test]
@@ -1139,6 +1283,48 @@ mod tests {
         assert_eq!(result, entries);
         let result = authorize_media_attachments(entries.clone(), Some(""));
         assert_eq!(result, entries);
+    }
+
+    #[test]
+    fn media_urls_to_attachments_stamps_gateway_urls_only() {
+        let media = vec![
+            "/v1/media/websocket/abc.png".to_string(),
+            "https://example.com/a.png".to_string(),
+        ];
+
+        let attachments = media_urls_to_attachments(media, Some("tok en"));
+
+        assert_eq!(
+            attachments,
+            vec![
+                ImageAttachment {
+                    url: "/v1/media/websocket/abc.png?token=tok%20en".to_string(),
+                    label: None,
+                },
+                ImageAttachment {
+                    url: "https://example.com/a.png".to_string(),
+                    label: None,
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn media_urls_to_attachments_no_op_without_a_token() {
+        let media = vec!["/v1/media/websocket/abc.png".to_string()];
+        let attachments = media_urls_to_attachments(media, None);
+        assert_eq!(
+            attachments,
+            vec![ImageAttachment {
+                url: "/v1/media/websocket/abc.png".to_string(),
+                label: None,
+            }]
+        );
+    }
+
+    #[test]
+    fn media_urls_to_attachments_empty_input_is_empty_output() {
+        assert_eq!(media_urls_to_attachments(Vec::new(), Some("tok")), vec![]);
     }
 
     #[test]

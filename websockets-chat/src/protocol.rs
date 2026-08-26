@@ -325,6 +325,20 @@ pub enum ServerEvent {
     SessionUpdated(serde_json::Value),
     /// Acknowledges that a `message` envelope was accepted for processing.
     MessageAccepted { chat_id: String, turn_id: String },
+    /// The user half of a turn accepted on `chat_id` — fanned out to every
+    /// connection subscribed to the chat, including the sender, as soon as
+    /// the gateway accepts it (before the reply starts). Lets a second tab
+    /// or device already attached to the same chat insert the prompt and
+    /// adopt `turn_id` so it can follow the reply as `delta`/`stream_end`
+    /// frames arrive, the same way the sender's own optimistic insert does.
+    /// `media` entries are already-resolved `/v1/media/...` URLs, same shape
+    /// as [`ServerEvent::Attached`]'s `history` rows.
+    User {
+        chat_id: String,
+        turn_id: String,
+        text: String,
+        media: Vec<String>,
+    },
     /// Sustained-goal state snapshot. Shape not yet finalized server-side, so
     /// the raw JSON is kept as-is.
     GoalState(serde_json::Value),
@@ -423,6 +437,7 @@ impl ServerEvent {
             ServerEvent::Ready { chat_id, .. }
             | ServerEvent::Attached { chat_id, .. }
             | ServerEvent::MessageAccepted { chat_id, .. }
+            | ServerEvent::User { chat_id, .. }
             | ServerEvent::GoalStatus { chat_id, .. }
             | ServerEvent::Message { chat_id, .. }
             | ServerEvent::Delta { chat_id, .. }
@@ -626,6 +641,16 @@ struct MessageAcceptedWire {
 }
 
 #[derive(Deserialize)]
+struct UserWire {
+    chat_id: String,
+    turn_id: String,
+    #[serde(default)]
+    text: String,
+    #[serde(default)]
+    media: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct GoalStatusWire {
     chat_id: String,
     status: String,
@@ -771,6 +796,12 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 turn_id: w.turn_id,
             })
         }
+        "user" => decode::<UserWire>(&value).map(|w| ServerEvent::User {
+            chat_id: w.chat_id,
+            turn_id: w.turn_id,
+            text: w.text,
+            media: w.media,
+        }),
         "goal_state" => Ok(ServerEvent::GoalState(value)),
         "goal_status" => decode::<GoalStatusWire>(&value).map(|w| ServerEvent::GoalStatus {
             chat_id: w.chat_id,
@@ -1150,6 +1181,62 @@ mod tests {
                 turn_id: "turn-1".to_string(),
             }
         );
+    }
+
+    #[test]
+    fn parses_user_event_text_only() {
+        let raw = r#"{"event":"user","chat_id":"chat-1","turn_id":"turn-1","text":"hello there"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::User {
+                chat_id: "chat-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                text: "hello there".to_string(),
+                media: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_user_event_with_media() {
+        let raw = r#"{"event":"user","chat_id":"chat-1","turn_id":"turn-1","text":"look at this","media":["/v1/media/websocket/abc.png"]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::User {
+                chat_id: "chat-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                text: "look at this".to_string(),
+                media: vec!["/v1/media/websocket/abc.png".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_user_event_ignoring_unknown_extra_fields() {
+        let raw = r#"{"event":"user","chat_id":"chat-1","turn_id":"turn-1","text":"hi","from_future_field":true}"#;
+        let event = parse_server_event(raw).expect("unknown extra fields must not fail parsing");
+        assert_eq!(
+            event,
+            ServerEvent::User {
+                chat_id: "chat-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                text: "hi".to_string(),
+                media: Vec::new(),
+            }
+        );
+    }
+
+    #[test]
+    fn user_event_chat_id_is_scoped() {
+        let event = ServerEvent::User {
+            chat_id: "chat-1".to_string(),
+            turn_id: "turn-1".to_string(),
+            text: "hi".to_string(),
+            media: Vec::new(),
+        };
+        assert_eq!(event.chat_id(), Some("chat-1"));
     }
 
     #[test]

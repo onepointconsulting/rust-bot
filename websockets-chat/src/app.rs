@@ -255,7 +255,11 @@ struct WsContext {
     entries: RwSignal<Vec<ChatEntry>>,
     next_id: RwSignal<u64>,
     turn_index: RwSignal<HashMap<String, u64>>,
-    /// The turn most recently sent by this client, if any.
+    /// The chat's in-flight turn, if any — not necessarily one this tab
+    /// sent: [`ServerEvent::User`] adopts a turn a *different* connection
+    /// sent for the same chat the same way [`start_local_turn`] adopts one
+    /// sent from here, so a chat this tab is only watching still ends up
+    /// with this set while that turn runs.
     ///
     /// `delta`/`stream_end`/`reasoning_delta`/`reasoning_end` events from
     /// the gateway (see `protocol::ServerEvent`) carry only a `stream_id`,
@@ -354,6 +358,48 @@ fn update_entries(
     mutator(&mut entries, &index);
     persist_entries(&entries);
     ctx.entries.set(entries);
+}
+
+/// Insert the user bubble and a streaming assistant placeholder for
+/// `turn_id`, and make it the chat's in-flight turn — a no-op if `turn_id`
+/// is already in `turn_index` (see [`state::begin_turn`]'s doc comment).
+///
+/// This is the exact sequence a turn *this* tab sends needs (`do_send`) —
+/// extracted so [`ServerEvent::User`] (a turn some *other* connection sent
+/// for the same chat) can adopt it identically, deduping a same-turn echo
+/// of its own optimistic insert rather than double-inserting the bubble.
+/// Once this returns, the existing `Delta`/`StreamEnd`/`Reasoning*`/
+/// final-`Message` handling in [`dispatch_server_event`] — which all key
+/// off [`WsContext::active_turn_id`] — fills the placeholder in without any
+/// further turn-specific routing.
+fn start_local_turn(
+    ctx: &WsContext,
+    turn_id: String,
+    text: String,
+    attachments: Vec<ImageAttachment>,
+) {
+    let mut entries = ctx.entries.get_untracked();
+    let mut turn_index = ctx.turn_index.get_untracked();
+    let mut next_id = ctx.next_id.get_untracked();
+    let started = state::begin_turn(
+        &mut entries,
+        &mut turn_index,
+        &mut next_id,
+        &turn_id,
+        text,
+        attachments,
+    );
+    if !started {
+        return;
+    }
+    let entries = trim_to_max_turns(entries, MAX_STORED_TURNS);
+    persist_entries(&entries);
+    ctx.entries.set(entries);
+    ctx.turn_index.set(turn_index);
+    ctx.next_id.set(next_id);
+    ctx.active_turn_id.set(Some(turn_id));
+    ctx.chat_error.set(None);
+    ctx.split_stream_on_next_delta.set(false);
 }
 
 fn append_finished_assistant_entry(ctx: &WsContext, text: String) {
@@ -580,6 +626,19 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::MessageAccepted { chat_id, turn_id } => {
             log::info!("message accepted: chat_id={chat_id} turn_id={turn_id}");
+        }
+        ServerEvent::User {
+            turn_id,
+            text,
+            media,
+            ..
+        } => {
+            // A no-op when `turn_id` is already in `turn_index` — the echo
+            // of a turn this tab itself just sent (see `start_local_turn`'s
+            // doc comment), whose optimistic insert already happened.
+            let attachments =
+                state::media_urls_to_attachments(media, ctx.token.get_untracked().as_deref());
+            start_local_turn(ctx, turn_id, text, attachments);
         }
         ServerEvent::GoalStatus {
             chat_id,
@@ -1274,29 +1333,6 @@ pub fn App() -> impl IntoView {
         open_connection(ws_context);
     }
 
-    let push_entry = move |role: Role,
-                           content: String,
-                           attachments: Vec<ImageAttachment>,
-                           streaming: bool|
-          -> u64 {
-        let id = next_id.get_untracked();
-        next_id.set(id + 1);
-        entries.update(|list| {
-            list.push(ChatEntry {
-                id,
-                role,
-                content,
-                attachments,
-                streaming,
-                tool_events: None,
-                reasoning: None,
-            });
-            *list = trim_to_max_turns(std::mem::take(list), MAX_STORED_TURNS);
-        });
-        persist_entries(&entries.get_untracked());
-        id
-    };
-
     let do_login = move |email: String, password: String| {
         login_error.set(None);
         login_pending.set(true);
@@ -1362,14 +1398,12 @@ pub fn App() -> impl IntoView {
         let OutgoingMessage { text, attachments } = outgoing;
         let turn_id = Uuid::new_v4().to_string();
 
-        push_entry(Role::User, text.clone(), attachments.clone(), false);
-        let placeholder_id = push_entry(Role::Assistant, String::new(), Vec::new(), true);
-        turn_index.update(|map| {
-            map.insert(turn_id.clone(), placeholder_id);
-        });
-        active_turn_id.set(Some(turn_id.clone()));
-        chat_error.set(None);
-        split_stream_on_next_delta.set(false);
+        start_local_turn(
+            &ws_context,
+            turn_id.clone(),
+            text.clone(),
+            attachments.clone(),
+        );
 
         let media = build_media_payload(&attachments);
         send_client_envelope(

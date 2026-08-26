@@ -1808,20 +1808,24 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     }
     if is_webui {
         // Recover from a poisoned mutex rather than panicking the WS handler —
-        // same pattern as the turn registry lock above.
-        let mut transcripts = shared
-            .gateway_services
-            .transcripts
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        transcripts.append_user_message(
-            cid,
-            content,
-            &metadata,
-            (!media_paths.is_empty()).then_some(media_paths.as_slice()),
-            (!cli_apps.is_empty()).then_some(cli_apps.as_slice()),
-            (!mcp_presets.is_empty()).then_some(mcp_presets.as_slice()),
-        );
+        // same pattern as the turn registry lock above. Scoped so the
+        // (synchronous) `MutexGuard` is dropped before this block's own
+        // `send_user_turn`/other `.await`s below.
+        {
+            let mut transcripts = shared
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_user_message(
+                cid,
+                content,
+                &metadata,
+                (!media_paths.is_empty()).then_some(media_paths.as_slice()),
+                (!cli_apps.is_empty()).then_some(cli_apps.as_slice()),
+                (!mcp_presets.is_empty()).then_some(mcp_presets.as_slice()),
+            );
+        }
         if webui_quote_allowed
             && let Some(block) = webui_quote_runtime_context(envelope.get("quoted_context"))
         {
@@ -1829,6 +1833,19 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
                 RUNTIME_CONTEXT_INPUT_META.to_string(),
                 serde_json::to_value([block]).unwrap_or(serde_json::Value::Null),
             );
+        }
+        // Fan out the user half of this turn to every subscriber *before*
+        // publishing below — see `send_user_turn`'s doc comment for why the
+        // ordering matters. Keyed off the normalized turn id (always present
+        // here: `client_turn_metadata` above set it whenever `is_webui` is
+        // true) rather than the client-supplied `turn_id`, so a client that
+        // omitted one still gets a stable id other subscribers can adopt.
+        if let Some(normalized_turn_id) = metadata
+            .get(WEBUI_TURN_METADATA_KEY)
+            .and_then(|v| v.as_str())
+        {
+            let media_urls = resolve_media_urls(&media_paths, &shared.media_root);
+            send_user_turn(cid, normalized_turn_id, content, &media_urls, shared).await;
         }
     }
     let send_result = handle_message(
@@ -2052,6 +2069,75 @@ async fn send_goal_state(chat_id: &str, blob: serde_json::Value, ws_shared: &WsS
         if tx.send(Message::text(raw.clone())).is_err() {
             log::warn!(
                 "WebSocket channel: connection '{connection_id}' gone while sending goal_state, cleaning up"
+            );
+            ws_shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&connection_id);
+        }
+    }
+}
+
+/// Map stored attachment paths (as returned by [`store_inbound_attachments`])
+/// to browser-relative `/v1/media/...` URLs for the outbound `user` event,
+/// dropping any that no longer resolve. Always disk paths (never an
+/// `http(s)://` passthrough — unlike [`resolve_history_media`]'s `media`
+/// field, a freshly stored attachment was never anything else), so this is a
+/// direct map over [`media_url_from_stored_path`] rather than needing that
+/// function's extra branch. Split out from its one call site in
+/// [`handle_envelope_message`] so it's unit-testable against a real
+/// `media_root` without going through the global-config-backed
+/// `store_inbound_attachments`/`get_media_dir` path.
+fn resolve_media_urls(media_paths: &[String], media_root: &std::path::Path) -> Vec<String> {
+    media_paths
+        .iter()
+        .filter_map(|p| {
+            crate::channels::websocket::webui::media::media_url_from_stored_path(p, media_root)
+        })
+        .collect()
+}
+
+/// Fan out the user half of a just-accepted webui turn to every connection
+/// subscribed to `chat_id`, including the sender. A client watching the same
+/// chat from elsewhere has no other way to learn the prompt or `turn_id`, so
+/// without this it can only ever render the assistant side of someone else's
+/// turn (or nothing at all, since `delta`/`stream_end` are keyed off a
+/// `turn_id` it never received). Rust-side addition, no nanobot wire-name
+/// precedent to mirror.
+///
+/// Called from [`handle_envelope_message`] *before* the turn is published to
+/// the bus — a fast-starting stream must never emit `delta` before a watcher
+/// has had a chance to adopt `turn_id` and set its own `active_turn_id`.
+/// Fan-out + cleanup-on-failure follows the same pattern as
+/// [`send_goal_state`]. The sender also receives this frame; that's fine —
+/// clients that already recorded `turn_id` locally (the sender did, via its
+/// own optimistic insert) are expected to ignore a duplicate.
+async fn send_user_turn(
+    chat_id: &str,
+    turn_id: &str,
+    text: &str,
+    media: &[String],
+    ws_shared: &WsShared,
+) {
+    let recipients = ws_shared.connections.lock().await.senders_for_chat(chat_id);
+    if recipients.is_empty() {
+        return;
+    }
+    let mut body = serde_json::json!({
+        "event": WsOutboundEvent::User.as_str(),
+        "chat_id": chat_id,
+        "turn_id": turn_id,
+        "text": text,
+    });
+    if !media.is_empty() {
+        body["media"] = serde_json::json!(media);
+    }
+    let raw = body.to_string();
+    for (connection_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            log::warn!(
+                "WebSocket channel: connection '{connection_id}' gone while sending user turn, cleaning up"
             );
             ws_shared
                 .connections
@@ -3259,6 +3345,125 @@ mod tests {
         );
     }
 
+    // --- send_user_turn / resolve_media_urls ---
+
+    #[tokio::test]
+    async fn send_user_turn_delivers_to_every_subscribed_connection() {
+        let shared = test_shared("browser");
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+
+        send_user_turn("chat-1", "turn-1", "hello there", &[], &shared).await;
+
+        for rx in [&mut rx1, &mut rx2] {
+            let body = recv_json(rx);
+            assert_eq!(body["event"], "user");
+            assert_eq!(body["chat_id"], "chat-1");
+            assert_eq!(body["turn_id"], "turn-1");
+            assert_eq!(body["text"], "hello there");
+            assert!(
+                body.get("media").is_none(),
+                "media must be omitted, not an empty array, when there's no attachment: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn send_user_turn_includes_media_when_present() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        send_user_turn(
+            "chat-1",
+            "turn-1",
+            "look at this",
+            &["/v1/media/websocket/abc.png".to_string()],
+            &shared,
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(
+            body["media"],
+            serde_json::json!(["/v1/media/websocket/abc.png"])
+        );
+    }
+
+    #[tokio::test]
+    async fn send_user_turn_noop_when_no_subscribers() {
+        let shared = test_shared("browser");
+        // Must not panic even though nothing is subscribed to "chat-1".
+        send_user_turn("chat-1", "turn-1", "hello", &[], &shared).await;
+    }
+
+    #[tokio::test]
+    async fn send_user_turn_cleans_up_a_connection_that_is_gone() {
+        let shared = test_shared("browser");
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        drop(rx); // simulate the connection's writer task having already exited
+
+        send_user_turn("chat-1", "turn-1", "hello", &[], &shared).await;
+
+        assert!(
+            shared
+                .connections
+                .lock()
+                .await
+                .sender_for("conn-1")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn resolve_media_urls_converts_a_stored_disk_path_to_a_browser_url() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        let image_path = sub.join("abc.png");
+        std::fs::write(&image_path, b"fake-png").unwrap();
+
+        let resolved = resolve_media_urls(&[image_path.display().to_string()], dir.path());
+
+        assert_eq!(resolved, vec!["/v1/media/websocket/abc.png".to_string()]);
+    }
+
+    #[test]
+    fn resolve_media_urls_drops_a_path_that_no_longer_exists() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_media_urls(
+            &[dir.path().join("gone.png").display().to_string()],
+            dir.path(),
+        );
+        assert!(resolved.is_empty());
+    }
+
+    #[test]
+    fn resolve_media_urls_empty_input_is_empty_output() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(resolve_media_urls(&[], dir.path()).is_empty());
+    }
+
     #[tokio::test]
     async fn workspace_scope_or_error_returns_scope_on_success() {
         let shared = test_shared("browser");
@@ -4317,6 +4522,215 @@ mod tests {
         assert_eq!(history[0]["content"], "hello");
         assert_eq!(history[1]["role"], "assistant");
         assert_eq!(history[1]["content"], "hi there");
+    }
+
+    // --- handle_envelope_message: `user` fan-out ---
+
+    fn dispatch_message<'a>(
+        envelope: &'a Envelope,
+        connection_id: &'a str,
+        client_id: &'a str,
+        shared: &'a WsShared,
+    ) -> impl Future<Output = ()> + 'a {
+        dispatch_envelope(EnvelopeDispatchContext {
+            envelope,
+            connection_id,
+            client_id,
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        })
+    }
+
+    fn message_envelope(chat_id: &str, content: &str, turn_id: Option<&str>) -> Envelope {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("message"));
+        envelope.insert("chat_id".to_string(), serde_json::json!(chat_id));
+        envelope.insert("content".to_string(), serde_json::json!(content));
+        envelope.insert("webui".to_string(), serde_json::json!(true));
+        if let Some(turn_id) = turn_id {
+            envelope.insert("turn_id".to_string(), serde_json::json!(turn_id));
+        }
+        envelope
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_message_fans_out_user_event_to_every_subscribed_connection() {
+        let shared = test_shared("browser");
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        let (tx3, mut rx3) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+        // Subscribed to a different chat entirely — must receive nothing.
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-3", "chat-2", tx3);
+
+        let envelope = message_envelope("chat-1", "hello there", Some("turn-1"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_message(&envelope, "conn-1", "client-1", &shared),
+        )
+        .await
+        .expect("handle_envelope_message must not hang");
+
+        let user_event_1 = recv_json(&mut rx1);
+        assert_eq!(user_event_1["event"], "user");
+        assert_eq!(user_event_1["chat_id"], "chat-1");
+        assert_eq!(user_event_1["turn_id"], "turn-1");
+        assert_eq!(user_event_1["text"], "hello there");
+
+        let user_event_2 = recv_json(&mut rx2);
+        assert_eq!(
+            user_event_2, user_event_1,
+            "every subscriber, including the sender, gets the same frame"
+        );
+
+        assert!(
+            rx3.try_recv().is_err(),
+            "a connection subscribed to a different chat must receive nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_message_sends_user_event_before_message_accepted() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        let envelope = message_envelope("chat-1", "hello", Some("turn-1"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_message(&envelope, "conn-1", "client-1", &shared),
+        )
+        .await
+        .expect("handle_envelope_message must not hang");
+
+        let first = recv_json(&mut rx);
+        assert_eq!(
+            first["event"], "user",
+            "a fast-starting stream must never race ahead of this frame"
+        );
+        let second = recv_json(&mut rx);
+        assert_eq!(second["event"], "message_accepted");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_message_user_event_uses_a_normalized_turn_id_when_client_omits_one() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        let envelope = message_envelope("chat-1", "hello", None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_message(&envelope, "conn-1", "client-1", &shared),
+        )
+        .await
+        .expect("handle_envelope_message must not hang");
+
+        let user_event = recv_json(&mut rx);
+        assert_eq!(user_event["event"], "user");
+        let turn_id = user_event["turn_id"]
+            .as_str()
+            .expect("turn_id must still be present so a watcher can adopt the turn");
+        assert!(!turn_id.is_empty());
+        // No `message_accepted` follows: that ack is only sent for a
+        // client-supplied `turn_id` (mirrors nanobot's `if is_webui and
+        // turn_id:`), unlike `user`, which always carries the normalized id.
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_message_access_denied_does_not_emit_a_user_event() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+
+        let envelope = message_envelope("chat-1", "hello", Some("turn-1"));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_message(&envelope, "conn-1", "client-1", &shared),
+        )
+        .await
+        .expect("handle_envelope_message must not hang");
+
+        let body = recv_json(&mut rx1);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert!(
+            rx2.try_recv().is_err(),
+            "a rejected turn must not fan out a user event to other subscribers"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_message_missing_content_does_not_emit_a_user_event() {
+        let shared = test_shared("browser");
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+
+        let envelope = message_envelope("chat-1", "", None);
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_message(&envelope, "conn-1", "client-1", &shared),
+        )
+        .await
+        .expect("handle_envelope_message must not hang");
+
+        let body = recv_json(&mut rx1);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "missing content");
+        assert!(
+            rx2.try_recv().is_err(),
+            "a rejected turn must not fan out a user event to other subscribers"
+        );
     }
 
     #[tokio::test]

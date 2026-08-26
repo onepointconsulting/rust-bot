@@ -123,7 +123,14 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::SetModelPreset`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ModelPresetSet,
-    User
+    /// Fan-out of the user half of a just-accepted [`EnvelopeType::Message`]
+    /// turn, sent to every connection subscribed to the chat (including the
+    /// sender) — not a reply to the sender alone, unlike every other variant
+    /// here. Lets a client watching the same chat from elsewhere insert the
+    /// prompt and adopt `turn_id` so it can follow the reply as `delta`/
+    /// `stream_end` frames arrive. Rust-side addition, no nanobot wire-name
+    /// precedent to mirror.
+    User,
 }
 
 impl WsOutboundEvent {
@@ -470,5 +477,10 @@ mod tests {
     #[test]
     fn ws_outbound_event_model_preset_set_has_no_nanobot_precedent() {
         assert_eq!(WsOutboundEvent::ModelPresetSet.as_str(), "model_preset_set");
+    }
+
+    #[test]
+    fn ws_outbound_event_user_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::User.as_str(), "user");
     }
 }
