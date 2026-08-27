@@ -4,7 +4,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use web_sys::{File, FileList, HtmlInputElement, HtmlTextAreaElement};
 
-use crate::models::{ImageAttachment, OutgoingMessage, SessionTokenUsage, format_compact_tokens};
+use crate::models::{format_compact_tokens, ImageAttachment, OutgoingMessage, SessionTokenUsage};
 
 const MAX_TEXTAREA_HEIGHT_PX: f64 = 160.0;
 /// Client-side guard against attaching huge images before base64 encoding.
@@ -289,7 +289,7 @@ fn SessionUsageChip(usage: Signal<Option<SessionTokenUsage>>) -> impl IntoView {
                     ></div>
                     <div
                         role="menu"
-                        class="absolute bottom-full right-0 z-20 mb-1 w-56 overflow-hidden rounded-xl bg-white py-2 shadow-lg ring-1 ring-slate-200"
+                        class="absolute bottom-full left-0 z-20 mb-1 w-56 overflow-hidden rounded-xl bg-white py-2 shadow-lg ring-1 ring-slate-200"
                     >
                         <p class="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
                             "Session usage"

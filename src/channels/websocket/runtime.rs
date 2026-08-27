@@ -38,10 +38,10 @@ use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
 use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
-use crate::session::SESSION_MODEL_PRESET_METADATA_KEY;
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
+use crate::session::{SESSION_MODEL_PRESET_METADATA_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY};
 use crate::{
     bus::{
         events::OutboundMessage,
@@ -223,21 +223,31 @@ pub(crate) const WEBUI_JWT_PURPOSE: &str = "webui";
 /// current agent-loop call site — forward-compatible plumbing only.
 const OUTBOUND_META_AGENT_UI: &str = "_agent_ui";
 
-/// Reject the upgrade with 401 when JWT auth is enabled and the token is
-/// missing/invalid. No-op (always `Ok`) when JWT is disabled.
+/// Reject the upgrade with 401 when JWT auth is enabled, a token is
+/// required (`WsShared::require_auth`), and the token is missing/invalid.
+/// No-op (always `Ok`) when JWT is disabled. When JWT is enabled but
+/// `require_auth` is `false` (a guest-capable instance), a missing token is
+/// also allowed — but a present, invalid one is still rejected, so a client
+/// that attempts auth and fails doesn't silently fall back to guest.
 ///
 /// Returns whether the connection's JWT proves it was minted for the WebUI
 /// frontend (`purpose == "webui"`) — `false` whenever there's no JWT to make
-/// that claim from (JWT disabled), not just when validation fails. Mirrors
-/// nanobot's `_webui_connections` gate (`channels/websocket/runtime.py:458-462`),
-/// which is only ever populated by a token issued specifically for webui use.
+/// that claim from (JWT disabled, or a guest connecting with no token), not
+/// just when validation fails. Mirrors nanobot's `_webui_connections` gate
+/// (`channels/websocket/runtime.py:458-462`), which is only ever populated
+/// by a token issued specifically for webui use.
 fn authorize(shared: &WsShared, token: Option<&str>) -> Result<bool, StatusCode> {
     let Some(public_key_pem) = shared.jwt_public_key_pem.as_ref() else {
         return Ok(false);
     };
-    let token = token
-        .filter(|t| !t.trim().is_empty())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+    let token = token.filter(|t| !t.trim().is_empty());
+    let Some(token) = token else {
+        return if shared.require_auth {
+            Err(StatusCode::UNAUTHORIZED)
+        } else {
+            Ok(false)
+        };
+    };
     let opts = JwtValidationOpts {
         iss: shared.jwt.iss.clone(),
         aud: shared.jwt.aud.clone(),
@@ -275,6 +285,11 @@ fn workspace_controls_available(shared: &WsShared, remote_addr: SocketAddr) -> b
 /// `base_fields` (e.g. `chat_id` / `turn_id` rejection context) and `fields`
 /// are both merged into the payload alongside `"event"`, mirroring
 /// `_send_event(..., detail=..., **rejection_fields)`.
+///
+/// [`WsOutboundEvent::Error`] is also logged at error level with the full
+/// JSON payload, including when the connection has already gone — those
+/// frames are otherwise easy to miss (client-side `access_denied` /
+/// `invalid chat_id` / save failures all funnel through here).
 async fn send_event(
     shared: &WsShared,
     connection_id: &str,
@@ -282,9 +297,6 @@ async fn send_event(
     base_fields: Option<&serde_json::Map<String, serde_json::Value>>,
     fields: serde_json::Value,
 ) {
-    let sender = shared.connections.lock().await.sender_for(connection_id);
-    let Some(sender) = sender else { return };
-
     let mut payload = serde_json::Map::new();
     payload.insert(
         "event".to_string(),
@@ -296,13 +308,15 @@ async fn send_event(
     if let serde_json::Value::Object(map) = fields {
         payload.extend(map);
     }
+    let payload = serde_json::Value::Object(payload);
+    if matches!(event, WsOutboundEvent::Error) {
+        log::error!("WebSocket channel: error event to '{connection_id}': {payload}");
+    }
 
-    if sender
-        .send(Message::text(
-            serde_json::Value::Object(payload).to_string(),
-        ))
-        .is_err()
-    {
+    let sender = shared.connections.lock().await.sender_for(connection_id);
+    let Some(sender) = sender else { return };
+
+    if sender.send(Message::text(payload.to_string())).is_err() {
         log::warn!(
             "WebSocket channel: connection '{connection_id}' closed while sending '{}' event",
             event.as_str()
@@ -503,6 +517,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::SetModelPreset => {
             handle_envelope_set_model_preset(envelope_dispatch_context).await;
         }
+        EnvelopeType::ClearSession => {
+            handle_envelope_clear_session(envelope_dispatch_context).await;
+        }
         EnvelopeType::Unrecognized(t) => {
             send_event(
                 envelope_dispatch_context.shared,
@@ -533,11 +550,7 @@ async fn handle_envelope_set_model_preset<'a>(
         return;
     };
 
-    let mut rejection_fields = serde_json::Map::new();
-    rejection_fields.insert(
-        "chat_id".to_string(),
-        serde_json::Value::String(cid.to_string()),
-    );
+    let rejection_fields = create_rejection_fields(&cid);
 
     if !sender_allowed(&shared.channels_config, client_id) {
         send_event(
@@ -676,12 +689,19 @@ async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchC
         return;
     }
 
+    if !check_owner_allows_access(shared, connection_id, client_id, &get_session_id(cid), None)
+        .await
+    {
+        return;
+    }
+
     attach_chat(connection_id, cid, shared).await;
 }
 
 async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let shared = envelope_dispatch_context.shared;
     let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
 
     let new_id = Uuid::new_v4().to_string();
     let scope_for_new_chat = {
@@ -723,9 +743,12 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        shared
-            .workspace_request_handler
-            .persist_scope(&mut session_manager, &new_id, &scope);
+        shared.workspace_request_handler.persist_scope(
+            &mut session_manager,
+            &new_id,
+            &scope,
+            client_id,
+        );
         // `persist_scope` just created/saved this session, so this always
         // finds it — reloaded (rather than reusing a value from the closure
         // above) since `persist_scope` only has a `SessionManager`-internal
@@ -799,6 +822,80 @@ fn list_websocket_chats(sessions: Vec<serde_json::Value>) -> Vec<serde_json::Val
         .collect()
 }
 
+/// Whether `client_id` may act on `session_key` (a `websocket:{chat_id}`
+/// key) under this instance's guest session-isolation policy — see the
+/// "Optional WebSocket login" plan's guest session isolation section.
+///
+/// Always `true` when [`WsShared::require_auth`] is on: the existing "any
+/// authenticated connection may see any chat" behavior is unchanged there,
+/// since [`SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY`] is only ever *consulted*
+/// under guest scoping, even though `persist_scope` stamps it unconditionally.
+///
+/// When `require_auth` is off:
+/// - a session that doesn't exist yet is allowed — there's nothing to own,
+///   and the caller's own first persist claims it (`new_chat`/`message`) or
+///   `attach` simply stays idempotent against nothing;
+/// - an existing session is allowed only when its stamped owner matches
+///   `client_id` **exactly** — including a session with *no* stamped owner
+///   at all (predates this feature), which fails closed rather than
+///   treating "unowned" as "shared".
+fn owner_allows_access(
+    shared: &WsShared,
+    session_manager: &SessionManager,
+    session_key: &str,
+    client_id: &str,
+) -> bool {
+    if shared.require_auth {
+        return true;
+    }
+    match session_manager.get_session_internal(session_key) {
+        None => true,
+        Some(session) => {
+            session
+                .metadata
+                .get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY)
+                .and_then(|v| v.as_str())
+                == Some(client_id)
+        }
+    }
+}
+
+/// Reject with an `access_denied` `error` event and return `false` when
+/// [`owner_allows_access`] denies this connection's `client_id` access to
+/// `session_key`. `true` means the caller may proceed. `rejection_fields` is
+/// `None` for `attach` (same unscoped-rejection reasoning as
+/// `require_valid_chat_id`) and `Some(&chat_id_fields)` everywhere else,
+/// matching each handler's existing `sender_allowed` rejection shape.
+async fn check_owner_allows_access(
+    shared: &WsShared,
+    connection_id: &str,
+    client_id: &str,
+    session_key: &str,
+    rejection_fields: Option<&serde_json::Map<String, serde_json::Value>>,
+) -> bool {
+    let allowed = {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before
+        // `send_event`'s `.await` below — same discipline as every other
+        // `session_manager` use in this file.
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        owner_allows_access(shared, &session_manager, session_key, client_id)
+    };
+    if !allowed {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            rejection_fields,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+    }
+    allowed
+}
+
 /// Handle a `rename_chat` envelope: persist a new display `title` on an
 /// existing `websocket:{chat_id}` session and ack with `chat_renamed`.
 /// Existence of a session file *is* required — unlike `attach`, renaming
@@ -812,11 +909,7 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
         return;
     };
 
-    let mut rejection_fields = serde_json::Map::new();
-    rejection_fields.insert(
-        "chat_id".to_string(),
-        serde_json::Value::String(cid.to_string()),
-    );
+    let rejection_fields = create_rejection_fields(&cid);
 
     if !sender_allowed(&shared.channels_config, client_id) {
         send_event(
@@ -827,6 +920,18 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
             serde_json::json!({"detail": "access_denied"}),
         )
         .await;
+        return;
+    }
+
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
         return;
     }
 
@@ -1031,6 +1136,40 @@ async fn send_turn_aborted(
     }
 }
 
+/// Fan-out `session_cleared` to every connection subscribed to `chat_id`,
+/// plus the requester even if it isn't currently attached to that chat
+/// (e.g. clearing a different sidebar row). Unlike `chat_deleted`, this
+/// does **not** detach anyone — the session is still live.
+async fn send_session_cleared(chat_id: &str, requester_id: &str, ws_shared: &WsShared) {
+    let recipients = {
+        let connections = ws_shared.connections.lock().await;
+        let mut recipients = connections.senders_for_chat(chat_id);
+        if !recipients.iter().any(|(id, _)| id == requester_id)
+            && let Some(sender) = connections.sender_for(requester_id)
+        {
+            recipients.push((requester_id.to_string(), sender));
+        }
+        recipients
+    };
+    let raw = serde_json::json!({
+        "event": WsOutboundEvent::SessionCleared.as_str(),
+        "chat_id": chat_id,
+    })
+    .to_string();
+    for (connection_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            log::warn!(
+                "WebSocket channel: connection '{connection_id}' gone while sending session_cleared, cleaning up"
+            );
+            ws_shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&connection_id);
+        }
+    }
+}
+
 /// Handle a `fork_chat` envelope: branch a new `websocket:{chat_id}` session
 /// from an existing one at a zero-based user-message index, then attach and
 /// hydrate the requesting connection on the new chat. Mirrors nanobot's
@@ -1048,7 +1187,7 @@ async fn send_turn_aborted(
 /// nothing" — the `websockets-chat` UI's "Fork session" menu item has no
 /// partial-fork picker, so it never sends this field.
 async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
@@ -1056,6 +1195,10 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
 
     let envelope = envelope_dispatch_context.envelope;
     let key = get_session_id(cid);
+
+    if !check_owner_allows_access(shared, connection_id, client_id, &key, None).await {
+        return;
+    }
     let before_user_index = match envelope.get("before_user_index").and_then(|v| v.as_u64()) {
         Some(v) => v as usize,
         None => {
@@ -1102,6 +1245,22 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
         .await;
         return;
     };
+    {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before this
+        // function's `.await`s below — same discipline as every other
+        // `session_manager` use in this file. Explicit rather than relying
+        // on the source's cloned metadata alone: the requesting connection
+        // is always the owner of a fork it was allowed to create (see
+        // `check_owner_allows_access` above), so this is a no-op whenever
+        // that metadata already carried an owner, and only matters for a
+        // fork of a legacy, never-owned source made while `require_auth`
+        // was still `true`.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.stamp_websocket_owner_if_absent(&new_session_key, client_id);
+    }
 
     let transcripts = Arc::clone(&shared.gateway_services.transcripts);
     // Scoped so each `MutexGuard` drops before this function's `.await`s
@@ -1169,6 +1328,18 @@ async fn handle_envelope_delete_chat<'a>(envelope_dispatch_context: EnvelopeDisp
             serde_json::json!({"detail": "access_denied"}),
         )
         .await;
+        return;
+    }
+
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
         return;
     }
 
@@ -1267,9 +1438,15 @@ async fn handle_envelope_delete_chat<'a>(envelope_dispatch_context: EnvelopeDisp
 /// session as a `chats` event, most-recently-updated first (the order
 /// `list_sessions()` already sorts in). New protocol surface with no
 /// nanobot precedent — see [`EnvelopeType::ListChats`]'s doc comment.
+///
+/// When [`WsShared::require_auth`] is off, [`scope_chats_to_owner`] narrows
+/// this down to chats owned by the requesting connection's `client_id` —
+/// see the "Optional WebSocket login" plan's guest session isolation
+/// section. `require_auth == true` keeps the existing global listing.
 async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let shared = envelope_dispatch_context.shared;
     let connection_id = envelope_dispatch_context.connection_id;
+    let client_id = envelope_dispatch_context.client_id;
 
     let sessions = {
         // Scoped so the (synchronous) `MutexGuard` is dropped before
@@ -1281,7 +1458,11 @@ async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispa
             .unwrap_or_else(|e| e.into_inner());
         session_manager.list_sessions()
     };
-    let chats = list_websocket_chats(sessions);
+    let mut chats = list_websocket_chats(sessions);
+    if !shared.require_auth {
+        chats = scope_chats_to_owner(chats, client_id);
+    }
+    strip_owner_client_id(&mut chats);
     send_event(
         shared,
         connection_id,
@@ -1290,6 +1471,36 @@ async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispa
         serde_json::json!({"chats": chats}),
     )
     .await;
+}
+
+/// Guest session isolation: keep only entries whose `owner_client_id` field
+/// (see [`SessionManager::list_sessions`]) matches `client_id` exactly.
+/// Fails closed — an entry with no owner at all (a session that predates
+/// this feature) is dropped, not treated as shared. Kept as a plain,
+/// signal-free function alongside [`list_websocket_chats`] so the filtering
+/// is unit-testable without a real `SessionManager`.
+fn scope_chats_to_owner(chats: Vec<serde_json::Value>, client_id: &str) -> Vec<serde_json::Value> {
+    chats
+        .into_iter()
+        .filter(|entry| {
+            entry
+                .get("owner_client_id")
+                .and_then(|v| v.as_str())
+                .filter(|s| !s.is_empty())
+                == Some(client_id)
+        })
+        .collect()
+}
+
+/// Drop the internal `owner_client_id` field before a chat list goes out
+/// over the wire — it's bookkeeping for [`scope_chats_to_owner`], not part
+/// of the `chats` event's public shape.
+fn strip_owner_client_id(chats: &mut [serde_json::Value]) {
+    for entry in chats.iter_mut() {
+        if let Some(map) = entry.as_object_mut() {
+            map.remove("owner_client_id");
+        }
+    }
 }
 
 /// Flatten a persisted `content` field to the text a transcript can render.
@@ -1783,9 +1994,12 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        shared
-            .workspace_request_handler
-            .persist_scope(&mut session_manager, cid, &scope);
+        shared.workspace_request_handler.persist_scope(
+            &mut session_manager,
+            cid,
+            &scope,
+            client_id,
+        );
     }
 
     let is_webui = metadata.get("webui").and_then(|v| v.as_bool()) == Some(true);
@@ -2211,6 +2425,120 @@ async fn send_goal_status(
     }
 }
 
+/// Handle a `clear_session` envelope: wipe the conversation on an existing
+/// `websocket:{chat_id}` session (messages, goal state, token usage) while
+/// leaving the session itself, its title, owner, and other metadata intact.
+/// Also empties the WebUI transcript so a later `attach` cannot resurrect
+/// the wiped history. Rust-side protocol addition with no nanobot
+/// precedent — see [`EnvelopeType::ClearSession`].
+async fn handle_envelope_clear_session<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
+        return;
+    }
+
+    // Cancel any in-flight agent turn/subagents for this chat *before*
+    // wiping state, so a stale write cannot land on the just-cleared
+    // session. `None` in every test fixture and whenever no live
+    // `AgentLoop` was wired in — see `GatewayServices::set_work_canceller`.
+    if let Some(canceller) = shared.gateway_services.work_canceller() {
+        canceller.abort("websocket", cid).await;
+    }
+    // The abort above may publish a `TurnEnd`, but that only clears the
+    // *agent's* bookkeeping — also clear the WebSocket-side turn projection
+    // directly so a client that queries it after `session_cleared` never
+    // sees this chat_id as still "running".
+    shared
+        .gateway_services
+        .turn_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear_chat(cid);
+
+    let save_result = {
+        // Drop the `MutexGuard` before any `.await` below — same discipline
+        // as every other `session_manager` use in this file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match session_manager.get_session_internal(&get_session_id(cid)) {
+            Some(mut session) => {
+                session.clear();
+                Some(session_manager.save(session))
+            }
+            None => None,
+        }
+    };
+    match save_result {
+        None => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": "session_not_found"}),
+            )
+            .await;
+            return;
+        }
+        Some(Err(e)) => {
+            log::error!("Failed to clear session {cid}: {e}");
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": "clear_failed"}),
+            )
+            .await;
+            return;
+        }
+        Some(Ok(())) => {}
+    }
+
+    // Empty the WebUI transcript without tombstoning the key — `attach`
+    // prefers transcript history over the `Session`, so leaving the JSONL
+    // in place would resurrect the conversation that was just wiped.
+    // Unlike `delete_chat`'s `forget_session`, later appends must still
+    // write: the session is still live.
+    shared
+        .gateway_services
+        .transcripts
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear_transcript(cid);
+
+    send_session_cleared(cid, connection_id, shared).await;
+}
+
 fn create_rejection_fields(cid: &str) -> serde_json::Map<String, serde_json::Value> {
     let mut rejection_fields = serde_json::Map::new();
     rejection_fields.insert(
@@ -2393,6 +2721,7 @@ impl WebSocketChannel {
             channels_config: self.channels_config.clone(),
             jwt: self.config.jwt.clone(),
             jwt_public_key_pem: self.jwt_public_key_pem.clone(),
+            require_auth: self.config.require_auth,
             connections: Arc::clone(&self.connections),
             supports_streaming: BaseChannel::supports_streaming(self),
             session_manager: Arc::clone(&self.base.session_manager),
@@ -3160,6 +3489,7 @@ mod tests {
             channels_config: ChannelsConfig::default(),
             jwt: JwtConfig::default(),
             jwt_public_key_pem: None,
+            require_auth: true,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
             session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
@@ -3256,6 +3586,31 @@ mod tests {
             authorize(&shared, Some("not-a-real-token")),
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    #[test]
+    fn authorize_allows_missing_token_when_auth_not_required() {
+        let (mut shared, _private_key_path) = shared_with_jwt_enabled();
+        shared.require_auth = false;
+        assert_eq!(authorize(&shared, None), Ok(false));
+    }
+
+    #[test]
+    fn authorize_still_rejects_invalid_token_when_auth_not_required() {
+        let (mut shared, _private_key_path) = shared_with_jwt_enabled();
+        shared.require_auth = false;
+        assert_eq!(
+            authorize(&shared, Some("not-a-real-token")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn authorize_still_returns_true_for_valid_webui_token_when_auth_not_required() {
+        let (mut shared, private_key_path) = shared_with_jwt_enabled();
+        shared.require_auth = false;
+        let token = mint_token_with_purpose(&private_key_path, Some(WEBUI_JWT_PURPOSE));
+        assert_eq!(authorize(&shared, Some(&token)), Ok(true));
     }
 
     // --- webui_quote_allowed ---
@@ -3606,6 +3961,19 @@ mod tests {
             session_updated_body.get("workspace_scope").is_some(),
             "session_updated must carry the new chat's workspace scope: {session_updated_body}"
         );
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = session_manager
+            .get_session_internal(&get_session_id(&new_chat_id))
+            .expect("new_chat must persist a session");
+        assert_eq!(
+            session.metadata.get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY),
+            Some(&serde_json::json!("client-1")),
+            "new_chat must stamp the requesting connection's client_id as owner"
+        );
     }
 
     // --- handle_envelope_attach ---
@@ -3791,7 +4159,12 @@ mod tests {
             .await
             .register("conn-1", "initial-chat", tx);
 
-        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("never-persisted"))).await;
+        dispatch_attach(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("never-persisted")),
+        )
+        .await;
 
         let body = recv_json(&mut rx);
         assert_eq!(body["event"], "attached");
@@ -4105,6 +4478,72 @@ mod tests {
                 .is_empty(),
             "a denied attach must not subscribe the connection"
         );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_denies_a_guest_attaching_someone_elses_chat() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "secret-chat", Some("someone-else"));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        // `dispatch_attach` always uses `client_id: "client-1"`.
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("secret-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("secret-chat")
+                .is_empty(),
+            "a denied attach must not subscribe the connection"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_allows_a_guest_attaching_their_own_chat() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "my-chat", Some("client-1"));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("my-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_attach_allows_a_guest_attaching_a_brand_new_chat_id() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        // No session exists yet for this chat_id — attach is idempotent
+        // against nothing, so it must not be treated as "unowned == denied".
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("brand-new"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "attached");
     }
 
     // --- handle_envelope_fork_chat ---
@@ -4450,6 +4889,86 @@ mod tests {
         let body = recv_json(&mut rx);
         assert_eq!(body["event"], "error");
         assert_eq!(body["detail"], "invalid fork source or index");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_denies_forking_someone_elses_chat_when_require_auth_is_false()
+     {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!("someone-else"),
+            );
+            session_manager.save(session).unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
+
+        // `dispatch_fork_chat` always uses `client_id: "client-1"`.
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert!(
+            rx.try_recv().is_err(),
+            "a denied fork must not also send attached"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_fork_chat_stamps_the_requesters_client_id_as_owner() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:src".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!("client-1"),
+            );
+            session_manager.save(session).unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "src", tx);
+
+        dispatch_fork_chat(&shared, "conn-1", "src", 1).await;
+
+        let attached = recv_json(&mut rx);
+        assert_eq!(attached["event"], "attached");
+        let new_chat_id = attached["chat_id"].as_str().unwrap().to_string();
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let forked = session_manager
+            .get_session_internal(&get_session_id(&new_chat_id))
+            .expect("fork destination must exist");
+        assert_eq!(
+            forked.metadata.get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY),
+            Some(&serde_json::json!("client-1"))
+        );
     }
 
     #[tokio::test]
@@ -5204,6 +5723,208 @@ mod tests {
         assert!(chat_ids.contains("chat-b"));
     }
 
+    // --- guest session isolation (owner_allows_access / scope_chats_to_owner) ---
+
+    #[test]
+    fn scope_chats_to_owner_keeps_only_the_matching_owner() {
+        let chats = vec![
+            serde_json::json!({"chat_id": "mine", "owner_client_id": "client-1"}),
+            serde_json::json!({"chat_id": "theirs", "owner_client_id": "client-2"}),
+            serde_json::json!({"chat_id": "unowned"}),
+        ];
+
+        let scoped = scope_chats_to_owner(chats, "client-1");
+
+        assert_eq!(scoped.len(), 1);
+        assert_eq!(scoped[0]["chat_id"], "mine");
+    }
+
+    #[test]
+    fn scope_chats_to_owner_hides_an_unowned_entry_fail_closed() {
+        let chats = vec![serde_json::json!({"chat_id": "legacy", "owner_client_id": ""})];
+        assert!(scope_chats_to_owner(chats, "client-1").is_empty());
+    }
+
+    #[test]
+    fn strip_owner_client_id_removes_the_field_but_keeps_others() {
+        let mut chats =
+            vec![serde_json::json!({"chat_id": "a", "owner_client_id": "client-1", "title": "t"})];
+        strip_owner_client_id(&mut chats);
+        assert!(chats[0].get("owner_client_id").is_none());
+        assert_eq!(chats[0]["chat_id"], "a");
+        assert_eq!(chats[0]["title"], "t");
+    }
+
+    fn save_session_with_owner(shared: &WsShared, chat_id: &str, owner_client_id: Option<&str>) {
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut session = Session::new(get_session_id(chat_id));
+        if let Some(owner) = owner_client_id {
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!(owner),
+            );
+        }
+        session_manager.save(session).unwrap();
+    }
+
+    #[test]
+    fn owner_allows_access_ignores_ownership_when_require_auth_is_true() {
+        let shared = test_shared("browser");
+        save_session_with_owner(&shared, "chat-1", Some("someone-else"));
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(owner_allows_access(
+            &shared,
+            &session_manager,
+            &get_session_id("chat-1"),
+            "client-1"
+        ));
+    }
+
+    #[test]
+    fn owner_allows_access_allows_a_session_that_does_not_exist_yet() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(owner_allows_access(
+            &shared,
+            &session_manager,
+            &get_session_id("brand-new"),
+            "client-1"
+        ));
+    }
+
+    #[test]
+    fn owner_allows_access_allows_the_matching_owner() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "chat-1", Some("client-1"));
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(owner_allows_access(
+            &shared,
+            &session_manager,
+            &get_session_id("chat-1"),
+            "client-1"
+        ));
+    }
+
+    #[test]
+    fn owner_allows_access_denies_a_mismatched_owner() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "chat-1", Some("someone-else"));
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!owner_allows_access(
+            &shared,
+            &session_manager,
+            &get_session_id("chat-1"),
+            "client-1"
+        ));
+    }
+
+    #[test]
+    fn owner_allows_access_denies_an_unowned_session_fail_closed() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "chat-1", None);
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(!owner_allows_access(
+            &shared,
+            &session_manager,
+            &get_session_id("chat-1"),
+            "client-1"
+        ));
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_list_chats_scopes_to_owner_when_require_auth_is_false() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "mine", Some("client-1"));
+        save_session_with_owner(&shared, "theirs", Some("client-2"));
+        save_session_with_owner(&shared, "legacy", None);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_chats"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+
+        dispatch_envelope(ctx).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "chats");
+        let chats = body["chats"].as_array().expect("chats should be an array");
+        assert_eq!(
+            chats.len(),
+            1,
+            "only client-1's own chat should be listed: {chats:?}"
+        );
+        assert_eq!(chats[0]["chat_id"], "mine");
+        assert!(
+            chats[0].get("owner_client_id").is_none(),
+            "owner_client_id is internal bookkeeping, not part of the wire shape: {chats:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_list_chats_keeps_global_listing_when_require_auth_is_true() {
+        let shared = test_shared("browser");
+        save_session_with_owner(&shared, "mine", Some("client-1"));
+        save_session_with_owner(&shared, "theirs", Some("client-2"));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_chats"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+
+        dispatch_envelope(ctx).await;
+
+        let body = recv_json(&mut rx);
+        let chats = body["chats"].as_array().expect("chats should be an array");
+        assert_eq!(chats.len(), 2, "requireAuth == true keeps the global list");
+    }
+
     // --- handle_envelope_rename_chat ---
 
     async fn dispatch_rename(
@@ -5655,6 +6376,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn handle_envelope_delete_chat_denies_a_guest_deleting_someone_elses_chat() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        save_session_with_owner(&shared, "chat-1", Some("someone-else"));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        // `dispatch_delete` always uses `client_id: "client-1"`.
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        assert!(
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .is_some(),
+            "a denied delete must not remove the session"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_envelope_delete_chat_then_save_does_not_recreate_the_jsonl() {
         let shared = test_shared("browser");
         let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
@@ -5699,6 +6451,376 @@ mod tests {
         assert!(
             !path.exists(),
             "save on a tombstoned key must not recreate the jsonl file"
+        );
+    }
+
+    async fn dispatch_clear_session(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("clear_session"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_clear_session must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_wipes_conversation_and_keeps_the_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        start_registry_turn(&shared, "chat-1", Some("turn-1"));
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.metadata.insert(
+                crate::session::GOAL_STATE_KEY.to_string(),
+                serde_json::json!({"objective": "ship it"}),
+            );
+            session.update_usage(LLMUsage {
+                input_tokens: Some(10),
+                output_tokens: Some(2),
+                ..LLMUsage::new()
+            });
+            session.metadata.insert(
+                crate::session::SESSION_TITLE_METADATA_KEY.to_string(),
+                serde_json::json!("Keep me"),
+            );
+            session.metadata.insert(
+                SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+                serde_json::json!("fast"),
+            );
+            session_manager.save(session).unwrap();
+        }
+        {
+            let mut transcripts = shared
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_user_message("chat-1", "hello", &HashMap::new(), None, None, None);
+        }
+
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "session_cleared");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert!(
+            body.get("detail").is_none(),
+            "ack must carry chat_id only, matching chat_deleted: {body}"
+        );
+        assert!(
+            rx.try_recv().is_err(),
+            "clear must send exactly one frame to the requester"
+        );
+        assert!(
+            !chat_is_running(&shared, "chat-1"),
+            "an in-flight turn must be cleared so the chat is not left running"
+        );
+
+        {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session = session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("cleared session must still exist");
+            assert!(session.messages.is_empty(), "messages must be wiped");
+            assert!(
+                session
+                    .metadata
+                    .get(crate::session::GOAL_STATE_KEY)
+                    .is_none()
+            );
+            assert!(session.usage().is_none());
+            assert_eq!(
+                session
+                    .metadata
+                    .get(crate::session::SESSION_TITLE_METADATA_KEY),
+                Some(&serde_json::json!("Keep me"))
+            );
+            assert_eq!(
+                session.metadata.get(SESSION_MODEL_PRESET_METADATA_KEY),
+                Some(&serde_json::json!("fast"))
+            );
+        }
+
+        {
+            let mut transcripts = shared
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            assert!(
+                transcripts.chat_history("websocket:chat-1", 500).is_empty(),
+                "WebUI transcript must be emptied so attach cannot resurrect history"
+            );
+            assert!(
+                transcripts.append_user_message(
+                    "chat-1",
+                    "after clear",
+                    &HashMap::new(),
+                    None,
+                    None,
+                    None,
+                ),
+                "later appends must still write — clear must not tombstone the key"
+            );
+            let history = transcripts.chat_history("websocket:chat-1", 500);
+            assert_eq!(history.len(), 1);
+            assert_eq!(history[0]["content"], "after clear");
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_notifies_requester_even_when_not_subscribed() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-2".to_string()))
+                .unwrap();
+        }
+
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("chat-2"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "session_cleared");
+        assert_eq!(body["chat_id"], "chat-2");
+        assert!(
+            rx.try_recv().is_err(),
+            "clear must send exactly one frame to the requester"
+        );
+
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("chat-1")
+                .len(),
+            1,
+            "the requester's subscription to a different chat must be untouched"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_notifies_every_subscribed_connection() {
+        let shared = test_shared("browser");
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx1);
+        shared.connections.lock().await.attach("conn-2", "chat-1");
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-2", "chat-1", tx2);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body1 = recv_json(&mut rx1);
+        assert_eq!(body1["event"], "session_cleared");
+        assert_eq!(body1["chat_id"], "chat-1");
+        let body2 = recv_json(&mut rx2);
+        assert_eq!(body2["event"], "session_cleared");
+        assert_eq!(body2["chat_id"], "chat-1");
+
+        assert_eq!(
+            shared
+                .connections
+                .lock()
+                .await
+                .senders_for_chat("chat-1")
+                .len(),
+            2,
+            "clear must not detach connections — the session is still live"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_rejects_invalid_or_missing_chat_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        for chat_id in [
+            None,
+            Some(serde_json::json!("")),
+            Some(serde_json::json!("has space")),
+            Some(serde_json::json!(123)),
+        ] {
+            dispatch_clear_session(&shared, "conn-1", chat_id.clone()).await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected payload: {chat_id:?}");
+            assert_eq!(body["detail"], "invalid chat_id");
+            assert!(
+                body.get("chat_id").is_none(),
+                "invalid clear must omit chat_id, matching attach/rename: {body}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_rejects_unknown_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("missing-chat"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "session_not_found");
+        assert_eq!(body["chat_id"], "missing-chat");
+        assert!(
+            !body["detail"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("websocket:"),
+            "wire error must not leak the internal session key: {body}"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["chat_id"], "chat-1");
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = session_manager
+            .get_session_internal("websocket:chat-1")
+            .expect("a denied clear must not remove the session");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "a denied clear must not wipe messages"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_clear_session_denies_a_guest_clearing_someone_elses_chat() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.add_message("user", "hello", serde_json::Map::new());
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!("someone-else"),
+            );
+            session_manager.save(session).unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        // `dispatch_clear_session` always uses `client_id: "client-1"`.
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = session_manager
+            .get_session_internal("websocket:chat-1")
+            .expect("a denied clear must not remove the session");
+        assert_eq!(
+            session.messages.len(),
+            1,
+            "a denied clear must not wipe messages"
         );
     }
 
@@ -6037,6 +7159,62 @@ mod tests {
                 .metadata
                 .get(crate::session::SESSION_TITLE_METADATA_KEY),
             Some(&serde_json::json!("Keep me"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_rename_chat_denies_a_guest_renaming_someone_elses_chat() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                crate::session::SESSION_TITLE_METADATA_KEY.to_string(),
+                serde_json::json!("Keep me"),
+            );
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!("someone-else"),
+            );
+            session_manager.save(session).unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        // `dispatch_rename` always uses `client_id: "client-1"`.
+        dispatch_rename(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("Hijacked")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = session_manager
+            .get_session_internal("websocket:chat-1")
+            .expect("session must still exist");
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::session::SESSION_TITLE_METADATA_KEY),
+            Some(&serde_json::json!("Keep me")),
+            "a denied rename must not change the title"
         );
     }
 

@@ -38,6 +38,20 @@ struct LoginResponse {
     token: String,
 }
 
+/// `GET /v1/auth/config`'s response body — mirrors the server's
+/// `AuthConfigResponse` (`src/api/login.rs`).
+#[derive(Debug, Clone, Copy, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AuthConfig {
+    /// Whether the web UI must sign in before opening a WebSocket connection.
+    /// `false` on an instance that allows guest use.
+    pub require_login: bool,
+    /// Whether `/v1/login` can mint tokens at all. Can be `true` even when
+    /// `require_login` is `false` — a guest-capable instance may still offer
+    /// optional sign-in.
+    pub login_available: bool,
+}
+
 #[derive(Debug, Deserialize)]
 struct ErrorBody {
     error: ErrorDetail,
@@ -74,5 +88,25 @@ pub async fn login(email: &str, password: &str) -> Result<String, ApiError> {
     resp.json::<LoginResponse>()
         .await
         .map(|body| body.token)
+        .map_err(|e| ApiError::new(e.to_string()))
+}
+
+/// Discover whether this gateway/API instance requires login before the web
+/// UI can be used at all. Unauthenticated by design (see
+/// `AuthConfigResponse`'s doc comment server-side): a frontend has to call
+/// this before it knows whether it even has credentials to send, so it must
+/// not be gated behind a token itself.
+pub async fn fetch_auth_config() -> Result<AuthConfig, ApiError> {
+    let resp = Request::get("/v1/auth/config")
+        .send()
+        .await
+        .map_err(|e| ApiError::new(e.to_string()))?;
+
+    if !resp.ok() {
+        return Err(error_from_response(resp).await);
+    }
+
+    resp.json::<AuthConfig>()
+        .await
         .map_err(|e| ApiError::new(e.to_string()))
 }

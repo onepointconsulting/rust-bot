@@ -25,6 +25,19 @@ pub const SESSION_TOKEN_USAGE_KEY: &str = "token_usage";
 /// Marks the session as originating from the WebUI / WebSocket channel.
 pub const SESSION_WEBUI_METADATA_KEY: &str = "webui";
 
+/// The WebSocket `client_id` (query param + `LocalStorage`, see
+/// `read_or_create_client_id` in `websockets-chat/src/app.rs`) that first
+/// created this session. Stamped once — on `new_chat`, first `message`
+/// persist, or as a fork's destination — and never overwritten afterward.
+///
+/// Only consulted when [`crate::channels::websocket::types::WsShared::require_auth`]
+/// is `false` (guest-capable instance): `list_chats`/`attach`/`rename_chat`/
+/// `delete_chat`/`fork_chat` then scope to sessions owned by the requesting
+/// connection's `client_id`, hiding everything else (including sessions with
+/// no stamped owner at all) rather than treating "unowned" as "shared". See
+/// the "Optional WebSocket login" plan's guest session isolation section.
+pub const SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY: &str = "websocket_owner_client_id";
+
 /// Session display title (LLM-generated or user-renamed).
 pub const SESSION_TITLE_METADATA_KEY: &str = "title";
 

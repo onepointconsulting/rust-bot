@@ -203,6 +203,9 @@ fn configure_web_app(config: &mut Config, config_path: PathBuf) -> Result<(), Cl
         .prompt()?;
     if configure_web_app {
         // JWT defaults to on: the web UI's /v1/login will not mint tokens without it.
+        // `configure_websocket_channel` separately prompts whether login is *required*
+        // (`WebSocketConfig::require_auth`) — a bot can enable JWT for optional sign-in
+        // while still allowing guest use.
         configure_websocket_channel(config, config_path, true)?;
     }
     Ok(())

@@ -19,8 +19,9 @@ use crate::{
     providers::base::{LLMResponse, LLMUsage},
     runtime_context::RUNTIME_CONTEXT_HISTORY_META,
     session::{
-        SESSION_TITLE_METADATA_KEY, SESSION_TOKEN_USAGE_KEY,
-        history_visibility::is_hidden_history_message, keys::COMMAND_KEY,
+        GOAL_STATE_KEY, SESSION_TITLE_METADATA_KEY, SESSION_TOKEN_USAGE_KEY,
+        SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, history_visibility::is_hidden_history_message,
+        keys::COMMAND_KEY,
     },
     utils::helpers::{
         ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
@@ -141,9 +142,17 @@ impl Session {
     }
 
     /// Clears conversation messages and resets consolidation cursor.
+    ///
+    /// Also drops conversation-scoped metadata that would be wrong on an
+    /// empty transcript: [`GOAL_STATE_KEY`] (would keep injecting the old
+    /// objective into later turns) and [`SESSION_TOKEN_USAGE_KEY`] (lifetime
+    /// totals for the conversation that was just wiped). Other metadata
+    /// (workspace scope, owner, title, model preset, …) is left alone.
     pub fn clear(&mut self) {
         self.messages.clear();
         self.last_consolidated = 0;
+        self.metadata.remove(GOAL_STATE_KEY);
+        self.metadata.remove(SESSION_TOKEN_USAGE_KEY);
         self.updated_at = Utc::now();
     }
 
@@ -759,6 +768,7 @@ impl SessionManager {
                                         "updated_at": metadata.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
                                         "path": path.display().to_string(),
                                         "title": listed_session_title(&metadata),
+                                        "owner_client_id": listed_session_owner_client_id(&metadata),
                                     }));
                                 }
                             }
@@ -1046,6 +1056,37 @@ impl SessionManager {
         manager.persist_generated_title(session_key, title)
     }
 
+    /// Stamp `client_id` as `session_key`'s [`SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY`]
+    /// if it doesn't already have one. Used for a `fork_chat` destination,
+    /// which `fork_session_before_user_index` already created and saved (a
+    /// fork's metadata is cloned from the source and then has
+    /// `FORK_VOLATILE_METADATA_KEYS` stripped — ownership is deliberately
+    /// *not* one of those, so a fork of your own chat keeps you as owner
+    /// without this call ever overwriting it). A no-op for a missing session
+    /// or a blank `client_id` — mirrors [`crate::security::workspace_requests::WorkspaceRequestHandler::persist_scope`]'s
+    /// same "first stamp wins, blank means don't" rule.
+    pub fn stamp_websocket_owner_if_absent(&mut self, session_key: &str, client_id: &str) {
+        if client_id.is_empty() {
+            return;
+        }
+        let Some(mut session) = self.get_session_internal(session_key) else {
+            return;
+        };
+        if session
+            .metadata
+            .contains_key(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY)
+        {
+            return;
+        }
+        session.metadata.insert(
+            SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+            json!(client_id),
+        );
+        if let Err(e) = self.save(session) {
+            log::error!("Failed to stamp websocket owner for session {session_key}: {e}");
+        }
+    }
+
     /// Persist a new display title on an existing session. Does not create a
     /// session — missing keys return [`RenameSessionError::NotFound`].
     pub fn rename_session(
@@ -1154,6 +1195,18 @@ fn listed_session_title(metadata_line: &Value) -> String {
     metadata_line
         .get("metadata")
         .and_then(|m| m.get(SESSION_TITLE_METADATA_KEY))
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .to_string()
+}
+
+/// Stamped [`SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY`] on the JSONL metadata
+/// line, if any — `""` for a session that predates guest scoping or was
+/// never websocket-owned.
+fn listed_session_owner_client_id(metadata_line: &Value) -> String {
+    metadata_line
+        .get("metadata")
+        .and_then(|m| m.get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY))
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_string()
@@ -1461,13 +1514,39 @@ mod tests {
     }
 
     #[test]
-    fn clear_preserves_key_and_metadata() {
+    fn clear_preserves_key_and_unrelated_metadata() {
         let mut session = Session::new("persist-key".into());
         session.metadata.insert("trace".into(), json!("v1"));
         session.add_message("user", "x", Map::new());
         session.clear();
         assert_eq!(session.key, "persist-key");
         assert_eq!(session.metadata.get("trace"), Some(&json!("v1")));
+    }
+
+    #[test]
+    fn clear_removes_goal_state() {
+        let mut session = Session::new("k1".into());
+        session.metadata.insert(
+            GOAL_STATE_KEY.to_string(),
+            json!({"objective": "ship it", "status": "active"}),
+        );
+        session.add_message("user", "x", Map::new());
+        session.clear();
+        assert!(session.metadata.get(GOAL_STATE_KEY).is_none());
+    }
+
+    #[test]
+    fn clear_removes_token_usage() {
+        let mut session = Session::new("k1".into());
+        session.update_usage(LLMUsage {
+            input_tokens: Some(10),
+            output_tokens: Some(2),
+            ..LLMUsage::new()
+        });
+        session.add_message("user", "x", Map::new());
+        session.clear();
+        assert!(session.usage().is_none());
+        assert!(session.metadata.get(SESSION_TOKEN_USAGE_KEY).is_none());
     }
 
     #[test]

@@ -808,14 +808,14 @@ impl OpenAICompatProvider {
             cost_details.and_then(|d| Self::json_f64(d, "upstream_inference_prompt_cost"));
         let split_output =
             cost_details.and_then(|d| Self::json_f64(d, "upstream_inference_completions_cost"));
-        let (input_cost, output_cost) = match (split_input, split_output, Self::json_f64(usage, "cost"))
-        {
-            (Some(input), Some(output), _) => (Some(input), Some(output)),
-            (Some(input), None, _) => (Some(input), None),
-            (None, Some(output), _) => (None, Some(output)),
-            (None, None, Some(total)) => (Some(total), None),
-            (None, None, None) => (None, None),
-        };
+        let (input_cost, output_cost) =
+            match (split_input, split_output, Self::json_f64(usage, "cost")) {
+                (Some(input), Some(output), _) => (Some(input), Some(output)),
+                (Some(input), None, _) => (Some(input), None),
+                (None, Some(output), _) => (None, Some(output)),
+                (None, None, Some(total)) => (Some(total), None),
+                (None, None, None) => (None, None),
+            };
 
         LLMUsage {
             input_tokens,
@@ -1904,8 +1904,12 @@ mod tests {
             output_tokens: Some(3),
             ..LLMUsage::new()
         };
-        let response =
-            OpenAICompatProvider::parse_stream_response("hello".into(), "stop".into(), vec![], usage);
+        let response = OpenAICompatProvider::parse_stream_response(
+            "hello".into(),
+            "stop".into(),
+            vec![],
+            usage,
+        );
         assert_eq!(response.content.as_deref(), Some("hello"));
         assert_eq!(response.usage.input_tokens, Some(12));
         assert_eq!(response.usage.output_tokens, Some(3));

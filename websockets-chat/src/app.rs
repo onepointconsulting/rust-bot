@@ -200,7 +200,12 @@ fn read_ws_base_override() -> Option<String> {
 
 /// Build the gateway WebSocket URL for the current page's origin (or the
 /// `?wsBase=` override), [`GATEWAY_WS_PATH`], and the given `client_id`/`token`.
-fn build_gateway_ws_url(client_id: &str, token: &str, ws_base_override: Option<&str>) -> String {
+/// `token` is `None` for a guest connection (see [`WsContext::require_login`]).
+fn build_gateway_ws_url(
+    client_id: &str,
+    token: Option<&str>,
+    ws_base_override: Option<&str>,
+) -> String {
     let (scheme, host) = web_sys::window()
         .map(|window| {
             let location = window.location();
@@ -249,6 +254,12 @@ fn build_media_payload(attachments: &[ImageAttachment]) -> Option<Vec<serde_json
 #[derive(Clone, Copy)]
 struct WsContext {
     token: RwSignal<Option<String>>,
+    /// This gateway instance's login policy, from `GET /v1/auth/config`.
+    /// `None` until the fetch resolves (treated as "assume login required"
+    /// wherever that matters — see [`open_connection`] and
+    /// [`handle_connection_closed`]); `Some(false)` means the gateway
+    /// allows guest connections with no JWT at all.
+    require_login: RwSignal<Option<bool>>,
     client_id: RwSignal<String>,
     chat_id: RwSignal<Option<String>>,
     connection_status: RwSignal<ConnectionStatus>,
@@ -796,6 +807,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::ChatDeleted { chat_id } => {
             handle_chat_deleted(ctx, chat_id);
         }
+        ServerEvent::SessionCleared { chat_id } => {
+            handle_session_cleared(ctx, chat_id);
+        }
         ServerEvent::TurnAborted { chat_id, turn_id } => {
             log::info!("turn aborted: chat_id={chat_id} turn_id={turn_id:?}");
             handle_turn_aborted(ctx, turn_id);
@@ -824,15 +838,19 @@ fn should_drop_event(ctx: &WsContext, event: &ServerEvent) -> bool {
 
 /// Open a new gateway WebSocket connection for `ctx.token`, wiring its
 /// receive loop into [`dispatch_server_event`] and [`handle_connection_closed`].
-/// No-ops if there is no token (logged out).
+/// No-ops if there is no token *and* this gateway doesn't allow guest
+/// connections (`ctx.require_login` is `Some(true)` or still unknown) —
+/// logged out, or the auth-config fetch hasn't resolved yet.
 ///
 /// Any previous socket is closed first. Dropping only the send half is not
 /// enough: the old receive loop keeps the connection subscribed, so both
 /// sockets would fan in `delta`s onto the same `entries` signal.
 fn open_connection(ctx: WsContext) {
-    let Some(token) = ctx.token.get_untracked() else {
+    let token = ctx.token.get_untracked();
+    let guest_allowed = ctx.require_login.get_untracked() == Some(false);
+    if token.is_none() && !guest_allowed {
         return;
-    };
+    }
 
     let attempt = ctx.reconnect_attempt.get_untracked();
     ctx.connection_status.set(if attempt == 0 {
@@ -847,7 +865,7 @@ fn open_connection(ctx: WsContext) {
 
     let url = build_gateway_ws_url(
         &ctx.client_id.get_untracked(),
-        &token,
+        token.as_deref(),
         ctx.ws_base_override.get_untracked().as_deref(),
     );
 
@@ -887,7 +905,9 @@ fn handle_connection_closed(ctx: WsContext, generation_at_open: u64) {
         return;
     }
     ctx.ws_sender.get_untracked().borrow_mut().take();
-    if ctx.token.get_untracked().is_some() {
+    let should_reconnect =
+        ctx.token.get_untracked().is_some() || ctx.require_login.get_untracked() == Some(false);
+    if should_reconnect {
         schedule_reconnect(ctx);
     } else {
         ctx.connection_status.set(ConnectionStatus::Disconnected);
@@ -1051,6 +1071,24 @@ fn request_delete(ctx: &WsContext, chat_id: String) {
     );
 }
 
+/// Ask the gateway to wipe `chat_id`'s conversation, leaving the session (and
+/// its sidebar row) in place.
+///
+/// Unlike [`request_delete`], clearing the only remaining chat is allowed —
+/// there's no risk of leaving the sidebar empty. No local turn-in-flight
+/// guard either: the gateway aborts any running turn as part of handling
+/// `clear_session` server-side. No optimistic local wipe (same reasoning as
+/// `request_delete`): the gateway always fans `session_cleared` back to the
+/// requester too, so [`dispatch_server_event`] emptying the transcript then
+/// is the single source of truth.
+fn request_clear(ctx: &WsContext, chat_id: String) {
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::clear_session(chat_id),
+        "Failed to encode the clear-session request.",
+    );
+}
+
 /// Ask the gateway to cancel the in-flight turn on the active chat.
 ///
 /// No optimistic local close (same reasoning as [`request_delete`]): the
@@ -1166,6 +1204,30 @@ fn handle_chat_deleted(ctx: &WsContext, chat_id: String) {
     }
 }
 
+/// Apply a `session_cleared` event: empty the transcript in place, without
+/// touching the sidebar row or the connection's subscription.
+///
+/// Every connection subscribed to the cleared chat gets this event (see the
+/// backend's `handle_envelope_clear_session`), not just the one that asked
+/// for the clear — but a chat this connection isn't currently looking at has
+/// no local transcript to empty, so this only acts when `chat_id` is the
+/// active chat. Unlike [`handle_chat_deleted`], this never calls
+/// [`reset_local_transcript`]: that also drops `ctx.chat_id` and the stored
+/// chat id, which would strand this connection with no chat to send on.
+fn handle_session_cleared(ctx: &WsContext, chat_id: String) {
+    if ctx.chat_id.get_untracked().as_deref() != Some(chat_id.as_str()) {
+        return;
+    }
+    clear_stored_entries();
+    ctx.entries.set(Vec::new());
+    ctx.next_id.set(0);
+    ctx.turn_index.set(HashMap::new());
+    ctx.active_turn_id.set(None);
+    ctx.split_stream_on_next_delta.set(false);
+    ctx.chat_error.set(None);
+    ctx.session_usage.set(None);
+}
+
 /// Reset every piece of local per-chat state and ask the gateway for a
 /// brand-new chat. Used by the "New chat" header action — not by delete,
 /// which switches to a remaining session instead of minting a replacement.
@@ -1265,6 +1327,9 @@ pub fn App() -> impl IntoView {
     let expanded =
         RwSignal::new(BrowserLocalStorage::get::<bool>(EXPANDED_STORAGE_KEY).unwrap_or(false));
 
+    let require_login = RwSignal::new(None::<bool>);
+    let auth_config_fetch_started = RwSignal::new(false);
+
     let client_id = RwSignal::new(read_or_create_client_id());
     let chat_id = RwSignal::new(read_stored_chat_id());
     let connection_status = RwSignal::new(ConnectionStatus::Disconnected);
@@ -1305,6 +1370,7 @@ pub fn App() -> impl IntoView {
 
     let ws_context = WsContext {
         token,
+        require_login,
         client_id,
         chat_id,
         connection_status,
@@ -1331,6 +1397,42 @@ pub fn App() -> impl IntoView {
     // refresh doesn't leave the user "logged in" but disconnected.
     if token.get_untracked().is_some() {
         open_connection(ws_context);
+    }
+
+    // Discover whether this gateway instance requires login at all — an
+    // unauthenticated `GET /v1/auth/config` (see `chat_ui::api::fetch_auth_config`'s
+    // doc comment). Fired at most once, either right away (if the chat
+    // widget was already open on a previous visit) or the first time the
+    // user opens it (see `open_chat` below) — no point spending a request
+    // on a visitor who never opens the widget.
+    let ensure_auth_config = move || {
+        if auth_config_fetch_started.get_untracked() {
+            return;
+        }
+        auth_config_fetch_started.set(true);
+        spawn_local(async move {
+            match chat_ui::api::fetch_auth_config().await {
+                Ok(config) => {
+                    require_login.set(Some(config.require_login));
+                    // A guest-capable instance with no session restored yet:
+                    // connect immediately rather than waiting for the user
+                    // to do anything, since there is no `LoginForm` to wait
+                    // on in this mode.
+                    if !config.require_login && token.get_untracked().is_none() {
+                        open_connection(ws_context);
+                    }
+                }
+                Err(err) => {
+                    log::warn!(
+                        "Failed to fetch /v1/auth/config, defaulting to requiring login: {err}"
+                    );
+                    require_login.set(Some(true));
+                }
+            }
+        });
+    };
+    if chat_open.get_untracked() {
+        ensure_auth_config();
     }
 
     let do_login = move |email: String, password: String| {
@@ -1360,6 +1462,16 @@ pub fn App() -> impl IntoView {
     };
 
     let do_logout = move || {
+        if require_login.get_untracked() == Some(false) {
+            // Guest-capable instance: there is no account to sign out of,
+            // and tearing down the guest connection here would strand the
+            // user on a screen `show_login`'s gate below will never show
+            // for this instance. Treat "Sign out" as "close the chat"
+            // instead — the connection stays up in the background.
+            chat_open.set(false);
+            let _ = BrowserLocalStorage::set(CHAT_OPEN_STORAGE_KEY, &chat_open.get());
+            return;
+        }
         close_connection(&ws_context);
         SessionStorage::delete(TOKEN_STORAGE_KEY);
         SessionStorage::delete(EMAIL_STORAGE_KEY);
@@ -1420,6 +1532,7 @@ pub fn App() -> impl IntoView {
     let open_chat = move || {
         chat_open.set(true);
         let _ = BrowserLocalStorage::set(CHAT_OPEN_STORAGE_KEY, &chat_open.get());
+        ensure_auth_config();
     };
     let close_chat = move || {
         chat_open.set(false);
@@ -1458,6 +1571,9 @@ pub fn App() -> impl IntoView {
     let on_delete_session = move |id: String| {
         request_delete(&ws_context, id);
     };
+    let on_clear_session = move |id: String| {
+        request_clear(&ws_context, id);
+    };
     let on_select_session = move |selected_id: String| {
         attach_to_session(&ws_context, selected_id);
     };
@@ -1471,13 +1587,22 @@ pub fn App() -> impl IntoView {
     // between rounds.
     let pending = Signal::derive(move || active_turn_id.get().is_some());
 
+    // Show `LoginForm` unless the user already has a session, or this
+    // gateway is known to allow guest use. While the auth-config fetch is
+    // still in flight (`require_login` is `None`), this defaults to
+    // requiring login — the same fail-closed default `do_logout`/the fetch's
+    // own error handler use — so a guest-capable instance shows `LoginForm`
+    // only briefly, if at all, rather than a guest-only instance ever
+    // skipping it by mistake.
+    let show_login = move || token.get().is_none() && require_login.get() != Some(false);
+
     view! {
         <Show
             when=move || chat_open.get()
             fallback=move || view! { <ChatLauncher on_open=open_chat /> }
         >
             <Show
-                when=move || token.get().is_some()
+                when=move || !show_login()
                 fallback=move || {
                     view! {
                         <LoginForm
@@ -1516,6 +1641,7 @@ pub fn App() -> impl IntoView {
                     on_fork_session=on_fork_session
                     on_fork_reply=on_fork_reply
                     on_delete_session=on_delete_session
+                    on_clear_session=on_clear_session
                     on_abort_turn=on_abort_turn
                     model_presets=Signal::derive(move || model_presets.get())
                     selected_model_preset=Signal::derive(move || model_preset.get())

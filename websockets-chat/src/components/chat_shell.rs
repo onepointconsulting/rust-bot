@@ -49,6 +49,7 @@ pub fn ChatShell(
     on_fork_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
     on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_clear_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(into)] model_presets: Signal<Vec<String>>,
     #[prop(into)] selected_model_preset: Signal<String>,
@@ -74,6 +75,7 @@ pub fn ChatShell(
                 on_select=on_select_session
                 on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
                 on_fork=Callback::new(move |id| on_fork_session(id))
+                on_clear=Callback::new(move |id| on_clear_session(id))
                 on_delete=Callback::new(move |id| on_delete_session(id))
             />
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">

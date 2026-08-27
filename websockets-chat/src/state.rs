@@ -593,15 +593,18 @@ pub fn media_urls_to_attachments(media: Vec<String>, token: Option<&str>) -> Vec
 /// scheme and combines it with `host`, unless `override_base` supplies an
 /// explicit scheme+host prefix instead (for local dev, e.g. `trunk serve`
 /// pointing at a gateway on a different port than the one Trunk itself serves
-/// from). `client_id`/`token` are always percent-encoded into the query
-/// string. `path` is used as-is (the gateway config already normalizes it to
-/// start with `/`; see `WebSocketConfig::path` server-side).
+/// from). `client_id` is always percent-encoded into the query string.
+/// `token` is omitted entirely (not sent as an empty value) when `None` —
+/// the guest-connection case, where the gateway's `WebSocketConfig` allows
+/// an upgrade with no JWT at all (see `authorize` server-side). `path` is
+/// used as-is (the gateway config already normalizes it to start with `/`;
+/// see `WebSocketConfig::path` server-side).
 pub fn build_ws_url(
     scheme: &str,
     host: &str,
     path: &str,
     client_id: &str,
-    token: &str,
+    token: Option<&str>,
     override_base: Option<&str>,
 ) -> String {
     let base = match override_base {
@@ -620,11 +623,14 @@ pub fn build_ws_url(
     } else {
         format!("/{path}")
     };
-    format!(
-        "{base}{path}?client_id={}&token={}",
-        percent_encode_query_value(client_id),
-        percent_encode_query_value(token)
-    )
+    let mut url = format!(
+        "{base}{path}?client_id={}",
+        percent_encode_query_value(client_id)
+    );
+    if let Some(token) = token {
+        url.push_str(&format!("&token={}", percent_encode_query_value(token)));
+    }
+    url
 }
 
 #[cfg(test)]
@@ -1329,7 +1335,14 @@ mod tests {
 
     #[test]
     fn build_ws_url_translates_http_to_ws() {
-        let url = build_ws_url("http", "127.0.0.1:18790", "/ws", "client-1", "tok en", None);
+        let url = build_ws_url(
+            "http",
+            "127.0.0.1:18790",
+            "/ws",
+            "client-1",
+            Some("tok en"),
+            None,
+        );
         assert_eq!(
             url,
             "ws://127.0.0.1:18790/ws?client_id=client-1&token=tok%20en"
@@ -1338,8 +1351,21 @@ mod tests {
 
     #[test]
     fn build_ws_url_translates_https_to_wss() {
-        let url = build_ws_url("https", "example.com", "/ws", "client-1", "secret", None);
+        let url = build_ws_url(
+            "https",
+            "example.com",
+            "/ws",
+            "client-1",
+            Some("secret"),
+            None,
+        );
         assert_eq!(url, "wss://example.com/ws?client_id=client-1&token=secret");
+    }
+
+    #[test]
+    fn build_ws_url_omits_token_when_none() {
+        let url = build_ws_url("https", "example.com", "/ws", "client-1", None, None);
+        assert_eq!(url, "wss://example.com/ws?client_id=client-1");
     }
 
     #[test]
@@ -1447,7 +1473,7 @@ mod tests {
             "example.com",
             "/ws",
             "client-1",
-            "secret",
+            Some("secret"),
             Some("ws://127.0.0.1:18790/"),
         );
         assert_eq!(

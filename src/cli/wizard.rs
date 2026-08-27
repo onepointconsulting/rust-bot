@@ -500,6 +500,13 @@ pub fn configure_websocket_channel(
         .prompt()?;
     websocket.jwt.enabled = enable_jwt;
     if enable_jwt {
+        let require_login = Confirm::new("Require login for the web UI?")
+            .with_default(true)
+            .with_help_message(
+                "No = allow guest use without signing in (login stays available for anyone who wants it)",
+            )
+            .prompt()?;
+        websocket.require_auth = require_login;
         websocket.jwt.aud = websocket.path.clone();
         let Some(parent) = config_path.parent() else {
             eprint_error("Could not determine credentials directory");
@@ -516,6 +523,8 @@ pub fn configure_websocket_channel(
         websocket.jwt.public_key_path = config.api.jwt.public_key_path.clone();
         websocket.jwt.iss = config.api.jwt.iss.clone();
         create_users_file(config, config_path, &websocket)?;
+    } else {
+        websocket.require_auth = false;
     }
     config.channels.extra.insert(
         CHANNEL_WEBSOCKET.to_string(),

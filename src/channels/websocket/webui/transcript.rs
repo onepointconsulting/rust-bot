@@ -361,6 +361,18 @@ impl WebUiTranscriptRecorder {
         }
     }
 
+    /// Empty `chat_id`'s durable WebUI transcript without tombstoning the
+    /// key — unlike [`Self::forget_session`], later [`Self::append`] calls
+    /// must still write. Used by the WebSocket `clear_session` handler:
+    /// `attach` prefers transcript history over the `Session`, so leaving
+    /// the JSONL in place would resurrect the conversation that was just
+    /// wiped.
+    pub fn clear_transcript(&mut self, chat_id: &str) {
+        let session_key = get_session_id(chat_id);
+        self.turn_sequences.retain(|(c, _), _| c != chat_id);
+        self.delete_webui_transcript(&session_key);
+    }
+
     /// Copy transcript rows before a zero-based global user-message index.
     /// ``before_user_index == user_count`` copies the full transcript prefix. WebUI
     /// uses that when forking from an assistant reply at the end of a chat.
@@ -1704,6 +1716,32 @@ mod tests {
             None,
             None
         ));
+    }
+
+    #[test]
+    fn clear_transcript_unlinks_the_file_but_later_appends_still_write() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        recorder.append_user_message("chat-1", "hello", &HashMap::new(), None, None, None);
+        let path = recorder.webui_transcript_path("websocket:chat-1");
+        assert!(path.exists());
+
+        recorder.clear_transcript("chat-1");
+        assert!(!path.exists());
+        assert!(recorder.chat_history("websocket:chat-1", 500).is_empty());
+
+        assert!(recorder.append_user_message(
+            "chat-1",
+            "after clear",
+            &HashMap::new(),
+            None,
+            None,
+            None
+        ));
+        assert!(path.exists());
+        let history = recorder.chat_history("websocket:chat-1", 500);
+        assert_eq!(history.len(), 1);
+        assert_eq!(history[0]["content"], "after clear");
     }
 
     // --- read_transcript_file ---

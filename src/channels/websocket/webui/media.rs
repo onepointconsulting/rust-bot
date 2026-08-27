@@ -133,7 +133,9 @@ pub(crate) struct MediaQuery {
 /// requires a valid `purpose=webui` token from either the `Authorization:
 /// Bearer` header (fetch/XHR callers) or a `?token=` query param (a plain
 /// `<img src>`, which can't set headers). No-op when JWT is disabled — same
-/// policy as the WS upgrade path.
+/// policy as the WS upgrade path. When JWT is enabled but
+/// `WsShared::require_auth` is `false` (an instance that allows guest use),
+/// a missing token is also allowed — but an invalid one still isn't.
 fn authorize_media_request(
     shared: &WsShared,
     headers: &HeaderMap,
@@ -151,8 +153,14 @@ fn authorize_media_request(
         });
     let token = header_token
         .or(query_token)
-        .filter(|t| !t.trim().is_empty())
-        .ok_or(StatusCode::UNAUTHORIZED)?;
+        .filter(|t| !t.trim().is_empty());
+    let Some(token) = token else {
+        return if shared.require_auth {
+            Err(StatusCode::UNAUTHORIZED)
+        } else {
+            Ok(())
+        };
+    };
     let opts = JwtValidationOpts {
         iss: shared.jwt.iss.clone(),
         aud: shared.jwt.aud.clone(),
@@ -306,6 +314,7 @@ mod tests {
             channels_config: ChannelsConfig::default(),
             jwt: JwtConfig::default(),
             jwt_public_key_pem: None,
+            require_auth: true,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
             session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
@@ -332,6 +341,12 @@ mod tests {
         };
         shared.jwt_public_key_pem = Some(Arc::new(std::fs::read(&keys.public_key_path).unwrap()));
         (shared, keys.private_key_path)
+    }
+
+    fn shared_with_jwt_enabled_and_optional_auth() -> (WsShared, std::path::PathBuf) {
+        let (mut shared, key) = shared_with_jwt_enabled();
+        shared.require_auth = false;
+        (shared, key)
     }
 
     fn mint_token_with_purpose(private_key_path: &Path, purpose: Option<&str>) -> String {
@@ -392,6 +407,28 @@ mod tests {
             authorize_media_request(&shared, &HeaderMap::new(), Some(&token)),
             Err(StatusCode::UNAUTHORIZED)
         );
+    }
+
+    #[test]
+    fn authorize_media_request_allows_missing_token_when_auth_not_required() {
+        let (shared, _key) = shared_with_jwt_enabled_and_optional_auth();
+        assert!(authorize_media_request(&shared, &HeaderMap::new(), None).is_ok());
+    }
+
+    #[test]
+    fn authorize_media_request_still_rejects_invalid_token_when_auth_not_required() {
+        let (shared, _key) = shared_with_jwt_enabled_and_optional_auth();
+        assert_eq!(
+            authorize_media_request(&shared, &HeaderMap::new(), Some("not-a-real-token")),
+            Err(StatusCode::UNAUTHORIZED)
+        );
+    }
+
+    #[test]
+    fn authorize_media_request_still_accepts_valid_token_when_auth_not_required() {
+        let (shared, key) = shared_with_jwt_enabled_and_optional_auth();
+        let token = mint_token_with_purpose(&key, Some(WEBUI_JWT_PURPOSE));
+        assert!(authorize_media_request(&shared, &HeaderMap::new(), Some(&token)).is_ok());
     }
 
     #[tokio::test]

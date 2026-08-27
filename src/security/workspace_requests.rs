@@ -21,7 +21,7 @@ use crate::{
         build_workspace_scope, default_workspace_scope, validate_workspace_scope_payload,
         workspace_scope_from_metadata,
     },
-    session::keys::SESSION_WEBUI_METADATA_KEY,
+    session::keys::{SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, SESSION_WEBUI_METADATA_KEY},
     session::manager::SessionManager,
     utils::helpers::write_text_atomic,
 };
@@ -352,11 +352,18 @@ impl WorkspaceRequestHandler {
     /// path our `/workspace` command uses) — this one uses
     /// `get_session_id` (`websocket:{chat_id}`) and the `webui` tag, both
     /// specific to the envelope-driven caller.
+    ///
+    /// Also stamps `owner_client_id` as this session's
+    /// [`SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY`] — but only the *first* time:
+    /// an already-stamped session (or an empty `owner_client_id`, e.g. a test
+    /// fixture that doesn't care) is left alone, so a chat's ownership can
+    /// never move to a later caller's `client_id`.
     pub fn persist_scope(
         &self,
         session_manager: &mut SessionManager,
         chat_id: &str,
         scope: &WorkspaceScope,
+        owner_client_id: &str,
     ) {
         let session_key = get_session_id(chat_id);
         let session = session_manager.get_or_create_session(&session_key);
@@ -367,6 +374,16 @@ impl WorkspaceRequestHandler {
         session
             .metadata
             .insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
+        if !owner_client_id.is_empty()
+            && !session
+                .metadata
+                .contains_key(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY)
+        {
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!(owner_client_id),
+            );
+        }
         let snapshot = session.clone();
         if let Err(e) = session_manager.save(snapshot) {
             log::error!("Failed to save session after persisting workspace scope: {e}");
@@ -571,7 +588,7 @@ mod tests {
         let (handler, mut sessions) = handler_and_sessions(default_dir.path());
 
         let scope = handler.default_scope();
-        handler.persist_scope(&mut sessions, "chat-1", &scope);
+        handler.persist_scope(&mut sessions, "chat-1", &scope, "client-1");
 
         let mut envelope = HashMap::new();
         envelope.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
@@ -587,7 +604,7 @@ mod tests {
         let (handler, mut sessions) = handler_and_sessions(default_dir.path());
 
         let scope = handler.default_scope();
-        handler.persist_scope(&mut sessions, "chat-1", &scope);
+        handler.persist_scope(&mut sessions, "chat-1", &scope, "client-1");
 
         let mut envelope = HashMap::new();
         envelope.insert(
@@ -608,7 +625,7 @@ mod tests {
         let (handler, mut sessions) = handler_and_sessions(default_dir.path());
 
         let scope = build_workspace_scope(project_dir.path(), WorkspaceAccessMode::Full, None);
-        handler.persist_scope(&mut sessions, "chat-1", &scope);
+        handler.persist_scope(&mut sessions, "chat-1", &scope, "client-1");
 
         let reloaded = handler.scope_for_session_key(&mut sessions, "websocket:chat-1");
         assert_eq!(reloaded.project_path, project_dir.path());
@@ -618,6 +635,47 @@ mod tests {
         assert_eq!(
             session.metadata.get(SESSION_WEBUI_METADATA_KEY),
             Some(&json!(true))
+        );
+    }
+
+    #[test]
+    fn persist_scope_stamps_owner_client_id_once() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let (handler, mut sessions) = handler_and_sessions(default_dir.path());
+        let scope = handler.default_scope();
+
+        handler.persist_scope(&mut sessions, "chat-1", &scope, "client-1");
+        {
+            let session = sessions.get_or_create_session("websocket:chat-1");
+            assert_eq!(
+                session.metadata.get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY),
+                Some(&json!("client-1"))
+            );
+        }
+
+        // A later call (e.g. a subsequent message on the same chat from a
+        // different reported client_id) must not move ownership.
+        handler.persist_scope(&mut sessions, "chat-1", &scope, "client-2");
+        let session = sessions.get_or_create_session("websocket:chat-1");
+        assert_eq!(
+            session.metadata.get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY),
+            Some(&json!("client-1"))
+        );
+    }
+
+    #[test]
+    fn persist_scope_with_empty_owner_client_id_does_not_stamp() {
+        let default_dir = tempfile::tempdir().unwrap();
+        let (handler, mut sessions) = handler_and_sessions(default_dir.path());
+        let scope = handler.default_scope();
+
+        handler.persist_scope(&mut sessions, "chat-1", &scope, "");
+        let session = sessions.get_or_create_session("websocket:chat-1");
+        assert!(
+            session
+                .metadata
+                .get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY)
+                .is_none()
         );
     }
 }

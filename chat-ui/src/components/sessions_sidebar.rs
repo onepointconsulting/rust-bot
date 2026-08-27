@@ -1,12 +1,13 @@
 //! Cursor-style sessions sidebar shared by `web-chat` and `websockets-chat`.
 //!
 //! Rows highlight the active session; clicking one invokes `on_select`.
-//! When `on_rename`, `on_fork`, and/or `on_delete` is provided
+//! When `on_rename`, `on_fork`, `on_clear`, and/or `on_delete` is provided
 //! (websockets-chat), each row also has a kebab that opens a menu with
-//! "Rename", "Fork session", and/or a red "Delete" item. Delete opens a
-//! confirmation dialog before actually calling `on_delete`; rename opens a
-//! small dialog to edit the title; fork fires immediately (non-destructive —
-//! it only ever creates a new chat).
+//! "Rename", "Fork session", "Clear session", and/or a red "Delete" item.
+//! Delete and clear each open their own confirmation dialog before actually
+//! calling `on_delete`/`on_clear`; rename opens a small dialog to edit the
+//! title; fork fires immediately (non-destructive — it only ever creates a
+//! new chat).
 //!
 //! Open/collapsed is a single `open: Signal<bool>` shared across every
 //! breakpoint (not "always docked on `sm+`, toggle-only on mobile" like an
@@ -159,6 +160,27 @@ fn IconFork() -> impl IntoView {
 }
 
 #[component]
+fn IconEraser() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <path d="m7 21-4.3-4.3c-1-1-1-2.5 0-3.4l9.6-9.6c1-1 2.5-1 3.4 0l5.6 5.6c1 1 1 2.5 0 3.4L13 21" />
+            <path d="M22 21H7" />
+            <path d="m5 11 9 9" />
+        </svg>
+    }
+}
+
+#[component]
 fn IconClose() -> impl IntoView {
     view! {
         <svg
@@ -221,6 +243,7 @@ fn SessionRow(
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
     on_open_fork: Option<Callback<String>>,
+    on_open_clear: Option<Callback<String>>,
     on_open_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     let id_for_class = id.clone();
@@ -234,8 +257,9 @@ fn SessionRow(
     let display_title_for_menu = display_title.clone();
     let show_rename = on_open_rename.is_some();
     let show_fork = on_open_fork.is_some();
+    let show_clear = on_open_clear.is_some();
     let show_delete = on_open_delete.is_some();
-    let show_menu = show_rename || show_fork || show_delete;
+    let show_menu = show_rename || show_fork || show_clear || show_delete;
 
     view! {
         <li class="group relative">
@@ -311,6 +335,7 @@ fn SessionRow(
                 let id_for_menu_visible = id.clone();
                 let id_for_rename = id.clone();
                 let id_for_fork = id.clone();
+                let id_for_clear = id.clone();
                 let id_for_delete = id.clone();
                 let title_for_rename = display_title_for_menu;
                 view! {
@@ -352,7 +377,7 @@ fn SessionRow(
                                     </button>
                                 }
                             })}
-                            {(show_rename && (show_fork || show_delete))
+                            {(show_rename && (show_fork || show_clear || show_delete))
                                 .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
                             {show_fork.then(|| {
                                 view! {
@@ -372,7 +397,27 @@ fn SessionRow(
                                     </button>
                                 }
                             })}
-                            {(show_fork && show_delete)
+                            {(show_fork && (show_clear || show_delete))
+                                .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
+                            {show_clear.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class=MENU_ITEM
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_clear) = on_open_clear {
+                                                on_open_clear.run(id_for_clear.clone());
+                                            }
+                                        }
+                                    >
+                                        <IconEraser />
+                                        "Clear session"
+                                    </button>
+                                }
+                            })}
+                            {(show_clear && show_delete)
                                 .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
                             {show_delete.then(|| {
                                 view! {
@@ -419,6 +464,7 @@ fn SessionGroupSection(
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
     on_open_fork: Option<Callback<String>>,
+    on_open_clear: Option<Callback<String>>,
     on_open_delete: Option<Callback<String>>,
 ) -> impl IntoView {
     let total = items.len();
@@ -448,6 +494,7 @@ fn SessionGroupSection(
                     open_menu_id=open_menu_id
                     on_open_rename=on_open_rename
                     on_open_fork=on_open_fork
+                    on_open_clear=on_open_clear
                     on_open_delete=on_open_delete
                 />
             }
@@ -503,6 +550,12 @@ pub fn SessionsSidebar(
     /// fork API yet.
     #[prop(optional)]
     on_fork: Option<Callback<String>>,
+    /// When set, each row's kebab also gets a "Clear session" item → confirm
+    /// dialog. Unlike delete, clearing the only remaining session is
+    /// allowed — the chat stays in the sidebar, just with its messages
+    /// wiped. Omitted by `web-chat`, which has no clear API yet.
+    #[prop(optional)]
+    on_clear: Option<Callback<String>>,
     /// When set, each row's kebab also gets a red "Delete" item → confirm
     /// dialog. Omitted by `web-chat`, which has no delete API yet.
     #[prop(optional)]
@@ -518,6 +571,7 @@ pub fn SessionsSidebar(
     let rename_draft = RwSignal::new(String::new());
     let rename_input = NodeRef::<Input>::new();
     let delete_id = RwSignal::new(None::<String>);
+    let clear_id = RwSignal::new(None::<String>);
 
     let open_rename = Callback::new(move |(id, title): (String, String)| {
         open_menu_id.set(None);
@@ -535,6 +589,24 @@ pub fn SessionsSidebar(
         }
     });
     let on_open_fork = on_fork.map(|_| open_fork);
+
+    let open_clear = Callback::new(move |id: String| {
+        open_menu_id.set(None);
+        clear_id.set(Some(id));
+    });
+    let on_open_clear = on_clear.map(|_| open_clear);
+
+    let close_clear = move || clear_id.set(None);
+
+    let confirm_clear = move || {
+        let Some(id) = clear_id.get() else {
+            return;
+        };
+        if let Some(on_clear) = on_clear {
+            on_clear.run(id);
+        }
+        close_clear();
+    };
 
     let close_rename = move || {
         rename_id.set(None);
@@ -609,6 +681,7 @@ pub fn SessionsSidebar(
                             open_menu_id=open_menu_id
                             on_open_rename=on_open_rename
                             on_open_fork=on_open_fork
+                            on_open_clear=on_open_clear
                             on_open_delete=on_open_delete
                         />
                     }
@@ -820,6 +893,64 @@ pub fn SessionsSidebar(
                                     "OK"
                                 </button>
                             </Show>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || clear_id.get().is_some()>
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    <div
+                        class="absolute inset-0 bg-slate-900/40"
+                        aria-hidden="true"
+                        on:click=move |_| close_clear()
+                    ></div>
+                    <div
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="clear-session-title"
+                        class="relative w-full max-w-sm rounded-2xl bg-white p-5 shadow-2xl ring-1 ring-slate-200"
+                        on:keydown=move |ev| {
+                            let key = ev.key();
+                            if key == "Escape" {
+                                close_clear();
+                            }
+                        }
+                    >
+                        <div class="mb-4 flex items-start justify-between gap-3">
+                            <h2
+                                id="clear-session-title"
+                                class="text-base font-semibold text-slate-900"
+                            >
+                                "Clear session"
+                            </h2>
+                            <button
+                                type="button"
+                                aria-label="Close"
+                                class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                                on:click=move |_| close_clear()
+                            >
+                                <IconClose />
+                            </button>
+                        </div>
+                        <p class="mb-5 text-sm text-slate-600">
+                            "Messages will be removed, but this chat will stay in the list."
+                        </p>
+                        <div class="flex justify-end gap-2">
+                            <button
+                                type="button"
+                                class="rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-200"
+                                on:click=move |_| close_clear()
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                type="button"
+                                class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
+                                on:click=move |_| confirm_clear()
+                            >
+                                "Clear"
+                            </button>
                         </div>
                     </div>
                 </div>

@@ -56,13 +56,23 @@ pub enum EnvelopeType {
     /// only cancellation path is the `/stop` chat command, which costs a
     /// visible user message and an agent reply just to stop a turn.
     AbortTurn,
+    /// Persist a named model-preset override on an existing
+    /// `websocket:{chat_id}` session. Rust-side addition with no nanobot
+    /// precedent — the Python reference has no preset envelope; its closest
+    /// path is the `/model-preset` chat command.
+    SetModelPreset,
+    /// Wipe an existing `websocket:{chat_id}` session's messages (and the
+    /// goal/usage metadata that would otherwise leak into the next turn)
+    /// without deleting the session itself. Rust-side addition with no
+    /// nanobot precedent — the Python reference has no clear envelope; its
+    /// closest path is the `/new` chat command.
+    ClearSession,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
     /// reaches dispatch, `_parse_envelope` has already guaranteed `type` is
     /// a string (not missing, not some other JSON value), so `String` here
     /// (not `Option<String>` or `serde_json::Value`) is the right shape.
-    SetModelPreset,
     Unrecognized(String),
 }
 
@@ -84,6 +94,7 @@ impl From<&str> for EnvelopeType {
             "message" => Self::Message,
             "list_chats" => Self::ListChats,
             "set_model_preset" => Self::SetModelPreset,
+            "clear_session" => Self::ClearSession,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -131,6 +142,9 @@ pub enum WsOutboundEvent {
     /// `stream_end` frames arrive. Rust-side addition, no nanobot wire-name
     /// precedent to mirror.
     User,
+    /// Reply to [`EnvelopeType::ClearSession`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    SessionCleared,
 }
 
 impl WsOutboundEvent {
@@ -149,6 +163,7 @@ impl WsOutboundEvent {
             Self::TurnAborted => "turn_aborted",
             Self::ModelPresetSet => "model_preset_set",
             Self::User => "user",
+            Self::SessionCleared => "session_cleared",
         }
     }
 }
@@ -201,6 +216,10 @@ fn validate_jwt_aud_matches_path(cfg: &WebSocketConfig) -> garde::Result {
     Ok(())
 }
 
+fn default_require_auth() -> bool {
+    true
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebSocketConfig {
@@ -210,6 +229,17 @@ pub struct WebSocketConfig {
     #[serde(deserialize_with = "deserialize_path")]
     pub path: String,
     pub jwt: JwtConfig,
+    /// Whether a valid `purpose=webui` JWT is required to open a connection
+    /// (and to fetch media) when `jwt.enabled` is `true`. Defaults to `true`
+    /// so existing deployments keep requiring login. When `false`, a missing
+    /// token is allowed (an invalid one is still rejected) and the
+    /// connection's `webui_authenticated` flag is `false`, same as when JWT
+    /// is disabled entirely — this is what lets a single instance offer
+    /// guest access while JWT (and `/v1/login`) stay available for anyone
+    /// who wants to sign in. Ignored when `jwt.enabled` is `false` (there is
+    /// nothing to require in that case).
+    #[serde(default = "default_require_auth")]
+    pub require_auth: bool,
     pub allow_from: Vec<String>,
     pub streaming: bool,
     pub max_message_bytes: usize,
@@ -233,6 +263,7 @@ impl Default for WebSocketConfig {
             port: 8765,
             path: DEFAULT_AUD.to_string(),
             jwt: JwtConfig::default(),
+            require_auth: default_require_auth(),
             allow_from: vec![],
             streaming: false,
             max_message_bytes: 1024 * 1024 * 32,
@@ -287,6 +318,10 @@ pub struct WsShared {
     pub channels_config: ChannelsConfig,
     pub jwt: JwtConfig,
     pub jwt_public_key_pem: Option<Arc<Vec<u8>>>,
+    /// Copied from [`WebSocketConfig::require_auth`] at channel construction —
+    /// see that field's doc comment for the exact semantics `authorize` and
+    /// `webui::media::authorize_media_request` apply to it.
+    pub require_auth: bool,
     pub connections: ConnectionRegistryHandle,
     pub supports_streaming: bool,
     pub gateway_services: Arc<GatewayServices>,
@@ -362,6 +397,24 @@ mod tests {
     }
 
     #[test]
+    fn require_auth_defaults_to_true_when_omitted() {
+        let cfg: WebSocketConfig =
+            serde_json::from_str("{}").expect("empty object should deserialize");
+        assert!(
+            cfg.require_auth,
+            "existing configs that omit requireAuth must keep requiring login"
+        );
+        assert!(WebSocketConfig::default().require_auth);
+    }
+
+    #[test]
+    fn require_auth_can_be_explicitly_disabled() {
+        let cfg: WebSocketConfig = serde_json::from_str(r#"{"requireAuth": false}"#)
+            .expect("requireAuth: false should deserialize");
+        assert!(!cfg.require_auth);
+    }
+
+    #[test]
     fn jwt_aud_must_match_path_when_enabled() {
         let mut cfg = WebSocketConfig {
             path: DEFAULT_AUD.to_string(),
@@ -428,6 +481,10 @@ mod tests {
             EnvelopeType::from("set_model_preset"),
             EnvelopeType::SetModelPreset
         );
+        assert_eq!(
+            EnvelopeType::from("clear_session"),
+            EnvelopeType::ClearSession
+        );
     }
 
     #[test]
@@ -482,5 +539,10 @@ mod tests {
     #[test]
     fn ws_outbound_event_user_has_no_nanobot_precedent() {
         assert_eq!(WsOutboundEvent::User.as_str(), "user");
+    }
+
+    #[test]
+    fn ws_outbound_event_session_cleared_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::SessionCleared.as_str(), "session_cleared");
     }
 }

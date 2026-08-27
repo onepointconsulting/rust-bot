@@ -23,6 +23,51 @@ Tailwind CSS is fetched automatically by Trunk on first build (via the
 `data-trunk rel="tailwind-css"` link in `index.html`) — no Node.js/npm
 required.
 
+## Optional login
+
+By default the gateway requires a JWT to use this app at all
+(`channels.websocket.jwt.enabled: true`, `requireAuth` defaults to `true`).
+You can instead run a guest-capable instance that skips login entirely, or
+one where login is available but not required:
+
+```json
+"channels": {
+  "websocket": {
+    "jwt": { "enabled": true },
+    "requireAuth": false
+  }
+}
+```
+
+(`rust-bot onboard`/`rust-bot wizard` also ask "Require login for the web
+UI?" after enabling JWT, which sets this field for you.)
+
+With `requireAuth: false`, this app fetches `GET /v1/auth/config` on load —
+`{ requireLogin, loginAvailable }` — and skips the `LoginForm` whenever
+`requireLogin` is `false`, connecting to the WebSocket with no `token=` query
+parameter instead. `jwt.enabled: false` (no login available at all) behaves
+the same way from the UI's perspective; `requireLogin` is always `false` in
+that case too.
+
+**Guest session isolation.** A guest's chat list, and `attach`/`rename_chat`/
+`delete_chat`/`fork_chat` on it, are scoped to the WebSocket `client_id` this
+app stores in `BrowserLocalStorage` (`rust-bot-websockets-chat-client-id`,
+persisted across tabs/reloads/restarts — unlike the JWT, which lives in
+`SessionStorage` and dies with the tab). Practical implications:
+
+- Same browser, later visit: a guest still sees their own chats.
+- Incognito, another browser, or cleared site data: a fresh `client_id`, so
+  previous chats stay on disk but are hidden from that connection (fails
+  closed rather than showing everyone else's chats).
+- Shared machine, same browser profile: two people share one `client_id` and
+  therefore one guest chat list.
+- `client_id` is a client-supplied value (query param + `LocalStorage`), so
+  this scoping stops accidental chat-list leakage between guests, not a
+  determined attacker.
+
+Logging in from a guest session at any point (`loginAvailable: true`) still
+works normally; guests just aren't forced through `LoginForm` first.
+
 ## Mint a usable token
 
 The gateway validates a token's `aud` claim against its own WebSocket

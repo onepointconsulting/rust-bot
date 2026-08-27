@@ -64,6 +64,14 @@ and JWT authentication (default: yes). JWT writes an Ed25519 keypair under
 `.rust-bot/users.json` (password stored as an Argon2id hash, never in
 plaintext).
 
+If you enable JWT, onboard also asks **Require login for the web UI?**
+(default: yes). Answering **No** sets `channels.websocket.requireAuth` to
+`false`: the gateway still supports login for anyone who wants it (tokens
+minted via `generate-jwt-token` still work), but the `websockets-chat` UI
+skips the login form and connects as a guest when no token is present. Guest
+chats are scoped to the browser's local `client_id` — see the note in
+"Gateway (`websockets/`)" below.
+
 Useful flags:
 
 | Flag | Default | Description |
@@ -97,6 +105,7 @@ Using config: C:\temp\rust-bot-temp\.\.rust-bot\config.json
 > Enter WebSocket port  8765          (WebSocket channel port)
 > Enter WebSocket port  18790         (gateway listen port)
 > Enable JWT authentication?  Yes
+> Require login for the web UI?  Yes
 Wrote private key: C:\temp\rust-bot-temp\.rust-bot\credentials\private_key.pem
 Wrote public key:  C:\temp\rust-bot-temp\.rust-bot\credentials\public_key.pem
 > Enter user email for login  you@example.com
@@ -299,6 +308,15 @@ session above that is `http://127.0.0.1:18790/`. You can also set
 
 Sign in with the email and password created during onboard (or with a user
 added later via `rust-bot generate-jwt-token --purpose webui`).
+
+If `channels.websocket.requireAuth` is `false` (answered **No** to "Require
+login for the web UI?" during onboard, or set by hand — see
+`websockets-chat/README.md`'s "Optional login" section), the UI skips the
+login form entirely and connects as a guest. A guest's chat list is scoped to
+a `client_id` stored in the browser's `LocalStorage`: it survives reloads and
+new tabs in the same browser, but a different browser, incognito window, or
+cleared site data starts a fresh, empty chat list (previous chats stay on
+disk but are hidden — guest scoping fails closed, not open).
 
 ### REST API (`web/`)
 

@@ -6,8 +6,8 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, `rename_chat`, `delete_chat`, `fork_chat`, and
-//!   `abort_turn`.
+//!   `attach`, `list_chats`, `rename_chat`, `delete_chat`, `clear_session`,
+//!   `fork_chat`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 /// more inbound types than this crate has a use for (`set_workspace_scope`,
 /// `transcribe_audio`). This struct covers the ones the frontend actually
 /// sends (`message`, `new_chat`, `attach`, `list_chats`, `rename_chat`,
-/// `delete_chat`, `fork_chat`, `abort_turn`); constructors pin `type_` so
-/// callers cannot invent a shape the gateway would reject with "unknown
-/// type".
+/// `delete_chat`, `clear_session`, `fork_chat`, `abort_turn`); constructors
+/// pin `type_` so callers cannot invent a shape the gateway would reject
+/// with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
 pub struct ClientEnvelope {
     #[serde(rename = "type")]
@@ -193,6 +193,27 @@ impl ClientEnvelope {
     pub fn delete_chat(chat_id: impl Into<String>) -> Self {
         Self {
             type_: "delete_chat",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            before_user_index: None,
+            webui: true,
+        }
+    }
+
+    /// Wipe `chat_id`'s conversation (messages, goal state, token usage)
+    /// without deleting the session itself — the chat stays in the sidebar.
+    ///
+    /// The reply is a `session_cleared` event carrying that `chat_id` —
+    /// sent to every connection subscribed to it, not just the requester,
+    /// same fan-out as `delete_chat`. Rejections come back as `error`
+    /// (`session_not_found`, `access_denied`, `clear_failed`).
+    pub fn clear_session(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "clear_session",
             chat_id: Some(chat_id.into()),
             turn_id: None,
             content: None,
@@ -403,6 +424,11 @@ pub enum ServerEvent {
     /// Reply to a `delete_chat` envelope, fanned out to every connection
     /// that was subscribed to `chat_id` — not just the requester.
     ChatDeleted { chat_id: String },
+    /// Reply to a [`ClientEnvelope::clear_session`] envelope: `chat_id`'s
+    /// conversation was wiped but the session itself still exists. Fanned
+    /// out to every connection subscribed to `chat_id` — not just the
+    /// requester.
+    SessionCleared { chat_id: String },
     /// Reply to an `abort_turn` envelope: the in-flight turn on `chat_id` was
     /// cancelled, so no `stream_end` or final `message` is coming for it.
     /// Fanned out to every connection attached to `chat_id`. `turn_id` is
@@ -430,8 +456,9 @@ impl ServerEvent {
     /// Used by the app to ignore leftover frames from a previous chat after
     /// `new_chat` switches the connection onto a new id. `Unknown`,
     /// [`ServerEvent::ChatsList`], [`ServerEvent::ChatRenamed`]/
-    /// [`ServerEvent::ChatDeleted`] (both can target any sidebar row), and
-    /// unscoped errors return `None`.
+    /// [`ServerEvent::ChatDeleted`]/[`ServerEvent::SessionCleared`] (all
+    /// three can target any sidebar row), and unscoped errors return
+    /// `None`.
     pub fn chat_id(&self) -> Option<&str> {
         match self {
             ServerEvent::Ready { chat_id, .. }
@@ -451,12 +478,14 @@ impl ServerEvent {
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
             }
-            // A rename/delete can target any sidebar row, not just the
-            // active chat, so these events are unscoped for drop purposes
-            // (see `should_drop_event`). The payload still carries `chat_id`.
+            // A rename/delete/clear can target any sidebar row, not just
+            // the active chat, so these events are unscoped for drop
+            // purposes (see `should_drop_event`). The payload still carries
+            // `chat_id`.
             ServerEvent::ChatsList { .. }
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatDeleted { .. }
+            | ServerEvent::SessionCleared { .. }
             | ServerEvent::Unknown(_) => None,
         }
     }
@@ -735,6 +764,11 @@ struct ChatDeletedWire {
 }
 
 #[derive(Deserialize)]
+struct SessionClearedWire {
+    chat_id: String,
+}
+
+#[derive(Deserialize)]
 struct TurnAbortedWire {
     chat_id: String,
     #[serde(default)]
@@ -854,6 +888,8 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         }),
         "chat_deleted" => decode::<ChatDeletedWire>(&value)
             .map(|w| ServerEvent::ChatDeleted { chat_id: w.chat_id }),
+        "session_cleared" => decode::<SessionClearedWire>(&value)
+            .map(|w| ServerEvent::SessionCleared { chat_id: w.chat_id }),
         "turn_aborted" => decode::<TurnAbortedWire>(&value).map(|w| ServerEvent::TurnAborted {
             chat_id: w.chat_id,
             turn_id: w.turn_id,
@@ -1521,6 +1557,33 @@ mod tests {
         assert_eq!(
             event,
             ServerEvent::ChatDeleted {
+                chat_id: "chat-1".to_string(),
+            }
+        );
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_clear_session_serializes_expected_shape() {
+        let envelope = ClientEnvelope::clear_session("chat-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "clear_session",
+                "chat_id": "chat-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_session_cleared() {
+        let raw = r#"{"event":"session_cleared","chat_id":"chat-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::SessionCleared {
                 chat_id: "chat-1".to_string(),
             }
         );

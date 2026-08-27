@@ -156,8 +156,6 @@ impl CommandHandler for CmdNew {
             .get(session.last_consolidated..)
             .map(<[_]>::to_vec);
         session.clear();
-        session.metadata.remove(goal_state::GOAL_STATE_KEY);
-        session.metadata.remove(crate::session::SESSION_TOKEN_USAGE_KEY);
         if let Err(e) = session_manager.save(session) {
             log::error!("Failed to save session: {e}");
         }

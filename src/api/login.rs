@@ -161,15 +161,50 @@ pub(crate) async fn login(
     }))
 }
 
+/// Response body for `GET /v1/auth/config` — lets a static, config-agnostic
+/// frontend bundle (`websockets-chat`) discover, on load, whether *this*
+/// gateway instance requires login before it decides whether to show
+/// `LoginForm` or connect as a guest. Unauthenticated by design: a client
+/// has to ask this before it knows whether it even has credentials to send.
+#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
+#[serde(rename_all = "camelCase")]
+pub(crate) struct AuthConfigResponse {
+    /// Whether the web UI must sign in before opening a WebSocket
+    /// connection — `WebSocketConfig::jwt.enabled && WebSocketConfig::require_auth`.
+    /// `false` on an instance that allows guest use.
+    pub(crate) require_login: bool,
+    /// Whether `/v1/login` can mint tokens at all (`WebSocketConfig::jwt.enabled`).
+    /// Can be `true` while `require_login` is `false`: a guest-capable instance
+    /// may still offer optional sign-in.
+    pub(crate) login_available: bool,
+}
+
+/// Axum handler for `GET /v1/auth/config`. The response is computed once at
+/// server-start (see `cli::commands::serve_combined_login_and_gateway`) and
+/// handed in as the route's own `State`, so this handler is just a clone-and-return.
+#[utoipa::path(
+    get,
+    path = "/v1/auth/config",
+    responses(
+        (status = 200, description = "Whether this gateway requires login for the web UI", body = AuthConfigResponse),
+    ),
+    tag = "security"
+)]
+pub(crate) async fn auth_config(
+    State(response): State<AuthConfigResponse>,
+) -> Json<AuthConfigResponse> {
+    Json(response)
+}
+
 /// Minimal OpenAPI document for the combined gateway server, which exposes
-/// only `/v1/login` (not the full `api::rest::ApiDoc` chat surface). No
-/// `bearerAuth` security scheme/modifier is needed — `login`'s own
-/// `#[utoipa::path]` doesn't declare `security(...)`, so nothing in this
-/// document needs it either.
+/// only `/v1/login` and `/v1/auth/config` (not the full `api::rest::ApiDoc`
+/// chat surface). No `bearerAuth` security scheme/modifier is needed —
+/// neither route's `#[utoipa::path]` declares `security(...)`, so nothing in
+/// this document needs it either.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(login),
-    components(schemas(ChatLoginRequest, ChatLoginResponse)),
+    paths(login, auth_config),
+    components(schemas(ChatLoginRequest, ChatLoginResponse, AuthConfigResponse)),
     tags((name = "security", description = "Authentication and token issuance")),
 )]
 pub(crate) struct GatewayApiDoc;

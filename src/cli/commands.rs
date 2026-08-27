@@ -11,7 +11,9 @@ use crate::agent::cron_context::with_cron_context_stack;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
-use crate::api::login::{GatewayApiDoc, LoginState, jwt_auth_state_from_config, login};
+use crate::api::login::{
+    AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
+};
 use crate::api::rest::ApiServer;
 use crate::api::rest::build_cors_layer;
 use crate::api::rest::create_api_server;
@@ -44,7 +46,7 @@ use crate::utils::evaluator::evaluate_response;
 
 use anstyle::{AnsiColor, Color, Style};
 use axum::Router;
-use axum::routing::post;
+use axum::routing::{get, post};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use reedline::{
@@ -869,8 +871,9 @@ async fn serve_combined_login_and_gateway(
     port: u16,
     web_root: Option<&std::path::Path>,
 ) -> std::io::Result<()> {
+    let ws_shared = ws_channel.shared();
     let login_state = Arc::new(LoginState {
-        jwt_auth: jwt_auth_state_from_config(&ws_channel_jwt(ws_channel)),
+        jwt_auth: jwt_auth_state_from_config(&ws_shared.jwt),
         user_registry: Arc::new(StdMutex::new(open_or_empty_user_registry(
             &config.api.users_file,
         ))),
@@ -880,7 +883,19 @@ async fn serve_combined_login_and_gateway(
         .route("/v1/login", post(login))
         .with_state(login_state);
 
+    // Unauthenticated by design — see `AuthConfigResponse`'s doc comment for
+    // why the frontend needs this before it knows whether it has anything to
+    // authenticate with.
+    let auth_config_response = AuthConfigResponse {
+        require_login: ws_shared.jwt.enabled && ws_shared.require_auth,
+        login_available: ws_shared.jwt.enabled,
+    };
+    let auth_config_router = Router::new()
+        .route("/v1/auth/config", get(auth_config))
+        .with_state(auth_config_response);
+
     let mut app: Router = login_router
+        .merge(auth_config_router)
         .merge(
             SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", GatewayApiDoc::openapi()),
         )
@@ -931,14 +946,6 @@ async fn serve_combined_login_and_gateway(
     )
     .with_graceful_shutdown(wait_for_websocket_shutdown(Arc::clone(ws_channel)))
     .await
-}
-
-/// `ws_channel`'s `WebSocketConfig.jwt` isn't exposed directly (only via the
-/// `WsShared` snapshot built per-router-call) — reading it through `shared()`
-/// keeps this file from needing a dedicated accessor on `WebSocketChannel`
-/// just for this one field.
-fn ws_channel_jwt(ws_channel: &Arc<WebSocketChannel>) -> crate::config::schema::JwtConfig {
-    ws_channel.shared().jwt
 }
 
 /// Mirrors `run_api`'s own open-or-empty fallback so the combined gateway

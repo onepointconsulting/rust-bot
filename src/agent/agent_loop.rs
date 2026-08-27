@@ -2181,9 +2181,10 @@ impl AgentLoop {
         if let Some(n) = usage.cache_read_input_tokens {
             usage_obj.insert("cached_tokens".into(), Value::from(n));
         }
-        outbound
-            .metadata
-            .insert(OutboundMessage::TOKEN_USAGE_KEY.into(), Value::Object(usage_obj));
+        outbound.metadata.insert(
+            OutboundMessage::TOKEN_USAGE_KEY.into(),
+            Value::Object(usage_obj),
+        );
     }
 }
 
