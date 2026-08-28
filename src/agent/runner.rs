@@ -1249,7 +1249,7 @@ mod tests {
             _: Option<Vec<Value>>,
             _: Option<String>,
             _: usize,
-            _: f32,
+            _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
@@ -1261,7 +1261,7 @@ mod tests {
             _: Option<Vec<Value>>,
             _: Option<String>,
             _: usize,
-            _: f32,
+            _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
@@ -1348,7 +1348,7 @@ mod tests {
             _: Option<Vec<Value>>,
             _: Option<String>,
             _: usize,
-            _: f32,
+            _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
@@ -1360,7 +1360,7 @@ mod tests {
             _: Option<Vec<Value>>,
             _: Option<String>,
             _: usize,
-            _: f32,
+            _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {

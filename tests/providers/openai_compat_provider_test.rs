@@ -45,7 +45,7 @@ async fn simple_test_chat_system(system_message: &str, user_message: &str) -> LL
         }),
     ];
     let response = provider
-        .chat(messages, None, None, 100, 0.5, None, None)
+        .chat(messages, None, None, 100, Some(0.5), None, None)
         .await;
     response
 }
@@ -57,7 +57,7 @@ async fn simple_test_chat(message: &str) -> LLMResponse {
         "content": message
     })];
     let response = provider
-        .chat(messages, None, None, 1000, 0.5, None, None)
+        .chat(messages, None, None, 1000, Some(0.5), None, None)
         .await;
     response
 }
@@ -99,7 +99,7 @@ async fn simple_test_safe_chat(message: &str) -> LLMResponse {
             Some(vec![simple_weather_tool()]),
             None,
             1000,
-            0.5,
+            Some(0.5),
             None,
             None,
         )
@@ -184,7 +184,7 @@ async fn test_chat_stream_success() {
             None,
             None,
             1000,
-            0.5,
+            Some(0.5),
             None,
             None,
             &Some(|content| async move {
@@ -206,7 +206,7 @@ async fn test_safe_chat_stream_success() {
             None,
             None,
             1000,
-            0.5,
+            Some(0.5),
             None,
             None,
             &Some(|content| async move {

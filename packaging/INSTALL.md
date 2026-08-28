@@ -1,8 +1,9 @@
 # Rust Bot - Installation
 
 This package contains a pre-built `rust-bot` binary, a `gmail-auth` helper
-for Gmail OAuth, the `web` (REST API) and `websockets` (gateway) UI assets,
-and two sample configurations. The recommended first run is `rust-bot onboard`.
+for Gmail OAuth, the `web` (REST API) UI assets, an optional `websockets/`
+copy of the gateway UI (already compiled into `rust-bot`), and two sample
+configurations. The recommended first run is `rust-bot onboard`.
 
 ## 1. Unpack
 
@@ -18,7 +19,8 @@ rust-bot-<version>-<platform>/
     *.js
     *.wasm
     *.css
-  websockets/          Gateway chat UI (rust-bot gateway)
+  websockets/          Gateway chat UI (optional --web-root override;
+                       already compiled into rust-bot)
     index.html
     *.js
     *.wasm
@@ -28,10 +30,11 @@ rust-bot-<version>-<platform>/
     anthropic.json
 ```
 
-The binary has its prompt templates and workspace seed files (`AGENTS.md`,
-`SOUL.md`, `TOOLS.md`, `USER.md`, …) compiled in, so it works standalone —
-you can move `rust-bot` (or `rust-bot.exe`) anywhere, including away from
-this folder.
+The binary has its prompt templates, workspace seed files (`AGENTS.md`,
+`SOUL.md`, `TOOLS.md`, `USER.md`, …), and the gateway web UI compiled in,
+so it works standalone — you can move `rust-bot` (or `rust-bot.exe`)
+anywhere, including away from this folder. The REST `web/` UI is still
+loaded from disk.
 
 ## 2. Onboard (recommended)
 
@@ -129,11 +132,11 @@ next-step commands. After this session the important paths are:
 From the same folder:
 
 ```bash
-# Windows — gateway + websockets chat UI
-.\rust-bot.exe gateway -c .\.rust-bot\config.json --web-root .\websockets
+# Windows — gateway + compiled-in websockets chat UI
+.\rust-bot.exe gateway -c .\.rust-bot\config.json
 
 # Linux / macOS
-./rust-bot gateway -c ./.rust-bot/config.json --web-root ./websockets
+./rust-bot gateway -c ./.rust-bot/config.json
 ```
 
 Open `http://127.0.0.1:18790/` and sign in with the email and password you
@@ -288,23 +291,26 @@ if tokens are revoked or scopes change.
 
 The package includes two pre-built UIs:
 
-- `websockets/` — login + streaming chat for `rust-bot gateway` (this is
-  what onboard configures when you answer **Configure the gateway web UI?**)
+- **Gateway** — login + streaming chat for `rust-bot gateway` (this is
+  what onboard configures when you answer **Configure the gateway web UI?**).
+  The UI is compiled into `rust-bot`; `websockets/` is an optional on-disk
+  copy if you want to override it with `--web-root` or `gateway.webRoot`.
 - `web/` — login + chat for the REST `rust-bot api` server
 
 ### Gateway (`websockets/`)
 
 ```bash
 # Windows
-.\rust-bot.exe gateway --config .\.rust-bot\config.json --web-root .\websockets
+.\rust-bot.exe gateway --config .\.rust-bot\config.json
 
 # Linux / macOS
-./rust-bot gateway --config ./.rust-bot/config.json --web-root ./websockets
+./rust-bot gateway --config ./.rust-bot/config.json
 ```
 
 Then open `http://<host>:<port>/` in a browser. With the example onboard
-session above that is `http://127.0.0.1:18790/`. You can also set
-`gateway.webRoot` in the config instead of passing `--web-root` every time.
+session above that is `http://127.0.0.1:18790/`. To serve a custom Trunk
+build instead of the compiled-in UI, pass `--web-root` or set
+`gateway.webRoot` (for example `--web-root .\websockets`).
 
 Sign in with the email and password created during onboard (or with a user
 added later via `rust-bot generate-jwt-token --purpose webui`).

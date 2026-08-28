@@ -237,7 +237,7 @@ impl Tool for OcrTool {
                 None,
                 Some(self.config.model.clone()),
                 OCR_MAX_TOKENS,
-                0.0,
+                Some(0.0),
                 None,
                 None,
             )

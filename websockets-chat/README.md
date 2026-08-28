@@ -101,10 +101,11 @@ must be set to `/ws` (matching `app.rs::GATEWAY_WS_PATH`) — **not** the
 server-side default of `/` — because the gateway registers the WebSocket
 upgrade handler as a literal route at whatever path you configure, and that
 takes priority over the static-file fallback that serves this app's own
-`index.html` when `gateway.webRoot` points at this app's build (see "Build
-for production" below). With path `/`, opening the gateway's URL in a
-browser always hits the upgrade handler instead of the SPA and fails with
-"Connection header did not include 'upgrade'". Set in your config:
+`index.html` (from the UI compiled into `rust-bot`, or from `--web-root` /
+`gateway.webRoot` — see "Build for production" below). With path `/`,
+opening the gateway's URL in a browser always hits the upgrade handler
+instead of the SPA and fails with "Connection header did not include
+'upgrade'". Set in your config:
 
 ```json
 "channels": {
@@ -149,7 +150,12 @@ trunk build --release
 ```
 
 Output (`index.html`, `*.js`, `*.wasm`, `*.css`) is written to
-`websockets-chat/dist/`. Point the gateway at it:
+`websockets-chat/dist/`. Recompile `rust-bot` after that so the gateway
+embeds the new bundle (`scripts/build_all` runs Trunk first for this
+reason). A plain `cargo run -- gateway` then serves `/` from the binary.
+
+To try an unreleased Trunk build without recompiling rust-bot, override
+with `--web-root`:
 
 ```bash
 cargo run -- gateway --config ./configs/simple1/config.json --web-root ./websockets-chat/dist
@@ -158,8 +164,8 @@ cargo run -- gateway --config ./configs/simple1/config.json --web-root ./websock
 Then open `http://<host>:<port>/` — login and the WebSocket connection are
 both same-origin, so `app.rs` derives everything it needs from
 `window.location` with no `?wsBase=` override required. `--web-root` (or the
-equivalent `gateway.webRoot` config field, which otherwise defaults to `./web`
-and won't point at this app's build) must be set for `/` to serve anything at
-all — and `channels.websocket.path`/`jwt.aud` must both be `/ws` per the
-"Develop" section above, or `/` will hit the WebSocket upgrade handler
-instead of the SPA, exactly as described there.
+equivalent `gateway.webRoot` config field) is optional: when unset, the
+gateway serves the UI compiled into the binary. `channels.websocket.path` /
+`jwt.aud` must both be `/ws` per the "Develop" section above, or `/` will
+hit the WebSocket upgrade handler instead of the SPA, exactly as described
+there.

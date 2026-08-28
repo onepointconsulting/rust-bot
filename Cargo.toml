@@ -82,7 +82,7 @@ whatsapp-rust = { version = "0.6", default-features = false, features = [
 whatsapp-rust-tokio-transport = "0.6"
 whatsapp-rust-ureq-http-client = "0.6"
 qrcode = {version = "0.14.1"}
-rust-embed = "8.11"
+rust-embed = { version = "8.11", features = ["interpolate-folder-path", "mime-guess"] }
 jsonwebtoken = { version = "10.4", features = ["rust_crypto"] }
 ed25519-dalek = { version = "2.1", features = ["pem", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }

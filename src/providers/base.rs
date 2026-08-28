@@ -325,7 +325,7 @@ pub trait LLMProviderDyn: Send + Sync {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse;
@@ -336,7 +336,7 @@ pub trait LLMProviderDyn: Send + Sync {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse;
@@ -406,7 +406,7 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
@@ -429,7 +429,7 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
@@ -717,7 +717,7 @@ pub trait LLMProvider: Send + Sync {
     /// * `tools` - Optional vector of tool definition maps.
     /// * `model` - Optional model identifier (provider-specific).
     /// * `max_tokens` - Maximum tokens in response.
-    /// * `temperature` - Sampling temperature.
+    /// * `temperature` - Optional sampling temperature. `None` omits the parameter.
     /// * `reasoning_effort` - Optional reasoning effort string.
     /// * `tool_choice` - Tool selection strategy ("auto", "required", or specific tool map/string).
     ///
@@ -733,7 +733,7 @@ pub trait LLMProvider: Send + Sync {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send;
@@ -823,7 +823,7 @@ pub trait LLMProvider: Send + Sync {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send {
@@ -872,7 +872,7 @@ pub trait LLMProvider: Send + Sync {
     /// * `tools` - Optional vector of tool definition maps.
     /// * `model` - Optional model identifier (provider-specific).
     /// * `max_tokens` - Maximum tokens in response.
-    /// * `temperature` - Sampling temperature.
+    /// * `temperature` - Optional sampling temperature. `None` omits the parameter.
     /// * `reasoning_effort` - Optional reasoning effort string.
     /// * `tool_choice` - Tool selection strategy ("auto", "required", or specific tool map/string).
     /// * `on_content_delta` - Optional async function taking a string that will be called with content delta text.
@@ -889,7 +889,7 @@ pub trait LLMProvider: Send + Sync {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
@@ -928,7 +928,7 @@ pub trait LLMProvider: Send + Sync {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
@@ -975,8 +975,9 @@ pub trait LLMProvider: Send + Sync {
 
     /// Calls chat() with retry logic on transient provider failures.
     ///
-    /// Parameters default to self.generation when not explicitly passed,
-    /// so callers do not need to thread temperature / max_tokens / reasoning_effort through every layer.
+    /// `max_tokens` and `reasoning_effort` default to `self.generation` when
+    /// not explicitly passed. `temperature` is sent only when `Some`; `None`
+    /// omits the parameter, which many models reject.
     fn chat_with_retry(
         &self,
         messages: Vec<serde_json::Value>,
@@ -991,7 +992,6 @@ pub trait LLMProvider: Send + Sync {
             // Fallback to default values from generation_settings if not specified.
             let gs = self.generation_settings();
             let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
-            let temperature = temperature.unwrap_or(gs.temperature);
             let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
 
             // Helper closure for calling self.chat and handling .await
@@ -1001,7 +1001,7 @@ pub trait LLMProvider: Send + Sync {
                 tools: Option<Vec<serde_json::Value>>,
                 model: Option<String>,
                 max_tokens: usize,
-                temperature: f32,
+                temperature: Option<f32>,
                 reasoning_effort: Option<String>,
                 tool_choice: Option<serde_json::Value>,
             ) -> LLMResponse {
@@ -1113,7 +1113,6 @@ pub trait LLMProvider: Send + Sync {
         async move {
             let gs = self.generation_settings();
             let max_tokens = max_tokens.unwrap_or(gs.max_tokens);
-            let temperature = temperature.unwrap_or(gs.temperature);
             let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
 
             for (attempt, delay) in CHAT_RETRY_DELAYS.iter().enumerate() {
@@ -1325,7 +1324,7 @@ mod tests {
             _tools: Option<Vec<serde_json::Value>>,
             _model: Option<String>,
             _max_tokens: usize,
-            _temperature: f32,
+            _temperature: Option<f32>,
             _reasoning_effort: Option<String>,
             _tool_choice: Option<serde_json::Value>,
         ) -> LLMResponse {
@@ -1349,7 +1348,7 @@ mod tests {
             _tools: Option<Vec<serde_json::Value>>,
             _model: Option<String>,
             _max_tokens: usize,
-            _temperature: f32,
+            _temperature: Option<f32>,
             _reasoning_effort: Option<String>,
             _tool_choice: Option<serde_json::Value>,
             on_content_delta: &Option<F>,
@@ -1666,7 +1665,7 @@ mod tests {
             Some(tools),
             None,
             4096,
-            0.0,
+            Some(0.0),
             None,
             None,
         )
@@ -1690,7 +1689,7 @@ mod tests {
                 None,
                 None,
                 4096,
-                0.0,
+                Some(0.0),
                 None,
                 None,
                 &None::<fn(String) -> std::future::Ready<()>>,
@@ -1715,7 +1714,7 @@ mod tests {
                 None,
                 None,
                 4096,
-                0.0,
+                Some(0.0),
                 None,
                 None,
                 &Some(|content| async move {
@@ -1743,7 +1742,7 @@ mod tests {
                 None,
                 None,
                 4096,
-                0.0,
+                Some(0.0),
                 None,
                 None,
                 &None::<fn(String) -> std::future::Ready<()>>,
@@ -1768,7 +1767,7 @@ mod tests {
                 None,
                 None,
                 4096,
-                0.0,
+                Some(0.0),
                 None,
                 None,
                 &Some(|content| async move {
@@ -1832,7 +1831,7 @@ mod tests {
                 _tools: Option<Vec<serde_json::Value>>,
                 _model: Option<String>,
                 _max_tokens: usize,
-                _temperature: f32,
+                _temperature: Option<f32>,
                 _reasoning_effort: Option<String>,
                 _tool_choice: Option<serde_json::Value>,
             ) -> LLMResponse {
@@ -1856,7 +1855,7 @@ mod tests {
                 _tools: Option<Vec<serde_json::Value>>,
                 _model: Option<String>,
                 _max_tokens: usize,
-                _temperature: f32,
+                _temperature: Option<f32>,
                 _reasoning_effort: Option<String>,
                 _tool_choice: Option<serde_json::Value>,
                 _on_content_delta: &Option<F>,
@@ -1979,7 +1978,7 @@ mod tests {
                 _tools: Option<Vec<serde_json::Value>>,
                 _model: Option<String>,
                 _max_tokens: usize,
-                _temperature: f32,
+                _temperature: Option<f32>,
                 _reasoning_effort: Option<String>,
                 _tool_choice: Option<serde_json::Value>,
             ) -> LLMResponse {
@@ -1996,7 +1995,7 @@ mod tests {
                 _tools: Option<Vec<serde_json::Value>>,
                 _model: Option<String>,
                 _max_tokens: usize,
-                _temperature: f32,
+                _temperature: Option<f32>,
                 _reasoning_effort: Option<String>,
                 _tool_choice: Option<serde_json::Value>,
                 _on_content_delta: &Option<F>,

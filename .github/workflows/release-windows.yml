@@ -76,6 +76,20 @@ jobs:
       - name: Install Trunk
         run: cargo install trunk --locked
 
+      - name: Install wasm-opt (Binaryen)
+        shell: pwsh
+        run: |
+          $ver = "version_132"
+          $url = "https://github.com/WebAssembly/binaryen/releases/download/$ver/binaryen-$ver-x86_64-windows.tar.gz"
+          $archive = Join-Path $env:RUNNER_TEMP "binaryen.tar.gz"
+          $dest = Join-Path $env:RUNNER_TEMP "binaryen"
+          Invoke-WebRequest -Uri $url -OutFile $archive
+          New-Item -ItemType Directory -Path $dest -Force | Out-Null
+          tar -xf $archive -C $dest
+          $bin = Join-Path $dest "binaryen-$ver\bin"
+          Add-Content -Path $env:GITHUB_PATH -Value $bin
+          & (Join-Path $bin "wasm-opt.exe") --version
+
       - name: Build web-chat (Leptos/WASM UI)
         working-directory: web-chat
         run: trunk build --release
@@ -124,8 +138,10 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
             Each package bundles the `rust-bot` and
-            `gmail-auth` binaries, the web-chat UI assets under `web/`,
-            the websockets-chat UI assets under `websockets/`,
+            `gmail-auth` binaries (the gateway web UI is compiled into
+            `rust-bot`), the web-chat UI assets under `web/`,
+            the websockets-chat UI assets under `websockets/`
+            (optional `--web-root` override),
             sample configurations under `configuration/samples/`, and an
             `INSTALL.md` with setup instructions.
           files: ${{ steps.package.outputs.archive }}

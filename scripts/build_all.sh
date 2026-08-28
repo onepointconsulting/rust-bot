@@ -5,12 +5,14 @@ set -euo pipefail
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
-cargo build -r || exit 1
-
+# Trunk first so `cargo build` of rust-bot can embed websockets-chat/dist.
 cd web-chat
 trunk build --release  || exit 1
 
 cd ..
 
 cd websockets-chat
-trunk build --release
+trunk build --release || exit 1
+
+cd ..
+cargo build -r

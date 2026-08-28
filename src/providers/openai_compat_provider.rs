@@ -475,7 +475,7 @@ impl OpenAICompatProvider {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> CreateChatCompletionRequestArgs {
@@ -635,8 +635,10 @@ impl OpenAICompatProvider {
         request.model(model_name);
         request.messages(chat_messages);
         request.max_tokens(max_tokens as u32);
-        log::info!("temperature: {}", temperature);
-        request.temperature(temperature);
+        if let Some(temperature) = temperature {
+            log::info!("temperature: {}", temperature);
+            request.temperature(temperature);
+        }
 
         // Prefer cache-annotated tools over the originals; deserialize from JSON.
         let effective_tools = cached_tools.or(tools);
@@ -1261,7 +1263,7 @@ impl LLMProvider for OpenAICompatProvider {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> crate::providers::base::LLMResponse {
@@ -1297,7 +1299,7 @@ impl LLMProvider for OpenAICompatProvider {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
@@ -1913,5 +1915,58 @@ mod tests {
         assert_eq!(response.content.as_deref(), Some("hello"));
         assert_eq!(response.usage.input_tokens, Some(12));
         assert_eq!(response.usage.output_tokens, Some(3));
+    }
+
+    #[test]
+    fn build_request_omits_temperature_when_none() {
+        let provider = OpenAICompatProvider::new(
+            Some("test-key".to_string()),
+            Some("https://example.com/v1".to_string()),
+            Some("gpt-test".to_string()),
+            None,
+            None,
+        );
+        let request = provider
+            .build_request(
+                &[serde_json::json!({ "role": "user", "content": "hi" })],
+                None,
+                Some("gpt-test".to_string()),
+                16,
+                None,
+                None,
+                None,
+            )
+            .build()
+            .expect("request should build");
+        let json = serde_json::to_value(&request).expect("serialize request");
+        assert!(
+            json.get("temperature").is_none(),
+            "temperature should be omitted, got {json}"
+        );
+    }
+
+    #[test]
+    fn build_request_includes_temperature_when_some() {
+        let provider = OpenAICompatProvider::new(
+            Some("test-key".to_string()),
+            Some("https://example.com/v1".to_string()),
+            Some("gpt-test".to_string()),
+            None,
+            None,
+        );
+        let request = provider
+            .build_request(
+                &[serde_json::json!({ "role": "user", "content": "hi" })],
+                None,
+                Some("gpt-test".to_string()),
+                16,
+                Some(0.5),
+                None,
+                None,
+            )
+            .build()
+            .expect("request should build");
+        let json = serde_json::to_value(&request).expect("serialize request");
+        assert_eq!(json.get("temperature"), Some(&serde_json::json!(0.5)));
     }
 }

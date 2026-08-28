@@ -14,9 +14,7 @@ shift
 goto parse_args
 :args_done
 
-cargo build %CARGO_FLAGS%
-if errorlevel 1 exit /b 1
-
+REM Trunk first so `cargo build` of rust-bot can embed websockets-chat/dist.
 cd web-chat
 trunk build %TRUNK_FLAGS%
 if errorlevel 1 exit /b 1
@@ -26,3 +24,6 @@ cd websockets-chat
 trunk build %TRUNK_FLAGS%
 if errorlevel 1 exit /b 1
 cd ..
+
+cargo build %CARGO_FLAGS%
+if errorlevel 1 exit /b 1

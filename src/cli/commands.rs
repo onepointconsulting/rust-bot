@@ -217,9 +217,11 @@ pub struct GatewayArgs {
     #[arg(long)]
     pub port: Option<u16>,
 
-    /// Directory of pre-built web-chat static assets (index.html, *.js, *.wasm)
-    /// to serve alongside the API. Falls back to `gateway.webRoot` in the config
-    /// file, then to `./web` if that directory exists.
+    /// Directory of pre-built websockets-chat static assets (`index.html`,
+    /// `*.js`, `*.wasm`) to serve instead of the UI compiled into this binary.
+    /// Falls back to `gateway.webRoot` in the config file, then to the
+    /// embedded bundle. Unlike `api --web-root`, this does **not** default
+    /// to `./web` (that folder is the REST UI).
     #[arg(long = "web-root")]
     pub web_root: Option<PathBuf>,
 }
@@ -307,7 +309,6 @@ pub struct GenerateJwtTokenArgs {
 
 #[derive(Debug)]
 pub enum CliError {
-    FailedToCreateWebRootDirectory(std::io::Error),
     Inquire(inquire::InquireError),
     Jwt(JwtError),
     UserRegistry(UserRegistryError),
@@ -323,9 +324,6 @@ impl fmt::Display for CliError {
             }
             Self::Inquire(err) => {
                 write!(f, "Inquire error: {err}")
-            }
-            Self::FailedToCreateWebRootDirectory(err) => {
-                write!(f, "Failed to create web root directory: {err}")
             }
             Self::Jwt(err) => write!(f, "{err}"),
             Self::UserRegistry(err) => write!(f, "{err}"),
@@ -739,10 +737,13 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
     }
 }
 
-/// Resolve the web-chat static assets directory: CLI `--web-root` takes
+/// Resolve the REST web-chat static assets directory: CLI `--web-root` takes
 /// priority, then `api.webRoot` from the config file, then `./web` if that
 /// directory happens to exist. Returns `None` when nothing is configured
 /// and no default directory is present (the API then runs without a UI).
+///
+/// The gateway does **not** use this helper — a leftover `./web` folder
+/// (REST UI) must not steal `rust-bot gateway`. See [`resolve_gateway_web_ui`].
 fn resolve_web_root(
     cli_web_root: Option<PathBuf>,
     config_web_root: Option<String>,
@@ -762,6 +763,74 @@ fn resolve_web_root(
 /// configured path was missing) is treated as "no UI".
 fn web_root_has_ui(web_root: &std::path::Path) -> bool {
     web_root.is_dir() && web_root.join("index.html").is_file()
+}
+
+/// Where the combined gateway server should load the websockets-chat SPA.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum GatewayWebUi {
+    /// On-disk directory that contains `index.html` (CLI `--web-root` or
+    /// `gateway.webRoot`).
+    Disk(PathBuf),
+    /// UI compiled into this binary via `rust-embed`.
+    Embedded,
+    /// No valid on-disk root and no WASM in the embedded bundle.
+    Disabled,
+}
+
+/// Gateway web-root resolution: CLI `--web-root`, then `gateway.webRoot`.
+/// Unlike [`resolve_web_root`], there is no implicit `./web` default.
+fn resolve_gateway_web_ui(
+    cli_web_root: Option<PathBuf>,
+    config_web_root: Option<String>,
+) -> GatewayWebUi {
+    resolve_gateway_web_ui_with(
+        cli_web_root,
+        config_web_root,
+        crate::utils::embedded_gateway_ui::is_available(),
+    )
+}
+
+fn resolve_gateway_web_ui_with(
+    cli_web_root: Option<PathBuf>,
+    config_web_root: Option<String>,
+    embed_available: bool,
+) -> GatewayWebUi {
+    let configured = if let Some(path) = cli_web_root {
+        Some(path)
+    } else {
+        config_web_root.map(PathBuf::from)
+    };
+
+    if let Some(path) = configured {
+        if web_root_has_ui(&path) {
+            return GatewayWebUi::Disk(path);
+        }
+        if embed_available {
+            log::warn!(
+                "gateway.webRoot / --web-root points at '{}', which is not a usable UI directory; falling back to embedded websockets-chat",
+                path.display()
+            );
+            return GatewayWebUi::Embedded;
+        }
+        if path.is_dir() {
+            log::warn!(
+                "gateway.webRoot / --web-root points at '{}', which has no index.html; web UI serving is disabled",
+                path.display()
+            );
+        } else {
+            log::warn!(
+                "gateway.webRoot / --web-root points at '{}', which is not a directory; web UI serving is disabled",
+                path.display()
+            );
+        }
+        return GatewayWebUi::Disabled;
+    }
+
+    if embed_available {
+        GatewayWebUi::Embedded
+    } else {
+        GatewayWebUi::Disabled
+    }
 }
 
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
@@ -853,11 +922,11 @@ async fn wait_for_websocket_shutdown(ws_channel: Arc<WebSocketChannel>) {
 
 /// Build and serve the combined login + WebSocket gateway server on one
 /// port: `POST /v1/login` (documented via its own minimal Swagger doc),
-/// `ws_channel`'s upgrade route, and — when `web_root` points at a real
-/// directory — the websockets-chat static bundle as a fallback service,
-/// sharing one `axum::serve` call. Every minted token carries
-/// `purpose: "webui"` unconditionally — this server's only real client is
-/// the websockets-chat UI.
+/// `ws_channel`'s upgrade route, and the websockets-chat static bundle as a
+/// fallback service (on-disk `--web-root` / `gateway.webRoot` when valid,
+/// otherwise the UI compiled into this binary), sharing one `axum::serve`
+/// call. Every minted token carries `purpose: "webui"` unconditionally —
+/// this server's only real client is the websockets-chat UI.
 ///
 /// Reuses `ws_channel`'s own `WebSocketConfig.jwt` for minting (already
 /// validated at config-load time to have `aud == path`, so a token minted
@@ -869,7 +938,7 @@ async fn serve_combined_login_and_gateway(
     ws_channel: &Arc<WebSocketChannel>,
     host: &str,
     port: u16,
-    web_root: Option<&std::path::Path>,
+    web_ui: GatewayWebUi,
 ) -> std::io::Result<()> {
     let ws_shared = ws_channel.shared();
     let login_state = Arc::new(LoginState {
@@ -902,33 +971,25 @@ async fn serve_combined_login_and_gateway(
         .layer(build_cors_layer(&config.api.cors))
         .merge(ws_channel.router());
 
-    // Mirrors `create_api_server`'s own web-root fallback wiring exactly —
-    // `ServeDir` serves the bundle, falling back to `index.html` for
-    // client-side routed paths, without shadowing `/v1/login`, `/swagger-ui`,
-    // or the WebSocket upgrade route above (all matched before the fallback).
-    let web_ui_status = match web_root {
-        Some(root) if web_root_has_ui(root) => {
+    // Disk `ServeDir` and the embedded fallback both sit behind the API
+    // routes above, so they cannot shadow `/v1/login`, `/swagger-ui`, or
+    // the WebSocket upgrade route. SPA unknown paths fall back to
+    // `index.html` in both cases.
+    let web_ui_status = match &web_ui {
+        GatewayWebUi::Disk(root) => {
             let index_html = root.join("index.html");
             app = app.fallback_service(
                 ServeDir::new(root).not_found_service(ServeFile::new(index_html)),
             );
             Some(format!("serving `{}`", root.display()))
         }
-        Some(root) if root.is_dir() => {
-            log::warn!(
-                "gateway.webRoot / --web-root points at '{}', which has no index.html; web UI serving is disabled",
-                root.display()
-            );
-            None
+        GatewayWebUi::Embedded => {
+            app = app.fallback_service(crate::utils::embedded_static::fallback_router::<
+                crate::utils::embedded_gateway_ui::BundledGatewayUi,
+            >());
+            Some("serving embedded websockets-chat".to_string())
         }
-        Some(root) => {
-            log::warn!(
-                "gateway.webRoot / --web-root points at '{}', which is not a directory; web UI serving is disabled",
-                root.display()
-            );
-            None
-        }
-        None => None,
+        GatewayWebUi::Disabled => None,
     };
 
     let addr = format!("{host}:{port}");
@@ -937,7 +998,9 @@ async fn serve_combined_login_and_gateway(
     log::info!("Swagger UI available at http://{addr}/swagger-ui");
     match web_ui_status {
         Some(status) => log::info!("Web UI available at http://{addr}/ ({status})"),
-        None => log::info!("Web UI disabled (no valid --web-root / gateway.webRoot configured)"),
+        None => log::info!(
+            "Web UI disabled (no valid --web-root / gateway.webRoot and no embedded websockets-chat UI)"
+        ),
     }
 
     axum::serve(
@@ -1253,12 +1316,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
 
     let gateway_host = host_override.unwrap_or_else(|| config.gateway.host.clone());
     let gateway_port = port_override.unwrap_or(config.gateway.port);
-    let web_root = resolve_web_root(web_root_override, config.gateway.web_root.clone());
-    if let Some(web_root) = &web_root {
-        if !web_root.exists() {
-            std::fs::create_dir_all(web_root).map_err(CliError::FailedToCreateWebRootDirectory)?;
-        }
-    }
+    let web_ui = resolve_gateway_web_ui(web_root_override, config.gateway.web_root.clone());
 
     let enabled = channels.get_enabled_channels();
     if !enabled.is_empty() {
@@ -1357,28 +1415,22 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             green.render_reset(),
             base_url
         );
-        match &web_root {
-            Some(root) if web_root_has_ui(root) => println!(
+        match &web_ui {
+            GatewayWebUi::Disk(root) => println!(
                 "{}✓{} Web UI: {}/ (serving `{}`)",
                 green.render(),
                 green.render_reset(),
                 base_url,
                 root.display()
             ),
-            Some(root) if root.is_dir() => println!(
-                "{}Warning: gateway.webRoot / --web-root '{}' has no index.html; web UI disabled{}",
-                yellow.render(),
-                root.display(),
-                yellow.render_reset()
+            GatewayWebUi::Embedded => println!(
+                "{}✓{} Web UI: {}/ (serving embedded websockets-chat)",
+                green.render(),
+                green.render_reset(),
+                base_url
             ),
-            Some(root) => println!(
-                "{}Warning: gateway.webRoot / --web-root '{}' is not a directory; web UI disabled{}",
-                yellow.render(),
-                root.display(),
-                yellow.render_reset()
-            ),
-            None => println!(
-                "{}✗{} Web UI: disabled (pass --web-root <dir> or set gateway.webRoot)",
+            GatewayWebUi::Disabled => println!(
+                "{}✗{} Web UI: disabled (pass --web-root <dir>, set gateway.webRoot, or compile with a websockets-chat dist)",
                 yellow.render(),
                 yellow.render_reset()
             ),
@@ -1398,7 +1450,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         let channels = Arc::clone(&channels);
         let config = Arc::clone(&config);
         let ws_channel = ws_channel.clone();
-        let web_root = web_root.clone();
+        let web_ui = web_ui.clone();
         async move {
             // A no-op, never-resolving branch when no `"websocket"` channel
             // was declared — keeps this a fixed 3-way join (so the
@@ -1412,7 +1464,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                             ws_channel,
                             &gateway_host,
                             gateway_port,
-                            web_root.as_deref(),
+                            web_ui,
                         )
                         .await
                         {
@@ -2117,10 +2169,9 @@ mod tests {
     }
 
     // --- resolve_web_root ---
-    // Shared by `run_api` (CLI `--web-root` / `api.webRoot`) and `run_gateway`
-    // (CLI `--web-root` / `gateway.webRoot`) — generic over the source config
-    // field, so these tests exercise the function directly rather than
-    // duplicating them per caller.
+    // Used by `run_api` (CLI `--web-root` / `api.webRoot`). The gateway
+    // uses [`resolve_gateway_web_ui`] instead so it never implicitly picks
+    // up a leftover REST `./web` folder.
 
     #[test]
     fn resolve_web_root_cli_override_wins_over_config() {
@@ -2198,6 +2249,59 @@ mod tests {
         let file = dir.path().join("not-a-dir");
         fs::write(&file, "x").unwrap();
         assert!(!web_root_has_ui(&file));
+    }
+
+    // --- resolve_gateway_web_ui ---
+
+    #[test]
+    fn resolve_gateway_web_ui_uses_valid_cli_path() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+        let resolved = resolve_gateway_web_ui_with(
+            Some(dir.path().to_path_buf()),
+            Some("/from/config".to_string()),
+            true,
+        );
+        assert_eq!(resolved, GatewayWebUi::Disk(dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn resolve_gateway_web_ui_uses_valid_config_path_when_no_cli() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("index.html"), "<html></html>").unwrap();
+        let resolved = resolve_gateway_web_ui_with(
+            None,
+            Some(dir.path().to_string_lossy().into_owned()),
+            false,
+        );
+        assert_eq!(resolved, GatewayWebUi::Disk(dir.path().to_path_buf()));
+    }
+
+    #[test]
+    fn resolve_gateway_web_ui_falls_back_to_embed_when_nothing_configured() {
+        let resolved = resolve_gateway_web_ui_with(None, None, true);
+        assert_eq!(resolved, GatewayWebUi::Embedded);
+    }
+
+    #[test]
+    fn resolve_gateway_web_ui_is_disabled_when_nothing_configured_and_no_embed() {
+        let resolved = resolve_gateway_web_ui_with(None, None, false);
+        assert_eq!(resolved, GatewayWebUi::Disabled);
+    }
+
+    #[test]
+    fn resolve_gateway_web_ui_falls_back_to_embed_when_configured_path_has_no_index() {
+        let dir = tempfile::tempdir().unwrap();
+        let resolved = resolve_gateway_web_ui_with(Some(dir.path().to_path_buf()), None, true);
+        assert_eq!(resolved, GatewayWebUi::Embedded);
+    }
+
+    #[test]
+    fn resolve_gateway_web_ui_does_not_default_to_web_folder() {
+        // Even if `./web` exists next to the test process, the gateway must
+        // not pick it up as an implicit default (that folder is the REST UI).
+        let resolved = resolve_gateway_web_ui_with(None, None, true);
+        assert_eq!(resolved, GatewayWebUi::Embedded);
     }
 
     /// `purpose = "webui"`, no `--aud` override, no existing `websocket`

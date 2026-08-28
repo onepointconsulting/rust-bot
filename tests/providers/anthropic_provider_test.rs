@@ -13,7 +13,7 @@ async fn test_simple_chat() {
             None,
             None,
             1024,
-            0.5,
+            Some(0.5),
             None,
             None,
         )
@@ -37,7 +37,7 @@ async fn test_simple_chat_with_thinking() {
             None,
             None,
             4096,
-            0.5,
+            Some(0.5),
             Some("high".to_string()),
             None,
         )
@@ -76,7 +76,7 @@ async fn test_simple_chat_with_thinking_stream() {
         None,
         None,
         4096,
-        0.5,
+        Some(0.5),
         Some("high".to_string()),
         None,
         &None::<fn(String) -> std::future::Ready<()>>,

@@ -344,7 +344,7 @@ mod tests {
             _: Option<Vec<serde_json::Value>>,
             _: Option<String>,
             _: usize,
-            _: f32,
+            _: Option<f32>,
             _: Option<String>,
             _: Option<serde_json::Value>,
         ) -> LLMResponse {
@@ -356,7 +356,7 @@ mod tests {
             _: Option<Vec<serde_json::Value>>,
             _: Option<String>,
             _: usize,
-            _: f32,
+            _: Option<f32>,
             _: Option<String>,
             _: Option<serde_json::Value>,
         ) -> LLMResponse {

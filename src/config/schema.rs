@@ -807,9 +807,10 @@ pub struct GatewayConfig {
 
     /// Directory of pre-built websockets-chat static assets (`index.html`,
     /// JS, WASM) to serve alongside the combined login + WebSocket gateway
-    /// server. When unset, the CLI falls back to `./web` if that directory
-    /// exists; otherwise the gateway runs without serving a web UI. Mirrors
-    /// `ApiConfig::web_root`, just scoped to the gateway server instead.
+    /// server. When unset, the gateway serves the UI compiled into the
+    /// binary. Set this (or pass `--web-root`) to override with an on-disk
+    /// Trunk build. Unlike `ApiConfig::web_root`, there is no implicit
+    /// `./web` fallback — that folder is the REST UI.
     #[serde(alias = "web_root", default)]
     #[garde(skip)]
     pub web_root: Option<String>,

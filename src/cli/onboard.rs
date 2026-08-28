@@ -100,7 +100,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     );
     println!("  2. c) API: rust-bot api -c \"{}\"", config_path.display());
     println!(
-        "  2. d) Gateway: rust-bot gateway -c \"{}\" --web-root websockets",
+        "  2. d) Gateway: rust-bot gateway -c \"{}\"",
         config_path.display()
     );
     if websocket_jwt_enabled(&config) {

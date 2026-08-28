@@ -138,7 +138,8 @@ impl AnthropicProvider {
         Some(json!({ "type": "auto" }))
     }
 
-    /// Convert the Anthropic format to the de-facto OpenAI format which is used in the application.
+    /// Convert the application's de-facto OpenAI message format to native Anthropic Messages API format.
+    /// Returns `(system, messages)`: the extracted `system` prompt and the remaining user/assistant turns.
     fn convert_messages(
         &self,
         messages: Vec<serde_json::Value>,
@@ -454,7 +455,7 @@ impl AnthropicProvider {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         supports_caching: bool,
@@ -514,7 +515,9 @@ impl AnthropicProvider {
                         serde_json::json!({"effort": reasoning_effort}),
                     );
                 }
-            } else if Self::supports_temperature(&model_name) {
+            } else if let Some(temperature) = temperature
+                && Self::supports_temperature(&model_name)
+            {
                 args.insert("temperature".to_string(), serde_json::json!(temperature));
             }
         } else if let Some(reasoning_effort) = reasoning_effort.clone()
@@ -550,7 +553,9 @@ impl AnthropicProvider {
             if Self::supports_temperature(&model_name) {
                 args.insert("temperature".to_string(), serde_json::json!(1.0));
             }
-        } else if Self::supports_temperature(&model_name) {
+        } else if let Some(temperature) = temperature
+            && Self::supports_temperature(&model_name)
+        {
             args.insert("temperature".to_string(), serde_json::json!(temperature));
         }
 
@@ -1048,7 +1053,7 @@ impl LLMProvider for AnthropicProvider {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
     ) -> LLMResponse {
@@ -1079,7 +1084,7 @@ impl LLMProvider for AnthropicProvider {
         tools: Option<Vec<serde_json::Value>>,
         model: Option<String>,
         max_tokens: usize,
-        temperature: f32,
+        temperature: Option<f32>,
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
@@ -2005,5 +2010,52 @@ mod tests {
             other => panic!("unexpected event: {other:?}"),
         }
         assert!(stream.next().await.is_none());
+    }
+
+    #[test]
+    fn build_args_omits_temperature_when_none() {
+        let provider = AnthropicProvider::new(
+            Some("sk-ant-test".to_string()),
+            None,
+            Some("claude-sonnet-4-6".to_string()),
+            None,
+            None,
+        );
+        let args = provider.build_args(
+            &[serde_json::json!({ "role": "user", "content": "hi" })],
+            None,
+            Some("claude-sonnet-4-6".to_string()),
+            16,
+            None,
+            None,
+            None,
+            false,
+        );
+        assert!(
+            !args.contains_key("temperature"),
+            "temperature should be omitted, got {args:?}"
+        );
+    }
+
+    #[test]
+    fn build_args_includes_temperature_when_some() {
+        let provider = AnthropicProvider::new(
+            Some("sk-ant-test".to_string()),
+            None,
+            Some("claude-sonnet-4-6".to_string()),
+            None,
+            None,
+        );
+        let args = provider.build_args(
+            &[serde_json::json!({ "role": "user", "content": "hi" })],
+            None,
+            Some("claude-sonnet-4-6".to_string()),
+            16,
+            Some(0.5),
+            None,
+            None,
+            false,
+        );
+        assert_eq!(args.get("temperature"), Some(&serde_json::json!(0.5)));
     }
 }

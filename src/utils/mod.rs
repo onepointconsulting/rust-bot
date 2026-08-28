@@ -1,5 +1,7 @@
 pub mod cli;
 pub mod clipboard;
+pub mod embedded_gateway_ui;
+pub mod embedded_static;
 pub mod embedded_templates;
 pub mod evaluator;
 pub mod exit_codes;

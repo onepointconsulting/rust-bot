@@ -35,7 +35,6 @@ const TITLE_MAX_CHARS: usize = 60;
 /// for a 3–8 word title from a non-reasoning model, but thinking-only replies
 /// hit `finish_reason=length` with `content: None` and never persist a title.
 const TITLE_GENERATION_MAX_TOKENS: usize = 512;
-const TITLE_GENERATION_TEMPERATURE: f32 = 0.2;
 const TITLE_INPUT_MAX_CHARS: usize = 1_000;
 
 const FORK_VOLATILE_METADATA_KEYS: &[&str] = &[
@@ -1037,7 +1036,7 @@ impl SessionManager {
                 None,
                 Some(model_runtime.model.clone()),
                 Some(TITLE_GENERATION_MAX_TOKENS),
-                Some(TITLE_GENERATION_TEMPERATURE),
+                None,
                 model_runtime.reasoning_effort.clone(),
                 None,
             )

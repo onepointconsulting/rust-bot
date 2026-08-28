@@ -59,6 +59,9 @@ jobs:
       - name: Install Trunk
         run: cargo install trunk --locked
 
+      - name: Install wasm-opt (Binaryen)
+        run: brew install binaryen
+
       - name: Build web-chat (Leptos/WASM UI)
         working-directory: web-chat
         run: trunk build --release
@@ -106,8 +109,10 @@ jobs:
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
             Each package bundles the `rust-bot` and
-            `gmail-auth` binaries, the web-chat UI assets under `web/`,
-            the websockets-chat UI assets under `websockets/`,
+            `gmail-auth` binaries (the gateway web UI is compiled into
+            `rust-bot`), the web-chat UI assets under `web/`,
+            the websockets-chat UI assets under `websockets/`
+            (optional `--web-root` override),
             sample configurations under `configuration/samples/`, and an
             `INSTALL.md` with setup instructions.
           files: ${{ steps.package.outputs.archive }}
