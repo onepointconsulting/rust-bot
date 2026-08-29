@@ -22,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use uuid::Uuid;
 
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::skills::SkillsLoader;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::get_session_id;
@@ -513,6 +514,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::ListChats => {
             handle_envelope_list_chats(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListSkills => {
+            handle_envelope_list_skills(envelope_dispatch_context).await;
         }
         EnvelopeType::SetModelPreset => {
             handle_envelope_set_model_preset(envelope_dispatch_context).await;
@@ -1469,6 +1473,26 @@ async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispa
         WsOutboundEvent::ChatsList,
         None,
         serde_json::json!({"chats": chats}),
+    )
+    .await;
+}
+
+/// Handle a `list_skills` envelope: reply with every skill installed on
+/// this process (workspace + builtin `SKILL.md` directories) as a `skills`
+/// event. New protocol surface with no nanobot precedent — see
+/// [`EnvelopeType::ListSkills`]'s doc comment.
+async fn handle_envelope_list_skills<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let shared = envelope_dispatch_context.shared;
+    let connection_id = envelope_dispatch_context.connection_id;
+
+    let loader = SkillsLoader::new(&shared.workspace_request_handler.default_workspace, None);
+    let summaries = loader.list_skill_summaries();
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::SkillsList,
+        None,
+        serde_json::json!({"skills": summaries}),
     )
     .await;
 }
@@ -5721,6 +5745,54 @@ mod tests {
             chats.iter().filter_map(|c| c["chat_id"].as_str()).collect();
         assert!(chat_ids.contains("chat-a"));
         assert!(chat_ids.contains("chat-b"));
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_list_skills_includes_workspace_skill_name_and_description() {
+        let shared = test_shared("browser");
+        let skill_dir = shared
+            .workspace_request_handler
+            .default_workspace
+            .join("skills")
+            .join("popup-skill");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(
+            skill_dir.join("SKILL.md"),
+            "---\ndescription: Helps with popup tests\n---\n# Popup\n",
+        )
+        .unwrap();
+
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_skills"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+
+        dispatch_envelope(ctx).await;
+
+        let frame = rx.try_recv().expect("expected a skills frame");
+        let body: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "skills");
+        let skills = body["skills"]
+            .as_array()
+            .expect("skills should be an array");
+        let popup = skills
+            .iter()
+            .find(|s| s["name"] == "popup-skill")
+            .expect("workspace skill must be in the list (cwd builtins may also appear)");
+        assert_eq!(popup["description"], "Helps with popup tests");
     }
 
     // --- guest session isolation (owner_allows_access / scope_chats_to_owner) ---

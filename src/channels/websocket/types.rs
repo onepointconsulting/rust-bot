@@ -43,6 +43,11 @@ pub enum EnvelopeType {
     /// Added so a UI can offer "fork one of my other chats", not just "fork
     /// the one I'm currently in".
     ListChats,
+    /// List skills installed on this process (workspace + builtin
+    /// `SKILL.md` directories). Rust-side addition with no nanobot
+    /// precedent — the Python reference has no skills-discovery envelope;
+    /// skills only appear in the agent system prompt.
+    ListSkills,
     /// Persist a new display title on an existing `websocket:{chat_id}`
     /// session. Rust-side addition with no nanobot precedent — the Python
     /// reference has no rename envelope; titles are LLM-generated only.
@@ -93,6 +98,7 @@ impl From<&str> for EnvelopeType {
             "transcribe_audio" => Self::TranscribeAudio,
             "message" => Self::Message,
             "list_chats" => Self::ListChats,
+            "list_skills" => Self::ListSkills,
             "set_model_preset" => Self::SetModelPreset,
             "clear_session" => Self::ClearSession,
             other => Self::Unrecognized(other.to_string()),
@@ -120,6 +126,9 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::ListChats`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatsList,
+    /// Reply to [`EnvelopeType::ListSkills`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    SkillsList,
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatRenamed,
@@ -158,6 +167,7 @@ impl WsOutboundEvent {
             Self::GoalState => "goal_state",
             Self::GoalStatus => "goal_status",
             Self::ChatsList => "chats",
+            Self::SkillsList => "skills",
             Self::ChatRenamed => "chat_renamed",
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
@@ -474,6 +484,7 @@ mod tests {
         );
         assert_eq!(EnvelopeType::from("message"), EnvelopeType::Message);
         assert_eq!(EnvelopeType::from("list_chats"), EnvelopeType::ListChats);
+        assert_eq!(EnvelopeType::from("list_skills"), EnvelopeType::ListSkills);
         assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
         assert_eq!(EnvelopeType::from("delete_chat"), EnvelopeType::DeleteChat);
         assert_eq!(EnvelopeType::from("abort_turn"), EnvelopeType::AbortTurn);
@@ -514,6 +525,11 @@ mod tests {
         // Not part of the previous test's "matches nanobot wire names" set —
         // this event is a Rust-side addition (see `EnvelopeType::ListChats`).
         assert_eq!(WsOutboundEvent::ChatsList.as_str(), "chats");
+    }
+
+    #[test]
+    fn ws_outbound_event_skills_list_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::SkillsList.as_str(), "skills");
     }
 
     #[test]

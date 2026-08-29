@@ -208,7 +208,7 @@ pub fn workspaces_payload(
 /// (`AgentLoop::set_session_model_preset`, `set_session_workspace_scope`).
 #[derive(Clone)]
 pub struct WorkspaceRequestHandler {
-    default_workspace: PathBuf,
+    pub default_workspace: PathBuf,
     default_restrict_to_workspace: bool,
 }
 

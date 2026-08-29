@@ -24,6 +24,7 @@ use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
     ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem, SessionTokenUsage,
+    SkillSummary,
 };
 
 use crate::api::{self, WsSender};
@@ -345,6 +346,11 @@ struct WsContext {
     /// that predates usage tracking, or an older gateway that doesn't send
     /// the field yet.
     session_usage: RwSignal<Option<SessionTokenUsage>>,
+    /// Skills installed on this process (workspace + builtin), from the
+    /// gateway's `skills` event. Empty until the first `ready` round-trip
+    /// (or on an older gateway that doesn't send it), which hides
+    /// `ChatInput`'s skills popup.
+    skills: RwSignal<Vec<SkillSummary>>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -613,6 +619,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // the no-resume path" left the sidebar empty whenever attach
             // was slow, rejected, or its follow-up send never ran.
             request_chat_list(ctx);
+            // Skills are process-wide, not per-chat — fetch once per
+            // connection (including reconnect) rather than on every attach.
+            request_skills_list(ctx);
             // The gateway mints a fresh chat_id per connection and
             // subscribes the connection to *that* id. So whenever we mean to
             // continue an existing chat (refresh, reconnect, or a session
@@ -800,6 +809,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 })
                 .collect();
             ctx.sessions.set(items);
+        }
+        ServerEvent::SkillsList { skills } => {
+            ctx.skills.set(skills);
         }
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
@@ -1004,6 +1016,17 @@ fn request_chat_list(ctx: &WsContext) {
         *ctx,
         protocol::ClientEnvelope::list_chats(),
         "Failed to encode the chats list request.",
+    );
+}
+
+/// Ask the gateway for skills installed on this process. Fire-and-forget:
+/// failures leave the popup's last known (or empty) list rather than
+/// surfacing a user-facing error.
+fn request_skills_list(ctx: &WsContext) {
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_skills(),
+        "Failed to encode the skills list request.",
     );
 }
 
@@ -1367,6 +1390,7 @@ pub fn App() -> impl IntoView {
     let model_presets = RwSignal::new(Vec::<String>::new());
     let model_preset = RwSignal::new("default".to_string());
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
+    let skills = RwSignal::new(Vec::<SkillSummary>::new());
 
     let ws_context = WsContext {
         token,
@@ -1391,6 +1415,7 @@ pub fn App() -> impl IntoView {
         model_presets,
         model_preset,
         session_usage,
+        skills,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -1497,6 +1522,7 @@ pub fn App() -> impl IntoView {
         model_presets.set(Vec::new());
         model_preset.set("default".to_string());
         session_usage.set(None);
+        skills.set(Vec::new());
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -1647,6 +1673,7 @@ pub fn App() -> impl IntoView {
                     selected_model_preset=Signal::derive(move || model_preset.get())
                     on_select_model_preset=on_select_model_preset
                     session_usage=Signal::derive(move || session_usage.get())
+                    skills=Signal::derive(move || skills.get())
                 />
             </Show>
         </Show>

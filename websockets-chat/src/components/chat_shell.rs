@@ -1,5 +1,7 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsSidebarToggle};
-use chat_ui::models::{ChatEntry, OutgoingMessage, SessionListItem, SessionTokenUsage};
+use chat_ui::models::{
+    ChatEntry, OutgoingMessage, SessionListItem, SessionTokenUsage, SkillSummary,
+};
 use leptos::prelude::*;
 
 use crate::components::MessageList;
@@ -55,6 +57,7 @@ pub fn ChatShell(
     #[prop(into)] selected_model_preset: Signal<String>,
     on_select_model_preset: impl Fn(String) + 'static + Send + Sync + Copy,
     #[prop(into)] session_usage: Signal<Option<SessionTokenUsage>>,
+    #[prop(into)] skills: Signal<Vec<SkillSummary>>,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
     let shell_class = move || {
@@ -135,6 +138,7 @@ pub fn ChatShell(
                     selected_model_preset=selected_model_preset
                     on_select_model_preset=Callback::new(move |name| on_select_model_preset(name))
                     session_usage=session_usage
+                    skills=skills
                 />
             </div>
         </div>

@@ -1,10 +1,12 @@
 use leptos::html::{Input, Textarea};
 use leptos::prelude::*;
-use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
+use wasm_bindgen::closure::Closure;
 use web_sys::{File, FileList, HtmlInputElement, HtmlTextAreaElement};
 
-use crate::models::{format_compact_tokens, ImageAttachment, OutgoingMessage, SessionTokenUsage};
+use crate::models::{
+    ImageAttachment, OutgoingMessage, SessionTokenUsage, SkillSummary, format_compact_tokens,
+};
 
 const MAX_TEXTAREA_HEIGHT_PX: f64 = 160.0;
 /// Client-side guard against attaching huge images before base64 encoding.
@@ -311,6 +313,77 @@ fn SessionUsageChip(usage: Signal<Option<SessionTokenUsage>>) -> impl IntoView {
     }
 }
 
+/// Skills drop-up, rendered on the toolbar row immediately before
+/// [`ModelPresetPicker`]. Absent entirely (not just disabled) when `skills`
+/// is empty — `web-chat` (no gateway skills protocol) never sets this, and
+/// an older/HTTP gateway with no catalog yet shouldn't show a trigger with
+/// nothing to browse. Read-only: name + description, no activation.
+#[component]
+fn SkillsPopup(skills: Signal<Vec<SkillSummary>>) -> impl IntoView {
+    let menu_open = RwSignal::new(false);
+
+    view! {
+        <Show when=move || !skills.get().is_empty()>
+            <div class="relative">
+                <button
+                    type="button"
+                    aria-haspopup="menu"
+                    aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                    aria-label="Skills"
+                    title="Skills"
+                    class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                    on:click=move |_| menu_open.update(|open| *open = !*open)
+                >
+                    <svg
+                        xmlns="http://www.w3.org/2000/svg"
+                        viewBox="0 0 24 24"
+                        fill="none"
+                        stroke="currentColor"
+                        stroke-width="2"
+                        stroke-linecap="round"
+                        stroke-linejoin="round"
+                        class="h-4 w-4"
+                        aria-hidden="true"
+                    >
+                        <path d="M9.937 15.5A2 2 0 0 0 8.5 14.063l-6.135-1.582a.5.5 0 0 1 0-.962L8.5 9.936A2 2 0 0 0 9.937 8.5l1.582-6.135a.5.5 0 0 1 .963 0L14.063 8.5A2 2 0 0 0 15.5 9.937l6.135 1.581a.5.5 0 0 1 0 .964L15.5 14.063a2 2 0 0 0-1.437 1.437l-1.582 6.135a.5.5 0 0 1-.963 0z" />
+                        <path d="M20 3v4" />
+                        <path d="M22 5h-4" />
+                        <path d="M4 17v2" />
+                        <path d="M5 18H3" />
+                    </svg>
+                </button>
+                <div class=move || {
+                    if menu_open.get() { "block" } else { "hidden" }
+                }>
+                    <div
+                        class="fixed inset-0 z-10"
+                        aria-hidden="true"
+                        on:click=move |_| menu_open.set(false)
+                    ></div>
+                    <div
+                        role="menu"
+                        class="absolute bottom-full left-0 z-20 mb-1 max-h-64 w-72 overflow-y-auto rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
+                    >
+                        <p class="px-3 pb-1 pt-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                            "Skills"
+                        </p>
+                        <For
+                            each=move || skills.get()
+                            key=|skill| skill.name.clone()
+                            let(skill)
+                        >
+                            <div class="px-3 py-2">
+                                <p class="text-sm font-medium text-slate-700">{skill.name.clone()}</p>
+                                <p class="line-clamp-2 text-xs text-slate-500">{skill.description.clone()}</p>
+                            </div>
+                        </For>
+                    </div>
+                </div>
+            </div>
+        </Show>
+    }
+}
+
 #[component]
 fn AttachmentChip(
     index: usize,
@@ -365,6 +438,10 @@ pub fn ChatInput(
     /// usage protocol) never sets this.
     #[prop(into, optional)]
     session_usage: Option<Signal<Option<SessionTokenUsage>>>,
+    /// Skills installed on this process. Omitted or empty hides the popup
+    /// entirely — `web-chat` (no gateway skills protocol) never sets this.
+    #[prop(into, optional)]
+    skills: Option<Signal<Vec<SkillSummary>>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -650,6 +727,12 @@ pub fn ChatInput(
                     </button>
                 </div>
 
+                {move || {
+                    match skills {
+                        Some(skills) => view! { <SkillsPopup skills=skills /> }.into_any(),
+                        None => view! { <></> }.into_any(),
+                    }
+                }}
                 {move || {
                     match (model_presets, selected_model_preset, on_select_model_preset) {
                         (Some(presets), Some(selected), Some(on_select)) => {

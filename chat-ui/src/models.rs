@@ -105,6 +105,18 @@ impl SessionTokenUsage {
     }
 }
 
+/// One discovered skill, as surfaced by the gateway's `skills` event.
+///
+/// Mirrors the backend's `SkillSummary` (`src/agent/skills.rs`) — `chat-ui`
+/// has no dependency on the backend crate itself, so this is a plain
+/// re-declaration rather than a shared type.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SkillSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 /// Compact token-count formatting for the composer chip: `412`, `1.2K`,
 /// `38.6M`. Matches common chat-UI conventions — one decimal place above
 /// 1,000, no decimal below.
@@ -171,11 +183,13 @@ mod tests {
     #[test]
     fn session_token_usage_is_empty_only_when_every_field_is_none() {
         assert!(SessionTokenUsage::default().is_empty());
-        assert!(!SessionTokenUsage {
-            input_tokens: Some(0),
-            ..SessionTokenUsage::default()
-        }
-        .is_empty());
+        assert!(
+            !SessionTokenUsage {
+                input_tokens: Some(0),
+                ..SessionTokenUsage::default()
+            }
+            .is_empty()
+        );
     }
 
     #[test]

@@ -5,6 +5,8 @@ use std::{
     path::PathBuf,
 };
 
+use serde::Serialize;
+
 use crate::utils::helpers::strip_surrounding_quotes;
 
 // Default builtin skills directory (relative to this file)
@@ -41,6 +43,14 @@ fn escape_xml(text: &str) -> String {
         .replace('>', "&gt;")
         .replace('"', "&quot;")
         .replace('\'', "&apos;")
+}
+
+/// Name + frontmatter description for a discovered skill — the shape sent
+/// to the WebUI's skills popup (`list_skills` → `skills` event).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct SkillSummary {
+    pub name: String,
+    pub description: String,
 }
 
 /// Loader for agent skills.
@@ -143,6 +153,25 @@ impl SkillsLoader {
         } else {
             skills
         }
+    }
+
+    /// Name and frontmatter description for every discovered skill (workspace
+    /// first, then builtin; workspace wins on name collision). Does **not**
+    /// filter by [`Self::check_requirements`] — "available" here means
+    /// installed on this system, matching what [`Self::build_skills_summary`]
+    /// includes. Description falls back to the directory name when the
+    /// `SKILL.md` has no `description:` frontmatter.
+    pub fn list_skill_summaries(&self) -> Vec<SkillSummary> {
+        self.list_skills(false)
+            .into_iter()
+            .filter_map(|entry| {
+                let name = entry.get("name").and_then(|v| v.as_str())?;
+                Some(SkillSummary {
+                    name: name.to_owned(),
+                    description: self.get_skill_description(name),
+                })
+            })
+            .collect()
     }
 
     /// Load a skill's content by name.
@@ -686,6 +715,38 @@ mod tests {
         let filtered = loader.list_skills(true);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["name"], "ok-meta");
+    }
+
+    // ── list_skill_summaries ──────────────────────────────────────────────────
+
+    #[test]
+    fn list_skill_summaries_returns_name_and_frontmatter_description() {
+        let workspace = tempfile::tempdir().expect("ws");
+        let missing = workspace.path().join("_no_builtin_");
+        write_skill(
+            workspace.path(),
+            "alpha",
+            "---\ndescription: Does alpha things\n---\n# Alpha",
+        );
+        write_skill(workspace.path(), "no-desc", "# no frontmatter");
+
+        let loader = SkillsLoader::new(&workspace.path().to_path_buf(), Some(missing));
+        let mut summaries = loader.list_skill_summaries();
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+
+        assert_eq!(
+            summaries,
+            vec![
+                SkillSummary {
+                    name: "alpha".to_string(),
+                    description: "Does alpha things".to_string(),
+                },
+                SkillSummary {
+                    name: "no-desc".to_string(),
+                    description: "no-desc".to_string(),
+                },
+            ]
+        );
     }
 
     #[test]

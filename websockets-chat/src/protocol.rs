@@ -6,7 +6,7 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, `rename_chat`, `delete_chat`, `clear_session`,
+//!   `attach`, `list_chats`, `list_skills`, `rename_chat`, `delete_chat`, `clear_session`,
 //!   `fork_chat`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
@@ -17,7 +17,9 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, ImageAttachment, Role, SessionTokenUsage, ToolEvent};
+use chat_ui::models::{
+    ChatEntry, ImageAttachment, Role, SessionTokenUsage, SkillSummary, ToolEvent,
+};
 use serde::{Deserialize, Serialize};
 
 /// Outbound envelope sent to the gateway.
@@ -25,7 +27,7 @@ use serde::{Deserialize, Serialize};
 /// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) covers
 /// more inbound types than this crate has a use for (`set_workspace_scope`,
 /// `transcribe_audio`). This struct covers the ones the frontend actually
-/// sends (`message`, `new_chat`, `attach`, `list_chats`, `rename_chat`,
+/// sends (`message`, `new_chat`, `attach`, `list_chats`, `list_skills`, `rename_chat`,
 /// `delete_chat`, `clear_session`, `fork_chat`, `abort_turn`); constructors
 /// pin `type_` so callers cannot invent a shape the gateway would reject
 /// with "unknown type".
@@ -155,6 +157,22 @@ impl ClientEnvelope {
     pub fn list_chats() -> Self {
         Self {
             type_: "list_chats",
+            chat_id: None,
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            before_user_index: None,
+            webui: true,
+        }
+    }
+
+    /// Ask the gateway for skills installed on this process (workspace +
+    /// builtin). The reply is a `skills` event (see [`ServerEvent::SkillsList`]).
+    pub fn list_skills() -> Self {
+        Self {
+            type_: "list_skills",
             chat_id: None,
             turn_id: None,
             content: None,
@@ -419,6 +437,10 @@ pub enum ServerEvent {
     /// connection, most-recently-updated first. Not scoped to any one
     /// `chat_id` — see [`ServerEvent::chat_id`].
     ChatsList { chats: Vec<ChatSummary> },
+    /// Reply to a `list_skills` envelope: every skill installed on this
+    /// process (workspace + builtin). Not scoped to any one `chat_id` —
+    /// see [`ServerEvent::chat_id`].
+    SkillsList { skills: Vec<SkillSummary> },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
     /// Reply to a `delete_chat` envelope, fanned out to every connection
@@ -455,7 +477,8 @@ impl ServerEvent {
     ///
     /// Used by the app to ignore leftover frames from a previous chat after
     /// `new_chat` switches the connection onto a new id. `Unknown`,
-    /// [`ServerEvent::ChatsList`], [`ServerEvent::ChatRenamed`]/
+    /// [`ServerEvent::ChatsList`], [`ServerEvent::SkillsList`],
+    /// [`ServerEvent::ChatRenamed`]/
     /// [`ServerEvent::ChatDeleted`]/[`ServerEvent::SessionCleared`] (all
     /// three can target any sidebar row), and unscoped errors return
     /// `None`.
@@ -483,6 +506,7 @@ impl ServerEvent {
             // purposes (see `should_drop_event`). The payload still carries
             // `chat_id`.
             ServerEvent::ChatsList { .. }
+            | ServerEvent::SkillsList { .. }
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatDeleted { .. }
             | ServerEvent::SessionCleared { .. }
@@ -753,6 +777,11 @@ struct ChatsListWire {
 }
 
 #[derive(Deserialize)]
+struct SkillsListWire {
+    skills: Vec<SkillSummary>,
+}
+
+#[derive(Deserialize)]
 struct ChatRenamedWire {
     chat_id: String,
     title: String,
@@ -881,6 +910,9 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         }),
         "chats" => {
             decode::<ChatsListWire>(&value).map(|w| ServerEvent::ChatsList { chats: w.chats })
+        }
+        "skills" => {
+            decode::<SkillsListWire>(&value).map(|w| ServerEvent::SkillsList { skills: w.skills })
         }
         "chat_renamed" => decode::<ChatRenamedWire>(&value).map(|w| ServerEvent::ChatRenamed {
             chat_id: w.chat_id,
@@ -1492,6 +1524,56 @@ mod tests {
     fn chats_list_has_no_scoping_chat_id() {
         let event = ServerEvent::ChatsList { chats: Vec::new() };
         assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn parses_skills_list() {
+        let raw = r#"{"event":"skills","skills":[
+            {"name":"alpha","description":"Does alpha things"},
+            {"name":"no-desc","description":"no-desc"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::SkillsList {
+                skills: vec![
+                    SkillSummary {
+                        name: "alpha".to_string(),
+                        description: "Does alpha things".to_string(),
+                    },
+                    SkillSummary {
+                        name: "no-desc".to_string(),
+                        description: "no-desc".to_string(),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn parses_empty_skills_list() {
+        let raw = r#"{"event":"skills","skills":[]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(event, ServerEvent::SkillsList { skills: Vec::new() });
+    }
+
+    #[test]
+    fn skills_list_has_no_scoping_chat_id() {
+        let event = ServerEvent::SkillsList { skills: Vec::new() };
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_list_skills_serializes_expected_shape() {
+        let envelope = ClientEnvelope::list_skills();
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "list_skills",
+                "webui": true,
+            })
+        );
     }
 
     #[test]
