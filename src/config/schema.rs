@@ -269,10 +269,10 @@ fn default_agent_provider() -> String {
     "auto".to_string()
 }
 fn default_agent_max_tokens() -> u32 {
-    8192 * 2
+    8192 * 4
 }
 fn default_agent_context_window_tokens() -> u64 {
-    65_536
+    131_072
 }
 fn default_agent_temperature() -> f32 {
     0.1

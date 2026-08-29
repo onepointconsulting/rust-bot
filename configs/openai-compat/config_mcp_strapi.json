@@ -4,7 +4,7 @@
     "model": "${GROK_MODEL}",
     "provider": "openrouter",
     "maxTokens": 32768,
-    "contextWindowTokens": 65536,
+    "contextWindowTokens": 131072,
     "temperature": 0.1,
     "maxToolIterations": 100,
     "maxToolResultChars": 16000,
@@ -95,7 +95,7 @@
       "model": "${GROK_MODEL}",
       "provider": "openrouter",
       "maxTokens": 32768,
-      "contextWindowTokens": 65536,
+      "contextWindowTokens": 131072,
       "temperature": 0.1,
       "reasoningEffort": null
     }

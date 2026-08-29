@@ -316,11 +316,15 @@ impl AgentRunner {
     ///   4. Separate system messages (which are always kept) from the rest.
     ///   5. Locate the last `user` message — it anchors the *current* turn, which must never be
     ///      dropped even if its accompanying tool results alone exceed the remaining budget.
-    ///      Everything from that user message to the end of the list is kept unconditionally;
-    ///      older messages are then prepended, newest-first, while they still fit the per-turn
-    ///      budget (`total budget - system tokens - tool-definition tokens`, minimum 128).
-    ///      If no `user` message exists at all (e.g. a system-triggered turn), fall back to the
-    ///      previous purely greedy newest-to-oldest accumulation.
+    ///      Everything from that user message to the end of the list is kept unconditionally.
+    ///      Older turns are then considered newest-first against the leftover budget
+    ///      (`total budget - system tokens - tool-definition tokens`, minimum 128). A full
+    ///      prior turn is kept when it fits; otherwise the turn is compacted to the user
+    ///      message plus the last text-only assistant reply (dropping tool dumps). This
+    ///      keeps in-session facts ("I live in …") even when a previous tool-heavy turn
+    ///      would otherwise consume the whole window. If no `user` message exists at all
+    ///      (e.g. a system-triggered turn), fall back to greedy newest-to-oldest
+    ///      accumulation, skipping messages that do not fit rather than stopping.
     ///   6. Trim the kept slice so it has no orphaned tool results (via `find_legal_message_start`).
     ///   7. If nothing survives the trim, fall back to the last four non-system messages and
     ///      apply the same legality check.
@@ -393,29 +397,23 @@ impl AgentRunner {
                 // model never loses sight of the question it is meant to answer.
                 let mandatory = &non_system[idx..];
                 let mut kept_tokens: usize = mandatory.iter().map(estimate_message_tokens).sum();
-
-                let mut prefix: Vec<Value> = Vec::new();
-                for message in non_system[..idx].iter().rev() {
-                    let msg_tokens = estimate_message_tokens(message);
-                    if kept_tokens + msg_tokens > remaining_budget {
-                        break;
-                    }
-                    prefix.push(message.clone());
-                    kept_tokens += msg_tokens;
-                }
-                prefix.reverse();
-
+                let prefix = Self::select_prior_turns_for_budget(
+                    &non_system[..idx],
+                    remaining_budget,
+                    &mut kept_tokens,
+                );
                 kept = prefix;
                 kept.extend(mandatory.iter().cloned());
             }
             None => {
-                // No user message in this batch — fall back to greedy newest-to-oldest
-                // accumulation, as before.
+                // No user message in this batch — greedy newest-to-oldest, skipping
+                // messages that do not fit so a large tool dump cannot hide a
+                // smaller earlier message.
                 let mut kept_tokens = 0usize;
                 for message in non_system.iter().rev() {
                     let msg_tokens = estimate_message_tokens(message);
                     if !kept.is_empty() && kept_tokens + msg_tokens > remaining_budget {
-                        break;
+                        continue;
                     }
                     kept.push(message.clone());
                     kept_tokens += msg_tokens;
@@ -442,7 +440,104 @@ impl AgentRunner {
 
         let mut result = system_messages;
         result.extend(kept);
+        if result.len() != messages.len() {
+            log::info!(
+                "snip_history dropped {} of {} messages (estimate={estimate}, budget={budget}, kept={})",
+                messages.len().saturating_sub(result.len()),
+                messages.len(),
+                result.len(),
+            );
+        }
         result
+    }
+
+    /// Keep as much of `prefix` as fits `remaining_budget`, preferring whole
+    /// prior turns and falling back to user text + the last text-only reply.
+    ///
+    /// `kept_tokens` is the token count already committed (typically the
+    /// current turn). It is updated as prefix messages are selected.
+    fn select_prior_turns_for_budget(
+        prefix: &[Value],
+        remaining_budget: usize,
+        kept_tokens: &mut usize,
+    ) -> Vec<Value> {
+        if prefix.is_empty() {
+            return Vec::new();
+        }
+
+        let mut user_starts: Vec<usize> = prefix
+            .iter()
+            .enumerate()
+            .filter_map(|(i, m)| {
+                (m.get("role").and_then(Value::as_str) == Some("user")).then_some(i)
+            })
+            .collect();
+
+        // Leading non-user rows (e.g. a restored assistant/tool prefix) are
+        // treated as their own turn so we still try to keep or compact them.
+        if user_starts.first().copied() != Some(0) {
+            user_starts.insert(0, 0);
+        }
+
+        let mut selected: Vec<Value> = Vec::new();
+        for (turn_idx, &start) in user_starts.iter().enumerate().rev() {
+            let end = user_starts.get(turn_idx + 1).copied().unwrap_or(prefix.len());
+            if start >= end {
+                continue;
+            }
+            let turn = &prefix[start..end];
+            let turn_tokens: usize = turn.iter().map(estimate_message_tokens).sum();
+            if *kept_tokens + turn_tokens <= remaining_budget {
+                selected.splice(0..0, turn.iter().cloned());
+                *kept_tokens += turn_tokens;
+                continue;
+            }
+
+            let compact = Self::compact_prior_turn(turn);
+            if compact.is_empty() {
+                continue;
+            }
+            let compact_tokens: usize = compact.iter().map(estimate_message_tokens).sum();
+            if *kept_tokens + compact_tokens <= remaining_budget {
+                selected.splice(0..0, compact);
+                *kept_tokens += compact_tokens;
+            }
+        }
+        selected
+    }
+
+    /// Reduce a prior turn to the user message and the last text-only assistant
+    /// reply, dropping tool calls and their (usually huge) results.
+    fn compact_prior_turn(turn: &[Value]) -> Vec<Value> {
+        let mut out = Vec::new();
+        if let Some(first) = turn.first() {
+            if first.get("role").and_then(Value::as_str) == Some("user") {
+                out.push(first.clone());
+            }
+        }
+        if let Some(assistant) = turn.iter().rev().find(|m| {
+            m.get("role").and_then(Value::as_str) == Some("assistant")
+                && Self::assistant_has_text(m)
+                && !Self::assistant_has_tool_calls(m)
+        }) {
+            out.push(assistant.clone());
+        }
+        out
+    }
+
+    fn assistant_has_tool_calls(message: &Value) -> bool {
+        message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+    }
+
+    fn assistant_has_text(message: &Value) -> bool {
+        match message.get("content") {
+            Some(Value::String(s)) => !s.is_empty(),
+            Some(Value::Array(blocks)) => !blocks.is_empty(),
+            _ => false,
+        }
     }
 
     /// Send one LLM request and return the response.
@@ -2003,6 +2098,71 @@ mod tests {
         assert_eq!(
             result, messages,
             "the whole single turn should be kept intact"
+        );
+    }
+
+    #[test]
+    fn test_snip_history_keeps_prior_user_facts_when_old_tools_overflow() {
+        // Mirrors the Willesden Green session: a prior user fact plus a
+        // tool-heavy weather lookup, then a short follow-up. Newest-first
+        // greedy snip used to hit the huge tool result and drop the fact.
+        let prior_user = serde_json::json!({
+            "role": "user",
+            "content": "I live in Willesden Green. How is the weather there?"
+        });
+        let lookup = serde_json::json!({
+            "role": "assistant",
+            "content": "I'll look up the weather.",
+            "tool_calls": [
+                {"id": "call_1", "type": "function", "function": {"name": "web_search", "arguments": "{}"}}
+            ]
+        });
+        let huge_tool = serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "call_1",
+            "name": "web_search",
+            "content": "x".repeat(2_000)
+        });
+        let prior_reply = serde_json::json!({
+            "role": "assistant",
+            "content": "Damp and mild, about 17C."
+        });
+        let follow_up = serde_json::json!({"role": "user", "content": "Where do I live?"});
+
+        let messages = vec![
+            prior_user.clone(),
+            lookup,
+            huge_tool,
+            prior_reply.clone(),
+            follow_up.clone(),
+        ];
+
+        // Fits current question + compacted prior turn, but not the tool dump.
+        let spec = AgentRunSpec {
+            context_window_tokens: Some(8_000),
+            context_block_limit: Some(80),
+            ..Default::default()
+        };
+        let runner = make_runner();
+        let result = runner.snip_history(&spec, messages);
+
+        let roles: Vec<&str> = result
+            .iter()
+            .filter_map(|m| m.get("role").and_then(Value::as_str))
+            .collect();
+        assert_eq!(
+            roles,
+            vec!["user", "assistant", "user"],
+            "expected compacted prior turn + follow-up, got {result:?}"
+        );
+        assert_eq!(result[0], prior_user);
+        assert_eq!(result[1], prior_reply);
+        assert_eq!(result[2], follow_up);
+        assert!(
+            !result
+                .iter()
+                .any(|m| m.get("role").and_then(Value::as_str) == Some("tool")),
+            "huge prior tool result should have been dropped"
         );
     }
 

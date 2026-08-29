@@ -4,7 +4,7 @@
     "model": "moonshot/kimi-k3",
     "provider": "custom",
     "maxTokens": 16384,
-    "contextWindowTokens": 65536,
+    "contextWindowTokens": 131072,
     "temperature": 1,
     "maxToolIterations": 100,
     "maxToolResultChars": 16000,
@@ -127,7 +127,7 @@
       "model": "moonshot/kimi-k3",
       "provider": "custom",
       "maxTokens": 16384,
-      "contextWindowTokens": 65536,
+      "contextWindowTokens": 131072,
       "temperature": 1,
       "reasoningEffort": null
     }

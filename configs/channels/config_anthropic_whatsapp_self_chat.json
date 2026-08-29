@@ -4,7 +4,7 @@
     "model": "${ANTHROPIC_API_MODEL}",
     "provider": "anthropic",
     "maxTokens": 32768,
-    "contextWindowTokens": 65536,
+    "contextWindowTokens": 131072,
     "temperature": 0.1,
     "maxToolIterations": 100,
     "maxToolResultChars": 16000,
@@ -110,7 +110,7 @@
       "model": "${ANTHROPIC_API_MODEL}",
       "provider": "anthropic",
       "maxTokens": 32768,
-      "contextWindowTokens": 65536,
+      "contextWindowTokens": 131072,
       "temperature": 0.1,
       "reasoningEffort": null
     }

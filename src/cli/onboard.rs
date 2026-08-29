@@ -1,7 +1,7 @@
 use inquire::Confirm;
 use std::fmt;
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anstyle::{AnsiColor, Color, Style};
 
@@ -14,6 +14,7 @@ use crate::config::loader::{load_config, save_config};
 use crate::config::schema::{Config, ModelPresetConfig};
 use crate::utils::helpers::{ensure_dir, sync_workspace_templates};
 use crate::utils::logo::LOGO;
+use crate::utils::path::{display_path, normalize_path_separators};
 
 pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     if args.wizard {
@@ -82,35 +83,50 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
 
     create_env_file();
 
-    println!();
-    println!("{LOGO} is ready!");
-    println!();
-    println!("Next steps:");
-    println!(
-        "  1. Change the config file to your needs at {}",
-        config_path.display()
-    );
-    println!(
-        "  2. a) One message chat: rust-bot agent -c \"{}\" -m \"Hello!\"",
-        config_path.display()
-    );
-    println!(
-        "  2. b) Interactive chat: rust-bot agent -c \"{}\" ",
-        config_path.display()
-    );
-    println!("  2. c) API: rust-bot api -c \"{}\"", config_path.display());
-    println!(
-        "  2. d) Gateway: rust-bot gateway -c \"{}\"",
-        config_path.display()
-    );
-    if websocket_jwt_enabled(&config) {
-        println!(
-            "  3. Mint a web UI user: rust-bot generate-jwt-token -c \"{}\" --user-email you@example.com --users-file \"{}\" --purpose webui --password <password>",
-            config_path.display(),
-            config.api.users_file
-        );
-    }
+    let users_file = websocket_jwt_enabled(&config).then_some(config.api.users_file.as_str());
+    print_next_steps(&config_path, users_file);
     Ok(())
+}
+
+/// Binary name used in onboarding "next steps" examples.
+///
+/// Linux/macOS archives are run from the extract directory (`./rust-bot`).
+/// Windows archives use `.\rust-bot.exe`.
+fn cli_bin() -> &'static str {
+    if cfg!(windows) {
+        r".\rust-bot.exe"
+    } else {
+        "./rust-bot"
+    }
+}
+
+fn print_next_steps(config_path: &Path, users_file: Option<&str>) {
+    for line in next_steps_lines(config_path, users_file) {
+        println!("{line}");
+    }
+}
+
+fn next_steps_lines(config_path: &Path, users_file: Option<&str>) -> Vec<String> {
+    let bin = cli_bin();
+    let config = display_path(config_path);
+    let mut lines = vec![
+        String::new(),
+        format!("{LOGO} is ready!"),
+        String::new(),
+        "Next steps:".to_string(),
+        format!("  1. Change the config file to your needs at {config}"),
+        format!("  2. a) One message chat: {bin} agent -c \"{config}\" -m \"Hello!\""),
+        format!("  2. b) Interactive chat: {bin} agent -c \"{config}\" "),
+        format!("  2. c) API: {bin} api -c \"{config}\""),
+        format!("  2. d) Gateway: {bin} gateway -c \"{config}\""),
+    ];
+    if let Some(users_file) = users_file {
+        let users_file = normalize_path_separators(users_file);
+        lines.push(format!(
+            "  3. Mint a web UI user: {bin} generate-jwt-token -c \"{config}\" --user-email you@example.com --users-file \"{users_file}\" --purpose webui --password <password>",
+        ));
+    }
+    lines
 }
 
 pub fn create_env_file() {
@@ -209,4 +225,54 @@ fn configure_web_app(config: &mut Config, config_path: PathBuf) -> Result<(), Cl
         configure_websocket_channel(config, config_path, true)?;
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_bin_uses_platform_invocation() {
+        #[cfg(windows)]
+        assert_eq!(cli_bin(), r".\rust-bot.exe");
+        #[cfg(not(windows))]
+        assert_eq!(cli_bin(), "./rust-bot");
+    }
+
+    #[test]
+    fn next_steps_commands_use_cli_bin() {
+        let config = PathBuf::from(".rust-bot").join("config.json");
+        let bin = cli_bin();
+        let lines = next_steps_lines(&config, None);
+        let commands: Vec<_> = lines
+            .iter()
+            .filter(|line| line.contains("  2."))
+            .collect();
+        assert_eq!(commands.len(), 4);
+        for line in &commands {
+            assert!(
+                line.contains(&format!("{bin} ")),
+                "expected {bin:?} in next-steps line: {line}"
+            );
+        }
+        #[cfg(not(windows))]
+        assert!(commands[0].starts_with("  2. a) One message chat: ./rust-bot agent"));
+        #[cfg(windows)]
+        assert!(commands[0].starts_with(r"  2. a) One message chat: .\rust-bot.exe agent"));
+    }
+
+    #[test]
+    fn next_steps_jwt_line_uses_cli_bin_and_native_separators() {
+        let config = PathBuf::from("config.json");
+        let lines = next_steps_lines(&config, Some("./.rust-bot/users.json"));
+        let jwt_line = lines
+            .iter()
+            .find(|line| line.contains("generate-jwt-token"))
+            .expect("JWT next-steps line");
+        assert!(jwt_line.contains(&format!("{} generate-jwt-token", cli_bin())));
+        #[cfg(not(windows))]
+        assert!(jwt_line.contains("--users-file \"./.rust-bot/users.json\""));
+        #[cfg(windows)]
+        assert!(jwt_line.contains(r#"--users-file ".\.rust-bot\users.json""#));
+    }
 }
