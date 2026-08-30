@@ -118,8 +118,10 @@ crossterm = { git = "https://github.com/eitsupi/crossterm", branch = "feature/wi
 whatsapp-rust = { path = "vendor/whatsapp-rust" }
 
 [profile.release]
-opt-level = "z"
-lto = true
+opt-level = 3       # or "s" as a middle ground
+lto = "thin"        # most of fat LTO, much faster compiles
+codegen-units = 1
+strip = true
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
