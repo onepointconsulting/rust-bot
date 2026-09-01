@@ -226,19 +226,25 @@ impl ShellTool {
             parts.join("\n")
         };
 
-        // ── Truncate if over MAX_OUTPUT ───────────────────────────────────────
-        if result.len() > Self::MAX_OUTPUT {
-            let half = Self::MAX_OUTPUT / 2;
-            let truncated = result.len() - Self::MAX_OUTPUT;
-            format!(
-                "{}\n\n... ({} chars truncated) ...\n\n{}",
-                &result[..half],
-                truncated,
-                &result[result.len() - half..],
-            )
-        } else {
-            result
+        Self::truncate_output(&result)
+    }
+
+    /// Keep the head and tail of oversized command output, cutting only on
+    /// UTF-8 character boundaries so a mid-character byte index cannot panic.
+    fn truncate_output(result: &str) -> String {
+        if result.len() <= Self::MAX_OUTPUT {
+            return result.to_string();
         }
+        let half = Self::MAX_OUTPUT / 2;
+        let prefix_end = result.floor_char_boundary(half);
+        let suffix_start = result.ceil_char_boundary(result.len() - half);
+        let truncated = suffix_start.saturating_sub(prefix_end);
+        format!(
+            "{}\n\n... ({} chars truncated) ...\n\n{}",
+            &result[..prefix_end],
+            truncated,
+            &result[suffix_start..],
+        )
     }
 
     /// Extract all absolute path references from a shell command string.
@@ -725,6 +731,27 @@ mod tests {
             result.contains("Exit code: 0"),
             "expected exit code 0, got: {result}"
         );
+    }
+
+    #[test]
+    fn truncate_output_snaps_to_char_boundary_at_nbsp() {
+        // U+00A0 is two UTF-8 bytes (C2 A0). Placing it so byte index 5000
+        // lands inside the character reproduces the newsletter-output panic.
+        let mut output = "a".repeat(4999);
+        output.push('\u{a0}');
+        output.push_str(&"b".repeat(5001));
+        assert_eq!(output.len(), 10002);
+        assert!(!output.is_char_boundary(5000));
+
+        let truncated = ShellTool::truncate_output(&output);
+        assert!(truncated.contains("chars truncated"));
+        assert!(truncated.starts_with(&"a".repeat(4999)));
+        assert!(truncated.ends_with(&"b".repeat(5000)));
+    }
+
+    #[test]
+    fn truncate_output_leaves_short_text_unchanged() {
+        assert_eq!(ShellTool::truncate_output("hello"), "hello");
     }
 
     #[test]

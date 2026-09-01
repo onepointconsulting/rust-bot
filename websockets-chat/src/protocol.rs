@@ -50,6 +50,9 @@ pub struct ClientEnvelope {
     /// envelope type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_preset: Option<String>,
+    /// Set only by [`Self::set_mode`] — `standard` / `minimal` / `default`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub mode: Option<String>,
     /// Set only by [`Self::fork_chat_before`]: a 0-based index into the
     /// source chat's *user* messages. The gateway copies history up to (not
     /// including) that user turn, so the assistant reply just before it is
@@ -79,6 +82,7 @@ impl ClientEnvelope {
             media,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -98,6 +102,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -116,6 +121,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -147,6 +153,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index,
             webui: true,
         }
@@ -163,6 +170,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -179,6 +187,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -198,6 +207,7 @@ impl ClientEnvelope {
             media: None,
             title: Some(title.into()),
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -217,6 +227,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -238,6 +249,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -263,6 +275,7 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: None,
+            mode: None,
             before_user_index: None,
             webui: true,
         }
@@ -282,6 +295,23 @@ impl ClientEnvelope {
             media: None,
             title: None,
             model_preset: Some(model_preset.into()),
+            mode: None,
+            before_user_index: None,
+            webui: true,
+        }
+    }
+
+    /// Set (or clear, via `"default"`) `chat_id`'s agent-mode override.
+    pub fn set_mode(chat_id: impl Into<String>, mode: impl Into<String>) -> Self {
+        Self {
+            type_: "set_mode",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: Some(mode.into()),
             before_user_index: None,
             webui: true,
         }
@@ -355,6 +385,7 @@ pub enum ServerEvent {
         history: Vec<ChatEntry>,
         model_presets: Vec<String>,
         model_preset: Option<String>,
+        mode: Option<String>,
         token_usage: Option<SessionTokenUsage>,
     },
     /// Sent when the server-side session state changes. Shape not yet
@@ -467,6 +498,8 @@ pub enum ServerEvent {
         model_preset: String,
         model: String,
     },
+    /// Reply to a [`ClientEnvelope::set_mode`] envelope.
+    ModeSet { chat_id: String, mode: String },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -496,7 +529,8 @@ impl ServerEvent {
             | ServerEvent::ReasoningEnd { chat_id, .. }
             | ServerEvent::FileEdit { chat_id, .. }
             | ServerEvent::TurnAborted { chat_id, .. }
-            | ServerEvent::ModelPresetSet { chat_id, .. } => Some(chat_id.as_str()),
+            | ServerEvent::ModelPresetSet { chat_id, .. }
+            | ServerEvent::ModeSet { chat_id, .. } => Some(chat_id.as_str()),
             ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
@@ -681,6 +715,9 @@ struct AttachedWire {
     /// empty (nothing resolved, since there was nothing to resolve).
     #[serde(default)]
     model_preset: Option<String>,
+    /// Absent on an older gateway that doesn't send agent mode yet.
+    #[serde(default)]
+    mode: Option<String>,
     /// Absent when the session has no recorded usage yet, or on an older
     /// gateway that doesn't send it.
     #[serde(default)]
@@ -811,6 +848,12 @@ struct ModelPresetSetWire {
     model: String,
 }
 
+#[derive(Deserialize)]
+struct ModeSetWire {
+    chat_id: String,
+    mode: String,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -850,6 +893,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             history: history_to_entries(&w.history),
             model_presets: w.model_presets,
             model_preset: w.model_preset,
+            mode: w.mode,
             token_usage: w.token_usage,
         }),
         "session_updated" => Ok(ServerEvent::SessionUpdated(value)),
@@ -933,6 +977,10 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 model: w.model,
             })
         }
+        "mode_set" => decode::<ModeSetWire>(&value).map(|w| ServerEvent::ModeSet {
+            chat_id: w.chat_id,
+            mode: w.mode,
+        }),
         _ => Ok(ServerEvent::Unknown(value)),
     }
 }
@@ -1035,6 +1083,7 @@ mod tests {
                 history: vec![],
                 model_presets: vec![],
                 model_preset: None,
+                mode: None,
                 token_usage: None,
             }
         );
@@ -1051,6 +1100,7 @@ mod tests {
                 history: vec![],
                 model_presets: vec!["default".to_string(), "fast".to_string()],
                 model_preset: Some("fast".to_string()),
+                mode: None,
                 token_usage: None,
             }
         );
@@ -1759,6 +1809,35 @@ mod tests {
         );
         // Scoped, like `turn_aborted`: an ack only ever concerns the chat it
         // was requested for.
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn client_envelope_set_mode_serializes_expected_shape() {
+        let envelope = ClientEnvelope::set_mode("chat-1", "minimal");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_mode",
+                "chat_id": "chat-1",
+                "mode": "minimal",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_mode_set() {
+        let raw = r#"{"event":"mode_set","chat_id":"chat-1","mode":"minimal"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ModeSet {
+                chat_id: "chat-1".to_string(),
+                mode: "minimal".to_string(),
+            }
+        );
         assert_eq!(event.chat_id(), Some("chat-1"));
     }
 

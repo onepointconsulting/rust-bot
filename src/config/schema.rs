@@ -4,6 +4,7 @@ use garde::Validate;
 use serde::{Deserialize, Serialize};
 
 use crate::{
+    agent::modes::AgentMode,
     channels::websocket::types::DEFAULT_AUD,
     providers::{
         anthropic_provider::AnthropicProvider,
@@ -295,6 +296,9 @@ fn default_agent_timezone() -> String {
 fn default_agent_dream_config() -> DreamConfig {
     DreamConfig::default()
 }
+fn default_agent_mode() -> AgentMode {
+    AgentMode::Standard
+}
 fn default_model_preset_provider() -> String {
     "auto".to_string()
 }
@@ -439,6 +443,12 @@ pub struct AgentsConfig {
     #[serde(alias = "model_preset")]
     #[garde(skip)]
     pub model_preset: Option<String>,
+
+    /// Process-wide default agent composition (`standard` or `minimal`).
+    /// Sessions may override this via `/mode` / `set_mode`.
+    #[serde(alias = "mode", default = "default_agent_mode")]
+    #[garde(skip)]
+    pub mode: AgentMode,
 }
 
 impl Default for AgentsConfig {
@@ -458,6 +468,7 @@ impl Default for AgentsConfig {
             timezone: default_agent_timezone(),
             dream: default_agent_dream_config(),
             model_preset: None,
+            mode: default_agent_mode(),
         }
     }
 }
@@ -1915,6 +1926,15 @@ mod tests {
             cfg.max_tool_result_chars,
             default_agent_max_tool_result_chars()
         );
+        assert_eq!(cfg.mode, default_agent_mode());
+    }
+
+    #[test]
+    fn test_agents_config_mode_defaults_to_standard_and_accepts_minimal() {
+        let cfg: AgentsConfig = serde_json::from_str(r#"{"model": "mistral"}"#).unwrap();
+        assert_eq!(cfg.mode, crate::agent::modes::AgentMode::Standard);
+        let cfg: AgentsConfig = serde_json::from_str(r#"{"mode": "minimal"}"#).unwrap();
+        assert_eq!(cfg.mode, crate::agent::modes::AgentMode::Minimal);
     }
 
     #[test]

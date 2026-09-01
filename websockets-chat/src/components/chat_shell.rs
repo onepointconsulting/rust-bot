@@ -56,6 +56,8 @@ pub fn ChatShell(
     #[prop(into)] model_presets: Signal<Vec<String>>,
     #[prop(into)] selected_model_preset: Signal<String>,
     on_select_model_preset: impl Fn(String) + 'static + Send + Sync + Copy,
+    #[prop(into)] selected_agent_mode: Signal<String>,
+    on_select_agent_mode: impl Fn(String) + 'static + Send + Sync + Copy,
     #[prop(into)] session_usage: Signal<Option<SessionTokenUsage>>,
     #[prop(into)] skills: Signal<Vec<SkillSummary>>,
 ) -> impl IntoView {
@@ -137,6 +139,8 @@ pub fn ChatShell(
                     model_presets=model_presets
                     selected_model_preset=selected_model_preset
                     on_select_model_preset=Callback::new(move |name| on_select_model_preset(name))
+                    selected_agent_mode=selected_agent_mode
+                    on_select_agent_mode=Callback::new(move |name| on_select_agent_mode(name))
                     session_usage=session_usage
                     skills=skills
                 />

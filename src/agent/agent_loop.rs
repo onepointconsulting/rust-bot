@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
+use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
@@ -438,10 +439,11 @@ impl AgentLoop {
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
         let tools = Arc::new(Mutex::new(tools));
-        let context = Arc::new(ContextBuilder::new(
+        let context = Arc::new(ContextBuilder::with_default_mode(
             workspace.clone(),
             timezone.clone(),
             tools.clone(),
+            agents_cfg.mode,
         ));
         let consolidator = Arc::new(Consolidator::new(
             Arc::clone(&context.memory),
@@ -588,6 +590,54 @@ impl AgentLoop {
             .save(snapshot)
             .map_err(|e| format!("Failed to save session: {e}"))?;
         Ok(runtime)
+    }
+
+    /// Resolve the agent mode a session would use right now (its stored
+    /// override, if any and valid, else the process-wide `agents.mode`).
+    pub fn mode_for_session(&self, session: Option<&Session>) -> AgentMode {
+        AgentMode::resolve(self.config.agents.mode, session.map(|s| &s.metadata))
+    }
+
+    /// Validate and persist one session's agent-mode override.
+    ///
+    /// `name == "default"` clears the override. Unknown names error without
+    /// mutating the session.
+    pub fn set_session_mode(
+        &self,
+        session_manager: &mut SessionManager,
+        session_key: &str,
+        name: &str,
+    ) -> Result<AgentMode, String> {
+        let session = session_manager.get_or_create_session(session_key);
+        if name.eq_ignore_ascii_case(RESERVED_AGENT_MODE_NAME) {
+            session.metadata.remove(SESSION_AGENT_MODE_METADATA_KEY);
+            let snapshot = session.clone();
+            session_manager
+                .save(snapshot)
+                .map_err(|e| format!("Failed to save session: {e}"))?;
+            return Ok(self.config.agents.mode);
+        }
+        let mode = AgentMode::parse(name).ok_or_else(|| {
+            format!("Unknown agent mode '{name}'. Available modes: standard, minimal")
+        })?;
+        session.metadata.insert(
+            SESSION_AGENT_MODE_METADATA_KEY.to_string(),
+            Value::String(mode.as_str().to_string()),
+        );
+        let snapshot = session.clone();
+        session_manager
+            .save(snapshot)
+            .map_err(|e| format!("Failed to save session: {e}"))?;
+        Ok(mode)
+    }
+
+    /// Tools visible to this session after applying its agent mode.
+    pub fn tools_for_session(&self, session: Option<&Session>) -> ToolRegistry {
+        let mode = self.mode_for_session(session);
+        self.tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .restrict(mode.allowed_tool_names())
     }
 
     /// Resolve the workspace scope a session would use right now (its
@@ -983,8 +1033,13 @@ impl AgentLoop {
                 }) as Arc<dyn Fn(Value) + Send + Sync>
             });
 
-        let run_tools = self.tools.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        log::info!("Running agent loop with {} tools", run_tools.len());
+        let mode = self.mode_for_session(session.as_ref());
+        let run_tools = self.tools_for_session(session.as_ref());
+        log::info!(
+            "Running agent loop with {} tools (mode={})",
+            run_tools.len(),
+            mode
+        );
 
         // Resolve the runtime for this specific session (its stored preset
         // override, if any, else the process-wide default) — no fixed
@@ -2689,6 +2744,68 @@ mod tests {
         assert_eq!(
             loop_.workspace_scopes.default_restrict_to_workspace,
             loop_.restrict_to_workspace
+        );
+    }
+
+    #[test]
+    fn set_session_mode_persists_and_default_clears() {
+        let loop_ = make_save_turn_loop(1000);
+        let key = "test:agent_mode";
+        {
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mode = loop_
+                .set_session_mode(&mut manager, key, "minimal")
+                .unwrap();
+            assert_eq!(mode, AgentMode::Minimal);
+            let session = manager.get_or_create_session(key);
+            assert_eq!(
+                session
+                    .metadata
+                    .get(SESSION_AGENT_MODE_METADATA_KEY)
+                    .and_then(Value::as_str),
+                Some("minimal")
+            );
+            assert_eq!(loop_.mode_for_session(Some(session)), AgentMode::Minimal);
+        }
+        {
+            let mut manager = loop_
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mode = loop_
+                .set_session_mode(&mut manager, key, RESERVED_AGENT_MODE_NAME)
+                .unwrap();
+            assert_eq!(mode, AgentMode::Standard);
+            let session = manager.get_or_create_session(key);
+            assert!(
+                session
+                    .metadata
+                    .get(SESSION_AGENT_MODE_METADATA_KEY)
+                    .is_none()
+            );
+        }
+    }
+
+    #[test]
+    fn set_session_mode_rejects_unknown_without_mutating() {
+        let loop_ = make_save_turn_loop(1000);
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let err = loop_
+            .set_session_mode(&mut manager, "test:agent_mode_bad", "ptc")
+            .unwrap_err();
+        assert!(err.contains("Unknown agent mode"));
+        let session = manager.get_or_create_session("test:agent_mode_bad");
+        assert!(
+            session
+                .metadata
+                .get(SESSION_AGENT_MODE_METADATA_KEY)
+                .is_none()
         );
     }
 }

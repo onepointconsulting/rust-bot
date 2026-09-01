@@ -326,6 +326,7 @@ mod tests {
             gateway_services: Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep())),
             media_root: tempfile::tempdir().unwrap().keep(),
             runtime_resolver: crate::agent::model_runtime::ModelRuntimeResolver::for_tests(),
+            default_agent_mode: crate::agent::modes::AgentMode::Standard,
         }
     }
 

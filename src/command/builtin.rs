@@ -813,6 +813,59 @@ impl CommandHandler for CmdDreamRestore {
     }
 }
 
+struct CmdMode;
+
+/// Show or switch the agent composition mode used by this chat session.
+///
+/// `/mode` (no args) reports the effective mode. `/mode standard|minimal`
+/// persists an override for this session only. `/mode default` clears it.
+#[async_trait]
+impl CommandHandler for CmdMode {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/mode");
+        };
+        let requested = ctx.args.trim();
+
+        if requested.is_empty() {
+            let (_session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+            let mode = agent_loop.mode_for_session(Some(&session));
+            let source = if session
+                .metadata
+                .get(crate::session::SESSION_AGENT_MODE_METADATA_KEY)
+                .and_then(|v| v.as_str())
+                .and_then(crate::agent::modes::AgentMode::parse)
+                .is_some()
+            {
+                "session override"
+            } else {
+                "process default"
+            };
+            return reply_as_text(
+                ctx,
+                format!("Agent mode: {} ({source})", mode.as_str()),
+            );
+        }
+
+        let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+        let session_key = session.key.clone();
+        match agent_loop.set_session_mode(&mut session_manager, &session_key, requested) {
+            Ok(mode) if requested.eq_ignore_ascii_case("default") => reply_as_text(
+                ctx,
+                format!(
+                    "Agent mode override cleared; using the process default ({}).",
+                    mode.as_str()
+                ),
+            ),
+            Ok(mode) => reply_as_text(
+                ctx,
+                format!("Agent mode set to '{}' for this session.", mode.as_str()),
+            ),
+            Err(e) => reply_as_text(ctx, e),
+        }
+    }
+}
+
 struct CmdTools;
 
 #[async_trait]
@@ -821,7 +874,8 @@ impl CommandHandler for CmdTools {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/tools");
         };
-        let registry = agent_loop.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let (_session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
+        let registry = agent_loop.tools_for_session(Some(&session));
         let mut names = registry.tool_names();
         names.sort();
         let content = if names.is_empty() {
@@ -1135,6 +1189,7 @@ fn build_help_text() -> String {
         "/model — Show the current model",
         "/model-preset — Show the current preset's model and provider or switch to a different preset",
         "/model-presets — List available model presets",
+        "/mode — Show this session's agent mode, or switch it: /mode standard|minimal, /mode default to clear",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",
@@ -1176,6 +1231,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.prefix(ChatCommand::McpPreset.to_string(), Arc::new(CmdMcpPreset));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
     router.prefix(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
+    router.prefix(ChatCommand::Mode.to_string(), Arc::new(CmdMode));
     router.prefix(ChatCommand::Goal.to_string(), Arc::new(CmdGoal));
     router.exact(ChatCommand::Cleanup.to_string(), Arc::new(CmdCleanup));
     router.exact(
@@ -1551,6 +1607,81 @@ mod tests {
             shown_after.content.contains("(preset: default)"),
             "got: {}",
             shown_after.content
+        );
+    }
+
+    fn mode_cmd_ctx(
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+        args: &str,
+    ) -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: format!("/mode {args}").trim().to_string(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "mode-cmd-session",
+            "/mode",
+            args,
+            Some(agent_loop),
+        )
+    }
+
+    #[tokio::test]
+    async fn cmd_mode_reports_process_default_then_persists_and_clears() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let shown = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "")).await;
+        assert!(
+            shown.content.contains("Agent mode: standard (process default)"),
+            "got: {}",
+            shown.content
+        );
+
+        let switched = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "minimal")).await;
+        assert!(
+            switched.content.contains("set to 'minimal'"),
+            "got: {}",
+            switched.content
+        );
+        let after_switch = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "")).await;
+        assert!(
+            after_switch
+                .content
+                .contains("Agent mode: minimal (session override)"),
+            "got: {}",
+            after_switch.content
+        );
+
+        let cleared = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "default")).await;
+        assert!(
+            cleared.content.contains("process default"),
+            "got: {}",
+            cleared.content
+        );
+        let after_clear = CmdMode.handle(&mode_cmd_ctx(loop_, "")).await;
+        assert!(
+            after_clear
+                .content
+                .contains("Agent mode: standard (process default)"),
+            "got: {}",
+            after_clear.content
+        );
+    }
+
+    #[tokio::test]
+    async fn cmd_mode_rejects_unknown() {
+        let loop_ = model_cmd_test_loop_with_preset();
+        let out = CmdMode.handle(&mode_cmd_ctx(loop_, "ptc")).await;
+        assert!(
+            out.content.contains("Unknown agent mode 'ptc'"),
+            "got: {}",
+            out.content
         );
     }
 

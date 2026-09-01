@@ -66,6 +66,10 @@ pub enum EnvelopeType {
     /// precedent — the Python reference has no preset envelope; its closest
     /// path is the `/model-preset` chat command.
     SetModelPreset,
+    /// Persist a Standard/Minimal agent-mode override on an existing
+    /// `websocket:{chat_id}` session. Rust-side addition — same role as
+    /// `/mode`.
+    SetMode,
     /// Wipe an existing `websocket:{chat_id}` session's messages (and the
     /// goal/usage metadata that would otherwise leak into the next turn)
     /// without deleting the session itself. Rust-side addition with no
@@ -100,6 +104,7 @@ impl From<&str> for EnvelopeType {
             "list_chats" => Self::ListChats,
             "list_skills" => Self::ListSkills,
             "set_model_preset" => Self::SetModelPreset,
+            "set_mode" => Self::SetMode,
             "clear_session" => Self::ClearSession,
             other => Self::Unrecognized(other.to_string()),
         }
@@ -143,6 +148,8 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::SetModelPreset`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ModelPresetSet,
+    /// Reply to [`EnvelopeType::SetMode`].
+    ModeSet,
     /// Fan-out of the user half of a just-accepted [`EnvelopeType::Message`]
     /// turn, sent to every connection subscribed to the chat (including the
     /// sender) — not a reply to the sender alone, unlike every other variant
@@ -172,6 +179,7 @@ impl WsOutboundEvent {
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
             Self::ModelPresetSet => "model_preset_set",
+            Self::ModeSet => "mode_set",
             Self::User => "user",
             Self::SessionCleared => "session_cleared",
         }
@@ -354,6 +362,9 @@ pub struct WsShared {
     /// through the agent loop. Per-session persistence still writes
     /// `model_preset` on the session via [`Self::session_manager`].
     pub runtime_resolver: Arc<ModelRuntimeResolver>,
+    /// Process-wide `agents.mode` default used when a session has no
+    /// persisted override (or an invalid one).
+    pub default_agent_mode: crate::agent::modes::AgentMode,
 }
 
 /// Everything one envelope-dispatch call needs, bundled so per-type handler
@@ -492,6 +503,7 @@ mod tests {
             EnvelopeType::from("set_model_preset"),
             EnvelopeType::SetModelPreset
         );
+        assert_eq!(EnvelopeType::from("set_mode"), EnvelopeType::SetMode);
         assert_eq!(
             EnvelopeType::from("clear_session"),
             EnvelopeType::ClearSession
@@ -550,6 +562,7 @@ mod tests {
     #[test]
     fn ws_outbound_event_model_preset_set_has_no_nanobot_precedent() {
         assert_eq!(WsOutboundEvent::ModelPresetSet.as_str(), "model_preset_set");
+        assert_eq!(WsOutboundEvent::ModeSet.as_str(), "mode_set");
     }
 
     #[test]

@@ -340,6 +340,8 @@ struct WsContext {
     /// [`request_set_model_preset`] and reconciled by the `attached` /
     /// `model_preset_set` acks.
     model_preset: RwSignal<String>,
+    /// This chat's resolved agent mode (`standard` / `minimal`).
+    agent_mode: RwSignal<String>,
     /// This chat's lifetime token/cost totals, from the active chat's
     /// `attached` frame and refreshed by `session_updated` after each turn.
     /// `None` hides the usage chip entirely — a brand new chat, a session
@@ -745,6 +747,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             history,
             model_presets,
             model_preset,
+            mode,
             token_usage,
         } => {
             log::info!(
@@ -765,6 +768,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             ctx.model_preset
                 .set(model_preset.unwrap_or_else(|| "default".to_string()));
+            ctx.agent_mode
+                .set(mode.unwrap_or_else(|| "standard".to_string()));
             // Unlike the preset catalog, always replace — a chat switch or
             // "New chat" must not keep showing the *previous* session's
             // usage chip when this one has none yet.
@@ -828,6 +833,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::ModelPresetSet { model_preset, .. } => {
             ctx.model_preset.set(model_preset);
+        }
+        ServerEvent::ModeSet { mode, .. } => {
+            ctx.agent_mode.set(mode);
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
@@ -1139,6 +1147,21 @@ fn request_abort_turn(ctx: &WsContext) {
 /// other request in this file — rather than reverting the optimistic value,
 /// since the next `attached` (chat switch) or a retried selection both
 /// naturally reconcile it.
+fn request_set_agent_mode(ctx: &WsContext, name: String) {
+    if ctx.agent_mode.get_untracked() == name {
+        return;
+    }
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    ctx.agent_mode.set(name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_mode(chat_id, name),
+        "Failed to encode the set-mode request.",
+    );
+}
+
 fn request_set_model_preset(ctx: &WsContext, name: String) {
     if ctx.model_preset.get_untracked() == name {
         return;
@@ -1389,6 +1412,7 @@ pub fn App() -> impl IntoView {
     let split_stream_on_next_delta = RwSignal::new(false);
     let model_presets = RwSignal::new(Vec::<String>::new());
     let model_preset = RwSignal::new("default".to_string());
+    let agent_mode = RwSignal::new("standard".to_string());
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
     let skills = RwSignal::new(Vec::<SkillSummary>::new());
 
@@ -1414,6 +1438,7 @@ pub fn App() -> impl IntoView {
         split_stream_on_next_delta,
         model_presets,
         model_preset,
+        agent_mode,
         session_usage,
         skills,
     };
@@ -1605,6 +1630,7 @@ pub fn App() -> impl IntoView {
     };
     let on_abort_turn = move || request_abort_turn(&ws_context);
     let on_select_model_preset = move |name: String| request_set_model_preset(&ws_context, name);
+    let on_select_agent_mode = move |name: String| request_set_agent_mode(&ws_context, name);
 
     // A turn stays in flight across tool waits, even though those pauses
     // clear `streaming` on the current bubble so the next LLM round can
@@ -1672,6 +1698,8 @@ pub fn App() -> impl IntoView {
                     model_presets=Signal::derive(move || model_presets.get())
                     selected_model_preset=Signal::derive(move || model_preset.get())
                     on_select_model_preset=on_select_model_preset
+                    selected_agent_mode=Signal::derive(move || agent_mode.get())
+                    on_select_agent_mode=on_select_agent_mode
                     session_usage=Signal::derive(move || session_usage.get())
                     skills=Signal::derive(move || skills.get())
                 />

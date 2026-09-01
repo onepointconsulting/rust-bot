@@ -175,6 +175,79 @@ fn ModelPresetPicker(
     }
 }
 
+#[component]
+fn AgentModePicker(selected: Signal<String>, on_select: Callback<String>) -> impl IntoView {
+    let menu_open = RwSignal::new(false);
+    let modes = vec!["standard".to_string(), "minimal".to_string()];
+
+    view! {
+        <div class="relative">
+            <button
+                type="button"
+                aria-haspopup="menu"
+                aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                aria-label="Agent mode"
+                title="Agent mode"
+                class="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                on:click=move |_| menu_open.update(|open| *open = !*open)
+            >
+                <span>{move || selected.get()}</span>
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-3 w-3"
+                    aria-hidden="true"
+                >
+                    <path d="m18 15-6-6-6 6" />
+                </svg>
+            </button>
+            <div class=move || { if menu_open.get() { "block" } else { "hidden" } }>
+                <div
+                    class="fixed inset-0 z-10"
+                    aria-hidden="true"
+                    on:click=move |_| menu_open.set(false)
+                ></div>
+                <div
+                    role="menu"
+                    class="absolute bottom-full z-20 mb-1 w-40 overflow-hidden rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
+                >
+                    <For
+                        each=move || modes.clone()
+                        key=|name| name.clone()
+                        let(name)
+                    >
+                        {
+                            let name_for_click = name.clone();
+                            let name_for_check = name.clone();
+                            view! {
+                                <button
+                                    type="button"
+                                    role="menuitem"
+                                    class="flex w-full items-center justify-between gap-2.5 px-3 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50"
+                                    on:click=move |_| {
+                                        menu_open.set(false);
+                                        on_select.run(name_for_click.clone());
+                                    }
+                                >
+                                    <span>{name.clone()}</span>
+                                    <Show when=move || selected.get() == name_for_check>
+                                        <span aria-hidden="true">"\u{2713}"</span>
+                                    </Show>
+                                </button>
+                            }
+                        }
+                    </For>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 /// Compact `"38.6K in · 412 out"` summary for the chip trigger. A field the
 /// provider never reported renders as `?` rather than `0`, matching
 /// [`SessionTokenUsage`]'s "missing is not zero" convention.
@@ -433,6 +506,10 @@ pub fn ChatInput(
     #[prop(into, optional)]
     selected_model_preset: Option<Signal<String>>,
     #[prop(optional)] on_select_model_preset: Option<Callback<String>>,
+    /// Current agent mode (`standard` / `minimal`). Omitted hides the picker.
+    #[prop(into, optional)]
+    selected_agent_mode: Option<Signal<String>>,
+    #[prop(optional)] on_select_agent_mode: Option<Callback<String>>,
     /// This session's lifetime token/cost totals. Omitted, or resolving to
     /// `None`/empty, hides the usage chip entirely — `web-chat` (no gateway
     /// usage protocol) never sets this.
@@ -742,6 +819,17 @@ pub fn ChatInput(
                                     selected=selected
                                     on_select=on_select
                                 />
+                            }
+                                .into_any()
+                        }
+                        _ => view! { <></> }.into_any(),
+                    }
+                }}
+                {move || {
+                    match (selected_agent_mode, on_select_agent_mode) {
+                        (Some(selected), Some(on_select)) => {
+                            view! {
+                                <AgentModePicker selected=selected on_select=on_select />
                             }
                                 .into_any()
                         }

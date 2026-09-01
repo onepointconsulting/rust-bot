@@ -142,6 +142,21 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    /// Return a registry that exposes only `allow`, or `self` cloned when
+    /// `allow` is `None` (Standard: every registered tool stays visible).
+    pub fn restrict(&self, allow: Option<&[&str]>) -> ToolRegistry {
+        let Some(allow) = allow else {
+            return self.clone();
+        };
+        let mut tools = HashMap::new();
+        for name in allow {
+            if let Some(tool) = self.tools.get(*name) {
+                tools.insert((*name).to_string(), tool.clone());
+            }
+        }
+        ToolRegistry { tools }
+    }
+
     /// Extract a normalised tool name from either OpenAI-wrapped or flat schemas.
     fn schema_name(schema: &serde_json::Value) -> String {
         if let Some(name) = schema
@@ -327,6 +342,28 @@ mod tests {
         let mut names = reg.tool_names();
         names.sort();
         assert_eq!(names, vec!["add", "echo"]);
+    }
+
+    #[test]
+    fn restrict_none_clones_the_full_catalog() {
+        let reg = registry_with_defaults();
+        let view = reg.restrict(None);
+        let mut names = view.tool_names();
+        names.sort();
+        assert_eq!(names, vec!["add", "echo"]);
+    }
+
+    #[test]
+    fn restrict_keep_listed_tools_and_drops_the_rest() {
+        let mut reg = registry_with_defaults();
+        reg.register(Box::new(McpSearchTool));
+        let view = reg.restrict(Some(&["echo"]));
+        assert!(view.has("echo"));
+        assert!(!view.has("add"));
+        assert!(!view.has("mcp_search"));
+        let (tool, _, error) = view.prepare_call("add", &serde_json::json!({}));
+        assert!(tool.is_none());
+        assert!(error.unwrap().contains("not found"));
     }
 
     // ── get_definitions ordering tests ───────────────────────────────────────

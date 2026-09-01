@@ -903,14 +903,16 @@ fn resolve_websocket_channel(
     if !cfg.enabled {
         return None;
     }
-    Some(Arc::new(WebSocketChannel::new(
+    let mut channel = WebSocketChannel::new(
         cfg,
         bus,
         config.channels.clone(),
         session_manager,
         workspace_request_handler,
         runtime_resolver,
-    )))
+    );
+    channel.default_agent_mode = config.agents.mode;
+    Some(Arc::new(channel))
 }
 
 /// Wait for the given channel's shutdown signal — the same `Arc<Notify>`

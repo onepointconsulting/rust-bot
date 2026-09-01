@@ -7,6 +7,7 @@ use tera::Context;
 use crate::{
     agent::{
         memory::{MemoryStore, MessageBuilder},
+        modes::AgentMode,
         skills::SkillsLoader,
         tools::registry::ToolRegistry,
     },
@@ -31,6 +32,7 @@ pub struct ContextBuilder {
     pub memory: Arc<MemoryStore>,
     skills: SkillsLoader,
     tools: Arc<Mutex<ToolRegistry>>,
+    default_mode: AgentMode,
 }
 
 impl ContextBuilder {
@@ -38,6 +40,15 @@ impl ContextBuilder {
         workspace: PathBuf,
         timezone: Option<String>,
         tools: Arc<Mutex<ToolRegistry>>,
+    ) -> Self {
+        Self::with_default_mode(workspace, timezone, tools, AgentMode::Standard)
+    }
+
+    pub fn with_default_mode(
+        workspace: PathBuf,
+        timezone: Option<String>,
+        tools: Arc<Mutex<ToolRegistry>>,
+        default_mode: AgentMode,
     ) -> Self {
         let skills = SkillsLoader::new(&workspace, None);
         let memory = Arc::new(MemoryStore::new(workspace.clone(), None));
@@ -47,7 +58,15 @@ impl ContextBuilder {
             skills,
             memory,
             tools,
+            default_mode,
         }
+    }
+
+    fn resolve_mode(
+        &self,
+        session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
+    ) -> AgentMode {
+        AgentMode::resolve(self.default_mode, session_metadata)
     }
 
     /// Build the system prompt from identity, bootstrap files, memory, and skills.
@@ -60,69 +79,92 @@ impl ContextBuilder {
         skill_names: Option<&[String]>,
         channel: Option<&str>,
     ) -> String {
-        let identity = self.get_identity(channel);
-        let mut parts = vec![identity];
-        let bootstrap = self.load_bootstrap_files();
+        self.build_system_prompt_for_mode(skill_names, channel, self.default_mode)
+    }
+
+    pub fn build_system_prompt_for_mode(
+        &self,
+        skill_names: Option<&[String]>,
+        channel: Option<&str>,
+        mode: AgentMode,
+    ) -> String {
+        let mut parts: Vec<String> = Vec::new();
+        if mode.include_identity() {
+            parts.push(self.get_identity(channel));
+        }
+        let bootstrap = self.load_bootstrap_files(mode.bootstrap_files());
         if !bootstrap.is_empty() {
             parts.push(bootstrap);
         }
 
-        let memory = self.memory.get_memory_context();
-        if !memory.is_empty() {
-            parts.push(memory);
+        if mode.include_memory() {
+            let memory = self.memory.get_memory_context();
+            if !memory.is_empty() {
+                parts.push(memory);
+            }
         }
 
-        // Combine always-skills with any explicitly requested skill_names,
-        // preserving order and removing duplicates.
-        let mut active_skills = self.skills.get_always_skills();
-        if let Some(names) = skill_names {
-            for name in names {
-                if !active_skills.iter().any(|s| s == name) {
-                    active_skills.push(name.clone());
+        if mode.include_skills() {
+            // Combine always-skills with any explicitly requested skill_names,
+            // preserving order and removing duplicates.
+            let mut active_skills = self.skills.get_always_skills();
+            if let Some(names) = skill_names {
+                for name in names {
+                    if !active_skills.iter().any(|s| s == name) {
+                        active_skills.push(name.clone());
+                    }
+                }
+            }
+            if !active_skills.is_empty() {
+                let always_content = self
+                    .skills
+                    .load_skills_for_context(active_skills.as_slice());
+                if !always_content.is_empty() {
+                    parts.push(format!("## Active Skills\n\n{always_content}"));
+                }
+            }
+
+            let skills_summary = self.skills.build_skills_summary();
+            if !skills_summary.is_empty() {
+                let mut skills_section_context = Context::new();
+                skills_section_context.insert("skills_summary", &skills_summary);
+                let rendered =
+                    render_template("agent/skills_section.md", &skills_section_context, true)
+                        .unwrap_or_else(|_| "".to_string());
+                if !rendered.is_empty() {
+                    parts.push(rendered);
                 }
             }
         }
-        if !active_skills.is_empty() {
-            let always_content = self
-                .skills
-                .load_skills_for_context(active_skills.as_slice());
-            if !always_content.is_empty() {
-                parts.push(format!("## Active Skills\n\n{always_content}"));
+
+        if mode.include_recent_history() {
+            let entries = self
+                .memory
+                .read_unprocessed_history(self.memory.get_last_dream_cursor());
+            if !entries.is_empty() {
+                let capped = entries[entries.len().saturating_sub(MAX_RECENT_HISTORY)..].to_vec();
+                let history_joined = capped
+                    .iter()
+                    .map(|e| {
+                        format!(
+                            "[{}] {}",
+                            e["timestamp"].as_str().unwrap_or(""),
+                            e["content"].as_str().unwrap_or("")
+                        )
+                    })
+                    .collect::<Vec<String>>()
+                    .join("\n");
+                parts.push(format!("## Recent History\n\n{history_joined}"));
             }
         }
 
-        let skills_summary = self.skills.build_skills_summary();
-        if !skills_summary.is_empty() {
-            let mut skills_section_context = Context::new();
-            skills_section_context.insert("skills_summary", &skills_summary);
-            let rendered =
-                render_template("agent/skills_section.md", &skills_section_context, true)
-                    .unwrap_or_else(|_| "".to_string());
-            if !rendered.is_empty() {
-                parts.push(rendered);
+        if parts.is_empty() {
+            if let Some(fallback) = mode.fallback_system_prompt() {
+                return fallback.to_string();
             }
         }
 
-        let entries = self
-            .memory
-            .read_unprocessed_history(self.memory.get_last_dream_cursor());
-        if !entries.is_empty() {
-            let capped = entries[entries.len().saturating_sub(MAX_RECENT_HISTORY)..].to_vec();
-            let history_joined = capped
-                .iter()
-                .map(|e| {
-                    format!(
-                        "[{}] {}",
-                        e["timestamp"].as_str().unwrap_or(""),
-                        e["content"].as_str().unwrap_or("")
-                    )
-                })
-                .collect::<Vec<String>>()
-                .join("\n");
-            parts.push(format!("## Recent History\n\n{history_joined}"));
-        }
-
-        return parts.join("\n\n---\n\n");
+        parts.join("\n\n---\n\n")
     }
 
     /// Map `std::env::consts::OS` (lowercase) to a human-readable OS name.
@@ -291,10 +333,10 @@ impl ContextBuilder {
         return merged.into();
     }
 
-    /// Load all bootstrap files from workspace.    
-    fn load_bootstrap_files(&self) -> String {
+    /// Load the given bootstrap files from the workspace.
+    fn load_bootstrap_files(&self, files: &[&str]) -> String {
         let mut parts: Vec<String> = vec![];
-        for filename in BOOTSTRAP_FILES {
+        for filename in files {
             let path = self.workspace.join(filename);
             if path.exists() {
                 match std::fs::read_to_string(&path) {
@@ -303,7 +345,7 @@ impl ContextBuilder {
                 }
             }
         }
-        return parts.join("\n\n");
+        parts.join("\n\n")
     }
 
     /// Append an assistant turn to `messages` and return the updated list.
@@ -343,13 +385,16 @@ impl MessageBuilder for ContextBuilder {
         runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
     ) -> Vec<serde_json::Value> {
+        let mode = self.resolve_mode(session_metadata);
         let mut runtime_ctx =
             ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
-        if let Some(metadata) = session_metadata {
-            let goal_lines = crate::session::goal_state::goal_state_runtime_lines(metadata);
-            if !goal_lines.is_empty() {
-                runtime_ctx.push('\n');
-                runtime_ctx.push_str(&goal_lines.join("\n"));
+        if mode.include_goal_runtime() {
+            if let Some(metadata) = session_metadata {
+                let goal_lines = crate::session::goal_state::goal_state_runtime_lines(metadata);
+                if !goal_lines.is_empty() {
+                    runtime_ctx.push('\n');
+                    runtime_ctx.push_str(&goal_lines.join("\n"));
+                }
             }
         }
         let user_content = self.build_user_content(current_message, media);
@@ -393,7 +438,7 @@ impl MessageBuilder for ContextBuilder {
             }
         }
 
-        let system_content = self.build_system_prompt(skill_names, channel);
+        let system_content = self.build_system_prompt_for_mode(skill_names, channel, mode);
         let mut messages: Vec<serde_json::Value> =
             std::iter::once(serde_json::json!({"role": "system", "content": system_content}))
                 .chain(history.iter().cloned())
@@ -463,6 +508,15 @@ mod tests {
             tmp.path().to_path_buf(),
             None,
             Arc::new(Mutex::new(ToolRegistry::new())),
+        )
+    }
+
+    fn make_minimal_builder(tmp: &TempDir) -> ContextBuilder {
+        ContextBuilder::with_default_mode(
+            tmp.path().to_path_buf(),
+            None,
+            Arc::new(Mutex::new(ToolRegistry::new())),
+            AgentMode::Minimal,
         )
     }
 
@@ -1027,6 +1081,46 @@ mod tests {
             prompt.contains("messaging app"),
             "telegram channel hint should appear in prompt"
         );
+    }
+
+    #[test]
+    fn minimal_prompt_keeps_soul_and_user_only() {
+        use std::fs;
+        let tmp = TempDir::new().unwrap();
+        fs::write(tmp.path().join("SOUL.md"), "soul-only-marker").unwrap();
+        fs::write(tmp.path().join("USER.md"), "user-only-marker").unwrap();
+        fs::write(tmp.path().join("AGENTS.md"), "agents-should-hide").unwrap();
+        fs::write(tmp.path().join("TOOLS.md"), "tools-should-hide").unwrap();
+        write_memory_md(&tmp, "memory-should-hide");
+        write_skill_md(
+            &tmp,
+            "eager",
+            "description: Does things\nalways: true\n",
+            "# Eager body should hide",
+        );
+        write_history_entries(&tmp, &[("2026-01-01 10:00", "history-should-hide")]);
+        let b = make_minimal_builder(&tmp);
+        let prompt = b.build_system_prompt(None, Some("telegram"));
+        assert!(prompt.contains("soul-only-marker"));
+        assert!(prompt.contains("user-only-marker"));
+        assert!(!prompt.contains("agents-should-hide"));
+        assert!(!prompt.contains("tools-should-hide"));
+        assert!(!prompt.contains("memory-should-hide"));
+        assert!(!prompt.contains("Eager body should hide"));
+        assert!(!prompt.contains("history-should-hide"));
+        assert!(!prompt.contains("You are rust-bot"));
+        assert!(!prompt.contains("messaging app"));
+        assert!(!prompt.contains("Active Skills"));
+        assert!(!prompt.contains("AGENTS.md"));
+        assert!(!prompt.contains("TOOLS.md"));
+    }
+
+    #[test]
+    fn minimal_prompt_falls_back_when_soul_and_user_missing() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_minimal_builder(&tmp);
+        let prompt = b.build_system_prompt(None, None);
+        assert_eq!(prompt, "You are a helpful software engineer assistant.");
     }
 
     // ── build_messages ───────────────────────────────────────────────────────

@@ -42,6 +42,7 @@ use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceSco
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
+use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::session::{SESSION_MODEL_PRESET_METADATA_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY};
 use crate::{
     bus::{
@@ -521,6 +522,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::SetModelPreset => {
             handle_envelope_set_model_preset(envelope_dispatch_context).await;
         }
+        EnvelopeType::SetMode => {
+            handle_envelope_set_mode(envelope_dispatch_context).await;
+        }
         EnvelopeType::ClearSession => {
             handle_envelope_clear_session(envelope_dispatch_context).await;
         }
@@ -659,6 +663,111 @@ async fn handle_envelope_set_model_preset<'a>(
     .await;
 }
 
+/// Handle a `set_mode` envelope: persist Standard/Minimal (or clear with
+/// `"default"`) on an existing `websocket:{chat_id}` session and ack with
+/// `mode_set`. Same persistence rules as [`handle_envelope_set_model_preset`].
+async fn handle_envelope_set_mode<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let rejection_fields = create_rejection_fields(&cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let mode_arg = envelope_dispatch_context
+        .envelope
+        .get("mode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(mode_arg) = mode_arg else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing_mode"}),
+        )
+        .await;
+        return;
+    };
+
+    let resolved = if mode_arg.eq_ignore_ascii_case(RESERVED_AGENT_MODE_NAME) {
+        shared.default_agent_mode
+    } else {
+        match AgentMode::parse(mode_arg) {
+            Some(mode) => mode,
+            None => {
+                send_event(
+                    shared,
+                    connection_id,
+                    WsOutboundEvent::Error,
+                    Some(&rejection_fields),
+                    serde_json::json!({"detail": "invalid_mode"}),
+                )
+                .await;
+                return;
+            }
+        }
+    };
+
+    let save_result = {
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        if let Some(mut session) = session_manager.get_session_internal(&get_session_id(cid)) {
+            if mode_arg.eq_ignore_ascii_case(RESERVED_AGENT_MODE_NAME) {
+                session.metadata.remove(SESSION_AGENT_MODE_METADATA_KEY);
+            } else {
+                session.metadata.insert(
+                    SESSION_AGENT_MODE_METADATA_KEY.to_string(),
+                    serde_json::Value::String(resolved.as_str().to_string()),
+                );
+            }
+            session_manager.save(session).map_err(|e| {
+                log::error!("Failed to save agent mode for session {cid}: {e}");
+                "failed_to_save_session"
+            })
+        } else {
+            Err("session_not_found")
+        }
+    };
+    if let Err(detail) = save_result {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": detail}),
+        )
+        .await;
+        return;
+    }
+
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ModeSet,
+        Some(&rejection_fields),
+        serde_json::json!({ "mode": resolved.as_str() }),
+    )
+    .await;
+}
+
 /// Handle an `attach` envelope: subscribe this connection to an existing
 /// `chat_id` (page-reload rehydrate / session switch). Mirrors nanobot's
 /// `attach` branch (`channels/websocket/runtime.py`): validate, `_attach`,
@@ -768,6 +877,10 @@ async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatc
     merge_json(
         &mut attached_payload,
         model_preset_attached_fields(shared, new_session.as_ref()),
+    );
+    merge_json(
+        &mut attached_payload,
+        agent_mode_attached_fields(shared, new_session.as_ref()),
     );
     merge_json(
         &mut attached_payload,
@@ -1294,6 +1407,10 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
     );
     merge_json(
         &mut attached_payload,
+        agent_mode_attached_fields(shared, Some(&forked)),
+    );
+    merge_json(
+        &mut attached_payload,
         token_usage_attached_fields(Some(&forked)),
     );
     send_event(
@@ -1729,6 +1846,11 @@ fn model_preset_attached_fields(shared: &WsShared, session: Option<&Session>) ->
     })
 }
 
+fn agent_mode_attached_fields(shared: &WsShared, session: Option<&Session>) -> serde_json::Value {
+    let mode = AgentMode::resolve(shared.default_agent_mode, session.map(|s| &s.metadata));
+    serde_json::json!({ "mode": mode.as_str() })
+}
+
 /// Session lifetime `token_usage`, merged into every `attached` payload
 /// (attach, new_chat, fork) alongside [`model_preset_attached_fields`] so the
 /// client learns the running totals without a separate round-trip.
@@ -1798,6 +1920,10 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
     merge_json(
         &mut payload,
         model_preset_attached_fields(shared, session.as_ref()),
+    );
+    merge_json(
+        &mut payload,
+        agent_mode_attached_fields(shared, session.as_ref()),
     );
     merge_json(&mut payload, token_usage_attached_fields(session.as_ref()));
     send_event(
@@ -2608,6 +2734,7 @@ pub struct WebSocketChannel {
     /// Same `Arc` as `AgentLoop::runtime_resolver`, cloned into every
     /// [`WsShared`] snapshot — see [`Self::shared`].
     runtime_resolver: Arc<ModelRuntimeResolver>,
+    pub(crate) default_agent_mode: AgentMode,
 }
 
 impl WebSocketChannel {
@@ -2645,6 +2772,7 @@ impl WebSocketChannel {
             stream_buffers: StdMutex::new(HashMap::new()),
             reasoning_buffers: StdMutex::new(HashMap::new()),
             runtime_resolver,
+            default_agent_mode: AgentMode::Standard,
         }
     }
 
@@ -2754,6 +2882,7 @@ impl WebSocketChannel {
             gateway_services: Arc::clone(&self.gateway_services),
             media_root: get_media_dir(None),
             runtime_resolver: Arc::clone(&self.runtime_resolver),
+            default_agent_mode: self.default_agent_mode,
         }
     }
 
@@ -3525,6 +3654,7 @@ mod tests {
             gateway_services: Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep())),
             media_root: tempfile::tempdir().unwrap().keep(),
             runtime_resolver: ModelRuntimeResolver::for_tests(),
+            default_agent_mode: AgentMode::Standard,
         }
     }
 
@@ -7613,6 +7743,241 @@ mod tests {
                 .get(SESSION_MODEL_PRESET_METADATA_KEY)
                 .is_none()
         );
+    }
+
+    // --- handle_envelope_set_mode ---
+
+    async fn dispatch_set_mode(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+        mode: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("set_mode"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        if let Some(mode) = mode {
+            envelope.insert("mode".to_string(), mode);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_set_mode must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_mode_persists_minimal_and_acks() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_mode(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("  MINIMAL  ")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "mode_set");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["mode"], "minimal");
+        assert!(rx.try_recv().is_err(), "set_mode must send exactly one frame");
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert_eq!(
+            session.metadata.get(SESSION_AGENT_MODE_METADATA_KEY),
+            Some(&serde_json::json!("minimal"))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_mode_default_clears_the_override() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                SESSION_AGENT_MODE_METADATA_KEY.to_string(),
+                serde_json::json!("minimal"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_set_mode(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("default")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "mode_set");
+        assert_eq!(body["mode"], "standard");
+        assert!(rx.try_recv().is_err(), "set_mode must send exactly one frame");
+
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert!(
+            session
+                .metadata
+                .get(SESSION_AGENT_MODE_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_mode_rejects_unknown_without_mutating() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_mode(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("ptc")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "invalid_mode");
+        let session = {
+            let session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .get_session_internal("websocket:chat-1")
+                .expect("session must still exist")
+        };
+        assert!(
+            session
+                .metadata
+                .get(SESSION_AGENT_MODE_METADATA_KEY)
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_mode_rejects_missing_or_empty() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:chat-1".to_string()))
+                .unwrap();
+        }
+
+        dispatch_set_mode(&shared, "conn-1", Some(serde_json::json!("chat-1")), None).await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "missing_mode");
+
+        dispatch_set_mode(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("   ")),
+        )
+        .await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "missing_mode");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_set_mode_rejects_unknown_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_set_mode(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("minimal")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "session_not_found");
     }
 
     #[tokio::test]
