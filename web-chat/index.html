@@ -4,7 +4,15 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>Rust Bot Chat</title>
-    <link data-trunk rel="rust" data-wasm-opt="z" />
+    <!-- rustc 1.87+ (LLVM 20) emits bulk-memory / saturating fptoint by
+         default; Binaryen 123's wasm-opt rejects those opcodes unless the
+         matching --enable-* flags are passed. -->
+    <link
+      data-trunk
+      rel="rust"
+      data-wasm-opt="z"
+      data-wasm-opt-params="--enable-bulk-memory --enable-bulk-memory-opt --enable-nontrapping-float-to-int"
+    />
     <link data-trunk rel="tailwind-css" href="style/input.css" />
     <!-- Plain (non-Tailwind) shared stylesheet from chat-ui; see the comment
          in style/input.css for why this can't be an @import instead. -->
