@@ -22,6 +22,7 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use uuid::Uuid;
 
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::skills::SkillsLoader;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
@@ -42,7 +43,6 @@ use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceSco
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
-use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::session::{SESSION_MODEL_PRESET_METADATA_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY};
 use crate::{
     bus::{
@@ -7805,7 +7805,10 @@ mod tests {
         assert_eq!(body["event"], "mode_set");
         assert_eq!(body["chat_id"], "chat-1");
         assert_eq!(body["mode"], "minimal");
-        assert!(rx.try_recv().is_err(), "set_mode must send exactly one frame");
+        assert!(
+            rx.try_recv().is_err(),
+            "set_mode must send exactly one frame"
+        );
 
         let session = {
             let session_manager = shared
@@ -7855,7 +7858,10 @@ mod tests {
         let body = recv_json(&mut rx);
         assert_eq!(body["event"], "mode_set");
         assert_eq!(body["mode"], "standard");
-        assert!(rx.try_recv().is_err(), "set_mode must send exactly one frame");
+        assert!(
+            rx.try_recv().is_err(),
+            "set_mode must send exactly one frame"
+        );
 
         let session = {
             let session_manager = shared

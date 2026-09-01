@@ -4,6 +4,10 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::agent::circuit_breaker::{
+    CIRCUIT_BREAKER_STOP_REASON, CIRCUIT_BREAKER_USER_MESSAGE, CircuitDecision,
+    DEFAULT_N_IDENTICAL_MESSAGES, MessageCircuitBreaker, is_tripped_error, tripped_error_message,
+};
 use crate::agent::hook::{AgentHook, AgentHookContext};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::{
@@ -481,7 +485,10 @@ impl AgentRunner {
 
         let mut selected: Vec<Value> = Vec::new();
         for (turn_idx, &start) in user_starts.iter().enumerate().rev() {
-            let end = user_starts.get(turn_idx + 1).copied().unwrap_or(prefix.len());
+            let end = user_starts
+                .get(turn_idx + 1)
+                .copied()
+                .unwrap_or(prefix.len());
             if start >= end {
                 continue;
             }
@@ -628,6 +635,7 @@ impl AgentRunner {
         spec: &AgentRunSpec,
         tool_calls: &[ToolCallRequest],
         external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+        message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
     ) -> (Vec<String>, Vec<HashMap<String, String>>, Option<String>) {
         let batches = Self::partition_tool_batches(spec, tool_calls);
         let mut tool_results: Vec<(String, HashMap<String, String>, Option<String>)> =
@@ -636,14 +644,25 @@ impl AgentRunner {
         for batch in batches {
             if spec.concurrent_tools && batch.len() > 1 {
                 let results = futures::future::join_all(batch.iter().map(|tool_call| {
-                    Self::run_tool(spec, tool_call, Arc::clone(&external_lookup_counts))
+                    Self::run_tool(
+                        spec,
+                        tool_call,
+                        Arc::clone(&external_lookup_counts),
+                        Arc::clone(&message_circuit_breaker),
+                    )
                 }))
                 .await;
                 tool_results.extend(results);
             } else {
                 for tool_call in batch {
                     tool_results.push(
-                        Self::run_tool(spec, tool_call, Arc::clone(&external_lookup_counts)).await,
+                        Self::run_tool(
+                            spec,
+                            tool_call,
+                            Arc::clone(&external_lookup_counts),
+                            Arc::clone(&message_circuit_breaker),
+                        )
+                        .await,
                     );
                 }
             }
@@ -727,14 +746,34 @@ impl AgentRunner {
     /// Returns `(result, event, fatal_error)`:
     ///   - `result`      — string fed back to the LLM as the tool result.
     ///   - `event`       — telemetry map (`"name"`, `"status"`, `"detail"`).
-    ///   - `fatal_error` — `Some(msg)` when `spec.fail_on_tool_error` is set
-    ///                     and an error occurred; the agent loop should abort.
+    ///   - `fatal_error` — `Some(msg)` when the message circuit breaker trips
+    ///                     (always abort), or when `spec.fail_on_tool_error` is
+    ///                     set and an error occurred; the agent loop should abort.
     async fn run_tool(
         spec: &AgentRunSpec,
         tool_call: &ToolCallRequest,
         external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+        message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
     ) -> (String, HashMap<String, String>, Option<String>) {
         const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
+
+        // ── 0. Message circuit breaker (consecutive identical sends) ──────────
+        let decision = message_circuit_breaker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .observe(&tool_call.name, &tool_call.arguments);
+        if let CircuitDecision::Tripped { streak } = decision {
+            let err = tripped_error_message(streak);
+            let event = HashMap::from([
+                ("name".to_string(), tool_call.name.clone()),
+                ("status".to_string(), "error".to_string()),
+                (
+                    "detail".to_string(),
+                    "message circuit breaker tripped".to_string(),
+                ),
+            ]);
+            return (err.clone(), event, Some(err));
+        }
 
         // ── 1. Block repeated identical external lookups ──────────────────────
         if let Some(lookup_error) = repeated_external_lookup_error(
@@ -984,6 +1023,9 @@ impl AgentRunner {
 
         let external_lookup_counts: Arc<Mutex<HashMap<String, usize>>> =
             Arc::new(Mutex::new(HashMap::new()));
+        let message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>> = Arc::new(Mutex::new(
+            MessageCircuitBreaker::new(DEFAULT_N_IDENTICAL_MESSAGES),
+        ));
 
         let mut empty_retries = 0usize;
         let mut length_recoveries = 0usize;
@@ -1089,6 +1131,7 @@ impl AgentRunner {
                     &spec,
                     &response.tool_calls,
                     Arc::clone(&external_lookup_counts),
+                    Arc::clone(&message_circuit_breaker),
                 )
                 .await;
 
@@ -1100,7 +1143,7 @@ impl AgentRunner {
                 all_tool_events.extend(events.clone());
                 ctx.tool_events = events;
 
-                if let Some(err) = fatal_error {
+                if let Some(err) = fatal_error.as_ref().filter(|e| !is_tripped_error(e)) {
                     log::error!("Fatal tool error: {}", err);
                     let error_msg = format!(
                         "Error: {}\n{}",
@@ -1115,7 +1158,7 @@ impl AgentRunner {
                     ctx.error = Some(err.clone());
                     hook.after_iteration(&mut ctx).await;
                     final_result_content = Some(error_msg.to_string());
-                    final_error = Some(err);
+                    final_error = Some(err.clone());
                     exhausted = false;
                     break 'outer;
                 }
@@ -1136,6 +1179,19 @@ impl AgentRunner {
                     });
                     ctx.tool_results.push(tool_msg.clone());
                     messages.push(tool_msg);
+                }
+
+                if fatal_error.as_deref().is_some_and(is_tripped_error) {
+                    log::warn!("{CIRCUIT_BREAKER_USER_MESSAGE}");
+                    stop_reason = CIRCUIT_BREAKER_STOP_REASON.to_string();
+                    Self::append_final_message(&mut messages, Some(CIRCUIT_BREAKER_USER_MESSAGE));
+                    ctx.stop_reason = Some(CIRCUIT_BREAKER_STOP_REASON.to_string());
+                    ctx.error = fatal_error.clone();
+                    hook.after_iteration(&mut ctx).await;
+                    final_result_content = Some(CIRCUIT_BREAKER_USER_MESSAGE.to_string());
+                    final_error = fatal_error;
+                    exhausted = false;
+                    break 'outer;
                 }
 
                 Self::emit_checkpoint(&spec, serde_json::json!({"type": "tools_completed"}));
@@ -1298,8 +1354,16 @@ impl AgentHook for NoopHook {}
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::message::MessageTool;
+    use crate::bus::events::OutboundMessage;
     use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
     use crate::providers::registry::ProviderSpec;
+
+    fn unused_message_circuit_breaker() -> Arc<Mutex<MessageCircuitBreaker>> {
+        Arc::new(Mutex::new(MessageCircuitBreaker::new(
+            DEFAULT_N_IDENTICAL_MESSAGES,
+        )))
+    }
 
     /// Minimal provider that satisfies `LLMProviderDyn` for tests that don't
     /// exercise the provider (e.g. `normalize_tool_result`).
@@ -2188,6 +2252,7 @@ mod tests {
             &spec,
             &tool_call,
             Arc::new(Mutex::new(external_lookup_counts)),
+            unused_message_circuit_breaker(),
         )
         .await;
         assert_eq!(
@@ -2234,6 +2299,7 @@ mod tests {
             &spec,
             &tool_call,
             Arc::new(Mutex::new(external_lookup_counts)),
+            unused_message_circuit_breaker(),
         )
         .await;
         assert!(result.contains("Error: malformed tool arguments JSON for 'write_file'"));
@@ -2244,6 +2310,71 @@ mod tests {
             fatal_error
                 .unwrap_or_default()
                 .contains("malformed tool arguments JSON for 'write_file'")
+        );
+    }
+
+    #[tokio::test]
+    async fn test_run_tool_message_circuit_breaker_skips_nth_send_and_is_always_fatal() {
+        let captured: Arc<Mutex<Vec<OutboundMessage>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink = Arc::clone(&captured);
+        let callback: crate::agent::tools::message::SendCallback = Arc::new(move |msg| {
+            let sink = Arc::clone(&sink);
+            Box::pin(async move {
+                sink.lock().unwrap().push(msg);
+            })
+        });
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(MessageTool::new(
+            Some(callback),
+            "websocket",
+            "chat-1",
+            None,
+        )));
+        let spec = AgentRunSpec {
+            tools,
+            fail_on_tool_error: false,
+            ..Default::default()
+        };
+        let breaker = Arc::new(Mutex::new(MessageCircuitBreaker::new(
+            DEFAULT_N_IDENTICAL_MESSAGES,
+        )));
+        let mut arguments = HashMap::new();
+        arguments.insert(
+            "content".to_string(),
+            Value::String("placeholder".to_string()),
+        );
+        let tool_call = crate::providers::base::ToolCallRequest {
+            id: "1".to_string(),
+            name: "message".to_string(),
+            arguments,
+            extra_content: None,
+            provider_specific_fields: None,
+            function_provider_specific_fields: None,
+        };
+
+        for i in 0..DEFAULT_N_IDENTICAL_MESSAGES {
+            let (result, event, fatal_error) = AgentRunner::run_tool(
+                &spec,
+                &tool_call,
+                Arc::new(Mutex::new(HashMap::new())),
+                Arc::clone(&breaker),
+            )
+            .await;
+            if i + 1 < DEFAULT_N_IDENTICAL_MESSAGES {
+                assert!(fatal_error.is_none(), "call {} should be allowed", i + 1);
+                assert_eq!(event.get("status").unwrap(), "ok");
+                assert!(result.contains("Message sent"));
+            } else {
+                assert!(is_tripped_error(fatal_error.as_deref().unwrap_or("")));
+                assert_eq!(event.get("status").unwrap(), "error");
+                assert!(is_tripped_error(&result));
+            }
+        }
+
+        assert_eq!(
+            captured.lock().unwrap().len(),
+            DEFAULT_N_IDENTICAL_MESSAGES - 1,
+            "the tripping call must not be sent"
         );
     }
 

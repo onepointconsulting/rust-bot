@@ -131,7 +131,10 @@ mod tests {
 
     #[test]
     fn resolve_uses_default_when_metadata_missing_or_invalid() {
-        assert_eq!(AgentMode::resolve(AgentMode::Minimal, None), AgentMode::Minimal);
+        assert_eq!(
+            AgentMode::resolve(AgentMode::Minimal, None),
+            AgentMode::Minimal
+        );
 
         let empty = HashMap::new();
         assert_eq!(

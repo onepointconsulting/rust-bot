@@ -15,14 +15,15 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
-use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::model_runtime::{
     ModelRuntime, ModelRuntimeResolver, SESSION_MODEL_PRESET_METADATA_KEY,
 };
+use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::cron::CronTool;
@@ -1096,6 +1097,8 @@ impl AgentLoop {
                 .take(200)
                 .collect::<String>();
             log::error!("LLM returned error: {message}");
+        } else if result.stop_reason == CIRCUIT_BREAKER_STOP_REASON {
+            log::warn!("Message circuit breaker tripped");
         }
         if let Some(session_key) = session_key {
             if result.usage != LLMUsage::new() {
@@ -1943,6 +1946,7 @@ impl AgentLoop {
             .await;
         let mut final_content = result.final_content.unwrap_or_default();
         let all_msgs = result.messages;
+        let stop_reason = result.stop_reason.as_str();
 
         if final_content.trim().is_empty() {
             final_content = EMPTY_FINAL_RESPONSE_MESSAGE.to_string();
@@ -1962,21 +1966,26 @@ impl AgentLoop {
                 .await;
         })
         .await;
-        if let Some(message_tool) = self
-            .tools
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .get("message")
-        {
-            if let Some(message_tool) =
-                (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
+        if stop_reason == CIRCUIT_BREAKER_STOP_REASON {
+            log::warn!("Message circuit breaker tripped; delivering stop notice");
+        }
+        if stop_reason != CIRCUIT_BREAKER_STOP_REASON {
+            if let Some(message_tool) = self
+                .tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get("message")
             {
-                if *message_tool
-                    .sent_in_turn
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
+                if let Some(message_tool) =
+                    (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
                 {
-                    return None;
+                    if *message_tool
+                        .sent_in_turn
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                    {
+                        return None;
+                    }
                 }
             }
         }

@@ -1,4 +1,5 @@
 pub mod agent_loop;
+pub mod circuit_breaker;
 pub mod context;
 pub mod cron_context;
 pub mod hook;

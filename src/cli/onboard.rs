@@ -244,10 +244,7 @@ mod tests {
         let config = PathBuf::from(".rust-bot").join("config.json");
         let bin = cli_bin();
         let lines = next_steps_lines(&config, None);
-        let commands: Vec<_> = lines
-            .iter()
-            .filter(|line| line.contains("  2."))
-            .collect();
+        let commands: Vec<_> = lines.iter().filter(|line| line.contains("  2.")).collect();
         assert_eq!(commands.len(), 4);
         for line in &commands {
             assert!(

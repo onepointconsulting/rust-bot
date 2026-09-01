@@ -183,13 +183,11 @@ mod tests {
     #[test]
     fn session_token_usage_is_empty_only_when_every_field_is_none() {
         assert!(SessionTokenUsage::default().is_empty());
-        assert!(
-            !SessionTokenUsage {
-                input_tokens: Some(0),
-                ..SessionTokenUsage::default()
-            }
-            .is_empty()
-        );
+        assert!(!SessionTokenUsage {
+            input_tokens: Some(0),
+            ..SessionTokenUsage::default()
+        }
+        .is_empty());
     }
 
     #[test]

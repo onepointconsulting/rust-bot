@@ -841,10 +841,7 @@ impl CommandHandler for CmdMode {
             } else {
                 "process default"
             };
-            return reply_as_text(
-                ctx,
-                format!("Agent mode: {} ({source})", mode.as_str()),
-            );
+            return reply_as_text(ctx, format!("Agent mode: {} ({source})", mode.as_str()));
         }
 
         let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
@@ -1638,12 +1635,16 @@ mod tests {
         let loop_ = model_cmd_test_loop_with_preset();
         let shown = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "")).await;
         assert!(
-            shown.content.contains("Agent mode: standard (process default)"),
+            shown
+                .content
+                .contains("Agent mode: standard (process default)"),
             "got: {}",
             shown.content
         );
 
-        let switched = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "minimal")).await;
+        let switched = CmdMode
+            .handle(&mode_cmd_ctx(loop_.clone(), "minimal"))
+            .await;
         assert!(
             switched.content.contains("set to 'minimal'"),
             "got: {}",
@@ -1658,7 +1659,9 @@ mod tests {
             after_switch.content
         );
 
-        let cleared = CmdMode.handle(&mode_cmd_ctx(loop_.clone(), "default")).await;
+        let cleared = CmdMode
+            .handle(&mode_cmd_ctx(loop_.clone(), "default"))
+            .await;
         assert!(
             cleared.content.contains("process default"),
             "got: {}",

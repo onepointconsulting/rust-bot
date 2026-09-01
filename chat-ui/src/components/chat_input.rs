@@ -1,11 +1,11 @@
 use leptos::html::{Input, Textarea};
 use leptos::prelude::*;
-use wasm_bindgen::JsCast;
 use wasm_bindgen::closure::Closure;
+use wasm_bindgen::JsCast;
 use web_sys::{File, FileList, HtmlInputElement, HtmlTextAreaElement};
 
 use crate::models::{
-    ImageAttachment, OutgoingMessage, SessionTokenUsage, SkillSummary, format_compact_tokens,
+    format_compact_tokens, ImageAttachment, OutgoingMessage, SessionTokenUsage, SkillSummary,
 };
 
 const MAX_TEXTAREA_HEIGHT_PX: f64 = 160.0;
