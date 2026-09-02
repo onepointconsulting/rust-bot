@@ -155,14 +155,16 @@ pub fn MessageBubble(
         let has_text = !markdown::is_blank(&content);
         if has_text {
             view! {
-                <div class="flex items-end gap-1.5 justify-start">
+                <div class="flex flex-col items-start gap-1.5 md:flex-row md:items-end md:justify-start">
                     <div class="max-w-[80%] rounded-2xl bg-white px-4 py-2 text-slate-800 shadow-sm">
                         <MarkdownView source=content.clone() />
                         {pending_view()}
                         {extra_view}
                     </div>
-                    <CopyButton text=content />
-                    {fork_button}
+                    <div class="flex items-end gap-1.5">
+                        <CopyButton text=content />
+                        {fork_button}
+                    </div>
                 </div>
             }
             .into_any()
@@ -170,7 +172,7 @@ pub fn MessageBubble(
             // Keep the thinking spinner / tool+reasoning extras; only the
             // empty padded pill is dropped.
             view! {
-                <div class="flex items-end gap-1.5 justify-start">
+                <div class="flex flex-col items-start gap-1.5 md:flex-row md:items-end md:justify-start">
                     <div class="flex flex-col items-start gap-2">
                         {pending_view()}
                         {extra_view}
