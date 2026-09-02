@@ -61,6 +61,10 @@ pub trait AgentHook: Send + Sync {
 
     async fn on_stream_end(&self, _ctx: &mut AgentHookContext, _resuming: bool) {}
 
+    async fn on_reasoning_delta(&self, _ctx: &mut AgentHookContext, _delta: &str) {}
+
+    async fn on_reasoning_end(&self, _ctx: &mut AgentHookContext) {}
+
     async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {}
 
     async fn after_iteration(&self, _ctx: &mut AgentHookContext) {}
@@ -147,6 +151,40 @@ impl AgentHook for CompositeHook {
                 Ok(()) => {}
                 Err(e) => log::error!(
                     "AgentHook.on_stream_end panicked: {:?}",
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
+                ),
+            }
+        }
+    }
+
+    async fn on_reasoning_delta(&self, ctx: &mut AgentHookContext, delta: &str) {
+        for hook in &self.hooks {
+            match AssertUnwindSafe(hook.on_reasoning_delta(ctx, delta))
+                .catch_unwind()
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => log::error!(
+                    "AgentHook.on_reasoning_delta panicked: {:?}",
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
+                ),
+            }
+        }
+    }
+
+    async fn on_reasoning_end(&self, ctx: &mut AgentHookContext) {
+        for hook in &self.hooks {
+            match AssertUnwindSafe(hook.on_reasoning_end(ctx))
+                .catch_unwind()
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => log::error!(
+                    "AgentHook.on_reasoning_end panicked: {:?}",
                     e.downcast_ref::<&str>()
                         .copied()
                         .unwrap_or("(non-string panic)")
@@ -257,6 +295,17 @@ mod tests {
                 .lock()
                 .unwrap()
                 .push(format!("on_stream_end(resuming={})", resuming));
+        }
+
+        async fn on_reasoning_delta(&self, _ctx: &mut AgentHookContext, delta: &str) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("on_reasoning_delta({delta})"));
+        }
+
+        async fn on_reasoning_end(&self, _ctx: &mut AgentHookContext) {
+            self.calls.lock().unwrap().push("on_reasoning_end".into());
         }
 
         async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {
@@ -454,6 +503,21 @@ mod tests {
                 .unwrap()
                 .contains(&"on_stream_end(resuming=false)".to_string())
         );
+    }
+
+    #[tokio::test]
+    async fn test_composite_on_reasoning_fans_out() {
+        let hook = RecordingHook::new(false);
+        let calls_ref = Arc::clone(&hook.calls);
+        let composite = CompositeHook::new(vec![Arc::new(hook)]);
+        let mut ctx = make_ctx();
+
+        composite.on_reasoning_delta(&mut ctx, "think").await;
+        composite.on_reasoning_end(&mut ctx).await;
+
+        let calls = calls_ref.lock().unwrap().clone();
+        assert!(calls.contains(&"on_reasoning_delta(think)".to_string()));
+        assert!(calls.contains(&"on_reasoning_end".to_string()));
     }
 
     #[test]

@@ -297,7 +297,8 @@ mod tests {
     use std::sync::Mutex as StdMutex;
 
     use crate::providers::base::{
-        BoxedStreamCallback, GenerationSettings, LLMResponse, LLMUsage, ToolCallRequest,
+        BoxedProgressCallback, BoxedStreamCallback, GenerationSettings, LLMResponse, LLMUsage,
+        ToolCallRequest,
     };
     use tempfile::TempDir;
 
@@ -395,6 +396,7 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
             _: Option<BoxedStreamCallback>,
+            _: Option<BoxedProgressCallback>,
         ) -> LLMResponse {
             unimplemented!("tests use chat_with_retry")
         }

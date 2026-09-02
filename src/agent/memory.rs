@@ -1247,7 +1247,7 @@ mod tests {
 
     use crate::config::schema::Config;
     use crate::providers::base::{
-        BoxedStreamCallback, GenerationSettings, LLMProviderDyn, LLMResponse,
+        BoxedProgressCallback, BoxedStreamCallback, GenerationSettings, LLMProviderDyn, LLMResponse,
     };
     use crate::providers::registry::ProviderSpec;
 
@@ -1372,6 +1372,7 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
             _: Option<BoxedStreamCallback>,
+            _: Option<BoxedProgressCallback>,
         ) -> LLMResponse {
             unimplemented!("not used in archive tests")
         }

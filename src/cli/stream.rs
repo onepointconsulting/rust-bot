@@ -68,6 +68,7 @@ pub struct StreamRenderer {
     spinner: Option<ThinkingSpinner>,
     pub header_printed: bool,
     is_tty: bool,
+    reasoning_started: bool,
 }
 
 impl StreamRenderer {
@@ -89,6 +90,7 @@ impl StreamRenderer {
             spinner: None,
             header_printed: false,
             is_tty: io::stdout().is_terminal(),
+            reasoning_started: false,
         };
         renderer.start_spinner();
         renderer
@@ -113,6 +115,43 @@ impl StreamRenderer {
         if let Some(mut spinner) = self.spinner.take() {
             spinner.stop();
         }
+    }
+
+    /// Append reasoning text in dim italic, without markdown.
+    pub fn write_reasoning_delta(&mut self, delta: &str) {
+        if delta.is_empty() {
+            return;
+        }
+        self.stop_spinner();
+        let mut out = io::stdout();
+        if !self.reasoning_started {
+            let _ = writeln!(out);
+            let prefix = crate::cli::progress::ProgressType::Reasoning.icon();
+            if self.is_tty {
+                let style = Style::new().dimmed().italic();
+                let _ = write!(out, "{}{prefix} {}", style.render(), style.render_reset());
+            } else {
+                let _ = write!(out, "{prefix} ");
+            }
+            self.reasoning_started = true;
+        }
+        if self.is_tty {
+            let style = Style::new().dimmed().italic();
+            let _ = write!(out, "{}{delta}{}", style.render(), style.render_reset());
+        } else {
+            let _ = write!(out, "{delta}");
+        }
+        let _ = out.flush();
+    }
+
+    /// End the reasoning line so assistant content can start cleanly.
+    pub fn finish_reasoning(&mut self) {
+        if !self.reasoning_started {
+            return;
+        }
+        let _ = writeln!(io::stdout());
+        let _ = io::stdout().flush();
+        self.reasoning_started = false;
     }
 
     fn write_delta(&self, delta: &str) {

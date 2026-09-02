@@ -10,9 +10,10 @@ use crate::agent::circuit_breaker::{
 };
 use crate::agent::hook::{AgentHook, AgentHookContext};
 use crate::agent::tools::registry::ToolRegistry;
+use crate::bus::outbound_events::ProgressKind;
 use crate::providers::base::{
-    BoxedStreamCallback, LLMProviderDyn, LLMResponse, LLMUsage, ToolCallRequest,
-    is_unsupported_image_input_error,
+    BoxedProgressCallback, BoxedStreamCallback, LLMProviderDyn, LLMResponse, LLMUsage,
+    ToolCallRequest, is_unsupported_image_input_error,
 };
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
@@ -570,11 +571,28 @@ impl AgentRunner {
             // in an `Arc` and clone an owned context snapshot instead.
             let hook_cb = Arc::clone(&hook);
             let ctx_snapshot = context.clone();
+            let progress_hook = Arc::clone(&hook_cb);
+            let progress_ctx = ctx_snapshot.clone();
             let callback: BoxedStreamCallback = Box::new(move |delta: String| {
                 let hook = Arc::clone(&hook_cb);
                 let mut ctx = ctx_snapshot.clone();
                 Box::pin(async move {
                     hook.on_stream(&mut ctx, &delta).await;
+                })
+            });
+            let progress_cb: BoxedProgressCallback = Box::new(move |content, kind| {
+                let hook = Arc::clone(&progress_hook);
+                let mut ctx = progress_ctx.clone();
+                Box::pin(async move {
+                    match kind {
+                        ProgressKind::ReasoningDelta => {
+                            hook.on_reasoning_delta(&mut ctx, &content).await;
+                        }
+                        ProgressKind::ReasoningEnd => {
+                            hook.on_reasoning_end(&mut ctx).await;
+                        }
+                        _ => {}
+                    }
                 })
             });
 
@@ -589,6 +607,7 @@ impl AgentRunner {
                     spec.reasoning_effort.clone(),
                     None,
                     Some(callback),
+                    Some(progress_cb),
                 )
                 .await;
         }
@@ -1455,6 +1474,7 @@ mod tests {
             _: Option<String>,
             _: Option<Value>,
             _: Option<BoxedStreamCallback>,
+            _: Option<BoxedProgressCallback>,
         ) -> LLMResponse {
             unimplemented!()
         }
@@ -1547,6 +1567,7 @@ mod tests {
             _: Option<String>,
             _: Option<Value>,
             _: Option<BoxedStreamCallback>,
+            _: Option<BoxedProgressCallback>,
         ) -> LLMResponse {
             self.response.clone()
         }

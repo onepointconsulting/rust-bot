@@ -195,6 +195,18 @@ impl AgentHook for LoopHook {
         buf.clear();
     }
 
+    async fn on_reasoning_delta(&self, _ctx: &mut AgentHookContext, delta: &str) {
+        if let Some(on_progress) = &self.on_progress {
+            on_progress(delta.to_string(), ProgressKind::ReasoningDelta).await;
+        }
+    }
+
+    async fn on_reasoning_end(&self, _ctx: &mut AgentHookContext) {
+        if let Some(on_progress) = &self.on_progress {
+            on_progress(String::new(), ProgressKind::ReasoningEnd).await;
+        }
+    }
+
     async fn before_execute_tools(&self, context: &mut AgentHookContext) {
         if let Some(on_progress) = &self.on_progress {
             if self.on_stream.is_none() {
@@ -275,6 +287,16 @@ impl AgentHook for LoopHookChain {
     async fn on_stream_end(&self, context: &mut AgentHookContext, resuming: bool) {
         self.primary.on_stream_end(context, resuming).await;
         self.extras.on_stream_end(context, resuming).await;
+    }
+
+    async fn on_reasoning_delta(&self, context: &mut AgentHookContext, delta: &str) {
+        self.primary.on_reasoning_delta(context, delta).await;
+        self.extras.on_reasoning_delta(context, delta).await;
+    }
+
+    async fn on_reasoning_end(&self, context: &mut AgentHookContext) {
+        self.primary.on_reasoning_end(context).await;
+        self.extras.on_reasoning_end(context).await;
     }
 
     async fn before_execute_tools(&self, context: &mut AgentHookContext) {
@@ -1886,34 +1908,38 @@ impl AgentLoop {
             let channel = msg.channel.clone();
             let chat_id = msg.chat_id.clone();
             let base_meta = msg.metadata.clone();
+            let reasoning_stream_id = {
+                let now_ns = SystemTime::now()
+                    .duration_since(UNIX_EPOCH)
+                    .map(|d| d.as_nanos())
+                    .unwrap_or(0);
+                format!("{}:reasoning:{now_ns}", msg.chat_id)
+            };
             Arc::new(move |content: String, kind: ProgressKind| {
                 let bus = Arc::clone(&bus);
                 let channel = channel.clone();
                 let chat_id = chat_id.clone();
                 let mut meta = base_meta.clone();
+                let reasoning_stream_id = reasoning_stream_id.clone();
                 Box::pin(async move {
-                    // `Reasoning*` isn't published through this bus path yet —
-                    // nothing upstream produces it here, so treat it as a
-                    // tripwire rather than silently wiring up the wrong
-                    // dispatch (reasoning has its own send path in
-                    // `ChannelManager::send_once`).
-                    if matches!(
+                    let is_reasoning = matches!(
                         kind,
                         ProgressKind::Reasoning
                             | ProgressKind::ReasoningDelta
                             | ProgressKind::ReasoningEnd
-                    ) {
-                        log::warn!(
-                            "bus_progress: ignoring unsupported {kind:?} progress event \
-                             (reasoning is not yet wired through this callback)"
-                        );
-                        return;
-                    }
-                    meta.insert("_progress".into(), Value::Bool(true));
-                    meta.insert(
-                        "_tool_hint".into(),
-                        Value::Bool(kind == ProgressKind::ToolHint),
                     );
+                    if is_reasoning {
+                        meta.insert(
+                            "_stream_id".into(),
+                            Value::String(reasoning_stream_id.clone()),
+                        );
+                    } else {
+                        meta.insert("_progress".into(), Value::Bool(true));
+                        meta.insert(
+                            "_tool_hint".into(),
+                            Value::Bool(kind == ProgressKind::ToolHint),
+                        );
+                    }
                     if let Err(e) = bus.publish_outbound(OutboundMessage {
                         channel,
                         chat_id,
@@ -1923,6 +1949,7 @@ impl AgentLoop {
                         metadata: meta,
                         event: Some(OutboundEvent::Progress(ProgressEvent {
                             kind,
+                            stream_id: is_reasoning.then_some(reasoning_stream_id),
                             ..ProgressEvent::default()
                         })),
                     }) {
@@ -2333,6 +2360,7 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
             _: Option<crate::providers::base::BoxedStreamCallback>,
+            _: Option<crate::providers::base::BoxedProgressCallback>,
         ) -> LLMResponse {
             LLMResponse::new()
         }

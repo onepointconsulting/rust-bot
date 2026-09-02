@@ -13,14 +13,16 @@ pub enum ProgressType {
     Progress,
     ToolHint,
     Image,
+    Reasoning,
 }
 
 impl ProgressType {
-    fn icon(self) -> &'static str {
+    pub(crate) fn icon(self) -> &'static str {
         match self {
             Self::Progress => "↳",
             Self::ToolHint => "⚙",
             Self::Image => "📷",
+            Self::Reasoning => "💭",
         }
     }
 }
@@ -75,13 +77,20 @@ pub(crate) fn create_on_progress(
                     }
                     ProgressType::Progress
                 }
-                // Reasoning isn't wired through this callback yet — nothing
-                // upstream produces it here. Warn instead of inventing a
-                // CLI line for a kind this sink doesn't render.
-                ProgressKind::Reasoning
-                | ProgressKind::ReasoningDelta
-                | ProgressKind::ReasoningEnd => {
-                    log::warn!("create_on_progress: ignoring unsupported {kind:?} progress event");
+                ProgressKind::Reasoning | ProgressKind::ReasoningDelta => {
+                    if !channels.show_reasoning {
+                        return;
+                    }
+                    let mut renderer_guard = renderer.lock().await;
+                    renderer_guard.write_reasoning_delta(&content);
+                    return;
+                }
+                ProgressKind::ReasoningEnd => {
+                    if !channels.show_reasoning {
+                        return;
+                    }
+                    let mut renderer_guard = renderer.lock().await;
+                    renderer_guard.finish_reasoning();
                     return;
                 }
             };

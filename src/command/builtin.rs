@@ -1377,6 +1377,7 @@ mod tests {
                 _: Option<String>,
                 _: Option<serde_json::Value>,
                 _: Option<crate::providers::base::BoxedStreamCallback>,
+                _: Option<crate::providers::base::BoxedProgressCallback>,
             ) -> LLMResponse {
                 LLMResponse::new()
             }
@@ -1495,6 +1496,7 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
             _: Option<crate::providers::base::BoxedStreamCallback>,
+            _: Option<crate::providers::base::BoxedProgressCallback>,
         ) -> crate::providers::base::LLMResponse {
             crate::providers::base::LLMResponse::new()
         }
@@ -2045,6 +2047,7 @@ mod tests {
                 _: Option<String>,
                 _: Option<serde_json::Value>,
                 _: Option<crate::providers::base::BoxedStreamCallback>,
+                _: Option<crate::providers::base::BoxedProgressCallback>,
             ) -> LLMResponse {
                 LLMResponse::new()
             }

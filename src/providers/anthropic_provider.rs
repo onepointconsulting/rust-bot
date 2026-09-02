@@ -1088,6 +1088,7 @@ impl LLMProvider for AnthropicProvider {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
+        _on_progress: &Option<crate::providers::base::BoxedProgressCallback>,
     ) -> LLMResponse
     where
         F: Fn(String) -> Fut + Send + Sync,

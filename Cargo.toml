@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "rust-bot"
-version = "0.1.9"
+version = "0.2.0"
 edition = "2024"
 default-run = "rust-bot"
 
@@ -21,8 +21,7 @@ futures = "0.3"
 log = "0.4.29"
 env_logger = "0.11.10"
 rand = "0.10.0"
-async-openai = { version = "0.34.0", features = ["chat-completion"] }
-reqwest = { version = "0.12", default-features = false, features = ["native-tls", "gzip", "socks", "multipart"] }
+reqwest = { version = "0.12", default-features = false, features = ["native-tls", "gzip", "socks", "multipart", "json"] }
 uuid = { version = "1.23.0", features = ["v4"] }
 dotenv = "0.15.0"
 sha1 = "0.11.0"
@@ -118,10 +117,8 @@ crossterm = { git = "https://github.com/eitsupi/crossterm", branch = "feature/wi
 whatsapp-rust = { path = "vendor/whatsapp-rust" }
 
 [profile.release]
-opt-level = 3       # or "s" as a middle ground
-lto = "thin"        # most of fat LTO, much faster compiles
-codegen-units = 1
-strip = true
+opt-level = "z"   # optimize for size
+lto = true        # fat LTO (more dead-code elimination across crates)
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]

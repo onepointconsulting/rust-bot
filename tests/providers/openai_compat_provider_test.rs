@@ -190,6 +190,7 @@ async fn test_chat_stream_success() {
             &Some(|content| async move {
                 println!("==>: {}", content);
             }),
+            &None,
         )
         .await;
     assert!(response.content.is_some());
@@ -212,6 +213,7 @@ async fn test_safe_chat_stream_success() {
             &Some(|content| async move {
                 println!("==>: {}", content);
             }),
+            &None,
         )
         .await;
     assert!(response.content.is_some());
@@ -234,6 +236,7 @@ async fn test_safe_chat_stream_with_retry_success() {
             &Some(|content| async move {
                 println!("==>: {}", content);
             }),
+            &None,
         )
         .await;
     assert!(response.content.is_some());
@@ -257,6 +260,7 @@ async fn test_safe_chat_stream_with_retry_success_2() {
             &Some(|content| async move {
                 println!("==>: {}", content);
             }),
+            &None,
         )
         .await;
     assert!(response.content.is_some());

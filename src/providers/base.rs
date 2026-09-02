@@ -6,6 +6,7 @@ use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 
+use crate::bus::outbound_events::ProgressKind;
 use crate::providers::registry::ProviderSpec;
 
 #[derive(Debug, Clone, PartialEq)]
@@ -298,6 +299,10 @@ pub fn is_unsupported_image_input_error(content: Option<&str>) -> bool {
 pub type BoxedStreamCallback =
     Box<dyn Fn(String) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Dyn-safe progress callback used for reasoning deltas during streaming.
+pub type BoxedProgressCallback =
+    Box<dyn Fn(String, ProgressKind) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
+
 /// A dyn-compatible subset of [`LLMProvider`].
 ///
 /// `LLMProvider` cannot be used as `dyn LLMProvider` because it contains:
@@ -373,6 +378,7 @@ pub trait LLMProviderDyn: Send + Sync {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: Option<BoxedStreamCallback>,
+        on_progress: Option<BoxedProgressCallback>,
     ) -> LLMResponse;
 }
 
@@ -479,6 +485,7 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: Option<BoxedStreamCallback>,
+        on_progress: Option<BoxedProgressCallback>,
     ) -> LLMResponse {
         // `BoxedStreamCallback` satisfies the bounds of `safe_chat_stream_with_retry`:
         //   F  = Box<dyn Fn(String) -> Pin<Box<dyn Future<Output=()> + Send>> + Send + Sync>
@@ -495,6 +502,7 @@ impl<T: LLMProvider + Send + Sync> LLMProviderDyn for T {
             reasoning_effort,
             tool_choice,
             &on_content_delta,
+            &on_progress,
         )
         .await
     }
@@ -876,6 +884,7 @@ pub trait LLMProvider: Send + Sync {
     /// * `reasoning_effort` - Optional reasoning effort string.
     /// * `tool_choice` - Tool selection strategy ("auto", "required", or specific tool map/string).
     /// * `on_content_delta` - Optional async function taking a string that will be called with content delta text.
+    /// * `on_progress` - Optional progress callback for reasoning deltas.
     ///
     /// # Returns
     /// An LLMResponse containing the result.
@@ -893,6 +902,7 @@ pub trait LLMProvider: Send + Sync {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
+        _on_progress: &Option<BoxedProgressCallback>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
@@ -932,6 +942,7 @@ pub trait LLMProvider: Send + Sync {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
+        on_progress: &Option<BoxedProgressCallback>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
@@ -947,6 +958,7 @@ pub trait LLMProvider: Send + Sync {
                 reasoning_effort,
                 tool_choice,
                 on_content_delta,
+                on_progress,
             ))
             .catch_unwind()
             .await
@@ -1105,6 +1117,7 @@ pub trait LLMProvider: Send + Sync {
         reasoning_effort: Option<String>,
         tool_choice: Option<serde_json::Value>,
         on_content_delta: &Option<F>,
+        on_progress: &Option<BoxedProgressCallback>,
     ) -> impl std::future::Future<Output = LLMResponse> + Send
     where
         F: Fn(String) -> Fut + Send + Sync,
@@ -1126,6 +1139,7 @@ pub trait LLMProvider: Send + Sync {
                         reasoning_effort.clone(),
                         tool_choice.clone(),
                         on_content_delta,
+                        on_progress,
                     )
                     .await;
                 log::info!("LLM stream response: {:?}", response);
@@ -1153,6 +1167,7 @@ pub trait LLMProvider: Send + Sync {
                                 reasoning_effort.clone(),
                                 tool_choice.clone(),
                                 on_content_delta,
+                                on_progress,
                             )
                             .await;
                     }
@@ -1185,6 +1200,7 @@ pub trait LLMProvider: Send + Sync {
                 reasoning_effort,
                 tool_choice,
                 on_content_delta,
+                on_progress,
             )
             .await
         }
@@ -1352,6 +1368,7 @@ mod tests {
             _reasoning_effort: Option<String>,
             _tool_choice: Option<serde_json::Value>,
             on_content_delta: &Option<F>,
+            _on_progress: &Option<BoxedProgressCallback>,
         ) -> LLMResponse
         where
             F: Fn(String) -> Fut + Send + Sync,
@@ -1693,6 +1710,7 @@ mod tests {
                 None,
                 None,
                 &None::<fn(String) -> std::future::Ready<()>>,
+                &None,
             )
             .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
@@ -1720,6 +1738,7 @@ mod tests {
                 &Some(|content| async move {
                     println!("content: {}", content);
                 }),
+                &None,
             )
             .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
@@ -1746,6 +1765,7 @@ mod tests {
                 None,
                 None,
                 &None::<fn(String) -> std::future::Ready<()>>,
+                &None,
             )
             .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
@@ -1773,6 +1793,7 @@ mod tests {
                 &Some(|content| async move {
                     println!("content: {}", content);
                 }),
+                &None,
             )
             .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
@@ -1859,6 +1880,7 @@ mod tests {
                 _reasoning_effort: Option<String>,
                 _tool_choice: Option<serde_json::Value>,
                 _on_content_delta: &Option<F>,
+                _on_progress: &Option<BoxedProgressCallback>,
             ) -> LLMResponse
             where
                 F: Fn(String) -> Fut + Send + Sync,
@@ -1902,6 +1924,7 @@ mod tests {
                 None,
                 None,
                 &None::<fn(String) -> std::future::Ready<()>>,
+                &None,
             )
             .await;
 
@@ -1999,6 +2022,7 @@ mod tests {
                 _reasoning_effort: Option<String>,
                 _tool_choice: Option<serde_json::Value>,
                 _on_content_delta: &Option<F>,
+                _on_progress: &Option<BoxedProgressCallback>,
             ) -> LLMResponse
             where
                 F: Fn(String) -> Fut + Send + Sync,
@@ -2027,6 +2051,7 @@ mod tests {
                 None,
                 None,
                 &None::<fn(String) -> std::future::Ready<()>>,
+                &None,
             )
             .await;
 

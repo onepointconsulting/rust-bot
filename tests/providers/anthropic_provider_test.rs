@@ -80,6 +80,7 @@ async fn test_simple_chat_with_thinking_stream() {
         Some("high".to_string()),
         None,
         &None::<fn(String) -> std::future::Ready<()>>,
+        &None,
     ).await;
     println!("response: {:?}", response);
     assert_ne!(

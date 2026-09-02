@@ -21,7 +21,8 @@ pub fn ReasoningPanel(text: String) -> impl IntoView {
                 aria-expanded=move || expanded.get().to_string()
                 on:click=move |_| expanded.update(|value| *value = !*value)
             >
-                {move || if expanded.get() { "Hide reasoning" } else { "Show reasoning" }}
+            "💭 "
+            {move || if expanded.get() { "Hide reasoning" } else { "Show reasoning" }}
             </button>
             <Show when=move || expanded.get()>
                 <p class="reasoning-panel__text">{text.clone()}</p>
