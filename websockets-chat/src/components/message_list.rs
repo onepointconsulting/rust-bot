@@ -1,5 +1,8 @@
-//! The chat transcript: auto-scrolling list of message bubbles plus the
-//! empty-state suggestion prompts.
+//! The chat transcript: pin-to-bottom list of message bubbles plus the
+//! empty-state suggestion prompts. Auto-scroll follows streamed updates
+//! while the user is near the bottom, pauses when they scroll up, and
+//! resumes when they return to the bottom, send a message, or switch
+//! sessions.
 //!
 //! Unlike `web-chat`'s otherwise-identical component, entries here can
 //! mutate in place after they're first pushed (delta text growing in,
@@ -16,11 +19,45 @@ use wasm_bindgen::JsCast;
 
 use crate::components::{ReasoningPanel, ToolActivity};
 
-fn scroll_list_to_bottom(list_ref: NodeRef<Div>) {
-    // Wait one frame so newly rendered/updated bubbles are in the layout.
+/// How close to the bottom (CSS pixels) still counts as pinned. Absorbs
+/// trackpad jitter and the one-frame gap after streamed content grows the
+/// list, before the follow-up scroll lands.
+const PIN_TO_BOTTOM_THRESHOLD_PX: i32 = 80;
+
+fn is_near_bottom(el: &web_sys::HtmlElement) -> bool {
+    el.scroll_height() - el.scroll_top() - el.client_height() <= PIN_TO_BOTTOM_THRESHOLD_PX
+}
+
+fn last_user_entry_id(entries: &[ChatEntry]) -> Option<u64> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.role == Role::User)
+        .map(|entry| entry.id)
+}
+
+/// Scroll the transcript to the latest content on the next frame, unless the
+/// user has unpinned (or a newer auto-scroll superseded this one) in the
+/// meantime.
+fn scroll_list_to_bottom(
+    list_ref: NodeRef<Div>,
+    pinned_to_bottom: RwSignal<bool>,
+    auto_scroll_generation: RwSignal<u64>,
+) {
+    if !pinned_to_bottom.get_untracked() {
+        return;
+    }
+    let generation = auto_scroll_generation.get_untracked().wrapping_add(1);
+    auto_scroll_generation.set(generation);
     if let Some(window) = web_sys::window() {
         let cb = Closure::once(move || {
-            if let Some(el) = list_ref.get() {
+            if auto_scroll_generation.get_untracked() != generation {
+                return;
+            }
+            if !pinned_to_bottom.get_untracked() {
+                return;
+            }
+            if let Some(el) = list_ref.get_untracked() {
                 el.set_scroll_top(el.scroll_height());
             }
         });
@@ -169,19 +206,57 @@ pub fn MessageList(
     #[prop(into)] example_prompts: Signal<Vec<String>>,
     #[prop(into)] token_streaming: Signal<bool>,
     #[prop(into)] pending: Signal<bool>,
+    #[prop(into)] active_session_id: Signal<Option<String>>,
     on_use_prompt: impl Fn(String) + 'static + Send + Sync + Copy,
     on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let list_ref = NodeRef::<Div>::new();
+    let pinned_to_bottom = RwSignal::new(true);
+    let auto_scroll_generation = RwSignal::new(0u64);
+    // `(session, last user entry)` — a new send or a session switch re-pins.
+    // Streaming mutates the same last user id, so it does not.
+    let pin_identity = RwSignal::new(None::<(Option<String>, Option<u64>)>);
 
-    // Keep the latest message in view. Tracks total content length (not
-    // just entry count) so the list also re-scrolls as streamed text grows
-    // an existing bubble, not only when a new entry is pushed.
+    // Follow the latest message while pinned. Tracks content / extra-panel
+    // size (not just entry count) so streamed tokens and tool/reasoning
+    // growth also re-scroll. A pending rAF is cancelled if the user scrolls
+    // away before it fires.
     Effect::new(move |_| {
-        let total_content_len: usize = entries.get().iter().map(|entry| entry.content.len()).sum();
-        let _ = total_content_len;
-        scroll_list_to_bottom(list_ref);
+        let current = entries.get();
+        let identity = (active_session_id.get(), last_user_entry_id(&current));
+        if pin_identity.get_untracked().as_ref() != Some(&identity) {
+            pin_identity.set(Some(identity));
+            pinned_to_bottom.set(true);
+        }
+
+        let total_content_len: usize = current.iter().map(|entry| entry.content.len()).sum();
+        let extra_growth: usize = current
+            .iter()
+            .map(|entry| {
+                entry.reasoning.as_ref().map(String::len).unwrap_or(0)
+                    + entry.tool_events.as_ref().map(Vec::len).unwrap_or(0)
+            })
+            .sum();
+        let _ = (total_content_len, extra_growth);
+
+        if pinned_to_bottom.get() {
+            scroll_list_to_bottom(list_ref, pinned_to_bottom, auto_scroll_generation);
+        }
     });
+
+    let on_list_scroll = move |_| {
+        let Some(el) = list_ref.get_untracked() else {
+            return;
+        };
+        if is_near_bottom(&el) {
+            pinned_to_bottom.set(true);
+        } else {
+            pinned_to_bottom.set(false);
+            auto_scroll_generation.update(|generation| {
+                *generation = generation.wrapping_add(1);
+            });
+        }
+    };
 
     // No separate "pending" flag needed: the streaming placeholder entry
     // itself (spinner until the first token, then a blinking cursor) is the
@@ -190,7 +265,11 @@ pub fn MessageList(
     let show_suggestions = move || entries.get().is_empty() && !example_prompts.get().is_empty();
 
     view! {
-        <div node_ref=list_ref class="flex flex-1 flex-col gap-3 overflow-y-auto px-4 py-4">
+        <div
+            node_ref=list_ref
+            class="flex flex-1 flex-col gap-3 overflow-y-auto px-4 py-4"
+            on:scroll=on_list_scroll
+        >
             <Show when=show_suggestions>
                 <SuggestionPrompts prompts=example_prompts on_use_prompt=on_use_prompt />
             </Show>

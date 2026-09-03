@@ -434,9 +434,10 @@ impl WebUiTranscriptRecorder {
 
     /// `pub(crate)` so `WebSocketChannel`'s outbound-persistence tests
     /// (`channels/websocket/runtime.rs`) can assert on raw rows — including
-    /// `turn_end`/`reasoning_end`/`tool_hint`/`file_edit` kinds that
-    /// [`Self::chat_history`]'s `attached.history` projection deliberately
-    /// filters out.
+    /// `turn_end`/`file_edit` kinds that [`Self::chat_history`]'s
+    /// `attached.history` projection drops, and the raw `reasoning_end`/
+    /// `tool_hint` rows it folds into the next answer rather than emitting
+    /// as standalone history.
     pub(crate) fn read_transcript_lines(&self, session_key: &str) -> Vec<Value> {
         let mut lines: Vec<Value> = vec![];
         for chunk_id in self.chunk_ids(session_key) {
@@ -1069,9 +1070,10 @@ fn chat_id_from_session_key(session_key: &str) -> Option<String> {
 /// Whether `row` is a display-worthy assistant transcript row: an
 /// `"event": "message"` (or `"assistant"`) row, or one carrying
 /// `"role": "assistant"` directly — but not a `tool_hint`/`progress`
-/// activity row, which has no standalone `attached.history` row of its own
-/// (see `transcript_chat_history`, which instead folds it into the next
-/// answer row's `activity` field).
+/// activity row or a `reasoning_end` row, which have no standalone
+/// `attached.history` row of their own (see `transcript_chat_history`,
+/// which folds them into the next answer's `activity` /
+/// `reasoning_content` instead).
 fn is_assistant_transcript_row(row: &Value) -> bool {
     let is_message_event = matches!(
         row.get("event").and_then(Value::as_str),
@@ -1101,19 +1103,23 @@ fn is_assistant_transcript_row(row: &Value) -> bool {
 /// `delta`/`reasoning_delta`/`file_edit` events into rich UI messages — those
 /// rows are simply skipped, since `attached.history` only ever carries plain
 /// `user`/`assistant` text (see `websocket_chat_history`'s doc comment)
-/// alongside the `activity` array described below.
+/// alongside the `activity` array and `reasoning_content` described below.
 ///
-/// `tool_hint`/`progress` ("activity") rows are not emitted as standalone
-/// history rows either — there is no `{role, content}` shape for them — but
-/// unlike the other skipped event kinds they aren't dropped outright: each
-/// one is buffered and attached, as a plain `{"kind", "text"}` object, to the
-/// `activity` field of the next answer row for the same turn (the simplest
-/// chronological pairing: "whatever hints preceded this answer, describe
-/// it"). The buffer is discarded, not carried forward, when a `user` row
-/// starts a new turn before any answer arrived — an aborted turn's hints
+/// `tool_hint`/`progress` ("activity") rows and `reasoning_end` rows are
+/// not emitted as standalone history rows either — there is no `{role,
+/// content}` shape for them — but unlike the other skipped event kinds they
+/// aren't dropped outright: each is buffered and attached to the next answer
+/// row for the same turn (the simplest chronological pairing: "whatever
+/// hints/reasoning preceded this answer, describe it"). Activity lands as a
+/// plain `{"kind", "text"}` object on the answer's `activity` field;
+/// assembled reasoning text lands on `reasoning_content`, matching the
+/// session-file projection `websocket_chat_history` already sends. The
+/// buffers are discarded, not carried forward, when a `user` row starts a
+/// new turn before any answer arrived — an aborted turn's hints/reasoning
 /// have no answer of their own to describe and shouldn't leak onto the next
-/// turn's. Presentation (chip glyph/status) is left entirely to the
-/// frontend, same as it already is for live `tool_hint`/`progress` messages.
+/// turn's. Presentation (chip glyph/status, reasoning panel) is left
+/// entirely to the frontend, same as it already is for live
+/// `tool_hint`/`progress`/`reasoning_*` messages.
 fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
     if max_messages == 0 {
         return Vec::new();
@@ -1129,13 +1135,22 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             Some("tool_hint") | Some("progress")
         )
     };
+    // `send_reasoning_end` persists `{event: "reasoning_end", text, turn_phase:
+    // "reasoning"}` — no `kind` field. Match either stamp so a row is not
+    // dropped just because one of them is missing.
+    let is_reasoning_row = |row: &Value| {
+        row.get("event").and_then(Value::as_str) == Some("reasoning_end")
+            || row.get("turn_phase").and_then(Value::as_str) == Some("reasoning")
+    };
 
     let mut pending_activity: Vec<Value> = Vec::new();
-    let mut visible: Vec<(&Value, Vec<Value>)> = Vec::new();
+    let mut pending_reasoning: Vec<String> = Vec::new();
+    let mut visible: Vec<(&Value, Vec<Value>, Vec<String>)> = Vec::new();
     for row in rows {
         if is_user_row(row) {
             pending_activity.clear();
-            visible.push((row, Vec::new()));
+            pending_reasoning.clear();
+            visible.push((row, Vec::new(), Vec::new()));
             continue;
         }
         if is_activity_row(row) {
@@ -1152,6 +1167,16 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             }
             continue;
         }
+        if is_reasoning_row(row) {
+            if let Some(text) = row
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|t| !t.trim().is_empty())
+            {
+                pending_reasoning.push(text.to_string());
+            }
+            continue;
+        }
         if is_assistant_transcript_row(row)
             && !row
                 .get("text")
@@ -1160,7 +1185,11 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
                 .trim()
                 .is_empty()
         {
-            visible.push((row, std::mem::take(&mut pending_activity)));
+            visible.push((
+                row,
+                std::mem::take(&mut pending_activity),
+                std::mem::take(&mut pending_reasoning),
+            ));
         }
     }
 
@@ -1168,13 +1197,13 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
         visible = visible.split_off(visible.len() - max_messages);
     }
     // Don't open the transcript on a dangling assistant reply.
-    if let Some(start) = visible.iter().position(|(row, _)| is_user_row(row)) {
+    if let Some(start) = visible.iter().position(|(row, _, _)| is_user_row(row)) {
         visible = visible.split_off(start);
     }
 
     visible
         .into_iter()
-        .map(|(row, activity)| {
+        .map(|(row, activity, reasoning_parts)| {
             let role = if is_user_row(row) {
                 "user"
             } else {
@@ -1187,15 +1216,27 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             if let Some(timestamp) = row.get("timestamp").and_then(Value::as_str) {
                 entry["timestamp"] = serde_json::json!(timestamp);
             }
-            let reasoning = row
-                .get("reasoning_content")
-                .and_then(Value::as_str)
-                .filter(|s| !s.is_empty())
-                .or_else(|| {
-                    row.get("reasoning")
-                        .and_then(Value::as_str)
-                        .filter(|s| !s.is_empty())
-                });
+            // Prefer the folded `reasoning_end` text (how the WebUI transcript
+            // actually stores a completed trace). Fall back to a
+            // `reasoning_content`/`reasoning` field on the answer row itself,
+            // which is the session-file shape `websocket_chat_history` reads.
+            let reasoning = if reasoning_parts.is_empty() {
+                None
+            } else {
+                Some(reasoning_parts.join("\n\n"))
+            }
+            .or_else(|| {
+                row.get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            })
+            .or_else(|| {
+                row.get("reasoning")
+                    .and_then(Value::as_str)
+                    .filter(|s| !s.is_empty())
+                    .map(str::to_string)
+            });
             if let Some(reasoning) = reasoning {
                 entry["reasoning_content"] = serde_json::json!(reasoning);
             }
@@ -2485,6 +2526,83 @@ mod tests {
             history[2]["activity"],
             serde_json::json!([{"kind": "tool_hint", "text": "round two hint"}])
         );
+    }
+
+    #[test]
+    fn transcript_chat_history_folds_reasoning_end_onto_the_next_answer() {
+        // Exact persist shape from `send_reasoning_end`: event + assembled
+        // text + turn_phase, no `kind`. Must become `reasoning_content` on
+        // the answer, not a standalone history row or an activity chip.
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi"}),
+            serde_json::json!({
+                "event": "reasoning_end",
+                "text": "assembled reasoning",
+                "turn_phase": "reasoning",
+            }),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "read foo.rs"}),
+            serde_json::json!({"event": "message", "text": "answer"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(history[1]["content"], "answer");
+        assert_eq!(history[1]["reasoning_content"], "assembled reasoning");
+        assert_eq!(
+            history[1]["activity"],
+            serde_json::json!([{"kind": "tool_hint", "text": "read foo.rs"}])
+        );
+        assert!(history[0].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_reads_on_row_reasoning_when_no_reasoning_end() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi"}),
+            serde_json::json!({
+                "event": "message",
+                "text": "answer",
+                "reasoning_content": "think",
+            }),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history[1]["reasoning_content"], "think");
+    }
+
+    #[test]
+    fn transcript_chat_history_pairs_each_reasoning_run_with_its_own_chronological_answer() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi"}),
+            serde_json::json!({"event": "reasoning_end", "text": "first thought"}),
+            serde_json::json!({"event": "message", "text": "round one"}),
+            serde_json::json!({"event": "reasoning_end", "text": "second thought"}),
+            serde_json::json!({"event": "message", "text": "round two"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[1]["reasoning_content"], "first thought");
+        assert_eq!(history[2]["reasoning_content"], "second thought");
+    }
+
+    #[test]
+    fn transcript_chat_history_discards_orphaned_reasoning_from_an_aborted_turn() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "first"}),
+            serde_json::json!({"event": "reasoning_end", "text": "aborted thought"}),
+            serde_json::json!({"event": "user", "text": "second"}),
+            serde_json::json!({"event": "message", "text": "second answer"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history.len(), 3);
+        assert_eq!(history[2]["content"], "second answer");
+        assert!(history[2].get("reasoning_content").is_none());
     }
 
     #[test]

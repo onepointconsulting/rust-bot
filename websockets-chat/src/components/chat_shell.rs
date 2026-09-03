@@ -128,6 +128,7 @@ pub fn ChatShell(
                     example_prompts=example_prompts
                     token_streaming=token_streaming
                     pending=pending
+                    active_session_id=active_session_id
                     on_use_prompt=on_use_prompt
                     on_fork_reply=on_fork_reply
                 />
