@@ -234,6 +234,7 @@ pub async fn fetch_sessions(token: &str) -> Result<Vec<SessionListItem>, ApiErro
             title: session.title,
             created_at: session.created_at,
             updated_at: session.updated_at,
+            has_summary: false,
         })
         .collect())
 }

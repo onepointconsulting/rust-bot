@@ -125,6 +125,7 @@ mod tests {
             title: format!("chat {id}"),
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
+            has_summary: false,
         }
     }
 

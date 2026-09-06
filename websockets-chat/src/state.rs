@@ -1426,6 +1426,7 @@ mod tests {
             title: format!("chat {id}"),
             created_at: String::new(),
             updated_at: String::new(),
+            has_summary: false,
         }
     }
 

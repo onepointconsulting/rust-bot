@@ -23,8 +23,8 @@ use uuid::Uuid;
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
-    ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem, SessionTokenUsage,
-    SkillSummary,
+    ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem, SessionSummaryPopup,
+    SessionTokenUsage, SkillSummary,
 };
 
 use crate::api::{self, WsSender};
@@ -353,6 +353,9 @@ struct WsContext {
     /// (or on an older gateway that doesn't send it), which hides
     /// `ChatInput`'s skills popup.
     skills: RwSignal<Vec<SkillSummary>>,
+    /// Sidebar Summary dialog: `None` when closed, `Some` with empty
+    /// `text` while the `get_session_summary` reply is in flight.
+    summary_popup: RwSignal<Option<SessionSummaryPopup>>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -730,6 +733,11 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ) {
                 request_chat_list(ctx);
             }
+            if detail == "summary_not_found" {
+                ctx.summary_popup.set(None);
+                request_chat_list(ctx);
+                return;
+            }
             ctx.chat_error.set(Some(detail));
             let turn_id = turn_id.or_else(|| ctx.active_turn_id.get_untracked());
             if let Some(turn_id) = turn_id {
@@ -811,6 +819,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                     title: chat.title,
                     created_at: chat.created_at,
                     updated_at: chat.updated_at,
+                    has_summary: chat.has_summary,
                 })
                 .collect();
             ctx.sessions.set(items);
@@ -826,6 +835,13 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::SessionCleared { chat_id } => {
             handle_session_cleared(ctx, chat_id);
+        }
+        ServerEvent::SessionSummary {
+            chat_id,
+            text,
+            last_active,
+        } => {
+            handle_session_summary(ctx, chat_id, text, last_active);
         }
         ServerEvent::TurnAborted { chat_id, turn_id } => {
             log::info!("turn aborted: chat_id={chat_id} turn_id={turn_id:?}");
@@ -1120,6 +1136,24 @@ fn request_clear(ctx: &WsContext, chat_id: String) {
     );
 }
 
+/// Ask the gateway for `chat_id`'s persisted idle-compact summary.
+///
+/// Opens the dialog in a loading state immediately; [`handle_session_summary`]
+/// fills it when the `session_summary` event arrives. No optimistic text —
+/// the gateway is the source of truth.
+fn request_summary(ctx: &WsContext, chat_id: String) {
+    ctx.summary_popup.set(Some(SessionSummaryPopup {
+        chat_id: chat_id.clone(),
+        text: None,
+        last_active: None,
+    }));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::get_session_summary(chat_id),
+        "Failed to encode the session-summary request.",
+    );
+}
+
 /// Ask the gateway to cancel the in-flight turn on the active chat.
 ///
 /// No optimistic local close (same reasoning as [`request_delete`]): the
@@ -1260,7 +1294,39 @@ fn handle_chat_deleted(ctx: &WsContext, chat_id: String) {
 /// active chat. Unlike [`handle_chat_deleted`], this never calls
 /// [`reset_local_transcript`]: that also drops `ctx.chat_id` and the stored
 /// chat id, which would strand this connection with no chat to send on.
+fn handle_session_summary(
+    ctx: &WsContext,
+    chat_id: String,
+    text: String,
+    last_active: String,
+) {
+    let matches_open = ctx
+        .summary_popup
+        .get_untracked()
+        .is_some_and(|popup| popup.chat_id == chat_id);
+    if !matches_open {
+        return;
+    }
+    ctx.summary_popup.set(Some(SessionSummaryPopup {
+        chat_id,
+        text: Some(text),
+        last_active: Some(last_active),
+    }));
+}
+
 fn handle_session_cleared(ctx: &WsContext, chat_id: String) {
+    ctx.sessions.update(|sessions| {
+        if let Some(item) = sessions.iter_mut().find(|item| item.id == chat_id) {
+            item.has_summary = false;
+        }
+    });
+    if ctx
+        .summary_popup
+        .get_untracked()
+        .is_some_and(|popup| popup.chat_id == chat_id)
+    {
+        ctx.summary_popup.set(None);
+    }
     if ctx.chat_id.get_untracked().as_deref() != Some(chat_id.as_str()) {
         return;
     }
@@ -1415,6 +1481,7 @@ pub fn App() -> impl IntoView {
     let agent_mode = RwSignal::new("standard".to_string());
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
     let skills = RwSignal::new(Vec::<SkillSummary>::new());
+    let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
 
     let ws_context = WsContext {
         token,
@@ -1441,6 +1508,7 @@ pub fn App() -> impl IntoView {
         agent_mode,
         session_usage,
         skills,
+        summary_popup,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -1605,6 +1673,12 @@ pub fn App() -> impl IntoView {
     let on_rename_session = move |id: String, title: String| {
         request_rename(&ws_context, id, title);
     };
+    let on_summary_session = move |id: String| {
+        request_summary(&ws_context, id);
+    };
+    let on_close_summary = move || {
+        ws_context.summary_popup.set(None);
+    };
     let on_fork_session = move |id: String| {
         request_fork(&ws_context, id, None);
     };
@@ -1690,6 +1764,9 @@ pub fn App() -> impl IntoView {
                     on_close_sidebar=close_sidebar
                     on_select_session=on_select_session
                     on_rename_session=on_rename_session
+                    on_summary_session=on_summary_session
+                    summary_popup=Signal::derive(move || summary_popup.get())
+                    on_close_summary=on_close_summary
                     on_fork_session=on_fork_session
                     on_fork_reply=on_fork_reply
                     on_delete_session=on_delete_session

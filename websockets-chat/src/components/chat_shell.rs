@@ -1,6 +1,7 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsSidebarToggle};
 use chat_ui::models::{
-    ChatEntry, OutgoingMessage, SessionListItem, SessionTokenUsage, SkillSummary,
+    ChatEntry, OutgoingMessage, SessionListItem, SessionSummaryPopup, SessionTokenUsage,
+    SkillSummary,
 };
 use leptos::prelude::*;
 
@@ -48,6 +49,9 @@ pub fn ChatShell(
     on_close_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
+    on_summary_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    #[prop(into)] summary_popup: Signal<Option<SessionSummaryPopup>>,
+    on_close_summary: impl Fn() + 'static + Send + Sync + Copy,
     on_fork_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
     on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
@@ -79,6 +83,9 @@ pub fn ChatShell(
                 on_close=on_close_sidebar
                 on_select=on_select_session
                 on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
+                on_summary=Callback::new(move |id| on_summary_session(id))
+                summary_popup=summary_popup
+                on_close_summary=Callback::new(move |()| on_close_summary())
                 on_fork=Callback::new(move |id| on_fork_session(id))
                 on_clear=Callback::new(move |id| on_clear_session(id))
                 on_delete=Callback::new(move |id| on_delete_session(id))

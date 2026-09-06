@@ -144,14 +144,17 @@ impl Session {
     ///
     /// Also drops conversation-scoped metadata that would be wrong on an
     /// empty transcript: [`GOAL_STATE_KEY`] (would keep injecting the old
-    /// objective into later turns) and [`SESSION_TOKEN_USAGE_KEY`] (lifetime
-    /// totals for the conversation that was just wiped). Other metadata
-    /// (workspace scope, owner, title, model preset, …) is left alone.
+    /// objective into later turns), [`SESSION_TOKEN_USAGE_KEY`] (lifetime
+    /// totals for the conversation that was just wiped), and
+    /// [`SessionManager::LAST_SUMMARY_KEY`] (summarizes the wiped history).
+    /// Other metadata (workspace scope, owner, title, model preset, …) is
+    /// left alone.
     pub fn clear(&mut self) {
         self.messages.clear();
         self.last_consolidated = 0;
         self.metadata.remove(GOAL_STATE_KEY);
         self.metadata.remove(SESSION_TOKEN_USAGE_KEY);
+        self.metadata.remove(SessionManager::LAST_SUMMARY_KEY);
         self.updated_at = Utc::now();
     }
 
@@ -821,6 +824,7 @@ impl SessionManager {
                                         "path": path.display().to_string(),
                                         "title": listed_session_title(&metadata),
                                         "owner_client_id": listed_session_owner_client_id(&metadata),
+                                        "has_summary": listed_session_has_summary(&metadata),
                                     }));
                                 }
                             }
@@ -1242,6 +1246,19 @@ impl SessionManager {
     }
 }
 
+/// Whether the JSONL metadata line carries a usable idle-compact summary
+/// (`metadata._last_summary.text` is a non-empty string). A stale non-object
+/// value does not count.
+fn listed_session_has_summary(metadata_line: &Value) -> bool {
+    metadata_line
+        .get("metadata")
+        .and_then(|m| m.get(SessionManager::LAST_SUMMARY_KEY))
+        .and_then(|v| v.as_object())
+        .and_then(|obj| obj.get("text"))
+        .and_then(Value::as_str)
+        .is_some_and(|s| !s.is_empty())
+}
+
 /// Title stored on the JSONL metadata line (`metadata.title`), if any.
 fn listed_session_title(metadata_line: &Value) -> String {
     metadata_line
@@ -1599,6 +1616,23 @@ mod tests {
         session.clear();
         assert!(session.usage().is_none());
         assert!(session.metadata.get(SESSION_TOKEN_USAGE_KEY).is_none());
+    }
+
+    #[test]
+    fn clear_removes_last_summary() {
+        let mut session = Session::new("k1".into());
+        session.metadata.insert(
+            SessionManager::LAST_SUMMARY_KEY.to_string(),
+            json!({"text": "old summary", "last_active": "2026-01-01T00:00:00Z"}),
+        );
+        session.add_message("user", "x", Map::new());
+        session.clear();
+        assert!(
+            session
+                .metadata
+                .get(SessionManager::LAST_SUMMARY_KEY)
+                .is_none()
+        );
     }
 
     #[test]
@@ -2022,6 +2056,7 @@ mod tests {
         assert_eq!(e["updated_at"], json!("2026-04-02T15:30:00+00:00"));
         assert_eq!(e["path"], json!(path.display().to_string()));
         assert_eq!(e["title"], json!(""));
+        assert_eq!(e["has_summary"], json!(false));
     }
 
     #[test]
@@ -2086,6 +2121,53 @@ mod tests {
         assert!(
             text.contains("- Fix the login bug [websocket:chat-1] — updated 2026-06-01T00:00:00Z")
         );
+    }
+
+    #[test]
+    fn list_sessions_has_summary_is_true_only_for_object_with_text() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        {
+            let session = mgr.get_or_create_session("with-summary");
+            session.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                json!({"text": "compacted", "last_active": "2026-01-01T00:00:00Z"}),
+            );
+            let snapshot = session.clone();
+            mgr.save(snapshot).unwrap();
+        }
+        {
+            let session = mgr.get_or_create_session("stale-string");
+            session
+                .metadata
+                .insert(SessionManager::LAST_SUMMARY_KEY.to_string(), json!("stale"));
+            let snapshot = session.clone();
+            mgr.save(snapshot).unwrap();
+        }
+        {
+            let session = mgr.get_or_create_session("empty-text");
+            session.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                json!({"text": "", "last_active": "2026-01-01T00:00:00Z"}),
+            );
+            let snapshot = session.clone();
+            mgr.save(snapshot).unwrap();
+        }
+        mgr.save(Session::new("no-summary".to_string())).unwrap();
+        mgr.cache.clear();
+
+        let listed = mgr.list_sessions();
+        let has_summary = |key: &str| {
+            listed
+                .iter()
+                .find(|e| e["key"] == json!(key))
+                .map(|e| e["has_summary"] == json!(true))
+                .expect(key)
+        };
+        assert!(has_summary("with-summary"));
+        assert!(!has_summary("stale-string"));
+        assert!(!has_summary("empty-text"));
+        assert!(!has_summary("no-summary"));
     }
 
     #[test]

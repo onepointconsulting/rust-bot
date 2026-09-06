@@ -76,6 +76,11 @@ pub enum EnvelopeType {
     /// nanobot precedent — the Python reference has no clear envelope; its
     /// closest path is the `/new` chat command.
     ClearSession,
+    /// Return the persisted idle-compact summary (`_last_summary`) for an
+    /// existing `websocket:{chat_id}` session, if one exists. Rust-side
+    /// addition with no nanobot precedent — the Python reference never
+    /// exposes session summaries on the wire.
+    GetSessionSummary,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
@@ -106,6 +111,7 @@ impl From<&str> for EnvelopeType {
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
             "clear_session" => Self::ClearSession,
+            "get_session_summary" => Self::GetSessionSummary,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -161,6 +167,9 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::ClearSession`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     SessionCleared,
+    /// Reply to [`EnvelopeType::GetSessionSummary`] — Rust-side addition, no
+    /// nanobot wire-name precedent to mirror (see that variant's doc comment).
+    SessionSummary,
 }
 
 impl WsOutboundEvent {
@@ -182,6 +191,7 @@ impl WsOutboundEvent {
             Self::ModeSet => "mode_set",
             Self::User => "user",
             Self::SessionCleared => "session_cleared",
+            Self::SessionSummary => "session_summary",
         }
     }
 }
@@ -508,6 +518,10 @@ mod tests {
             EnvelopeType::from("clear_session"),
             EnvelopeType::ClearSession
         );
+        assert_eq!(
+            EnvelopeType::from("get_session_summary"),
+            EnvelopeType::GetSessionSummary
+        );
     }
 
     #[test]
@@ -573,5 +587,10 @@ mod tests {
     #[test]
     fn ws_outbound_event_session_cleared_has_no_nanobot_precedent() {
         assert_eq!(WsOutboundEvent::SessionCleared.as_str(), "session_cleared");
+    }
+
+    #[test]
+    fn ws_outbound_event_session_summary_has_no_nanobot_precedent() {
+        assert_eq!(WsOutboundEvent::SessionSummary.as_str(), "session_summary");
     }
 }

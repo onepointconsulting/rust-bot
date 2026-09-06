@@ -7,7 +7,7 @@
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
 //!   `attach`, `list_chats`, `list_skills`, `rename_chat`, `delete_chat`, `clear_session`,
-//!   `fork_chat`, and `abort_turn`.
+//!   `get_session_summary`, `fork_chat`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -28,7 +28,7 @@ use serde::{Deserialize, Serialize};
 /// more inbound types than this crate has a use for (`set_workspace_scope`,
 /// `transcribe_audio`). This struct covers the ones the frontend actually
 /// sends (`message`, `new_chat`, `attach`, `list_chats`, `list_skills`, `rename_chat`,
-/// `delete_chat`, `clear_session`, `fork_chat`, `abort_turn`); constructors
+/// `delete_chat`, `clear_session`, `get_session_summary`, `fork_chat`, `abort_turn`); constructors
 /// pin `type_` so callers cannot invent a shape the gateway would reject
 /// with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -255,6 +255,26 @@ impl ClientEnvelope {
         }
     }
 
+    /// Fetch `chat_id`'s persisted idle-compact summary, if one exists.
+    ///
+    /// The reply is a `session_summary` event carrying `text` and
+    /// `last_active`. Rejections come back as `error` (`session_not_found`,
+    /// `access_denied`, `summary_not_found`).
+    pub fn get_session_summary(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "get_session_summary",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: None,
+            before_user_index: None,
+            webui: true,
+        }
+    }
+
     /// Cancel the in-flight agent turn on `chat_id`, leaving the chat and its
     /// history intact.
     ///
@@ -331,6 +351,10 @@ pub struct ChatSummary {
     pub created_at: String,
     #[serde(default)]
     pub updated_at: String,
+    /// Whether this chat has a persisted `_last_summary`. Older gateways
+    /// omit the field; treat that as no summary.
+    #[serde(default)]
+    pub has_summary: bool,
 }
 
 /// One event the gateway can push down the WebSocket connection.
@@ -482,6 +506,13 @@ pub enum ServerEvent {
     /// out to every connection subscribed to `chat_id` — not just the
     /// requester.
     SessionCleared { chat_id: String },
+    /// Reply to a [`ClientEnvelope::get_session_summary`] envelope: the
+    /// persisted idle-compact summary for `chat_id`.
+    SessionSummary {
+        chat_id: String,
+        text: String,
+        last_active: String,
+    },
     /// Reply to an `abort_turn` envelope: the in-flight turn on `chat_id` was
     /// cancelled, so no `stream_end` or final `message` is coming for it.
     /// Fanned out to every connection attached to `chat_id`. `turn_id` is
@@ -512,9 +543,9 @@ impl ServerEvent {
     /// `new_chat` switches the connection onto a new id. `Unknown`,
     /// [`ServerEvent::ChatsList`], [`ServerEvent::SkillsList`],
     /// [`ServerEvent::ChatRenamed`]/
-    /// [`ServerEvent::ChatDeleted`]/[`ServerEvent::SessionCleared`] (all
-    /// three can target any sidebar row), and unscoped errors return
-    /// `None`.
+    /// [`ServerEvent::ChatDeleted`]/[`ServerEvent::SessionCleared`]/
+    /// [`ServerEvent::SessionSummary`] (all can target any sidebar row), and
+    /// unscoped errors return `None`.
     pub fn chat_id(&self) -> Option<&str> {
         match self {
             ServerEvent::Ready { chat_id, .. }
@@ -544,6 +575,7 @@ impl ServerEvent {
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatDeleted { .. }
             | ServerEvent::SessionCleared { .. }
+            | ServerEvent::SessionSummary { .. }
             | ServerEvent::Unknown(_) => None,
         }
     }
@@ -835,6 +867,13 @@ struct SessionClearedWire {
 }
 
 #[derive(Deserialize)]
+struct SessionSummaryWire {
+    chat_id: String,
+    text: String,
+    last_active: String,
+}
+
+#[derive(Deserialize)]
 struct TurnAbortedWire {
     chat_id: String,
     #[serde(default)]
@@ -966,6 +1005,13 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             .map(|w| ServerEvent::ChatDeleted { chat_id: w.chat_id }),
         "session_cleared" => decode::<SessionClearedWire>(&value)
             .map(|w| ServerEvent::SessionCleared { chat_id: w.chat_id }),
+        "session_summary" => {
+            decode::<SessionSummaryWire>(&value).map(|w| ServerEvent::SessionSummary {
+                chat_id: w.chat_id,
+                text: w.text,
+                last_active: w.last_active,
+            })
+        }
         "turn_aborted" => decode::<TurnAbortedWire>(&value).map(|w| ServerEvent::TurnAborted {
             chat_id: w.chat_id,
             turn_id: w.turn_id,
@@ -1551,12 +1597,14 @@ mod tests {
                         title: "Fix the login bug".to_string(),
                         created_at: "2024-01-01T00:00:00Z".to_string(),
                         updated_at: "2024-01-02T00:00:00Z".to_string(),
+                        has_summary: false,
                     },
                     ChatSummary {
                         chat_id: "chat-2".to_string(),
                         title: String::new(),
                         created_at: "2024-01-03T00:00:00Z".to_string(),
                         updated_at: "2024-01-03T00:00:00Z".to_string(),
+                        has_summary: false,
                     },
                 ],
             }
@@ -1720,6 +1768,53 @@ mod tests {
             }
         );
         assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_get_session_summary_serializes_expected_shape() {
+        let envelope = ClientEnvelope::get_session_summary("chat-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "get_session_summary",
+                "chat_id": "chat-1",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_session_summary() {
+        let raw = r#"{"event":"session_summary","chat_id":"chat-1","text":"compacted turns","last_active":"2026-01-02T03:04:05Z"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::SessionSummary {
+                chat_id: "chat-1".to_string(),
+                text: "compacted turns".to_string(),
+                last_active: "2026-01-02T03:04:05Z".to_string(),
+            }
+        );
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn parses_chats_list_has_summary() {
+        let raw = r#"{"event":"chats","chats":[{"chat_id":"chat-1","title":"T","created_at":"","updated_at":"","has_summary":true}]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ChatsList {
+                chats: vec![ChatSummary {
+                    chat_id: "chat-1".to_string(),
+                    title: "T".to_string(),
+                    created_at: String::new(),
+                    updated_at: String::new(),
+                    has_summary: true,
+                }],
+            }
+        );
     }
 
     #[test]

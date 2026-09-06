@@ -1,9 +1,10 @@
 //! Cursor-style sessions sidebar shared by `web-chat` and `websockets-chat`.
 //!
 //! Rows highlight the active session; clicking one invokes `on_select`.
-//! When `on_rename`, `on_fork`, `on_clear`, and/or `on_delete` is provided
-//! (websockets-chat), each row also has a kebab that opens a menu with
-//! "Rename", "Fork session", "Clear session", and/or a red "Delete" item.
+//! When `on_rename`, `on_summary`, `on_fork`, `on_clear`, and/or `on_delete`
+//! is provided (websockets-chat), each row also has a kebab that opens a
+//! menu with "Rename", "Summary" (only when that row has a persisted
+//! summary), "Fork session", "Clear session", and/or a red "Delete" item.
 //! Delete and clear each open their own confirmation dialog before actually
 //! calling `on_delete`/`on_clear`; rename opens a small dialog to edit the
 //! title; fork fires immediately (non-destructive — it only ever creates a
@@ -37,7 +38,7 @@ use std::collections::HashSet;
 use leptos::html::Input;
 use leptos::prelude::*;
 
-use crate::models::SessionListItem;
+use crate::models::{SessionListItem, SessionSummaryPopup};
 use crate::session_groups::{group_sessions, SessionGroup};
 
 use super::UserAccountChip;
@@ -160,6 +161,29 @@ fn IconFork() -> impl IntoView {
 }
 
 #[component]
+fn IconDocument() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <path d="M15 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V7Z" />
+            <path d="M14 2v4a2 2 0 0 0 2 2h4" />
+            <path d="M10 9H8" />
+            <path d="M16 13H8" />
+            <path d="M16 17H8" />
+        </svg>
+    }
+}
+
+#[component]
 fn IconEraser() -> impl IntoView {
     view! {
         <svg
@@ -238,10 +262,12 @@ fn SessionRow(
     id: String,
     display_title: String,
     raw_title: String,
+    has_summary: bool,
     #[prop(into)] active_id: Signal<Option<String>>,
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_summary: Option<Callback<String>>,
     on_open_fork: Option<Callback<String>>,
     on_open_clear: Option<Callback<String>>,
     on_open_delete: Option<Callback<String>>,
@@ -256,10 +282,11 @@ fn SessionRow(
     let id_for_toggle = id.clone();
     let display_title_for_menu = display_title.clone();
     let show_rename = on_open_rename.is_some();
+    let show_summary = on_open_summary.is_some() && has_summary;
     let show_fork = on_open_fork.is_some();
     let show_clear = on_open_clear.is_some();
     let show_delete = on_open_delete.is_some();
-    let show_menu = show_rename || show_fork || show_clear || show_delete;
+    let show_menu = show_rename || show_summary || show_fork || show_clear || show_delete;
 
     view! {
         <li class="group relative">
@@ -334,6 +361,7 @@ fn SessionRow(
             {show_menu.then(|| {
                 let id_for_menu_visible = id.clone();
                 let id_for_rename = id.clone();
+                let id_for_summary = id.clone();
                 let id_for_fork = id.clone();
                 let id_for_clear = id.clone();
                 let id_for_delete = id.clone();
@@ -377,7 +405,28 @@ fn SessionRow(
                                     </button>
                                 }
                             })}
-                            {(show_rename && (show_fork || show_clear || show_delete))
+                            {(show_rename
+                                && (show_summary || show_fork || show_clear || show_delete))
+                                .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
+                            {show_summary.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class=MENU_ITEM
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_summary) = on_open_summary {
+                                                on_open_summary.run(id_for_summary.clone());
+                                            }
+                                        }
+                                    >
+                                        <IconDocument />
+                                        "Summary"
+                                    </button>
+                                }
+                            })}
+                            {(show_summary && (show_fork || show_clear || show_delete))
                                 .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
                             {show_fork.then(|| {
                                 view! {
@@ -463,6 +512,7 @@ fn SessionGroupSection(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_summary: Option<Callback<String>>,
     on_open_fork: Option<Callback<String>>,
     on_open_clear: Option<Callback<String>>,
     on_open_delete: Option<Callback<String>>,
@@ -489,10 +539,12 @@ fn SessionGroupSection(
                     id=item.id
                     display_title=display_title
                     raw_title=item.title
+                    has_summary=item.has_summary
                     active_id=active_id
                     on_select=on_select
                     open_menu_id=open_menu_id
                     on_open_rename=on_open_rename
+                    on_open_summary=on_open_summary
                     on_open_fork=on_open_fork
                     on_open_clear=on_open_clear
                     on_open_delete=on_open_delete
@@ -544,6 +596,17 @@ pub fn SessionsSidebar(
     /// `web-chat`, which has no rename API yet.
     #[prop(optional)]
     on_rename: Option<Callback<(String, String)>>,
+    /// When set, a row whose session has a persisted summary gets a
+    /// "Summary" kebab item. Clicking it fires this callback and the parent
+    /// fills [`summary_popup`]. Omitted by `web-chat`.
+    #[prop(optional)]
+    on_summary: Option<Callback<String>>,
+    /// The Summary dialog's current contents. `None` hides it; `Some` with
+    /// empty `text` is the in-flight loading state.
+    #[prop(optional)]
+    summary_popup: Option<Signal<Option<SessionSummaryPopup>>>,
+    #[prop(optional)]
+    on_close_summary: Option<Callback<()>>,
     /// When set, each row's kebab also gets a "Fork session" item that fires
     /// immediately (no confirmation dialog — forking is non-destructive, it
     /// only ever creates a new chat). Omitted by `web-chat`, which has no
@@ -579,6 +642,20 @@ pub fn SessionsSidebar(
         rename_draft.set(title);
     });
     let on_open_rename = on_rename.map(|_| open_rename);
+
+    let open_summary = Callback::new(move |id: String| {
+        open_menu_id.set(None);
+        if let Some(on_summary) = on_summary {
+            on_summary.run(id);
+        }
+    });
+    let on_open_summary = on_summary.map(|_| open_summary);
+
+    let close_summary = move || {
+        if let Some(on_close_summary) = on_close_summary {
+            on_close_summary.run(());
+        }
+    };
 
     // No dialog/confirm step for fork — unlike rename/delete, this just
     // fires the callback immediately.
@@ -680,6 +757,7 @@ pub fn SessionsSidebar(
                             on_select=on_select
                             open_menu_id=open_menu_id
                             on_open_rename=on_open_rename
+                            on_open_summary=on_open_summary
                             on_open_fork=on_open_fork
                             on_open_clear=on_open_clear
                             on_open_delete=on_open_delete
@@ -893,6 +971,87 @@ pub fn SessionsSidebar(
                                     "OK"
                                 </button>
                             </Show>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || {
+                summary_popup
+                    .and_then(|popup| popup.get())
+                    .is_some()
+            }>
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    <div
+                        class="absolute inset-0 bg-slate-900/40"
+                        aria-hidden="true"
+                        on:click=move |_| close_summary()
+                    ></div>
+                    <div
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="session-summary-title"
+                        class="relative flex w-full max-w-lg flex-col rounded-2xl bg-white p-5 shadow-2xl ring-1 ring-slate-200"
+                        on:keydown=move |ev| {
+                            if ev.key() == "Escape" {
+                                close_summary();
+                            }
+                        }
+                    >
+                        <div class="mb-3 flex items-start justify-between gap-3">
+                            <h2
+                                id="session-summary-title"
+                                class="text-base font-semibold text-slate-900"
+                            >
+                                "Summary"
+                            </h2>
+                            <button
+                                type="button"
+                                aria-label="Close"
+                                class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                                on:click=move |_| close_summary()
+                            >
+                                <IconClose />
+                            </button>
+                        </div>
+                        {move || {
+                            let popup = summary_popup.and_then(|signal| signal.get());
+                            match popup {
+                                Some(SessionSummaryPopup {
+                                    text: Some(text),
+                                    last_active,
+                                    ..
+                                }) => {
+                                    let timestamp = last_active
+                                        .filter(|value| !value.is_empty())
+                                        .map(|value| format!("Last active: {value}"));
+                                    view! {
+                                        <div class="min-h-0 max-h-[min(24rem,70vh)] overflow-y-auto whitespace-pre-wrap text-sm text-slate-700">
+                                            {text}
+                                        </div>
+                                        {timestamp
+                                            .map(|label| {
+                                                view! {
+                                                    <p class="mt-3 text-xs text-slate-400">{label}</p>
+                                                }
+                                            })}
+                                    }
+                                    .into_any()
+                                }
+                                _ => view! {
+                                    <p class="text-sm text-slate-400">"Loading…"</p>
+                                }
+                                .into_any(),
+                            }
+                        }}
+                        <div class="mt-5 flex justify-end">
+                            <button
+                                type="button"
+                                class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"
+                                on:click=move |_| close_summary()
+                            >
+                                "Close"
+                            </button>
                         </div>
                     </div>
                 </div>

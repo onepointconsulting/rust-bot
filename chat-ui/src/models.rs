@@ -154,6 +154,20 @@ pub struct SessionListItem {
     pub title: String,
     pub created_at: String,
     pub updated_at: String,
+    /// Whether this session has a persisted idle-compact summary. The
+    /// sidebar kebab uses this to hide "Summary" until one exists.
+    #[serde(default)]
+    pub has_summary: bool,
+}
+
+/// Content for the sessions-sidebar Summary dialog.
+///
+/// `text` / `last_active` are `None` while the gateway reply is in flight.
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct SessionSummaryPopup {
+    pub chat_id: String,
+    pub text: Option<String>,
+    pub last_active: Option<String>,
 }
 
 #[cfg(test)]

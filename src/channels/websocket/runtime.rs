@@ -528,6 +528,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::ClearSession => {
             handle_envelope_clear_session(envelope_dispatch_context).await;
         }
+        EnvelopeType::GetSessionSummary => {
+            handle_envelope_get_session_summary(envelope_dispatch_context).await;
+        }
         EnvelopeType::Unrecognized(t) => {
             send_event(
                 envelope_dispatch_context.shared,
@@ -2688,6 +2691,116 @@ async fn handle_envelope_clear_session<'a>(envelope_dispatch_context: EnvelopeDi
         .clear_transcript(cid);
 
     send_session_cleared(cid, connection_id, shared).await;
+}
+
+/// Handle a `get_session_summary` envelope: return the persisted idle-compact
+/// summary (`_last_summary`) for an existing `websocket:{chat_id}` session.
+/// Reply is sent only to the requester — this is a read, not a mutation.
+/// Rust-side protocol addition with no nanobot precedent — see
+/// [`EnvelopeType::GetSessionSummary`].
+async fn handle_envelope_get_session_summary<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
+        return;
+    }
+
+    let summary = {
+        // Drop the `MutexGuard` before `send_event`'s `.await` — same
+        // discipline as every other `session_manager` use in this file.
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match session_manager.get_session_internal(&get_session_id(cid)) {
+            None => None,
+            Some(session) => Some(session_summary_fields(&session)),
+        }
+    };
+    match summary {
+        None => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": "session_not_found"}),
+            )
+            .await;
+        }
+        Some(None) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": "summary_not_found"}),
+            )
+            .await;
+        }
+        Some(Some((text, last_active))) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::SessionSummary,
+                None,
+                serde_json::json!({
+                    "chat_id": cid,
+                    "text": text,
+                    "last_active": last_active,
+                }),
+            )
+            .await;
+        }
+    }
+}
+
+/// Extract `{ text, last_active }` from [`SessionManager::LAST_SUMMARY_KEY`].
+/// Requires the object shape idle-compact writes: a non-empty `text` string
+/// and a `last_active` string. Anything else is treated as missing.
+fn session_summary_fields(session: &Session) -> Option<(String, String)> {
+    let meta = session
+        .metadata
+        .get(SessionManager::LAST_SUMMARY_KEY)?
+        .as_object()?;
+    let text = meta
+        .get("text")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())?
+        .to_string();
+    let last_active = meta
+        .get(SessionManager::LAST_ACTIVE_KEY)
+        .and_then(|v| v.as_str())?
+        .to_string();
+    Some((text, last_active))
 }
 
 fn create_rejection_fields(cid: &str) -> serde_json::Map<String, serde_json::Value> {
@@ -5809,6 +5922,23 @@ mod tests {
     }
 
     #[test]
+    fn list_websocket_chats_forwards_has_summary() {
+        let sessions = vec![serde_json::json!({
+            "key": "websocket:chat-1",
+            "created_at": "t1",
+            "updated_at": "t2",
+            "path": "/some/path",
+            "title": "Fix the login bug",
+            "has_summary": true,
+        })];
+
+        let chats = list_websocket_chats(sessions);
+
+        assert_eq!(chats.len(), 1);
+        assert_eq!(chats[0]["has_summary"], true);
+    }
+
+    #[test]
     fn list_websocket_chats_skips_invalid_chat_ids_after_stripping_prefix() {
         let sessions = vec![
             serde_json::json!({"key": "websocket:", "created_at": "", "updated_at": "", "path": ""}),
@@ -7025,6 +7155,203 @@ mod tests {
             1,
             "a denied clear must not wipe messages"
         );
+    }
+
+    // --- handle_envelope_get_session_summary ---
+
+    async fn dispatch_get_session_summary(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert(
+            "type".to_string(),
+            serde_json::json!("get_session_summary"),
+        );
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            webui_authenticated: false,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_get_session_summary must not hang");
+    }
+
+    fn last_summary_object(text: &str, last_active: &str) -> serde_json::Value {
+        serde_json::json!({
+            "text": text,
+            "last_active": last_active,
+        })
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_get_session_summary_returns_text_and_last_active() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                last_summary_object("compacted turns", "2026-01-02T03:04:05Z"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_get_session_summary(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "session_summary");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["text"], "compacted turns");
+        assert_eq!(body["last_active"], "2026-01-02T03:04:05Z");
+        assert!(
+            rx.try_recv().is_err(),
+            "summary must send exactly one frame to the requester"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_get_session_summary_rejects_missing_or_malformed_summary() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            session_manager
+                .save(Session::new("websocket:no-summary".to_string()))
+                .unwrap();
+            let mut stale = Session::new("websocket:stale-summary".to_string());
+            stale.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                serde_json::json!("stale"),
+            );
+            session_manager.save(stale).unwrap();
+            let mut empty = Session::new("websocket:empty-summary".to_string());
+            empty.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                last_summary_object("", "2026-01-02T03:04:05Z"),
+            );
+            session_manager.save(empty).unwrap();
+        }
+
+        for chat_id in ["no-summary", "stale-summary", "empty-summary"] {
+            dispatch_get_session_summary(&shared, "conn-1", Some(serde_json::json!(chat_id))).await;
+            let body = recv_json(&mut rx);
+            assert_eq!(body["event"], "error", "rejected chat_id={chat_id}");
+            assert_eq!(body["detail"], "summary_not_found");
+            assert_eq!(body["chat_id"], chat_id);
+        }
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_get_session_summary_rejects_unknown_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_get_session_summary(&shared, "conn-1", Some(serde_json::json!("missing-chat")))
+            .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "session_not_found");
+        assert_eq!(body["chat_id"], "missing-chat");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_get_session_summary_denies_a_sender_outside_the_allow_list() {
+        let mut shared = test_shared("browser");
+        shared.channels_config = ChannelsConfig {
+            allow_from: vec!["someone-else".to_string()],
+            ..ChannelsConfig::default()
+        };
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                last_summary_object("secret", "2026-01-02T03:04:05Z"),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_get_session_summary(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["chat_id"], "chat-1");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_get_session_summary_denies_a_guest_reading_someone_elses_chat() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                SessionManager::LAST_SUMMARY_KEY.to_string(),
+                last_summary_object("secret", "2026-01-02T03:04:05Z"),
+            );
+            session.metadata.insert(
+                SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY.to_string(),
+                serde_json::json!("someone-else"),
+            );
+            session_manager.save(session).unwrap();
+        }
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_get_session_summary(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
     }
 
     async fn dispatch_abort_turn(
