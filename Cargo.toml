@@ -117,8 +117,11 @@ crossterm = { git = "https://github.com/eitsupi/crossterm", branch = "feature/wi
 whatsapp-rust = { path = "vendor/whatsapp-rust" }
 
 [profile.release]
-opt-level = "z"   # optimize for size
-lto = true        # fat LTO (more dead-code elimination across crates)
+opt-level = "z"     # optimize for size
+lto = true          # fat LTO (more dead-code elimination across crates)
+codegen-units = 1   # one CGU so LTO can see the whole crate
+strip = true        # drop symbols from the final binary
+panic = "abort"     # no unwinding tables
 
 [target.x86_64-unknown-linux-gnu]
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
