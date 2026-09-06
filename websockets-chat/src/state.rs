@@ -35,6 +35,14 @@ pub fn next_session_id_after(sessions: &[SessionListItem], deleted_id: &str) -> 
         .map(|session| session.id.clone())
 }
 
+/// Whether the in-transcript Fork control should render next to this entry.
+///
+/// Shown on every completed assistant reply, not just the last one; hidden
+/// while a turn is in flight (`pending`) or the bubble is still streaming.
+pub fn show_fork_for_entry(entry: &ChatEntry, pending: bool) -> bool {
+    !pending && entry.role == Role::Assistant && !entry.streaming
+}
+
 /// 0-based user-message index to send as `before_user_index` when forking
 /// after `entry_id`'s assistant reply.
 ///
@@ -659,6 +667,13 @@ mod tests {
             streaming: false,
             tool_events: None,
             reasoning: None,
+        }
+    }
+
+    fn completed_assistant_entry(id: u64) -> ChatEntry {
+        ChatEntry {
+            streaming: false,
+            ..assistant_entry(id)
         }
     }
 
@@ -1464,6 +1479,20 @@ mod tests {
         assert_eq!(before_user_index_after_entry(&entries, 3), Some(2));
         assert_eq!(before_user_index_after_entry(&entries, 0), None);
         assert_eq!(before_user_index_after_entry(&entries, 99), None);
+    }
+
+    #[test]
+    fn show_fork_for_entry_is_completed_assistant_when_not_pending() {
+        let user = user_entry(0);
+        let streaming = assistant_entry(1);
+        let completed = completed_assistant_entry(2);
+
+        assert!(!show_fork_for_entry(&user, false));
+        assert!(!show_fork_for_entry(&streaming, false));
+        assert!(show_fork_for_entry(&completed, false));
+        assert!(!show_fork_for_entry(&completed, true));
+        assert!(!show_fork_for_entry(&user, true));
+        assert!(!show_fork_for_entry(&streaming, true));
     }
 
     #[test]

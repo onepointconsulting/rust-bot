@@ -11,3 +11,4 @@ pub mod skills;
 pub mod subagent;
 pub mod tools;
 pub mod workspace_context;
+pub mod autocompact;

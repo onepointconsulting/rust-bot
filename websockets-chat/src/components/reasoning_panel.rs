@@ -17,7 +17,7 @@ pub fn ReasoningPanel(text: String) -> impl IntoView {
         <div class="reasoning-panel">
             <button
                 type="button"
-                class="reasoning-panel__toggle"
+                class="reasoning-panel__toggle w-full text-left"
                 aria-expanded=move || expanded.get().to_string()
                 on:click=move |_| expanded.update(|value| *value = !*value)
             >

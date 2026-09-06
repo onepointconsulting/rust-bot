@@ -53,7 +53,7 @@ fn default_send_progress() -> bool {
 }
 
 fn default_streaming() -> bool {
-    false
+    true
 }
 
 fn default_send_max_retries() -> u8 {
@@ -296,6 +296,12 @@ fn default_agent_timezone() -> String {
 fn default_agent_dream_config() -> DreamConfig {
     DreamConfig::default()
 }
+fn default_agent_session_ttl_minutes() -> u32 {
+    15
+}
+fn default_agent_idle_compact_check_interval_seconds() -> u32 {
+    60
+}
 fn default_agent_mode() -> AgentMode {
     AgentMode::Standard
 }
@@ -436,6 +442,27 @@ pub struct AgentsConfig {
     #[garde(skip)]
     pub dream: DreamConfig,
 
+    /// Auto-compact idle threshold in minutes (0 = disabled). Matches
+    /// nanobot's `AgentDefaults.session_ttl_minutes`, whose canonical JSON
+    /// name is `idleCompactAfterMinutes` (its own field name, camelCased,
+    /// is accepted too for tolerance).
+    #[serde(
+        alias = "session_ttl_minutes",
+        alias = "idleCompactAfterMinutes",
+        alias = "idle_compact_after_minutes",
+        default = "default_agent_session_ttl_minutes"
+    )]
+    #[garde(skip)]
+    pub session_ttl_minutes: u32,
+
+    /// Minimum interval in seconds between scans for idle sessions.
+    #[serde(
+        alias = "idle_compact_check_interval_seconds",
+        default = "default_agent_idle_compact_check_interval_seconds"
+    )]
+    #[garde(skip)]
+    pub idle_compact_check_interval_seconds: u32,
+
     /// Name of a `model_presets` entry to use as the process-wide default.
     /// `None` or `"default"` both mean: use this struct's own flat
     /// `model`/`provider`/... fields (the implicit, backward-compatible
@@ -467,6 +494,8 @@ impl Default for AgentsConfig {
             reasoning_effort: None,
             timezone: default_agent_timezone(),
             dream: default_agent_dream_config(),
+            session_ttl_minutes: default_agent_session_ttl_minutes(),
+            idle_compact_check_interval_seconds: default_agent_idle_compact_check_interval_seconds(),
             model_preset: None,
             mode: default_agent_mode(),
         }

@@ -23,8 +23,8 @@ fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
 /// itself renders nothing there when `None`.
 ///
 /// `on_fork`, when set, adds a Fork control next to the copy button on an
-/// assistant bubble. The parent decides *which* bubble shows it (websockets-
-/// chat pins it to the last completed assistant reply).
+/// assistant bubble. The parent decides *which* bubbles show it (websockets-
+/// chat shows it on every completed, non-streaming assistant reply).
 ///
 /// While `streaming` is true, the in-progress indicator is the thinking
 /// spinner until the first visible token arrives, then a blinking cursor

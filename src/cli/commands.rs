@@ -1262,8 +1262,11 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                 let mut manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
                 let session = {
                     let session = manager.get_or_create_session("heartbeat");
+                    // Matches nanobot's heartbeat call (`gateway_runtime.py`), which
+                    // omits extend_to_user and so takes its default of `false`.
                     session.retain_recent_legal_suffix(
                         config.gateway.heartbeat.keep_recent_messages as usize,
+                        false,
                     );
                     session.clone()
                 };

@@ -51,7 +51,7 @@ const FORK_VOLATILE_METADATA_KEYS: &[&str] = &[
 pub struct Session {
     pub key: String,
     pub messages: Vec<Value>,
-    created_at: DateTime<Utc>,
+    pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
     pub metadata: HashMap<String, Value>,
     pub last_consolidated: usize,
@@ -155,8 +155,20 @@ impl Session {
         self.updated_at = Utc::now();
     }
 
-    /// Keep a legal recent suffix, mirroring get_history boundary rules.
-    pub fn retain_recent_legal_suffix(&mut self, max_messages: usize) {
+    /// Keep a legal recent suffix, mirroring `get_history`'s boundary rules.
+    ///
+    /// Ports nanobot's `Session.retain_recent_legal_suffix`, `extend_to_user`
+    /// included:
+    /// - `true` — search backward, with no distance limit, for the nearest
+    ///   earlier user turn so the cutoff never lands mid-turn. Used for
+    ///   idle-session compaction probes, where losing the visible-suffix
+    ///   anchor would corrupt the summary boundary.
+    /// - `false` — enforce a hard cap of `max_messages`: no unbounded
+    ///   backward search. If the capped tail turns out to contain no user
+    ///   turn at all, fall back to anchoring on the *last* user turn
+    ///   anywhere in the session and take a forward-capped window from
+    ///   there, so the retained slice is never headless.
+    pub fn retain_recent_legal_suffix(&mut self, max_messages: usize, extend_to_user: bool) {
         if max_messages == 0 {
             self.clear();
             return;
@@ -165,29 +177,48 @@ impl Session {
             return;
         }
 
-        let prev_last = self.last_consolidated;
+        let before_lc = self.last_consolidated;
+        let is_user = |m: &Value| m.get("role").and_then(|v| v.as_str()) == Some("user");
+
         let mut start_idx = self.messages.len() - max_messages;
+        let mut end_idx = self.messages.len();
 
-        // If the cutoff lands mid-turn, extend backward to the nearest user turn.
-        while start_idx > 0
-            && self.messages[start_idx]
-                .get("role")
-                .and_then(|v| v.as_str())
-                != Some("user")
-        {
-            start_idx -= 1;
+        if extend_to_user {
+            // Search backward from start_idx to 0 inclusive; if no user turn
+            // exists in that whole range, fall back to the original cut
+            // point rather than walking all the way to the front.
+            let original_start = start_idx;
+            start_idx = (0..=original_start)
+                .rev()
+                .find(|&i| is_user(&self.messages[i]))
+                .unwrap_or(original_start);
         }
 
-        self.messages = self.messages[start_idx..].to_vec();
-        let mut last_consolidated = prev_last.saturating_sub(start_idx);
-
-        let legal_trim = find_legal_message_start(&self.messages);
-        if legal_trim > 0 {
-            self.messages = self.messages[legal_trim..].to_vec();
-            last_consolidated = last_consolidated.saturating_sub(legal_trim);
+        // Prefer starting at a user turn already inside the retained window.
+        match self.messages[start_idx..end_idx].iter().position(is_user) {
+            Some(offset) => start_idx += offset,
+            None if !extend_to_user => {
+                // No user turn anywhere in the capped tail: anchor on the
+                // latest user turn in the whole session and take a
+                // forward-capped window from there.
+                if let Some(latest_user) = self.messages[..start_idx].iter().rposition(is_user) {
+                    start_idx = latest_user;
+                    end_idx = (latest_user + max_messages).min(self.messages.len());
+                }
+            }
+            None => {}
         }
 
-        self.last_consolidated = last_consolidated;
+        start_idx += find_legal_message_start(&self.messages[start_idx..end_idx]);
+
+        // Hard-cap guarantee unless the caller requested user-turn extension.
+        if !extend_to_user && end_idx - start_idx > max_messages {
+            start_idx = end_idx - max_messages;
+            start_idx += find_legal_message_start(&self.messages[start_idx..end_idx]);
+        }
+
+        self.last_consolidated = before_lc.min(end_idx).saturating_sub(start_idx);
+        self.messages = self.messages[start_idx..end_idx].to_vec();
         self.updated_at = Utc::now();
     }
 
@@ -386,6 +417,10 @@ pub struct SessionManager {
 }
 
 impl SessionManager {
+
+    pub const LAST_SUMMARY_KEY: &str = "_last_summary";
+    pub const LAST_ACTIVE_KEY: &str = "last_active";
+
     pub fn new(workspace: PathBuf) -> Self {
         Self {
             workspace: workspace.clone(),
@@ -478,6 +513,7 @@ impl SessionManager {
         let mut messages: Vec<Value> = Vec::new();
         let mut metadata: HashMap<String, Value> = HashMap::new();
         let mut created_at = Utc::now();
+        let mut updated_at = Utc::now();
         let mut last_consolidated: usize = 0;
 
         let reader = BufReader::new(file);
@@ -532,6 +568,23 @@ impl SessionManager {
                         }
                     }
                 }
+                if let Some(updated_at_val) = data.get("updated_at") {
+                    if let Some(updated_at_str) = updated_at_val.as_str() {
+                        let parsed =
+                            NaiveDateTime::parse_from_str(updated_at_str, "%Y-%m-%dT%H:%M:%S%.f")
+                                .or_else(|_| {
+                                    NaiveDateTime::parse_from_str(
+                                        updated_at_str,
+                                        "%Y-%m-%dT%H:%M:%S",
+                                    )
+                                });
+                        if let Ok(naive_dt) = parsed {
+                            updated_at = Utc.from_utc_datetime(&naive_dt);
+                        } else if let Ok(dt) = DateTime::parse_from_rfc3339(updated_at_str) {
+                            updated_at = dt.with_timezone(&Utc);
+                        }
+                    }
+                }
                 if let Some(v) = data.get("last_consolidated") {
                     last_consolidated = json_value_as_last_consolidated(v);
                 }
@@ -544,7 +597,7 @@ impl SessionManager {
             key: key.to_string(),
             messages,
             created_at,
-            updated_at: Utc::now(),
+            updated_at,
             metadata,
             last_consolidated,
         })
@@ -667,7 +720,7 @@ impl SessionManager {
 
         let mut last_consolidated = source.last_consolidated.min(copied.len());
         if source.last_consolidated > copied.len() {
-            metadata.remove("_last_summary");
+            metadata.remove(Self::LAST_SUMMARY_KEY);
             last_consolidated = 0;
         }
 
@@ -1571,7 +1624,7 @@ mod tests {
         session.last_consolidated = 3;
         let history_before = session.get_history(None);
 
-        session.retain_recent_legal_suffix(2);
+        session.retain_recent_legal_suffix(2, true);
         assert_eq!(session.messages.len(), 3);
         assert_eq!(
             session.messages[0].get("content"),
@@ -1589,7 +1642,8 @@ mod tests {
         let mut session = Session::new("k".into());
         session.messages.push(fixture_message("user", "x"));
         session.last_consolidated = 1;
-        session.retain_recent_legal_suffix(0);
+        // extend_to_user is irrelevant here: max_messages == 0 always clears.
+        session.retain_recent_legal_suffix(0, false);
         assert!(session.messages.is_empty());
         assert_eq!(session.last_consolidated, 0);
     }
@@ -1616,10 +1670,85 @@ mod tests {
         session.messages.push(fixture_message("user", "hi"));
         session.last_consolidated = 0;
 
-        session.retain_recent_legal_suffix(3);
+        session.retain_recent_legal_suffix(3, true);
         assert_eq!(session.messages.len(), 1);
         assert_eq!(session.messages[0].get("content"), Some(&json!("hi")));
         assert_eq!(session.last_consolidated, 0);
+    }
+
+    /// One assistant with 2 tool_calls + their 2 matching tool results — mirrors
+    /// nanobot's `_tool_turn` test fixture (`tests/agent/test_session_manager_history.py`).
+    fn tool_turn(prefix: &str, idx: usize) -> Vec<Value> {
+        let call_a = format!("{prefix}_{idx}_a");
+        let call_b = format!("{prefix}_{idx}_b");
+        vec![
+            json!({
+                "role": "assistant",
+                "content": null,
+                "tool_calls": [
+                    {"id": call_a, "type": "function", "function": {"name": "x", "arguments": "{}"}},
+                    {"id": call_b, "type": "function", "function": {"name": "y", "arguments": "{}"}},
+                ],
+            }),
+            json!({"role": "tool", "tool_call_id": call_a, "name": "x", "content": "ok"}),
+            json!({"role": "tool", "tool_call_id": call_b, "name": "y", "content": "ok"}),
+        ]
+    }
+
+    /// `extend_to_user: false` enforces the hard cap even when the tail is a
+    /// long run of non-user messages with no legal cut point nearby.
+    #[test]
+    fn retain_recent_legal_suffix_hard_cap_with_long_non_user_chain() {
+        let mut session = Session::new("k".into());
+        session.messages.push(fixture_message("user", "u0"));
+        let mut declares_c1 = Map::new();
+        declares_c1.insert("role".into(), json!("assistant"));
+        declares_c1.insert("content".into(), Value::Null);
+        declares_c1.insert(
+            "tool_calls".into(),
+            json!([{"id": "c1", "type": "function", "function": {"name": "x", "arguments": "{}"}}]),
+        );
+        session.messages.push(Value::Object(declares_c1));
+        for i in 0..12 {
+            session
+                .messages
+                .push(fixture_message("assistant", &format!("a{i}")));
+        }
+
+        session.retain_recent_legal_suffix(6, false);
+
+        assert!(session.messages.len() <= 6);
+    }
+
+    /// `extend_to_user: true` grows past `max_messages` rather than cutting a
+    /// long recent turn in half, and the retained suffix stays legal.
+    #[test]
+    fn retain_recent_legal_suffix_can_extend_to_user_for_long_recent_turn() {
+        let mut session = Session::new("k".into());
+        session.messages.push(fixture_message("user", "old"));
+        session
+            .messages
+            .push(fixture_message("assistant", "old answer"));
+        session
+            .messages
+            .push(fixture_message("user", "record this"));
+        for i in 0..4 {
+            session.messages.extend(tool_turn("recent", i));
+        }
+        session.messages.push(fixture_message("assistant", "done"));
+
+        session.retain_recent_legal_suffix(8, true);
+
+        assert!(session.messages.len() > 8);
+        assert_eq!(
+            session.messages[0].get("content"),
+            Some(&json!("record this"))
+        );
+        assert_eq!(
+            session.messages.last().unwrap().get("content"),
+            Some(&json!("done"))
+        );
+        assert_eq!(find_legal_message_start(&session.messages), 0);
     }
 
     #[test]
@@ -2480,7 +2609,7 @@ mod tests {
         session.metadata.insert("title".into(), json!("old title"));
         session
             .metadata
-            .insert("_last_summary".into(), json!("stale"));
+            .insert(SessionManager::LAST_SUMMARY_KEY.into(), json!("stale"));
         mgr.save(session).unwrap();
     }
 
@@ -2555,6 +2684,6 @@ mod tests {
         let forked = mgr.get_session_internal("dst").unwrap();
         assert_eq!(forked.messages.len(), 2);
         assert_eq!(forked.last_consolidated, 0);
-        assert!(!forked.metadata.contains_key("_last_summary"));
+        assert!(!forked.metadata.contains_key(SessionManager::LAST_SUMMARY_KEY));
     }
 }

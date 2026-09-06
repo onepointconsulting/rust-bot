@@ -1301,8 +1301,9 @@ async fn send_session_cleared(chat_id: &str, requester_id: &str, ws_shared: &WsS
 ///
 /// A missing `before_user_index` means "fork the whole chat" (computed as
 /// the source session's total user-message count) rather than "fork
-/// nothing" — the `websockets-chat` UI's "Fork session" menu item has no
-/// partial-fork picker, so it never sends this field.
+/// nothing" — the sidebar "Fork session" kebab omits this field. In-transcript
+/// Fork buttons send `before_user_index` so a mid-thread assistant reply
+/// can branch without copying later turns.
 async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
@@ -1319,9 +1320,9 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
     let before_user_index = match envelope.get("before_user_index").and_then(|v| v.as_u64()) {
         Some(v) => v as usize,
         None => {
-            // No frontend UI for partial fork yet — omitting the field means
-            // "fork the whole chat". Both `fork_session_before_user_index`
-            // and `fork_transcript_before_user_index` already treat an index
+            // Sidebar "Fork session" omits the field, meaning "fork the
+            // whole chat". Both `fork_session_before_user_index` and
+            // `fork_transcript_before_user_index` already treat an index
             // equal to the total user-message count as "copy everything".
             let session_manager = shared
                 .session_manager

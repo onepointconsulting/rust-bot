@@ -109,7 +109,7 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
         .prompt()?;
         match answer {
             LLM_PROVIDER => {
-                choose_providers(&mut config)?;
+                choose_providers(&mut config, true)?;
             }
             CHAT_CHANNELS => {
                 configure_channels_menu(&mut config, config_path.clone())?;
@@ -158,7 +158,7 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
 }
 
 //Configure LLM providers.
-pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
+pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, CliError> {
     let provider_names = vec![
         PROVIDER_OPENROUTER,
         PROVIDER_ANTHROPIC,
@@ -175,7 +175,9 @@ pub fn choose_providers(config: &mut Config) -> Result<Config, CliError> {
         Some(provider) => {
             configure_provider(config, &provider)?;
             configure_api_base(config, &provider)?;
-            configure_extra_headers(config, &provider)?;
+            if advanced {
+                configure_extra_headers(config, &provider)?;
+            }
             if let Some(slot) = provider_config_slot(&provider) {
                 config.agents.provider = slot.to_string();
             }

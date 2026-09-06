@@ -78,8 +78,9 @@ impl ContextBuilder {
         &self,
         skill_names: Option<&[String]>,
         channel: Option<&str>,
+        session_summary: Option<&str>,
     ) -> String {
-        self.build_system_prompt_for_mode(skill_names, channel, self.default_mode)
+        self.build_system_prompt_for_mode(skill_names, channel, self.default_mode, session_summary)
     }
 
     pub fn build_system_prompt_for_mode(
@@ -87,6 +88,11 @@ impl ContextBuilder {
         skill_names: Option<&[String]>,
         channel: Option<&str>,
         mode: AgentMode,
+        // A previous idle-session compaction's already-formatted summary
+        // text (see `Autocompact::prepare_session`), appended as its own
+        // trailing section — mirrors nanobot's `build_system_prompt(...,
+        // session_summary=...)` (`context.py:124-125`).
+        session_summary: Option<&str>,
     ) -> String {
         let mut parts: Vec<String> = Vec::new();
         if mode.include_identity() {
@@ -156,6 +162,10 @@ impl ContextBuilder {
                     .join("\n");
                 parts.push(format!("## Recent History\n\n{history_joined}"));
             }
+        }
+
+        if let Some(summary) = session_summary.filter(|s| !s.is_empty()) {
+            parts.push(format!("[Archived Context Summary]\n\n{summary}"));
         }
 
         if parts.is_empty() {
@@ -384,6 +394,7 @@ impl MessageBuilder for ContextBuilder {
         session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
         runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
+        session_summary: Option<&str>,
     ) -> Vec<serde_json::Value> {
         let mode = self.resolve_mode(session_metadata);
         let mut runtime_ctx =
@@ -438,7 +449,8 @@ impl MessageBuilder for ContextBuilder {
             }
         }
 
-        let system_content = self.build_system_prompt_for_mode(skill_names, channel, mode);
+        let system_content =
+            self.build_system_prompt_for_mode(skill_names, channel, mode, session_summary);
         let mut messages: Vec<serde_json::Value> =
             std::iter::once(serde_json::json!({"role": "system", "content": system_content}))
                 .chain(history.iter().cloned())
@@ -479,6 +491,7 @@ impl MessageBuilder for Arc<ContextBuilder> {
         session_metadata: Option<&std::collections::HashMap<String, serde_json::Value>>,
         runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
+        session_summary: Option<&str>,
     ) -> Vec<serde_json::Value> {
         self.as_ref().build_messages(
             history,
@@ -490,6 +503,7 @@ impl MessageBuilder for Arc<ContextBuilder> {
             session_metadata,
             runtime_context_blocks,
             current_role,
+            session_summary,
         )
     }
 
@@ -865,7 +879,7 @@ mod tests {
         )
         .unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         // No section should be empty — check no part between separators is blank
         for part in prompt.split("\n\n---\n\n") {
             assert!(
@@ -881,7 +895,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("SOUL.md"), "# Soul").unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             prompt.contains("\n\n---\n\n"),
             "sections should be separated by '\\n\\n---\\n\\n'"
@@ -894,7 +908,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         fs::write(tmp.path().join("SOUL.md"), "# Soul\nSome soul content.").unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             prompt.contains("Some soul content."),
             "bootstrap content should appear"
@@ -909,7 +923,7 @@ mod tests {
         fs::write(tmp.path().join("USER.md"), "user-marker").unwrap();
         fs::write(tmp.path().join("TOOLS.md"), "tools-marker").unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(prompt.contains("soul-marker"), "SOUL.md content missing");
         assert!(prompt.contains("user-marker"), "USER.md content missing");
         assert!(prompt.contains("tools-marker"), "TOOLS.md content missing");
@@ -922,7 +936,7 @@ mod tests {
         // File has trailing newlines that should be stripped.
         fs::write(tmp.path().join("SOUL.md"), "soul-marker\n\n\n").unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         let soul_section = prompt
             .split("\n\n---\n\n")
             .find(|p| p.contains("SOUL.md"))
@@ -937,7 +951,7 @@ mod tests {
     fn build_system_prompt_missing_bootstrap_files_are_skipped() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         for filename in BOOTSTRAP_FILES {
             assert!(
                 !prompt.contains(filename),
@@ -951,7 +965,7 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         write_memory_md(&tmp, "# Memory\nRemember this important fact.");
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             prompt.contains("Remember this important fact."),
             "memory content should appear in prompt"
@@ -962,7 +976,7 @@ mod tests {
     fn build_system_prompt_no_memory_section_when_absent() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         // get_memory_context emits "## Long-term memory:\n..." only when content exists.
         assert!(
             !prompt.contains("## Long-term memory:"),
@@ -980,7 +994,7 @@ mod tests {
             "# Eager body",
         );
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             prompt.contains("Active Skills"),
             "Active Skills section should be present"
@@ -1001,7 +1015,7 @@ mod tests {
             "# Lazy body",
         );
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             !prompt.contains("Active Skills"),
             "non-always skill should not create Active Skills section"
@@ -1023,7 +1037,7 @@ mod tests {
             ],
         );
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             prompt.contains("[2026-01-01 10:00] first entry"),
             "first entry should be formatted as [ts] content"
@@ -1047,7 +1061,7 @@ mod tests {
             .collect();
         write_history_entries(&tmp, &refs);
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         // Entries 1-5 should be dropped
         for i in 1u32..=5 {
             assert!(
@@ -1065,7 +1079,7 @@ mod tests {
     fn build_system_prompt_history_section_absent_when_no_entries() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert!(
             !prompt.contains("Recent History"),
             "history section should be absent when there are no history entries"
@@ -1076,7 +1090,7 @@ mod tests {
     fn build_system_prompt_channel_telegram_propagates_to_identity() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let prompt = b.build_system_prompt(None, Some("telegram"));
+        let prompt = b.build_system_prompt(None, Some("telegram"), None);
         assert!(
             prompt.contains("messaging app"),
             "telegram channel hint should appear in prompt"
@@ -1100,7 +1114,7 @@ mod tests {
         );
         write_history_entries(&tmp, &[("2026-01-01 10:00", "history-should-hide")]);
         let b = make_minimal_builder(&tmp);
-        let prompt = b.build_system_prompt(None, Some("telegram"));
+        let prompt = b.build_system_prompt(None, Some("telegram"), None);
         assert!(prompt.contains("soul-only-marker"));
         assert!(prompt.contains("user-only-marker"));
         assert!(!prompt.contains("agents-should-hide"));
@@ -1119,14 +1133,14 @@ mod tests {
     fn minimal_prompt_falls_back_when_soul_and_user_missing() {
         let tmp = TempDir::new().unwrap();
         let b = make_minimal_builder(&tmp);
-        let prompt = b.build_system_prompt(None, None);
+        let prompt = b.build_system_prompt(None, None, None);
         assert_eq!(prompt, "You are a helpful software engineer assistant.");
     }
 
     // ── build_messages ───────────────────────────────────────────────────────
 
     fn bm(b: &ContextBuilder, text: &str) -> Vec<serde_json::Value> {
-        b.build_messages(&[], text, None, None, None, None, None, None, "user")
+        b.build_messages(&[], text, None, None, None, None, None, None, "user", None)
     }
 
     #[test]
@@ -1170,6 +1184,7 @@ mod tests {
             None,
             None,
             "user",
+            None,
         );
         assert_eq!(msgs.len(), 4, "system + 2 history + 1 new user");
         assert_eq!(msgs[0]["role"], "system");
@@ -1194,6 +1209,7 @@ mod tests {
             None,
             None,
             "user",
+            None,
         );
         // system + merged-user (no extra message appended)
         assert_eq!(msgs.len(), 2, "should merge, not append");
@@ -1224,6 +1240,7 @@ mod tests {
             None,
             None,
             "user",
+            None,
         );
         // system + assistant history + new user
         assert_eq!(msgs.len(), 3, "should not merge across different roles");
@@ -1251,6 +1268,7 @@ mod tests {
             None,
             None,
             "user",
+            None,
         );
         let system = msgs[0]["content"].as_str().unwrap();
         assert!(
@@ -1273,6 +1291,7 @@ mod tests {
             None,
             None,
             "user",
+            None,
         );
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(
@@ -1305,6 +1324,7 @@ mod tests {
             None,
             None,
             "tool",
+            None,
         );
         assert_eq!(msgs[1]["role"], "tool");
     }
@@ -1327,6 +1347,7 @@ mod tests {
             Some(&session.metadata),
             None,
             "user",
+            None,
         );
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(
@@ -1351,6 +1372,7 @@ mod tests {
             Some(&session.metadata),
             None,
             "user",
+            None,
         );
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(
@@ -1379,6 +1401,7 @@ mod tests {
             None,
             Some(&blocks),
             "user",
+            None,
         );
         let user_content = msgs[1]["content"].as_str().unwrap();
         assert!(
@@ -1415,6 +1438,7 @@ mod tests {
             None,
             Some(&blocks),
             "user",
+            None,
         );
         let arr = msgs[1]["content"].as_array().expect("should be an array");
         let last = arr.last().unwrap();
@@ -1426,9 +1450,9 @@ mod tests {
     fn build_messages_no_runtime_context_blocks_leaves_output_unchanged() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let with_none = b.build_messages(&[], "hi", None, None, None, None, None, None, "user");
+        let with_none = b.build_messages(&[], "hi", None, None, None, None, None, None, "user", None);
         let with_empty_slice =
-            b.build_messages(&[], "hi", None, None, None, None, None, Some(&[]), "user");
+            b.build_messages(&[], "hi", None, None, None, None, None, Some(&[]), "user", None);
         assert_eq!(with_none, with_empty_slice);
     }
 

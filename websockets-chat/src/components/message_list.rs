@@ -18,6 +18,7 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 
 use crate::components::{ReasoningPanel, ToolActivity};
+use crate::state::show_fork_for_entry;
 
 /// How close to the bottom (CSS pixels) still counts as pinned. Absorbs
 /// trackpad jitter and the one-frame gap after streamed content grows the
@@ -91,15 +92,6 @@ fn entry_render_key(entry: &ChatEntry, show_fork: bool) -> (u64, String, bool, S
         format!("{:?}|{:?}", entry.tool_events, entry.reasoning),
         show_fork,
     )
-}
-
-/// Most recent completed assistant bubble, if any. Used to pin the in-transcript
-/// Fork control to that reply (and to hide it while a turn is still streaming).
-fn last_completed_assistant_id(entries: &[ChatEntry]) -> Option<u64> {
-    entries
-        .iter()
-        .rev()
-        .find_map(|entry| (entry.role == Role::Assistant && !entry.streaming).then_some(entry.id))
 }
 
 /// One transcript entry, with a `ToolActivity`/`ReasoningPanel` slot injected
@@ -275,16 +267,12 @@ pub fn MessageList(
             </Show>
             <For
                 each=move || {
-                    let entries = entries.get();
-                    let fork_id = if pending.get() {
-                        None
-                    } else {
-                        last_completed_assistant_id(&entries)
-                    };
+                    let pending = pending.get();
                     entries
+                        .get()
                         .into_iter()
                         .map(|entry| {
-                            let show_fork = fork_id == Some(entry.id);
+                            let show_fork = show_fork_for_entry(&entry, pending);
                             (entry, show_fork)
                         })
                         .collect::<Vec<_>>()

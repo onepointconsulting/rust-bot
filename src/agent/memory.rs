@@ -692,6 +692,11 @@ pub trait MessageBuilder: Send + Sync {
         // being resolved once per request, ahead of context assembly.
         runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
         current_role: &str,
+        // A previous idle-session compaction's summary text, formatted and
+        // ready to inject (see `Autocompact::prepare_session`) — distinct
+        // from `session_metadata`, which is the session's own raw metadata
+        // map. `None` when there is nothing pending.
+        session_summary: Option<&str>,
     ) -> Vec<serde_json::Value>;
 
     /// Get tool definitions with stable ordering for cache-friendly prompts.
@@ -779,6 +784,7 @@ impl Consolidator {
             None,
             None,
             "user",
+            None,
         );
         let (estimated, source) = estimate_prompt_tokens_chain(
             probe_messages.as_slice(),
@@ -787,11 +793,30 @@ impl Consolidator {
         (estimated as u64, source)
     }
 
-    /// Summarize messages via LLM and append to history.jsonl.
-    /// Returns True on success (or degraded success), False if nothing to do.
-    pub async fn archive(&self, messages: &Vec<serde_json::Value>, session_key: &str) -> bool {
+    /// Summarize *messages* via LLM and append the result to `history.jsonl`.
+    ///
+    /// Mirrors nanobot's `Consolidator.archive`: returns the summary text
+    /// that was actually persisted on success, or `None` when the provider
+    /// call itself failed (`finish_reason == "error"`) — in which case
+    /// *messages* is raw-archived instead so nothing is silently lost.
+    ///
+    /// `summary_messages`, when given, replaces `messages` as the LLM's
+    /// input (richer context — e.g. a still-visible suffix that shouldn't
+    /// itself be archived) while `messages` remains what gets raw-dumped on
+    /// failure.
+    ///
+    /// `runtime_override`, when given, is used as-is instead of resolving a
+    /// runtime from `session_key` (used by [`Self::compact_idle_session`],
+    /// whose caller already resolved one for the full session).
+    pub async fn archive(
+        &self,
+        messages: &[serde_json::Value],
+        session_key: &str,
+        summary_messages: Option<&[serde_json::Value]>,
+        runtime_override: Option<&ModelRuntime>,
+    ) -> Option<String> {
         if messages.is_empty() {
-            return false;
+            return None;
         }
         let system_prompt =
             match render_template("agent/consolidator_archive.md", &Context::new(), true) {
@@ -801,10 +826,19 @@ impl Consolidator {
                     String::new()
                 }
             };
-        let formatted = MemoryStore::format_messages(messages);
-        let runtime = self
-            .runtime_resolver
-            .resolve_for_session_key(&self.sessions, session_key);
+        let formatted = MemoryStore::format_messages(summary_messages.unwrap_or(messages));
+
+        let resolved_runtime;
+        let runtime: &ModelRuntime = match runtime_override {
+            Some(r) => r,
+            None => {
+                resolved_runtime = self
+                    .runtime_resolver
+                    .resolve_for_session_key(&self.sessions, session_key);
+                &resolved_runtime
+            }
+        };
+
         let response = runtime
             .provider
             .chat_with_retry(
@@ -826,6 +860,13 @@ impl Consolidator {
                 None,
             )
             .await;
+
+        if response.finish_reason == "error" {
+            log::warn!("Consolidation provider returned an error, raw-dumping to history");
+            self.store.raw_archive(messages);
+            return None;
+        }
+
         // Match `append_history`: treat blank / whitespace-only summaries like missing output.
         let summary_entry = response.content.as_ref().and_then(|entry| {
             let mut c = strip_think(entry.trim_end());
@@ -841,13 +882,14 @@ impl Consolidator {
         match summary_entry {
             Some(s) => {
                 self.store.append_history(s);
+                Some(s.to_string())
             }
             None => {
                 log::warn!("Consolidation LLM call failed, raw-dumping to history.");
-                self.store.raw_archive(messages)
+                self.store.raw_archive(messages);
+                None
             }
         }
-        return true;
     }
 
     /// Loop: archive old messages until prompt fits within safe budget.
@@ -924,7 +966,7 @@ impl Consolidator {
                 return;
             };
 
-            if !self.archive(&chunk, session_key).await {
+            if self.archive(&chunk, session_key, None, None).await.is_none() {
                 return;
             }
 
@@ -958,6 +1000,119 @@ impl Consolidator {
             .entry(session_key.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Archive an idle session's un-replayed prefix and hide it from replay
+    /// without deleting it.
+    ///
+    /// Mirrors nanobot's `Consolidator.compact_idle_session`: the returned
+    /// `Some(String::new())` means there was nothing to archive (an empty
+    /// tail, or the tail already fits within `max_suffix`); `Some(text)` is
+    /// the archived summary; `None` means the provider call itself failed
+    /// (the dropped messages were raw-archived instead, and the replay
+    /// boundary still advances so a failed session doesn't get stuck
+    /// re-summarizing the same prefix forever).
+    pub async fn compact_idle_session(
+        &self,
+        session_key: &str,
+        runtime: ModelRuntime,
+        max_suffix: usize,
+    ) -> Option<String> {
+        let lock = self.get_lock(session_key);
+        let _guard = lock.lock().await;
+
+        // Force a fresh reload so this pass never works from a stale cached
+        // session while some other task may have mutated it concurrently.
+        let mut session = {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            sessions.invalidate(session_key);
+            sessions.get_or_create_session(session_key).clone()
+        };
+
+        let start = session.last_consolidated.min(session.messages.len());
+        let messages_to_summarize = session.messages[start..].to_vec();
+        if messages_to_summarize.is_empty() {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = sessions.save(session) {
+                log::error!("Failed to save session {session_key} after idle compact: {e}");
+            }
+            return Some(String::new());
+        }
+
+        // Probe: how much of the tail would a legal recent-suffix retention
+        // drop? The probe always starts at last_consolidated == 0, so
+        // nothing in it counts as already-consolidated — any messages it
+        // drops are exactly the ones this pass needs to summarize.
+        let mut probe = Session {
+            key: session.key.clone(),
+            messages: messages_to_summarize.clone(),
+            created_at: session.created_at,
+            updated_at: session.updated_at,
+            metadata: HashMap::new(),
+            last_consolidated: 0,
+        };
+        probe.retain_recent_legal_suffix(max_suffix, true);
+        let visible_suffix = probe.messages;
+        let dropped_count = messages_to_summarize.len() - visible_suffix.len();
+
+        if dropped_count == 0 {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = sessions.save(session) {
+                log::error!("Failed to save session {session_key} after idle compact: {e}");
+            }
+            return Some(String::new());
+        }
+        let messages_to_remove = &messages_to_summarize[..dropped_count];
+
+        let last_active = session.updated_at;
+        // The visible suffix informs the summary but stays out of the raw
+        // fallback dump if the provider call fails.
+        let summary = self
+            .archive(
+                messages_to_remove,
+                session_key,
+                Some(messages_to_summarize.as_slice()),
+                Some(&runtime),
+            )
+            .await;
+
+        if let Some(text) = summary.as_deref() {
+            if text != "(nothing)" {
+                let mut summary_meta = serde_json::Map::new();
+                summary_meta.insert("text".to_string(), serde_json::Value::String(text.to_string()));
+                summary_meta.insert(
+                    SessionManager::LAST_ACTIVE_KEY.to_string(),
+                    serde_json::Value::String(last_active.to_rfc3339()),
+                );
+                session.metadata.insert(
+                    SessionManager::LAST_SUMMARY_KEY.to_string(),
+                    serde_json::Value::Object(summary_meta),
+                );
+                log::info!("session {session_key} archived; summary={text}");
+            } else {
+                log::error!("session {session_key} failed to archive; no summary metadata");
+            }
+        }
+
+        // Preserve history and advance only the replay boundary.
+        session.last_consolidated = session.messages.len() - visible_suffix.len();
+
+        log::info!(
+            "Idle-session compact for {session_key}: archived={}, visible={}, retained={}, summary={}",
+            messages_to_remove.len(),
+            visible_suffix.len(),
+            session.messages.len(),
+            summary.is_some(),
+        );
+
+        {
+            let mut sessions = self.sessions.lock().unwrap_or_else(|e| e.into_inner());
+            if let Err(e) = sessions.save(session) {
+                log::error!("Failed to save session {session_key} after idle compact: {e}");
+            }
+        }
+
+        summary
     }
 }
 
@@ -1279,6 +1434,7 @@ mod tests {
             _session_metadata: Option<&HashMap<String, serde_json::Value>>,
             _runtime_context_blocks: Option<&[crate::runtime_context::RuntimeContextBlock]>,
             _current_role: &str,
+            _session_summary: Option<&str>,
         ) -> Vec<serde_json::Value> {
             vec![]
         }
@@ -1380,6 +1536,12 @@ mod tests {
 
     fn test_runtime_resolver(provider: Arc<dyn LLMProviderDyn>) -> Arc<ModelRuntimeResolver> {
         Arc::new(ModelRuntimeResolver::new(Config::default(), provider))
+    }
+
+    /// A `ModelRuntime` for tests that call `compact_idle_session` directly
+    /// (it takes a caller-resolved runtime rather than resolving its own).
+    fn test_runtime(provider: Arc<dyn LLMProviderDyn>) -> ModelRuntime {
+        test_runtime_resolver(provider).current_default()
     }
 
     fn test_consolidator(tmp: &TempDir, provider: Arc<dyn LLMProviderDyn>) -> Consolidator {
@@ -1590,7 +1752,7 @@ mod tests {
         let mut resp = LLMResponse::new();
         resp.content = Some("should-not-be-used".into());
         let c = test_consolidator(&tmp, ArchiveTestProvider::arc(resp));
-        assert!(!c.archive(&vec![], "test-session").await);
+        assert!(c.archive(&[], "test-session", None, None).await.is_none());
         assert!(
             !c.store.history_file.exists()
                 || fs::metadata(&c.store.history_file).unwrap().len() == 0
@@ -1608,7 +1770,10 @@ mod tests {
             "content": "hello archive",
             "timestamp": "2026-01-01T12:00:00Z",
         })];
-        assert!(c.archive(&messages, "test-session").await);
+        assert_eq!(
+            c.archive(&messages, "test-session", None, None).await,
+            Some("consolidated-summary-unique-xyz".to_string())
+        );
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
@@ -1629,7 +1794,7 @@ mod tests {
             "content": "fall back",
             "timestamp": "2026-02-02T15:00:00Z",
         })];
-        assert!(c.archive(&messages, "test-session").await);
+        assert!(c.archive(&messages, "test-session", None, None).await.is_none());
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
@@ -1666,12 +1831,210 @@ mod tests {
             "content": "only whitespace summary",
             "timestamp": "2026-03-03T10:00:00Z",
         })];
-        assert!(c.archive(&messages, "test-session").await);
+        assert_eq!(
+            c.archive(&messages, "test-session", None, None).await,
+            Some("[no summary]".to_string())
+        );
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
         let content = row.get("content").and_then(|v| v.as_str()).unwrap_or("");
         assert_eq!(content, "[no summary]", "got: {content:?}");
+    }
+
+    // ── compact_idle_session tests ─────────────────────────────────────────
+
+    #[tokio::test]
+    async fn compact_idle_session_archives_prefix_preserves_messages_and_hides_prefix() {
+        let tmp = TempDir::new().unwrap();
+        let mut resp = LLMResponse::new();
+        resp.content = Some("Summary of old conversation.".into());
+        resp.finish_reason = "stop".into();
+        let provider = ArchiveTestProvider::arc(resp);
+        let runtime = test_runtime(provider.clone());
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+
+        let mut session = Session::new("cli:test".into());
+        let old_ts = session.updated_at;
+        for i in 0..20 {
+            session.add_message("user", format!("user msg {i}"), serde_json::Map::new());
+            session.add_message("assistant", format!("assistant msg {i}"), serde_json::Map::new());
+        }
+        session.updated_at = old_ts;
+        sessions.lock().unwrap().save(session).unwrap();
+
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            test_runtime_resolver(provider),
+            sessions.clone(),
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
+        );
+
+        let result = c.compact_idle_session("cli:test", runtime, 8).await;
+        assert_eq!(result, Some("Summary of old conversation.".to_string()));
+
+        let reloaded = {
+            let mut guard = sessions.lock().unwrap();
+            guard.invalidate("cli:test");
+            guard.get_or_create_session("cli:test").clone()
+        };
+
+        assert_eq!(reloaded.messages.len(), 40);
+        assert_eq!(
+            reloaded.messages[0].get("content"),
+            Some(&json!("user msg 0"))
+        );
+        assert_eq!(reloaded.last_consolidated, 32);
+        let visible = reloaded.get_history(Some(40));
+        assert_eq!(visible.len(), 8);
+        assert_eq!(visible[0].get("content"), Some(&json!("user msg 16")));
+        assert_eq!(
+            visible.last().unwrap().get("content"),
+            Some(&json!("assistant msg 19"))
+        );
+        let meta = reloaded
+            .metadata
+            .get(SessionManager::LAST_SUMMARY_KEY)
+            .expect("summary metadata written");
+        assert_eq!(
+            meta.get("text"),
+            Some(&json!("Summary of old conversation."))
+        );
+        assert!(meta.get(SessionManager::LAST_ACTIVE_KEY).is_some());
+        assert_eq!(reloaded.updated_at, old_ts, "updated_at must be untouched");
+    }
+
+    #[tokio::test]
+    async fn compact_idle_session_llm_failure_raw_dumps_and_advances_boundary() {
+        let tmp = TempDir::new().unwrap();
+        let mut resp = LLMResponse::new();
+        resp.content = None;
+        resp.finish_reason = "error".into();
+        let provider = ArchiveTestProvider::arc(resp);
+        let runtime = test_runtime(provider.clone());
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+
+        let mut session = Session::new("cli:fail".into());
+        for i in 0..10 {
+            session.add_message("user", format!("u{i}"), serde_json::Map::new());
+            session.add_message("assistant", format!("a{i}"), serde_json::Map::new());
+        }
+        sessions.lock().unwrap().save(session).unwrap();
+
+        let store = Arc::new(make_store(&tmp));
+        let c = Consolidator::new(
+            store.clone(),
+            test_runtime_resolver(provider),
+            sessions.clone(),
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
+        );
+
+        let result = c.compact_idle_session("cli:fail", runtime, 4).await;
+        assert!(result.is_none());
+
+        let entries = store.read_unprocessed_history(0);
+        assert!(
+            entries.iter().any(|e| e
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains(RAW_MARKER)),
+            "expected a [RAW] entry in history.jsonl after a failed provider call"
+        );
+
+        let reloaded = {
+            let mut guard = sessions.lock().unwrap();
+            guard.invalidate("cli:fail");
+            guard.get_or_create_session("cli:fail").clone()
+        };
+        assert_eq!(reloaded.messages.len(), 20, "raw dump must not delete history");
+        assert_eq!(reloaded.messages[0].get("content"), Some(&json!("u0")));
+        assert_eq!(reloaded.last_consolidated, 16, "boundary still advances on failure");
+        let visible: Vec<String> = reloaded
+            .get_history(Some(20))
+            .iter()
+            .map(|m| m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .collect();
+        assert_eq!(visible, vec!["u8", "a8", "u9", "a9"]);
+    }
+
+    #[tokio::test]
+    async fn compact_idle_session_nothing_summary_not_stored() {
+        let tmp = TempDir::new().unwrap();
+        let mut resp = LLMResponse::new();
+        resp.content = Some("(nothing)".into());
+        resp.finish_reason = "stop".into();
+        let provider = ArchiveTestProvider::arc(resp);
+        let runtime = test_runtime(provider.clone());
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+
+        let mut session = Session::new("cli:nothing".into());
+        for i in 0..10 {
+            session.add_message("user", format!("u{i}"), serde_json::Map::new());
+            session.add_message("assistant", format!("a{i}"), serde_json::Map::new());
+        }
+        sessions.lock().unwrap().save(session).unwrap();
+
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            test_runtime_resolver(provider),
+            sessions.clone(),
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
+        );
+
+        let result = c.compact_idle_session("cli:nothing", runtime, 4).await;
+        assert_eq!(result, Some("(nothing)".to_string()));
+
+        let reloaded = {
+            let mut guard = sessions.lock().unwrap();
+            guard.invalidate("cli:nothing");
+            guard.get_or_create_session("cli:nothing").clone()
+        };
+        assert!(
+            !reloaded.metadata.contains_key(SessionManager::LAST_SUMMARY_KEY),
+            "a literal '(nothing)' summary must not be persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn compact_idle_session_empty_session_is_noop() {
+        let tmp = TempDir::new().unwrap();
+        let mut resp = LLMResponse::new();
+        resp.content = Some("should-not-be-used".into());
+        let provider = ArchiveTestProvider::arc(resp);
+        let runtime = test_runtime(provider.clone());
+        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+
+        let old_ts = chrono::Utc::now() - chrono::Duration::hours(2);
+        let mut session = Session::new("cli:empty".into());
+        session.updated_at = old_ts;
+        sessions.lock().unwrap().save(session).unwrap();
+
+        let c = Consolidator::new(
+            Arc::new(make_store(&tmp)),
+            test_runtime_resolver(provider),
+            sessions.clone(),
+            65_536,
+            Box::new(StubArchiveMessageBuilder),
+            8192,
+        );
+
+        let result = c.compact_idle_session("cli:empty", runtime, 8).await;
+        assert_eq!(result, Some(String::new()));
+
+        let reloaded = {
+            let mut guard = sessions.lock().unwrap();
+            guard.invalidate("cli:empty");
+            guard.get_or_create_session("cli:empty").clone()
+        };
+        assert_eq!(reloaded.updated_at, old_ts, "an idle-but-empty session's timestamp must not look active");
+        assert!(reloaded.metadata.is_empty());
     }
 
     #[test]

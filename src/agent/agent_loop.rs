@@ -15,6 +15,7 @@ use tokio::sync::Mutex as AsyncMutex;
 use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
+use crate::agent::autocompact::Autocompact;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
 use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
@@ -379,6 +380,10 @@ pub struct AgentLoop {
     concurrency_gate: Option<Arc<Semaphore>>,
     pub consolidator: Arc<Consolidator>,
     pub dream: Arc<Dream>,
+    pub auto_compact: Arc<Autocompact>,
+    /// Minimum interval between `Autocompact::check_expired` scans, matching
+    /// nanobot's `_idle_compact_check_interval_s` (`loop.py:1099-1104`).
+    idle_compact_check_interval: Duration,
     commands: CommandRouter,
 }
 
@@ -476,6 +481,13 @@ impl AgentLoop {
             Box::new(Arc::clone(&context)),
             max_tool_result_chars as usize,
         ));
+        let auto_compact = Arc::new(Autocompact::new(
+            session_manager.clone(),
+            Arc::clone(&consolidator),
+            agents_cfg.session_ttl_minutes as i64,
+        ));
+        let idle_compact_check_interval =
+            Duration::from_secs(agents_cfg.idle_compact_check_interval_seconds as u64);
 
         let dream_cfg = agents_cfg.dream.clone();
 
@@ -523,6 +535,8 @@ impl AgentLoop {
                 dream_cfg.max_iterations as usize,
                 max_tool_result_chars as usize,
             )),
+            auto_compact,
+            idle_compact_check_interval,
             commands: {
                 let mut router = CommandRouter::new();
                 register_builtin_commands(&mut router);
@@ -1159,20 +1173,64 @@ impl AgentLoop {
         }
     }
 
+    /// Scan idle sessions and schedule background archival, no more often
+    /// than once per `idle_compact_check_interval` — `next_check_at` is the
+    /// caller's throttle gate, advanced here on every actual scan. Mirrors
+    /// nanobot's `_check_expired_sessions_if_due` (`loop.py:1099-1109`).
+    async fn check_expired_sessions_if_due(self: &Arc<Self>, next_check_at: &mut Instant) {
+        let now = Instant::now();
+        if now < *next_check_at {
+            return;
+        }
+        *next_check_at = now + self.idle_compact_check_interval;
+
+        let active_session_keys: Vec<String> = {
+            let active_tasks = self.active_tasks.lock().await;
+            active_tasks.keys().cloned().collect()
+        };
+        let this = Arc::clone(self);
+        self.auto_compact.check_expired(
+            move |fut| {
+                // `Autocompact::check_expired` hands us a boxed future
+                // fire-and-forget (nanobot's `schedule_background` is sync
+                // too); `AgentLoop::schedule_background` is async only to
+                // acquire the task-registry lock, so spawn a tiny task to
+                // drive that await without blocking this scan.
+                let this = Arc::clone(&this);
+                tokio::spawn(async move {
+                    this.schedule_background(fut).await;
+                });
+            },
+            |session| self.runtime_resolver.runtime_for_session(Some(session)),
+            &active_session_keys,
+        );
+    }
+
     /// Run the agent loop, dispatching messages as tasks to stay responsive to /stop.
     pub async fn run(self: &Arc<Self>) {
         self.running.store(true, Ordering::Relaxed);
         self.connect_mcp().await;
         log::info!("Agent loop started");
+        // Local to this call: `_check_expired_sessions_if_due`'s throttle gate
+        // (`loop.py`'s `_next_idle_compact_check_at`) only needs to live for
+        // one `run()` invocation, so a plain local avoids adding shared
+        // mutable state to `AgentLoop` itself.
+        let mut next_idle_compact_check_at = Instant::now();
         while self.running.load(Ordering::Relaxed) {
             // `consume_inbound` takes `&self` (the receiver is locked internally),
             // so producers can keep publishing while we wait here.
             let msg = match tokio::time::timeout(Duration::from_secs(1), self.bus.consume_inbound())
                 .await
             {
-                Ok(Some(msg)) => msg,      // got a message
-                Ok(None) => break,         // channel closed (all senders dropped)
-                Err(_elapsed) => continue, // timed out → poll again
+                Ok(Some(msg)) => msg, // got a message
+                Ok(None) => break,    // channel closed (all senders dropped)
+                Err(_elapsed) => {
+                    // Timed out → poll again, but first check whether it's
+                    // due to scan for idle sessions to auto-compact.
+                    self.check_expired_sessions_if_due(&mut next_idle_compact_check_at)
+                        .await;
+                    continue;
+                }
             };
             let raw = msg.content.trim();
             if self.commands.is_priority(raw) {
@@ -1488,13 +1546,17 @@ impl AgentLoop {
         );
 
         // Re-read the session AFTER consolidation so history reflects any archiving.
-        let mut snapshot = {
+        let snapshot = {
             let mut manager = self
                 .session_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             manager.get_or_create_session(&key).clone()
         };
+        // Pick up any idle-compaction summary produced since this session was
+        // last used, refreshing `snapshot` again if a background archive is
+        // still in flight (or the session still looks idle-expired).
+        let (mut snapshot, pending_summary) = self.auto_compact.prepare_session(snapshot, &key);
 
         let history = snapshot.get_history(Some(0));
         let turn_runtime = self.runtime_resolver.runtime_for_session(Some(&snapshot));
@@ -1511,6 +1573,7 @@ impl AgentLoop {
             Some(&snapshot.metadata),
             (!runtime_context_blocks.is_empty()).then_some(runtime_context_blocks.as_slice()),
             current_role,
+            pending_summary.as_deref(),
         );
         let agent_run_result = self
             .run_agent_loop(
@@ -1875,13 +1938,17 @@ impl AgentLoop {
         }
 
         // Re-read the session AFTER consolidation so history reflects any archiving.
-        let mut session = {
+        let session = {
             let mut session_manager = self
                 .session_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             session_manager.get_or_create_session(&key).clone()
         };
+        // Pick up any idle-compaction summary produced since this session was
+        // last used, refreshing `session` again if a background archive is
+        // still in flight (or the session still looks idle-expired).
+        let (mut session, pending_summary) = self.auto_compact.prepare_session(session, &key);
         let history = session.get_history(Some(0));
         let media = if !msg.media.is_empty() {
             Some(&msg.media.as_slice()[..])
@@ -1901,6 +1968,7 @@ impl AgentLoop {
             Some(&session.metadata),
             (!runtime_context_blocks.is_empty()).then_some(runtime_context_blocks.as_slice()),
             DEFAULT_CURRENT_ROLE,
+            pending_summary.as_deref(),
         );
 
         let bus_progress: ProgressCallback = {
