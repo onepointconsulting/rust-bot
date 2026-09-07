@@ -11,7 +11,6 @@ use regex::Regex;
 use serde_json::{Map, Value, json};
 
 use tera::Context;
-use whatsapp_rust::session;
 
 use crate::{
     agent::model_runtime::ModelRuntime,

@@ -6,11 +6,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use reqwest::multipart;
 
-pub const GROQ_DEFAULT_MODEL: &'static str = "whisper-large-v3";
-pub const OPENAI_DEFAULT_MODEL: &'static str = "whisper-1";
-pub const GROQ_DEFAULT_API_URL: &'static str =
+pub const GROQ_DEFAULT_MODEL: &str = "whisper-large-v3";
+pub const OPENAI_DEFAULT_MODEL: &str = "whisper-1";
+pub const GROQ_DEFAULT_API_URL: &str =
     "https://api.groq.com/openai/v1/audio/transcriptions";
-pub const OPENAI_DEFAULT_API_URL: &'static str = "https://api.openai.com/v1/audio/transcriptions";
+pub const OPENAI_DEFAULT_API_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
 
 fn convert_path(file_path: PathLike) -> PathBuf {
     let path: PathBuf = match file_path {

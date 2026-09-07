@@ -234,7 +234,10 @@ impl LLMResponse {
 }
 
 pub struct GenerationSettings {
-    temperature: f32,
+    /// Sampling temperature hint for the provider. Not yet consumed by the
+    /// wire builders (they take their own `temperature` parameter), but kept
+    /// public as part of the settings API and asserted on in tests.
+    pub temperature: f32,
     max_tokens: usize,
     reasoning_effort: Option<String>,
 }

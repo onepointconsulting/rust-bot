@@ -93,7 +93,7 @@ impl MessageTool {
     }
 }
 
-pub const MESSAGE_TOOL_NAME: &'static str = "message";
+pub const MESSAGE_TOOL_NAME: &str = "message";
 
 #[async_trait]
 impl Tool for MessageTool {

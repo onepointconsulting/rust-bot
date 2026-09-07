@@ -126,6 +126,3 @@ strip = true        # drop symbols from the final binary
 # `-C prefer-dynamic` and link the prebuilt libstd (panic_unwind). Mixing that
 # with abort fails with: "the linked panic runtime `panic_unwind` is not
 # compiled with this crate's panic strategy `abort`".
-
-[target.x86_64-unknown-linux-gnu]
-rustflags = ["-C", "link-arg=-fuse-ld=lld"]

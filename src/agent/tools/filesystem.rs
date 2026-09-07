@@ -316,7 +316,7 @@ impl WriteFileTool {
 
 impl ListDirTool {
     const DEFAULT_MAX: usize = 200;
-    pub(crate) const IGNORE_DIRS: &'static [&'static str] =
+    pub(crate) const IGNORE_DIRS: &[&str] =
         &[".git", "node_modules", "__pycache__", ".venv", "target"];
 
     pub fn new(

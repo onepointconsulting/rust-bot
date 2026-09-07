@@ -25,12 +25,12 @@ use tera::Context;
 
 const DEFAULT_MAX_HISTORY: usize = 1000;
 
-const RAW_MARKER: &'static str = "[RAW]";
-const MEMORY_FILE: &'static str = "MEMORY.md";
-const HISTORY_FILE: &'static str = "history.jsonl";
-const CURSOR_FILE: &'static str = ".cursor";
-const DREAM_CURSOR_FILE: &'static str = ".dream_cursor";
-const LEGACY_HISTORY_BACKUP: &'static str = "HISTORY.md.bak";
+const RAW_MARKER: &str = "[RAW]";
+const MEMORY_FILE: &str = "MEMORY.md";
+const HISTORY_FILE: &str = "history.jsonl";
+const CURSOR_FILE: &str = ".cursor";
+const DREAM_CURSOR_FILE: &str = ".dream_cursor";
+const LEGACY_HISTORY_BACKUP: &str = "HISTORY.md.bak";
 
 static LEGACY_ENTRY_START: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"^\[(\d{4}-\d{2}-\d{2}[^\]]*)\]\s*").unwrap());

@@ -536,7 +536,6 @@ fn handle_stream_end(
     let Some(turn_id) = ctx.active_turn_id.get_untracked() else {
         return;
     };
-    let resuming = resuming.unwrap_or(false);
     let merge_next = merge_next.unwrap_or(false);
     update_entries(ctx, |entries, index| {
         state::apply_stream_end(entries, index, &turn_id, text.as_deref());
@@ -544,10 +543,14 @@ fn handle_stream_end(
             state::reopen_streaming(entries, index, &turn_id);
         }
     });
-    if merge_next {
-        ctx.split_stream_on_next_delta.set(false);
-    } else if resuming {
-        ctx.split_stream_on_next_delta.set(true);
+    if state::stream_end_continues_turn(resuming, Some(merge_next)) {
+        if merge_next {
+            ctx.split_stream_on_next_delta.set(false);
+        } else {
+            // `resuming`: tool calls follow and the next LLM round continues
+            // this turn — open a new bubble when its first delta lands.
+            ctx.split_stream_on_next_delta.set(true);
+        }
     } else {
         ctx.split_stream_on_next_delta.set(false);
         ctx.active_turn_id.set(None);

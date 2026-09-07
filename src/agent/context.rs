@@ -18,10 +18,10 @@ use crate::{
     },
 };
 
-pub const AGENTS_FILE: &'static str = "AGENTS.md";
-pub const SOUL_FILE: &'static str = "SOUL.md";
-pub const USER_FILE: &'static str = "USER.md";
-pub const TOOLS_FILE: &'static str = "TOOLS.md";
+pub const AGENTS_FILE: &str = "AGENTS.md";
+pub const SOUL_FILE: &str = "SOUL.md";
+pub const USER_FILE: &str = "USER.md";
+pub const TOOLS_FILE: &str = "TOOLS.md";
 
 pub const BOOTSTRAP_FILES: [&str; 4] = [AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE];
 
@@ -477,7 +477,7 @@ impl MessageBuilder for ContextBuilder {
     }
 }
 
-pub const DEFAULT_CURRENT_ROLE: &'static str = "user";
+pub const DEFAULT_CURRENT_ROLE: &str = "user";
 
 impl MessageBuilder for Arc<ContextBuilder> {
     fn build_messages(

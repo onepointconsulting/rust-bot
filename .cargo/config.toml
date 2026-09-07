@@ -1,0 +1,4 @@
+# Cargo ignores `rustflags` under [target.*] in Cargo.toml; it must live here.
+# Link with lld on Linux release builds to keep binary size/link times down.
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

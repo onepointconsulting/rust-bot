@@ -29,23 +29,24 @@ use crate::{
     },
 };
 
-const LLM_PROVIDER: &'static str = "LLM Provider";
-const CHAT_CHANNELS: &'static str = "Chat Channels";
-const AGENT_SETTINGS: &'static str = "Agent Settings";
-const MODEL_PRESETS: &'static str = "Model Presets";
-const API: &'static str = "API";
-const GATEWAY: &'static str = "Gateway";
-const TOOLS: &'static str = "Tools";
-const SUBAGENT: &'static str = "Subagent";
-const VIEW_CONFIGURATION_SUMMARY: &'static str = "View Configuration Summary";
-const SAVE_AND_EXIT: &'static str = "Save and Exit";
-const EXIT_WITHOUT_SAVING: &'static str = "Exit Without Saving";
+const LLM_PROVIDER: &str = "LLM Provider";
+const CHAT_CHANNELS: &str = "Chat Channels";
+const AGENT_SETTINGS: &str = "Agent Settings";
+const MODEL_PRESETS: &str = "Model Presets";
+const API: &str = "API";
+const GATEWAY: &str = "Gateway";
+const TOOLS: &str = "Tools";
+const SUBAGENT: &str = "Subagent";
+const VIEW_CONFIGURATION_SUMMARY: &str = "View Configuration Summary";
+const SAVE_AND_EXIT: &str = "Save and Exit";
+const EXIT_WITHOUT_SAVING: &str = "Exit Without Saving";
 
-const PROVIDER_OPENROUTER: &'static str = "openrouter";
-const PROVIDER_EDENAI: &'static str = "edenai";
-const PROVIDER_REQUESTY: &'static str = "requesty";
-const PROVIDER_ANTHROPIC: &'static str = "anthropic";
-const PROVIDER_NANOGPT: &'static str = "nanogpt";
+const PROVIDER_OPENROUTER: &str = "openrouter";
+const PROVIDER_EDENAI: &str = "edenai";
+const PROVIDER_REQUESTY: &str = "requesty";
+const PROVIDER_ANTHROPIC: &str = "anthropic";
+const PROVIDER_NANOGPT: &str = "nanogpt";
+
 
 const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
@@ -61,27 +62,27 @@ const WIZARD_OPTIONS: [&str; 11] = [
     EXIT_WITHOUT_SAVING,
 ];
 
-const CREATE_MODEL_PRESET: &'static str = "Create model preset";
-const SET_DEFAULT_MODEL_PRESET: &'static str = "Set default model preset";
+const CREATE_MODEL_PRESET: &str = "Create model preset";
+const SET_DEFAULT_MODEL_PRESET: &str = "Set default model preset";
 const MODEL_PRESETS_MENU: [&str; 2] = [CREATE_MODEL_PRESET, SET_DEFAULT_MODEL_PRESET];
 const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
 
-const CHANNEL_EMAIL: &'static str = "email";
-const CHANNEL_WEBSOCKET: &'static str = "websocket";
-const CHANNEL_OPTIONS_CHOICE: &'static str = "Channel Options";
-const CHANNELS: &'static str = "Channels";
+const CHANNEL_EMAIL: &str = "email";
+const CHANNEL_WEBSOCKET: &str = "websocket";
+const CHANNEL_OPTIONS_CHOICE: &str = "Channel Options";
+const CHANNELS: &str = "Channels";
 const CHANNELS_MENU: [&str; 2] = [CHANNEL_OPTIONS_CHOICE, CHANNELS];
 const AVAILABLE_CHANNELS: [&str; 2] = [CHANNEL_EMAIL, CHANNEL_WEBSOCKET];
-const TRANSCRIPTION_PROVIDERS_NONE: &'static str = "none";
+const TRANSCRIPTION_PROVIDERS_NONE: &str = "none";
 const TRANSCRIPTION_PROVIDERS: [&str; 3] = [TRANSCRIPTION_PROVIDERS_NONE, "groq", "openai"];
 
-const TOOL_GMAIL: &'static str = "gmail";
-const TOOL_WEB: &'static str = "web";
-const TOOL_EXEC: &'static str = "exec";
-const TOOL_OCR: &'static str = "ocr";
-const TOOL_DOCX: &'static str = "docx";
-const TOOL_MCP: &'static str = "mcp";
-const TOOL_IMAGE_GENERATION: &'static str = "image_generation";
+const TOOL_GMAIL: &str = "gmail";
+const TOOL_WEB: &str = "web";
+const TOOL_EXEC: &str = "exec";
+const TOOL_OCR: &str = "ocr";
+const TOOL_DOCX: &str = "docx";
+const TOOL_MCP: &str = "mcp";
+const TOOL_IMAGE_GENERATION: &str = "image_generation";
 const AVAILABLE_TOOLS: [&str; 7] = [
     TOOL_GMAIL,
     TOOL_WEB,
