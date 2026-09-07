@@ -1,8 +1,9 @@
 //! The chat transcript: pin-to-bottom list of message bubbles plus the
-//! empty-state suggestion prompts. Auto-scroll follows streamed updates
-//! while the user is near the bottom, pauses when they scroll up, and
-//! resumes when they return to the bottom, send a message, or switch
-//! sessions.
+//! empty-state suggestion prompts. While a turn is in flight, auto-scroll
+//! follows streamed updates if the user is near the bottom, pauses when
+//! they scroll up, and resumes when they return to the bottom or send.
+//! Idle conversations stay unpinned; a session switch (or first paint)
+//! still jumps once to the latest message.
 //!
 //! Unlike `web-chat`'s otherwise-identical component, entries here can
 //! mutate in place after they're first pushed (delta text growing in,
@@ -37,25 +38,20 @@ fn last_user_entry_id(entries: &[ChatEntry]) -> Option<u64> {
         .map(|entry| entry.id)
 }
 
-/// Scroll the transcript to the latest content on the next frame, unless the
-/// user has unpinned (or a newer auto-scroll superseded this one) in the
-/// meantime.
-fn scroll_list_to_bottom(
-    list_ref: NodeRef<Div>,
-    pinned_to_bottom: RwSignal<bool>,
-    auto_scroll_generation: RwSignal<u64>,
-) {
-    if !pinned_to_bottom.get_untracked() {
-        return;
-    }
+fn cancel_pending_auto_scroll(auto_scroll_generation: RwSignal<u64>) {
+    auto_scroll_generation.update(|generation| {
+        *generation = generation.wrapping_add(1);
+    });
+}
+
+/// Scroll the transcript to the latest content on the next frame, unless a
+/// newer auto-scroll (or a user scroll-away) superseded this one.
+fn scroll_list_to_bottom(list_ref: NodeRef<Div>, auto_scroll_generation: RwSignal<u64>) {
     let generation = auto_scroll_generation.get_untracked().wrapping_add(1);
     auto_scroll_generation.set(generation);
     if let Some(window) = web_sys::window() {
         let cb = Closure::once(move || {
             if auto_scroll_generation.get_untracked() != generation {
-                return;
-            }
-            if !pinned_to_bottom.get_untracked() {
                 return;
             }
             if let Some(el) = list_ref.get_untracked() {
@@ -203,23 +199,29 @@ pub fn MessageList(
     on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let list_ref = NodeRef::<Div>::new();
-    let pinned_to_bottom = RwSignal::new(true);
+    let pinned_to_bottom = RwSignal::new(false);
     let auto_scroll_generation = RwSignal::new(0u64);
-    // `(session, last user entry)` — a new send or a session switch re-pins.
-    // Streaming mutates the same last user id, so it does not.
+    // `(session, last user entry)` — a new send re-pins while a turn is in
+    // flight; a session switch (or first paint) one-shot jumps to latest
+    // even when idle. Streaming mutates the same last user id, so it does
+    // not change this identity.
     let pin_identity = RwSignal::new(None::<(Option<String>, Option<u64>)>);
 
-    // Follow the latest message while pinned. Tracks content / extra-panel
-    // size (not just entry count) so streamed tokens and tool/reasoning
-    // growth also re-scroll. A pending rAF is cancelled if the user scrolls
-    // away before it fires.
+    // Follow the latest message while a turn is in flight and pinned.
+    // Tracks content / extra-panel size (not just entry count) so streamed
+    // tokens and tool/reasoning growth also re-scroll. Idle conversations
+    // unpin; session load / first paint, and a pinned turn ending, still
+    // jump once to the latest message.
     Effect::new(move |_| {
         let current = entries.get();
         let identity = (active_session_id.get(), last_user_entry_id(&current));
-        if pin_identity.get_untracked().as_ref() != Some(&identity) {
+        let identity_changed = pin_identity.get_untracked().as_ref() != Some(&identity);
+        if identity_changed {
             pin_identity.set(Some(identity));
-            pinned_to_bottom.set(true);
         }
+
+        let in_flight = pending.get();
+        let was_pinned = pinned_to_bottom.get_untracked();
 
         let total_content_len: usize = current.iter().map(|entry| entry.content.len()).sum();
         let extra_growth: usize = current
@@ -231,12 +233,33 @@ pub fn MessageList(
             .sum();
         let _ = (total_content_len, extra_growth);
 
-        if pinned_to_bottom.get() {
-            scroll_list_to_bottom(list_ref, pinned_to_bottom, auto_scroll_generation);
+        if in_flight {
+            if identity_changed {
+                pinned_to_bottom.set(true);
+            }
+            if pinned_to_bottom.get() {
+                scroll_list_to_bottom(list_ref, auto_scroll_generation);
+            }
+        } else {
+            // Snap once on session load / first paint, or to land the final
+            // layout when a pinned turn ends. Do not bump generation here:
+            // unpinning can retrigger this effect, and a bump would cancel
+            // the snap just scheduled. Scroll-away during a turn already
+            // cancelled any leftover rAF.
+            let should_snap = was_pinned || identity_changed;
+            if was_pinned {
+                pinned_to_bottom.set(false);
+            }
+            if should_snap {
+                scroll_list_to_bottom(list_ref, auto_scroll_generation);
+            }
         }
     });
 
     let on_list_scroll = move |_| {
+        if !pending.get_untracked() {
+            return;
+        }
         let Some(el) = list_ref.get_untracked() else {
             return;
         };
@@ -244,9 +267,7 @@ pub fn MessageList(
             pinned_to_bottom.set(true);
         } else {
             pinned_to_bottom.set(false);
-            auto_scroll_generation.update(|generation| {
-                *generation = generation.wrapping_add(1);
-            });
+            cancel_pending_auto_scroll(auto_scroll_generation);
         }
     };
 

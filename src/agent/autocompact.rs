@@ -80,7 +80,9 @@ impl Autocompact {
         // nanobot's `bool(result.dropped)` for this same probe).
         let before = probe.messages.len();
         probe.retain_recent_legal_suffix(Self::RECENT_SUFFIX_MESSAGES, true);
-        before != probe.messages.len()
+        let after = probe.messages.len();
+        log::info!("Auto-compact: has_compactable_idle_tail: {before} -> {after}");
+        before != after
     }
 
     fn format_summary(text: &str, last_active: DateTime<Utc>) -> String {
