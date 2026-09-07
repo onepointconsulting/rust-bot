@@ -72,7 +72,10 @@ fn default_transcription_provider() -> Option<String> {
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelsConfig {
     /// Stream agent's text progress to the channel.
-    #[serde(alias = "streaming")]
+    #[serde(
+        alias = "streaming",
+        default = "default_streaming"
+    )]
     #[garde(skip)]
     pub streaming: bool,
 

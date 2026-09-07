@@ -62,7 +62,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     } else {
         let mut config = apply_workspace_override(Config::default(), args.workspace);
         choose_providers(&mut config, false)?;
-        config_model(&mut config.agents)?;
+        config_model(&mut config.agents, &config.providers)?;
         create_default_model_presets(&mut config);
         configure_web_app(&mut config, config_path.clone())?;
         save_config(&config, Some(config_path.clone()))?;

@@ -9,6 +9,7 @@ use crate::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_passw
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
 use crate::cli::onboard::create_env_file;
+use crate::config::schema::ProvidersConfig;
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_token};
 use crate::{
@@ -46,6 +47,7 @@ const PROVIDER_EDENAI: &str = "edenai";
 const PROVIDER_REQUESTY: &str = "requesty";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_NANOGPT: &str = "nanogpt";
+const PROVIDER_ZAI_SUBSCRIPTION: &str = "zai_subscription";
 
 
 const WIZARD_OPTIONS: [&str; 11] = [
@@ -166,6 +168,7 @@ pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, C
         PROVIDER_EDENAI,
         PROVIDER_REQUESTY,
         PROVIDER_NANOGPT,
+        PROVIDER_ZAI_SUBSCRIPTION,
     ];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
@@ -193,7 +196,7 @@ fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         PROVIDER_OPENROUTER => Some("openrouter"),
         PROVIDER_ANTHROPIC => Some("anthropic"),
-        PROVIDER_EDENAI | PROVIDER_REQUESTY | PROVIDER_NANOGPT => Some("custom"),
+        PROVIDER_EDENAI | PROVIDER_REQUESTY | PROVIDER_NANOGPT | PROVIDER_ZAI_SUBSCRIPTION => Some("custom"),
         _ => None,
     }
 }
@@ -224,6 +227,7 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
             PROVIDER_REQUESTY => "https://router.requesty.ai/v1",
             PROVIDER_ANTHROPIC => AnthropicProvider::DEFAULT_API_BASE,
             PROVIDER_NANOGPT => "https://nano-gpt.com/api/v1",
+            PROVIDER_ZAI_SUBSCRIPTION => "https://api.z.ai/api/coding/paas/v4",
             _ => "",
         }
     }
@@ -613,7 +617,7 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         .with_help_message("Directory for agent files, memory, and credentials")
         .prompt()?;
 
-    config_model(agents)?;
+    config_model(agents, &config.providers)?;
 
     let mut provider_choices = vec!["auto".to_string()];
     provider_choices.extend(providers().into_iter().map(|p| p.name));
@@ -707,11 +711,17 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
     Ok(config.clone())
 }
 
-pub fn config_model(agents: &mut AgentsConfig) -> Result<(), CliError> {
+pub fn config_model(agents: &mut AgentsConfig, providers: &ProvidersConfig) -> Result<(), CliError> {
     let model = agents.model.clone();
+    let custom = &providers.custom;
+    let (default_model, help_message) = if let Some(api_base) = &custom.api_base && api_base.contains("z.ai") {
+        ("glm-5.3-flash", "e.g. glm-5.3, glm-5.3-flash")
+    } else {
+        (model.as_str(), "e.g. anthropic/claude-opus-5 or openai/gpt-5.6")
+    };
     agents.model = Text::new("Model")
-        .with_default(model.as_str())
-        .with_help_message("e.g. anthropic/claude-opus-5 or openai/gpt-5.6")
+        .with_default(default_model)
+        .with_help_message(help_message)
         .prompt()?;
     Ok(())
 }
