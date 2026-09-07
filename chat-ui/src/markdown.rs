@@ -165,7 +165,7 @@ fn code_block_html(slot: &CodeSlot) -> String {
     };
     format!(
         r#"<div class="code-block"><div class="code-block__header">{lang_label}<button type="button" class="code-block__copy" title="Copy">Copy</button></div><pre><code{code_class}>{}</code></pre></div>"#,
-        escape_html(&slot.body)
+        crate::highlight::code_inner_html(&slot.lang, &slot.body)
     )
 }
 
@@ -597,7 +597,7 @@ mod tests {
             "expected Copy button, got: {html}"
         );
         assert!(
-            html.contains("dsh --profile web --dump-config"),
+            html.contains("dsh") && html.contains("profile") && html.contains("dump-config"),
             "code body missing, got: {html}"
         );
         assert!(
@@ -615,6 +615,25 @@ mod tests {
             "bare fence should not invent a language, got: {html}"
         );
         assert!(html.contains("foo"), "got: {html}");
+        assert!(
+            !html.contains("<span"),
+            "bare fence must stay unhighlighted plaintext, got: {html}"
+        );
+    }
+
+    #[test]
+    fn fenced_rust_gets_syntax_token_spans() {
+        let html = render("```rust\nfn main() {}\n```");
+        assert!(
+            html.contains(r#"class="language-rust""#),
+            "expected language class on <code>, got: {html}"
+        );
+        assert!(
+            html.contains("<span class="),
+            "expected syntect token spans, got: {html}"
+        );
+        assert!(html.contains("fn"), "source text missing, got: {html}");
+        assert!(html.contains("main"), "source text missing, got: {html}");
     }
 
     #[test]
@@ -628,7 +647,10 @@ mod tests {
     fn fenced_html_is_escaped_inside_the_block() {
         let html = render("```html\n<script>alert(1)</script>\n```");
         assert!(!html.contains("<script"), "got: {html}");
-        assert!(html.contains("&lt;script&gt;"), "got: {html}");
+        assert!(
+            html.contains("&lt;") && html.contains("script") && html.contains("&gt;"),
+            "expected escaped tags (possibly split across token spans), got: {html}"
+        );
         assert!(html.contains(">html<"), "got: {html}");
     }
 

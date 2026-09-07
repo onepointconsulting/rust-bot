@@ -138,6 +138,38 @@
   color: inherit;
   padding: 0;
 }
+/* syntect ClassStyle::Spaced token classes, scoped to the dark fence chrome.
+   Header / Copy stay white via .code-block__header. */
+.markdown .code-block .comment {
+  color: #8b949e;
+}
+.markdown .code-block .string {
+  color: #a5d6ff;
+}
+.markdown .code-block .keyword {
+  color: #ff7b72;
+}
+.markdown .code-block .storage {
+  color: #ff7b72;
+}
+.markdown .code-block .constant {
+  color: #79c0ff;
+}
+.markdown .code-block .support {
+  color: #79c0ff;
+}
+.markdown .code-block .entity {
+  color: #d2a8ff;
+}
+.markdown .code-block .variable {
+  color: #ffa657;
+}
+.markdown .code-block .punctuation {
+  color: #c9d1d9;
+}
+.markdown .code-block .invalid {
+  color: #f85149;
+}
 .markdown table {
   width: 100%;
   text-align: left;

@@ -2,7 +2,7 @@
 
 /// First alphanumeric character of the email's local-part, uppercased.
 ///
-/// Used as the avatar glyph in [`crate::components::UserAccountChip`]. The
+/// Used as the avatar glyph in [`crate::components::UserAccountMenu`]. The
 /// registry has no separate display name, so the local-part is the closest
 /// stand-in for "the name".
 pub fn email_initial(email: &str) -> char {

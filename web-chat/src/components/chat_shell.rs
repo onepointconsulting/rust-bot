@@ -39,7 +39,6 @@ pub fn ChatShell(
                 sessions=sessions
                 active_id=active_session_id
                 open=sidebar_open
-                user_email=user_email
                 on_close=on_close_sidebar
                 on_select=on_select_session
             />
@@ -54,6 +53,7 @@ pub fn ChatShell(
                     </div>
                     <ChatHeaderActions
                         expanded=expanded
+                        email=user_email
                         on_new_chat=on_new_chat
                         on_logout=on_logout
                         on_minimize=on_minimize

@@ -1,12 +1,11 @@
 use leptos::prelude::*;
 
+use super::UserAccountMenu;
+
 const ICON_BTN: &str = "flex h-8 w-8 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700";
 const TEXT_BTN: &str =
     "rounded-full px-3 py-1.5 text-xs font-medium text-slate-600 hover:bg-slate-100";
-const TEXT_BTN_MUTED: &str =
-    "rounded-full px-3 py-1.5 text-xs font-medium text-slate-400 hover:bg-slate-100";
 const MENU_ITEM: &str = "flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-slate-50";
-const MENU_ITEM_MUTED: &str = "flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-sm font-medium text-slate-500 hover:bg-slate-50";
 
 fn icon_class() -> &'static str {
     "h-4 w-4"
@@ -118,9 +117,11 @@ fn IconClose() -> impl IntoView {
 
 /// Header actions for both chat frontends: inline on `sm+`, a hamburger
 /// dropdown below that so the title/status stay readable on a narrow phone.
+/// The account avatar (and Log Out) is always visible at every breakpoint.
 #[component]
 pub fn ChatHeaderActions(
     #[prop(into)] expanded: Signal<bool>,
+    #[prop(into)] email: Signal<Option<String>>,
     on_new_chat: impl Fn() + 'static + Copy,
     on_logout: impl Fn() + 'static + Copy,
     on_minimize: impl Fn() + 'static + Copy,
@@ -131,10 +132,6 @@ pub fn ChatHeaderActions(
     let do_new_chat = move |_| {
         menu_open.set(false);
         on_new_chat();
-    };
-    let do_logout = move |_| {
-        menu_open.set(false);
-        on_logout();
     };
     let do_minimize = move |_| {
         menu_open.set(false);
@@ -164,9 +161,6 @@ pub fn ChatHeaderActions(
             <div class="hidden items-center gap-1 sm:flex">
                 <button type="button" class=TEXT_BTN on:click=do_new_chat>
                     "New chat"
-                </button>
-                <button type="button" class=TEXT_BTN_MUTED on:click=do_logout>
-                    "Sign out"
                 </button>
                 <button
                     type="button"
@@ -240,18 +234,10 @@ pub fn ChatHeaderActions(
                             <IconMinimize />
                             "Minimize"
                         </button>
-                        <div class="my-1 border-t border-slate-100"></div>
-                        <button
-                            type="button"
-                            role="menuitem"
-                            class=MENU_ITEM_MUTED
-                            on:click=do_logout
-                        >
-                            "Sign out"
-                        </button>
                     </div>
                 </div>
             </div>
+            <UserAccountMenu email=email on_logout=on_logout />
         </div>
     }
 }

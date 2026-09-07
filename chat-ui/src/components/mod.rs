@@ -12,4 +12,4 @@ pub use login_form::LoginForm;
 pub use markdown_view::MarkdownView;
 pub use message_bubble::{CopyButton, MessageBubble};
 pub use sessions_sidebar::{SessionsSidebar, SessionsSidebarToggle};
-pub use user_account::UserAccountChip;
+pub use user_account::UserAccountMenu;

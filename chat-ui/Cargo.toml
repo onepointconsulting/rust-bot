@@ -23,6 +23,15 @@ gloo-net = { version = "0.6", features = ["http"] }
 pulldown-cmark = { version = "0.13", default-features = false, features = ["html"] }
 pulldown-latex = "0.8"
 ammonia = "4"
+# `regex-onig` (syntect's default) needs Oniguruma and does not compile to
+# wasm32-unknown-unknown. `regex-fancy` is pure Rust; `dump-load` pulls the
+# bundled syntax set so we never touch the filesystem.
+syntect = { version = "5", default-features = false, features = [
+    "default-syntaxes",
+    "html",
+    "dump-load",
+    "regex-fancy",
+] }
 web-sys = { version = "0.3", features = [
     "HtmlElement",
     "HtmlTextAreaElement",

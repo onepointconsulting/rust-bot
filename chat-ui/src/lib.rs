@@ -7,6 +7,7 @@
 
 pub mod api;
 pub mod components;
+pub(crate) mod highlight;
 pub mod markdown;
 pub mod models;
 pub mod session_groups;

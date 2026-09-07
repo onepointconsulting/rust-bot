@@ -15,10 +15,6 @@
 //! earlier pass) — the same [`SessionsSidebarToggle`] button and the same
 //! in-panel collapse icon drive it everywhere.
 //!
-//! The logged-in account chip (initial + email) lives at the bottom of this
-//! panel and is not shown anywhere else, so collapsing the sidebar also
-//! hides the email.
-//!
 //! Deliberately **not** a `<For>` keyed by group label for the outer
 //! date-bucket list: `<For>`'s keyed diffing only re-renders a child when
 //! its *key* disappears or reappears. A brand-new chat landing in an
@@ -40,8 +36,6 @@ use leptos::prelude::*;
 
 use crate::models::{SessionListItem, SessionSummaryPopup};
 use crate::session_groups::{group_sessions, SessionGroup};
-
-use super::UserAccountChip;
 
 /// Rows beyond this count in a single group are collapsed behind a
 /// "··· More" toggle, mirroring Cursor's own history list.
@@ -589,7 +583,6 @@ pub fn SessionsSidebar(
     #[prop(into)] sessions: Signal<Vec<SessionListItem>>,
     #[prop(into)] active_id: Signal<Option<String>>,
     #[prop(into)] open: Signal<bool>,
-    #[prop(into)] user_email: Signal<Option<String>>,
     on_close: impl Fn() + 'static + Send + Sync + Copy,
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     /// When set, each row shows a kebab → Rename → dialog. Omitted by
@@ -605,8 +598,7 @@ pub fn SessionsSidebar(
     /// empty `text` is the in-flight loading state.
     #[prop(optional)]
     summary_popup: Option<Signal<Option<SessionSummaryPopup>>>,
-    #[prop(optional)]
-    on_close_summary: Option<Callback<()>>,
+    #[prop(optional)] on_close_summary: Option<Callback<()>>,
     /// When set, each row's kebab also gets a "Fork session" item that fires
     /// immediately (no confirmation dialog — forking is non-destructive, it
     /// only ever creates a new chat). Omitted by `web-chat`, which has no
@@ -797,13 +789,6 @@ pub fn SessionsSidebar(
                         }
                     }}
                 </div>
-                <Show when=move || {
-                    user_email.get().is_some_and(|value| !value.trim().is_empty())
-                }>
-                    <div class="shrink-0 border-t border-slate-200 bg-white">
-                        <UserAccountChip email=user_email />
-                    </div>
-                </Show>
             </div>
         }
     };

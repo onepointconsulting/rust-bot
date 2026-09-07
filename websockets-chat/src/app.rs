@@ -1297,12 +1297,7 @@ fn handle_chat_deleted(ctx: &WsContext, chat_id: String) {
 /// active chat. Unlike [`handle_chat_deleted`], this never calls
 /// [`reset_local_transcript`]: that also drops `ctx.chat_id` and the stored
 /// chat id, which would strand this connection with no chat to send on.
-fn handle_session_summary(
-    ctx: &WsContext,
-    chat_id: String,
-    text: String,
-    last_active: String,
-) {
+fn handle_session_summary(ctx: &WsContext, chat_id: String, text: String, last_active: String) {
     let matches_open = ctx
         .summary_popup
         .get_untracked()
