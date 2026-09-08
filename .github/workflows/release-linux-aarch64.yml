@@ -49,7 +49,7 @@ jobs:
       - name: Install Linux build dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y pkg-config libssl-dev cmake binaryen
+          sudo apt-get install -y pkg-config libssl-dev cmake
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
@@ -63,6 +63,17 @@ jobs:
 
       - name: Install Trunk
         run: cargo install trunk --locked
+
+      - name: Install wasm-opt (Binaryen)
+        run: |
+          ver=version_132
+          url="https://github.com/WebAssembly/binaryen/releases/download/${ver}/binaryen-${ver}-aarch64-linux.tar.gz"
+          dest="${RUNNER_TEMP}/binaryen"
+          mkdir -p "$dest"
+          curl -fsSL "$url" -o "${RUNNER_TEMP}/binaryen.tar.gz"
+          tar -xf "${RUNNER_TEMP}/binaryen.tar.gz" -C "$dest"
+          echo "${dest}/binaryen-${ver}/bin" >> "$GITHUB_PATH"
+          "${dest}/binaryen-${ver}/bin/wasm-opt" --version
 
       - name: Build web-chat (Leptos/WASM UI)
         working-directory: web-chat
