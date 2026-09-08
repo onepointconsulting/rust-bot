@@ -106,6 +106,7 @@ jobs:
             Platform packages:
             - rust-bot-${{ steps.version.outputs.version }}-windows-x86_64.zip
             - rust-bot-${{ steps.version.outputs.version }}-linux-x86_64.tar.gz
+            - rust-bot-${{ steps.version.outputs.version }}-linux-aarch64.tar.gz
             - rust-bot-${{ steps.version.outputs.version }}-macos-aarch64.tar.gz
 
             Each package bundles the `rust-bot` and

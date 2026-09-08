@@ -101,7 +101,7 @@ cd "rust-bot-${VERSION}-linux-x86_64"
 ./rust-bot agent -c ./.rust-bot/config.json -m "Hello!"
 ```
 
-Omit `-m` to enter the [interactive console](#interactive-console). Windows and macOS archives are `rust-bot-<version>-windows-x86_64.zip` and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
+Omit `-m` to enter the [interactive console](#interactive-console). Windows, Linux ARM64, and macOS archives are `rust-bot-<version>-windows-x86_64.zip`, `rust-bot-<version>-linux-aarch64.tar.gz`, and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
 
 ---
 
