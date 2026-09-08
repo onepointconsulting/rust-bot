@@ -128,7 +128,9 @@ impl SubagentManager {
         max_tool_result_chars: usize,
     ) -> Self {
         let runtime_resolver = Arc::new(ModelRuntimeResolver::new(Config::default(), provider));
-        let sessions = Arc::new(Mutex::new(SessionManager::new(workspace.clone())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            workspace.clone(),
+        )));
         SubagentManager::new(
             runtime_resolver,
             sessions,
@@ -1150,7 +1152,9 @@ mod tests {
         let runtime_resolver = Arc::new(ModelRuntimeResolver::new(config, initial_provider));
 
         let tmp = TempDir::new().unwrap();
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
         {
             let mut manager = sessions.lock().unwrap();
             let session = manager.get_or_create_session("preset-session");

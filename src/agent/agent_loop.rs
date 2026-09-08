@@ -430,8 +430,12 @@ impl AgentLoop {
         } else {
             None
         };
-        let session_manager = session_manager
-            .unwrap_or_else(|| Arc::new(Mutex::new(SessionManager::new(workspace.clone()))));
+        let session_manager = session_manager.unwrap_or_else(|| {
+            Arc::new(Mutex::new(SessionManager::from_agents_config(
+                workspace.clone(),
+                &agents_cfg,
+            )))
+        });
         let runtime_resolver =
             Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
         let subagents = Arc::new(SubagentManager::new(

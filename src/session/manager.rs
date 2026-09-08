@@ -6,7 +6,7 @@ use std::{
     sync::{LazyLock, Mutex},
 };
 
-use chrono::{DateTime, NaiveDateTime, TimeZone, Utc};
+use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
 use regex::Regex;
 use serde_json::{Map, Value, json};
 
@@ -416,21 +416,60 @@ pub struct SessionManager {
     /// after the delete already ran) from recreating the file or resurrecting
     /// the key in the cache.
     deleted: HashSet<String>,
+    session_eviction_threshold_hours: u32,
+    session_eviction_cron_interval_hours: u32,
 }
 
 impl SessionManager {
-
     pub const LAST_SUMMARY_KEY: &str = "_last_summary";
     pub const LAST_ACTIVE_KEY: &str = "last_active";
 
-    pub fn new(workspace: PathBuf) -> Self {
+    /// Create a manager using the config default eviction settings.
+    /// Prefer [`Self::from_agents_config`] when the values come from `AgentsConfig`.
+    pub fn with_default_eviction_threshold(workspace: PathBuf) -> Self {
+        Self::new(
+            workspace,
+            crate::config::schema::default_agent_session_eviction_threshold_hours(),
+            crate::config::schema::default_agent_session_eviction_cron_interval_hours(),
+        )
+    }
+
+    /// Create a manager whose eviction settings match `AgentsConfig`.
+    pub fn from_agents_config(
+        workspace: PathBuf,
+        agents: &crate::config::schema::AgentsConfig,
+    ) -> Self {
+        Self::new(
+            workspace,
+            agents.session_eviction_threshold_hours,
+            agents.session_eviction_cron_interval_hours,
+        )
+    }
+
+    pub fn new(
+        workspace: PathBuf,
+        session_eviction_threshold_hours: u32,
+        session_eviction_cron_interval_hours: u32,
+    ) -> Self {
         Self {
             workspace: workspace.clone(),
             sessions_dir: ensure_dir(workspace.join("sessions")),
             legacy_sessions_dir: get_legacy_sessions_dir(),
             cache: HashMap::new(),
             deleted: HashSet::new(),
+            session_eviction_threshold_hours,
+            session_eviction_cron_interval_hours,
         }
+    }
+
+    /// Hours without use after which a session is dropped from the in-memory cache.
+    pub fn session_eviction_threshold_hours(&self) -> u32 {
+        self.session_eviction_threshold_hours
+    }
+
+    /// Hours between cache-cleanup cron ticks. `0` disables the job.
+    pub fn session_eviction_cron_interval_hours(&self) -> u32 {
+        self.session_eviction_cron_interval_hours
     }
 
     /// Get the file path for a session.
@@ -642,6 +681,19 @@ impl SessionManager {
 
     pub fn invalidate(&mut self, key: &str) -> Option<Session> {
         self.cache.remove(key)
+    }
+
+    /// Drop sessions that have not been used for
+    /// [`Self::session_eviction_threshold_hours`] from the in-memory cache.
+    /// Files stay on disk; the next access reloads the session. `0` disables.
+    pub fn remove_stale_sessions(&mut self) {
+        let hours = self.session_eviction_threshold_hours;
+        if hours == 0 {
+            return;
+        }
+        let threshold = Utc::now() - Duration::hours(hours as i64);
+        self.cache
+            .retain(|_, session| session.updated_at >= threshold);
     }
 
     /// Permanently delete a session: tombstone the key, drop it from the
@@ -1785,9 +1837,63 @@ mod tests {
     }
 
     #[test]
+    fn new_stores_configured_eviction_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mgr = SessionManager::new(dir.path().join("ws"), 3, 1);
+        assert_eq!(mgr.session_eviction_threshold_hours(), 3);
+        assert_eq!(mgr.session_eviction_cron_interval_hours(), 1);
+    }
+
+    #[test]
+    fn from_agents_config_copies_eviction_settings() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut agents = crate::config::schema::AgentsConfig::default();
+        agents.session_eviction_threshold_hours = 12;
+        agents.session_eviction_cron_interval_hours = 3;
+        let mgr = SessionManager::from_agents_config(dir.path().join("ws"), &agents);
+        assert_eq!(mgr.session_eviction_threshold_hours(), 12);
+        assert_eq!(mgr.session_eviction_cron_interval_hours(), 3);
+    }
+
+    #[test]
+    fn remove_stale_sessions_drops_idle_entries_from_cache_only() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"), 1, 1);
+
+        let mut stale = Session::new("stale".to_string());
+        stale.updated_at = Utc::now() - Duration::hours(2);
+        mgr.save(stale).unwrap();
+        let stale_path = mgr.get_session_path("stale");
+
+        let mut fresh = Session::new("fresh".to_string());
+        fresh.updated_at = Utc::now();
+        mgr.save(fresh).unwrap();
+
+        mgr.remove_stale_sessions();
+
+        assert!(!mgr.cache.contains_key("stale"));
+        assert!(mgr.cache.contains_key("fresh"));
+        assert!(stale_path.exists());
+        assert!(mgr.load("stale").is_some());
+    }
+
+    #[test]
+    fn remove_stale_sessions_is_a_no_op_when_threshold_is_zero() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::new(dir.path().join("ws"), 0, 1);
+        let mut stale = Session::new("stale".to_string());
+        stale.updated_at = Utc::now() - Duration::hours(2);
+        mgr.save(stale).unwrap();
+
+        mgr.remove_stale_sessions();
+
+        assert!(mgr.cache.contains_key("stale"));
+    }
+
+    #[test]
     fn load_reads_jsonl_metadata_and_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("s1")));
@@ -1808,7 +1914,7 @@ mod tests {
     #[test]
     fn load_non_object_metadata_does_not_panic_and_keeps_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("s2")));
@@ -1826,7 +1932,7 @@ mod tests {
     #[test]
     fn load_skips_invalid_json_line_and_keeps_following_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("s3")));
@@ -1839,7 +1945,7 @@ mod tests {
     #[test]
     fn save_writes_metadata_line_and_messages_as_jsonl() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let mut session = Session::new("k1".into());
         session.add_message("user", "hello", Map::new());
         session.add_message("assistant", "world", Map::new());
@@ -1877,7 +1983,7 @@ mod tests {
     #[test]
     fn save_updates_cache_so_next_load_is_not_needed() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let mut session = Session::new("k2".into());
         session.add_message("user", "ping", Map::new());
 
@@ -1892,7 +1998,7 @@ mod tests {
     #[test]
     fn save_then_load_round_trips_fields() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let mut session = Session::new("k3".into());
         session.add_message("user", "a", Map::new());
         session.add_message("assistant", "b", Map::new());
@@ -1920,7 +2026,7 @@ mod tests {
     #[test]
     fn save_overwrites_existing_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("k4")));
@@ -1943,14 +2049,14 @@ mod tests {
     #[test]
     fn list_sessions_empty_directory() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         assert!(mgr.list_sessions().is_empty());
     }
 
     #[test]
     fn list_sessions_sorted_by_updated_at_descending() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
 
         let mut older = Session::new("older".into());
         older.updated_at = Utc.with_ymd_and_hms(2026, 5, 1, 10, 0, 0).unwrap();
@@ -1969,7 +2075,7 @@ mod tests {
     #[test]
     fn list_sessions_ignores_non_jsonl_files() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         fs::write(mgr.sessions_dir.join("readme.txt"), "x").unwrap();
         let s = Session::new("only".into());
         mgr.save(s).unwrap();
@@ -1983,7 +2089,7 @@ mod tests {
     #[test]
     fn list_sessions_skips_invalid_json_first_line() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("bad")));
@@ -1995,7 +2101,7 @@ mod tests {
     #[test]
     fn list_sessions_skips_first_line_not_metadata_type() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr.sessions_dir.join("other.jsonl");
         fs::write(
             &path,
@@ -2009,7 +2115,7 @@ mod tests {
     #[test]
     fn list_sessions_skips_metadata_without_key() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr.sessions_dir.join("nokey.jsonl");
         fs::write(
             &path,
@@ -2023,7 +2129,7 @@ mod tests {
     #[test]
     fn list_sessions_skips_empty_string_key() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr.sessions_dir.join("emptykey.jsonl");
         fs::write(
             &path,
@@ -2037,7 +2143,7 @@ mod tests {
     #[test]
     fn list_sessions_returns_created_at_path_and_defaults() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("meta-t")));
@@ -2061,7 +2167,7 @@ mod tests {
     #[test]
     fn list_sessions_missing_datetime_fields_use_empty_strings() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr.sessions_dir.join("partial.jsonl");
         fs::write(&path, r#"{"_type":"metadata","key":"partial"}"#).unwrap();
 
@@ -2075,7 +2181,7 @@ mod tests {
     #[test]
     fn list_sessions_empty_updated_at_sorts_after_rfc3339() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
 
         let path_a = mgr.sessions_dir.join("a.jsonl");
         fs::write(
@@ -2125,7 +2231,7 @@ mod tests {
     #[test]
     fn list_sessions_has_summary_is_true_only_for_object_with_text() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         {
             let session = mgr.get_or_create_session("with-summary");
             session.metadata.insert(
@@ -2172,7 +2278,7 @@ mod tests {
     #[test]
     fn list_sessions_includes_generated_title() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         {
             let session = mgr.get_or_create_session("chat");
             session.metadata.insert(
@@ -2192,7 +2298,7 @@ mod tests {
     #[test]
     fn rename_session_persists_title_and_overwrites_existing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         mgr.save(Session::new("chat".to_string())).unwrap();
 
         mgr.rename_session("chat", "First title").unwrap();
@@ -2214,7 +2320,7 @@ mod tests {
     #[test]
     fn rename_session_errors_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         assert!(matches!(
             mgr.rename_session("missing", "Nope"),
             Err(RenameSessionError::NotFound)
@@ -2227,7 +2333,7 @@ mod tests {
     #[test]
     fn delete_session_removes_file_and_cache_and_listing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         mgr.save(Session::new("chat".to_string())).unwrap();
         let path = mgr.get_session_path("chat");
         assert!(path.exists());
@@ -2245,7 +2351,7 @@ mod tests {
     #[test]
     fn delete_session_errors_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         assert!(matches!(
             mgr.delete_session("missing"),
             Err(DeleteSessionError::NotFound)
@@ -2255,7 +2361,7 @@ mod tests {
     #[test]
     fn delete_session_finds_cache_only_session_with_no_file_yet() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         mgr.get_or_create_session("never-saved");
         assert!(mgr.delete_session("never-saved").is_ok());
     }
@@ -2263,7 +2369,7 @@ mod tests {
     #[test]
     fn save_after_delete_is_a_silent_no_op_and_does_not_recreate_the_file() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let mut session = Session::new("chat".to_string());
         session.add_message("user", "hello", Map::new());
         mgr.save(session.clone()).unwrap();
@@ -2286,7 +2392,7 @@ mod tests {
     #[test]
     fn get_or_create_after_delete_returns_inert_placeholder_not_resurrected_from_disk() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let mut session = Session::new("chat".to_string());
         session.add_message("user", "hello", Map::new());
         mgr.save(session).unwrap();
@@ -2317,14 +2423,14 @@ mod tests {
     #[test]
     fn read_session_payload_returns_none_when_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         assert!(mgr.read_session_file("missing").is_none());
     }
 
     #[test]
     fn read_session_payload_preserves_raw_timestamps_and_messages() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("r1")));
@@ -2348,7 +2454,7 @@ mod tests {
     #[test]
     fn read_session_payload_falls_back_to_key_when_metadata_omits_it() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("fallback-key")));
@@ -2367,7 +2473,7 @@ mod tests {
     #[test]
     fn read_session_payload_repairs_corrupt_lines() {
         let dir = tempfile::tempdir().unwrap();
-        let mgr = SessionManager::new(dir.path().join("ws"));
+        let mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let path = mgr
             .sessions_dir
             .join(format!("{}.jsonl", safe_filename("corrupt")));
@@ -2635,7 +2741,7 @@ mod tests {
     #[test]
     fn session_needs_title_false_when_missing_titled_or_empty() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().to_path_buf());
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().to_path_buf());
         assert!(!mgr.session_needs_title("missing"));
 
         mgr.get_or_create_session("empty");
@@ -2654,7 +2760,7 @@ mod tests {
     #[test]
     fn session_needs_title_true_when_user_text_and_no_title() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().to_path_buf());
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().to_path_buf());
         {
             let session = mgr.get_or_create_session("chat");
             session.messages.push(fixture_message("user", "hello"));
@@ -2665,7 +2771,7 @@ mod tests {
     #[test]
     fn session_needs_title_true_for_multimodal_user_text() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().to_path_buf());
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().to_path_buf());
         {
             let session = mgr.get_or_create_session("chat");
             session.messages.push(json!({
@@ -2697,7 +2803,7 @@ mod tests {
     #[test]
     fn fork_session_before_user_index_zero_stops_before_first_user() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         save_two_turn_session(&mut mgr, "src", 0);
 
         mgr.fork_session_before_user_index("src", "dst", 0).unwrap();
@@ -2708,7 +2814,7 @@ mod tests {
     #[test]
     fn fork_session_before_user_index_copies_prefix_before_second_user() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         save_two_turn_session(&mut mgr, "src", 0);
 
         mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
@@ -2723,7 +2829,7 @@ mod tests {
     #[test]
     fn fork_session_before_user_index_at_user_count_copies_full_session() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         save_two_turn_session(&mut mgr, "src", 1);
 
         mgr.fork_session_before_user_index("src", "dst", 2).unwrap();
@@ -2735,7 +2841,7 @@ mod tests {
     #[test]
     fn fork_session_before_user_index_past_user_count_is_invalid() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         save_two_turn_session(&mut mgr, "src", 0);
 
         let err = mgr
@@ -2748,7 +2854,7 @@ mod tests {
     #[test]
     fn fork_session_before_user_index_missing_source_is_not_found() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         let err = mgr
             .fork_session_before_user_index("missing", "dst", 0)
             .unwrap_err();
@@ -2758,13 +2864,17 @@ mod tests {
     #[test]
     fn fork_session_before_user_index_resets_last_consolidated_when_prefix_is_shorter() {
         let dir = tempfile::tempdir().unwrap();
-        let mut mgr = SessionManager::new(dir.path().join("ws"));
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         save_two_turn_session(&mut mgr, "src", 4);
 
         mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
         let forked = mgr.get_session_internal("dst").unwrap();
         assert_eq!(forked.messages.len(), 2);
         assert_eq!(forked.last_consolidated, 0);
-        assert!(!forked.metadata.contains_key(SessionManager::LAST_SUMMARY_KEY));
+        assert!(
+            !forked
+                .metadata
+                .contains_key(SessionManager::LAST_SUMMARY_KEY)
+        );
     }
 }

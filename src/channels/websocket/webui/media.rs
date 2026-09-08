@@ -317,7 +317,9 @@ mod tests {
             require_auth: true,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
-            session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            session_manager: Arc::new(StdMutex::new(
+                SessionManager::with_default_eviction_threshold(dir.keep()),
+            )),
             workspace_request_handler: WorkspaceRequestHandler::new(
                 tempfile::tempdir().unwrap().keep(),
                 true,

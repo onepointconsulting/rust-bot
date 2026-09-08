@@ -30,6 +30,8 @@ use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
 use crate::cli::cancel::wait_for_escape_cancel;
 use crate::cli::onboard::run_onboard;
 use crate::cli::wizard::resolve_onboard_config_path;
+use crate::command::types::DREAM_JOB_NAME;
+use crate::command::types::EVICT_STALE_SESSIONS_JOB_NAME;
 use crate::cron::CronJobState;
 use crate::cron::CronPayload;
 use crate::cron::CronPayloadKind;
@@ -694,7 +696,10 @@ async fn run_login(args: LoginArgs) -> Result<(), CliError> {
     // Login never touches sessions or workspace scope — it only calls
     // `channel.login(force)` — so these throwaway values exist solely to
     // satisfy the (now-uniform) channel constructor signature.
-    let session_manager = Arc::new(StdMutex::new(SessionManager::new(config.workspace_path())));
+    let session_manager = Arc::new(StdMutex::new(SessionManager::from_agents_config(
+        config.workspace_path(),
+        &config.agents,
+    )));
     let workspace_request_handler =
         WorkspaceRequestHandler::new(config.workspace_path(), config.tools.restrict_to_workspace);
     let channel: Arc<dyn BaseChannel> = match channel_name.as_str() {
@@ -1043,8 +1048,14 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             Box::pin(async move {
                 with_cron_context_stack(|| async move {
                     // Dream is an internal job — run directly, not through the agent loop.
-                    if job.name == "dream" {
+                    if job.name == DREAM_JOB_NAME {
                         let _ = agent_loop.dream.run().await;
+                        return Ok(());
+                    }
+                    if job.name == EVICT_STALE_SESSIONS_JOB_NAME {
+                        let mut manager = agent_loop.session_manager.lock()
+                            .unwrap_or_else(|e| e.into_inner());
+                        manager.remove_stale_sessions();
                         return Ok(());
                     }
                     let reminder_note = [
@@ -1379,8 +1390,8 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         let now = now_ms();
         let schedule = dream_cfg.build_schedule(&timezone);
         cron.register_system_job(crate::cron::types::CronJob {
-            id: "dream".to_string(),
-            name: "dream".to_string(),
+            id: DREAM_JOB_NAME.to_string(),
+            name: DREAM_JOB_NAME.to_string(),
             enabled: true,
             schedule: schedule.clone(),
             payload: CronPayload {
@@ -1402,6 +1413,52 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             green.render_reset(),
             dream_cfg.describe_schedule()
         );
+
+        let (eviction_interval_hours, eviction_threshold_hours) = {
+            let manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
+            (
+                manager.session_eviction_cron_interval_hours(),
+                manager.session_eviction_threshold_hours(),
+            )
+        };
+        if eviction_interval_hours == 0 {
+            println!(
+                "{}✗{} Session cache cleanup: disabled",
+                yellow.render(),
+                yellow.render_reset()
+            );
+        } else {
+            let schedule = crate::cron::types::CronSchedule {
+                kind: crate::cron::types::CronScheduleKind::Every,
+                every_ms: Some(eviction_interval_hours as i64 * 3_600_000),
+                ..Default::default()
+            };
+            cron.register_system_job(crate::cron::types::CronJob {
+                id: EVICT_STALE_SESSIONS_JOB_NAME.to_string(),
+                name: EVICT_STALE_SESSIONS_JOB_NAME.to_string(),
+                enabled: true,
+                schedule: schedule.clone(),
+                payload: CronPayload {
+                    kind: CronPayloadKind::SystemEvent,
+                    ..Default::default()
+                },
+                created_at_ms: now,
+                updated_at_ms: now,
+                delete_after_run: false,
+                state: CronJobState {
+                    next_run_at_ms: compute_next_run(&schedule, now),
+                    ..Default::default()
+                },
+            })
+            .await;
+            println!(
+                "{}✓{} Session cache: drop unused after {}h (every {}h)",
+                green.render(),
+                green.render_reset(),
+                eviction_threshold_hours,
+                eviction_interval_hours
+            );
+        }
     }
 
     // Combined login + WebSocket REST server (only when channels.websocket is present).
@@ -2085,7 +2142,9 @@ mod tests {
 
     fn test_session_manager() -> Arc<StdMutex<SessionManager>> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(StdMutex::new(SessionManager::new(dir.keep())))
+        Arc::new(StdMutex::new(
+            SessionManager::with_default_eviction_threshold(dir.keep()),
+        ))
     }
 
     fn test_workspace_request_handler() -> WorkspaceRequestHandler {

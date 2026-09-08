@@ -1450,9 +1450,20 @@ mod tests {
     fn build_messages_no_runtime_context_blocks_leaves_output_unchanged() {
         let tmp = TempDir::new().unwrap();
         let b = make_builder(&tmp);
-        let with_none = b.build_messages(&[], "hi", None, None, None, None, None, None, "user", None);
-        let with_empty_slice =
-            b.build_messages(&[], "hi", None, None, None, None, None, Some(&[]), "user", None);
+        let with_none =
+            b.build_messages(&[], "hi", None, None, None, None, None, None, "user", None);
+        let with_empty_slice = b.build_messages(
+            &[],
+            "hi",
+            None,
+            None,
+            None,
+            None,
+            None,
+            Some(&[]),
+            "user",
+            None,
+        );
         assert_eq!(with_none, with_empty_slice);
     }
 

@@ -966,7 +966,11 @@ impl Consolidator {
                 return;
             };
 
-            if self.archive(&chunk, session_key, None, None).await.is_none() {
+            if self
+                .archive(&chunk, session_key, None, None)
+                .await
+                .is_none()
+            {
                 return;
             }
 
@@ -1079,7 +1083,10 @@ impl Consolidator {
         if let Some(text) = summary.as_deref() {
             if text != "(nothing)" {
                 let mut summary_meta = serde_json::Map::new();
-                summary_meta.insert("text".to_string(), serde_json::Value::String(text.to_string()));
+                summary_meta.insert(
+                    "text".to_string(),
+                    serde_json::Value::String(text.to_string()),
+                );
                 summary_meta.insert(
                     SessionManager::LAST_ACTIVE_KEY.to_string(),
                     serde_json::Value::String(last_active.to_rfc3339()),
@@ -1548,7 +1555,9 @@ mod tests {
         Consolidator::new(
             Arc::new(make_store(tmp)),
             test_runtime_resolver(provider),
-            Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf()))),
+            Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+                tmp.path().to_path_buf(),
+            ))),
             65_536,
             Box::new(StubArchiveMessageBuilder),
             8192,
@@ -1562,7 +1571,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("summary".into());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
         sessions
             .lock()
             .unwrap()
@@ -1589,7 +1600,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("summary".into());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
         sessions
             .lock()
             .unwrap()
@@ -1624,7 +1637,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("summary".into());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
         sessions
             .lock()
             .unwrap()
@@ -1673,7 +1688,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("archive-summary".into());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
 
         // Build a session with several alternating messages starting already past last_consolidated=0.
         // last_consolidated stays 0; after any consolidation round it should advance.
@@ -1721,7 +1738,9 @@ mod tests {
         let tmp = TempDir::new().unwrap();
         let mut resp = LLMResponse::new();
         resp.content = Some("s".into());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
         sessions
             .lock()
             .unwrap()
@@ -1794,7 +1813,11 @@ mod tests {
             "content": "fall back",
             "timestamp": "2026-02-02T15:00:00Z",
         })];
-        assert!(c.archive(&messages, "test-session", None, None).await.is_none());
+        assert!(
+            c.archive(&messages, "test-session", None, None)
+                .await
+                .is_none()
+        );
         let raw = fs::read_to_string(&c.store.history_file).expect("history written");
         let last_line = raw.lines().last().expect("one jsonl line");
         let row: serde_json::Value = serde_json::from_str(last_line).unwrap();
@@ -1852,13 +1875,19 @@ mod tests {
         resp.finish_reason = "stop".into();
         let provider = ArchiveTestProvider::arc(resp);
         let runtime = test_runtime(provider.clone());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
 
         let mut session = Session::new("cli:test".into());
         let old_ts = session.updated_at;
         for i in 0..20 {
             session.add_message("user", format!("user msg {i}"), serde_json::Map::new());
-            session.add_message("assistant", format!("assistant msg {i}"), serde_json::Map::new());
+            session.add_message(
+                "assistant",
+                format!("assistant msg {i}"),
+                serde_json::Map::new(),
+            );
         }
         session.updated_at = old_ts;
         sessions.lock().unwrap().save(session).unwrap();
@@ -1914,7 +1943,9 @@ mod tests {
         resp.finish_reason = "error".into();
         let provider = ArchiveTestProvider::arc(resp);
         let runtime = test_runtime(provider.clone());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
 
         let mut session = Session::new("cli:fail".into());
         for i in 0..10 {
@@ -1951,13 +1982,25 @@ mod tests {
             guard.invalidate("cli:fail");
             guard.get_or_create_session("cli:fail").clone()
         };
-        assert_eq!(reloaded.messages.len(), 20, "raw dump must not delete history");
+        assert_eq!(
+            reloaded.messages.len(),
+            20,
+            "raw dump must not delete history"
+        );
         assert_eq!(reloaded.messages[0].get("content"), Some(&json!("u0")));
-        assert_eq!(reloaded.last_consolidated, 16, "boundary still advances on failure");
+        assert_eq!(
+            reloaded.last_consolidated, 16,
+            "boundary still advances on failure"
+        );
         let visible: Vec<String> = reloaded
             .get_history(Some(20))
             .iter()
-            .map(|m| m.get("content").and_then(|v| v.as_str()).unwrap_or("").to_string())
+            .map(|m| {
+                m.get("content")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("")
+                    .to_string()
+            })
             .collect();
         assert_eq!(visible, vec!["u8", "a8", "u9", "a9"]);
     }
@@ -1970,7 +2013,9 @@ mod tests {
         resp.finish_reason = "stop".into();
         let provider = ArchiveTestProvider::arc(resp);
         let runtime = test_runtime(provider.clone());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
 
         let mut session = Session::new("cli:nothing".into());
         for i in 0..10 {
@@ -1997,7 +2042,9 @@ mod tests {
             guard.get_or_create_session("cli:nothing").clone()
         };
         assert!(
-            !reloaded.metadata.contains_key(SessionManager::LAST_SUMMARY_KEY),
+            !reloaded
+                .metadata
+                .contains_key(SessionManager::LAST_SUMMARY_KEY),
             "a literal '(nothing)' summary must not be persisted"
         );
     }
@@ -2009,7 +2056,9 @@ mod tests {
         resp.content = Some("should-not-be-used".into());
         let provider = ArchiveTestProvider::arc(resp);
         let runtime = test_runtime(provider.clone());
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
 
         let old_ts = chrono::Utc::now() - chrono::Duration::hours(2);
         let mut session = Session::new("cli:empty".into());
@@ -2033,7 +2082,10 @@ mod tests {
             guard.invalidate("cli:empty");
             guard.get_or_create_session("cli:empty").clone()
         };
-        assert_eq!(reloaded.updated_at, old_ts, "an idle-but-empty session's timestamp must not look active");
+        assert_eq!(
+            reloaded.updated_at, old_ts,
+            "an idle-but-empty session's timestamp must not look active"
+        );
         assert!(reloaded.metadata.is_empty());
     }
 

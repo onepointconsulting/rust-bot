@@ -1,6 +1,9 @@
 use serde::{Deserialize, Serialize};
 use utoipa::ToSchema;
 
+pub const DREAM_JOB_NAME: &str = "dream";
+pub const EVICT_STALE_SESSIONS_JOB_NAME: &str = "evict_stale_sessions";
+
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub enum CommandLifecycle {
     SideChannel,
@@ -67,7 +70,7 @@ impl std::str::FromStr for ChatCommand {
             "model" => Ok(ChatCommand::Model),
             "model-preset" => Ok(ChatCommand::ModelPreset),
             "model-presets" => Ok(ChatCommand::ModelPresets),
-            "dream" => Ok(ChatCommand::Dream),
+            DREAM_JOB_NAME => Ok(ChatCommand::Dream),
             "dream-log" => Ok(ChatCommand::DreamLog),
             "dream-restore" => Ok(ChatCommand::DreamRestore),
             "mcp-list" => Ok(ChatCommand::McpList),

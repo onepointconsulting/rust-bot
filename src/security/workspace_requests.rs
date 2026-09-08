@@ -530,7 +530,7 @@ mod tests {
 
     fn handler_and_sessions(default_dir: &Path) -> (WorkspaceRequestHandler, SessionManager) {
         let handler = WorkspaceRequestHandler::new(default_dir.to_path_buf(), true);
-        let sessions = SessionManager::new(default_dir.to_path_buf());
+        let sessions = SessionManager::with_default_eviction_threshold(default_dir.to_path_buf());
         (handler, sessions)
     }
 

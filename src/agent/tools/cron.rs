@@ -5,6 +5,7 @@ use serde_json::Value;
 
 use crate::agent::cron_context::{self, CronContextToken};
 use crate::agent::tools::base::Tool;
+use crate::command::types::{DREAM_JOB_NAME, EVICT_STALE_SESSIONS_JOB_NAME};
 use crate::cron::{
     CronJob, CronJobState, CronPayloadKind, CronRunStatus, CronSchedule, CronScheduleKind,
     CronService, RemoveJobResult,
@@ -243,8 +244,10 @@ impl CronTool {
     }
 
     fn system_job_purpose(job: &CronJob) -> String {
-        if job.name == "dream" {
+        if job.name == DREAM_JOB_NAME {
             "Dream memory consolidation for long-term memory.".to_string()
+        } else if job.name == EVICT_STALE_SESSIONS_JOB_NAME {
+            "Drop unused sessions from memory; files are kept on disk.".to_string()
         } else {
             "System-managed internal job.".to_string()
         }

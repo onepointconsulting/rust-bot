@@ -3759,7 +3759,9 @@ mod tests {
             require_auth: true,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
-            session_manager: Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            session_manager: Arc::new(StdMutex::new(
+                SessionManager::with_default_eviction_threshold(dir.keep()),
+            )),
             workspace_request_handler: WorkspaceRequestHandler::new(
                 tempfile::tempdir().unwrap().keep(),
                 true,
@@ -7165,10 +7167,7 @@ mod tests {
         chat_id: Option<serde_json::Value>,
     ) {
         let mut envelope: Envelope = HashMap::new();
-        envelope.insert(
-            "type".to_string(),
-            serde_json::json!("get_session_summary"),
-        );
+        envelope.insert("type".to_string(), serde_json::json!("get_session_summary"));
         if let Some(chat_id) = chat_id {
             envelope.insert("chat_id".to_string(), chat_id);
         }
@@ -8483,7 +8482,9 @@ mod tests {
             WebSocketConfig::default(),
             Arc::new(MessageBus::new()),
             ChannelsConfig::default(),
-            Arc::new(StdMutex::new(SessionManager::new(dir.keep()))),
+            Arc::new(StdMutex::new(
+                SessionManager::with_default_eviction_threshold(dir.keep()),
+            )),
             WorkspaceRequestHandler::new(tempfile::tempdir().unwrap().keep(), true),
             ModelRuntimeResolver::for_tests(),
         );

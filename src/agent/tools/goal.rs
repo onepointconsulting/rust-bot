@@ -125,7 +125,7 @@ mod tests {
 
     fn tool() -> UpdateGoalTool {
         let dir = tempfile::tempdir().unwrap();
-        let manager = SessionManager::new(dir.path().to_path_buf());
+        let manager = SessionManager::with_default_eviction_threshold(dir.path().to_path_buf());
         UpdateGoalTool::new(Arc::new(Mutex::new(manager)))
     }
 

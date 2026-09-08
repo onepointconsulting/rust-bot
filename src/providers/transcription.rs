@@ -8,8 +8,7 @@ use reqwest::multipart;
 
 pub const GROQ_DEFAULT_MODEL: &str = "whisper-large-v3";
 pub const OPENAI_DEFAULT_MODEL: &str = "whisper-1";
-pub const GROQ_DEFAULT_API_URL: &str =
-    "https://api.groq.com/openai/v1/audio/transcriptions";
+pub const GROQ_DEFAULT_API_URL: &str = "https://api.groq.com/openai/v1/audio/transcriptions";
 pub const OPENAI_DEFAULT_API_URL: &str = "https://api.openai.com/v1/audio/transcriptions";
 
 fn convert_path(file_path: PathLike) -> PathBuf {

@@ -419,7 +419,7 @@ mod tests {
     #[test]
     fn create_session_goal_and_update_session_goal_persist_across_manager_calls() {
         let dir = tempfile::tempdir().unwrap();
-        let mut manager = SessionManager::new(dir.path().to_path_buf());
+        let mut manager = SessionManager::with_default_eviction_threshold(dir.path().to_path_buf());
         create_session_goal(&mut manager, "cli:direct", "ship the feature", None).unwrap();
         assert!(sustained_goal_active(
             &manager.get_or_create_session("cli:direct").metadata

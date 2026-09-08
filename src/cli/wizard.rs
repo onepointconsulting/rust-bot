@@ -49,7 +49,6 @@ const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_NANOGPT: &str = "nanogpt";
 const PROVIDER_ZAI_SUBSCRIPTION: &str = "zai_subscription";
 
-
 const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
     CHAT_CHANNELS,
@@ -196,7 +195,9 @@ fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         PROVIDER_OPENROUTER => Some("openrouter"),
         PROVIDER_ANTHROPIC => Some("anthropic"),
-        PROVIDER_EDENAI | PROVIDER_REQUESTY | PROVIDER_NANOGPT | PROVIDER_ZAI_SUBSCRIPTION => Some("custom"),
+        PROVIDER_EDENAI | PROVIDER_REQUESTY | PROVIDER_NANOGPT | PROVIDER_ZAI_SUBSCRIPTION => {
+            Some("custom")
+        }
         _ => None,
     }
 }
@@ -711,13 +712,21 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
     Ok(config.clone())
 }
 
-pub fn config_model(agents: &mut AgentsConfig, providers: &ProvidersConfig) -> Result<(), CliError> {
+pub fn config_model(
+    agents: &mut AgentsConfig,
+    providers: &ProvidersConfig,
+) -> Result<(), CliError> {
     let model = agents.model.clone();
     let custom = &providers.custom;
-    let (default_model, help_message) = if let Some(api_base) = &custom.api_base && api_base.contains("z.ai") {
+    let (default_model, help_message) = if let Some(api_base) = &custom.api_base
+        && api_base.contains("z.ai")
+    {
         ("glm-5.3-flash", "e.g. glm-5.3, glm-5.3-flash")
     } else {
-        (model.as_str(), "e.g. anthropic/claude-opus-5 or openai/gpt-5.6")
+        (
+            model.as_str(),
+            "e.g. anthropic/claude-opus-5 or openai/gpt-5.6",
+        )
     };
     agents.model = Text::new("Model")
         .with_default(default_model)

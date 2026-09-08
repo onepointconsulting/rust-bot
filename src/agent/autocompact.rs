@@ -8,7 +8,8 @@ use std::{
 use chrono::{DateTime, Utc};
 
 use crate::{
-    agent::{memory::Consolidator, model_runtime::ModelRuntime}, session::manager::{Session, SessionManager},
+    agent::{memory::Consolidator, model_runtime::ModelRuntime},
+    session::manager::{Session, SessionManager},
 };
 
 struct Summary {
@@ -94,7 +95,9 @@ impl Autocompact {
     }
 
     fn is_internal_session(session_key: &str) -> bool {
-        Self::INTERNAL_SESSION_PREFIXES.iter().any(|prefix| session_key.starts_with(prefix))
+        Self::INTERNAL_SESSION_PREFIXES
+            .iter()
+            .any(|prefix| session_key.starts_with(prefix))
     }
 
     fn is_archiving(&self, session_key: &str) -> bool {
@@ -149,15 +152,17 @@ impl Autocompact {
                 .get("updated_at")
                 .and_then(|u| u.as_str())
                 .unwrap_or_default();
-            let is_expired = self.is_expired(Some(TsInput::Str(updated_at_str.to_string())), Some(now));
+            let is_expired =
+                self.is_expired(Some(TsInput::Str(updated_at_str.to_string())), Some(now));
             let has_compactable_idle_tail = self.has_compactable_idle_tail(&session_key);
-            if !is_expired || !has_compactable_idle_tail
-            {
+            if !is_expired || !has_compactable_idle_tail {
                 if !is_expired {
                     log::info!("Auto-compact: session {session_key} is not expired");
                 }
                 if !has_compactable_idle_tail {
-                    log::info!("Auto-compact: session {session_key} does not have a compactable idle tail");
+                    log::info!(
+                        "Auto-compact: session {session_key} does not have a compactable idle tail"
+                    );
                 }
                 continue;
             }
@@ -221,9 +226,12 @@ impl Autocompact {
         };
         let (Some(text), Some(last_active_str)) = (
             meta.get("text").and_then(|v| v.as_str()),
-            meta.get(SessionManager::LAST_ACTIVE_KEY).and_then(|v| v.as_str()),
+            meta.get(SessionManager::LAST_ACTIVE_KEY)
+                .and_then(|v| v.as_str()),
         ) else {
-            log::error!("Auto-compact: failed for {session_key}: _last_summary missing text or last_active");
+            log::error!(
+                "Auto-compact: failed for {session_key}: _last_summary missing text or last_active"
+            );
             return;
         };
         let last_active = match DateTime::parse_from_rfc3339(last_active_str) {
@@ -233,16 +241,13 @@ impl Autocompact {
                 return;
             }
         };
-        summaries
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(
-                session_key,
-                Summary {
-                    summary: text.to_string(),
-                    last_updated: last_active,
-                },
-            );
+        summaries.lock().unwrap_or_else(|e| e.into_inner()).insert(
+            session_key,
+            Summary {
+                summary: text.to_string(),
+                last_updated: last_active,
+            },
+        );
     }
 
     /// Refresh a possibly-stale session and return any pending idle-compaction
@@ -305,7 +310,8 @@ impl Autocompact {
         {
             if let (Some(text), Some(last_active_str)) = (
                 meta.get("text").and_then(|v| v.as_str()),
-                meta.get(SessionManager::LAST_ACTIVE_KEY).and_then(|v| v.as_str()),
+                meta.get(SessionManager::LAST_ACTIVE_KEY)
+                    .and_then(|v| v.as_str()),
             ) {
                 if let Ok(dt) = DateTime::parse_from_rfc3339(last_active_str) {
                     let formatted = Self::format_summary(text, dt.with_timezone(&Utc));
@@ -623,8 +629,13 @@ mod tests {
         }
     }
 
-    fn test_autocompact(tmp: &TempDir, ttl_minutes: i64) -> (Autocompact, Arc<Mutex<SessionManager>>) {
-        let sessions = Arc::new(Mutex::new(SessionManager::new(tmp.path().to_path_buf())));
+    fn test_autocompact(
+        tmp: &TempDir,
+        ttl_minutes: i64,
+    ) -> (Autocompact, Arc<Mutex<SessionManager>>) {
+        let sessions = Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            tmp.path().to_path_buf(),
+        )));
         let store = Arc::new(MemoryStore::new(tmp.path().to_path_buf(), None));
         let runtime_resolver = Arc::new(ModelRuntimeResolver::new(
             Config::default(),
@@ -661,10 +672,12 @@ mod tests {
         let (returned, summary) = ac.prepare_session(session, "dream:20260101-000000");
 
         assert!(summary.is_none());
-        assert!(!ac.is_archiving("dream:20260101-000000"), "archiving flag must be cleared");
         assert!(
-            !ac
-                .summaries
+            !ac.is_archiving("dream:20260101-000000"),
+            "archiving flag must be cleared"
+        );
+        assert!(
+            !ac.summaries
                 .lock()
                 .unwrap()
                 .contains_key("dream:20260101-000000"),

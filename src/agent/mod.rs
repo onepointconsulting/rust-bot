@@ -1,4 +1,5 @@
 pub mod agent_loop;
+pub mod autocompact;
 pub mod circuit_breaker;
 pub mod context;
 pub mod cron_context;
@@ -11,4 +12,3 @@ pub mod skills;
 pub mod subagent;
 pub mod tools;
 pub mod workspace_context;
-pub mod autocompact;

@@ -72,10 +72,7 @@ fn default_transcription_provider() -> Option<String> {
 #[serde(rename_all = "camelCase", default)]
 pub struct ChannelsConfig {
     /// Stream agent's text progress to the channel.
-    #[serde(
-        alias = "streaming",
-        default = "default_streaming"
-    )]
+    #[serde(alias = "streaming", default = "default_streaming")]
     #[garde(skip)]
     pub streaming: bool,
 
@@ -302,6 +299,12 @@ fn default_agent_dream_config() -> DreamConfig {
 fn default_agent_session_ttl_minutes() -> u32 {
     15
 }
+pub(crate) fn default_agent_session_eviction_threshold_hours() -> u32 {
+    6
+}
+pub(crate) fn default_agent_session_eviction_cron_interval_hours() -> u32 {
+    1
+}
 fn default_agent_idle_compact_check_interval_seconds() -> u32 {
     60
 }
@@ -458,6 +461,26 @@ pub struct AgentsConfig {
     #[garde(skip)]
     pub session_ttl_minutes: u32,
 
+    /// Hours without use after which a session is dropped from the in-memory
+    /// cache (not deleted from disk). Canonical JSON name is
+    /// `sessionEvictionThresholdHours`. `0` disables cache cleanup.
+    #[serde(
+        alias = "session_eviction_threshold_hours",
+        default = "default_agent_session_eviction_threshold_hours"
+    )]
+    #[garde(skip)]
+    pub session_eviction_threshold_hours: u32,
+
+    /// How often (hours) to scan the session cache and drop unused entries.
+    /// Canonical JSON name is `sessionEvictionCronIntervalHours`.
+    /// `0` disables the cleanup job.
+    #[serde(
+        alias = "session_eviction_cron_interval_hours",
+        default = "default_agent_session_eviction_cron_interval_hours"
+    )]
+    #[garde(skip)]
+    pub session_eviction_cron_interval_hours: u32,
+
     /// Minimum interval in seconds between scans for idle sessions.
     #[serde(
         alias = "idle_compact_check_interval_seconds",
@@ -498,7 +521,10 @@ impl Default for AgentsConfig {
             timezone: default_agent_timezone(),
             dream: default_agent_dream_config(),
             session_ttl_minutes: default_agent_session_ttl_minutes(),
-            idle_compact_check_interval_seconds: default_agent_idle_compact_check_interval_seconds(),
+            idle_compact_check_interval_seconds: default_agent_idle_compact_check_interval_seconds(
+            ),
+            session_eviction_threshold_hours: default_agent_session_eviction_threshold_hours(),
+            session_eviction_cron_interval_hours: default_agent_session_eviction_cron_interval_hours(),
             model_preset: None,
             mode: default_agent_mode(),
         }
@@ -1959,6 +1985,46 @@ mod tests {
             default_agent_max_tool_result_chars()
         );
         assert_eq!(cfg.mode, default_agent_mode());
+        assert_eq!(
+            cfg.session_eviction_threshold_hours,
+            default_agent_session_eviction_threshold_hours()
+        );
+        assert_eq!(
+            cfg.session_eviction_cron_interval_hours,
+            default_agent_session_eviction_cron_interval_hours()
+        );
+        assert_eq!(
+            cfg.idle_compact_check_interval_seconds,
+            default_agent_idle_compact_check_interval_seconds()
+        );
+        assert_eq!(cfg.session_ttl_minutes, default_agent_session_ttl_minutes());
+    }
+
+    #[test]
+    fn test_agents_config_session_eviction_settings_from_json() {
+        let omitted: AgentsConfig = serde_json::from_str(r#"{"model": "mistral"}"#).unwrap();
+        assert_eq!(
+            omitted.session_eviction_threshold_hours,
+            default_agent_session_eviction_threshold_hours()
+        );
+        assert_eq!(
+            omitted.session_eviction_cron_interval_hours,
+            default_agent_session_eviction_cron_interval_hours()
+        );
+
+        let camel: AgentsConfig = serde_json::from_str(
+            r#"{"sessionEvictionThresholdHours": 12, "sessionEvictionCronIntervalHours": 4}"#,
+        )
+        .unwrap();
+        assert_eq!(camel.session_eviction_threshold_hours, 12);
+        assert_eq!(camel.session_eviction_cron_interval_hours, 4);
+
+        let snake: AgentsConfig = serde_json::from_str(
+            r#"{"session_eviction_threshold_hours": 9, "session_eviction_cron_interval_hours": 2}"#,
+        )
+        .unwrap();
+        assert_eq!(snake.session_eviction_threshold_hours, 9);
+        assert_eq!(snake.session_eviction_cron_interval_hours, 2);
     }
 
     #[test]

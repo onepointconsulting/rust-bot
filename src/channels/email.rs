@@ -1526,7 +1526,9 @@ mod tests {
 
     fn test_session_manager() -> Arc<Mutex<SessionManager>> {
         let dir = tempfile::tempdir().unwrap();
-        Arc::new(Mutex::new(SessionManager::new(dir.keep())))
+        Arc::new(Mutex::new(SessionManager::with_default_eviction_threshold(
+            dir.keep(),
+        )))
     }
 
     fn test_workspace_request_handler() -> WorkspaceRequestHandler {
