@@ -5,9 +5,10 @@ use wasm_bindgen::closure::Closure;
 use wasm_bindgen::JsCast;
 use wasm_bindgen_futures::JsFuture;
 
+use crate::attachments::{filename_from_media_url, is_image_attachment_url, with_download_query};
 use crate::components::MarkdownView;
 use crate::markdown;
-use crate::models::{ChatEntry, Role};
+use crate::models::{ChatEntry, ImageAttachment, Role};
 
 fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
     let window = web_sys::window().ok_or_else(|| "No window".to_string())?;
@@ -98,42 +99,7 @@ pub fn MessageBubble(
             pending_view()
         };
         let has_attachments = !attachments.is_empty();
-        let attachments_view = if !has_attachments {
-            ().into_any()
-        } else {
-            let row_class = if has_text {
-                "mt-2 flex flex-wrap gap-1.5"
-            } else {
-                "flex flex-wrap gap-1.5"
-            };
-            view! {
-                <div class=row_class>
-                    <For
-                        each=move || attachments.clone()
-                        key=|attachment| attachment.url.clone()
-                        let(attachment)
-                    >
-                        {
-                            let open_url = attachment.url.clone();
-                            view! {
-                                <button
-                                    type="button"
-                                    class="block cursor-pointer rounded-lg transition hover:opacity-90"
-                                    on:click=move |_| lightbox_url.set(Some(open_url.clone()))
-                                >
-                                    <img
-                                        src=attachment.url.clone()
-                                        alt=attachment.label.clone().unwrap_or_default()
-                                        class="h-24 max-w-full rounded-lg object-cover"
-                                    />
-                                </button>
-                            }
-                        }
-                    </For>
-                </div>
-            }
-            .into_any()
-        };
+        let attachments_view = attachments_row(attachments.clone(), lightbox_url, has_text);
         if !has_text && !has_attachments && extra_view.is_none() && !streaming.get() {
             ().into_any()
         } else {
@@ -153,16 +119,30 @@ pub fn MessageBubble(
         // zero-width fragment still produces a padded bubble + copy button
         // with nothing visible inside it.
         let has_text = !markdown::is_blank(&content);
-        if has_text {
+        let has_attachments = !attachments.is_empty();
+        if has_text || has_attachments {
+            let attachments_view = attachments_row(attachments.clone(), lightbox_url, has_text);
+            let text_block = if has_text {
+                view! {
+                    <>
+                        <MarkdownView source=content.clone() />
+                        {pending_view()}
+                    </>
+                }
+                .into_any()
+            } else {
+                pending_view()
+            };
+            let copy_button = has_text.then(|| view! { <CopyButton text=content.clone() /> });
             view! {
                 <div class="flex flex-col items-start gap-1.5 md:flex-row md:items-end md:justify-start">
                     <div class="max-w-[80%] rounded-2xl bg-white px-4 py-2 text-slate-800 shadow-sm">
-                        <MarkdownView source=content.clone() />
-                        {pending_view()}
+                        {text_block}
+                        {attachments_view}
                         {extra_view}
                     </div>
                     <div class="flex items-end gap-1.5">
-                        <CopyButton text=content />
+                        {copy_button}
                         {fork_button}
                     </div>
                 </div>
@@ -184,6 +164,20 @@ pub fn MessageBubble(
         } else {
             ().into_any()
         }
+    };
+
+    let lightbox_download_href = move || {
+        lightbox_url
+            .get()
+            .map(|url| with_download_query(&url))
+            .unwrap_or_default()
+    };
+    let lightbox_download_name = move || {
+        lightbox_url
+            .get()
+            .as_deref()
+            .and_then(filename_from_media_url)
+            .unwrap_or_else(|| "image".to_string())
     };
 
     view! {
@@ -214,6 +208,16 @@ pub fn MessageBubble(
                             alt=""
                             class="max-h-[90vh] max-w-[90vw] rounded-lg object-contain shadow-2xl"
                         />
+                        <a
+                            href=lightbox_download_href
+                            download=lightbox_download_name
+                            aria-label="Download image"
+                            title="Download"
+                            class="attachment-lightbox-download"
+                            on:click=move |ev| ev.stop_propagation()
+                        >
+                            <IconDownload />
+                        </a>
                         <button
                             type="button"
                             aria-label="Close image preview"
@@ -226,6 +230,112 @@ pub fn MessageBubble(
                 </div>
             </Show>
         </>
+    }
+}
+
+fn attachments_row(
+    attachments: Vec<ImageAttachment>,
+    lightbox_url: RwSignal<Option<String>>,
+    has_text: bool,
+) -> impl IntoView {
+    if attachments.is_empty() {
+        return ().into_any();
+    }
+    let row_class = if has_text {
+        "mt-2 flex flex-wrap gap-1.5"
+    } else {
+        "flex flex-wrap gap-1.5"
+    };
+    view! {
+        <div class=row_class>
+            <For
+                each=move || attachments.clone()
+                key=|attachment| attachment.url.clone()
+                let(attachment)
+            >
+                <AttachmentItem attachment=attachment lightbox_url=lightbox_url />
+            </For>
+        </div>
+    }
+    .into_any()
+}
+
+#[component]
+fn AttachmentItem(
+    attachment: ImageAttachment,
+    lightbox_url: RwSignal<Option<String>>,
+) -> impl IntoView {
+    let url = attachment.url.clone();
+    let filename = attachment
+        .label
+        .clone()
+        .or_else(|| filename_from_media_url(&url))
+        .unwrap_or_else(|| "attachment".to_string());
+    let download_url = with_download_query(&url);
+    if is_image_attachment_url(&url) {
+        let open_url = url.clone();
+        view! {
+            <div class="attachment-item">
+                <button
+                    type="button"
+                    class="block cursor-pointer rounded-lg transition hover:opacity-90"
+                    on:click=move |_| lightbox_url.set(Some(open_url.clone()))
+                >
+                    <img
+                        src=url
+                        alt=filename.clone()
+                        class="h-24 max-w-full rounded-lg object-cover"
+                    />
+                </button>
+                <a
+                    href=download_url
+                    download=filename.clone()
+                    aria-label=format!("Download {filename}")
+                    title="Download"
+                    class="attachment-download"
+                    on:click=move |ev| ev.stop_propagation()
+                >
+                    <IconDownload />
+                </a>
+            </div>
+        }
+        .into_any()
+    } else {
+        let download_name = filename.clone();
+        let chip_title = format!("Download {filename}");
+        view! {
+            <a
+                href=download_url
+                download=download_name
+                class="attachment-chip"
+                title=chip_title
+            >
+                <IconDownload />
+                <span class="attachment-chip-name">{filename}</span>
+            </a>
+        }
+        .into_any()
+    }
+}
+
+#[component]
+fn IconDownload() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-4 w-4"
+            aria-hidden="true"
+        >
+            <path d="M12 3v12" />
+            <path d="M8 11l4 4 4-4" />
+            <path d="M5 21h14" />
+        </svg>
     }
 }
 

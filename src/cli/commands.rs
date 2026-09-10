@@ -1053,7 +1053,9 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                         return Ok(());
                     }
                     if job.name == EVICT_STALE_SESSIONS_JOB_NAME {
-                        let mut manager = agent_loop.session_manager.lock()
+                        let mut manager = agent_loop
+                            .session_manager
+                            .lock()
                             .unwrap_or_else(|e| e.into_inner());
                         manager.remove_stale_sessions();
                         return Ok(());

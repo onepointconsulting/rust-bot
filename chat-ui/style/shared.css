@@ -138,36 +138,40 @@
   color: inherit;
   padding: 0;
 }
-/* syntect ClassStyle::Spaced token classes, scoped to the dark fence chrome.
-   Header / Copy stay white via .code-block__header. */
-.markdown .code-block .comment {
+/* syntect ClassStyle::SpacedPrefixed { prefix: "syn-" } token classes.
+   The prefix avoids Tailwind utility collisions (`block` → display:block
+   wrapping every JS `{`). Header / Copy stay white via .code-block__header. */
+.markdown .code-block pre span {
+  display: inline;
+}
+.markdown .code-block .syn-comment {
   color: #8b949e;
 }
-.markdown .code-block .string {
+.markdown .code-block .syn-string {
   color: #a5d6ff;
 }
-.markdown .code-block .keyword {
+.markdown .code-block .syn-keyword {
   color: #ff7b72;
 }
-.markdown .code-block .storage {
+.markdown .code-block .syn-storage {
   color: #ff7b72;
 }
-.markdown .code-block .constant {
+.markdown .code-block .syn-constant {
   color: #79c0ff;
 }
-.markdown .code-block .support {
+.markdown .code-block .syn-support {
   color: #79c0ff;
 }
-.markdown .code-block .entity {
+.markdown .code-block .syn-entity {
   color: #d2a8ff;
 }
-.markdown .code-block .variable {
+.markdown .code-block .syn-variable {
   color: #ffa657;
 }
-.markdown .code-block .punctuation {
+.markdown .code-block .syn-punctuation {
   color: #c9d1d9;
 }
-.markdown .code-block .invalid {
+.markdown .code-block .syn-invalid {
   color: #f85149;
 }
 .markdown table {
@@ -256,4 +260,61 @@
   to {
     transform: rotate(360deg);
   }
+}
+
+.attachment-item {
+  position: relative;
+  display: inline-block;
+}
+.attachment-download,
+.attachment-lightbox-download {
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  height: 1.75rem; /* h-7 */
+  width: 1.75rem;
+  border-radius: 9999px;
+  background-color: #ffffff;
+  color: #475569; /* text-slate-600 */
+  box-shadow: 0 1px 3px 0 rgb(0 0 0 / 0.1), 0 1px 2px -1px rgb(0 0 0 / 0.1);
+  text-decoration: none;
+}
+.attachment-download {
+  position: absolute;
+  right: 0.25rem;
+  bottom: 0.25rem;
+}
+.attachment-lightbox-download {
+  position: absolute;
+  left: 0;
+  bottom: 0.5rem;
+  height: 2rem;
+  width: 2rem;
+}
+.attachment-download:hover,
+.attachment-lightbox-download:hover {
+  background-color: #f1f5f9; /* bg-slate-100 */
+  color: #0f172a; /* text-slate-900 */
+}
+.attachment-chip {
+  display: inline-flex;
+  align-items: center;
+  gap: 0.375rem;
+  max-width: 100%;
+  padding: 0.375rem 0.625rem;
+  border-radius: 0.5rem;
+  background-color: #f8fafc; /* bg-slate-50 */
+  color: #1e293b; /* text-slate-800 */
+  font-size: 0.75rem; /* text-xs */
+  line-height: 1rem;
+  text-decoration: none;
+  box-shadow: 0 1px 2px 0 rgb(0 0 0 / 0.05);
+}
+.attachment-chip:hover {
+  background-color: #f1f5f9;
+}
+.attachment-chip-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }

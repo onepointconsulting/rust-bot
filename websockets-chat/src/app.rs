@@ -424,7 +424,11 @@ fn start_local_turn(
     ctx.split_stream_on_next_delta.set(false);
 }
 
-fn append_finished_assistant_entry(ctx: &WsContext, text: String) {
+fn append_finished_assistant_entry(
+    ctx: &WsContext,
+    text: String,
+    attachments: Vec<ImageAttachment>,
+) {
     let id = ctx.next_id.get_untracked();
     ctx.next_id.set(id + 1);
     ctx.entries.update(|list| {
@@ -432,7 +436,7 @@ fn append_finished_assistant_entry(ctx: &WsContext, text: String) {
             id,
             role: Role::Assistant,
             content: text,
-            attachments: Vec::new(),
+            attachments,
             streaming: false,
             tool_events: None,
             reasoning: None,
@@ -443,13 +447,14 @@ fn append_finished_assistant_entry(ctx: &WsContext, text: String) {
 
 /// Handle a `message` event, branching on whether `kind` is present (a live
 /// progress/tool-hint update) or absent (the turn's final, non-streaming
-/// answer).
+/// answer). `media` is ignored on progress/tool-hint frames.
 fn handle_message_event(
     ctx: &WsContext,
     text: String,
     reply_to: Option<String>,
     kind: Option<String>,
     tool_events: Option<Vec<chat_ui::models::ToolEvent>>,
+    media: Vec<String>,
 ) {
     match kind {
         None => {
@@ -457,11 +462,19 @@ fn handle_message_event(
             // `stream_end` carrying the authoritative full text, so
             // `apply_stream_end` is reused verbatim instead of duplicating
             // "overwrite content, clear streaming" here.
+            let attachments =
+                state::media_urls_to_attachments(media, ctx.token.get_untracked().as_deref());
             let turn_id = reply_to.or_else(|| ctx.active_turn_id.get_untracked());
             match turn_id {
                 Some(turn_id) => {
                     update_entries(ctx, |entries, index| {
                         state::apply_stream_end(entries, index, &turn_id, Some(&text));
+                        state::apply_assistant_attachments(
+                            entries,
+                            index,
+                            &turn_id,
+                            attachments.clone(),
+                        );
                     });
                     ctx.active_turn_id.set(None);
                     ctx.split_stream_on_next_delta.set(false);
@@ -473,7 +486,7 @@ fn handle_message_event(
                     // outside any client-sent turn) — surface it as a new,
                     // already-finished assistant entry rather than
                     // dropping it.
-                    append_finished_assistant_entry(ctx, text);
+                    append_finished_assistant_entry(ctx, text, attachments);
                 }
             }
         }
@@ -683,9 +696,10 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             reply_to,
             kind,
             tool_events,
+            media,
             ..
         } => {
-            handle_message_event(ctx, text, reply_to, kind, tool_events);
+            handle_message_event(ctx, text, reply_to, kind, tool_events, media);
         }
         ServerEvent::Delta { text, .. } => {
             if let Some(turn_id) = ctx.active_turn_id.get_untracked() {

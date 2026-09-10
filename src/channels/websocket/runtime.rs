@@ -2849,6 +2849,10 @@ pub struct WebSocketChannel {
     /// [`WsShared`] snapshot — see [`Self::shared`].
     runtime_resolver: Arc<ModelRuntimeResolver>,
     pub(crate) default_agent_mode: AgentMode,
+    /// Filesystem root [`serve_media`] confines keys to. Captured at
+    /// construction (`get_media_dir(None)`) so tests can point it at a
+    /// tempdir the same way they override `gateway_services`.
+    media_root: std::path::PathBuf,
 }
 
 impl WebSocketChannel {
@@ -2887,6 +2891,7 @@ impl WebSocketChannel {
             reasoning_buffers: StdMutex::new(HashMap::new()),
             runtime_resolver,
             default_agent_mode: AgentMode::Standard,
+            media_root: get_media_dir(None),
         }
     }
 
@@ -2951,14 +2956,14 @@ impl WebSocketChannel {
     /// this is a plain message or a progress/tool-hint event. Mirrors
     /// `runtime.py:997-1029` (excluding the progress-only `kind`/`tool_events`
     /// fields, added by the caller for `ProgressEvent`s).
-    fn build_message_payload(msg: &OutboundMessage) -> serde_json::Value {
+    fn build_message_payload(msg: &OutboundMessage, media: &[String]) -> serde_json::Value {
         let mut payload = serde_json::json!({
             "event": "message",
             "chat_id": msg.chat_id,
             "text": msg.content,
         });
-        if !msg.media.is_empty() {
-            payload["media"] = serde_json::json!(msg.media);
+        if !media.is_empty() {
+            payload["media"] = serde_json::json!(media);
         }
         if let Some(reply_to) = &msg.reply_to {
             payload["reply_to"] = serde_json::json!(reply_to);
@@ -2994,7 +2999,7 @@ impl WebSocketChannel {
             workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
             gateway_services: Arc::clone(&self.gateway_services),
-            media_root: get_media_dir(None),
+            media_root: self.media_root.clone(),
             runtime_resolver: Arc::clone(&self.runtime_resolver),
             default_agent_mode: self.default_agent_mode,
         }
@@ -3091,6 +3096,14 @@ impl BaseChannel for WebSocketChannel {
         // event, a `TurnEnd`, or no typed event at all. Other `OutboundEvent`
         // variants fail safe with a logged skip rather than reusing the wrong
         // shape.
+        // Confine agent-attached files under `media_root` and rewrite the
+        // live payload to `/v1/media/...` URLs. Raw host paths never go on
+        // the websocket; the transcript stores `media_paths` instead.
+        let confined = crate::channels::websocket::webui::media::confine_outbound_media(
+            &msg.media,
+            &self.media_root,
+        );
+        let media_urls = resolve_media_urls(&confined, &self.media_root);
         let payload = match &msg.event {
             Some(OutboundEvent::TurnEnd(turn_end_event)) => {
                 let turn_id = msg
@@ -3154,7 +3167,7 @@ impl BaseChannel for WebSocketChannel {
                         .send_file_edit_events(&msg.chat_id, edits, Some(msg.metadata.clone()))
                         .await;
                 }
-                let mut payload = Self::build_message_payload(&msg);
+                let mut payload = Self::build_message_payload(&msg, &media_urls);
                 if let Some(tool_events) = progress_event
                     .tool_events
                     .as_ref()
@@ -3171,7 +3184,7 @@ impl BaseChannel for WebSocketChannel {
                     });
                 payload
             }
-            None => Self::build_message_payload(&msg),
+            None => Self::build_message_payload(&msg, &media_urls),
             Some(other) => {
                 log::warn!(
                     "WebSocket channel: no wire mapping yet for {other:?} event \
@@ -3196,12 +3209,12 @@ impl BaseChannel for WebSocketChannel {
                 .transcripts
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            transcripts.append_turn_event(
-                &msg.chat_id,
-                json_object_to_map(&payload),
-                &msg.metadata,
-                phase,
-            );
+            let mut record = json_object_to_map(&payload);
+            if !confined.is_empty() {
+                record.insert("media_paths".to_string(), serde_json::json!(confined));
+                record.remove("media");
+            }
+            transcripts.append_turn_event(&msg.chat_id, record, &msg.metadata, phase);
         }
 
         let raw = payload.to_string();
@@ -8495,6 +8508,7 @@ mod tests {
         // isolation `test_shared()` already gives `WsShared`.
         channel.gateway_services =
             Arc::new(GatewayServices::new(tempfile::tempdir().unwrap().keep()));
+        channel.media_root = tempfile::tempdir().unwrap().keep();
         channel
     }
 
@@ -9016,6 +9030,62 @@ mod tests {
         assert_eq!(rows[0]["event"], "message");
         assert_eq!(rows[0]["text"], "hi there");
         assert_eq!(rows[0]["turn_phase"], "answer");
+    }
+
+    #[tokio::test]
+    async fn send_plain_message_rewrites_media_to_gateway_urls_and_persists_paths() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        let source_dir = tempfile::tempdir().unwrap();
+        let source = source_dir.path().join("report.pdf");
+        std::fs::write(&source, b"%PDF-fake").unwrap();
+
+        let mut msg = outbound("chat-1", "here is the file", None);
+        msg.media = vec![source.to_str().unwrap().to_string()];
+        msg.metadata = webui_meta("turn-1");
+
+        BaseChannel::send(&channel, msg).await.unwrap();
+        let frame = rx.try_recv().unwrap();
+        let body: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+        let media = body["media"]
+            .as_array()
+            .expect("live payload has media URLs");
+        assert_eq!(media.len(), 1);
+        let url = media[0].as_str().unwrap();
+        assert!(
+            url.starts_with("/v1/media/websocket/"),
+            "live media must be a gateway URL, got {url}"
+        );
+        assert!(url.ends_with("_report.pdf"), "{url}");
+        assert!(
+            !url.contains(source_dir.path().to_str().unwrap()),
+            "raw host path must not leak onto the wire: {url}"
+        );
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert!(
+            rows[0].get("media").is_none(),
+            "transcript stores media_paths, not live URLs"
+        );
+        let paths = rows[0]["media_paths"].as_array().expect("media_paths");
+        assert_eq!(paths.len(), 1);
+        let stored = paths[0].as_str().unwrap();
+        assert!(
+            std::path::Path::new(stored).starts_with(&channel.media_root)
+                || std::path::Path::new(stored)
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(channel.media_root.canonicalize().unwrap()),
+            "confined path {stored} should live under media_root"
+        );
+        assert_eq!(std::fs::read(stored).unwrap(), b"%PDF-fake");
     }
 
     #[tokio::test]

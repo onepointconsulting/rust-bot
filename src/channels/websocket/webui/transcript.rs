@@ -1244,14 +1244,14 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
                 entry["activity"] = serde_json::json!(activity);
             }
             // Raw (unresolved) media refs: still the absolute on-disk paths
-            // `build_user_transcript_event` recorded under `media_paths`, not
-            // yet turned into `/v1/media/...` URLs. Kept as a pure, filesystem-
-            // free projection here — path -> URL resolution (which needs to
+            // recorded under `media_paths` on user rows (`build_user_transcript_event`)
+            // and assistant answer rows (outbound `send()`). Not yet turned
+            // into `/v1/media/...` URLs. Kept as a pure, filesystem-free
+            // projection here — path -> URL resolution (which needs to
             // check the file still exists) happens once, afterward, in
             // `channels::websocket::runtime::resolve_history_media`, so this
             // function's own tests stay filesystem-free.
-            if is_user_row(row)
-                && let Some(media_paths) = row.get("media_paths").and_then(Value::as_array)
+            if let Some(media_paths) = row.get("media_paths").and_then(Value::as_array)
                 && !media_paths.is_empty()
             {
                 entry["media"] = serde_json::json!(media_paths);
@@ -2455,8 +2455,28 @@ mod tests {
             history[0]["media"],
             serde_json::json!(["/data/media/websocket/abc.png"])
         );
-        // Assistant rows never carry `media` — it's user-only.
         assert!(history[1].get("media").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_carries_raw_media_paths_on_assistant_rows() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "make a pdf"}),
+            serde_json::json!({
+                "event": "message",
+                "text": "here you go",
+                "media_paths": ["/data/media/websocket/report.pdf"],
+            }),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history.len(), 2);
+        assert!(history[0].get("media").is_none());
+        assert_eq!(
+            history[1]["media"],
+            serde_json::json!(["/data/media/websocket/report.pdf"])
+        );
     }
 
     #[test]

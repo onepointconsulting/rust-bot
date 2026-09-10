@@ -7,10 +7,11 @@ pub enum Role {
     Assistant,
 }
 
-/// An image attached to an outgoing (or previously sent) message.
+/// A file attached to an outgoing (or previously sent) message.
 ///
-/// `url` is either an `http(s)://` reference or a `data:image/...;base64,...`
-/// URL produced client-side from a picked/dropped/pasted file.
+/// `url` is a gateway `/v1/media/...` path, an `http(s)://` reference, or a
+/// `data:image/...;base64,...` URL produced client-side from a
+/// picked/dropped/pasted file. `label` is the display filename when known.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ImageAttachment {
     pub url: String,

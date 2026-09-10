@@ -524,7 +524,8 @@ impl Default for AgentsConfig {
             idle_compact_check_interval_seconds: default_agent_idle_compact_check_interval_seconds(
             ),
             session_eviction_threshold_hours: default_agent_session_eviction_threshold_hours(),
-            session_eviction_cron_interval_hours: default_agent_session_eviction_cron_interval_hours(),
+            session_eviction_cron_interval_hours:
+                default_agent_session_eviction_cron_interval_hours(),
             model_preset: None,
             mode: default_agent_mode(),
         }

@@ -6,6 +6,7 @@
 //! and the shared `login()` REST call.
 
 pub mod api;
+pub mod attachments;
 pub mod components;
 pub(crate) mod highlight;
 pub mod markdown;

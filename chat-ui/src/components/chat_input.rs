@@ -28,6 +28,17 @@ fn resize_textarea(el: &HtmlTextAreaElement) {
     let _ = style.set_property("overflow-y", overflow);
 }
 
+/// Write `value` onto the textarea (when it differs) and then remeasure.
+///
+/// `prop:value` may not have flushed yet when `send()` or a `draft` Effect
+/// runs, so measuring without this keeps the previous multi-line `scrollHeight`.
+fn sync_textarea_value_and_resize(el: &HtmlTextAreaElement, value: &str) {
+    if el.value() != value {
+        el.set_value(value);
+    }
+    resize_textarea(el);
+}
+
 /// Read a `File`'s bytes as a `data:` URL and hand the result to `on_loaded`.
 fn read_file_as_data_url(file: File, on_loaded: impl Fn(String) + 'static) {
     let Ok(reader) = web_sys::FileReader::new() else {
@@ -530,9 +541,9 @@ pub fn ChatInput(
     // When something outside the composer (e.g. an example-prompt click)
     // sets `draft`, keep the textarea's auto-sized height in sync too.
     Effect::new(move |_| {
-        let _ = draft.get();
+        let value = draft.get();
         if let Some(el) = textarea_ref.get() {
-            resize_textarea(&el);
+            sync_textarea_value_and_resize(&el, &value);
         }
     });
 
@@ -554,7 +565,7 @@ pub fn ChatInput(
         show_url_field.set(false);
         url_draft.set(String::new());
         if let Some(el) = textarea_ref.get() {
-            resize_textarea(&el);
+            sync_textarea_value_and_resize(&el, "");
         }
     };
 

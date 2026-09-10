@@ -446,11 +446,13 @@ pub enum ServerEvent {
     /// A complete chat message. When `kind` is `Some("progress")` or
     /// `Some("tool_hint")` this is a live-progress update (often carrying
     /// `tool_events`) rather than the turn's final answer; `kind == None`
-    /// means a plain final message.
+    /// means a plain final message. `media` is already-resolved
+    /// `/v1/media/...` URLs (same shape as [`ServerEvent::User`]), empty
+    /// when the message has no attachments.
     Message {
         chat_id: String,
         text: String,
-        media: Option<serde_json::Value>,
+        media: Vec<String>,
         reply_to: Option<String>,
         latency_ms: Option<u64>,
         kind: Option<String>,
@@ -715,7 +717,7 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                     .iter()
                     .map(|url| ImageAttachment {
                         url: url.clone(),
-                        label: None,
+                        label: chat_ui::attachments::filename_from_media_url(url),
                     })
                     .collect(),
                 streaming: false,
@@ -787,7 +789,7 @@ struct MessageWire {
     chat_id: String,
     text: String,
     #[serde(default)]
-    media: Option<serde_json::Value>,
+    media: Vec<String>,
     #[serde(default)]
     reply_to: Option<String>,
     #[serde(default)]
@@ -1260,8 +1262,31 @@ mod tests {
                 assert_eq!(history.len(), 2);
                 assert_eq!(history[0].attachments.len(), 1);
                 assert_eq!(history[0].attachments[0].url, "/v1/media/websocket/abc.png");
-                assert!(history[0].attachments[0].label.is_none());
+                assert_eq!(history[0].attachments[0].label.as_deref(), Some("abc.png"));
                 assert!(history[1].attachments.is_empty());
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attached_history_assistant_media_into_attachments() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"make a pdf"},
+            {"role":"assistant","content":"here you go","media":["/v1/media/websocket/report.pdf"]}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { history, .. } => {
+                assert_eq!(history[1].attachments.len(), 1);
+                assert_eq!(
+                    history[1].attachments[0].url,
+                    "/v1/media/websocket/report.pdf"
+                );
+                assert_eq!(
+                    history[1].attachments[0].label.as_deref(),
+                    Some("report.pdf")
+                );
             }
             other => panic!("expected Attached, got {other:?}"),
         }
@@ -1452,7 +1477,25 @@ mod tests {
             ServerEvent::Message {
                 chat_id: "chat-1".to_string(),
                 text: "hello there".to_string(),
-                media: None,
+                media: vec![],
+                reply_to: None,
+                latency_ms: None,
+                kind: None,
+                tool_events: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_plain_final_message_with_media() {
+        let raw = r#"{"event":"message","chat_id":"chat-1","text":"here you go","media":["/v1/media/websocket/report.pdf"]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::Message {
+                chat_id: "chat-1".to_string(),
+                text: "here you go".to_string(),
+                media: vec!["/v1/media/websocket/report.pdf".to_string()],
                 reply_to: None,
                 latency_ms: None,
                 kind: None,
@@ -1478,7 +1521,7 @@ mod tests {
             ServerEvent::Message {
                 chat_id: "chat-1".to_string(),
                 text: "running a tool".to_string(),
-                media: None,
+                media: vec![],
                 reply_to: Some("turn-1".to_string()),
                 latency_ms: Some(42),
                 kind: Some("tool_hint".to_string()),

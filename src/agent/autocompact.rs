@@ -63,6 +63,10 @@ impl Autocompact {
                 return false;
             };
             let start = session.last_consolidated.min(session.messages.len());
+            log::info!(
+                "Auto-compact {session_key}: has_compactable_idle_tail: start={start} length={}",
+                session.messages.len()
+            );
             (session.messages[start..].to_vec(), session.key.clone())
         };
         let mut probe = Session {
@@ -124,7 +128,6 @@ impl Autocompact {
         F: Fn(Pin<Box<dyn Future<Output = ()> + Send + 'static>>),
         R: Fn(&Session) -> ModelRuntime,
     {
-        log::info!("Auto-compact: checking expired sessions");
         let now = Utc::now();
         // Drop the sessions lock before the probe; `has_compactable_idle_tail`
         // locks the same `Mutex` and std mutexes are not reentrant.

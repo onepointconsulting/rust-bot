@@ -590,9 +590,28 @@ pub fn media_urls_to_attachments(media: Vec<String>, token: Option<&str>) -> Vec
             if let Some(token) = token {
                 stamp_media_url(&mut url, token);
             }
-            ImageAttachment { url, label: None }
+            let label = chat_ui::attachments::filename_from_media_url(&url);
+            ImageAttachment { url, label }
         })
         .collect()
+}
+
+/// Attach files from a final `message` event onto the assistant bubble
+/// tracking `turn_id`. No-op when `attachments` is empty or the turn is
+/// unknown. Extends rather than replacing, so a later file-bearing
+/// `message` on the same turn keeps anything already shown.
+pub fn apply_assistant_attachments(
+    entries: &mut Vec<ChatEntry>,
+    turn_index: &HashMap<String, u64>,
+    turn_id: &str,
+    attachments: Vec<ImageAttachment>,
+) {
+    if attachments.is_empty() {
+        return;
+    }
+    if let Some(entry) = find_entry_for_turn(entries, turn_index, turn_id) {
+        entry.attachments.extend(attachments);
+    }
 }
 
 /// Build the gateway WebSocket URL.
@@ -1320,11 +1339,11 @@ mod tests {
             vec![
                 ImageAttachment {
                     url: "/v1/media/websocket/abc.png?token=tok%20en".to_string(),
-                    label: None,
+                    label: Some("abc.png".to_string()),
                 },
                 ImageAttachment {
                     url: "https://example.com/a.png".to_string(),
-                    label: None,
+                    label: Some("a.png".to_string()),
                 },
             ]
         );
@@ -1338,7 +1357,7 @@ mod tests {
             attachments,
             vec![ImageAttachment {
                 url: "/v1/media/websocket/abc.png".to_string(),
-                label: None,
+                label: Some("abc.png".to_string()),
             }]
         );
     }
@@ -1346,6 +1365,64 @@ mod tests {
     #[test]
     fn media_urls_to_attachments_empty_input_is_empty_output() {
         assert_eq!(media_urls_to_attachments(Vec::new(), Some("tok")), vec![]);
+    }
+
+    #[test]
+    fn apply_assistant_attachments_extends_the_turn_bubble() {
+        let mut entries = Vec::new();
+        let mut turn_index = HashMap::new();
+        let mut next_id = 0;
+        begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "make a pdf".to_string(),
+            Vec::new(),
+        );
+        apply_stream_end(&mut entries, &turn_index, "turn-1", Some("here you go"));
+        apply_assistant_attachments(
+            &mut entries,
+            &turn_index,
+            "turn-1",
+            vec![ImageAttachment {
+                url: "/v1/media/websocket/report.pdf".to_string(),
+                label: Some("report.pdf".to_string()),
+            }],
+        );
+
+        assert_eq!(entries[1].attachments.len(), 1);
+        assert_eq!(
+            entries[1].attachments[0].url,
+            "/v1/media/websocket/report.pdf"
+        );
+        assert_eq!(entries[1].content, "here you go");
+    }
+
+    #[test]
+    fn apply_assistant_attachments_no_op_when_empty_or_unknown_turn() {
+        let mut entries = Vec::new();
+        let mut turn_index = HashMap::new();
+        let mut next_id = 0;
+        begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "hi".to_string(),
+            Vec::new(),
+        );
+        apply_assistant_attachments(&mut entries, &turn_index, "turn-1", Vec::new());
+        apply_assistant_attachments(
+            &mut entries,
+            &turn_index,
+            "missing",
+            vec![ImageAttachment {
+                url: "/v1/media/websocket/a.pdf".to_string(),
+                label: Some("a.pdf".to_string()),
+            }],
+        );
+        assert!(entries[1].attachments.is_empty());
     }
 
     #[test]

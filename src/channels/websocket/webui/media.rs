@@ -1,20 +1,25 @@
-//! Authenticated `GET /v1/media/{*key}` endpoint that serves previously
-//! uploaded WebUI attachments back to the browser.
+//! Authenticated `GET /v1/media/{*key}` endpoint that serves WebUI media
+//! back to the browser — inbound user uploads and outbound `message`-tool
+//! attachments alike.
 //!
-//! Uploaded images are written to disk under
-//! [`get_media_dir`](crate::config::paths::get_media_dir) (see
-//! `security::attachment_ingress::store_inbound_attachments`) and the file's
-//! absolute path is recorded on the transcript (`media_paths`) / session
-//! (`_meta.path`). A freshly-sent message still shows its thumbnail from an
-//! in-memory `data:` URL the browser already has — this endpoint only
-//! matters once that message comes back through `attached.history` (attach,
-//! fork, reconnect), which is text-only and has no `data:` payload to show.
+//! Files live on disk under
+//! [`get_media_dir`](crate::config::paths::get_media_dir). User uploads are
+//! written there by `security::attachment_ingress::store_inbound_attachments`;
+//! agent-attached files are copied in by [`confine_outbound_media`]. The
+//! absolute path is recorded on the transcript (`media_paths`). A freshly
+//! sent *user* message still shows its thumbnail from an in-memory `data:`
+//! URL the browser already has — this endpoint matters once that message
+//! comes back through `attached.history`, and for every outbound attachment
+//! (live `message` event and restored history), which never had a `data:`
+//! payload to show.
 //!
-//! Two halves live in this module:
+//! Pieces that live in this module:
 //! - [`media_url_from_stored_path`]: a pure(ish) mapping from a stored
 //!   absolute file path to a browser-relative `/v1/media/...` URL, used by
 //!   `channels::websocket::runtime::resolve_history_media` to rewrite
-//!   `attached.history` rows.
+//!   `attached.history` rows and by outbound `send()` for live `media`.
+//! - [`confine_outbound_media`]: copy agent-supplied paths under `media_root`
+//!   so the HTTP handler never serves outside it.
 //! - [`serve_media`]: the axum handler those URLs resolve to, mounted on
 //!   [`WebSocketChannel::router`](super::super::runtime::WebSocketChannel::router)
 //!   so it shares origin and JWT config with the WebSocket upgrade route.
@@ -27,11 +32,13 @@ use axum::{
     response::{IntoResponse, Response},
 };
 use serde::Deserialize;
+use uuid::Uuid;
 
 use crate::channels::websocket::runtime::WEBUI_JWT_PURPOSE;
 use crate::channels::websocket::types::WsShared;
+use crate::security::ingress_policy::AttachmentIngressLimits;
 use crate::security::jwt::{JwtValidationOpts, validate_jwt_token};
-use crate::utils::helpers::detect_image_mime;
+use crate::utils::helpers::{detect_image_mime, safe_filename};
 
 /// Convert a stored absolute media file path (a transcript's `media_paths`
 /// entry, or a session's recovered `[image: <path>]` placeholder) into a
@@ -66,6 +73,111 @@ pub fn media_url_from_stored_path(path: &str, media_root: &Path) -> Option<Strin
     Some(format!("/v1/media/{}", segments.join("/")))
 }
 
+/// Copy agent-attached files into `media_root` so [`serve_media`] can hand
+/// them out without ever reading outside the media directory.
+///
+/// Files already confined to `media_root` are reused in place. Missing,
+/// unreadable, or oversized files (above inbound
+/// [`AttachmentIngressLimits::DEFAULT.max_file_bytes`]) are logged and
+/// dropped rather than failing the whole send.
+pub fn confine_outbound_media(paths: &[String], media_root: &Path) -> Vec<String> {
+    confine_outbound_media_with_limit(
+        paths,
+        media_root,
+        AttachmentIngressLimits::DEFAULT.max_file_bytes,
+    )
+}
+
+fn confine_outbound_media_with_limit(
+    paths: &[String],
+    media_root: &Path,
+    max_file_bytes: usize,
+) -> Vec<String> {
+    if paths.is_empty() {
+        return Vec::new();
+    }
+    let dest_dir = media_root.join("websocket");
+    if let Err(e) = std::fs::create_dir_all(&dest_dir) {
+        log::warn!(
+            "outbound media: failed to create {}: {e}",
+            dest_dir.display()
+        );
+        return Vec::new();
+    }
+    let canonical_root = match media_root.canonicalize() {
+        Ok(root) => root,
+        Err(e) => {
+            log::warn!(
+                "outbound media: failed to canonicalize {}: {e}",
+                media_root.display()
+            );
+            return Vec::new();
+        }
+    };
+
+    let mut confined = Vec::new();
+    for path in paths {
+        match confine_one(path, &dest_dir, &canonical_root, max_file_bytes) {
+            Some(saved) => confined.push(saved),
+            None => {}
+        }
+    }
+    confined
+}
+
+fn confine_one(
+    path: &str,
+    dest_dir: &Path,
+    canonical_root: &Path,
+    max_file_bytes: usize,
+) -> Option<String> {
+    let source = Path::new(path);
+    if !source.is_file() {
+        log::warn!("outbound media: skipping missing or non-file path {path}");
+        return None;
+    }
+    let size = match std::fs::metadata(source) {
+        Ok(meta) => meta.len() as usize,
+        Err(e) => {
+            log::warn!("outbound media: failed to stat {path}: {e}");
+            return None;
+        }
+    };
+    if size > max_file_bytes {
+        log::warn!(
+            "outbound media: skipping oversized file {path} ({size} bytes, limit {max_file_bytes})"
+        );
+        return None;
+    }
+    if let Ok(canonical) = source.canonicalize()
+        && canonical.is_file()
+        && canonical.starts_with(canonical_root)
+    {
+        return Some(canonical.to_string_lossy().into_owned());
+    }
+
+    let original = source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("attachment");
+    let dest_name = format!("{}_{}", Uuid::new_v4(), safe_filename(original));
+    let dest = dest_dir.join(dest_name);
+    if let Err(e) = std::fs::copy(source, &dest) {
+        log::warn!(
+            "outbound media: failed to copy {path} -> {}: {e}",
+            dest.display()
+        );
+        return None;
+    }
+    Some(
+        dest.canonicalize()
+            .unwrap_or(dest)
+            .to_string_lossy()
+            .into_owned(),
+    )
+}
+
 /// Percent-encode one path segment for use in a URL, keeping only the
 /// RFC 3986 "unreserved" ASCII set raw.
 fn percent_encode_segment(segment: &str) -> String {
@@ -81,22 +193,93 @@ fn percent_encode_segment(segment: &str) -> String {
         .collect()
 }
 
-/// A small subset of `mimetypes.guess_extension`'s table, just enough to
-/// classify the image types the WebUI upload allow-list accepts when magic
-/// bytes alone (`detect_image_mime`) aren't conclusive (never observed in
-/// practice for files this endpoint serves, but kept as a defensive
-/// fallback rather than a hard 404 on ambiguous bytes). Deliberately
-/// duplicated from `agent::context`'s private, near-identical helper rather
-/// than shared — same "narrower reimplementation" precedent as
-/// `api::media`'s relationship to `utils::media_decode`.
-fn guess_image_mime_from_extension(path: &Path) -> Option<&'static str> {
+/// MIME from a file extension when magic bytes aren't conclusive. Covers
+/// the image/video/document types the WebUI already accepts inbound, plus
+/// the common outbound attachments the `message` tool delivers. Fallback
+/// at the call site is `application/octet-stream`.
+fn guess_mime_from_extension(path: &Path) -> Option<&'static str> {
     match path.extension()?.to_str()?.to_ascii_lowercase().as_str() {
         "png" => Some("image/png"),
         "jpg" | "jpeg" => Some("image/jpeg"),
         "gif" => Some("image/gif"),
         "webp" => Some("image/webp"),
+        "svg" => Some("image/svg+xml"),
+        "pdf" => Some("application/pdf"),
+        "txt" | "log" => Some("text/plain; charset=utf-8"),
+        "md" => Some("text/markdown; charset=utf-8"),
+        "csv" => Some("text/csv; charset=utf-8"),
+        "html" | "htm" => Some("text/html; charset=utf-8"),
+        "json" => Some("application/json"),
+        "xml" => Some("application/xml"),
+        "toml" => Some("application/toml"),
+        "yaml" | "yml" => Some("application/yaml"),
+        "zip" => Some("application/zip"),
+        "mp3" => Some("audio/mpeg"),
+        "wav" => Some("audio/wav"),
+        "ogg" => Some("audio/ogg"),
+        "m4a" => Some("audio/mp4"),
+        "mp4" => Some("video/mp4"),
+        "webm" => Some("video/webm"),
+        "mov" => Some("video/quicktime"),
+        "doc" => Some("application/msword"),
+        "docx" => Some("application/vnd.openxmlformats-officedocument.wordprocessingml.document"),
+        "xls" => Some("application/vnd.ms-excel"),
+        "xlsx" => Some("application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"),
+        "ppt" => Some("application/vnd.ms-powerpoint"),
+        "pptx" => Some("application/vnd.openxmlformats-officedocument.presentationml.presentation"),
         _ => None,
     }
+}
+
+fn mime_for_file(path: &Path, bytes: &[u8]) -> &'static str {
+    detect_image_mime(bytes)
+        .or_else(|| guess_mime_from_extension(path))
+        .unwrap_or("application/octet-stream")
+}
+
+fn is_inline_image_mime(mime: &str) -> bool {
+    matches!(
+        mime,
+        "image/png" | "image/jpeg" | "image/gif" | "image/webp"
+    )
+}
+
+/// Prefer the original filename when outbound copies are stored as
+/// `{uuid}_{original}`; otherwise the on-disk name.
+fn download_filename(path: &Path) -> String {
+    let name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or("attachment");
+    if let Some((maybe_uuid, rest)) = name.split_once('_')
+        && Uuid::parse_str(maybe_uuid).is_ok()
+        && !rest.is_empty()
+    {
+        return rest.to_string();
+    }
+    name.to_string()
+}
+
+fn content_disposition_header(inline: bool, filename: &str) -> header::HeaderValue {
+    let kind = if inline { "inline" } else { "attachment" };
+    let ascii: String = filename
+        .chars()
+        .map(|c| {
+            if c.is_ascii_alphanumeric() || matches!(c, '.' | '-' | '_' | ' ') {
+                c
+            } else {
+                '_'
+            }
+        })
+        .collect();
+    let encoded = percent_encode_segment(filename);
+    let value = format!("{kind}; filename=\"{ascii}\"; filename*=UTF-8''{encoded}");
+    header::HeaderValue::from_str(&value).unwrap_or_else(|_| header::HeaderValue::from_static(kind))
+}
+
+fn is_download_query(value: Option<&str>) -> bool {
+    matches!(value.map(str::trim), Some("1") | Some("true") | Some("yes"))
 }
 
 /// Confine a request's `key` (already percent-decoded by axum's `Path`
@@ -120,11 +303,15 @@ fn resolve_media_request_path(media_root: &Path, key: &str) -> Option<PathBuf> {
 
 /// Query params accepted on the media request, mirroring the WebSocket
 /// upgrade's own `?token=...` convention (`WsUpgradeQuery`) — needed because
-/// a plain `<img src>` cannot set an `Authorization` header.
-#[derive(Debug, Deserialize)]
+/// a plain `<img src>` cannot set an `Authorization` header. `download=1`
+/// forces `Content-Disposition: attachment` so a click-to-save link can
+/// download an image that would otherwise be served `inline` for `<img>`.
+#[derive(Debug, Default, Deserialize)]
 pub(crate) struct MediaQuery {
     #[serde(default)]
     pub token: Option<String>,
+    #[serde(default)]
+    pub download: Option<String>,
 }
 
 /// Bearer-or-query-token guard for the media endpoint, mirroring the
@@ -177,10 +364,10 @@ fn authorize_media_request(
 }
 
 /// Axum handler for `GET /v1/media/{*key}`: authorize, confine `key` to the
-/// media root, and stream the file back with an image `Content-Type` —
-/// 404 for anything missing, escaping the media root, or not an image (this
-/// endpoint only ever serves images; non-image attachments aren't shown as
-/// bubble thumbnails).
+/// media root, and stream the file back. Images are served `inline` so an
+/// `<img src>` can render them; non-images, or any file requested with
+/// `?download=1`, get `Content-Disposition: attachment`. 404 for anything
+/// missing or escaping the media root.
 pub(crate) async fn serve_media(
     State(shared): State<WsShared>,
     AxumPath(key): AxumPath<String>,
@@ -200,15 +387,18 @@ pub(crate) async fn serve_media(
         Err(_) => return StatusCode::NOT_FOUND.into_response(),
     };
 
-    let Some(mime) =
-        detect_image_mime(&bytes).or_else(|| guess_image_mime_from_extension(&resolved))
-    else {
-        return StatusCode::NOT_FOUND.into_response();
-    };
+    let mime = mime_for_file(&resolved, &bytes);
+    let force_download = is_download_query(query.download.as_deref());
+    let inline = is_inline_image_mime(mime) && !force_download;
+    let filename = download_filename(&resolved);
 
     let mut response = bytes.into_response();
     let headers = response.headers_mut();
     headers.insert(header::CONTENT_TYPE, header::HeaderValue::from_static(mime));
+    headers.insert(
+        header::CONTENT_DISPOSITION,
+        content_disposition_header(inline, &filename),
+    );
     headers.insert(
         header::CACHE_CONTROL,
         header::HeaderValue::from_static("private, max-age=86400"),
@@ -302,6 +492,78 @@ mod tests {
     fn resolve_media_request_path_rejects_empty_key() {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_media_request_path(dir.path(), "").is_none());
+    }
+
+    // ── confine_outbound_media ───────────────────────────────────────────────
+
+    #[test]
+    fn confine_outbound_media_reuses_file_already_under_media_root() {
+        let dir = tempfile::tempdir().unwrap();
+        let sub = dir.path().join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        let file = sub.join("already.png");
+        std::fs::write(&file, b"png-bytes").unwrap();
+
+        let confined = confine_outbound_media(&[file.to_str().unwrap().to_string()], dir.path());
+        assert_eq!(confined.len(), 1);
+        assert_eq!(
+            Path::new(&confined[0]).canonicalize().unwrap(),
+            file.canonicalize().unwrap()
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"png-bytes");
+    }
+
+    #[test]
+    fn confine_outbound_media_copies_file_from_outside_media_root() {
+        let media_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let source = outside_dir.path().join("report.pdf");
+        std::fs::write(&source, b"%PDF-fake").unwrap();
+
+        let confined =
+            confine_outbound_media(&[source.to_str().unwrap().to_string()], media_dir.path());
+        assert_eq!(confined.len(), 1);
+        let dest = Path::new(&confined[0]);
+        assert!(
+            dest.starts_with(media_dir.path())
+                || dest
+                    .canonicalize()
+                    .unwrap()
+                    .starts_with(media_dir.path().canonicalize().unwrap())
+        );
+        assert_eq!(std::fs::read(dest).unwrap(), b"%PDF-fake");
+        assert!(
+            std::fs::read(&source).is_ok(),
+            "source must be left in place"
+        );
+        let name = dest.file_name().unwrap().to_string_lossy();
+        assert!(name.ends_with("_report.pdf"), "{name}");
+        assert_eq!(download_filename(dest), "report.pdf");
+    }
+
+    #[test]
+    fn confine_outbound_media_skips_missing_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("gone.pdf");
+        assert!(
+            confine_outbound_media(&[missing.to_string_lossy().into_owned()], dir.path())
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn confine_outbound_media_skips_oversized_file() {
+        let media_dir = tempfile::tempdir().unwrap();
+        let outside_dir = tempfile::tempdir().unwrap();
+        let source = outside_dir.path().join("big.bin");
+        std::fs::write(&source, vec![0u8; 32]).unwrap();
+
+        let confined = confine_outbound_media_with_limit(
+            &[source.to_str().unwrap().to_string()],
+            media_dir.path(),
+            16,
+        );
+        assert!(confined.is_empty());
     }
 
     // ── authorize_media_request / serve_media ────────────────────────────────
@@ -446,7 +708,7 @@ mod tests {
         let response = serve_media(
             State(shared),
             AxumPath("websocket/pic.png".to_string()),
-            Query(MediaQuery { token: None }),
+            Query(MediaQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -454,6 +716,17 @@ mod tests {
         assert_eq!(
             response.headers().get(header::CONTENT_TYPE).unwrap(),
             "image/png"
+        );
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.starts_with("inline;"), "{disposition}");
+        assert!(
+            disposition.contains("filename=\"pic.png\""),
+            "{disposition}"
         );
     }
 
@@ -463,7 +736,7 @@ mod tests {
         let response = serve_media(
             State(shared),
             AxumPath("../../etc/passwd".to_string()),
-            Query(MediaQuery { token: None }),
+            Query(MediaQuery::default()),
             HeaderMap::new(),
         )
         .await;
@@ -471,7 +744,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn serve_media_404_for_non_image_file() {
+    async fn serve_media_returns_non_image_as_attachment() {
         let shared = test_shared();
         let sub = shared.media_root.join("websocket");
         std::fs::create_dir_all(&sub).unwrap();
@@ -480,11 +753,82 @@ mod tests {
         let response = serve_media(
             State(shared),
             AxumPath("websocket/notes.txt".to_string()),
-            Query(MediaQuery { token: None }),
+            Query(MediaQuery::default()),
             HeaderMap::new(),
         )
         .await;
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "text/plain; charset=utf-8"
+        );
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.starts_with("attachment;"), "{disposition}");
+        assert!(
+            disposition.contains("filename=\"notes.txt\""),
+            "{disposition}"
+        );
+    }
+
+    #[tokio::test]
+    async fn serve_media_pdf_is_attachment() {
+        let shared = test_shared();
+        let sub = shared.media_root.join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        std::fs::write(sub.join("report.pdf"), b"%PDF-1.4").unwrap();
+
+        let response = serve_media(
+            State(shared),
+            AxumPath("websocket/report.pdf".to_string()),
+            Query(MediaQuery::default()),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(
+            response.headers().get(header::CONTENT_TYPE).unwrap(),
+            "application/pdf"
+        );
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.starts_with("attachment;"), "{disposition}");
+    }
+
+    #[tokio::test]
+    async fn serve_media_download_query_forces_attachment_on_image() {
+        let shared = test_shared();
+        let sub = shared.media_root.join("websocket");
+        std::fs::create_dir_all(&sub).unwrap();
+        let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-file";
+        std::fs::write(sub.join("pic.png"), png_bytes).unwrap();
+
+        let response = serve_media(
+            State(shared),
+            AxumPath("websocket/pic.png".to_string()),
+            Query(MediaQuery {
+                token: None,
+                download: Some("1".to_string()),
+            }),
+            HeaderMap::new(),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::OK);
+        let disposition = response
+            .headers()
+            .get(header::CONTENT_DISPOSITION)
+            .unwrap()
+            .to_str()
+            .unwrap();
+        assert!(disposition.starts_with("attachment;"), "{disposition}");
     }
 
     #[tokio::test]
@@ -493,7 +837,7 @@ mod tests {
         let response = serve_media(
             State(shared),
             AxumPath("websocket/pic.png".to_string()),
-            Query(MediaQuery { token: None }),
+            Query(MediaQuery::default()),
             HeaderMap::new(),
         )
         .await;
