@@ -6,6 +6,7 @@ use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, Password, Select, Text};
 
 use crate::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_password};
+use crate::channels::websocket::CHANNEL_NAME as CHANNEL_WEBSOCKET;
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
 use crate::cli::onboard::create_env_file;
@@ -69,7 +70,6 @@ const MODEL_PRESETS_MENU: [&str; 2] = [CREATE_MODEL_PRESET, SET_DEFAULT_MODEL_PR
 const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
 
 const CHANNEL_EMAIL: &str = "email";
-const CHANNEL_WEBSOCKET: &str = "websocket";
 const CHANNEL_OPTIONS_CHOICE: &str = "Channel Options";
 const CHANNELS: &str = "Channels";
 const CHANNELS_MENU: [&str; 2] = [CHANNEL_OPTIONS_CHOICE, CHANNELS];

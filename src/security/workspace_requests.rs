@@ -14,7 +14,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    channels::websocket::get_session_id,
+    channels::websocket::{CHANNEL_NAME, get_session_id},
     config::paths::get_webui_dir,
     security::{
         WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
@@ -28,7 +28,6 @@ use crate::{
 
 const WEBUI_WORKSPACE_STATE_SCHEMA_VERSION: u16 = 1;
 const MAX_STATE_FILE_BYTES: u64 = 128 * 1024;
-const WEBUI_SCOPE_CHANNEL: &str = "websocket";
 
 /// Allow a remote request only when it keeps the project and does not add access.
 fn scope_change_is_non_escalating(current: &WorkspaceScope, requested: &WorkspaceScope) -> bool {
@@ -171,12 +170,12 @@ pub fn default_scope_for_webui(
         DefaultAccessMode::Default => default_workspace_scope(
             default_workspace,
             default_restrict_to_workspace,
-            Some(WEBUI_SCOPE_CHANNEL),
+            Some(CHANNEL_NAME),
         ),
         DefaultAccessMode::Full => build_workspace_scope(
             default_workspace,
             WorkspaceAccessMode::Full,
-            Some(WEBUI_SCOPE_CHANNEL),
+            Some(CHANNEL_NAME),
         ),
     }
 }
@@ -239,7 +238,7 @@ impl WorkspaceRequestHandler {
             &session.metadata,
             &self.default_workspace,
             self.default_restrict_to_workspace,
-            Some(WEBUI_SCOPE_CHANNEL),
+            Some(CHANNEL_NAME),
         )
     }
 
@@ -272,7 +271,7 @@ impl WorkspaceRequestHandler {
                 raw,
                 &self.default_workspace,
                 self.default_restrict_to_workspace,
-                Some(WEBUI_SCOPE_CHANNEL),
+                Some(CHANNEL_NAME),
             )?,
         };
         if !controls_available && !scope_change_is_non_escalating(&current, &scope) {
@@ -483,13 +482,11 @@ mod tests {
         // depending on the process-global `get_webui_dir()` path.
         let scope = match state.default_access_mode {
             DefaultAccessMode::Default => {
-                default_workspace_scope(dir.path(), true, Some(WEBUI_SCOPE_CHANNEL))
+                default_workspace_scope(dir.path(), true, Some(CHANNEL_NAME))
             }
-            DefaultAccessMode::Full => build_workspace_scope(
-                dir.path(),
-                WorkspaceAccessMode::Full,
-                Some(WEBUI_SCOPE_CHANNEL),
-            ),
+            DefaultAccessMode::Full => {
+                build_workspace_scope(dir.path(), WorkspaceAccessMode::Full, Some(CHANNEL_NAME))
+            }
         };
         assert_eq!(scope.access_mode, WorkspaceAccessMode::Full);
         assert!(!scope.restrict_to_workspace);

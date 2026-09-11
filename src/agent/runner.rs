@@ -2347,7 +2347,7 @@ mod tests {
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(MessageTool::new(
             Some(callback),
-            "websocket",
+            crate::channels::websocket::CHANNEL_NAME,
             "chat-1",
             None,
         )));

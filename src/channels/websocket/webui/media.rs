@@ -34,6 +34,7 @@ use axum::{
 use serde::Deserialize;
 use uuid::Uuid;
 
+use crate::channels::websocket::CHANNEL_NAME;
 use crate::channels::websocket::runtime::WEBUI_JWT_PURPOSE;
 use crate::channels::websocket::types::WsShared;
 use crate::security::ingress_policy::AttachmentIngressLimits;
@@ -96,7 +97,7 @@ fn confine_outbound_media_with_limit(
     if paths.is_empty() {
         return Vec::new();
     }
-    let dest_dir = media_root.join("websocket");
+    let dest_dir = media_root.join(CHANNEL_NAME);
     if let Err(e) = std::fs::create_dir_all(&dest_dir) {
         log::warn!(
             "outbound media: failed to create {}: {e}",
@@ -424,19 +425,19 @@ mod tests {
     #[test]
     fn media_url_from_stored_path_maps_relative_url() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("websocket");
+        let sub = dir.path().join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let file = sub.join("abc123.png");
         std::fs::write(&file, b"fake-png").unwrap();
 
         let url = media_url_from_stored_path(file.to_str().unwrap(), dir.path()).unwrap();
-        assert_eq!(url, "/v1/media/websocket/abc123.png");
+        assert_eq!(url, format!("/v1/media/{CHANNEL_NAME}/abc123.png"));
     }
 
     #[test]
     fn media_url_from_stored_path_none_when_file_missing() {
         let dir = tempfile::tempdir().unwrap();
-        let missing = dir.path().join("websocket").join("gone.png");
+        let missing = dir.path().join(CHANNEL_NAME).join("gone.png");
         assert!(media_url_from_stored_path(missing.to_str().unwrap(), dir.path()).is_none());
     }
 
@@ -500,7 +501,7 @@ mod tests {
     #[test]
     fn confine_outbound_media_reuses_file_already_under_media_root() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("websocket");
+        let sub = dir.path().join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let file = sub.join("already.png");
         std::fs::write(&file, b"png-bytes").unwrap();
@@ -572,7 +573,7 @@ mod tests {
     fn test_shared() -> WsShared {
         let dir = tempfile::tempdir().unwrap();
         WsShared {
-            name: "websocket",
+            name: CHANNEL_NAME,
             bus: Arc::new(MessageBus::new()),
             channels_config: ChannelsConfig::default(),
             jwt: JwtConfig::default(),
@@ -702,7 +703,7 @@ mod tests {
     #[tokio::test]
     async fn serve_media_returns_image_bytes_when_jwt_disabled() {
         let shared = test_shared();
-        let sub = shared.media_root.join("websocket");
+        let sub = shared.media_root.join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         // Minimal valid PNG magic-byte header, enough for `detect_image_mime`.
         let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-file";
@@ -710,7 +711,7 @@ mod tests {
 
         let response = serve_media(
             State(shared),
-            AxumPath("websocket/pic.png".to_string()),
+            AxumPath(format!("{CHANNEL_NAME}/pic.png")),
             Query(MediaQuery::default()),
             HeaderMap::new(),
         )
@@ -749,13 +750,13 @@ mod tests {
     #[tokio::test]
     async fn serve_media_returns_non_image_as_attachment() {
         let shared = test_shared();
-        let sub = shared.media_root.join("websocket");
+        let sub = shared.media_root.join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("notes.txt"), b"plain text, not an image").unwrap();
 
         let response = serve_media(
             State(shared),
-            AxumPath("websocket/notes.txt".to_string()),
+            AxumPath(format!("{CHANNEL_NAME}/notes.txt")),
             Query(MediaQuery::default()),
             HeaderMap::new(),
         )
@@ -781,13 +782,13 @@ mod tests {
     #[tokio::test]
     async fn serve_media_pdf_is_attachment() {
         let shared = test_shared();
-        let sub = shared.media_root.join("websocket");
+        let sub = shared.media_root.join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         std::fs::write(sub.join("report.pdf"), b"%PDF-1.4").unwrap();
 
         let response = serve_media(
             State(shared),
-            AxumPath("websocket/report.pdf".to_string()),
+            AxumPath(format!("{CHANNEL_NAME}/report.pdf")),
             Query(MediaQuery::default()),
             HeaderMap::new(),
         )
@@ -809,14 +810,14 @@ mod tests {
     #[tokio::test]
     async fn serve_media_download_query_forces_attachment_on_image() {
         let shared = test_shared();
-        let sub = shared.media_root.join("websocket");
+        let sub = shared.media_root.join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let png_bytes: &[u8] = b"\x89PNG\r\n\x1a\nrest-of-file";
         std::fs::write(sub.join("pic.png"), png_bytes).unwrap();
 
         let response = serve_media(
             State(shared),
-            AxumPath("websocket/pic.png".to_string()),
+            AxumPath(format!("{CHANNEL_NAME}/pic.png")),
             Query(MediaQuery {
                 token: None,
                 download: Some("1".to_string()),
@@ -839,7 +840,7 @@ mod tests {
         let (shared, _key) = shared_with_jwt_enabled();
         let response = serve_media(
             State(shared),
-            AxumPath("websocket/pic.png".to_string()),
+            AxumPath(format!("{CHANNEL_NAME}/pic.png")),
             Query(MediaQuery::default()),
             HeaderMap::new(),
         )

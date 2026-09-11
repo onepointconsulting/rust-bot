@@ -16,7 +16,7 @@ use crate::{
         outbound_events::{OutboundEvent, ProgressKind},
         queue::MessageBus,
     },
-    channels::{base::BaseChannel, registry::discover_all},
+    channels::{base::BaseChannel, registry::discover_all, websocket::CHANNEL_NAME},
     config::schema::Config,
     security::workspace_requests::WorkspaceRequestHandler,
     session::manager::SessionManager,
@@ -1205,7 +1205,7 @@ mod tests {
         let bus = Arc::new(MessageBus::new());
         let mut channels: HashMap<String, SharedChannel> = HashMap::new();
         channels.insert(
-            "websocket".to_string(),
+            CHANNEL_NAME.to_string(),
             Arc::new(MockChannel::new(bus, true)),
         );
         let mut config = Config::default();
@@ -1213,11 +1213,11 @@ mod tests {
         config
             .channels
             .extra
-            .insert("websocket".to_string(), json!({"sendProgress": false}));
+            .insert(CHANNEL_NAME.to_string(), json!({"sendProgress": false}));
 
         let overrides = ChannelManager::resolve_progress_overrides(&channels, &config);
 
-        assert!(!overrides.get("websocket").unwrap().send_progress);
+        assert!(!overrides.get(CHANNEL_NAME).unwrap().send_progress);
     }
 
     #[tokio::test]
@@ -1320,10 +1320,10 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
         )
-        .register_channel("websocket", Arc::new(MockChannel::new(bus, true)));
+        .register_channel(CHANNEL_NAME, Arc::new(MockChannel::new(bus, true)));
 
         assert!(manager.get_channel("email").is_some());
-        assert!(manager.get_channel("websocket").is_some());
+        assert!(manager.get_channel(CHANNEL_NAME).is_some());
     }
 
     #[test]

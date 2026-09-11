@@ -297,6 +297,7 @@ fn extract_webui_outbound_metadata(inbound: &HashMap<String, Value>) -> HashMap<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::websocket::CHANNEL_NAME;
 
     /// Build a callback that records every `OutboundMessage` it receives.
     fn capturing_callback() -> (SendCallback, Arc<Mutex<Vec<OutboundMessage>>>) {
@@ -447,7 +448,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_owner_send_copies_inbound_webui_keys() {
-        let (tool, captured) = tool_with_capture("websocket", "chat-1", None);
+        let (tool, captured) = tool_with_capture(CHANNEL_NAME, "chat-1", None);
         tool.set_inbound_webui_metadata(&HashMap::from([
             (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
             (
@@ -472,7 +473,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_websocket_channel_without_inbound_webui_does_not_invent_the_flag() {
-        let (tool, captured) = tool_with_capture("websocket", "chat-1", None);
+        let (tool, captured) = tool_with_capture(CHANNEL_NAME, "chat-1", None);
 
         tool.execute(&serde_json::json!({ "content": "hi" })).await;
 
@@ -483,7 +484,7 @@ mod tests {
 
     #[tokio::test]
     async fn execute_cross_chat_does_not_copy_inbound_webui_keys() {
-        let (tool, captured) = tool_with_capture("websocket", "chat-1", None);
+        let (tool, captured) = tool_with_capture(CHANNEL_NAME, "chat-1", None);
         tool.set_inbound_webui_metadata(&HashMap::from([
             (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
             (
@@ -506,7 +507,7 @@ mod tests {
 
     #[test]
     fn set_inbound_webui_metadata_clears_when_inbound_is_not_webui() {
-        let tool = MessageTool::new(None, "websocket", "chat-1", None);
+        let tool = MessageTool::new(None, CHANNEL_NAME, "chat-1", None);
         tool.set_inbound_webui_metadata(&HashMap::from([
             (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
             (

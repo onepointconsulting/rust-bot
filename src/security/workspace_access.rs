@@ -13,6 +13,8 @@ use std::str::FromStr;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::channels::websocket::CHANNEL_NAME;
+
 pub use crate::session::keys::WORKSPACE_SCOPE_METADATA_KEY;
 
 /// Env vars used to detect OS-level sandbox enforcement of workspace
@@ -238,7 +240,7 @@ impl WorkspaceScopeResolver {
         Self {
             default_workspace,
             default_restrict_to_workspace,
-            scoped_channel: "websocket".to_string(),
+            scoped_channel: CHANNEL_NAME.to_string(),
         }
     }
 

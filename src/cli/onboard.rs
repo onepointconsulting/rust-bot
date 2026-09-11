@@ -5,6 +5,7 @@ use std::path::{Path, PathBuf};
 
 use anstyle::{AnsiColor, Color, Style};
 
+use crate::channels::websocket::CHANNEL_NAME;
 use crate::cli::commands::{CliError, OnboardArgs};
 use crate::cli::wizard::{
     apply_workspace_override, choose_providers, config_model, configure_websocket_channel,
@@ -203,7 +204,7 @@ fn websocket_jwt_enabled(config: &Config) -> bool {
     config
         .channels
         .extra
-        .get("websocket")
+        .get(CHANNEL_NAME)
         .and_then(|value| value.get("jwt"))
         .and_then(|value| value.get("enabled"))
         .and_then(|value| value.as_bool())

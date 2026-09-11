@@ -24,6 +24,7 @@ use crate::bus::events::{InboundMessage, OutboundMessage};
 use crate::channels::base::BaseChannel;
 use crate::channels::gateway_services::SessionWorkCanceller;
 use crate::channels::manager::ChannelManager;
+use crate::channels::websocket::CHANNEL_NAME;
 use crate::channels::websocket::runtime::WebSocketChannel;
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
@@ -513,7 +514,7 @@ pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
     let existing_websocket_config: Option<WebSocketConfig> = config
         .channels
         .extra
-        .get("websocket")
+        .get(CHANNEL_NAME)
         .and_then(|value| serde_json::from_value(value.clone()).ok());
 
     let aud = resolve_aud(
@@ -544,9 +545,9 @@ pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
     config.api.users_file = path_for_config(args.users_file).display().to_string();
 
     let websocket_config = WebSocketConfig::default();
-    if !config.channels.extra.contains_key("websocket") {
+    if !config.channels.extra.contains_key(CHANNEL_NAME) {
         config.channels.extra.insert(
-            "websocket".to_string(),
+            CHANNEL_NAME.to_string(),
             serde_json::json!({
                 "enabled": websocket_config.enabled,
                 "host": websocket_config.host,
@@ -901,9 +902,9 @@ fn resolve_websocket_channel(
     workspace_request_handler: WorkspaceRequestHandler,
     runtime_resolver: Arc<ModelRuntimeResolver>,
 ) -> Option<Arc<WebSocketChannel>> {
-    let raw = config.channels.extra.get("websocket")?.clone();
+    let raw = config.channels.extra.get(CHANNEL_NAME)?.clone();
     let cfg: WebSocketConfig = serde_json::from_value(raw)
-        .inspect_err(|err| log::error!("Invalid \"websocket\" channel config: {err}"))
+        .inspect_err(|err| log::error!("Invalid \"{CHANNEL_NAME}\" channel config: {err}"))
         .ok()?;
     if !cfg.enabled {
         return None;
@@ -1203,7 +1204,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     );
     if let Some(ws_channel) = &ws_channel {
         channel_manager = channel_manager
-            .register_channel("websocket", Arc::clone(ws_channel) as Arc<dyn BaseChannel>);
+            .register_channel(CHANNEL_NAME, Arc::clone(ws_channel) as Arc<dyn BaseChannel>);
     }
     let channels = Arc::new(channel_manager);
 
@@ -2160,7 +2161,7 @@ mod tests {
     #[test]
     fn resolve_websocket_channel_is_none_when_key_absent() {
         let config = Config::default();
-        assert!(config.channels.extra.get("websocket").is_none());
+        assert!(config.channels.extra.get(CHANNEL_NAME).is_none());
 
         let resolved = resolve_websocket_channel(
             &config,
@@ -2181,7 +2182,7 @@ mod tests {
     fn resolve_websocket_channel_is_none_when_present_but_disabled() {
         let mut config = Config::default();
         config.channels.extra.insert(
-            "websocket".to_string(),
+            CHANNEL_NAME.to_string(),
             serde_json::json!({"enabled": false}),
         );
 
@@ -2200,7 +2201,7 @@ mod tests {
     fn resolve_websocket_channel_is_some_when_present_and_enabled() {
         let mut config = Config::default();
         config.channels.extra.insert(
-            "websocket".to_string(),
+            CHANNEL_NAME.to_string(),
             serde_json::json!({"enabled": true}),
         );
 
@@ -2219,7 +2220,7 @@ mod tests {
     fn resolve_websocket_channel_is_none_when_malformed() {
         let mut config = Config::default();
         config.channels.extra.insert(
-            "websocket".to_string(),
+            CHANNEL_NAME.to_string(),
             serde_json::json!({"port": "not-a-number"}),
         );
 

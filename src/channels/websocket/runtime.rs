@@ -28,7 +28,6 @@ use crate::agent::skills::SkillsLoader;
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
-use crate::channels::websocket::get_session_id;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
@@ -38,6 +37,7 @@ use crate::channels::websocket::webui::metadata::{
     WEBSOCKET_TURN_OWNER_METADATA_KEY, WEBUI_TURN_METADATA_KEY,
 };
 use crate::channels::websocket::webui::transcript::client_turn_metadata;
+use crate::channels::websocket::{CHANNEL_NAME, get_session_id};
 use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
@@ -69,7 +69,7 @@ const MAX_HISTORY_MESSAGES: usize = 200;
 /// Enqueue a runtime model snapshot for websocket subscribers (fan-out in-channel).
 pub fn publish_runtime_model_update(bus: Arc<MessageBus>, model: &str, model_preset: Option<&str>) {
     let res = bus.outbound.put_nowait(outbound_message_for_event(
-        "websocket",
+        CHANNEL_NAME,
         "*",
         RuntimeModelUpdated(RuntimeModelUpdatedEvent {
             model: Some(model.to_string()),
@@ -1294,7 +1294,7 @@ async fn handle_envelope_abort_turn<'a>(envelope_dispatch_context: EnvelopeDispa
     // every test fixture and whenever no live `AgentLoop` was wired in — see
     // `GatewayServices::set_work_canceller`.
     if let Some(canceller) = shared.gateway_services.work_canceller() {
-        canceller.abort("websocket", cid).await;
+        canceller.abort(CHANNEL_NAME, cid).await;
     }
     // The abort above publishes a `TurnEnd`, which clears the projection via
     // `WebSocketChannel::send` — but only when there *was* a canceller to run
@@ -1607,7 +1607,7 @@ async fn handle_envelope_delete_chat<'a>(envelope_dispatch_context: EnvelopeDisp
     // fixture and whenever no live `AgentLoop` was wired in — see
     // `GatewayServices::set_work_canceller`.
     if let Some(canceller) = shared.gateway_services.work_canceller() {
-        canceller.abort("websocket", cid).await;
+        canceller.abort(CHANNEL_NAME, cid).await;
     }
     // The abort above may publish a `TurnEnd`, but that only clears the
     // *agent's* bookkeeping — also clear the WebSocket-side turn projection
@@ -2130,7 +2130,7 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
             .await;
             return;
         };
-        let media_dir = get_media_dir(Some("websocket"));
+        let media_dir = get_media_dir(Some(CHANNEL_NAME));
         match store_inbound_attachments(
             media_array,
             &media_dir,
@@ -2728,7 +2728,7 @@ async fn handle_envelope_clear_session<'a>(envelope_dispatch_context: EnvelopeDi
     // session. `None` in every test fixture and whenever no live
     // `AgentLoop` was wired in — see `GatewayServices::set_work_canceller`.
     if let Some(canceller) = shared.gateway_services.work_canceller() {
-        canceller.abort("websocket", cid).await;
+        canceller.abort(CHANNEL_NAME, cid).await;
     }
     // The abort above may publish a `TurnEnd`, but that only clears the
     // *agent's* bookkeeping — also clear the WebSocket-side turn projection
@@ -3194,7 +3194,7 @@ impl WebSocketChannel {
 #[async_trait]
 impl BaseChannel for WebSocketChannel {
     fn name(&self) -> &'static str {
-        "websocket"
+        CHANNEL_NAME
     }
 
     fn display_name(&self) -> &'static str {
@@ -3624,6 +3624,10 @@ mod tests {
     use crate::config::schema::JwtConfig;
     use crate::providers::base::LLMUsage;
 
+    fn ws_media_url(file: &str) -> String {
+        format!("/v1/media/{CHANNEL_NAME}/{file}")
+    }
+
     // --- parse_inbound_payload ---
 
     #[test]
@@ -3918,7 +3922,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let bus = MessageBus::new();
         WsShared {
-            name: "websocket",
+            name: CHANNEL_NAME,
             bus: Arc::new(bus),
             channels_config: ChannelsConfig::default(),
             jwt: JwtConfig::default(),
@@ -4187,16 +4191,13 @@ mod tests {
             "chat-1",
             "turn-1",
             "look at this",
-            &["/v1/media/websocket/abc.png".to_string()],
+            &[ws_media_url("abc.png")],
             &shared,
         )
         .await;
 
         let body = recv_json(&mut rx);
-        assert_eq!(
-            body["media"],
-            serde_json::json!(["/v1/media/websocket/abc.png"])
-        );
+        assert_eq!(body["media"], serde_json::json!([ws_media_url("abc.png")]));
     }
 
     #[tokio::test]
@@ -4232,14 +4233,14 @@ mod tests {
     #[test]
     fn resolve_media_urls_converts_a_stored_disk_path_to_a_browser_url() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("websocket");
+        let sub = dir.path().join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let image_path = sub.join("abc.png");
         std::fs::write(&image_path, b"fake-png").unwrap();
 
         let resolved = resolve_media_urls(&[image_path.display().to_string()], dir.path());
 
-        assert_eq!(resolved, vec!["/v1/media/websocket/abc.png".to_string()]);
+        assert_eq!(resolved, vec![ws_media_url("abc.png")]);
     }
 
     #[test]
@@ -4773,7 +4774,7 @@ mod tests {
             .await
             .register("conn-1", "initial-chat", tx);
 
-        let sub = shared.media_root.join("websocket");
+        let sub = shared.media_root.join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let image_path = sub.join("abc.png");
         std::fs::write(&image_path, b"fake-png").unwrap();
@@ -4804,7 +4805,7 @@ mod tests {
         assert_eq!(history[0]["content"], "look at this");
         assert_eq!(
             history[0]["media"],
-            serde_json::json!(["/v1/media/websocket/abc.png"])
+            serde_json::json!([ws_media_url("abc.png")])
         );
         assert!(history[1].get("media").is_none());
     }
@@ -5264,7 +5265,7 @@ mod tests {
             .await
             .register("conn-1", "src", tx);
 
-        let sub = shared.media_root.join("websocket");
+        let sub = shared.media_root.join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let image_path = sub.join("abc.png");
         std::fs::write(&image_path, b"fake-png").unwrap();
@@ -5297,7 +5298,7 @@ mod tests {
         assert_eq!(history[0]["content"], "look at this");
         assert_eq!(
             history[0]["media"],
-            serde_json::json!(["/v1/media/websocket/abc.png"])
+            serde_json::json!([ws_media_url("abc.png")])
         );
     }
 
@@ -6015,7 +6016,7 @@ mod tests {
     #[test]
     fn resolve_history_media_converts_local_path_and_passes_through_http_url() {
         let dir = tempfile::tempdir().unwrap();
-        let sub = dir.path().join("websocket");
+        let sub = dir.path().join(CHANNEL_NAME);
         std::fs::create_dir_all(&sub).unwrap();
         let file = sub.join("abc.png");
         std::fs::write(&file, b"fake-png").unwrap();
@@ -6029,7 +6030,7 @@ mod tests {
 
         let media = history[0]["media"].as_array().unwrap();
         assert_eq!(media.len(), 2);
-        assert_eq!(media[0], "/v1/media/websocket/abc.png");
+        assert_eq!(media[0], ws_media_url("abc.png"));
         assert_eq!(media[1], "https://example.com/a.png");
     }
 
@@ -8680,7 +8681,7 @@ mod tests {
 
     fn outbound(chat_id: &str, content: &str, event: Option<OutboundEvent>) -> OutboundMessage {
         OutboundMessage {
-            channel: "websocket".to_string(),
+            channel: CHANNEL_NAME.to_string(),
             chat_id: chat_id.to_string(),
             content: content.to_string(),
             reply_to: None,
@@ -9215,7 +9216,7 @@ mod tests {
         assert_eq!(media.len(), 1);
         let url = media[0].as_str().unwrap();
         assert!(
-            url.starts_with("/v1/media/websocket/"),
+            url.starts_with(&format!("/v1/media/{CHANNEL_NAME}/")),
             "live media must be a gateway URL, got {url}"
         );
         assert!(url.ends_with("_report.pdf"), "{url}");
