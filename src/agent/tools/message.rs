@@ -14,12 +14,23 @@ use crate::utils::helpers::strip_think;
 pub type SendCallback =
     Arc<dyn Fn(OutboundMessage) -> Pin<Box<dyn Future<Output = ()> + Send>> + Send + Sync>;
 
+/// Inbound WebUI flag copied onto owner-bound outbounds so
+/// `WebSocketChannel::send` persists the delivery to the transcript.
+const WEBUI_METADATA_KEY: &str = "webui";
+/// Same key `WebUiTranscriptRecorder::annotate_turn` reads for `turn_id`.
+const WEBUI_TURN_ID_KEY: &str = "webui_turn_id";
+
 /// Tool for sending messages (and optional media) to a chat channel.
 pub struct MessageTool {
     send_callback: Mutex<Option<SendCallback>>,
     default_channel: Mutex<String>,
     default_chat_id: Mutex<String>,
     default_message_id: Mutex<Option<String>>,
+    /// `webui` / `webui_turn_id` from the inbound turn, if any. Copied onto
+    /// owner-bound sends so the WebUI transcript records the delivery;
+    /// cross-chat sends must not inherit them. Replaced each turn from
+    /// inbound metadata — not inferred from `channel == "websocket"`.
+    inbound_webui_metadata: Mutex<HashMap<String, Value>>,
     pub sent_in_turn: Mutex<bool>,
     /// Last outbound delivered back to the owning chat this turn (for sync callers).
     last_owner_outbound: Mutex<Option<OutboundMessage>>,
@@ -37,6 +48,7 @@ impl MessageTool {
             default_channel: Mutex::new(default_channel.into()),
             default_chat_id: Mutex::new(default_chat_id.into()),
             default_message_id: Mutex::new(default_message_id),
+            inbound_webui_metadata: Mutex::new(HashMap::new()),
             sent_in_turn: Mutex::new(false),
             last_owner_outbound: Mutex::new(None),
         }
@@ -56,6 +68,16 @@ impl MessageTool {
             .default_message_id
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = message_id.map(str::to_string);
+    }
+
+    /// Snapshot inbound WebUI keys for this turn. Empty when the inbound
+    /// message was not a WebUI turn, so a later CLI/Telegram send cannot
+    /// leak a stale `webui: true` onto the outbound.
+    pub fn set_inbound_webui_metadata(&self, inbound: &HashMap<String, Value>) {
+        *self
+            .inbound_webui_metadata
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = extract_webui_outbound_metadata(inbound);
     }
 
     /// Set the callback for sending messages.
@@ -189,6 +211,8 @@ impl Tool for MessageTool {
 
         if channel.is_empty() || chat_id.is_empty() {
             return "Error: No target channel/chat specified".to_string();
+        } else {
+            log::debug!("MessageTool: sending message to channel: {channel}, chat_id: {chat_id}");
         }
 
         let callback = self
@@ -214,6 +238,14 @@ impl Tool for MessageTool {
         let mut metadata = HashMap::new();
         if let Some(ref message_id) = message_id {
             metadata.insert("message_id".to_string(), Value::String(message_id.clone()));
+        }
+        if going_back_to_owner {
+            metadata.extend(
+                self.inbound_webui_metadata
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .clone(),
+            );
         }
         let outbound = OutboundMessage {
             channel: channel.clone(),
@@ -244,6 +276,22 @@ impl Tool for MessageTool {
 
         format!("Message sent to {channel}:{chat_id}{media_info}")
     }
+}
+
+fn extract_webui_outbound_metadata(inbound: &HashMap<String, Value>) -> HashMap<String, Value> {
+    let mut out = HashMap::new();
+    if inbound.get(WEBUI_METADATA_KEY).and_then(Value::as_bool) != Some(true) {
+        return out;
+    }
+    out.insert(WEBUI_METADATA_KEY.to_string(), Value::Bool(true));
+    if let Some(turn_id) = inbound.get(WEBUI_TURN_ID_KEY).cloned().filter(|value| {
+        value
+            .as_str()
+            .is_some_and(|turn_id| !turn_id.trim().is_empty())
+    }) {
+        out.insert(WEBUI_TURN_ID_KEY.to_string(), turn_id);
+    }
+    out
 }
 
 #[cfg(test)]
@@ -394,6 +442,80 @@ mod tests {
         let delivered = tool.take_delivered_outbound().expect("owner outbound");
         assert_eq!(delivered.content, "hello");
         assert!(tool.take_delivered_outbound().is_none());
+        assert!(sent[0].metadata.get(WEBUI_METADATA_KEY).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_owner_send_copies_inbound_webui_keys() {
+        let (tool, captured) = tool_with_capture("websocket", "chat-1", None);
+        tool.set_inbound_webui_metadata(&HashMap::from([
+            (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
+            (
+                WEBUI_TURN_ID_KEY.to_string(),
+                Value::String("turn-abc".to_string()),
+            ),
+        ]));
+
+        tool.execute(&serde_json::json!({ "content": "here's the image" }))
+            .await;
+
+        let sent = captured.lock().unwrap();
+        assert_eq!(
+            sent[0].metadata.get(WEBUI_METADATA_KEY),
+            Some(&Value::Bool(true))
+        );
+        assert_eq!(
+            sent[0].metadata.get(WEBUI_TURN_ID_KEY),
+            Some(&Value::String("turn-abc".to_string()))
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_websocket_channel_without_inbound_webui_does_not_invent_the_flag() {
+        let (tool, captured) = tool_with_capture("websocket", "chat-1", None);
+
+        tool.execute(&serde_json::json!({ "content": "hi" })).await;
+
+        let sent = captured.lock().unwrap();
+        assert!(sent[0].metadata.get(WEBUI_METADATA_KEY).is_none());
+        assert!(sent[0].metadata.get(WEBUI_TURN_ID_KEY).is_none());
+    }
+
+    #[tokio::test]
+    async fn execute_cross_chat_does_not_copy_inbound_webui_keys() {
+        let (tool, captured) = tool_with_capture("websocket", "chat-1", None);
+        tool.set_inbound_webui_metadata(&HashMap::from([
+            (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
+            (
+                WEBUI_TURN_ID_KEY.to_string(),
+                Value::String("turn-abc".to_string()),
+            ),
+        ]));
+
+        tool.execute(&serde_json::json!({
+            "content": "hi there",
+            "channel": "telegram",
+            "chat_id": "other-chat",
+        }))
+        .await;
+
+        let sent = captured.lock().unwrap();
+        assert!(sent[0].metadata.get(WEBUI_METADATA_KEY).is_none());
+        assert!(sent[0].metadata.get(WEBUI_TURN_ID_KEY).is_none());
+    }
+
+    #[test]
+    fn set_inbound_webui_metadata_clears_when_inbound_is_not_webui() {
+        let tool = MessageTool::new(None, "websocket", "chat-1", None);
+        tool.set_inbound_webui_metadata(&HashMap::from([
+            (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
+            (
+                WEBUI_TURN_ID_KEY.to_string(),
+                Value::String("turn-abc".to_string()),
+            ),
+        ]));
+        tool.set_inbound_webui_metadata(&HashMap::new());
+        assert!(tool.inbound_webui_metadata.lock().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -352,6 +352,12 @@ pub struct WsShared {
     pub require_auth: bool,
     pub connections: ConnectionRegistryHandle,
     pub supports_streaming: bool,
+    /// Copied from [`WebSocketConfig::ping_interval_s`]. `0` disables
+    /// server-initiated ping frames.
+    pub ping_interval_s: u64,
+    /// Copied from [`WebSocketConfig::ping_timeout_s`]. `0` means send
+    /// pings but never close for a missing pong.
+    pub ping_timeout_s: u64,
     pub gateway_services: Arc<GatewayServices>,
     pub session_manager: Arc<StdMutex<SessionManager>>,
     pub workspace_request_handler: WorkspaceRequestHandler,

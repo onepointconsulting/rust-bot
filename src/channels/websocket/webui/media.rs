@@ -412,6 +412,7 @@ mod tests {
     use crate::bus::queue::MessageBus;
     use crate::channels::gateway_services::GatewayServices;
     use crate::channels::websocket::registry::ConnectionRegistry;
+    use crate::channels::websocket::types::WebSocketConfig;
     use crate::config::schema::{ChannelsConfig, JwtConfig};
     use crate::security::workspace_requests::WorkspaceRequestHandler;
     use crate::session::manager::SessionManager;
@@ -579,6 +580,8 @@ mod tests {
             require_auth: true,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
+            ping_interval_s: WebSocketConfig::default().ping_interval_s,
+            ping_timeout_s: WebSocketConfig::default().ping_timeout_s,
             session_manager: Arc::new(StdMutex::new(
                 SessionManager::with_default_eviction_threshold(dir.keep()),
             )),

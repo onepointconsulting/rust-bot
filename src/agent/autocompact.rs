@@ -86,7 +86,6 @@ impl Autocompact {
         let before = probe.messages.len();
         probe.retain_recent_legal_suffix(Self::RECENT_SUFFIX_MESSAGES, true);
         let after = probe.messages.len();
-        log::info!("Auto-compact: has_compactable_idle_tail: {before} -> {after}");
         before != after
     }
 

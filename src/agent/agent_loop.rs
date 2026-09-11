@@ -1030,6 +1030,22 @@ impl AgentLoop {
         }
     }
 
+    /// Copy inbound `webui` / `webui_turn_id` onto the `message` tool so
+    /// owner-bound sends persist to the WebUI transcript. An empty map
+    /// (or a non-WebUI inbound) clears a stale snapshot from a previous turn.
+    fn apply_message_tool_inbound_metadata(&self, metadata: &HashMap<String, Value>) {
+        let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(tool) = registry.get("message") else {
+            return;
+        };
+        let Some(message_tool) =
+            (tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
+        else {
+            return;
+        };
+        message_tool.set_inbound_webui_metadata(metadata);
+    }
+
     /// Run the agent iteration loop.
     ///
     /// `on_stream` is called with each content delta during streaming.
@@ -1548,6 +1564,7 @@ impl AgentLoop {
             chat_id,
             msg.metadata.get("message_id").and_then(Value::as_str),
         );
+        self.apply_message_tool_inbound_metadata(&msg.metadata);
 
         // Re-read the session AFTER consolidation so history reflects any archiving.
         let snapshot = {
@@ -1927,6 +1944,7 @@ impl AgentLoop {
             msg.chat_id.as_str(),
             msg.metadata.get("message_id").and_then(Value::as_str),
         );
+        self.apply_message_tool_inbound_metadata(&msg.metadata);
         if let Some(message_tool) = self
             .tools
             .lock()

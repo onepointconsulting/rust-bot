@@ -4,6 +4,7 @@ use std::net::SocketAddr;
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, atomic::Ordering};
+use std::time::{Duration, Instant};
 
 use async_trait::async_trait;
 use axum::{
@@ -24,6 +25,7 @@ use uuid::Uuid;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::skills::SkillsLoader;
+use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::get_session_id;
@@ -378,6 +380,48 @@ fn ready_event(chat_id: &str, client_id: &str, streaming: bool) -> serde_json::V
     })
 }
 
+/// Server-initiated WebSocket ping policy for one connection.
+///
+/// `None` from [`PingLiveness::new`] means pings are disabled (`interval_s == 0`).
+/// `timeout == Duration::ZERO` still sends pings (so idle proxies stay awake)
+/// but never closes for a missing pong. Any inbound frame, not only `Pong`,
+/// clears the outstanding ping.
+struct PingLiveness {
+    interval: Duration,
+    timeout: Duration,
+    last_ping_at: Option<Instant>,
+}
+
+impl PingLiveness {
+    fn new(interval_s: u64, timeout_s: u64) -> Option<Self> {
+        (interval_s > 0).then(|| Self {
+            interval: Duration::from_secs(interval_s),
+            timeout: Duration::from_secs(timeout_s),
+            last_ping_at: None,
+        })
+    }
+
+    fn interval(&self) -> Duration {
+        self.interval
+    }
+
+    fn on_ping_sent(&mut self, now: Instant) {
+        self.last_ping_at = Some(now);
+    }
+
+    fn on_inbound(&mut self) {
+        self.last_ping_at = None;
+    }
+
+    fn is_timed_out(&self, now: Instant) -> bool {
+        if self.timeout.is_zero() {
+            return false;
+        }
+        self.last_ping_at
+            .is_some_and(|ping_at| now.saturating_duration_since(ping_at) >= self.timeout)
+    }
+}
+
 /// Drive one connection for its lifetime: mint a fresh `chat_id` for it,
 /// announce it via a `ready` frame, register an outbound sender, forward
 /// inbound text frames to the bus, and clean up the registry entry on close.
@@ -388,9 +432,11 @@ fn ready_event(chat_id: &str, client_id: &str, streaming: bool) -> serde_json::V
 /// possibly client-named, chat_ids) is not implemented yet; every plain-text
 /// frame on this connection routes to this one default chat_id.
 ///
-/// Ping/pong keep-alive is handled by axum/tokio-tungstenite automatically
-/// (server auto-replies to client pings); `ping_interval_s`/`ping_timeout_s`
-/// (server-initiated liveness probing) are not wired yet.
+/// Axum/tokio-tungstenite auto-replies to client pings. This loop also
+/// sends server-initiated `Ping` frames every `ping_interval_s` (disabled
+/// when that value is 0) so idle reverse proxies do not drop the socket.
+/// `ping_timeout_s` closes the connection if nothing inbound arrives after
+/// a ping; 0 means send pings but never kill for a missing pong.
 async fn handle_socket(
     socket: WebSocket,
     shared: WsShared,
@@ -417,10 +463,63 @@ async fn handle_socket(
         .await
         .register(&connection_id, &chat_id, tx);
 
+    let liveness = PingLiveness::new(shared.ping_interval_s, shared.ping_timeout_s)
+        .map(|liveness| Arc::new(StdMutex::new(liveness)));
+    let writer_liveness = liveness.clone();
+    let writer_connection_id = connection_id.clone();
     let writer = tokio::spawn(async move {
-        while let Some(msg) = rx.recv().await {
-            if sink.send(msg).await.is_err() {
-                break;
+        let Some(liveness) = writer_liveness else {
+            while let Some(msg) = rx.recv().await {
+                if sink.send(msg).await.is_err() {
+                    break;
+                }
+            }
+            return;
+        };
+
+        let interval = liveness
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .interval();
+        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            tokio::select! {
+                msg = rx.recv() => {
+                    match msg {
+                        Some(msg) => {
+                            if sink.send(msg).await.is_err() {
+                                log::warn!(
+                                    "WebSocket channel: connection '{writer_connection_id}' closed while writing"
+                                );
+                                break;
+                            }
+                        }
+                        None => break,
+                    }
+                }
+                _ = ticker.tick() => {
+                    let timed_out = liveness
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .is_timed_out(Instant::now());
+                    if timed_out {
+                        log::warn!(
+                            "WebSocket channel: connection '{writer_connection_id}' ping timeout"
+                        );
+                        break;
+                    }
+                    if sink.send(Message::Ping(Default::default())).await.is_err() {
+                        log::warn!(
+                            "WebSocket channel: connection '{writer_connection_id}' closed while pinging"
+                        );
+                        break;
+                    }
+                    liveness
+                        .lock()
+                        .unwrap_or_else(|e| e.into_inner())
+                        .on_ping_sent(Instant::now());
+                }
             }
         }
     });
@@ -433,6 +532,12 @@ async fn handle_socket(
                 break;
             }
         };
+        if let Some(liveness) = &liveness {
+            liveness
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .on_inbound();
+        }
         match msg {
             Message::Text(text) => {
                 let raw = text.as_str();
@@ -2995,6 +3100,8 @@ impl WebSocketChannel {
             require_auth: self.config.require_auth,
             connections: Arc::clone(&self.connections),
             supports_streaming: BaseChannel::supports_streaming(self),
+            ping_interval_s: self.config.ping_interval_s,
+            ping_timeout_s: self.config.ping_timeout_s,
             session_manager: Arc::clone(&self.base.session_manager),
             workspace_request_handler: self.base.workspace_request_handler.clone(),
             runtime_surface: self.config.runtime_surface.clone(),
@@ -3024,6 +3131,63 @@ impl WebSocketChannel {
     /// can wait on the same signal this channel's own `start()` does.
     pub(crate) fn shutdown_signal(&self) -> Arc<Notify> {
         Arc::clone(&self.shutdown)
+    }
+
+    async fn handle_turn_end(
+        &self,
+        msg: &OutboundMessage,
+        turn_end_event: &TurnEndEvent,
+    ) -> Result<(), String> {
+        let turn_id = msg
+            .metadata
+            .get(WEBUI_TURN_METADATA_KEY)
+            .and_then(|v| v.as_str())
+            .filter(|t| !t.is_empty())
+            .map(str::to_string);
+        // Persist the canonical turn boundary — this is also what
+        // makes `append_transcript_object`'s rotate-on-`turn_end`
+        // check (`webui/transcript.rs`) actually fire in production.
+        if is_webui_metadata(&msg.metadata) {
+            let mut body: HashMap<String, serde_json::Value> = HashMap::from([
+                ("event".to_string(), serde_json::json!("turn_end")),
+                ("chat_id".to_string(), serde_json::json!(msg.chat_id)),
+            ]);
+            if let Some(turn_id) = &turn_id {
+                body.insert("turn_id".to_string(), serde_json::json!(turn_id));
+            }
+            if let Some(latency_ms) = turn_end_event.latency_ms {
+                body.insert("latency_ms".to_string(), serde_json::json!(latency_ms));
+            }
+            if let Some(goal_state) = &turn_end_event.goal_state {
+                body.insert("goal_state".to_string(), serde_json::json!(goal_state));
+            }
+            let mut transcripts = self
+                .gateway_services
+                .transcripts
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            transcripts.append_turn_event(&msg.chat_id, body, &msg.metadata, "complete");
+        }
+        let owner = msg
+            .metadata
+            .get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
+            .and_then(|v| v.as_str());
+        {
+            let mut turn_registry = self
+                .gateway_services
+                .turn_registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(owner) = owner.filter(|o| !o.is_empty()) {
+                turn_registry.clear_turn_if_current(&msg.chat_id, Some(owner), false);
+            } else {
+                turn_registry.clear_chat(&msg.chat_id);
+            }
+        }
+        let shared = self.shared();
+        send_goal_status(&msg.chat_id, "idle", None, turn_id, &shared).await;
+        self.fan_out_session_token_usage(&msg.chat_id).await;
+        return Ok(());
     }
 }
 
@@ -3106,56 +3270,8 @@ impl BaseChannel for WebSocketChannel {
         let media_urls = resolve_media_urls(&confined, &self.media_root);
         let payload = match &msg.event {
             Some(OutboundEvent::TurnEnd(turn_end_event)) => {
-                let turn_id = msg
-                    .metadata
-                    .get(WEBUI_TURN_METADATA_KEY)
-                    .and_then(|v| v.as_str())
-                    .filter(|t| !t.is_empty())
-                    .map(str::to_string);
-                // Persist the canonical turn boundary — this is also what
-                // makes `append_transcript_object`'s rotate-on-`turn_end`
-                // check (`webui/transcript.rs`) actually fire in production.
-                if is_webui_metadata(&msg.metadata) {
-                    let mut body: HashMap<String, serde_json::Value> = HashMap::from([
-                        ("event".to_string(), serde_json::json!("turn_end")),
-                        ("chat_id".to_string(), serde_json::json!(msg.chat_id)),
-                    ]);
-                    if let Some(turn_id) = &turn_id {
-                        body.insert("turn_id".to_string(), serde_json::json!(turn_id));
-                    }
-                    if let Some(latency_ms) = turn_end_event.latency_ms {
-                        body.insert("latency_ms".to_string(), serde_json::json!(latency_ms));
-                    }
-                    if let Some(goal_state) = &turn_end_event.goal_state {
-                        body.insert("goal_state".to_string(), serde_json::json!(goal_state));
-                    }
-                    let mut transcripts = self
-                        .gateway_services
-                        .transcripts
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    transcripts.append_turn_event(&msg.chat_id, body, &msg.metadata, "complete");
-                }
-                let owner = msg
-                    .metadata
-                    .get(WEBSOCKET_TURN_OWNER_METADATA_KEY)
-                    .and_then(|v| v.as_str());
-                {
-                    let mut turn_registry = self
-                        .gateway_services
-                        .turn_registry
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner());
-                    if let Some(owner) = owner.filter(|o| !o.is_empty()) {
-                        turn_registry.clear_turn_if_current(&msg.chat_id, Some(owner), false);
-                    } else {
-                        turn_registry.clear_chat(&msg.chat_id);
-                    }
-                }
-                let shared = self.shared();
-                send_goal_status(&msg.chat_id, "idle", None, turn_id, &shared).await;
-                self.fan_out_session_token_usage(&msg.chat_id).await;
-                return Ok(());
+                let res = self.handle_turn_end(&msg, turn_end_event).await?;
+                return Ok(res);
             }
             Some(OutboundEvent::Progress(progress_event)) => {
                 if let Some(edits) = progress_event
@@ -3758,6 +3874,44 @@ mod tests {
         assert_eq!(body["streaming"], false);
     }
 
+    // --- PingLiveness ---
+
+    #[test]
+    fn ping_liveness_disabled_when_interval_is_zero() {
+        assert!(PingLiveness::new(0, 30).is_none());
+        assert!(PingLiveness::new(30, 30).is_some());
+    }
+
+    #[test]
+    fn ping_liveness_timeout_zero_never_times_out() {
+        let mut liveness = PingLiveness::new(30, 0).expect("interval 30 enables pings");
+        let t0 = Instant::now();
+        liveness.on_ping_sent(t0);
+        assert!(!liveness.is_timed_out(t0 + Duration::from_secs(3600)));
+    }
+
+    #[test]
+    fn ping_liveness_times_out_when_no_inbound_after_ping() {
+        let mut liveness = PingLiveness::new(30, 30).expect("interval 30 enables pings");
+        let t0 = Instant::now();
+        assert!(
+            !liveness.is_timed_out(t0 + Duration::from_secs(60)),
+            "no ping sent yet"
+        );
+        liveness.on_ping_sent(t0);
+        assert!(!liveness.is_timed_out(t0 + Duration::from_secs(29)));
+        assert!(liveness.is_timed_out(t0 + Duration::from_secs(30)));
+    }
+
+    #[test]
+    fn ping_liveness_inbound_clears_timeout() {
+        let mut liveness = PingLiveness::new(30, 30).expect("interval 30 enables pings");
+        let t0 = Instant::now();
+        liveness.on_ping_sent(t0);
+        liveness.on_inbound();
+        assert!(!liveness.is_timed_out(t0 + Duration::from_secs(60)));
+    }
+
     // --- workspace_controls_available ---
 
     fn test_shared(runtime_surface: &str) -> WsShared {
@@ -3772,6 +3926,8 @@ mod tests {
             require_auth: true,
             connections: Arc::new(AsyncMutex::new(ConnectionRegistry::default())),
             supports_streaming: false,
+            ping_interval_s: WebSocketConfig::default().ping_interval_s,
+            ping_timeout_s: WebSocketConfig::default().ping_timeout_s,
             session_manager: Arc::new(StdMutex::new(
                 SessionManager::with_default_eviction_threshold(dir.keep()),
             )),

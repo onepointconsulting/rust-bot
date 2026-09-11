@@ -44,9 +44,7 @@ impl ImageGenerationTool {
 
 /// OpenRouter accepts HTTP(S) URLs or base64 `data:image/...` URLs as references.
 fn is_supported_reference_url(url: &str) -> bool {
-    url.starts_with("https://")
-        || url.starts_with("http://")
-        || url.starts_with("data:image/")
+    url.starts_with("https://") || url.starts_with("http://") || url.starts_with("data:image/")
 }
 
 /// Rebuild one OpenRouter `input_references` item:
