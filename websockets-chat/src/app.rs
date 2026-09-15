@@ -399,6 +399,7 @@ fn start_local_turn(
     turn_id: String,
     text: String,
     attachments: Vec<ImageAttachment>,
+    user_id: Option<String>,
 ) {
     let mut entries = ctx.entries.get_untracked();
     let mut turn_index = ctx.turn_index.get_untracked();
@@ -410,6 +411,7 @@ fn start_local_turn(
         &turn_id,
         text,
         attachments,
+        user_id,
     );
     if !started {
         return;
@@ -440,6 +442,7 @@ fn append_finished_assistant_entry(
             streaming: false,
             tool_events: None,
             reasoning: None,
+            user_id: None,
         });
     });
     persist_entries(&ctx.entries.get_untracked());
@@ -672,6 +675,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             turn_id,
             text,
             media,
+            user_id,
             ..
         } => {
             // A no-op when `turn_id` is already in `turn_index` — the echo
@@ -679,7 +683,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // doc comment), whose optimistic insert already happened.
             let attachments =
                 state::media_urls_to_attachments(media, ctx.token.get_untracked().as_deref());
-            start_local_turn(ctx, turn_id, text, attachments);
+            start_local_turn(ctx, turn_id, text, attachments, user_id);
         }
         ServerEvent::GoalStatus {
             chat_id,
@@ -1646,6 +1650,7 @@ pub fn App() -> impl IntoView {
             turn_id.clone(),
             text.clone(),
             attachments.clone(),
+            user_email.get_untracked(),
         );
 
         let media = build_media_payload(&attachments);

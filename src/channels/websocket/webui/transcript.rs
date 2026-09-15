@@ -24,6 +24,7 @@ use serde_json::Value;
 use uuid::Uuid;
 
 use crate::channels::websocket::get_session_id;
+use crate::channels::websocket::webui::metadata::USER_ID_METADATA_KEY;
 
 /// Maximum size of the active transcript file, past which nanobot rolls
 /// older turns into a segment file. Mirrors `_MAX_TRANSCRIPT_FILE_BYTES`
@@ -264,11 +265,17 @@ impl WebUiTranscriptRecorder {
         if text.trim() == "/stop" && media_paths.is_none_or(<[String]>::is_empty) {
             return false;
         }
-        let Some(payload) =
+        let Some(mut payload) =
             build_user_transcript_event(chat_id, text, media_paths, cli_apps, mcp_presets)
         else {
             return false;
         };
+        if let Some(user_id) = user_id_from_metadata(metadata) {
+            payload.insert(
+                USER_ID_METADATA_KEY.to_string(),
+                Value::String(user_id.to_string()),
+            );
+        }
         self.prepare_and_append(chat_id, payload, Some(metadata), Some("user"), false, None)
     }
 
@@ -1058,6 +1065,27 @@ fn replace_file(from: &Path, to: &Path) -> std::io::Result<()> {
     }
 }
 
+/// JWT `sub` stored on a transcript user row or session-file user message.
+/// Accepts a top-level `user_id` string, or the same key nested under
+/// `metadata` (inbound envelope metadata shape).
+pub(crate) fn user_id_from_row(row: &Value) -> Option<&str> {
+    user_id_from_value(row.get(USER_ID_METADATA_KEY)).or_else(|| {
+        row.get("metadata")
+            .and_then(|metadata| user_id_from_value(metadata.get(USER_ID_METADATA_KEY)))
+    })
+}
+
+fn user_id_from_metadata(metadata: &HashMap<String, Value>) -> Option<&str> {
+    user_id_from_value(metadata.get(USER_ID_METADATA_KEY))
+}
+
+fn user_id_from_value(value: Option<&Value>) -> Option<&str> {
+    value
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+}
+
 fn chat_id_from_session_key(session_key: &str) -> Option<String> {
     let chat_id = session_key.strip_prefix("websocket:")?.trim();
     if chat_id.is_empty() {
@@ -1255,6 +1283,11 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
                 && !media_paths.is_empty()
             {
                 entry["media"] = serde_json::json!(media_paths);
+            }
+            if role == "user"
+                && let Some(user_id) = user_id_from_row(row)
+            {
+                entry["user_id"] = serde_json::json!(user_id);
             }
             entry
         })
@@ -1689,6 +1722,45 @@ mod tests {
         assert_eq!(parsed["turn_phase"], "user");
         assert_eq!(parsed["turn_seq"], 1);
         assert!(parsed.get("created_at_ms").is_some());
+        assert!(parsed.get("user_id").is_none());
+    }
+
+    #[test]
+    fn append_user_message_stamps_user_id_from_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        let metadata = HashMap::from([
+            (
+                WEBUI_TURN_METADATA_KEY.to_string(),
+                Value::String("turn-1".to_string()),
+            ),
+            (
+                USER_ID_METADATA_KEY.to_string(),
+                Value::String("a@b.com".to_string()),
+            ),
+        ]);
+        assert!(recorder.append_user_message("chat-1", "hello", &metadata, None, None, None));
+
+        let path = recorder.webui_transcript_path("websocket:chat-1");
+        let contents = std::fs::read_to_string(path).unwrap();
+        let parsed: Value = serde_json::from_str(contents.trim_end()).unwrap();
+        assert_eq!(parsed["user_id"], "a@b.com");
+    }
+
+    #[test]
+    fn append_user_message_omits_blank_user_id() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut recorder = WebUiTranscriptRecorder::new(dir.path().to_path_buf());
+        let metadata = HashMap::from([(
+            USER_ID_METADATA_KEY.to_string(),
+            Value::String("   ".to_string()),
+        )]);
+        assert!(recorder.append_user_message("chat-1", "hello", &metadata, None, None, None));
+
+        let path = recorder.webui_transcript_path("websocket:chat-1");
+        let contents = std::fs::read_to_string(path).unwrap();
+        let parsed: Value = serde_json::from_str(contents.trim_end()).unwrap();
+        assert!(parsed.get("user_id").is_none());
     }
 
     // --- forget_session ---
@@ -2435,6 +2507,31 @@ mod tests {
         assert_eq!(history[0]["content"], "hi");
         assert_eq!(history[1]["role"], "assistant");
         assert_eq!(history[1]["content"], "hello there");
+        assert!(history[0].get("user_id").is_none());
+        assert!(history[1].get("user_id").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_carries_user_id_on_user_rows() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi", "user_id": "a@b.com"}),
+            serde_json::json!({"event": "message", "text": "hello there"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history[0]["user_id"], "a@b.com");
+        assert!(history[1].get("user_id").is_none());
+    }
+
+    #[test]
+    fn user_id_from_row_reads_nested_metadata() {
+        let row = serde_json::json!({
+            "role": "user",
+            "content": "hi",
+            "metadata": {"user_id": "  a@b.com  "},
+        });
+        assert_eq!(user_id_from_row(&row), Some("a@b.com"));
     }
 
     #[test]

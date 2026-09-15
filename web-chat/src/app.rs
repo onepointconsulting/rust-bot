@@ -204,6 +204,7 @@ pub fn App() -> impl IntoView {
                 streaming: false,
                 tool_events: None,
                 reasoning: None,
+                user_id: None,
             });
             *list = trim_to_max_turns(std::mem::take(list), MAX_STORED_TURNS);
         });

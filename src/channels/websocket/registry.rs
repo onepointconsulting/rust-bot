@@ -2,6 +2,8 @@ use axum::extract::ws::Message;
 use std::collections::{HashMap, HashSet};
 use tokio::sync::mpsc;
 
+use super::types::AuthorizeResult;
+
 /// Many-to-many chat_id↔connection subscription registry, mirroring
 /// nanobot's `_subs`/`_conn_chats`/`_conn_default`. One connection may be
 /// attached to several chat_ids (e.g. several open chats sharing one
@@ -18,6 +20,9 @@ pub struct ConnectionRegistry {
     conn_default: HashMap<String, String>,
     /// connection_id -> outbound sender, so [`Self::senders_for_chat`] can reach it.
     senders: HashMap<String, mpsc::UnboundedSender<Message>>,
+    /// connection_id -> upgrade-time JWT outcome. Guests (no token / JWT
+    /// disabled) store [`AuthorizeResult::UNAUTHENTICATED`].
+    auth: HashMap<String, AuthorizeResult>,
 }
 
 impl ConnectionRegistry {
@@ -34,16 +39,42 @@ impl ConnectionRegistry {
     }
 
     /// Record a newly-opened connection's sender and default chat_id, then attach it.
+    /// Tests and paths that do not care about JWT identity get an unauthenticated
+    /// [`AuthorizeResult`]; the live upgrade path uses [`Self::register_with_auth`].
     pub fn register(
         &mut self,
         connection_id: &str,
         default_chat_id: &str,
         sender: mpsc::UnboundedSender<Message>,
     ) {
+        self.register_with_auth(
+            connection_id,
+            default_chat_id,
+            sender,
+            AuthorizeResult::UNAUTHENTICATED,
+        );
+    }
+
+    /// Like [`Self::register`], storing the upgrade-time JWT outcome on the
+    /// connection so later lookups (and envelope dispatch) can read `sub`
+    /// without re-validating the token.
+    pub fn register_with_auth(
+        &mut self,
+        connection_id: &str,
+        default_chat_id: &str,
+        sender: mpsc::UnboundedSender<Message>,
+        auth: AuthorizeResult,
+    ) {
         self.senders.insert(connection_id.to_string(), sender);
         self.conn_default
             .insert(connection_id.to_string(), default_chat_id.to_string());
+        self.auth.insert(connection_id.to_string(), auth);
         self.attach(connection_id, default_chat_id);
+    }
+
+    /// Upgrade-time JWT outcome for `connection_id`, if it is still registered.
+    pub fn auth_for(&self, connection_id: &str) -> Option<&AuthorizeResult> {
+        self.auth.get(connection_id)
     }
 
     /// Remove `connection_id` from every subscription set; safe to call
@@ -61,6 +92,7 @@ impl ConnectionRegistry {
         }
         self.conn_default.remove(connection_id);
         self.senders.remove(connection_id);
+        self.auth.remove(connection_id);
     }
 
     /// Snapshot the senders currently subscribed to `chat_id`. Mirrors
@@ -108,12 +140,14 @@ impl ConnectionRegistry {
         self.conn_chats.clear();
         self.conn_default.clear();
         self.senders.clear();
+        self.auth.clear();
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::websocket::types::AuthorizeResult;
 
     fn dummy_sender() -> mpsc::UnboundedSender<Message> {
         let (tx, _rx) = mpsc::unbounded_channel::<Message>();
@@ -269,5 +303,37 @@ mod tests {
         assert!(registry.conn_chats.is_empty());
         assert!(registry.conn_default.is_empty());
         assert!(registry.senders.is_empty());
+        assert!(registry.auth.is_empty());
+    }
+
+    #[test]
+    fn register_stores_unauthenticated_auth_by_default() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register("conn-1", "chat-1", dummy_sender());
+        assert_eq!(
+            registry.auth_for("conn-1"),
+            Some(&AuthorizeResult::UNAUTHENTICATED)
+        );
+    }
+
+    #[test]
+    fn register_with_auth_keeps_the_upgrade_result_on_the_connection() {
+        let mut registry = ConnectionRegistry::default();
+        let auth = AuthorizeResult::new(true, Some("a@b.com".to_string()));
+        registry.register_with_auth("conn-1", "chat-1", dummy_sender(), auth.clone());
+        assert_eq!(registry.auth_for("conn-1"), Some(&auth));
+    }
+
+    #[test]
+    fn cleanup_connection_drops_auth() {
+        let mut registry = ConnectionRegistry::default();
+        registry.register_with_auth(
+            "conn-1",
+            "chat-1",
+            dummy_sender(),
+            AuthorizeResult::new(true, Some("a@b.com".to_string())),
+        );
+        registry.cleanup_connection("conn-1");
+        assert!(registry.auth_for("conn-1").is_none());
     }
 }

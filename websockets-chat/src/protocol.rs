@@ -432,6 +432,7 @@ pub enum ServerEvent {
         turn_id: String,
         text: String,
         media: Vec<String>,
+        user_id: Option<String>,
     },
     /// Sustained-goal state snapshot. Shape not yet finalized server-side, so
     /// the raw JSON is kept as-is.
@@ -662,6 +663,8 @@ struct HistoryMessage {
     activity: Option<Vec<HistoryActivity>>,
     #[serde(default)]
     media: Vec<String>,
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
 /// Rebuild the tool-activity chips for one history row from its buffered
@@ -726,6 +729,9 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                     .as_deref()
                     .and_then(history_activity_to_tool_events),
                 reasoning: message.reasoning_content.clone().filter(|s| !s.is_empty()),
+                user_id: (role == Role::User)
+                    .then(|| message.user_id.clone())
+                    .flatten(),
             })
         })
         .enumerate()
@@ -772,6 +778,8 @@ struct UserWire {
     text: String,
     #[serde(default)]
     media: Vec<String>,
+    #[serde(default)]
+    user_id: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -949,6 +957,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             turn_id: w.turn_id,
             text: w.text,
             media: w.media,
+            user_id: w.user_id,
         }),
         "goal_state" => Ok(ServerEvent::GoalState(value)),
         "goal_status" => decode::<GoalStatusWire>(&value).map(|w| ServerEvent::GoalStatus {
@@ -1213,10 +1222,27 @@ mod tests {
                 assert_eq!(history[0].id, 0);
                 assert_eq!(history[0].role, Role::User);
                 assert_eq!(history[0].content, "hello");
+                assert_eq!(history[0].user_id, None);
                 assert_eq!(history[1].id, 1);
                 assert_eq!(history[1].role, Role::Assistant);
                 assert_eq!(history[1].content, "hi");
                 assert_eq!(history[1].reasoning.as_deref(), Some("think"));
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attached_history_user_id() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"hello","user_id":"a@b.com"},
+            {"role":"assistant","content":"hi"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { history, .. } => {
+                assert_eq!(history[0].user_id.as_deref(), Some("a@b.com"));
+                assert_eq!(history[1].user_id, None);
             }
             other => panic!("expected Attached, got {other:?}"),
         }
@@ -1383,6 +1409,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 text: "hello there".to_string(),
                 media: Vec::new(),
+                user_id: None,
             }
         );
     }
@@ -1398,6 +1425,7 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 text: "look at this".to_string(),
                 media: vec!["/v1/media/websocket/abc.png".to_string()],
+                user_id: None,
             }
         );
     }
@@ -1413,6 +1441,23 @@ mod tests {
                 turn_id: "turn-1".to_string(),
                 text: "hi".to_string(),
                 media: Vec::new(),
+                user_id: None,
+            }
+        );
+    }
+
+    #[test]
+    fn parses_user_event_with_user_id() {
+        let raw = r#"{"event":"user","chat_id":"chat-1","turn_id":"turn-1","text":"hi","user_id":"a@b.com"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::User {
+                chat_id: "chat-1".to_string(),
+                turn_id: "turn-1".to_string(),
+                text: "hi".to_string(),
+                media: Vec::new(),
+                user_id: Some("a@b.com".to_string()),
             }
         );
     }
@@ -1424,6 +1469,7 @@ mod tests {
             turn_id: "turn-1".to_string(),
             text: "hi".to_string(),
             media: Vec::new(),
+            user_id: None,
         };
         assert_eq!(event.chat_id(), Some("chat-1"));
     }

@@ -98,21 +98,33 @@ pub fn begin_turn(
     turn_id: &str,
     text: String,
     attachments: Vec<ImageAttachment>,
+    sender_user_id: Option<String>,
 ) -> bool {
-    if turn_index.contains_key(turn_id) {
+    if let Some(&placeholder_id) = turn_index.get(turn_id) {
+        if let Some(sender_user_id) = sender_user_id {
+            if let Some(entry) = entries
+                .iter_mut()
+                .find(|entry| entry.id + 1 == placeholder_id && entry.role == Role::User)
+            {
+                if entry.user_id.is_none() {
+                    entry.user_id = Some(sender_user_id);
+                }
+            }
+        }
         return false;
     }
-    let user_id = *next_id;
+    let entry_id = *next_id;
     entries.push(ChatEntry {
-        id: user_id,
+        id: entry_id,
         role: Role::User,
         content: text,
         attachments,
         streaming: false,
         tool_events: None,
         reasoning: None,
+        user_id: sender_user_id,
     });
-    let placeholder_id = user_id + 1;
+    let placeholder_id = entry_id + 1;
     entries.push(ChatEntry {
         id: placeholder_id,
         role: Role::Assistant,
@@ -121,6 +133,7 @@ pub fn begin_turn(
         streaming: true,
         tool_events: None,
         reasoning: None,
+        user_id: None,
     });
     *next_id = placeholder_id + 1;
     turn_index.insert(turn_id.to_string(), placeholder_id);
@@ -194,6 +207,7 @@ pub fn begin_next_stream_segment(
         streaming: true,
         tool_events: None,
         reasoning: None,
+        user_id: None,
     });
     turn_index.insert(turn_id.to_string(), new_id);
 }
@@ -674,6 +688,7 @@ mod tests {
             streaming: true,
             tool_events: None,
             reasoning: None,
+            user_id: None,
         }
     }
 
@@ -686,6 +701,7 @@ mod tests {
             streaming: false,
             tool_events: None,
             reasoning: None,
+            user_id: None,
         }
     }
 
@@ -737,6 +753,7 @@ mod tests {
             "turn-1",
             "hello there".to_string(),
             Vec::new(),
+            None,
         );
 
         assert!(started);
@@ -749,6 +766,58 @@ mod tests {
         assert!(entries[1].streaming);
         assert_eq!(turn_index.get("turn-1"), Some(&entries[1].id));
         assert_eq!(next_id, entries[1].id + 1);
+        assert_eq!(entries[0].user_id, None);
+        assert_eq!(entries[1].user_id, None);
+    }
+
+    #[test]
+    fn begin_turn_stamps_sender_user_id_on_the_user_bubble() {
+        let mut entries = Vec::new();
+        let mut turn_index = HashMap::new();
+        let mut next_id = 0u64;
+
+        begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "hello".to_string(),
+            Vec::new(),
+            Some("a@b.com".to_string()),
+        );
+
+        assert_eq!(entries[0].user_id.as_deref(), Some("a@b.com"));
+        assert_eq!(entries[1].user_id, None);
+    }
+
+    #[test]
+    fn begin_turn_echo_fills_user_id_when_the_optimistic_insert_had_none() {
+        let mut entries = Vec::new();
+        let mut turn_index = HashMap::new();
+        let mut next_id = 0u64;
+        begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "hello".to_string(),
+            Vec::new(),
+            None,
+        );
+
+        let started = begin_turn(
+            &mut entries,
+            &mut turn_index,
+            &mut next_id,
+            "turn-1",
+            "hello".to_string(),
+            Vec::new(),
+            Some("a@b.com".to_string()),
+        );
+
+        assert!(!started);
+        assert_eq!(entries.len(), 2);
+        assert_eq!(entries[0].user_id.as_deref(), Some("a@b.com"));
     }
 
     #[test]
@@ -768,6 +837,7 @@ mod tests {
             "turn-1",
             "look at this".to_string(),
             attachments.clone(),
+            None,
         );
 
         assert_eq!(entries[0].attachments, attachments);
@@ -787,6 +857,7 @@ mod tests {
             "turn-1",
             "duplicate echo".to_string(),
             Vec::new(),
+            None,
         );
 
         assert!(
@@ -1279,6 +1350,7 @@ mod tests {
                 streaming: false,
                 tool_events: None,
                 reasoning: None,
+                user_id: None,
             },
             ChatEntry {
                 id: 1,
@@ -1291,6 +1363,7 @@ mod tests {
                 streaming: false,
                 tool_events: None,
                 reasoning: None,
+                user_id: None,
             },
         ];
 
@@ -1317,6 +1390,7 @@ mod tests {
             streaming: false,
             tool_events: None,
             reasoning: None,
+            user_id: None,
         }];
 
         let result = authorize_media_attachments(entries.clone(), None);
@@ -1379,6 +1453,7 @@ mod tests {
             "turn-1",
             "make a pdf".to_string(),
             Vec::new(),
+            None,
         );
         apply_stream_end(&mut entries, &turn_index, "turn-1", Some("here you go"));
         apply_assistant_attachments(
@@ -1411,6 +1486,7 @@ mod tests {
             "turn-1",
             "hi".to_string(),
             Vec::new(),
+            None,
         );
         apply_assistant_attachments(&mut entries, &turn_index, "turn-1", Vec::new());
         apply_assistant_attachments(

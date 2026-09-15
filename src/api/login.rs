@@ -124,6 +124,7 @@ pub(crate) async fn login(
     let iss = jwt.opts.iss.clone();
     let aud = jwt.opts.aud.clone();
     let purpose = state.token_purpose.clone();
+    let sub = Some(request.email.clone());
     let minted = tokio::task::spawn_blocking(move || {
         generate_jwt_token(
             private_key_path,
@@ -131,6 +132,7 @@ pub(crate) async fn login(
             aud,
             purpose,
             DEFAULT_EXPIRES_IN_MONTHS,
+            sub,
         )
     })
     .await
@@ -292,7 +294,16 @@ mod tests {
             .await
             .unwrap();
 
-        let parts: Vec<_> = response.token.split('.').collect();
-        assert_eq!(parts.len(), 3, "expected a 3-part JWT");
+        let claims = crate::security::jwt::validate_jwt_token_from_path(
+            &response.token,
+            &keys.public_key_path,
+            &JwtValidationOpts {
+                iss: "rust-bot".to_string(),
+                aud: String::new(),
+            },
+        )
+        .unwrap();
+        assert_eq!(claims.sub, "a@b.com");
+        assert_eq!(claims.purpose.as_deref(), Some("webui"));
     }
 }

@@ -1,8 +1,9 @@
 //! Simple JSON-file-backed registry mapping user emails to JWTs.
 //!
-//! The token itself never carries the email (see [`crate::security::jwt::Claims`]);
-//! this registry provides the out-of-band mapping so operators can look up which
-//! token is current for a given user. Tokens are minted by `rust-bot generate-jwt-token` at
+//! Login and `generate-jwt-token` stamp the user email into the JWT `sub`
+//! claim (see [`crate::security::jwt::Claims`]). This registry still maps
+//! email → current token / password hash so operators can look up and rotate
+//! credentials. Tokens are minted by `rust-bot generate-jwt-token` at
 //! registration time and refreshed on each successful `/v1/login`. An
 //! Argon2id password hash is stored alongside the token for login.
 

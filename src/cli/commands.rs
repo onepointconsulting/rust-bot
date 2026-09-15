@@ -531,6 +531,7 @@ pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
         aud,
         purpose,
         args.expires_in_months,
+        Some(args.user_email.clone()),
     )?;
 
     let mut registry = JsonUserRegistry::open(args.users_file.clone())?;

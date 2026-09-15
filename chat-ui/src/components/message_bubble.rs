@@ -18,6 +18,9 @@ fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
 
 /// A single chat entry rendered as a bubble.
 ///
+/// On a user row, a non-empty `entry.user_id` is shown as a small caption
+/// under the bubble (guests and assistant rows omit it).
+///
 /// `extra` is an optional slot rendered below the message text/attachments,
 /// letting a consumer (e.g. `websockets-chat`) inject tool-activity or
 /// reasoning panels without this crate knowing anything about them; `chat-ui`
@@ -43,6 +46,10 @@ pub fn MessageBubble(
     let is_user = entry.role == Role::User;
     let content = entry.content.clone();
     let attachments = entry.attachments.clone();
+    let sender_label = is_user
+        .then(|| entry.user_id.clone())
+        .flatten()
+        .filter(|id| !id.trim().is_empty());
     let extra_view = extra.map(|children| children());
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
     let awaiting_first_token = !markdown::has_visible_chars(&content);
@@ -103,12 +110,21 @@ pub fn MessageBubble(
         if !has_text && !has_attachments && extra_view.is_none() && !streaming.get() {
             ().into_any()
         } else {
+            let sender_caption = sender_label.map(|id| {
+                view! {
+                    <p class="px-1 text-[11px] leading-tight text-slate-400">{id}</p>
+                }
+                .into_any()
+            });
             view! {
                 <div class="flex justify-end">
-                    <div class="max-w-[80%] rounded-2xl bg-orange-600 px-4 py-2 text-sm text-white shadow-sm">
-                        {text_view}
-                        {attachments_view}
-                        {extra_view}
+                    <div class="flex max-w-[80%] flex-col items-end gap-1">
+                        <div class="rounded-2xl bg-orange-600 px-4 py-2 text-sm text-white shadow-sm">
+                            {text_view}
+                            {attachments_view}
+                            {extra_view}
+                        </div>
+                        {sender_caption}
                     </div>
                 </div>
             }

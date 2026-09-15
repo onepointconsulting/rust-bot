@@ -15,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::tools::web;
 use crate::{
     bus::queue::MessageBus,
     channels::gateway_services::GatewayServices,
@@ -261,7 +262,7 @@ pub struct WebSocketConfig {
     /// (and to fetch media) when `jwt.enabled` is `true`. Defaults to `true`
     /// so existing deployments keep requiring login. When `false`, a missing
     /// token is allowed (an invalid one is still rejected) and the
-    /// connection's `webui_authenticated` flag is `false`, same as when JWT
+    /// connection's [`AuthorizeResult`] is unauthenticated, same as when JWT
     /// is disabled entirely — this is what lets a single instance offer
     /// guest access while JWT (and `/v1/login`) stay available for anyone
     /// who wants to sign in. Ignored when `jwt.enabled` is `false` (there is
@@ -383,6 +384,39 @@ pub struct WsShared {
     pub default_agent_mode: crate::agent::modes::AgentMode,
 }
 
+/// Upgrade-time JWT outcome for one WebSocket connection. Produced by
+/// `authorize` and kept for the connection's lifetime (see
+/// [`EnvelopeDispatchContext::auth`]) so later handlers can read both the
+/// WebUI-purpose gate and the token subject without re-validating.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AuthorizeResult {
+    /// Whether the JWT was minted for the WebUI frontend (`purpose == "webui"`).
+    pub webui_authenticated: bool,
+    /// JWT `sub` when a token was presented and validated. `None` for guests
+    /// (JWT disabled, or optional-auth with no token).
+    pub sub: Option<String>,
+}
+
+impl AuthorizeResult {
+    /// Guest / JWT-disabled / missing-token outcome. A `'static` value so
+    /// callers and tests can borrow it without an extra local.
+    pub const UNAUTHENTICATED: Self = Self {
+        webui_authenticated: false,
+        sub: None,
+    };
+
+    pub fn new(webui_authenticated: bool, sub: Option<String>) -> Self {
+        Self {
+            webui_authenticated,
+            sub: sub.filter(|s| !s.trim().is_empty()),
+        }
+    }
+
+    pub fn failed() -> Self {
+        Self::UNAUTHENTICATED
+    }
+}
+
 /// Everything one envelope-dispatch call needs, bundled so per-type handler
 /// functions (`handle_envelope_message`, and future siblings) take one
 /// parameter instead of growing a new one for every field a handler needs.
@@ -396,14 +430,13 @@ pub struct EnvelopeDispatchContext<'a> {
     pub client_id: &'a str,
     pub shared: &'a WsShared,
     pub remote_addr: SocketAddr,
-    /// Whether this connection's JWT proves it was minted for the WebUI
-    /// frontend specifically (`purpose == "webui"`), as opposed to the
+    /// Upgrade-time JWT outcome for this connection, as opposed to the
     /// client-supplied, self-declared `envelope["webui"]` flag. Set once per
     /// connection at upgrade time (`channels::websocket::runtime::authorize`)
-    /// and copied into every envelope's dispatch context for that
+    /// and borrowed into every envelope's dispatch context for that
     /// connection's lifetime. Mirrors nanobot's `connection in
     /// self._webui_connections` (`channels/websocket/runtime.py:824`).
-    pub webui_authenticated: bool,
+    pub auth: &'a AuthorizeResult,
 }
 
 #[cfg(test)]
@@ -449,6 +482,13 @@ mod tests {
         let cfg: WebSocketConfig = serde_json::from_str(r#"{"requireAuth": false}"#)
             .expect("requireAuth: false should deserialize");
         assert!(!cfg.require_auth);
+    }
+
+    #[test]
+    fn authorize_result_new_drops_blank_subject() {
+        let result = AuthorizeResult::new(true, Some("  ".to_string()));
+        assert!(result.webui_authenticated);
+        assert_eq!(result.sub, None);
     }
 
     #[test]

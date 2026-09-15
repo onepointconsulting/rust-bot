@@ -584,6 +584,7 @@ fn create_users_file(
         websocket.jwt.aud.clone(),
         "webui",
         DEFAULT_EXPIRES_IN_MONTHS,
+        Some(user_email.clone()),
     )?;
 
     let mut registry = JsonUserRegistry::open(users_file.clone())?;

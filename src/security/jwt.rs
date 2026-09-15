@@ -19,6 +19,9 @@ pub const DEFAULT_EXPIRES_IN_MONTHS: u32 = 6;
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claims {
     pub iss: String,
+    /// Token subject. Login and `generate-jwt-token` stamp the user email
+    /// here so a connection can be identified later; omitted callers get a
+    /// fresh UUID (the previous always-random behavior).
     pub sub: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub aud: Option<String>,
@@ -152,13 +155,16 @@ pub fn generate_jwt_keypair(
 
 /// Mint an EdDSA JWT signed with the private key at `private_key_path`.
 ///
-/// Empty `aud`/`purpose` omit their respective claims.
+/// Empty `aud`/`purpose` omit their respective claims. `sub` is the token
+/// identity (login / CLI pass the user email); `None` or a blank string
+/// mints a fresh UUID instead.
 pub fn generate_jwt_token(
     private_key_path: impl AsRef<Path>,
     iss: impl Into<String>,
     aud: impl Into<String>,
     purpose: impl Into<String>,
     expires_in_months: u32,
+    sub: Option<String>,
 ) -> Result<GeneratedToken, JwtError> {
     let private_pem = fs::read(private_key_path.as_ref()).map_err(|e| {
         JwtError::msg(format!(
@@ -191,7 +197,9 @@ pub fn generate_jwt_token(
 
     let claims = Claims {
         iss,
-        sub: Uuid::new_v4().to_string(),
+        sub: sub
+            .filter(|s| !s.trim().is_empty())
+            .unwrap_or_else(|| Uuid::new_v4().to_string()),
         aud,
         exp,
         iat,
@@ -263,6 +271,7 @@ mod tests {
             "https://api.example.com",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
 
@@ -288,6 +297,7 @@ mod tests {
             "aud-1",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
         assert!(minted.claims.purpose.is_none());
@@ -303,9 +313,50 @@ mod tests {
             "",
             "webui",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
         assert_eq!(minted.claims.purpose.as_deref(), Some("webui"));
+    }
+
+    #[test]
+    fn generate_jwt_token_uses_provided_subject() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "webui",
+            DEFAULT_EXPIRES_IN_MONTHS,
+            Some("a@b.com".to_string()),
+        )
+        .unwrap();
+        assert_eq!(minted.claims.sub, "a@b.com");
+
+        let validated = validate_jwt_token_from_path(
+            &minted.token,
+            &keys.public_key_path,
+            &opts("rust-bot", ""),
+        )
+        .unwrap();
+        assert_eq!(validated.sub, "a@b.com");
+    }
+
+    #[test]
+    fn generate_jwt_token_treats_blank_subject_as_missing() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "",
+            DEFAULT_EXPIRES_IN_MONTHS,
+            Some("   ".to_string()),
+        )
+        .unwrap();
+        assert!(Uuid::parse_str(&minted.claims.sub).is_ok());
     }
 
     #[test]
@@ -318,6 +369,7 @@ mod tests {
             "",
             "webui",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
 
@@ -344,6 +396,7 @@ mod tests {
             "",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
         let validated = validate_jwt_token_from_path(
@@ -365,6 +418,7 @@ mod tests {
             "",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
 
@@ -398,6 +452,7 @@ mod tests {
             "aud-1",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
 
@@ -421,6 +476,7 @@ mod tests {
             "aud-1",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
 
@@ -452,6 +508,7 @@ mod tests {
             "aud-1",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
         )
         .unwrap();
 

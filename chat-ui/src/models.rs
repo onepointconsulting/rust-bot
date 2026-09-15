@@ -1,6 +1,6 @@
 use serde::{Deserialize, Serialize};
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
 pub enum Role {
     User,
@@ -49,6 +49,11 @@ pub struct ChatEntry {
     /// Streamed reasoning/thinking text for this entry (websockets-chat only).
     #[serde(default)]
     pub reasoning: Option<String>,
+    /// Stable identity of the user who sent this row (JWT `sub`, currently
+    /// the account email). `None` for assistant rows, guests, and history
+    /// that predates identity stamping.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub user_id: Option<String>,
 }
 
 /// Session lifetime token/cost totals, as surfaced by the gateway on

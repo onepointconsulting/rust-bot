@@ -30,13 +30,13 @@ use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
-    ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType, WebSocketConfig,
-    WsOutboundEvent, WsShared, WsUpgradeQuery,
+    AuthorizeResult, ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType,
+    WebSocketConfig, WsOutboundEvent, WsShared, WsUpgradeQuery,
 };
 use crate::channels::websocket::webui::metadata::{
-    WEBSOCKET_TURN_OWNER_METADATA_KEY, WEBUI_TURN_METADATA_KEY,
+    USER_ID_METADATA_KEY, WEBSOCKET_TURN_OWNER_METADATA_KEY, WEBUI_TURN_METADATA_KEY,
 };
-use crate::channels::websocket::webui::transcript::client_turn_metadata;
+use crate::channels::websocket::webui::transcript::{client_turn_metadata, user_id_from_row};
 use crate::channels::websocket::{CHANNEL_NAME, get_session_id};
 use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
@@ -234,22 +234,23 @@ const OUTBOUND_META_AGENT_UI: &str = "_agent_ui";
 /// also allowed — but a present, invalid one is still rejected, so a client
 /// that attempts auth and fails doesn't silently fall back to guest.
 ///
-/// Returns whether the connection's JWT proves it was minted for the WebUI
-/// frontend (`purpose == "webui"`) — `false` whenever there's no JWT to make
-/// that claim from (JWT disabled, or a guest connecting with no token), not
-/// just when validation fails. Mirrors nanobot's `_webui_connections` gate
-/// (`channels/websocket/runtime.py:458-462`), which is only ever populated
-/// by a token issued specifically for webui use.
-fn authorize(shared: &WsShared, token: Option<&str>) -> Result<bool, StatusCode> {
+/// Returns the connection's JWT outcome: whether it was minted for the WebUI
+/// frontend (`purpose == "webui"`) and the token `sub` when a token was
+/// validated. Both are `UNAUTHENTICATED` whenever there's no JWT to make
+/// those claims from (JWT disabled, or a guest connecting with no token),
+/// not just when validation fails. Mirrors nanobot's `_webui_connections`
+/// gate (`channels/websocket/runtime.py:458-462`), which is only ever
+/// populated by a token issued specifically for webui use.
+fn authorize(shared: &WsShared, token: Option<&str>) -> Result<AuthorizeResult, StatusCode> {
     let Some(public_key_pem) = shared.jwt_public_key_pem.as_ref() else {
-        return Ok(false);
+        return Ok(AuthorizeResult::failed());
     };
     let token = token.filter(|t| !t.trim().is_empty());
     let Some(token) = token else {
         return if shared.require_auth {
             Err(StatusCode::UNAUTHORIZED)
         } else {
-            Ok(false)
+            Ok(AuthorizeResult::failed())
         };
     };
     let opts = JwtValidationOpts {
@@ -257,7 +258,12 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<bool, StatusCode>
         aud: shared.jwt.aud.clone(),
     };
     validate_jwt_token(token, public_key_pem.as_slice(), &opts)
-        .map(|claims| claims.purpose.as_deref() == Some(WEBUI_JWT_PURPOSE))
+        .map(|claims| {
+            AuthorizeResult::new(
+                claims.purpose.as_deref() == Some(WEBUI_JWT_PURPOSE),
+                Some(claims.sub),
+            )
+        })
         .map_err(|e| {
             log::warn!("WebSocket channel: rejected connection with invalid JWT: {e}");
             StatusCode::UNAUTHORIZED
@@ -266,13 +272,13 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<bool, StatusCode>
 
 /// Whether the current turn may inject the WebUI "quoted context" into the
 /// model prompt: requires both the client's self-declared `is_webui` flag
-/// *and* the stronger, connection-level `webui_authenticated` signal from
+/// *and* the stronger, connection-level WebUI-purpose gate from
 /// [`authorize`] — neither alone is sufficient. Mirrors nanobot's `is_webui
 /// and connection in self._webui_connections` (`channels/websocket/runtime.py:824`),
 /// the one place in this function where client-supplied text becomes
 /// model-visible context, so the bare client-declared flag isn't trusted.
-fn webui_quote_allowed(is_webui: bool, webui_authenticated: bool) -> bool {
-    is_webui && webui_authenticated
+fn webui_quote_allowed(is_webui: bool, auth: &AuthorizeResult) -> bool {
+    is_webui && auth.webui_authenticated
 }
 
 /// Mirrors nanobot's `_workspace_controls_available` / `ws_http.workspace_controls_available`
@@ -345,8 +351,8 @@ async fn ws_upgrade_handler(
     ConnectInfo(remote_addr): ConnectInfo<SocketAddr>,
     ws: WebSocketUpgrade,
 ) -> Response {
-    let webui_authenticated = match authorize(&shared, query.token.as_deref()) {
-        Ok(webui_authenticated) => webui_authenticated,
+    let auth = match authorize(&shared, query.token.as_deref()) {
+        Ok(auth) => auth,
         Err(status) => return status.into_response(),
     };
 
@@ -366,9 +372,7 @@ async fn ws_upgrade_handler(
         None => format!("anon-{}", &Uuid::new_v4().simple().to_string()[..12]),
     };
 
-    ws.on_upgrade(move |socket| {
-        handle_socket(socket, shared, client_id, remote_addr, webui_authenticated)
-    })
+    ws.on_upgrade(move |socket| handle_socket(socket, shared, client_id, remote_addr, auth))
 }
 
 fn ready_event(chat_id: &str, client_id: &str, streaming: bool) -> serde_json::Value {
@@ -442,7 +446,7 @@ async fn handle_socket(
     shared: WsShared,
     client_id: String,
     remote_addr: SocketAddr,
-    webui_authenticated: bool,
+    auth: AuthorizeResult,
 ) {
     let connection_id = Uuid::new_v4().to_string();
     let chat_id = Uuid::new_v4().to_string();
@@ -461,7 +465,7 @@ async fn handle_socket(
         .connections
         .lock()
         .await
-        .register(&connection_id, &chat_id, tx);
+        .register_with_auth(&connection_id, &chat_id, tx, auth.clone());
 
     let liveness = PingLiveness::new(shared.ping_interval_s, shared.ping_timeout_s)
         .map(|liveness| Arc::new(StdMutex::new(liveness)));
@@ -548,7 +552,7 @@ async fn handle_socket(
                         client_id: &client_id,
                         shared: &shared,
                         remote_addr,
-                        webui_authenticated,
+                        auth: &auth,
                     };
                     dispatch_envelope(envelope_dispatch_context).await;
                     continue;
@@ -1922,6 +1926,11 @@ fn websocket_chat_history(
             if !media.is_empty() {
                 entry["media"] = serde_json::json!(media);
             }
+            if message.get("role").and_then(|v| v.as_str()) == Some("user")
+                && let Some(user_id) = user_id_from_row(message)
+            {
+                entry["user_id"] = serde_json::json!(user_id);
+            }
             entry
         })
         .collect()
@@ -2246,6 +2255,14 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
         metadata.insert("mcp_presets".to_string(), serde_json::json!(mcp_presets));
     }
     metadata.insert(WORKSPACE_SCOPE_METADATA_KEY.to_string(), scope.metadata());
+    if let Some(user_id) = envelope_dispatch_context
+        .auth
+        .sub
+        .as_deref()
+        .filter(|s| !s.is_empty())
+    {
+        metadata.insert(USER_ID_METADATA_KEY.to_string(), serde_json::json!(user_id));
+    }
     {
         // Recover from a poisoned mutex rather than panicking the WS handler —
         // same pattern as the scope resolver above.
@@ -2262,8 +2279,7 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
     }
 
     let is_webui = metadata.get("webui").and_then(|v| v.as_bool()) == Some(true);
-    let webui_quote_allowed =
-        webui_quote_allowed(is_webui, envelope_dispatch_context.webui_authenticated);
+    let webui_quote_allowed = webui_quote_allowed(is_webui, envelope_dispatch_context.auth);
     let mut queued_owner_metadata: Option<String> = None;
     if is_webui && builtin_command_starts_agent_turn(content) {
         let mut turn_registry = shared
@@ -2318,7 +2334,15 @@ async fn handle_envelope_message<'a>(envelope_dispatch_context: EnvelopeDispatch
             .and_then(|v| v.as_str())
         {
             let media_urls = resolve_media_urls(&media_paths, &shared.media_root);
-            send_user_turn(cid, normalized_turn_id, content, &media_urls, shared).await;
+            send_user_turn(
+                cid,
+                normalized_turn_id,
+                content,
+                &media_urls,
+                metadata.get(USER_ID_METADATA_KEY).and_then(|v| v.as_str()),
+                shared,
+            )
+            .await;
         }
     }
     let send_result = handle_message(
@@ -2586,11 +2610,15 @@ fn resolve_media_urls(media_paths: &[String], media_root: &std::path::Path) -> V
 /// [`send_goal_state`]. The sender also receives this frame; that's fine —
 /// clients that already recorded `turn_id` locally (the sender did, via its
 /// own optimistic insert) are expected to ignore a duplicate.
+///
+/// When the sending connection is logged in, `user_id` is the JWT `sub`
+/// (currently the account email). Omitted for guests.
 async fn send_user_turn(
     chat_id: &str,
     turn_id: &str,
     text: &str,
     media: &[String],
+    user_id: Option<&str>,
     ws_shared: &WsShared,
 ) {
     let recipients = ws_shared.connections.lock().await.senders_for_chat(chat_id);
@@ -2605,6 +2633,9 @@ async fn send_user_turn(
     });
     if !media.is_empty() {
         body["media"] = serde_json::json!(media);
+    }
+    if let Some(user_id) = user_id.filter(|s| !s.trim().is_empty()) {
+        body["user_id"] = serde_json::json!(user_id);
     }
     let raw = body.to_string();
     for (connection_id, tx) in recipients {
@@ -3990,62 +4021,73 @@ mod tests {
     }
 
     #[test]
-    fn authorize_false_when_jwt_disabled() {
+    fn authorize_unauthenticated_when_jwt_disabled() {
         let shared = test_shared("browser");
-        assert_eq!(authorize(&shared, None), Ok(false));
+        let result = authorize(&shared, None).unwrap();
+        assert_eq!(result, AuthorizeResult::UNAUTHENTICATED);
     }
 
     #[test]
     fn authorize_true_for_webui_purpose_token() {
         let (shared, private_key_path) = shared_with_jwt_enabled();
         let token = mint_token_with_purpose(&private_key_path, Some(WEBUI_JWT_PURPOSE));
-        assert_eq!(authorize(&shared, Some(&token)), Ok(true));
+        let result = authorize(&shared, Some(&token)).unwrap();
+        assert!(result.webui_authenticated);
+        assert!(result.sub.is_some());
     }
 
     #[test]
     fn authorize_false_for_token_without_purpose() {
         let (shared, private_key_path) = shared_with_jwt_enabled();
         let token = mint_token_with_purpose(&private_key_path, None);
-        assert_eq!(authorize(&shared, Some(&token)), Ok(false));
+        let result = authorize(&shared, Some(&token)).unwrap();
+        assert!(!result.webui_authenticated);
+        assert!(result.sub.is_some());
     }
 
     #[test]
     fn authorize_false_for_token_with_different_purpose() {
         let (shared, private_key_path) = shared_with_jwt_enabled();
         let token = mint_token_with_purpose(&private_key_path, Some("client"));
-        assert_eq!(authorize(&shared, Some(&token)), Ok(false));
+        let result = authorize(&shared, Some(&token)).unwrap();
+        assert!(!result.webui_authenticated);
+        assert!(result.sub.is_some());
     }
 
     #[test]
     fn authorize_rejects_missing_token_when_jwt_enabled() {
         let (shared, _private_key_path) = shared_with_jwt_enabled();
-        assert_eq!(authorize(&shared, None), Err(StatusCode::UNAUTHORIZED));
+        let result = authorize(&shared, None);
+        assert_eq!(result.is_err(), true);
+        let err = result.unwrap_err();
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn authorize_rejects_invalid_token() {
         let (shared, _private_key_path) = shared_with_jwt_enabled();
-        assert_eq!(
-            authorize(&shared, Some("not-a-real-token")),
-            Err(StatusCode::UNAUTHORIZED)
-        );
+        let result = authorize(&shared, Some("not-a-real-token"));
+        assert_eq!(result.is_err(), true);
+        let err = result.unwrap_err();
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
     fn authorize_allows_missing_token_when_auth_not_required() {
         let (mut shared, _private_key_path) = shared_with_jwt_enabled();
         shared.require_auth = false;
-        assert_eq!(authorize(&shared, None), Ok(false));
+        let result = authorize(&shared, None).unwrap();
+        assert_eq!(result, AuthorizeResult::UNAUTHENTICATED);
     }
 
     #[test]
     fn authorize_still_rejects_invalid_token_when_auth_not_required() {
         let (mut shared, _private_key_path) = shared_with_jwt_enabled();
         shared.require_auth = false;
-        assert_eq!(
-            authorize(&shared, Some("not-a-real-token")),
-            Err(StatusCode::UNAUTHORIZED)
-        );
+        let result = authorize(&shared, Some("not-a-real-token"));
+        assert_eq!(result.is_err(), true);
+        let err = result.unwrap_err();
+        assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
 
     #[test]
@@ -4053,17 +4095,45 @@ mod tests {
         let (mut shared, private_key_path) = shared_with_jwt_enabled();
         shared.require_auth = false;
         let token = mint_token_with_purpose(&private_key_path, Some(WEBUI_JWT_PURPOSE));
-        assert_eq!(authorize(&shared, Some(&token)), Ok(true));
+        let result = authorize(&shared, Some(&token)).unwrap();
+        assert!(result.webui_authenticated);
+        assert!(result.sub.is_some());
+    }
+
+    #[test]
+    fn authorize_keeps_token_subject() {
+        let (shared, private_key_path) = shared_with_jwt_enabled();
+        let private_pem = std::fs::read(&private_key_path).unwrap();
+        let now = chrono::Utc::now().timestamp();
+        let claims = crate::security::jwt::Claims {
+            iss: "rust-bot".to_string(),
+            sub: "a@b.com".to_string(),
+            aud: None,
+            exp: now + 3600,
+            iat: now,
+            purpose: Some(WEBUI_JWT_PURPOSE.to_string()),
+        };
+        let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
+        let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(&private_pem).unwrap();
+        let token = jsonwebtoken::encode(&header, &claims, &encoding_key).unwrap();
+
+        let result = authorize(&shared, Some(&token)).unwrap();
+        assert_eq!(
+            result,
+            AuthorizeResult::new(true, Some("a@b.com".to_string()))
+        );
     }
 
     // --- webui_quote_allowed ---
 
     #[test]
-    fn webui_quote_allowed_requires_both_flags() {
-        assert!(!webui_quote_allowed(false, true));
-        assert!(!webui_quote_allowed(true, false));
-        assert!(!webui_quote_allowed(false, false));
-        assert!(webui_quote_allowed(true, true));
+    fn webui_quote_allowed_requires_webui_flag_and_webui_purpose_token() {
+        let guest = AuthorizeResult::UNAUTHENTICATED;
+        let webui = AuthorizeResult::new(true, Some("a@b.com".to_string()));
+        assert!(!webui_quote_allowed(false, &webui));
+        assert!(!webui_quote_allowed(true, &guest));
+        assert!(!webui_quote_allowed(false, &guest));
+        assert!(webui_quote_allowed(true, &webui));
     }
 
     #[test]
@@ -4162,7 +4232,7 @@ mod tests {
             .await
             .register("conn-2", "chat-1", tx2);
 
-        send_user_turn("chat-1", "turn-1", "hello there", &[], &shared).await;
+        send_user_turn("chat-1", "turn-1", "hello there", &[], None, &shared).await;
 
         for rx in [&mut rx1, &mut rx2] {
             let body = recv_json(rx);
@@ -4173,6 +4243,10 @@ mod tests {
             assert!(
                 body.get("media").is_none(),
                 "media must be omitted, not an empty array, when there's no attachment: {body}"
+            );
+            assert!(
+                body.get("user_id").is_none(),
+                "user_id must be omitted when the sender is a guest: {body}"
             );
         }
     }
@@ -4192,6 +4266,7 @@ mod tests {
             "turn-1",
             "look at this",
             &[ws_media_url("abc.png")],
+            None,
             &shared,
         )
         .await;
@@ -4201,10 +4276,42 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn send_user_turn_includes_user_id_when_present() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        send_user_turn("chat-1", "turn-1", "hello", &[], Some("a@b.com"), &shared).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["user_id"], "a@b.com");
+    }
+
+    #[tokio::test]
+    async fn send_user_turn_omits_blank_user_id() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        send_user_turn("chat-1", "turn-1", "hello", &[], Some("   "), &shared).await;
+
+        let body = recv_json(&mut rx);
+        assert!(body.get("user_id").is_none());
+    }
+
+    #[tokio::test]
     async fn send_user_turn_noop_when_no_subscribers() {
         let shared = test_shared("browser");
         // Must not panic even though nothing is subscribed to "chat-1".
-        send_user_turn("chat-1", "turn-1", "hello", &[], &shared).await;
+        send_user_turn("chat-1", "turn-1", "hello", &[], None, &shared).await;
     }
 
     #[tokio::test]
@@ -4218,7 +4325,7 @@ mod tests {
             .register("conn-1", "chat-1", tx);
         drop(rx); // simulate the connection's writer task having already exited
 
-        send_user_turn("chat-1", "turn-1", "hello", &[], &shared).await;
+        send_user_turn("chat-1", "turn-1", "hello", &[], None, &shared).await;
 
         assert!(
             shared
@@ -4365,7 +4472,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
 
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
@@ -4439,7 +4546,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -5007,7 +5114,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -5160,7 +5267,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -5438,7 +5545,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -5497,7 +5604,7 @@ mod tests {
             client_id,
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         })
     }
 
@@ -5550,6 +5657,10 @@ mod tests {
         assert_eq!(user_event_1["chat_id"], "chat-1");
         assert_eq!(user_event_1["turn_id"], "turn-1");
         assert_eq!(user_event_1["text"], "hello there");
+        assert!(
+            user_event_1.get("user_id").is_none(),
+            "guest connections must not stamp user_id: {user_event_1}"
+        );
 
         let user_event_2 = recv_json(&mut rx2);
         assert_eq!(
@@ -5618,6 +5729,49 @@ mod tests {
         // client-supplied `turn_id` (mirrors nanobot's `if is_webui and
         // turn_id:`), unlike `user`, which always carries the normalized id.
         assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_message_stamps_auth_sub_on_user_event_and_transcript() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        let envelope = message_envelope("chat-1", "hello", Some("turn-1"));
+        let auth = AuthorizeResult::new(true, Some("a@b.com".to_string()));
+        tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            dispatch_envelope(EnvelopeDispatchContext {
+                envelope: &envelope,
+                connection_id: "conn-1",
+                client_id: "client-1",
+                shared: &shared,
+                remote_addr: addr("127.0.0.1"),
+                auth: &auth,
+            }),
+        )
+        .await
+        .expect("handle_envelope_message must not hang");
+
+        let user_event = recv_json(&mut rx);
+        assert_eq!(user_event["event"], "user");
+        assert_eq!(user_event["user_id"], "a@b.com");
+
+        let rows = shared
+            .gateway_services
+            .transcripts
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .read_transcript_lines(&get_session_id("chat-1"));
+        let user_row = rows
+            .iter()
+            .find(|row| row.get("event").and_then(serde_json::Value::as_str) == Some("user"))
+            .expect("transcript should contain the user row");
+        assert_eq!(user_row["user_id"], "a@b.com");
     }
 
     #[tokio::test]
@@ -5719,7 +5873,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -5795,6 +5949,24 @@ mod tests {
             "LLM tool_calls are not a ChatEntry field: {}",
             history[1]
         );
+        assert!(history[0].get("user_id").is_none());
+        assert!(history[1].get("user_id").is_none());
+    }
+
+    #[test]
+    fn websocket_chat_history_carries_user_id_on_user_rows() {
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.messages.push(serde_json::json!({
+            "role": "user",
+            "content": "hello",
+            "user_id": "a@b.com",
+        }));
+        session.messages.push(history_message("assistant", "hi"));
+
+        let history = websocket_chat_history(Some(&session), 500);
+
+        assert_eq!(history[0]["user_id"], "a@b.com");
+        assert!(history[1].get("user_id").is_none());
     }
 
     #[test]
@@ -6164,7 +6336,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
 
         dispatch_envelope(ctx).await;
@@ -6210,7 +6382,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
 
         dispatch_envelope(ctx).await;
@@ -6380,7 +6552,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
 
         dispatch_envelope(ctx).await;
@@ -6420,7 +6592,7 @@ mod tests {
             client_id: "client-1",
             shared: &shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
 
         dispatch_envelope(ctx).await;
@@ -6452,7 +6624,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -6646,7 +6818,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -6975,7 +7147,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -7347,7 +7519,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -7543,7 +7715,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -7939,7 +8111,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
@@ -8264,7 +8436,7 @@ mod tests {
             client_id: "client-1",
             shared,
             remote_addr: addr("127.0.0.1"),
-            webui_authenticated: false,
+            auth: &AuthorizeResult::UNAUTHENTICATED,
         };
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await

@@ -71,7 +71,8 @@ fn scroll_list_to_bottom(list_ref: NodeRef<Div>, auto_scroll_generation: RwSigna
 /// keying by `entry.id` alone is correct there.
 ///
 /// This app's entries mutate in place as gateway events arrive (delta text
-/// appended, `streaming` flipped off, tool/reasoning panels attached), and
+/// appended, `streaming` flipped off, tool/reasoning panels attached,
+/// `user_id` filled in on a `user` echo), and
 /// `chat_ui::components::MessageBubble` takes its `entry`/`extra` content as
 /// plain (non-reactive) values captured once at render time — so the only
 /// way to make those in-place mutations actually show up is to make the
@@ -80,13 +81,17 @@ fn scroll_list_to_bottom(list_ref: NodeRef<Div>, auto_scroll_generation: RwSigna
 /// rebuilt with the current data. `content`/`tool_events`/`reasoning` are
 /// folded through `{:?}` into one string component rather than requiring
 /// `Hash` on `chat_ui::models::ToolEvent` (which doesn't derive it).
-fn entry_render_key(entry: &ChatEntry, show_fork: bool) -> (u64, String, bool, String, bool) {
+fn entry_render_key(
+    entry: &ChatEntry,
+    show_fork: bool,
+) -> (u64, String, bool, String, bool, Option<String>) {
     (
         entry.id,
         entry.content.clone(),
         entry.streaming,
         format!("{:?}|{:?}", entry.tool_events, entry.reasoning),
         show_fork,
+        entry.user_id.clone(),
     )
 }
 
