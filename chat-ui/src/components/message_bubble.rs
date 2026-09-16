@@ -30,7 +30,8 @@ fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
 /// assistant bubble. The parent decides *which* bubbles show it (websockets-
 /// chat shows it on every completed, non-streaming assistant reply). A
 /// formatted `entry.timestamp` (when present) is rendered after that
-/// control, or after the copy button when there is no fork.
+/// control only when the bubble has visible message text — attachment-only
+/// and thinking/tool/reasoning rows omit it.
 ///
 /// While `streaming` is true, the in-progress indicator is the thinking
 /// spinner until the first visible token arrives, then a blinking cursor
@@ -56,7 +57,7 @@ pub fn MessageBubble(
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
     let awaiting_first_token = !markdown::has_visible_chars(&content);
     let fork_button = on_fork.map(|on_fork| view! { <ForkButton on_fork=on_fork /> }.into_any());
-    let timestamp_label = message_time_label(entry.timestamp.as_deref());
+    let timestamp = entry.timestamp.clone();
 
     // One lightbox per bubble instance: only ever holds the URL of the
     // attachment most recently clicked in *this* bubble, so no lifted/global
@@ -153,6 +154,7 @@ pub fn MessageBubble(
                 pending_view()
             };
             let copy_button = has_text.then(|| view! { <CopyButton text=content.clone() /> });
+            let timestamp_label = has_text.then(|| message_time_label(timestamp.as_deref()));
             view! {
                 <div class="flex flex-col items-start gap-1.5">
                     <div class="max-w-[80%] rounded-2xl bg-white px-4 py-2 text-slate-800 shadow-sm">
@@ -177,10 +179,7 @@ pub fn MessageBubble(
                         {pending_view()}
                         {extra_view}
                     </div>
-                    <div class="flex items-end gap-1.5">
-                        {fork_button}
-                        {timestamp_label}
-                    </div>
+                    {fork_button}
                 </div>
             }
             .into_any()
