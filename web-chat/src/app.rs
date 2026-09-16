@@ -6,7 +6,9 @@ use leptos::task::spawn_local;
 
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
-use chat_ui::models::{ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem};
+use chat_ui::models::{
+    now_rfc3339, ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem,
+};
 
 use crate::api;
 use crate::components::ChatShell;
@@ -205,6 +207,7 @@ pub fn App() -> impl IntoView {
                 tool_events: None,
                 reasoning: None,
                 user_id: None,
+                timestamp: Some(now_rfc3339()),
             });
             *list = trim_to_max_turns(std::mem::take(list), MAX_STORED_TURNS);
         });

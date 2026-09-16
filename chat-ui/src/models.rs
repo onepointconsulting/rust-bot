@@ -54,6 +54,10 @@ pub struct ChatEntry {
     /// that predates identity stamping.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub user_id: Option<String>,
+    /// RFC3339 timestamp of when this row was sent or produced. `None` for
+    /// history that predates stamping, and for host-side test fixtures.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<String>,
 }
 
 /// Session lifetime token/cost totals, as surfaced by the gateway on
@@ -123,6 +127,63 @@ pub struct SkillSummary {
     pub description: String,
 }
 
+/// Current UTC time as RFC3339 (`Date.toISOString()`). Used to stamp live
+/// [`ChatEntry`]s in the browser; not called from host `#[test]`s, where
+/// `js_sys::Date` has no runtime.
+pub fn now_rfc3339() -> String {
+    js_sys::Date::new_0().to_iso_string().into()
+}
+
+/// Format an RFC3339 timestamp for the message action row, in the browser's
+/// local timezone: `5th Sep 2026, 5:16 PM`. `None` when the string isn't a
+/// parseable RFC3339 timestamp.
+pub fn format_message_time(rfc3339: &str) -> Option<String> {
+    let dt = chrono::DateTime::parse_from_rfc3339(rfc3339).ok()?;
+    let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
+        dt.timestamp_millis() as f64,
+    ));
+    Some(format_message_time_parts(
+        date.get_full_year() as i32,
+        date.get_month() + 1,
+        date.get_date(),
+        date.get_hours(),
+        date.get_minutes(),
+    ))
+}
+
+const MONTH_ABBREVS: [&str; 12] = [
+    "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+];
+
+fn day_ordinal_suffix(day: u32) -> &'static str {
+    match day {
+        11 | 12 | 13 => "th",
+        _ => match day % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    }
+}
+
+/// `5th Sep 2026, 5:16 PM` from local civil-time parts. `month` is 1–12;
+/// `hour` is 0–23. Out-of-range month falls back to `Jan`.
+pub fn format_message_time_parts(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> String {
+    let month_name = MONTH_ABBREVS
+        .get(month.saturating_sub(1) as usize)
+        .copied()
+        .unwrap_or("Jan");
+    let suffix = day_ordinal_suffix(day);
+    let (hour12, meridiem) = match hour {
+        0 => (12, "AM"),
+        1..=11 => (hour, "AM"),
+        12 => (12, "PM"),
+        _ => (hour - 12, "PM"),
+    };
+    format!("{day}{suffix} {month_name} {year}, {hour12}:{minute:02} {meridiem}")
+}
+
 /// Compact token-count formatting for the composer chip: `412`, `1.2K`,
 /// `38.6M`. Matches common chat-UI conventions — one decimal place above
 /// 1,000, no decimal below.
@@ -179,6 +240,46 @@ pub struct SessionSummaryPopup {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn format_message_time_parts_matches_requested_display() {
+        assert_eq!(
+            format_message_time_parts(2026, 9, 5, 17, 16),
+            "5th Sep 2026, 5:16 PM"
+        );
+    }
+
+    #[test]
+    fn format_message_time_parts_ordinals_and_clock() {
+        assert_eq!(
+            format_message_time_parts(2026, 1, 1, 0, 5),
+            "1st Jan 2026, 12:05 AM"
+        );
+        assert_eq!(
+            format_message_time_parts(2026, 2, 2, 12, 0),
+            "2nd Feb 2026, 12:00 PM"
+        );
+        assert_eq!(
+            format_message_time_parts(2026, 3, 3, 11, 59),
+            "3rd Mar 2026, 11:59 AM"
+        );
+        assert_eq!(
+            format_message_time_parts(2026, 11, 11, 13, 1),
+            "11th Nov 2026, 1:01 PM"
+        );
+        assert_eq!(
+            format_message_time_parts(2026, 12, 21, 23, 9),
+            "21st Dec 2026, 11:09 PM"
+        );
+        assert_eq!(
+            format_message_time_parts(2026, 8, 22, 8, 0),
+            "22nd Aug 2026, 8:00 AM"
+        );
+        assert_eq!(
+            format_message_time_parts(2026, 7, 23, 16, 30),
+            "23rd Jul 2026, 4:30 PM"
+        );
+    }
 
     #[test]
     fn format_compact_tokens_below_thousand_has_no_suffix() {

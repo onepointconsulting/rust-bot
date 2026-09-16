@@ -665,6 +665,10 @@ struct HistoryMessage {
     media: Vec<String>,
     #[serde(default)]
     user_id: Option<String>,
+    /// RFC3339 when the gateway included one (`websocket_chat_history` /
+    /// `transcript_chat_history`). Absent on older history rows.
+    #[serde(default)]
+    timestamp: Option<String>,
 }
 
 /// Rebuild the tool-activity chips for one history row from its buffered
@@ -732,6 +736,10 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                 user_id: (role == Role::User)
                     .then(|| message.user_id.clone())
                     .flatten(),
+                timestamp: message
+                    .timestamp
+                    .clone()
+                    .filter(|s| !s.trim().is_empty()),
             })
         })
         .enumerate()
@@ -1223,10 +1231,34 @@ mod tests {
                 assert_eq!(history[0].role, Role::User);
                 assert_eq!(history[0].content, "hello");
                 assert_eq!(history[0].user_id, None);
+                assert_eq!(history[0].timestamp, None);
                 assert_eq!(history[1].id, 1);
                 assert_eq!(history[1].role, Role::Assistant);
                 assert_eq!(history[1].content, "hi");
                 assert_eq!(history[1].reasoning.as_deref(), Some("think"));
+                assert_eq!(history[1].timestamp, None);
+            }
+            other => panic!("expected Attached, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parses_attached_history_timestamp() {
+        let raw = r#"{"event":"attached","chat_id":"chat-1","history":[
+            {"role":"user","content":"hello","timestamp":"2026-09-05T17:16:00Z"},
+            {"role":"assistant","content":"hi","timestamp":"2026-09-05T17:16:05Z"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        match event {
+            ServerEvent::Attached { history, .. } => {
+                assert_eq!(
+                    history[0].timestamp.as_deref(),
+                    Some("2026-09-05T17:16:00Z")
+                );
+                assert_eq!(
+                    history[1].timestamp.as_deref(),
+                    Some("2026-09-05T17:16:05Z")
+                );
             }
             other => panic!("expected Attached, got {other:?}"),
         }

@@ -1243,6 +1243,10 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             });
             if let Some(timestamp) = row.get("timestamp").and_then(Value::as_str) {
                 entry["timestamp"] = serde_json::json!(timestamp);
+            } else if let Some(ms) = valid_created_at_ms(row.get("created_at_ms")) {
+                if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
+                    entry["timestamp"] = serde_json::json!(dt.to_rfc3339());
+                }
             }
             // Prefer the folded `reasoning_end` text (how the WebUI transcript
             // actually stores a completed trace). Fall back to a
@@ -2509,6 +2513,30 @@ mod tests {
         assert_eq!(history[1]["content"], "hello there");
         assert!(history[0].get("user_id").is_none());
         assert!(history[1].get("user_id").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_prefers_timestamp_then_created_at_ms() {
+        let rows = vec![
+            serde_json::json!({
+                "event": "user",
+                "text": "hi",
+                "timestamp": "2026-09-05T16:16:00Z",
+                "created_at_ms": 1
+            }),
+            serde_json::json!({
+                "event": "message",
+                "text": "hello there",
+                "created_at_ms": 1_757_090_165_000i64
+            }),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history[0]["timestamp"], "2026-09-05T16:16:00Z");
+        let stamped = history[1]["timestamp"].as_str().expect("created_at_ms stamp");
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamped).expect("rfc3339");
+        assert_eq!(parsed.timestamp_millis(), 1_757_090_165_000);
     }
 
     #[test]

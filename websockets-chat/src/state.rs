@@ -123,6 +123,7 @@ pub fn begin_turn(
         tool_events: None,
         reasoning: None,
         user_id: sender_user_id,
+        timestamp: None,
     });
     let placeholder_id = entry_id + 1;
     entries.push(ChatEntry {
@@ -134,6 +135,7 @@ pub fn begin_turn(
         tool_events: None,
         reasoning: None,
         user_id: None,
+        timestamp: None,
     });
     *next_id = placeholder_id + 1;
     turn_index.insert(turn_id.to_string(), placeholder_id);
@@ -208,6 +210,7 @@ pub fn begin_next_stream_segment(
         tool_events: None,
         reasoning: None,
         user_id: None,
+        timestamp: None,
     });
     turn_index.insert(turn_id.to_string(), new_id);
 }
@@ -689,6 +692,7 @@ mod tests {
             tool_events: None,
             reasoning: None,
             user_id: None,
+            timestamp: None,
         }
     }
 
@@ -702,6 +706,7 @@ mod tests {
             tool_events: None,
             reasoning: None,
             user_id: None,
+            timestamp: None,
         }
     }
 
@@ -1351,6 +1356,7 @@ mod tests {
                 tool_events: None,
                 reasoning: None,
                 user_id: None,
+                timestamp: None,
             },
             ChatEntry {
                 id: 1,
@@ -1364,6 +1370,7 @@ mod tests {
                 tool_events: None,
                 reasoning: None,
                 user_id: None,
+                timestamp: None,
             },
         ];
 
@@ -1391,6 +1398,7 @@ mod tests {
             tool_events: None,
             reasoning: None,
             user_id: None,
+            timestamp: None,
         }];
 
         let result = authorize_media_attachments(entries.clone(), None);

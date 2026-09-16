@@ -84,7 +84,7 @@ fn scroll_list_to_bottom(list_ref: NodeRef<Div>, auto_scroll_generation: RwSigna
 fn entry_render_key(
     entry: &ChatEntry,
     show_fork: bool,
-) -> (u64, String, bool, String, bool, Option<String>) {
+) -> (u64, String, bool, String, bool, Option<String>, Option<String>) {
     (
         entry.id,
         entry.content.clone(),
@@ -92,6 +92,7 @@ fn entry_render_key(
         format!("{:?}|{:?}", entry.tool_events, entry.reasoning),
         show_fork,
         entry.user_id.clone(),
+        entry.timestamp.clone(),
     )
 }
 

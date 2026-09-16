@@ -23,8 +23,8 @@ use uuid::Uuid;
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
-    ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem, SessionSummaryPopup,
-    SessionTokenUsage, SkillSummary,
+    now_rfc3339, ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem,
+    SessionSummaryPopup, SessionTokenUsage, SkillSummary,
 };
 
 use crate::api::{self, WsSender};
@@ -416,6 +416,12 @@ fn start_local_turn(
     if !started {
         return;
     }
+    let timestamp = now_rfc3339();
+    for entry in entries.iter_mut().rev().take(2) {
+        if entry.timestamp.is_none() {
+            entry.timestamp = Some(timestamp.clone());
+        }
+    }
     let entries = trim_to_max_turns(entries, MAX_STORED_TURNS);
     persist_entries(&entries);
     ctx.entries.set(entries);
@@ -443,6 +449,7 @@ fn append_finished_assistant_entry(
             tool_events: None,
             reasoning: None,
             user_id: None,
+            timestamp: Some(now_rfc3339()),
         });
     });
     persist_entries(&ctx.entries.get_untracked());
@@ -588,6 +595,11 @@ fn maybe_begin_next_stream_segment(ctx: &WsContext, turn_id: &str) {
     ctx.turn_index.update(|map| {
         state::begin_next_stream_segment(&mut entries, map, turn_id, new_id);
     });
+    if let Some(entry) = entries.last_mut() {
+        if entry.timestamp.is_none() {
+            entry.timestamp = Some(now_rfc3339());
+        }
+    }
     persist_entries(&entries);
     ctx.entries.set(entries);
 }
