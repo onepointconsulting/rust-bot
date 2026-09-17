@@ -54,5 +54,6 @@ mod tests {
         assert!(paths.iter().any(|p| p == "AGENTS.md"));
         assert!(paths.iter().any(|p| p == "agent/identity.md"));
         assert!(paths.iter().any(|p| p == "memory/MEMORY.md"));
+        assert!(paths.iter().any(|p| p == "history/title_generation.md"));
     }
 }

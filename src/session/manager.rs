@@ -1201,6 +1201,7 @@ impl SessionManager {
         session_key: &str,
         title: &str,
     ) -> Result<(), RenameSessionError> {
+        log::info!("Renaming session {session_key} to {title}");
         let Some(mut session) = self.get_session_internal(session_key) else {
             return Err(RenameSessionError::NotFound);
         };
@@ -1208,7 +1209,10 @@ impl SessionManager {
             .metadata
             .insert(SESSION_TITLE_METADATA_KEY.to_string(), json!(title));
         session.updated_at = Utc::now();
-        self.save(session).map_err(RenameSessionError::Save)
+        self.save(session).map_err(|e| {
+            log::error!("Failed to save generated title for {session_key}: {e}");
+            RenameSessionError::Save(e)
+        })
     }
 
     fn persist_generated_title(&mut self, session_key: &str, title: String) -> Option<String> {

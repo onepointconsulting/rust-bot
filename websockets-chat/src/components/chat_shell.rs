@@ -64,6 +64,8 @@ pub fn ChatShell(
     on_select_agent_mode: impl Fn(String) + 'static + Send + Sync + Copy,
     #[prop(into)] session_usage: Signal<Option<SessionTokenUsage>>,
     #[prop(into)] skills: Signal<Vec<SkillSummary>>,
+    #[prop(default = true)] show_logout: bool,
+    #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
     let shell_class = move || {
@@ -107,6 +109,8 @@ pub fn ChatShell(
                             on_logout=on_logout
                             on_minimize=on_minimize
                             on_toggle_expand=on_toggle_expand
+                            show_logout=show_logout
+                            show_minimize=show_minimize
                         />
                     </div>
                 </header>

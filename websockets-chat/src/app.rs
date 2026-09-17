@@ -39,6 +39,7 @@ use crate::storage_keys::SIDEBAR_OPEN_STORAGE_KEY;
 const TOKEN_STORAGE_KEY: &str = "rust-bot-websockets-chat-token";
 const EMAIL_STORAGE_KEY: &str = "rust-bot-websockets-chat-email";
 const ENTRIES_STORAGE_KEY: &str = "rust-bot-websockets-chat-entries";
+const EMBED_STORAGE_KEY: &str = "rust-bot-websockets-chat-embed";
 
 /// Persisted in `LocalStorage` (survives across tabs and reloads, unlike
 /// `SessionStorage`) because the gateway's `allow_from` allow-list is keyed
@@ -172,6 +173,30 @@ fn read_or_create_client_id() -> String {
     let generated = Uuid::new_v4().to_string();
     let _ = BrowserLocalStorage::set(CLIENT_ID_STORAGE_KEY, &generated);
     generated
+}
+
+/// Read `#token=` off the page URL, persist it, and strip the hash so the
+/// JWT is not left in history/referrer. Returns the token when present.
+fn consume_hash_token() -> Option<String> {
+    let window = web_sys::window()?;
+    let location = window.location();
+    let hash = location.hash().ok()?;
+    let token = crate::sso_handoff::token_from_hash(&hash)?;
+    if let (Ok(history), Ok(pathname), Ok(search)) =
+        (window.history(), location.pathname(), location.search())
+    {
+        let url = format!("{pathname}{search}");
+        let _ = history.replace_state_with_url(&wasm_bindgen::JsValue::NULL, "", Some(&url));
+    }
+    Some(token)
+}
+
+fn read_embed_mode() -> bool {
+    SessionStorage::get::<bool>(EMBED_STORAGE_KEY).unwrap_or(false)
+}
+
+fn persist_embed_mode(embed: bool) {
+    let _ = SessionStorage::set(EMBED_STORAGE_KEY, &embed);
 }
 
 /// Parse an optional `?wsBase=...` query parameter off the current page
@@ -1459,13 +1484,33 @@ fn ChatLauncher(on_open: impl Fn() + 'static + Copy) -> impl IntoView {
 
 #[component]
 pub fn App() -> impl IntoView {
-    let token = RwSignal::new(read_stored_token());
+    let hash_token = consume_hash_token();
+    if let Some(ref jwt) = hash_token {
+        let _ = SessionStorage::set(TOKEN_STORAGE_KEY, jwt);
+        persist_embed_mode(true);
+        if let Some(email) = crate::sso_handoff::email_from_jwt(jwt) {
+            persist_email(&email);
+        }
+    }
+    let embed_mode = hash_token.is_some() || read_embed_mode();
+    if embed_mode {
+        let _ = BrowserLocalStorage::set(CHAT_OPEN_STORAGE_KEY, &true);
+        let _ = BrowserLocalStorage::set(EXPANDED_STORAGE_KEY, &true);
+    }
+
+    let token = RwSignal::new(hash_token.or_else(read_stored_token));
     let login_error = RwSignal::new(None::<String>);
     let login_pending = RwSignal::new(false);
-    let chat_open =
-        RwSignal::new(BrowserLocalStorage::get::<bool>(CHAT_OPEN_STORAGE_KEY).unwrap_or(false));
-    let expanded =
-        RwSignal::new(BrowserLocalStorage::get::<bool>(EXPANDED_STORAGE_KEY).unwrap_or(false));
+    let chat_open = RwSignal::new(if embed_mode {
+        true
+    } else {
+        BrowserLocalStorage::get::<bool>(CHAT_OPEN_STORAGE_KEY).unwrap_or(false)
+    });
+    let expanded = RwSignal::new(if embed_mode {
+        true
+    } else {
+        BrowserLocalStorage::get::<bool>(EXPANDED_STORAGE_KEY).unwrap_or(false)
+    });
 
     let require_login = RwSignal::new(None::<bool>);
     let auth_config_fetch_started = RwSignal::new(false);
@@ -1497,7 +1542,13 @@ pub fn App() -> impl IntoView {
     // empty-state suggestion list simply stays empty for now.
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
-    let user_email = RwSignal::new(read_stored_email());
+    let user_email = RwSignal::new(read_stored_email().or_else(|| {
+        token
+            .get_untracked()
+            .as_deref()
+            .and_then(crate::sso_handoff::email_from_jwt)
+            .inspect(|email| persist_email(email))
+    }));
     let token_streaming = RwSignal::new(false);
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
     let sidebar_open =
@@ -1621,6 +1672,7 @@ pub fn App() -> impl IntoView {
         close_connection(&ws_context);
         SessionStorage::delete(TOKEN_STORAGE_KEY);
         SessionStorage::delete(EMAIL_STORAGE_KEY);
+        SessionStorage::delete(EMBED_STORAGE_KEY);
         clear_stored_entries();
         clear_stored_chat_id();
         token.set(None);
@@ -1683,10 +1735,16 @@ pub fn App() -> impl IntoView {
         ensure_auth_config();
     };
     let close_chat = move || {
+        if embed_mode {
+            return;
+        }
         chat_open.set(false);
         let _ = BrowserLocalStorage::set(CHAT_OPEN_STORAGE_KEY, &chat_open.get());
     };
     let toggle_expand = move || {
+        if embed_mode {
+            return;
+        }
         expanded.update(|value| *value = !*value);
         let _ = BrowserLocalStorage::set(EXPANDED_STORAGE_KEY, &expanded.get());
     };
@@ -1808,6 +1866,8 @@ pub fn App() -> impl IntoView {
                     on_select_agent_mode=on_select_agent_mode
                     session_usage=Signal::derive(move || session_usage.get())
                     skills=Signal::derive(move || skills.get())
+                    show_logout=!embed_mode
+                    show_minimize=!embed_mode
                 />
             </Show>
         </Show>

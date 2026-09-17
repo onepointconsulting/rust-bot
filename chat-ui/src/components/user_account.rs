@@ -90,6 +90,7 @@ fn IconLogout() -> impl IntoView {
 pub fn UserAccountMenu(
     #[prop(into)] email: Signal<Option<String>>,
     on_logout: impl Fn() + 'static + Copy,
+    #[prop(default = true)] show_logout: bool,
 ) -> impl IntoView {
     let menu_open = RwSignal::new(false);
     let copied = RwSignal::new(false);
@@ -189,7 +190,17 @@ pub fn UserAccountMenu(
                         </div>
                         <div class="my-1 border-t border-slate-100"></div>
                     </Show>
-                    <button type="button" role="menuitem" class=MENU_ITEM on:click=do_logout>
+                    <button
+                        type="button"
+                        role="menuitem"
+                        class=move || {
+                            format!(
+                                "{MENU_ITEM}{}",
+                                if show_logout { "" } else { " hidden" }
+                            )
+                        }
+                        on:click=do_logout
+                    >
                         <IconLogout />
                         "Log Out"
                     </button>

@@ -23,7 +23,22 @@
     "sendProgress": true,
     "sendToolHints": true,
     "sendMaxRetries": 3,
-    "transcriptionProvider": "groq"
+    "transcriptionProvider": "groq",
+    "allowFrom": ["*"],
+    "websocket": {
+      "enabled": true,
+      "host": "127.0.0.1",
+      "port": 18793,
+      "path": "/ws",
+      "jwt": {
+        "enabled": true,
+        "privateKeyPath": "./.rust-bot/credentials/private_key.pem",
+        "publicKeyPath": "./.rust-bot/credentials/public_key.pem",
+        "iss": "rust-bot",
+        "aud": "/ws"
+      },
+      "allowFrom": ["*"]
+    }
   },
   "providers": {
     "openrouter": {
@@ -39,11 +54,14 @@
   },
   "gateway": {
     "host": "0.0.0.0",
-    "port": 18790,
+    "port": 18793,
     "heartbeat": {
       "enabled": true,
       "intervalS": 1800,
       "keepRecentMessages": 8
+    },
+    "strapiSso": {
+      "strapiUrl": "http://localhost:1337"
     }
   },
   "tools": {

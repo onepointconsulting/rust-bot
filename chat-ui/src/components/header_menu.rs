@@ -117,7 +117,8 @@ fn IconClose() -> impl IntoView {
 
 /// Header actions for both chat frontends: inline on `sm+`, a hamburger
 /// dropdown below that so the title/status stay readable on a narrow phone.
-/// The account avatar (and Log Out) is always visible at every breakpoint.
+/// The account avatar (and Log Out) is always visible at every breakpoint
+/// unless `show_logout` / `show_minimize` are false (SSO iframe embed).
 #[component]
 pub fn ChatHeaderActions(
     #[prop(into)] expanded: Signal<bool>,
@@ -126,6 +127,8 @@ pub fn ChatHeaderActions(
     on_logout: impl Fn() + 'static + Copy,
     on_minimize: impl Fn() + 'static + Copy,
     on_toggle_expand: impl Fn() + 'static + Copy,
+    #[prop(default = true)] show_logout: bool,
+    #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
     let menu_open = RwSignal::new(false);
 
@@ -177,7 +180,12 @@ pub fn ChatHeaderActions(
                     type="button"
                     aria-label="Minimize chat"
                     title="Minimize"
-                    class=format!("ml-1 {ICON_BTN}")
+                    class=move || {
+                        format!(
+                            "ml-1 {ICON_BTN}{}",
+                            if show_minimize { "" } else { " hidden" }
+                        )
+                    }
                     on:click=do_minimize
                 >
                     <IconMinimize />
@@ -228,7 +236,12 @@ pub fn ChatHeaderActions(
                         <button
                             type="button"
                             role="menuitem"
-                            class=MENU_ITEM
+                            class=move || {
+                                format!(
+                                    "{MENU_ITEM}{}",
+                                    if show_minimize { "" } else { " hidden" }
+                                )
+                            }
                             on:click=do_minimize
                         >
                             <IconMinimize />
@@ -237,7 +250,7 @@ pub fn ChatHeaderActions(
                     </div>
                 </div>
             </div>
-            <UserAccountMenu email=email on_logout=on_logout />
+            <UserAccountMenu email=email on_logout=on_logout show_logout=show_logout />
         </div>
     }
 }

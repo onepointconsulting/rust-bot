@@ -184,7 +184,6 @@ impl ApiError {
         }
     }
 
-    #[cfg(test)]
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
@@ -558,6 +557,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
         jwt_auth: jwt_auth_state_from_config(&server.jwt),
         user_registry: Arc::clone(&server.user_registry),
         token_purpose: String::new(),
+        strapi_url: None,
     });
     let login_router = Router::new()
         .route("/v1/login", post(login))

@@ -63,10 +63,6 @@ impl Autocompact {
                 return false;
             };
             let start = session.last_consolidated.min(session.messages.len());
-            log::info!(
-                "Auto-compact {session_key}: has_compactable_idle_tail: start={start} length={}",
-                session.messages.len()
-            );
             (session.messages[start..].to_vec(), session.key.clone())
         };
         let mut probe = Session {
@@ -143,7 +139,6 @@ impl Autocompact {
             else {
                 continue;
             };
-            log::info!("Auto-compact: checking session {session_key}");
             if Self::is_internal_session(&session_key)
                 || self.is_archiving(&session_key)
                 || active_session_keys.iter().any(|k| k == &session_key)

@@ -4,10 +4,11 @@
 /// Shared snippets live under `agent/_snippets/` and are pulled in via
 /// `{% include 'agent/_snippets/....md' %}` — identical to the Python/Jinja2 setup.
 ///
-/// The templates root is resolved at runtime (see [`resolve_templates_root`]). When no
-/// on-disk `templates/` directory can be found, templates are loaded from the
-/// compile-time embedded bundle instead (see [`crate::utils::embedded_templates`]), so a
-/// standalone binary always has prompts available.
+/// The templates root is resolved at runtime (see [`resolve_templates_root`]). The
+/// compile-time embedded bundle (see [`crate::utils::embedded_templates`]) is always
+/// loaded first so a standalone binary has every prompt, even when an on-disk
+/// `templates/` directory is missing, empty, or only a subset. Files found on disk
+/// overlay the bundle by the same relative name.
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -28,11 +29,18 @@ use crate::utils::embedded_templates;
 /// 3. `{current_working_directory}/templates` — last resort when launched from the project
 ///    root or another directory that contains a `templates/` folder.
 ///
-/// Returns `None` when no candidate directory exists on disk, in which case callers
-/// should fall back to the embedded bundle in [`crate::utils::embedded_templates`].
+/// Returns `None` when no candidate directory exists on disk. [`build_environment`]
+/// still loads the embedded bundle in that case; a disk root is only an overlay.
 pub fn resolve_templates_root() -> Option<PathBuf> {
     if let Ok(dir) = std::env::var("RUST_BOT_TEMPLATES_DIR") {
-        return Some(PathBuf::from(dir));
+        let path = PathBuf::from(dir);
+        if path.is_dir() {
+            return Some(path);
+        }
+        log::warn!(
+            "RUST_BOT_TEMPLATES_DIR is set to '{}' but is not a directory; ignoring",
+            path.display()
+        );
     }
 
     if let Ok(exe) = std::env::current_exe() {
@@ -65,28 +73,64 @@ fn environment() -> Result<&'static Tera, String> {
         .map_err(|e| e.clone())
 }
 
-/// Build a Tera environment from an on-disk `templates/` root, or from the embedded
-/// bundle when `root` is `None`.
+/// Build a Tera environment from the embedded bundle, then overlay any on-disk
+/// `templates/` root. Disk files with the same relative name win.
 fn build_environment(root: Option<&Path>) -> Result<Tera, String> {
-    match root {
-        Some(root) => {
-            let glob = format!("{}/**/*.md", root.to_string_lossy());
-            Tera::new(&glob).map_err(|e| format!("Failed to load templates from {:?}: {}", root, e))
-        }
-        None => {
-            let mut tera = Tera::default();
-            for path in embedded_templates::paths() {
-                if !path.ends_with(".md") {
-                    continue;
-                }
-                let content = embedded_templates::get(&path)
-                    .ok_or_else(|| format!("Embedded template '{path}' is not valid UTF-8"))?;
-                tera.add_raw_template(&path, &content)
-                    .map_err(|e| format!("Failed to load embedded template '{path}': {e}"))?;
-            }
-            Ok(tera)
-        }
+    let mut tera = Tera::default();
+    load_embedded_templates(&mut tera)?;
+    if let Some(root) = root {
+        overlay_disk_templates(&mut tera, root)?;
     }
+    Ok(tera)
+}
+
+fn load_embedded_templates(tera: &mut Tera) -> Result<(), String> {
+    for path in embedded_templates::paths() {
+        if !path.ends_with(".md") {
+            continue;
+        }
+        let content = embedded_templates::get(&path)
+            .ok_or_else(|| format!("Embedded template '{path}' is not valid UTF-8"))?;
+        tera.add_raw_template(&path, &content)
+            .map_err(|e| format!("Failed to load embedded template '{path}': {e}"))?;
+    }
+    Ok(())
+}
+
+fn overlay_disk_templates(tera: &mut Tera, root: &Path) -> Result<(), String> {
+    if !root.is_dir() {
+        return Ok(());
+    }
+    overlay_disk_dir(tera, root, root)
+}
+
+fn overlay_disk_dir(tera: &mut Tera, root: &Path, dir: &Path) -> Result<(), String> {
+    let entries = std::fs::read_dir(dir)
+        .map_err(|e| format!("Failed to read templates from {:?}: {}", dir, e))?;
+    for entry in entries {
+        let entry = entry.map_err(|e| format!("Failed to read templates from {:?}: {}", dir, e))?;
+        let path = entry.path();
+        if path.is_dir() {
+            overlay_disk_dir(tera, root, &path)?;
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        if !name.ends_with(".md") {
+            continue;
+        }
+        let rel = path
+            .strip_prefix(root)
+            .unwrap_or(&path)
+            .to_string_lossy()
+            .replace('\\', "/");
+        let content = std::fs::read_to_string(&path)
+            .map_err(|e| format!("Failed to read template '{rel}': {e}"))?;
+        tera.add_raw_template(&rel, &content)
+            .map_err(|e| format!("Failed to load on-disk template '{rel}': {e}"))?;
+    }
+    Ok(())
 }
 
 // ── public API ────────────────────────────────────────────────────────────────
@@ -161,6 +205,53 @@ mod tests {
         let result = render_with_root(None, "agent/dream_phase1.md", &ctx(), false);
         assert!(result.is_ok(), "unexpected error: {:?}", result.err());
         assert!(!result.unwrap().is_empty());
+    }
+
+    #[test]
+    fn test_embedded_bundle_includes_title_generation() {
+        let mut ctx = Context::new();
+        ctx.insert("part", "system");
+        let result = render_with_root(None, "history/title_generation.md", &ctx, true);
+        assert!(result.is_ok(), "unexpected error: {:?}", result.err());
+        assert!(result.unwrap().contains("Return only the title text"));
+    }
+
+    #[test]
+    fn test_missing_disk_root_still_serves_embedded_title_generation() {
+        let missing = PathBuf::from("/this/path/does/not/exist/templates");
+        let mut ctx = Context::new();
+        ctx.insert("part", "system");
+        let result = render_with_root(Some(&missing), "history/title_generation.md", &ctx, true);
+        assert!(
+            result.is_ok(),
+            "missing disk root should not hide embedded templates: {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn test_partial_disk_root_falls_back_to_embedded_title_generation() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::write(tmp.path().join("README.md"), "disk overlay").unwrap();
+        let mut ctx = Context::new();
+        ctx.insert("part", "system");
+        let result = render_with_root(Some(tmp.path()), "history/title_generation.md", &ctx, true);
+        assert!(
+            result.is_ok(),
+            "partial disk root should still serve embedded title template: {:?}",
+            result.err()
+        );
+        assert!(result.unwrap().contains("Return only the title text"));
+    }
+
+    #[test]
+    fn test_disk_overlay_replaces_embedded_template() {
+        let tmp = tempfile::tempdir().unwrap();
+        let agent_dir = tmp.path().join("agent");
+        std::fs::create_dir_all(&agent_dir).unwrap();
+        std::fs::write(agent_dir.join("dream_phase1.md"), "disk-override-prompt").unwrap();
+        let result = render_with_root(Some(tmp.path()), "agent/dream_phase1.md", &ctx(), true);
+        assert_eq!(result.unwrap(), "disk-override-prompt");
     }
 
     #[test]

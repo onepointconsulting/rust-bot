@@ -38,6 +38,9 @@ pub(crate) struct LoginState {
     /// combined gateway server, whose only client is the WebSocket-based
     /// chat UI (see `security::jwt::Claims::purpose`).
     pub(crate) token_purpose: String,
+    /// Configured Strapi origin for `POST /v1/sso/strapi`. `None` disables
+    /// the exchange (handler returns 500). The REST API leaves this unset.
+    pub(crate) strapi_url: Option<String>,
 }
 
 /// Build the `JwtAuthState` a server needs to validate/mint tokens from its
@@ -199,14 +202,18 @@ pub(crate) async fn auth_config(
 }
 
 /// Minimal OpenAPI document for the combined gateway server, which exposes
-/// only `/v1/login` and `/v1/auth/config` (not the full `api::rest::ApiDoc`
-/// chat surface). No `bearerAuth` security scheme/modifier is needed —
-/// neither route's `#[utoipa::path]` declares `security(...)`, so nothing in
-/// this document needs it either.
+/// only `/v1/login`, `/v1/sso/strapi`, and `/v1/auth/config` (not the full
+/// `api::rest::ApiDoc` chat surface). No `bearerAuth` security scheme/modifier
+/// is needed — none of these routes' `#[utoipa::path]` declare `security(...)`.
 #[derive(utoipa::OpenApi)]
 #[openapi(
-    paths(login, auth_config),
-    components(schemas(ChatLoginRequest, ChatLoginResponse, AuthConfigResponse)),
+    paths(login, auth_config, crate::api::sso::sso_strapi),
+    components(schemas(
+        ChatLoginRequest,
+        ChatLoginResponse,
+        AuthConfigResponse,
+        crate::api::sso::StrapiSsoRequest
+    )),
     tags((name = "security", description = "Authentication and token issuance")),
 )]
 pub(crate) struct GatewayApiDoc;
@@ -222,6 +229,7 @@ mod tests {
             jwt_auth,
             user_registry: Arc::new(Mutex::new(JsonUserRegistry::empty())),
             token_purpose: "webui".to_string(),
+            strapi_url: None,
         })
     }
 
@@ -288,6 +296,7 @@ mod tests {
             }),
             user_registry: Arc::new(Mutex::new(registry)),
             token_purpose: "webui".to_string(),
+            strapi_url: None,
         });
 
         let response = login(State(state), Json(request("a@b.com", "correct horse")))

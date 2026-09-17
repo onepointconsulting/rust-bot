@@ -14,6 +14,7 @@ use crate::agent::tools::message::MessageTool;
 use crate::api::login::{
     AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
 };
+use crate::api::sso::sso_strapi;
 use crate::api::rest::ApiServer;
 use crate::api::rest::build_cors_layer;
 use crate::api::rest::create_api_server;
@@ -950,15 +951,21 @@ async fn serve_combined_login_and_gateway(
     web_ui: GatewayWebUi,
 ) -> std::io::Result<()> {
     let ws_shared = ws_channel.shared();
+    let strapi_url = {
+        let url = config.gateway.strapi_sso.strapi_url.trim();
+        (!url.is_empty()).then(|| url.trim_end_matches('/').to_string())
+    };
     let login_state = Arc::new(LoginState {
         jwt_auth: jwt_auth_state_from_config(&ws_shared.jwt),
         user_registry: Arc::new(StdMutex::new(open_or_empty_user_registry(
             &config.api.users_file,
         ))),
         token_purpose: "webui".to_string(),
+        strapi_url,
     });
     let login_router = Router::new()
         .route("/v1/login", post(login))
+        .route("/v1/sso/strapi", post(sso_strapi))
         .with_state(login_state);
 
     // Unauthenticated by design — see `AuthConfigResponse`'s doc comment for
@@ -1024,12 +1031,10 @@ async fn serve_combined_login_and_gateway(
 /// server's login shares the exact same credential-file semantics as the
 /// REST API's `/v1/login`.
 fn open_or_empty_user_registry(users_file: &str) -> JsonUserRegistry {
-    let path: PathBuf = users_file.into();
-    if path.exists() {
-        JsonUserRegistry::open(path).unwrap()
-    } else {
-        JsonUserRegistry::empty()
-    }
+    // `open` treats a missing file as empty while keeping the path, so SSO
+    // map-or-create can persist the first user. `empty()` has no path and
+    // cannot save.
+    JsonUserRegistry::open(users_file).unwrap()
 }
 
 async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {

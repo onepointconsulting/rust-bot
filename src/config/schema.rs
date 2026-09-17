@@ -884,6 +884,24 @@ pub struct GatewayConfig {
     #[serde(alias = "web_root", default)]
     #[garde(skip)]
     pub web_root: Option<String>,
+
+    /// Strapi admin JWT exchange for the combined gateway (`POST /v1/sso/strapi`).
+    /// Empty `strapiUrl` disables the route's verification target (handler
+    /// returns 500 until configured).
+    #[serde(alias = "strapi_sso", default)]
+    #[garde(dive)]
+    pub strapi_sso: StrapiSsoConfig,
+}
+
+/// Config for exchanging a Strapi admin JWT for a rust-bot WebUI JWT.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StrapiSsoConfig {
+    /// Base URL of the Strapi instance used to validate admin JWTs via
+    /// `GET {strapiUrl}/admin/users/me`. Must not be taken from the client.
+    #[serde(alias = "strapi_url", default)]
+    #[garde(skip)]
+    pub strapi_url: String,
 }
 
 impl Default for GatewayConfig {
@@ -893,6 +911,7 @@ impl Default for GatewayConfig {
             port: default_gateway_port(),
             heartbeat: HeartbeatConfig::default(),
             web_root: None,
+            strapi_sso: StrapiSsoConfig::default(),
         }
     }
 }
@@ -2399,6 +2418,15 @@ mod tests {
         assert_eq!(cfg.heartbeat.interval_s, 30 * 60);
         assert_eq!(cfg.heartbeat.keep_recent_messages, 8);
         assert_eq!(cfg.web_root, None);
+        assert!(cfg.strapi_sso.strapi_url.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_strapi_sso_deserialize() {
+        let json = r#"{"strapiSso": {"strapiUrl": "http://localhost:1337"}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.strapi_sso.strapi_url, "http://localhost:1337");
         assert!(cfg.validate().is_ok());
     }
 

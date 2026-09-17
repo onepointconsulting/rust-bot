@@ -2,6 +2,7 @@ mod api;
 mod app;
 mod components;
 mod protocol;
+mod sso_handoff;
 mod state;
 mod storage_keys;
 
