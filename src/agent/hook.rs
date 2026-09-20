@@ -44,6 +44,72 @@ impl AgentHookContext {
 
 // ── AgentHook ─────────────────────────────────────────────────────────────────
 
+/// Decision returned by [`AgentHook::before_execute_tools`].
+///
+/// The runner honours these after the assistant tool-call message is already
+/// on the transcript, so deny/abort paths inject synthetic tool results to
+/// keep the conversation well-formed.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ToolHookDecision {
+    #[default]
+    Continue,
+    Deny {
+        reason: String,
+    },
+    DenyCalls {
+        ids: Vec<String>,
+        reason: String,
+    },
+    Abort {
+        reason: String,
+    },
+}
+
+/// [`AgentRunResult::stop_reason`] when a hook aborts tool execution.
+pub const HOOK_ABORT_STOP_REASON: &str = "hook_abort";
+
+impl ToolHookDecision {
+    /// Fail-closed reduction used by composite / chained hooks.
+    ///
+    /// The earlier `Abort` is sticky. A later `Abort` upgrades anything else.
+    /// `Deny` (all calls) dominates `DenyCalls`. Two `DenyCalls` union their
+    /// ids. `Continue` is the identity.
+    pub fn merge(self, next: Self) -> Self {
+        match (self, next) {
+            (abort @ Self::Abort { .. }, _) => abort,
+            (_, abort @ Self::Abort { .. }) => abort,
+            (deny @ Self::Deny { .. }, _) => deny,
+            (_, deny @ Self::Deny { .. }) => deny,
+            (
+                Self::DenyCalls { mut ids, reason },
+                Self::DenyCalls {
+                    ids: more,
+                    reason: next_reason,
+                },
+            ) => {
+                for id in more {
+                    if !ids.contains(&id) {
+                        ids.push(id);
+                    }
+                }
+                let reason = if reason.is_empty() {
+                    next_reason
+                } else if next_reason.is_empty() || reason == next_reason {
+                    reason
+                } else {
+                    format!("{reason}; {next_reason}")
+                };
+                Self::DenyCalls { ids, reason }
+            }
+            (Self::Continue, other) | (other, Self::Continue) => other,
+        }
+    }
+
+    pub fn is_abort(&self) -> bool {
+        matches!(self, Self::Abort { .. })
+    }
+}
+
 /// Minimal lifecycle surface for shared runner customization.
 ///
 /// All async methods have no-op defaults so implementors only override
@@ -65,7 +131,11 @@ pub trait AgentHook: Send + Sync {
 
     async fn on_reasoning_end(&self, _ctx: &mut AgentHookContext) {}
 
-    async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {}
+    /// Gate immediately before tools run. Return [`ToolHookDecision::Continue`]
+    /// (the default) to execute the batch, or deny/abort to skip calls.
+    async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
+        ToolHookDecision::Continue
+    }
 
     async fn after_iteration(&self, _ctx: &mut AgentHookContext) {}
 
@@ -193,13 +263,19 @@ impl AgentHook for CompositeHook {
         }
     }
 
-    async fn before_execute_tools(&self, ctx: &mut AgentHookContext) {
+    async fn before_execute_tools(&self, ctx: &mut AgentHookContext) -> ToolHookDecision {
+        let mut acc = ToolHookDecision::Continue;
         for hook in &self.hooks {
             match AssertUnwindSafe(hook.before_execute_tools(ctx))
                 .catch_unwind()
                 .await
             {
-                Ok(()) => {}
+                Ok(decision) => {
+                    acc = acc.merge(decision);
+                    if acc.is_abort() {
+                        return acc;
+                    }
+                }
                 Err(e) => log::error!(
                     "AgentHook.before_execute_tools panicked: {:?}",
                     e.downcast_ref::<&str>()
@@ -208,6 +284,7 @@ impl AgentHook for CompositeHook {
                 ),
             }
         }
+        acc
     }
 
     async fn after_iteration(&self, ctx: &mut AgentHookContext) {
@@ -308,11 +385,12 @@ mod tests {
             self.calls.lock().unwrap().push("on_reasoning_end".into());
         }
 
-        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {
+        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
             self.calls
                 .lock()
                 .unwrap()
                 .push("before_execute_tools".into());
+            ToolHookDecision::Continue
         }
 
         async fn after_iteration(&self, _ctx: &mut AgentHookContext) {
@@ -343,7 +421,7 @@ mod tests {
         async fn on_stream_end(&self, _ctx: &mut AgentHookContext, _resuming: bool) {
             panic!("deliberate panic");
         }
-        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {
+        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
             panic!("deliberate panic");
         }
         async fn after_iteration(&self, _ctx: &mut AgentHookContext) {
@@ -382,7 +460,10 @@ mod tests {
         hook.before_iteration(&mut ctx).await;
         hook.on_stream(&mut ctx, "x").await;
         hook.on_stream_end(&mut ctx, false).await;
-        hook.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            hook.before_execute_tools(&mut ctx).await,
+            ToolHookDecision::Continue
+        );
         hook.after_iteration(&mut ctx).await;
         assert!(!hook.wants_streaming());
         assert_eq!(
@@ -591,5 +672,155 @@ mod tests {
                 .unwrap()
                 .contains(&"after_iteration".to_string())
         );
+    }
+
+    // ── ToolHookDecision ──────────────────────────────────────────────────────
+
+    struct DecisionHook {
+        decision: ToolHookDecision,
+        calls: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait]
+    impl AgentHook for DecisionHook {
+        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
+            self.calls
+                .lock()
+                .unwrap()
+                .push("before_execute_tools".into());
+            self.decision.clone()
+        }
+    }
+
+    #[test]
+    fn test_decision_merge_continue_is_identity() {
+        let deny = ToolHookDecision::Deny {
+            reason: "nope".into(),
+        };
+        assert_eq!(ToolHookDecision::Continue.merge(deny.clone()), deny.clone());
+        assert_eq!(deny.clone().merge(ToolHookDecision::Continue), deny);
+    }
+
+    #[test]
+    fn test_decision_merge_deny_dominates_deny_calls() {
+        let deny = ToolHookDecision::Deny {
+            reason: "all".into(),
+        };
+        let some = ToolHookDecision::DenyCalls {
+            ids: vec!["c1".into()],
+            reason: "one".into(),
+        };
+        assert_eq!(deny.clone().merge(some.clone()), deny.clone());
+        assert_eq!(some.merge(deny.clone()), deny);
+    }
+
+    #[test]
+    fn test_decision_merge_deny_calls_unions_ids() {
+        let merged = ToolHookDecision::DenyCalls {
+            ids: vec!["a".into()],
+            reason: "first".into(),
+        }
+        .merge(ToolHookDecision::DenyCalls {
+            ids: vec!["a".into(), "b".into()],
+            reason: "second".into(),
+        });
+        assert_eq!(
+            merged,
+            ToolHookDecision::DenyCalls {
+                ids: vec!["a".into(), "b".into()],
+                reason: "first; second".into(),
+            }
+        );
+    }
+
+    #[test]
+    fn test_decision_merge_first_abort_is_sticky() {
+        let first = ToolHookDecision::Abort {
+            reason: "first".into(),
+        };
+        let second = ToolHookDecision::Abort {
+            reason: "second".into(),
+        };
+        assert_eq!(first.clone().merge(second), first);
+    }
+
+    #[tokio::test]
+    async fn test_composite_merges_deny_calls_and_keeps_later_hooks() {
+        let later = Arc::new(Mutex::new(Vec::<String>::new()));
+        let composite = CompositeHook::new(vec![
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::DenyCalls {
+                    ids: vec!["a".into()],
+                    reason: "first".into(),
+                },
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::DenyCalls {
+                    ids: vec!["b".into()],
+                    reason: "second".into(),
+                },
+                calls: Arc::clone(&later),
+            }),
+        ]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::DenyCalls {
+                ids: vec!["a".into(), "b".into()],
+                reason: "first; second".into(),
+            }
+        );
+        assert_eq!(later.lock().unwrap().as_slice(), ["before_execute_tools"]);
+    }
+
+    #[tokio::test]
+    async fn test_composite_abort_skips_later_hooks() {
+        let later = Arc::new(Mutex::new(Vec::<String>::new()));
+        let composite = CompositeHook::new(vec![
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::Abort {
+                    reason: "stop".into(),
+                },
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::Continue,
+                calls: Arc::clone(&later),
+            }),
+        ]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Abort {
+                reason: "stop".into()
+            }
+        );
+        assert!(later.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_panicking_hook_isolated_before_execute_tools() {
+        let later = Arc::new(Mutex::new(Vec::<String>::new()));
+        let composite = CompositeHook::new(vec![
+            Arc::new(PanickingHook),
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::Deny {
+                    reason: "blocked".into(),
+                },
+                calls: Arc::clone(&later),
+            }),
+        ]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Deny {
+                reason: "blocked".into()
+            }
+        );
+        assert_eq!(later.lock().unwrap().as_slice(), ["before_execute_tools"]);
     }
 }

@@ -18,7 +18,7 @@ use tokio::task::JoinHandle;
 use crate::agent::autocompact::Autocompact;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
-use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook};
+use crate::agent::hook::{AgentHook, AgentHookContext, CompositeHook, ToolHookDecision};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::model_runtime::{
@@ -208,7 +208,7 @@ impl AgentHook for LoopHook {
         }
     }
 
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) {
+    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
         if let Some(on_progress) = &self.on_progress {
             if self.on_stream.is_none() {
                 let content: Option<String> = if let Some(response) = context.response.clone()
@@ -240,6 +240,7 @@ impl AgentHook for LoopHook {
         }
         self.agent_loop
             .set_tool_context(&self.channel, &self.chat_id, self.message_id.as_deref());
+        ToolHookDecision::Continue
     }
 
     async fn after_iteration(&self, context: &mut AgentHookContext) {
@@ -300,9 +301,13 @@ impl AgentHook for LoopHookChain {
         self.extras.on_reasoning_end(context).await;
     }
 
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) {
-        self.primary.before_execute_tools(context).await;
-        self.extras.before_execute_tools(context).await;
+    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
+        let primary = self.primary.before_execute_tools(context).await;
+        if primary.is_abort() {
+            return primary;
+        }
+        let extras = self.extras.before_execute_tools(context).await;
+        primary.merge(extras)
     }
 
     async fn after_iteration(&self, context: &mut AgentHookContext) {
@@ -2477,11 +2482,12 @@ mod tests {
                 .push(format!("{}:on_stream_end", self.label));
         }
 
-        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) {
+        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
             self.calls
                 .lock()
                 .unwrap()
                 .push(format!("{}:before_execute_tools", self.label));
+            ToolHookDecision::Continue
         }
 
         async fn after_iteration(&self, _ctx: &mut AgentHookContext) {
@@ -2539,6 +2545,93 @@ mod tests {
                 "extra:before_execute_tools".to_string(),
                 "primary:after_iteration".to_string(),
                 "extra:after_iteration".to_string(),
+            ]
+        );
+    }
+
+    struct DecisionRecordingHook {
+        calls: Arc<Mutex<Vec<String>>>,
+        label: &'static str,
+        decision: ToolHookDecision,
+    }
+
+    #[async_trait]
+    impl AgentHook for DecisionRecordingHook {
+        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("{}:before_execute_tools", self.label));
+            self.decision.clone()
+        }
+    }
+
+    #[tokio::test]
+    async fn test_loop_hook_chain_abort_skips_extras() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let chain = LoopHookChain::new(
+            Arc::new(DecisionRecordingHook {
+                calls: Arc::clone(&calls),
+                label: "primary",
+                decision: ToolHookDecision::Abort {
+                    reason: "stop".into(),
+                },
+            }),
+            vec![Arc::new(DecisionRecordingHook {
+                calls: Arc::clone(&calls),
+                label: "extra",
+                decision: ToolHookDecision::Continue,
+            })],
+        );
+        let mut ctx = make_ctx();
+        let decision = chain.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Abort {
+                reason: "stop".into()
+            }
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec!["primary:before_execute_tools".to_string()]
+        );
+    }
+
+    #[tokio::test]
+    async fn test_loop_hook_chain_merges_primary_deny_with_extras() {
+        let calls = Arc::new(Mutex::new(Vec::new()));
+        let chain = LoopHookChain::new(
+            Arc::new(DecisionRecordingHook {
+                calls: Arc::clone(&calls),
+                label: "primary",
+                decision: ToolHookDecision::DenyCalls {
+                    ids: vec!["a".into()],
+                    reason: "primary".into(),
+                },
+            }),
+            vec![Arc::new(DecisionRecordingHook {
+                calls: Arc::clone(&calls),
+                label: "extra",
+                decision: ToolHookDecision::DenyCalls {
+                    ids: vec!["b".into()],
+                    reason: "extra".into(),
+                },
+            })],
+        );
+        let mut ctx = make_ctx();
+        let decision = chain.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::DenyCalls {
+                ids: vec!["a".into(), "b".into()],
+                reason: "primary; extra".into(),
+            }
+        );
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                "primary:before_execute_tools".to_string(),
+                "extra:before_execute_tools".to_string(),
             ]
         );
     }

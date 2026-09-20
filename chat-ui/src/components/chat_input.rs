@@ -659,7 +659,7 @@ pub fn ChatInput(
                     </button>
                 </div>
             </Show>
-            
+
             <form
                 class="flex items-end gap-1.5"
                 on:submit=move |ev| {

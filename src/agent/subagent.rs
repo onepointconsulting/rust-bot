@@ -10,7 +10,7 @@ use chrono::Utc;
 use crate::{
     agent::{
         context::ContextBuilder,
-        hook::{AgentHook, AgentHookContext},
+        hook::{AgentHook, AgentHookContext, ToolHookDecision},
         model_runtime::ModelRuntimeResolver,
         runner::{AgentRunResult, AgentRunSpec, AgentRunner},
         skills::SkillsLoader,
@@ -48,7 +48,7 @@ impl SubagentHook {
 /// Logging-only hook for subagent execution.
 #[async_trait]
 impl AgentHook for SubagentHook {
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) {
+    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
         for tool_call in context.tool_calls.iter() {
             let args_str = serde_json::to_string(&tool_call.arguments).unwrap();
             log::info!(
@@ -58,6 +58,7 @@ impl AgentHook for SubagentHook {
                 args_str
             );
         }
+        ToolHookDecision::Continue
     }
 }
 

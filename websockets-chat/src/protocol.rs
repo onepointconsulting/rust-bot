@@ -736,10 +736,7 @@ fn history_to_entries(history: &[HistoryMessage]) -> Vec<ChatEntry> {
                 user_id: (role == Role::User)
                     .then(|| message.user_id.clone())
                     .flatten(),
-                timestamp: message
-                    .timestamp
-                    .clone()
-                    .filter(|s| !s.trim().is_empty()),
+                timestamp: message.timestamp.clone().filter(|s| !s.trim().is_empty()),
             })
         })
         .enumerate()

@@ -8,7 +8,7 @@ use crate::agent::circuit_breaker::{
     CIRCUIT_BREAKER_STOP_REASON, CIRCUIT_BREAKER_USER_MESSAGE, CircuitDecision,
     DEFAULT_N_IDENTICAL_MESSAGES, MessageCircuitBreaker, is_tripped_error, tripped_error_message,
 };
-use crate::agent::hook::{AgentHook, AgentHookContext};
+use crate::agent::hook::{AgentHook, AgentHookContext, HOOK_ABORT_STOP_REASON, ToolHookDecision};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::bus::outbound_events::ProgressKind;
 use crate::providers::base::{
@@ -706,6 +706,99 @@ impl AgentRunner {
         (results, events, fatal_error)
     }
 
+    fn hook_block_result(name: &str, reason: &str) -> (String, HashMap<String, String>) {
+        let result = format!("Error: tool call blocked by hook: {reason}");
+        let detail: String = reason.replace('\n', " ").trim().chars().take(120).collect();
+        let event = HashMap::from([
+            ("name".to_string(), name.to_string()),
+            ("status".to_string(), "blocked".to_string()),
+            ("detail".to_string(), detail),
+        ]);
+        (result, event)
+    }
+
+    fn hook_denied_ids(
+        decision: &ToolHookDecision,
+        tool_calls: &[ToolCallRequest],
+    ) -> Option<(std::collections::HashSet<String>, String)> {
+        match decision {
+            ToolHookDecision::Continue | ToolHookDecision::Abort { .. } => None,
+            ToolHookDecision::Deny { reason } => Some((
+                tool_calls.iter().map(|tc| tc.id.clone()).collect(),
+                reason.clone(),
+            )),
+            ToolHookDecision::DenyCalls { ids, reason } => {
+                Some((ids.iter().cloned().collect(), reason.clone()))
+            }
+        }
+    }
+
+    /// Execute the allowed subset of `tool_calls` and stitch synthetic
+    /// blocked results into the original order so the transcript stays
+    /// aligned with the assistant's tool-call message.
+    async fn execute_tools_honoring_decision(
+        spec: &AgentRunSpec,
+        tool_calls: &[ToolCallRequest],
+        decision: &ToolHookDecision,
+        external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
+        message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
+    ) -> (Vec<String>, Vec<HashMap<String, String>>, Option<String>) {
+        let Some((denied, reason)) = Self::hook_denied_ids(decision, tool_calls) else {
+            return Self::execute_tools(
+                spec,
+                tool_calls,
+                external_lookup_counts,
+                message_circuit_breaker,
+            )
+            .await;
+        };
+
+        let to_run: Vec<ToolCallRequest> = tool_calls
+            .iter()
+            .filter(|tc| !denied.contains(&tc.id))
+            .cloned()
+            .collect();
+        let (run_results, run_events, fatal_error) = if to_run.is_empty() {
+            (Vec::new(), Vec::new(), None)
+        } else {
+            Self::execute_tools(
+                spec,
+                &to_run,
+                external_lookup_counts,
+                message_circuit_breaker,
+            )
+            .await
+        };
+
+        let mut run_results = run_results.into_iter();
+        let mut run_events = run_events.into_iter();
+        let mut results = Vec::with_capacity(tool_calls.len());
+        let mut events = Vec::with_capacity(tool_calls.len());
+        for tc in tool_calls {
+            if denied.contains(&tc.id) {
+                let (result, event) = Self::hook_block_result(&tc.name, &reason);
+                results.push(result);
+                events.push(event);
+            } else {
+                results.push(
+                    run_results
+                        .next()
+                        .unwrap_or_else(|| format!("Error: tool call blocked by hook: {reason}")),
+                );
+                events.push(run_events.next().unwrap_or_default());
+            }
+        }
+        (results, events, fatal_error)
+    }
+
+    fn tool_call_denied(decision: &ToolHookDecision, tool_call_id: &str) -> bool {
+        match decision {
+            ToolHookDecision::Continue => false,
+            ToolHookDecision::Abort { .. } | ToolHookDecision::Deny { .. } => true,
+            ToolHookDecision::DenyCalls { ids, .. } => ids.iter().any(|id| id == tool_call_id),
+        }
+    }
+
     /// Group tool calls into batches for (optionally concurrent) execution.
     ///
     /// When `spec.concurrent_tools` is `false` every call gets its own
@@ -1144,18 +1237,61 @@ impl AgentRunner {
                 Self::emit_checkpoint(&spec, serde_json::json!({"type": "awaiting_tools"}));
 
                 ctx.tool_calls = response.tool_calls.clone();
-                hook.before_execute_tools(&mut ctx).await;
+                let decision = hook.before_execute_tools(&mut ctx).await;
 
-                let (results, events, fatal_error) = Self::execute_tools(
+                if let ToolHookDecision::Abort { reason } = &decision {
+                    log::warn!("Tool execution aborted by hook: {reason}");
+                    let mut abort_events = Vec::with_capacity(response.tool_calls.len());
+                    for tc in &response.tool_calls {
+                        let (result, event) = Self::hook_block_result(&tc.name, reason);
+                        let normalized = self.normalize_tool_result(
+                            &spec,
+                            &tc.id,
+                            &tc.name,
+                            coerce_tool_execute_result(result),
+                        );
+                        let tool_msg = serde_json::json!({
+                            "role": "tool",
+                            "tool_call_id": tc.id,
+                            "name": tc.name,
+                            "content": normalized,
+                        });
+                        ctx.tool_results.push(tool_msg.clone());
+                        messages.push(tool_msg);
+                        abort_events.push(event);
+                    }
+                    all_tool_events.extend(abort_events.clone());
+                    ctx.tool_events = abort_events;
+                    let error_msg = format!(
+                        "Error: {}\n{}",
+                        reason,
+                        spec.error_message
+                            .as_deref()
+                            .unwrap_or(DEFAULT_ERROR_MESSAGE)
+                    );
+                    stop_reason = HOOK_ABORT_STOP_REASON.to_string();
+                    Self::append_final_message(&mut messages, Some(&error_msg));
+                    ctx.stop_reason = Some(HOOK_ABORT_STOP_REASON.to_string());
+                    ctx.error = Some(reason.clone());
+                    hook.after_iteration(&mut ctx).await;
+                    final_result_content = Some(error_msg);
+                    final_error = Some(reason.clone());
+                    exhausted = false;
+                    break 'outer;
+                }
+
+                let (results, events, fatal_error) = Self::execute_tools_honoring_decision(
                     &spec,
                     &response.tool_calls,
+                    &decision,
                     Arc::clone(&external_lookup_counts),
                     Arc::clone(&message_circuit_breaker),
                 )
                 .await;
 
                 for tc in &response.tool_calls {
-                    if !tools_used.contains(&tc.name) {
+                    if !Self::tool_call_denied(&decision, &tc.id) && !tools_used.contains(&tc.name)
+                    {
                         tools_used.push(tc.name.clone());
                     }
                 }
@@ -2739,5 +2875,333 @@ mod tests {
             .await;
         assert_eq!(result.stop_reason, "error");
         assert_eq!(hook.streamed(), UNSUPPORTED_IMAGE_INPUT_MESSAGE);
+    }
+
+    // ── before_execute_tools decisions ────────────────────────────────────────
+
+    struct ScriptedProvider {
+        settings: GenerationSettings,
+        responses: Mutex<Vec<LLMResponse>>,
+    }
+
+    impl ScriptedProvider {
+        fn new(responses: Vec<LLMResponse>) -> Arc<dyn LLMProviderDyn> {
+            Arc::new(Self {
+                settings: GenerationSettings::new(),
+                responses: Mutex::new(responses),
+            })
+        }
+
+        fn next(&self) -> LLMResponse {
+            let mut responses = self.responses.lock().unwrap_or_else(|e| e.into_inner());
+            if responses.is_empty() {
+                LLMResponse {
+                    content: Some("done".into()),
+                    finish_reason: "stop".into(),
+                    tool_calls: Vec::new(),
+                    usage: LLMUsage::new(),
+                    reasoning_content: None,
+                    thinking_blocks: None,
+                }
+            } else {
+                responses.remove(0)
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl LLMProviderDyn for ScriptedProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            String::new()
+        }
+        async fn chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.next()
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.next()
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.next()
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+            _: Option<BoxedStreamCallback>,
+            _: Option<BoxedProgressCallback>,
+        ) -> LLMResponse {
+            self.next()
+        }
+    }
+
+    struct CountingTool {
+        name: String,
+        hits: Arc<Mutex<usize>>,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::tools::base::Tool for CountingTool {
+        fn name(&self) -> String {
+            self.name.clone()
+        }
+        fn description(&self) -> String {
+            "count".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type": "object", "properties": {}})
+        }
+        async fn execute(&self, _: &serde_json::Value) -> String {
+            *self.hits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
+            "ok".into()
+        }
+    }
+
+    struct FixedDecisionHook {
+        decision: ToolHookDecision,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for FixedDecisionHook {
+        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
+            self.decision.clone()
+        }
+    }
+
+    fn tool_call_llm_response(calls: Vec<ToolCallRequest>) -> LLMResponse {
+        LLMResponse {
+            content: Some("calling tools".into()),
+            finish_reason: "tool_calls".into(),
+            tool_calls: calls,
+            usage: LLMUsage::new(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
+    }
+
+    fn text_llm_response(text: &str) -> LLMResponse {
+        LLMResponse {
+            content: Some(text.into()),
+            finish_reason: "stop".into(),
+            tool_calls: Vec::new(),
+            usage: LLMUsage::new(),
+            reasoning_content: None,
+            thinking_blocks: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn run_denies_all_tools_and_continues() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool {
+            name: "echo".into(),
+            hits: Arc::clone(&hits),
+        }));
+        let runner = AgentRunner::new(ScriptedProvider::new(vec![
+            tool_call_llm_response(vec![tc("echo")]),
+            text_llm_response("recovered"),
+        ]));
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                tools,
+                model: "test".into(),
+                max_iterations: 3,
+                hook: Some(Arc::new(FixedDecisionHook {
+                    decision: ToolHookDecision::Deny {
+                        reason: "not allowed".into(),
+                    },
+                })),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(*hits.lock().unwrap(), 0);
+        assert!(result.tools_used.is_empty());
+        assert_eq!(result.stop_reason, "completed");
+        assert_eq!(result.final_content.as_deref(), Some("recovered"));
+        let blocked = result
+            .messages
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("synthetic tool result");
+        assert_eq!(blocked["tool_call_id"], "echo");
+        assert!(
+            blocked["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("blocked by hook: not allowed")
+        );
+        assert_eq!(
+            result
+                .tool_events
+                .iter()
+                .find(|e| e.get("status").map(String::as_str) == Some("blocked"))
+                .and_then(|e| e.get("detail"))
+                .map(String::as_str),
+            Some("not allowed")
+        );
+    }
+
+    #[tokio::test]
+    async fn run_denies_selected_tool_calls() {
+        let hits_a = Arc::new(Mutex::new(0usize));
+        let hits_b = Arc::new(Mutex::new(0usize));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool {
+            name: "tool_a".into(),
+            hits: Arc::clone(&hits_a),
+        }));
+        tools.register(Box::new(CountingTool {
+            name: "tool_b".into(),
+            hits: Arc::clone(&hits_b),
+        }));
+        let runner = AgentRunner::new(ScriptedProvider::new(vec![
+            tool_call_llm_response(vec![tc("tool_a"), tc("tool_b")]),
+            text_llm_response("done"),
+        ]));
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                tools,
+                model: "test".into(),
+                max_iterations: 3,
+                hook: Some(Arc::new(FixedDecisionHook {
+                    decision: ToolHookDecision::DenyCalls {
+                        ids: vec!["tool_a".into()],
+                        reason: "a is blocked".into(),
+                    },
+                })),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(*hits_a.lock().unwrap(), 0);
+        assert_eq!(*hits_b.lock().unwrap(), 1);
+        assert_eq!(result.tools_used, vec!["tool_b".to_string()]);
+        assert_eq!(result.stop_reason, "completed");
+        let contents: Vec<String> = result
+            .messages
+            .iter()
+            .filter(|m| m["role"] == "tool")
+            .map(|m| {
+                format!(
+                    "{}:{}",
+                    m["name"].as_str().unwrap_or(""),
+                    m["content"].as_str().unwrap_or("")
+                )
+            })
+            .collect();
+        assert!(
+            contents
+                .iter()
+                .any(|c| c.starts_with("tool_a:") && c.contains("blocked by hook: a is blocked")),
+            "{contents:?}"
+        );
+        assert!(contents.iter().any(|c| c == "tool_b:ok"), "{contents:?}");
+    }
+
+    #[tokio::test]
+    async fn run_aborts_tool_execution() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool {
+            name: "echo".into(),
+            hits: Arc::clone(&hits),
+        }));
+        let runner = AgentRunner::new(ScriptedProvider::new(vec![tool_call_llm_response(vec![
+            tc("echo"),
+        ])]));
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                tools,
+                model: "test".into(),
+                max_iterations: 3,
+                hook: Some(Arc::new(FixedDecisionHook {
+                    decision: ToolHookDecision::Abort {
+                        reason: "policy veto".into(),
+                    },
+                })),
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(*hits.lock().unwrap(), 0);
+        assert!(result.tools_used.is_empty());
+        assert_eq!(result.stop_reason, HOOK_ABORT_STOP_REASON);
+        assert_eq!(result.error.as_deref(), Some("policy veto"));
+        assert!(
+            result
+                .final_content
+                .as_deref()
+                .unwrap_or("")
+                .contains("policy veto")
+        );
+        let blocked = result
+            .messages
+            .iter()
+            .find(|m| m["role"] == "tool")
+            .expect("synthetic tool result");
+        assert!(
+            blocked["content"]
+                .as_str()
+                .unwrap_or("")
+                .contains("blocked by hook: policy veto")
+        );
+        assert_eq!(
+            result.messages.last().and_then(|m| m["role"].as_str()),
+            Some("assistant")
+        );
     }
 }

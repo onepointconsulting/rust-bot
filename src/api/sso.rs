@@ -90,9 +90,7 @@ fn persist_sso_user(state: &LoginState, email: &str, token: &str) {
     let existing = registry.get_user_by_email(email).ok();
     let user = User {
         email: email.to_string(),
-        password_hash: existing
-            .as_ref()
-            .and_then(|u| u.password_hash.clone()),
+        password_hash: existing.as_ref().and_then(|u| u.password_hash.clone()),
         token: token.to_string(),
     };
     let result = if existing.is_some() {
@@ -116,9 +114,7 @@ async fn fetch_strapi_admin_email(strapi_url: &str, strapi_jwt: &str) -> Result<
         .bearer_auth(strapi_jwt)
         .send()
         .await
-        .map_err(|err| {
-            ApiError::unauthorized(format!("Failed to reach Strapi at {url}: {err}"))
-        })?;
+        .map_err(|err| ApiError::unauthorized(format!("Failed to reach Strapi at {url}: {err}")))?;
     let status = response.status();
     let body = response
         .text()
@@ -130,7 +126,9 @@ async fn fetch_strapi_admin_email(strapi_url: &str, strapi_jwt: &str) -> Result<
         )));
     }
     let value: serde_json::Value = serde_json::from_str(&body).map_err(|err| {
-        ApiError::unauthorized(format!("Strapi /admin/users/me returned invalid JSON: {err}"))
+        ApiError::unauthorized(format!(
+            "Strapi /admin/users/me returned invalid JSON: {err}"
+        ))
     })?;
     parse_strapi_admin_email(&value)
         .ok_or_else(|| ApiError::unauthorized("Strapi user has no email"))
@@ -157,7 +155,9 @@ mod tests {
     use super::*;
     use crate::api::login::{JwtAuthState, LoginState};
     use crate::api::user_registry::JsonUserRegistry;
-    use crate::security::jwt::{JwtValidationOpts, generate_jwt_keypair, validate_jwt_token_from_path};
+    use crate::security::jwt::{
+        JwtValidationOpts, generate_jwt_keypair, validate_jwt_token_from_path,
+    };
     use axum::extract::State;
     use axum::routing::get;
     use axum::{Json as AxumJson, Router};
@@ -255,8 +255,11 @@ mod tests {
 
     #[tokio::test]
     async fn sso_rejects_strapi_unauthorized() {
-        let url = spawn_users_me(json!({"error": "nope"}), axum::http::StatusCode::UNAUTHORIZED)
-            .await;
+        let url = spawn_users_me(
+            json!({"error": "nope"}),
+            axum::http::StatusCode::UNAUTHORIZED,
+        )
+        .await;
         let dir = tempfile::tempdir().unwrap();
         let keys = generate_jwt_keypair(dir.path(), false).unwrap();
         let jwt_auth = Some(JwtAuthState {

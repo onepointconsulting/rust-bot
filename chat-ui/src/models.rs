@@ -140,7 +140,7 @@ pub fn now_rfc3339() -> String {
 pub fn format_message_time(rfc3339: &str) -> Option<String> {
     let dt = chrono::DateTime::parse_from_rfc3339(rfc3339).ok()?;
     let date = js_sys::Date::new(&wasm_bindgen::JsValue::from_f64(
-        dt.timestamp_millis() as f64,
+        dt.timestamp_millis() as f64
     ));
     Some(format_message_time_parts(
         date.get_full_year() as i32,
@@ -169,7 +169,13 @@ fn day_ordinal_suffix(day: u32) -> &'static str {
 
 /// `5th Sep 2026, 5:16 PM` from local civil-time parts. `month` is 1–12;
 /// `hour` is 0–23. Out-of-range month falls back to `Jan`.
-pub fn format_message_time_parts(year: i32, month: u32, day: u32, hour: u32, minute: u32) -> String {
+pub fn format_message_time_parts(
+    year: i32,
+    month: u32,
+    day: u32,
+    hour: u32,
+    minute: u32,
+) -> String {
     let month_name = MONTH_ABBREVS
         .get(month.saturating_sub(1) as usize)
         .copied()

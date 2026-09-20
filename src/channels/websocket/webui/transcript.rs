@@ -2534,7 +2534,9 @@ mod tests {
         let history = transcript_chat_history(&rows, 500);
 
         assert_eq!(history[0]["timestamp"], "2026-09-05T16:16:00Z");
-        let stamped = history[1]["timestamp"].as_str().expect("created_at_ms stamp");
+        let stamped = history[1]["timestamp"]
+            .as_str()
+            .expect("created_at_ms stamp");
         let parsed = chrono::DateTime::parse_from_rfc3339(stamped).expect("rfc3339");
         assert_eq!(parsed.timestamp_millis(), 1_757_090_165_000);
     }

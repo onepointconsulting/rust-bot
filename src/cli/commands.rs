@@ -14,10 +14,10 @@ use crate::agent::tools::message::MessageTool;
 use crate::api::login::{
     AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
 };
-use crate::api::sso::sso_strapi;
 use crate::api::rest::ApiServer;
 use crate::api::rest::build_cors_layer;
 use crate::api::rest::create_api_server;
+use crate::api::sso::sso_strapi;
 use crate::api::user_registry::{
     JsonUserRegistry, User, UserRegistry, UserRegistryError, hash_password,
 };

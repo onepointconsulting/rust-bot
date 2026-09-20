@@ -11,6 +11,8 @@
 //! `entry_render_key`'s doc comment for why that requires a different
 //! `<For>` keying strategy than a plain `entry.id`.
 
+use std::collections::HashSet;
+
 use chat_ui::components::MessageBubble;
 use chat_ui::models::{ChatEntry, Role};
 use leptos::html::Div;
@@ -78,18 +80,37 @@ fn scroll_list_to_bottom(list_ref: NodeRef<Div>, auto_scroll_generation: RwSigna
 /// way to make those in-place mutations actually show up is to make the
 /// `<For>` key itself change whenever anything user-visibly relevant about
 /// the entry changes, forcing that entry's bubble to be torn down and
-/// rebuilt with the current data. `content`/`tool_events`/`reasoning` are
-/// folded through `{:?}` into one string component rather than requiring
-/// `Hash` on `chat_ui::models::ToolEvent` (which doesn't derive it).
+/// rebuilt with the current data. `tool_events` are folded through `{:?}`
+/// rather than requiring `Hash` on `chat_ui::models::ToolEvent` (which
+/// doesn't derive it).
+///
+/// Growing reasoning *text* is deliberately not part of the key:
+/// `ReasoningPanel` reads it from a live `Signal` so an expanded panel can
+/// keep streaming without remounting (and collapsing). The key only tracks
+/// whether a non-empty reasoning buffer exists, so the panel still attaches
+/// on the first delta.
 fn entry_render_key(
     entry: &ChatEntry,
     show_fork: bool,
-) -> (u64, String, bool, String, bool, Option<String>, Option<String>) {
+) -> (
+    u64,
+    String,
+    bool,
+    String,
+    bool,
+    bool,
+    Option<String>,
+    Option<String>,
+) {
     (
         entry.id,
         entry.content.clone(),
         entry.streaming,
-        format!("{:?}|{:?}", entry.tool_events, entry.reasoning),
+        format!("{:?}", entry.tool_events),
+        entry
+            .reasoning
+            .as_ref()
+            .is_some_and(|text| !text.is_empty()),
         show_fork,
         entry.user_id.clone(),
         entry.timestamp.clone(),
@@ -109,7 +130,9 @@ fn entry_render_key(
 #[component]
 fn ChatEntryBubble(
     entry: ChatEntry,
+    #[prop(into)] entries: Signal<Vec<ChatEntry>>,
     #[prop(into)] token_streaming: Signal<bool>,
+    reasoning_expanded_ids: RwSignal<HashSet<u64>>,
     show_fork: bool,
     on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
@@ -126,6 +149,14 @@ fn ChatEntryBubble(
     if has_extra {
         let has_tool_events = !tool_events.is_empty();
         let has_reasoning = !reasoning.is_empty();
+        let reasoning_text = Signal::derive(move || {
+            entries.with(|list| {
+                list.iter()
+                    .find(|item| item.id == entry_id)
+                    .and_then(|item| item.reasoning.clone())
+                    .unwrap_or_default()
+            })
+        });
         // `MessageBubble`'s `extra` field is `Option<Children>`, i.e.
         // `Option<Box<dyn FnOnce() -> AnyView + Send>>` — a bare closure
         // doesn't coerce into that automatically, so it must be boxed (and
@@ -138,7 +169,14 @@ fn ChatEntryBubble(
                 ().into_any()
             };
             let reasoning_view = if has_reasoning {
-                view! { <ReasoningPanel text=reasoning.clone() /> }.into_any()
+                view! {
+                    <ReasoningPanel
+                        entry_id=entry_id
+                        text=reasoning_text
+                        expanded_ids=reasoning_expanded_ids
+                    />
+                }
+                .into_any()
             } else {
                 ().into_any()
             };
@@ -207,11 +245,27 @@ pub fn MessageList(
     let list_ref = NodeRef::<Div>::new();
     let pinned_to_bottom = RwSignal::new(false);
     let auto_scroll_generation = RwSignal::new(0u64);
+    // Survives `<For>` remounts of `ChatEntryBubble` (content/tool updates)
+    // so an expanded reasoning panel stays open while the turn streams.
+    // Entry ids restart per session, so the set is cleared on session change.
+    let reasoning_expanded_ids = RwSignal::new(HashSet::<u64>::new());
+    let reasoning_expanded_session = RwSignal::new(None::<Option<String>>);
     // `(session, last user entry)` — a new send re-pins while a turn is in
     // flight; a session switch (or first paint) one-shot jumps to latest
     // even when idle. Streaming mutates the same last user id, so it does
     // not change this identity.
     let pin_identity = RwSignal::new(None::<(Option<String>, Option<u64>)>);
+
+    Effect::new(move |_| {
+        let session = active_session_id.get();
+        let previous = reasoning_expanded_session.get_untracked();
+        if previous.as_ref() != Some(&session) {
+            if previous.is_some() {
+                reasoning_expanded_ids.set(HashSet::new());
+            }
+            reasoning_expanded_session.set(Some(session));
+        }
+    });
 
     // Follow the latest message while a turn is in flight and pinned.
     // Tracks content / extra-panel size (not just entry count) so streamed
@@ -309,7 +363,9 @@ pub fn MessageList(
             >
                 <ChatEntryBubble
                     entry=entry
+                    entries=entries
                     token_streaming=token_streaming
+                    reasoning_expanded_ids=reasoning_expanded_ids
                     show_fork=show_fork
                     on_fork_reply=on_fork_reply
                 />

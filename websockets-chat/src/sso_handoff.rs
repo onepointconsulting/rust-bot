@@ -153,7 +153,10 @@ mod tests {
     fn jwt_with_sub(sub: &str) -> String {
         // header.payload.sig — only the payload is parsed.
         let payload = format!(r#"{{"sub":"{sub}","purpose":"webui"}}"#);
-        format!("eyJhbGciOiJFZERTQSJ9.{}.sig", base64url_encode(payload.as_bytes()))
+        format!(
+            "eyJhbGciOiJFZERTQSJ9.{}.sig",
+            base64url_encode(payload.as_bytes())
+        )
     }
 
     fn base64url_encode(bytes: &[u8]) -> String {
@@ -167,7 +170,10 @@ mod tests {
             out.push(TABLE[(b0 >> 2) as usize] as char);
             out.push(TABLE[(((b0 & 0x03) << 4) | (b1.unwrap_or(0) >> 4)) as usize] as char);
             if b1.is_some() {
-                out.push(TABLE[(((b1.unwrap_or(0) & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize] as char);
+                out.push(
+                    TABLE[(((b1.unwrap_or(0) & 0x0f) << 2) | (b2.unwrap_or(0) >> 6)) as usize]
+                        as char,
+                );
             }
             if b2.is_some() {
                 out.push(TABLE[(b2.unwrap_or(0) & 0x3f) as usize] as char);
