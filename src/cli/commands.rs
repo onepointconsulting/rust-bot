@@ -66,7 +66,9 @@ use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
+use crate::agent::hook::AgentHook;
 use crate::bus::queue::MessageBus;
+use crate::cli::confirm_tools::CliAskHook;
 use crate::cli::paste_edit_mode::{
     PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
 };
@@ -600,7 +602,11 @@ fn prepare_workspace(config: PathBuf, workspace: Option<PathBuf>) -> (Config, Pa
     (config, workspace)
 }
 
-fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
+fn init_agent_loop(
+    config: &Config,
+    workspace: PathBuf,
+    hooks: Option<Vec<Arc<dyn AgentHook>>>,
+) -> AgentLoop {
     let bus = MessageBus::new();
     let provider = create_provider(&config);
     log::info!("provider api base: {:?}", provider.api_base());
@@ -615,7 +621,7 @@ fn init_agent_loop(config: &Config, workspace: PathBuf) -> AgentLoop {
         config.clone(),
         Some(cron_service),
         None,
-        None,
+        hooks,
     );
     agent_loop
 }
@@ -627,7 +633,15 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     init_runtime_logging(logs, None);
 
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
-    let agent_loop = init_agent_loop(&config, workspace);
+    let confirm_hook = if config.tools.confirm_before_execute {
+        Some(Arc::new(CliAskHook::new()))
+    } else {
+        None
+    };
+    let hooks = confirm_hook
+        .clone()
+        .map(|hook| vec![hook as Arc<dyn AgentHook>]);
+    let agent_loop = init_agent_loop(&config, workspace, hooks);
 
     if let Some(restart_notice) = consume_restart_notice_from_env() {
         if should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
@@ -655,6 +669,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 &session_id,
                 Arc::clone(&agent_loop),
                 true,
+                confirm_hook.clone(),
             )
             .await
         }
@@ -665,6 +680,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 markdown,
                 &config.channels,
                 &session_id,
+                confirm_hook.clone(),
             )
             .await
         }
@@ -844,7 +860,7 @@ fn resolve_gateway_web_ui_with(
 async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     init_runtime_logging(true, None);
     let (config, workspace) = prepare_workspace(args.config, None);
-    let agent_loop = init_agent_loop(&config, workspace.clone());
+    let agent_loop = init_agent_loop(&config, workspace.clone(), None);
     let host = args.host.unwrap_or_else(|| config.api.host.clone());
     let port = args.port.unwrap_or_else(|| config.api.port);
     let model_name = config.agents.model.clone();
@@ -1044,7 +1060,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let port_override = args.port;
     let web_root_override = args.web_root.clone();
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
-    let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone()));
+    let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone(), None));
     let session_manager = agent_loop.session_manager.clone();
     let cron = agent_loop.cron_service.clone();
 
@@ -1698,6 +1714,7 @@ async fn message_session(
     session_id: &str,
     agent_loop: Arc<AgentLoop>,
     stream: bool,
+    confirm_hook: Option<Arc<CliAskHook>>,
 ) -> Result<(), CliError> {
     log::info!("message={message}");
     for media_path in &media {
@@ -1705,6 +1722,9 @@ async fn message_session(
     }
     let renderer: Arc<Mutex<StreamRenderer>> =
         Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
+    if let Some(hook) = &confirm_hook {
+        hook.set_renderer(Arc::clone(&renderer));
+    }
     let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
     let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
     // Esc cancels the in-flight turn instead of exiting the process (unlike
@@ -1724,6 +1744,9 @@ async fn message_session(
         ) => response,
         _ = wait_for_escape_cancel() => {
             renderer.lock().await.close().await;
+            if let Some(hook) = &confirm_hook {
+                hook.clear_renderer();
+            }
             println!("Cancelled.");
             return Ok(());
         }
@@ -1742,6 +1765,9 @@ async fn message_session(
             response.as_ref().map(|r| &r.metadata),
             !header_printed,
         );
+    }
+    if let Some(hook) = &confirm_hook {
+        hook.clear_renderer();
     }
     Ok(())
 }
@@ -1869,6 +1895,7 @@ async fn interactive_session(
     markdown: bool,
     channels_config: &ChannelsConfig,
     session_id: &str,
+    confirm_hook: Option<Arc<CliAskHook>>,
 ) -> Result<(), CliError> {
     let welcome = interactive_welcome_text(markdown);
     print_agent_response_with_header(&welcome, markdown, None, true);
@@ -1939,6 +1966,7 @@ async fn interactive_session(
                     session_id,
                     Arc::clone(&agent_loop),
                     !markdown,
+                    confirm_hook.clone(),
                 )
                 .await;
                 for media_path in media {

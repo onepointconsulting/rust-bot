@@ -970,6 +970,13 @@ fn configure_tool_options(config: &mut Config) -> Result<(), CliError> {
         .with_help_message("Only allow tools to access files in the workspace directory")
         .prompt()?;
 
+    tools.confirm_before_execute = Confirm::new("Confirm each tool call in the CLI?")
+        .with_default(tools.confirm_before_execute)
+        .with_help_message(
+            "When enabled, the CLI `agent` command asks before executing each tool. Gateway and API ignore this.",
+        )
+        .prompt()?;
+
     if !tools.ssrf_whitelist.is_empty() {
         println!(
             "Current SSRF whitelist: {}",

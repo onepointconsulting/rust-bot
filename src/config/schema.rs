@@ -1454,6 +1454,11 @@ pub struct ToolsConfig {
     #[garde(skip)]
     pub restrict_to_workspace: bool,
 
+    /// When true, the CLI `agent` command asks before each tool call.
+    #[serde(alias = "confirm_before_execute")]
+    #[garde(skip)]
+    pub confirm_before_execute: bool,
+
     /// Named MCP server configurations, keyed by server name.
     #[serde(alias = "mcp_servers")]
     #[garde(dive)]
@@ -1492,6 +1497,7 @@ impl Default for ToolsConfig {
             web: WebToolsConfig::default(),
             exec: ExecToolConfig::default(),
             restrict_to_workspace: false,
+            confirm_before_execute: false,
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
             gmail: GmailToolConfig::default(),
@@ -2791,6 +2797,7 @@ mod tests {
         assert!(cfg.web.enable);
         assert!(cfg.exec.enable);
         assert!(!cfg.restrict_to_workspace);
+        assert!(!cfg.confirm_before_execute);
         assert!(cfg.mcp_servers.is_empty());
         assert!(cfg.ssrf_whitelist.is_empty());
         assert!(cfg.validate().is_ok());
@@ -2801,6 +2808,22 @@ mod tests {
         let json = r#"{"restrictToWorkspace": true}"#;
         let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.restrict_to_workspace);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_confirm_before_execute() {
+        let json = r#"{"confirmBeforeExecute": true}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.confirm_before_execute);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_confirm_before_execute_snake_case_alias() {
+        let json = r#"{"confirm_before_execute": true}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.confirm_before_execute);
         assert!(cfg.validate().is_ok());
     }
 

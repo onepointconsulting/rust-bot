@@ -1,10 +1,18 @@
 use std::io::IsTerminal;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyEventKind};
 use crossterm::terminal;
+
+/// Nested count of [`pause_for_prompt`] guards. While > 0 the Esc-cancel
+/// poller must not read console events (those belong to the prompt).
+static PROMPT_PAUSE: AtomicUsize = AtomicUsize::new(0);
+
+/// Nested count of live [`wait_for_escape_cancel`] waiters. Used so a prompt
+/// pause can restore raw mode only when cancel is still listening.
+static CANCEL_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 
 /// How often the background poll loop wakes up to check the stop flag.
 ///
@@ -27,16 +35,58 @@ const POLL_INTERVAL: Duration = Duration::from_millis(75);
 /// still readable; output post-processing is restored immediately after.
 struct RawModeGuard;
 
+fn enable_raw_mode_preserving_output() -> std::io::Result<()> {
+    #[cfg(unix)]
+    let saved_oflag = unix_output_flags();
+    terminal::enable_raw_mode()?;
+    #[cfg(unix)]
+    if let Some(oflag) = saved_oflag {
+        restore_unix_output_flags(oflag);
+    }
+    Ok(())
+}
+
 impl RawModeGuard {
     fn enable() -> std::io::Result<Self> {
-        #[cfg(unix)]
-        let saved_oflag = unix_output_flags();
-        terminal::enable_raw_mode()?;
-        #[cfg(unix)]
-        if let Some(oflag) = saved_oflag {
-            restore_unix_output_flags(oflag);
-        }
+        enable_raw_mode_preserving_output()?;
         Ok(Self)
+    }
+}
+
+fn prompt_is_paused() -> bool {
+    PROMPT_PAUSE.load(Ordering::SeqCst) > 0
+}
+
+/// Releases the terminal from the Esc-cancel poller so a blocking prompt
+/// (e.g. inquire) can own stdin without each keystroke being stolen or
+/// echoed as a new line.
+///
+/// Drop the guard when the prompt finishes: the poller resumes, and raw
+/// mode is restored if cancel is still waiting.
+pub fn pause_for_prompt() -> PromptPauseGuard {
+    PROMPT_PAUSE.fetch_add(1, Ordering::SeqCst);
+    let _ = terminal::disable_raw_mode();
+    PromptPauseGuard
+}
+
+pub struct PromptPauseGuard;
+
+impl Drop for PromptPauseGuard {
+    fn drop(&mut self) {
+        let remaining = PROMPT_PAUSE
+            .fetch_sub(1, Ordering::SeqCst)
+            .saturating_sub(1);
+        if remaining == 0 && CANCEL_ACTIVE.load(Ordering::SeqCst) > 0 {
+            let _ = enable_raw_mode_preserving_output();
+        }
+    }
+}
+
+struct CancelActiveGuard;
+
+impl Drop for CancelActiveGuard {
+    fn drop(&mut self) {
+        CANCEL_ACTIVE.fetch_sub(1, Ordering::SeqCst);
     }
 }
 
@@ -104,6 +154,9 @@ pub async fn wait_for_escape_cancel() {
         return;
     };
 
+    CANCEL_ACTIVE.fetch_add(1, Ordering::SeqCst);
+    let _cancel_active = CancelActiveGuard;
+
     let stop = Arc::new(AtomicBool::new(false));
     let _stop_guard = StopOnDrop(Arc::clone(&stop));
 
@@ -112,6 +165,10 @@ pub async fn wait_for_escape_cancel() {
         loop {
             if poll_stop.load(Ordering::Relaxed) {
                 return false;
+            }
+            if prompt_is_paused() {
+                std::thread::sleep(POLL_INTERVAL);
+                continue;
             }
             match event::poll(POLL_INTERVAL) {
                 Ok(true) => match event::read() {
@@ -137,6 +194,16 @@ pub async fn wait_for_escape_cancel() {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn prompt_pause_guard_clears_when_dropped() {
+        assert!(!super::prompt_is_paused());
+        {
+            let _guard = super::pause_for_prompt();
+            assert!(super::prompt_is_paused());
+        }
+        assert!(!super::prompt_is_paused());
+    }
+
     #[cfg(unix)]
     #[test]
     fn restoring_saved_output_flags_is_idempotent() {

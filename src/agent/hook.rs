@@ -316,6 +316,76 @@ impl AgentHook for CompositeHook {
     }
 }
 
+/// Run the core hook before extra hooks.
+pub struct LoopHookChain {
+    primary: Arc<dyn AgentHook>,
+    extras: CompositeHook,
+}
+
+impl LoopHookChain {
+    pub fn new(primary: Arc<dyn AgentHook>, extras: Vec<Arc<dyn AgentHook>>) -> Self {
+        Self {
+            primary,
+            extras: CompositeHook::new(extras),
+        }
+    }
+}
+
+#[async_trait]
+impl AgentHook for LoopHookChain {
+    fn wants_streaming(&self) -> bool {
+        self.primary.wants_streaming() || self.extras.wants_streaming()
+    }
+
+    async fn before_iteration(&self, context: &mut AgentHookContext) {
+        self.primary.before_iteration(context).await;
+        self.extras.before_iteration(context).await;
+    }
+
+    async fn on_stream(&self, context: &mut AgentHookContext, delta: &str) {
+        self.primary.on_stream(context, delta).await;
+        self.extras.on_stream(context, delta).await;
+    }
+
+    async fn on_stream_end(&self, context: &mut AgentHookContext, resuming: bool) {
+        self.primary.on_stream_end(context, resuming).await;
+        self.extras.on_stream_end(context, resuming).await;
+    }
+
+    async fn on_reasoning_delta(&self, context: &mut AgentHookContext, delta: &str) {
+        self.primary.on_reasoning_delta(context, delta).await;
+        self.extras.on_reasoning_delta(context, delta).await;
+    }
+
+    async fn on_reasoning_end(&self, context: &mut AgentHookContext) {
+        self.primary.on_reasoning_end(context).await;
+        self.extras.on_reasoning_end(context).await;
+    }
+
+    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
+        let primary = self.primary.before_execute_tools(context).await;
+        if primary.is_abort() {
+            return primary;
+        }
+        let extras = self.extras.before_execute_tools(context).await;
+        primary.merge(extras)
+    }
+
+    async fn after_iteration(&self, context: &mut AgentHookContext) {
+        self.primary.after_iteration(context).await;
+        self.extras.after_iteration(context).await;
+    }
+
+    fn finalize_content(
+        &self,
+        context: &AgentHookContext,
+        content: Option<String>,
+    ) -> Option<String> {
+        let content = self.primary.finalize_content(context, content);
+        self.extras.finalize_content(context, content)
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]

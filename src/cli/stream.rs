@@ -239,6 +239,11 @@ impl StreamRenderer {
         self.stop_spinner();
     }
 
+    /// Restart the thinking spinner after a blocking prompt returns.
+    pub fn resume_after_input(&mut self) {
+        self.start_spinner();
+    }
+
     /// Stop spinner without rendering a final streamed round.
     pub async fn close(&mut self) {
         self.stop_spinner();
@@ -299,6 +304,18 @@ mod tests {
         assert!(
             renderer.spinner.as_ref().is_some_and(|s| s.is_active()),
             "spinner should restart while the agent continues after a tool-call round"
+        );
+    }
+
+    #[test]
+    fn stop_for_input_then_resume_restarts_spinner() {
+        let mut renderer = StreamRenderer::new(false, true);
+        renderer.stop_for_input();
+        assert!(renderer.spinner.is_none());
+        renderer.resume_after_input();
+        assert!(
+            renderer.spinner.as_ref().is_some_and(|s| s.is_active()),
+            "spinner should resume after a blocking confirmation prompt"
         );
     }
 }
