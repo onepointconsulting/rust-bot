@@ -1,10 +1,11 @@
 //! Cursor-style sessions sidebar shared by `web-chat` and `websockets-chat`.
 //!
 //! Rows highlight the active session; clicking one invokes `on_select`.
-//! When `on_rename`, `on_summary`, `on_fork`, `on_clear`, and/or `on_delete`
-//! is provided (websockets-chat), each row also has a kebab that opens a
-//! menu with "Rename", "Summary" (only when that row has a persisted
-//! summary), "Fork session", "Clear session", and/or a red "Delete" item.
+//! When `on_rename`, `on_workspace`, `on_summary`, `on_fork`, `on_clear`,
+//! and/or `on_delete` is provided (websockets-chat), each row also has a
+//! kebab that opens a menu with "Rename", "Workspace" (localhost only),
+//! "Summary" (only when that row has a persisted summary), "Fork session",
+//! "Clear session", and/or a red "Delete" item.
 //! Delete and clear each open their own confirmation dialog before actually
 //! calling `on_delete`/`on_clear`; rename opens a small dialog to edit the
 //! title; fork fires immediately (non-destructive — it only ever creates a
@@ -34,7 +35,7 @@ use std::collections::HashSet;
 use leptos::html::Input;
 use leptos::prelude::*;
 
-use crate::models::{SessionListItem, SessionSummaryPopup};
+use crate::models::{SessionListItem, SessionSummaryPopup, WorkspaceDialogState};
 use crate::session_groups::{group_sessions, SessionGroup};
 
 /// Rows beyond this count in a single group are collapsed behind a
@@ -178,6 +179,25 @@ fn IconDocument() -> impl IntoView {
 }
 
 #[component]
+fn IconFolder() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <path d="M20 20a2 2 0 0 0 2-2V8a2 2 0 0 0-2-2h-7.9a2 2 0 0 1-1.69-.9L9.6 3.9A2 2 0 0 0 7.93 3H4a2 2 0 0 0-2 2v13a2 2 0 0 0 2 2Z" />
+        </svg>
+    }
+}
+
+#[component]
 fn IconEraser() -> impl IntoView {
     view! {
         <svg
@@ -261,6 +281,7 @@ fn SessionRow(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_workspace: Option<Callback<String>>,
     on_open_summary: Option<Callback<String>>,
     on_open_fork: Option<Callback<String>>,
     on_open_clear: Option<Callback<String>>,
@@ -276,11 +297,13 @@ fn SessionRow(
     let id_for_toggle = id.clone();
     let display_title_for_menu = display_title.clone();
     let show_rename = on_open_rename.is_some();
+    let show_workspace = on_open_workspace.is_some();
     let show_summary = on_open_summary.is_some() && has_summary;
     let show_fork = on_open_fork.is_some();
     let show_clear = on_open_clear.is_some();
     let show_delete = on_open_delete.is_some();
-    let show_menu = show_rename || show_summary || show_fork || show_clear || show_delete;
+    let show_menu =
+        show_rename || show_workspace || show_summary || show_fork || show_clear || show_delete;
 
     view! {
         <li class="group relative">
@@ -355,6 +378,7 @@ fn SessionRow(
             {show_menu.then(|| {
                 let id_for_menu_visible = id.clone();
                 let id_for_rename = id.clone();
+                let id_for_workspace = id.clone();
                 let id_for_summary = id.clone();
                 let id_for_fork = id.clone();
                 let id_for_clear = id.clone();
@@ -400,6 +424,31 @@ fn SessionRow(
                                 }
                             })}
                             {(show_rename
+                                && (show_workspace
+                                    || show_summary
+                                    || show_fork
+                                    || show_clear
+                                    || show_delete))
+                                .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
+                            {show_workspace.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class=MENU_ITEM
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_workspace) = on_open_workspace {
+                                                on_open_workspace.run(id_for_workspace.clone());
+                                            }
+                                        }
+                                    >
+                                        <IconFolder />
+                                        "Workspace"
+                                    </button>
+                                }
+                            })}
+                            {(show_workspace
                                 && (show_summary || show_fork || show_clear || show_delete))
                                 .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
                             {show_summary.then(|| {
@@ -506,6 +555,7 @@ fn SessionGroupSection(
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
     on_open_rename: Option<Callback<(String, String)>>,
+    on_open_workspace: Option<Callback<String>>,
     on_open_summary: Option<Callback<String>>,
     on_open_fork: Option<Callback<String>>,
     on_open_clear: Option<Callback<String>>,
@@ -538,6 +588,7 @@ fn SessionGroupSection(
                     on_select=on_select
                     open_menu_id=open_menu_id
                     on_open_rename=on_open_rename
+                    on_open_workspace=on_open_workspace
                     on_open_summary=on_open_summary
                     on_open_fork=on_open_fork
                     on_open_clear=on_open_clear
@@ -589,6 +640,19 @@ pub fn SessionsSidebar(
     /// `web-chat`, which has no rename API yet.
     #[prop(optional)]
     on_rename: Option<Callback<(String, String)>>,
+    /// When set, each row's kebab also gets a "Workspace" item that opens
+    /// the folder-and-access-mode dialog. Omitted unless the parent is
+    /// running on localhost.
+    #[prop(default = None)]
+    on_workspace: Option<Callback<String>>,
+    /// Current contents of the Workspace dialog. `None` hides it; `Some`
+    /// with `path: None` is the in-flight loading state.
+    #[prop(optional)]
+    workspace_popup: Option<Signal<Option<WorkspaceDialogState>>>,
+    #[prop(optional)] on_close_workspace: Option<Callback<()>>,
+    #[prop(optional)] on_browse_workspace: Option<Callback<String>>,
+    #[prop(optional)] on_save_workspace: Option<Callback<(String, String)>>,
+    #[prop(optional)] on_default_workspace: Option<Callback<()>>,
     /// When set, a row whose session has a persisted summary gets a
     /// "Summary" kebab item. Clicking it fires this callback and the parent
     /// fills [`summary_popup`]. Omitted by `web-chat`.
@@ -634,6 +698,23 @@ pub fn SessionsSidebar(
         rename_draft.set(title);
     });
     let on_open_rename = on_rename.map(|_| open_rename);
+
+    let workspace_access_mode = RwSignal::new("restricted".to_string());
+    let open_workspace = Callback::new(move |id: String| {
+        open_menu_id.set(None);
+        workspace_access_mode.set("restricted".to_string());
+        if let Some(on_workspace) = on_workspace {
+            on_workspace.run(id);
+        }
+    });
+    let on_open_workspace = on_workspace.map(|_| open_workspace);
+
+    let close_workspace = move || {
+        workspace_access_mode.set("restricted".to_string());
+        if let Some(on_close_workspace) = on_close_workspace {
+            on_close_workspace.run(());
+        }
+    };
 
     let open_summary = Callback::new(move |id: String| {
         open_menu_id.set(None);
@@ -749,6 +830,7 @@ pub fn SessionsSidebar(
                             on_select=on_select
                             open_menu_id=open_menu_id
                             on_open_rename=on_open_rename
+                            on_open_workspace=on_open_workspace
                             on_open_summary=on_open_summary
                             on_open_fork=on_open_fork
                             on_open_clear=on_open_clear
@@ -1094,6 +1176,194 @@ pub fn SessionsSidebar(
                                 on:click=move |_| confirm_clear()
                             >
                                 "Clear"
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </Show>
+
+            <Show when=move || {
+                workspace_popup
+                    .and_then(|popup| popup.get())
+                    .is_some()
+            }>
+                <div class="fixed inset-0 z-50 flex items-center justify-center p-4">
+                    <div
+                        class="absolute inset-0 bg-slate-900/40"
+                        aria-hidden="true"
+                        on:click=move |_| close_workspace()
+                    ></div>
+                    <div
+                        role="dialog"
+                        aria-modal="true"
+                        aria-labelledby="workspace-scope-title"
+                        class="relative flex w-full max-w-lg flex-col rounded-2xl bg-white p-5 shadow-2xl ring-1 ring-slate-200"
+                        on:keydown=move |ev| {
+                            if ev.key() == "Escape" {
+                                close_workspace();
+                            }
+                        }
+                    >
+                        <div class="mb-4 flex items-start justify-between gap-3">
+                            <h2
+                                id="workspace-scope-title"
+                                class="text-base font-semibold text-slate-900"
+                            >
+                                "Workspace"
+                            </h2>
+                            <button
+                                type="button"
+                                aria-label="Close"
+                                class="flex h-7 w-7 shrink-0 items-center justify-center rounded-full text-slate-400 hover:bg-slate-100 hover:text-slate-700"
+                                on:click=move |_| close_workspace()
+                            >
+                                <IconClose />
+                            </button>
+                        </div>
+                        <label class="mb-1 text-xs font-medium text-slate-500" for="workspace-access-mode">
+                            "Access mode"
+                        </label>
+                        <select
+                            id="workspace-access-mode"
+                            class="mb-4 w-full rounded-lg border border-slate-200 bg-white px-3 py-2 text-sm text-slate-900 outline-none focus:border-orange-500 focus:ring-1 focus:ring-orange-500"
+                            prop:value=move || workspace_access_mode.get()
+                            on:change=move |ev| workspace_access_mode.set(event_target_value(&ev))
+                        >
+                            <option value="restricted">"Restricted"</option>
+                            <option value="full">"Full"</option>
+                        </select>
+                        <p class="mb-1 text-xs font-medium text-slate-500">"Folder"</p>
+                        <p class="mb-2 truncate rounded-lg bg-slate-50 px-3 py-2 text-xs text-slate-600" title=move || {
+                            workspace_popup
+                                .and_then(|popup| popup.get())
+                                .and_then(|state| state.path)
+                                .unwrap_or_else(|| "Loading…".to_string())
+                        }>
+                            {move || {
+                                workspace_popup
+                                    .and_then(|popup| popup.get())
+                                    .and_then(|state| state.path)
+                                    .unwrap_or_else(|| "Loading…".to_string())
+                            }}
+                        </p>
+                        <div class="mb-3 max-h-[min(16rem,50vh)] overflow-y-auto rounded-lg border border-slate-200">
+                            {move || {
+                                let Some(state) = workspace_popup.and_then(|popup| popup.get()) else {
+                                    return view! { <p class="px-3 py-2 text-sm text-slate-400">"Loading…"</p> }.into_any();
+                                };
+                                let parent = state.parent.clone();
+                                let path_pending = state.path.is_none();
+                                let entries_empty = state.entries.is_empty();
+                                let up_row = parent.clone().map(|parent_path| {
+                                    view! {
+                                        <button
+                                            type="button"
+                                            class="flex w-full items-center gap-2 border-b border-slate-100 px-3 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50"
+                                            on:click=move |_| {
+                                                if let Some(on_browse_workspace) = on_browse_workspace {
+                                                    on_browse_workspace.run(parent_path.clone());
+                                                }
+                                            }
+                                        >
+                                            "↑ Up"
+                                        </button>
+                                    }
+                                });
+                                let rows = state
+                                    .entries
+                                    .into_iter()
+                                    .map(|entry| {
+                                        let path = entry.path.clone();
+                                        view! {
+                                            <button
+                                                type="button"
+                                                class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm text-slate-700 hover:bg-slate-50"
+                                                on:click=move |_| {
+                                                    if let Some(on_browse_workspace) = on_browse_workspace {
+                                                        on_browse_workspace.run(path.clone());
+                                                    }
+                                                }
+                                            >
+                                                <IconFolder />
+                                                {entry.name}
+                                            </button>
+                                        }
+                                    })
+                                    .collect_view();
+                                view! {
+                                    <>
+                                        {up_row}
+                                        {if path_pending {
+                                            view! {
+                                                <p class="px-3 py-2 text-sm text-slate-400">"Loading…"</p>
+                                            }.into_any()
+                                        } else if entries_empty && parent.is_none() {
+                                            view! {
+                                                <p class="px-3 py-2 text-sm text-slate-400">"No folders here"</p>
+                                            }.into_any()
+                                        } else if entries_empty {
+                                            view! {
+                                                <p class="px-3 py-2 text-sm text-slate-400">"No subfolders"</p>
+                                            }.into_any()
+                                        } else {
+                                            rows.into_any()
+                                        }}
+                                    </>
+                                }
+                                .into_any()
+                            }}
+                        </div>
+                        {move || {
+                            workspace_popup
+                                .and_then(|popup| popup.get())
+                                .and_then(|state| state.error)
+                                .map(|detail| {
+                                    view! {
+                                        <p class="mb-3 text-sm text-red-600">{detail}</p>
+                                    }
+                                })
+                        }}
+                        <div class="flex flex-wrap justify-end gap-2">
+                            <button
+                                type="button"
+                                class="rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-200"
+                                on:click=move |_| {
+                                    if let Some(on_default_workspace) = on_default_workspace {
+                                        on_default_workspace.run(());
+                                    }
+                                }
+                            >
+                                "Use default"
+                            </button>
+                            <button
+                                type="button"
+                                class="rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-200"
+                                on:click=move |_| close_workspace()
+                            >
+                                "Cancel"
+                            </button>
+                            <button
+                                type="button"
+                                class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:cursor-not-allowed disabled:opacity-40"
+                                disabled=move || {
+                                    workspace_popup
+                                        .and_then(|popup| popup.get())
+                                        .and_then(|state| state.path)
+                                        .is_none()
+                                }
+                                on:click=move |_| {
+                                    let Some(path) = workspace_popup
+                                        .and_then(|popup| popup.get())
+                                        .and_then(|state| state.path)
+                                    else {
+                                        return;
+                                    };
+                                    if let Some(on_save_workspace) = on_save_workspace {
+                                        on_save_workspace.run((path, workspace_access_mode.get()));
+                                    }
+                                }
+                            >
+                                "Save"
                             </button>
                         </div>
                     </div>

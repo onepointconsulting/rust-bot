@@ -243,6 +243,25 @@ pub struct SessionSummaryPopup {
     pub last_active: Option<String>,
 }
 
+/// One child directory in the workspace-scope folder picker.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceDirectoryEntry {
+    pub name: String,
+    pub path: String,
+}
+
+/// Content for the sessions-sidebar Workspace dialog.
+///
+/// `path` is `None` while the first `directories` reply is in flight.
+#[derive(Debug, Clone, PartialEq)]
+pub struct WorkspaceDialogState {
+    pub chat_id: String,
+    pub path: Option<String>,
+    pub parent: Option<String>,
+    pub entries: Vec<WorkspaceDirectoryEntry>,
+    pub error: Option<String>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

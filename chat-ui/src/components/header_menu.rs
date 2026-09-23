@@ -123,6 +123,7 @@ fn IconClose() -> impl IntoView {
 pub fn ChatHeaderActions(
     #[prop(into)] expanded: Signal<bool>,
     #[prop(into)] email: Signal<Option<String>>,
+    #[prop(into)] version: Signal<Option<String>>,
     on_new_chat: impl Fn() + 'static + Copy,
     on_logout: impl Fn() + 'static + Copy,
     on_minimize: impl Fn() + 'static + Copy,
@@ -250,7 +251,12 @@ pub fn ChatHeaderActions(
                     </div>
                 </div>
             </div>
-            <UserAccountMenu email=email on_logout=on_logout show_logout=show_logout />
+            <UserAccountMenu
+                email=email
+                version=version
+                on_logout=on_logout
+                show_logout=show_logout
+            />
         </div>
     }
 }

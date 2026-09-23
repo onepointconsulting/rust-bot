@@ -171,7 +171,7 @@ pub(crate) async fn login(
 /// gateway instance requires login before it decides whether to show
 /// `LoginForm` or connect as a guest. Unauthenticated by design: a client
 /// has to ask this before it knows whether it even has credentials to send.
-#[derive(Debug, Clone, Copy, serde::Serialize, utoipa::ToSchema)]
+#[derive(Debug, Clone, serde::Serialize, utoipa::ToSchema)]
 #[serde(rename_all = "camelCase")]
 pub(crate) struct AuthConfigResponse {
     /// Whether the web UI must sign in before opening a WebSocket
@@ -182,6 +182,8 @@ pub(crate) struct AuthConfigResponse {
     /// Can be `true` while `require_login` is `false`: a guest-capable instance
     /// may still offer optional sign-in.
     pub(crate) login_available: bool,
+    /// rust-bot package version (`PKG_VERSION`) this process is running.
+    pub(crate) version: String,
 }
 
 /// Axum handler for `GET /v1/auth/config`. The response is computed once at
@@ -314,5 +316,18 @@ mod tests {
         .unwrap();
         assert_eq!(claims.sub, "a@b.com");
         assert_eq!(claims.purpose.as_deref(), Some("webui"));
+    }
+
+    #[tokio::test]
+    async fn auth_config_includes_package_version() {
+        let response = auth_config(State(AuthConfigResponse {
+            require_login: true,
+            login_available: true,
+            version: crate::PKG_VERSION.to_string(),
+        }))
+        .await;
+        assert_eq!(response.0.version, crate::PKG_VERSION);
+        assert!(response.0.require_login);
+        assert!(response.0.login_available);
     }
 }

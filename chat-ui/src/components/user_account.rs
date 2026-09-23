@@ -1,7 +1,8 @@
-//! Header avatar that opens an account menu: User ID (email) + Log Out.
+//! Header avatar that opens an account menu: User ID (email), Version, + Log Out.
 //!
 //! Always rendered so guest sessions still have a way to close the chat.
-//! The User ID row is omitted when `email` is `None` or blank.
+//! The User ID row is omitted when `email` is `None` or blank. The Version
+//! row is omitted when `version` is missing or the user has no User ID.
 
 use leptos::prelude::*;
 use leptos::task::spawn_local;
@@ -11,8 +12,7 @@ use wasm_bindgen_futures::JsFuture;
 
 use crate::user_display::email_initial;
 
-const MENU_ITEM: &str =
-    "flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-slate-50";
+const MENU_ITEM: &str = "flex w-full items-center gap-2.5 px-3 py-2.5 text-left text-sm font-medium text-slate-700 hover:bg-slate-50";
 
 fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
     let window = web_sys::window().ok_or_else(|| "No window".to_string())?;
@@ -85,10 +85,11 @@ fn IconLogout() -> impl IntoView {
 }
 
 /// Circular-initial trigger whose popover shows the logged-in email (as
-/// User ID) and a Log Out action.
+/// User ID), the rust-bot version when known, and a Log Out action.
 #[component]
 pub fn UserAccountMenu(
     #[prop(into)] email: Signal<Option<String>>,
+    #[prop(into)] version: Signal<Option<String>>,
     on_logout: impl Fn() + 'static + Copy,
     #[prop(default = true)] show_logout: bool,
 ) -> impl IntoView {
@@ -96,6 +97,12 @@ pub fn UserAccountMenu(
     let copied = RwSignal::new(false);
 
     let display_email = move || email.get().filter(|value| !value.trim().is_empty());
+    let display_version = move || {
+        version
+            .get()
+            .filter(|value| !value.trim().is_empty())
+            .filter(|_| display_email().is_some())
+    };
     let initial = move || {
         display_email()
             .as_deref()
@@ -187,6 +194,26 @@ pub fn UserAccountMenu(
                                     <IconCheck />
                                 </Show>
                             </button>
+                        </div>
+                        <div class="my-1 border-t border-slate-100"></div>
+                    </Show>
+                    <Show when=move || display_version().is_some()>
+                        <div class="px-3 py-2.5">
+                            <p class="text-xs font-medium text-slate-400">"Version"</p>
+                            <p
+                                class="mt-0.5 truncate text-sm text-slate-800"
+                                title=move || {
+                                    display_version()
+                                        .map(|value| format!("rust-bot {value}"))
+                                        .unwrap_or_default()
+                                }
+                            >
+                                {move || {
+                                    display_version()
+                                        .map(|value| format!("rust-bot {value}"))
+                                        .unwrap_or_default()
+                                }}
+                            </p>
                         </div>
                         <div class="my-1 border-t border-slate-100"></div>
                     </Show>

@@ -974,6 +974,7 @@ async fn serve_combined_login_and_gateway(
     let auth_config_response = AuthConfigResponse {
         require_login: ws_shared.jwt.enabled && ws_shared.require_auth,
         login_available: ws_shared.jwt.enabled,
+        version: crate::PKG_VERSION.to_string(),
     };
     let auth_config_router = Router::new()
         .route("/v1/auth/config", get(auth_config))

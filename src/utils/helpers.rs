@@ -1,5 +1,6 @@
 /// Utility functions for rust-bot.
 use std::fs;
+use std::net::IpAddr;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -61,6 +62,59 @@ pub fn strip_think(text: &str) -> String {
 /// unquoted Python-style values.
 pub fn strip_surrounding_quotes(s: &str) -> String {
     s.trim().trim_matches('"').trim_matches('\'').to_string()
+}
+
+/// Whether `host` is this machine's loopback interface.
+///
+/// `host` may be a bind address (`localhost`, `127.0.0.1`, `::1`), the same
+/// value with a port (`127.0.0.1:8765`, `[::1]:8765`), or a URL. The whole
+/// `127.0.0.0/8` range counts, as does IPv4-mapped `::ffff:127.0.0.1`.
+/// Wildcard binds such as `0.0.0.0` and `::` are not loopback: they listen on
+/// every interface.
+pub fn is_localhost(host: &str) -> bool {
+    hostname_of(host.trim()).is_some_and(|name| is_loopback_name(&name))
+}
+
+fn hostname_of(input: &str) -> Option<String> {
+    if input.is_empty() {
+        return None;
+    }
+    if input.contains("://") {
+        let url = url::Url::parse(input).ok()?;
+        return match url.host() {
+            Some(url::Host::Domain(domain)) => Some(domain.to_string()),
+            Some(url::Host::Ipv4(ip)) => Some(ip.to_string()),
+            Some(url::Host::Ipv6(ip)) => Some(ip.to_string()),
+            None => None,
+        };
+    }
+    Some(strip_host_port(input).to_string())
+}
+
+/// Drop a trailing `:port`, including the bracket form used for IPv6.
+fn strip_host_port(host: &str) -> &str {
+    if let Some(rest) = host.strip_prefix('[') {
+        let end = rest.find(']').unwrap_or(rest.len());
+        return &rest[..end];
+    }
+    if let Some((name, port)) = host.rsplit_once(':') {
+        if host.matches(':').count() == 1
+            && !name.is_empty()
+            && port.chars().all(|c| c.is_ascii_digit())
+        {
+            return name;
+        }
+    }
+    host
+}
+
+fn is_loopback_name(host: &str) -> bool {
+    let host = host.trim().trim_end_matches('.');
+    if host.eq_ignore_ascii_case("localhost") {
+        return true;
+    }
+    host.parse::<IpAddr>()
+        .is_ok_and(|ip| ip.to_canonical().is_loopback())
 }
 
 // ── image utilities ───────────────────────────────────────────────────────────
@@ -1390,5 +1444,60 @@ mod tests {
         );
         assert_eq!(strip_surrounding_quotes("'Alice'"), "Alice");
         assert_eq!(strip_surrounding_quotes("  plain  "), "plain");
+    }
+
+    // ── is_localhost ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_is_localhost_names_and_loopback_addresses() {
+        for host in [
+            "localhost",
+            "LOCALHOST",
+            "localhost.",
+            "  localhost  ",
+            "127.0.0.1",
+            "127.255.255.254",
+            "::1",
+            "[::1]",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(is_localhost(host), "{host} should be localhost");
+        }
+    }
+
+    #[test]
+    fn test_is_localhost_with_port_or_url() {
+        for host in [
+            "localhost:8765",
+            "127.0.0.1:8765",
+            "[::1]:8765",
+            "http://localhost:1337",
+            "https://127.0.0.1/path",
+            "http://[::1]/ws",
+            "ws://localhost/ws",
+        ] {
+            assert!(is_localhost(host), "{host} should be localhost");
+        }
+    }
+
+    #[test]
+    fn test_is_localhost_rejects_non_loopback_hosts() {
+        for host in [
+            "",
+            "   ",
+            "0.0.0.0",
+            "::",
+            "[::]",
+            "0.0.0.0:8765",
+            "192.168.1.1",
+            "10.0.0.1",
+            "::ffff:8.8.8.8",
+            "example.com",
+            "localhost.localdomain",
+            "http://example.com",
+            "not a url",
+        ] {
+            assert!(!is_localhost(host), "{host} should not be localhost");
+        }
     }
 }

@@ -576,6 +576,7 @@ mod tests {
             name: CHANNEL_NAME,
             bus: Arc::new(MessageBus::new()),
             channels_config: ChannelsConfig::default(),
+            config: WebSocketConfig::default(),
             jwt: JwtConfig::default(),
             jwt_public_key_pem: None,
             require_auth: true,

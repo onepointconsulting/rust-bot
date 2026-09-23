@@ -208,7 +208,7 @@ pub fn workspaces_payload(
 #[derive(Clone)]
 pub struct WorkspaceRequestHandler {
     pub default_workspace: PathBuf,
-    default_restrict_to_workspace: bool,
+    pub default_restrict_to_workspace: bool,
 }
 
 impl WorkspaceRequestHandler {

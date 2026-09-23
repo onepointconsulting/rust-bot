@@ -1,7 +1,10 @@
 use crate::{
     PKG_VERSION,
-    agent::context::BOOTSTRAP_FILES,
-    agent::tools::mcp::{load_mcp_tools_from_config, mcp_presets_api},
+    agent::{
+        agent_loop::AgentLoop,
+        context::BOOTSTRAP_FILES,
+        tools::mcp::{load_mcp_tools_from_config, mcp_presets_api},
+    },
     bus::events::OutboundMessage,
     command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
     config::{
@@ -926,7 +929,7 @@ impl CommandHandler for CmdWorkspace {
 
         if requested.eq_ignore_ascii_case("default") {
             let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
-            agent_loop.clear_session_workspace_scope(&mut session_manager, &session.key);
+            AgentLoop::clear_session_workspace_scope(&mut session_manager, &session.key);
             return reply_as_text(
                 ctx,
                 "Workspace override cleared; using the process default.",

@@ -6,8 +6,9 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, `list_skills`, `rename_chat`, `delete_chat`, `clear_session`,
-//!   `get_session_summary`, `fork_chat`, and `abort_turn`.
+//!   `attach`, `list_chats`, `list_skills`, `list_directories`, `rename_chat`,
+//!   `delete_chat`, `clear_session`, `get_session_summary`, `fork_chat`,
+//!   `set_workspace_scope`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
 //!   send, decoded by [`parse_server_event`].
 //!
@@ -25,10 +26,8 @@ use serde::{Deserialize, Serialize};
 /// Outbound envelope sent to the gateway.
 ///
 /// The backend's `EnvelopeType` (`src/channels/websocket/types.rs`) covers
-/// more inbound types than this crate has a use for (`set_workspace_scope`,
-/// `transcribe_audio`). This struct covers the ones the frontend actually
-/// sends (`message`, `new_chat`, `attach`, `list_chats`, `list_skills`, `rename_chat`,
-/// `delete_chat`, `clear_session`, `get_session_summary`, `fork_chat`, `abort_turn`); constructors
+/// more inbound types than this crate has a use for (`transcribe_audio`).
+/// This struct covers the ones the frontend actually sends; constructors
 /// pin `type_` so callers cannot invent a shape the gateway would reject
 /// with "unknown type".
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -59,6 +58,18 @@ pub struct ClientEnvelope {
     /// kept. Omitted by [`Self::fork_chat`] to fork the whole chat.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub before_user_index: Option<u64>,
+    /// Set only by [`Self::list_directories`] — the absolute directory to
+    /// list. Omitted to start at the session override or the user home
+    /// directory.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub path: Option<String>,
+    /// Set only by [`Self::set_workspace_scope`] — an absolute folder, or
+    /// `"default"` to clear the session override.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub workspace_folder: Option<String>,
+    /// Set only by [`Self::set_workspace_scope`] — `restricted` or `full`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub access_mode: Option<String>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -84,6 +95,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -104,6 +118,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -123,6 +140,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -155,6 +175,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -172,6 +195,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -189,6 +215,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -209,6 +238,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -229,6 +261,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -251,6 +286,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -271,6 +309,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -297,6 +338,9 @@ impl ClientEnvelope {
             model_preset: None,
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -317,6 +361,9 @@ impl ClientEnvelope {
             model_preset: Some(model_preset.into()),
             mode: None,
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
             webui: true,
         }
     }
@@ -333,6 +380,55 @@ impl ClientEnvelope {
             model_preset: None,
             mode: Some(mode.into()),
             before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
+            webui: true,
+        }
+    }
+
+    /// List immediate child directories of `path` on the gateway machine.
+    ///
+    /// Omit `path` to start at the session's saved workspace, or the user
+    /// home directory. The reply is a `directories` event.
+    pub fn list_directories(chat_id: impl Into<String>, path: Option<String>) -> Self {
+        Self {
+            type_: "list_directories",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: None,
+            before_user_index: None,
+            path,
+            workspace_folder: None,
+            access_mode: None,
+            webui: true,
+        }
+    }
+
+    /// Persist `chat_id`'s workspace-scope override. `"default"` as
+    /// `workspace_folder` clears it. The reply is `workspace_scope_set`.
+    pub fn set_workspace_scope(
+        chat_id: impl Into<String>,
+        workspace_folder: impl Into<String>,
+        access_mode: Option<String>,
+    ) -> Self {
+        Self {
+            type_: "set_workspace_scope",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: None,
+            before_user_index: None,
+            path: None,
+            workspace_folder: Some(workspace_folder.into()),
+            access_mode,
             webui: true,
         }
     }
@@ -355,6 +451,13 @@ pub struct ChatSummary {
     /// omit the field; treat that as no summary.
     #[serde(default)]
     pub has_summary: bool,
+}
+
+/// One child directory inside a `directories` event.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DirectoryEntry {
+    pub name: String,
+    pub path: String,
 }
 
 /// One event the gateway can push down the WebSocket connection.
@@ -534,6 +637,22 @@ pub enum ServerEvent {
     },
     /// Reply to a [`ClientEnvelope::set_mode`] envelope.
     ModeSet { chat_id: String, mode: String },
+    /// Reply to a [`ClientEnvelope::list_directories`] envelope.
+    Directories {
+        chat_id: String,
+        path: String,
+        parent: Option<String>,
+        entries: Vec<DirectoryEntry>,
+    },
+    /// Reply to a [`ClientEnvelope::set_workspace_scope`] envelope.
+    /// `workspace_folder`/`access_mode` are present after a set;
+    /// `detail` is `"workspace_scope_cleared"` after `"default"`.
+    WorkspaceScopeSet {
+        chat_id: String,
+        workspace_folder: Option<String>,
+        access_mode: Option<String>,
+        detail: Option<String>,
+    },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -579,6 +698,8 @@ impl ServerEvent {
             | ServerEvent::ChatDeleted { .. }
             | ServerEvent::SessionCleared { .. }
             | ServerEvent::SessionSummary { .. }
+            | ServerEvent::Directories { .. }
+            | ServerEvent::WorkspaceScopeSet { .. }
             | ServerEvent::Unknown(_) => None,
         }
     }
@@ -908,6 +1029,27 @@ struct ModeSetWire {
     mode: String,
 }
 
+#[derive(Deserialize)]
+struct DirectoriesWire {
+    chat_id: String,
+    path: String,
+    #[serde(default)]
+    parent: Option<String>,
+    #[serde(default)]
+    entries: Vec<DirectoryEntry>,
+}
+
+#[derive(Deserialize)]
+struct WorkspaceScopeSetWire {
+    chat_id: String,
+    #[serde(default)]
+    workspace_folder: Option<String>,
+    #[serde(default)]
+    access_mode: Option<String>,
+    #[serde(default)]
+    detail: Option<String>,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -1043,6 +1185,20 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             chat_id: w.chat_id,
             mode: w.mode,
         }),
+        "directories" => decode::<DirectoriesWire>(&value).map(|w| ServerEvent::Directories {
+            chat_id: w.chat_id,
+            path: w.path,
+            parent: w.parent,
+            entries: w.entries,
+        }),
+        "workspace_scope_set" => {
+            decode::<WorkspaceScopeSetWire>(&value).map(|w| ServerEvent::WorkspaceScopeSet {
+                chat_id: w.chat_id,
+                workspace_folder: w.workspace_folder,
+                access_mode: w.access_mode,
+                detail: w.detail,
+            })
+        }
         _ => Ok(ServerEvent::Unknown(value)),
     }
 }
@@ -2052,6 +2208,73 @@ mod tests {
             }
         );
         assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn client_envelope_list_directories_serializes_expected_shape() {
+        let envelope = ClientEnvelope::list_directories("chat-1", Some("/tmp/ws".to_string()));
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "list_directories",
+                "chat_id": "chat-1",
+                "path": "/tmp/ws",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_directories() {
+        let raw = r#"{"event":"directories","chat_id":"chat-1","path":"/tmp/ws","parent":"/tmp","entries":[{"name":"alpha","path":"/tmp/ws/alpha"}]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::Directories {
+                chat_id: "chat-1".to_string(),
+                path: "/tmp/ws".to_string(),
+                parent: Some("/tmp".to_string()),
+                entries: vec![DirectoryEntry {
+                    name: "alpha".to_string(),
+                    path: "/tmp/ws/alpha".to_string(),
+                }],
+            }
+        );
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_set_workspace_scope_serializes_expected_shape() {
+        let envelope =
+            ClientEnvelope::set_workspace_scope("chat-1", "/tmp/ws", Some("full".to_string()));
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_workspace_scope",
+                "chat_id": "chat-1",
+                "workspace_folder": "/tmp/ws",
+                "access_mode": "full",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_workspace_scope_set() {
+        let raw = r#"{"event":"workspace_scope_set","chat_id":"chat-1","workspace_folder":"/tmp/ws","access_mode":"restricted"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::WorkspaceScopeSet {
+                chat_id: "chat-1".to_string(),
+                workspace_folder: Some("/tmp/ws".to_string()),
+                access_mode: Some("restricted".to_string()),
+                detail: None,
+            }
+        );
+        assert_eq!(event.chat_id(), None);
     }
 
     #[test]

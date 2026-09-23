@@ -40,7 +40,7 @@ struct LoginResponse {
 
 /// `GET /v1/auth/config`'s response body — mirrors the server's
 /// `AuthConfigResponse` (`src/api/login.rs`).
-#[derive(Debug, Clone, Copy, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AuthConfig {
     /// Whether the web UI must sign in before opening a WebSocket connection.
@@ -50,6 +50,10 @@ pub struct AuthConfig {
     /// `require_login` is `false` — a guest-capable instance may still offer
     /// optional sign-in.
     pub login_available: bool,
+    /// rust-bot package version this process is running. Empty when an older
+    /// server omits the field.
+    #[serde(default)]
+    pub version: String,
 }
 
 #[derive(Debug, Deserialize)]

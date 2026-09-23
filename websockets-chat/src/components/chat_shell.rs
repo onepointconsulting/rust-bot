@@ -1,7 +1,7 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsSidebarToggle};
 use chat_ui::models::{
     ChatEntry, OutgoingMessage, SessionListItem, SessionSummaryPopup, SessionTokenUsage,
-    SkillSummary,
+    SkillSummary, WorkspaceDialogState,
 };
 use leptos::prelude::*;
 
@@ -33,6 +33,7 @@ pub fn ChatShell(
     #[prop(into)] active_session_id: Signal<Option<String>>,
     #[prop(into)] sidebar_open: Signal<bool>,
     #[prop(into)] user_email: Signal<Option<String>>,
+    #[prop(into)] bot_version: Signal<Option<String>>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Send + Sync + Copy,
@@ -49,6 +50,13 @@ pub fn ChatShell(
     on_close_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
+    #[prop(default = false)] show_workspace: bool,
+    #[prop(into)] workspace_popup: Signal<Option<WorkspaceDialogState>>,
+    on_workspace_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_close_workspace: impl Fn() + 'static + Send + Sync + Copy,
+    on_browse_workspace: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_save_workspace: impl Fn(String, String) + 'static + Send + Sync + Copy,
+    on_default_workspace: impl Fn() + 'static + Send + Sync + Copy,
     on_summary_session: impl Fn(String) + 'static + Send + Sync + Copy,
     #[prop(into)] summary_popup: Signal<Option<SessionSummaryPopup>>,
     on_close_summary: impl Fn() + 'static + Send + Sync + Copy,
@@ -84,6 +92,12 @@ pub fn ChatShell(
                 on_close=on_close_sidebar
                 on_select=on_select_session
                 on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
+                on_workspace=show_workspace.then_some(Callback::new(move |id| on_workspace_session(id)))
+                workspace_popup=workspace_popup
+                on_close_workspace=Callback::new(move |()| on_close_workspace())
+                on_browse_workspace=Callback::new(move |path| on_browse_workspace(path))
+                on_save_workspace=Callback::new(move |(folder, mode)| on_save_workspace(folder, mode))
+                on_default_workspace=Callback::new(move |()| on_default_workspace())
                 on_summary=Callback::new(move |id| on_summary_session(id))
                 summary_popup=summary_popup
                 on_close_summary=Callback::new(move |()| on_close_summary())
@@ -105,6 +119,7 @@ pub fn ChatShell(
                         <ChatHeaderActions
                             expanded=expanded
                             email=user_email
+                            version=bot_version
                             on_new_chat=on_new_chat
                             on_logout=on_logout
                             on_minimize=on_minimize

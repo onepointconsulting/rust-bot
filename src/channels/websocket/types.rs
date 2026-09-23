@@ -35,6 +35,10 @@ pub enum EnvelopeType {
     ForkChat,
     Attach,
     SetWorkspaceScope,
+    /// List immediate child directories of a path on this machine so a
+    /// localhost WebUI can pick a workspace folder. Rust-side addition —
+    /// gated the same way as [`Self::SetWorkspaceScope`].
+    ListDirectories,
     TranscribeAudio,
     Message,
     /// List this connection's forkable chats (`websocket:*` sessions). Rust-side
@@ -105,6 +109,7 @@ impl From<&str> for EnvelopeType {
             "abort_turn" => Self::AbortTurn,
             "attach" => Self::Attach,
             "set_workspace_scope" => Self::SetWorkspaceScope,
+            "list_directories" => Self::ListDirectories,
             "transcribe_audio" => Self::TranscribeAudio,
             "message" => Self::Message,
             "list_chats" => Self::ListChats,
@@ -171,6 +176,11 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::GetSessionSummary`] — Rust-side addition, no
     /// nanobot wire-name precedent to mirror (see that variant's doc comment).
     SessionSummary,
+    /// Reply to [`EnvelopeType::SetWorkspaceScope`] — Rust-side addition, no nanobot
+    /// wire-name precedent to mirror (see that variant's doc comment).
+    WorkspaceScopeSet,
+    /// Reply to [`EnvelopeType::ListDirectories`].
+    Directories,
 }
 
 impl WsOutboundEvent {
@@ -193,6 +203,8 @@ impl WsOutboundEvent {
             Self::User => "user",
             Self::SessionCleared => "session_cleared",
             Self::SessionSummary => "session_summary",
+            Self::WorkspaceScopeSet => "workspace_scope_set",
+            Self::Directories => "directories",
         }
     }
 }
@@ -345,6 +357,7 @@ pub struct WsShared {
     pub name: &'static str,
     pub bus: Arc<MessageBus>,
     pub channels_config: ChannelsConfig,
+    pub config: WebSocketConfig,
     pub jwt: JwtConfig,
     pub jwt_public_key_pem: Option<Arc<Vec<u8>>>,
     /// Copied from [`WebSocketConfig::require_auth`] at channel construction —
@@ -544,6 +557,10 @@ mod tests {
         assert_eq!(
             EnvelopeType::from("set_workspace_scope"),
             EnvelopeType::SetWorkspaceScope
+        );
+        assert_eq!(
+            EnvelopeType::from("list_directories"),
+            EnvelopeType::ListDirectories
         );
         assert_eq!(
             EnvelopeType::from("transcribe_audio"),

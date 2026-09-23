@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::str::FromStr;
 use std::sync::{Arc, LazyLock, Mutex as StdMutex, atomic::Ordering};
@@ -22,6 +23,7 @@ use regex::Regex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use uuid::Uuid;
 
+use crate::agent::agent_loop::AgentLoop;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::skills::SkillsLoader;
@@ -41,11 +43,14 @@ use crate::channels::websocket::{CHANNEL_NAME, get_session_id};
 use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
-use crate::security::{WORKSPACE_SCOPE_METADATA_KEY, WorkspaceScope, WorkspaceScopeError};
+use crate::security::{
+    WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
+};
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
 use crate::session::{SESSION_MODEL_PRESET_METADATA_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY};
+use crate::utils::helpers::is_localhost;
 use crate::{
     bus::{
         events::OutboundMessage,
@@ -617,7 +622,12 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::Attach => {
             handle_envelope_attach(envelope_dispatch_context).await;
         }
-        EnvelopeType::SetWorkspaceScope => { /* ... */ }
+        EnvelopeType::SetWorkspaceScope => {
+            handle_workspace_scope_set(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListDirectories => {
+            handle_list_directories(envelope_dispatch_context).await;
+        }
         EnvelopeType::TranscribeAudio => { /* ... */ }
         EnvelopeType::Message => {
             handle_envelope_message(envelope_dispatch_context).await;
@@ -880,6 +890,385 @@ async fn handle_envelope_set_mode<'a>(envelope_dispatch_context: EnvelopeDispatc
     .await;
 }
 
+/// Handle a `set_workspace_scope` envelope the same way `/workspace` does.
+/// `"default"` clears the session override. Any other `workspace_folder` must
+/// be an absolute directory that already exists. `access_mode` is optional
+/// and defaults to `restricted`, matching the CLI when the mode word is
+/// omitted.
+///
+/// A chat with a live turn is rejected with `chat_running` before anything
+/// is written. That is the same signal as
+/// [`WorkspaceRequestHandler::scope_for_set_request`]: `websocket_turn_wall_started_at`
+/// is `Some` while [`session::websocket_turns::WebsocketTurnRegistry`] has an
+/// owner registered for this chat, so the sandbox cannot change underneath
+/// the tools of the turn that is already running.
+async fn handle_workspace_scope_set<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    if !is_localhost(&shared.config.host) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let workspace_folder = envelope_dispatch_context
+        .envelope
+        .get("workspace_folder")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    let Some(workspace_folder) = workspace_folder else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing_workspace_folder"}),
+        )
+        .await;
+        return;
+    };
+
+    if chat_is_running(shared, cid) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "chat_running"}),
+        )
+        .await;
+        return;
+    }
+
+    let session_key = get_session_id(cid);
+    if workspace_folder.eq_ignore_ascii_case("default") {
+        {
+            // Drop the `MutexGuard` before `send_event`'s `.await` — same
+            // discipline as every other `session_manager` use in this file.
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            AgentLoop::clear_session_workspace_scope(&mut session_manager, &session_key);
+        }
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::WorkspaceScopeSet,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "workspace_scope_cleared"}),
+        )
+        .await;
+        return;
+    }
+
+    let access_mode = match envelope_dispatch_context
+        .envelope
+        .get("access_mode")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("restricted")
+        .parse::<WorkspaceAccessMode>()
+    {
+        Ok(mode) => mode,
+        Err(e) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": e.to_string()}),
+            )
+            .await;
+            return;
+        }
+    };
+
+    let workspace_folder = Path::new(workspace_folder);
+    let default_workspace = shared.workspace_request_handler.default_workspace.clone();
+    let default_restrict_to_workspace = shared
+        .workspace_request_handler
+        .default_restrict_to_workspace;
+    let scope = {
+        // Drop the `MutexGuard` before `send_event`'s `.await` — same
+        // discipline as every other `session_manager` use in this file.
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        AgentLoop::set_session_workspace_scope_from_payload(
+            &mut session_manager,
+            &session_key,
+            workspace_folder,
+            access_mode,
+            &default_workspace,
+            default_restrict_to_workspace,
+        )
+    };
+    match scope {
+        Ok(scope) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::WorkspaceScopeSet,
+                Some(&rejection_fields),
+                serde_json::json!({
+                    "workspace_folder": scope.project_path.display().to_string(),
+                    "access_mode": scope.access_mode.as_str(),
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": e.to_string()}),
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle a `list_directories` envelope: list immediate child directories
+/// of `path` so a localhost WebUI can pick a workspace folder. Same
+/// allowlist and bind-host gates as [`handle_workspace_scope_set`]. When
+/// `path` is omitted, start at the session's saved `project_path` if that
+/// directory still exists, otherwise the user home directory.
+async fn handle_list_directories<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    if !is_localhost(&shared.config.host) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+
+    let requested = envelope_dispatch_context
+        .envelope
+        .get("path")
+        .and_then(|v| v.as_str())
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let session_project_path = {
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager
+            .get_session_internal(&get_session_id(cid))
+            .and_then(|session| {
+                session
+                    .metadata
+                    .get(WORKSPACE_SCOPE_METADATA_KEY)
+                    .and_then(|raw| raw.get("project_path"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string)
+            })
+    };
+    let path = match resolve_list_directories_path(
+        requested.as_deref(),
+        session_project_path.as_deref(),
+        home::home_dir(),
+        &shared.workspace_request_handler.default_workspace,
+    ) {
+        Ok(path) => path,
+        Err(detail) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": detail}),
+            )
+            .await;
+            return;
+        }
+    };
+    match collect_directory_listing(&path) {
+        Ok(listing) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Directories,
+                Some(&rejection_fields),
+                serde_json::json!({
+                    "path": listing.path,
+                    "parent": listing.parent,
+                    "entries": listing.entries,
+                }),
+            )
+            .await;
+        }
+        Err(detail) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": detail}),
+            )
+            .await;
+        }
+    }
+}
+
+struct DirectoryListing {
+    path: String,
+    parent: Option<String>,
+    entries: Vec<serde_json::Value>,
+}
+
+fn resolve_list_directories_path(
+    requested: Option<&str>,
+    session_project_path: Option<&str>,
+    home: Option<PathBuf>,
+    fallback: &Path,
+) -> Result<PathBuf, String> {
+    if let Some(requested) = requested {
+        let path = PathBuf::from(requested);
+        if !path.is_absolute() {
+            return Err(format!(
+                "path must be an absolute directory: {}",
+                path.display()
+            ));
+        }
+        if !path.is_dir() {
+            return Err(format!(
+                "path does not exist or is not a directory: {}",
+                path.display()
+            ));
+        }
+        return Ok(path);
+    }
+    if let Some(saved) = session_project_path {
+        let path = PathBuf::from(saved);
+        if path.is_absolute() && path.is_dir() {
+            return Ok(path);
+        }
+    }
+    if let Some(home) = home.filter(|path| path.is_dir()) {
+        return Ok(home);
+    }
+    if fallback.is_dir() {
+        return Ok(fallback.to_path_buf());
+    }
+    Err("no listable directory available".to_string())
+}
+
+fn collect_directory_listing(path: &Path) -> Result<DirectoryListing, String> {
+    if !path.is_absolute() {
+        return Err(format!(
+            "path must be an absolute directory: {}",
+            path.display()
+        ));
+    }
+    if !path.is_dir() {
+        return Err(format!(
+            "path does not exist or is not a directory: {}",
+            path.display()
+        ));
+    }
+    let mut entries = match std::fs::read_dir(path) {
+        Ok(read) => read
+            .flatten()
+            .filter_map(|entry| {
+                let child = entry.path();
+                if !child.is_dir() {
+                    return None;
+                }
+                let name = entry.file_name().to_string_lossy().into_owned();
+                if name == "." || name == ".." {
+                    return None;
+                }
+                Some(serde_json::json!({
+                    "name": name,
+                    "path": child.display().to_string(),
+                }))
+            })
+            .collect::<Vec<_>>(),
+        Err(e) => return Err(format!("failed to list directory: {e}")),
+    };
+    entries.sort_by(|a, b| {
+        let left = a.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        let right = b.get("name").and_then(|v| v.as_str()).unwrap_or("");
+        left.to_ascii_lowercase().cmp(&right.to_ascii_lowercase())
+    });
+    Ok(DirectoryListing {
+        path: path.display().to_string(),
+        parent: listing_parent(path),
+        entries,
+    })
+}
+
+fn listing_parent(path: &Path) -> Option<String> {
+    let parent = path.parent()?;
+    if parent.as_os_str().is_empty() || !parent.is_dir() {
+        return None;
+    }
+    Some(parent.display().to_string())
+}
+
+/// Whether this chat has an in-flight WebSocket turn. Callers treat
+/// `websocket_turn_wall_started_at(...).is_some()` as the `chat_running` bit,
+/// the same way [`WorkspaceRequestHandler::scope_for_set_request`] does.
+fn chat_is_running(shared: &WsShared, chat_id: &str) -> bool {
+    shared
+        .gateway_services
+        .turn_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .websocket_turn_wall_started_at(chat_id)
+        .is_some()
+}
+
 /// Handle an `attach` envelope: subscribe this connection to an existing
 /// `chat_id` (page-reload rehydrate / session switch). Mirrors nanobot's
 /// `attach` branch (`channels/websocket/runtime.py`): validate, `_attach`,
@@ -887,11 +1276,11 @@ async fn handle_envelope_set_mode<'a>(envelope_dispatch_context: EnvelopeDispatc
 /// file is not required — subscribe is idempotent, `history` is `[]` when
 /// nothing is persisted, and hydrate is a no-op in that case.
 async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
-
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
         return;
     };
+
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     // `attached` carries a transcript snapshot, so this envelope reads chat
     // content and must clear the same allowlist bar as `message` — the
@@ -3126,6 +3515,7 @@ impl WebSocketChannel {
             name: self.name(),
             bus: Arc::clone(&self.base.bus),
             channels_config: self.channels_config.clone(),
+            config: self.config.clone(),
             jwt: self.config.jwt.clone(),
             jwt_public_key_pem: self.jwt_public_key_pem.clone(),
             require_auth: self.config.require_auth,
@@ -3956,6 +4346,7 @@ mod tests {
             name: CHANNEL_NAME,
             bus: Arc::new(bus),
             channels_config: ChannelsConfig::default(),
+            config: WebSocketConfig::default(),
             jwt: JwtConfig::default(),
             jwt_public_key_pem: None,
             require_auth: true,
@@ -7731,16 +8122,6 @@ mod tests {
             .start_turn(chat_id, "owner-a", turn_id);
     }
 
-    fn chat_is_running(shared: &WsShared, chat_id: &str) -> bool {
-        shared
-            .gateway_services
-            .turn_registry
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .websocket_turn_wall_started_at(chat_id)
-            .is_some()
-    }
-
     #[tokio::test]
     async fn handle_envelope_abort_turn_clears_the_turn_and_acks() {
         let shared = test_shared("browser");
@@ -8653,6 +9034,420 @@ mod tests {
         let body = recv_json(&mut rx);
         assert_eq!(body["event"], "error");
         assert_eq!(body["detail"], "session_not_found");
+    }
+
+    // --- handle_workspace_scope_set ---
+
+    async fn dispatch_set_workspace_scope(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+        workspace_folder: Option<serde_json::Value>,
+        access_mode: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("set_workspace_scope"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        if let Some(workspace_folder) = workspace_folder {
+            envelope.insert("workspace_folder".to_string(), workspace_folder);
+        }
+        if let Some(access_mode) = access_mode {
+            envelope.insert("access_mode".to_string(), access_mode);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_workspace_scope_set must not hang");
+    }
+
+    fn session_workspace_scope(shared: &WsShared) -> Option<serde_json::Value> {
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager
+            .get_session_internal("websocket:chat-1")
+            .and_then(|session| session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).cloned())
+    }
+
+    #[tokio::test]
+    async fn handle_workspace_scope_set_persists_folder_and_defaults_to_restricted() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let folder = tempfile::tempdir().unwrap();
+        let folder_str = folder.path().display().to_string();
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!(folder_str)),
+            None,
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "workspace_scope_set");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["workspace_folder"], folder_str);
+        assert_eq!(body["access_mode"], "restricted");
+        assert!(rx.try_recv().is_err(), "set must send exactly one frame");
+        assert_eq!(
+            session_workspace_scope(&shared),
+            Some(serde_json::json!({
+                "project_path": folder_str,
+                "access_mode": "restricted",
+            }))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_workspace_scope_set_honors_full_access_mode() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let folder = tempfile::tempdir().unwrap();
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!(folder.path().display().to_string())),
+            Some(serde_json::json!("full")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "workspace_scope_set");
+        assert_eq!(body["access_mode"], "full");
+        assert_eq!(
+            session_workspace_scope(&shared).and_then(|v| v
+                .get("access_mode")
+                .and_then(|m| m.as_str())
+                .map(str::to_string)),
+            Some("full".to_string())
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_workspace_scope_set_default_clears_the_override() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                WORKSPACE_SCOPE_METADATA_KEY.to_string(),
+                serde_json::json!({
+                    "project_path": "C:/kept",
+                    "access_mode": "full",
+                }),
+            );
+            session_manager.save(session).unwrap();
+        }
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("Default")),
+            None,
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "workspace_scope_set");
+        assert_eq!(body["detail"], "workspace_scope_cleared");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert!(
+            session_workspace_scope(&shared).is_none(),
+            "default must remove the session override"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_workspace_scope_set_rejects_while_chat_is_running() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        {
+            let mut session_manager = shared
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let mut session = Session::new("websocket:chat-1".to_string());
+            session.metadata.insert(
+                WORKSPACE_SCOPE_METADATA_KEY.to_string(),
+                serde_json::json!({
+                    "project_path": "/original",
+                    "access_mode": "restricted",
+                }),
+            );
+            session_manager.save(session).unwrap();
+        }
+        start_registry_turn(&shared, "chat-1", Some("turn-1"));
+        let folder = tempfile::tempdir().unwrap();
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!(folder.path().display().to_string())),
+            None,
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "chat_running");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(
+            session_workspace_scope(&shared).and_then(|v| v
+                .get("project_path")
+                .and_then(|p| p.as_str())
+                .map(str::to_string)),
+            Some("/original".to_string()),
+            "a running turn must keep the scope that was already persisted"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_workspace_scope_set_rejects_non_localhost_bind() {
+        let mut shared = test_shared("browser");
+        shared.config.host = "0.0.0.0".to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let folder = tempfile::tempdir().unwrap();
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!(folder.path().display().to_string())),
+            None,
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert!(
+            session_workspace_scope(&shared).is_none(),
+            "a denied request must not create a workspace override"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_workspace_scope_set_rejects_missing_folder_and_relative_path() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            None,
+            None,
+        )
+        .await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "missing_workspace_folder");
+
+        dispatch_set_workspace_scope(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("relative/dir")),
+            None,
+        )
+        .await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("absolute path"),
+            "relative paths must be rejected, got {}",
+            body["detail"]
+        );
+        assert!(session_workspace_scope(&shared).is_none());
+    }
+
+    // --- handle_list_directories ---
+
+    async fn dispatch_list_directories(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: Option<serde_json::Value>,
+        path: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_directories"));
+        if let Some(chat_id) = chat_id {
+            envelope.insert("chat_id".to_string(), chat_id);
+        }
+        if let Some(path) = path {
+            envelope.insert("path".to_string(), path);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_list_directories must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_list_directories_returns_child_directories() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join("alpha")).unwrap();
+        std::fs::create_dir(root.path().join("beta")).unwrap();
+        std::fs::write(root.path().join("file.txt"), b"skip").unwrap();
+
+        dispatch_list_directories(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!(root.path().display().to_string())),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "directories");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["path"], root.path().display().to_string());
+        let entries = body["entries"].as_array().expect("entries");
+        let names: Vec<&str> = entries
+            .iter()
+            .filter_map(|entry| entry.get("name").and_then(|v| v.as_str()))
+            .collect();
+        assert_eq!(names, vec!["alpha", "beta"]);
+        assert!(
+            entries.iter().all(|entry| entry.get("path").is_some()),
+            "each child must carry its absolute path"
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_list_directories_rejects_non_localhost_bind() {
+        let mut shared = test_shared("browser");
+        shared.config.host = "0.0.0.0".to_string();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let root = tempfile::tempdir().unwrap();
+
+        dispatch_list_directories(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!(root.path().display().to_string())),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+    }
+
+    #[tokio::test]
+    async fn handle_list_directories_rejects_relative_path() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_list_directories(
+            &shared,
+            "conn-1",
+            Some(serde_json::json!("chat-1")),
+            Some(serde_json::json!("relative/dir")),
+        )
+        .await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert!(
+            body["detail"]
+                .as_str()
+                .unwrap_or("")
+                .contains("absolute directory"),
+            "relative paths must be rejected, got {}",
+            body["detail"]
+        );
+    }
+
+    #[test]
+    fn resolve_list_directories_path_prefers_saved_session_path() {
+        let saved = tempfile::tempdir().unwrap();
+        let fallback = tempfile::tempdir().unwrap();
+        let resolved = resolve_list_directories_path(
+            None,
+            Some(&saved.path().display().to_string()),
+            None,
+            fallback.path(),
+        )
+        .unwrap();
+        assert_eq!(resolved, saved.path());
     }
 
     #[tokio::test]

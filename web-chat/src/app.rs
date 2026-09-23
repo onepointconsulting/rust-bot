@@ -156,8 +156,16 @@ pub fn App() -> impl IntoView {
     let example_prompts = RwSignal::new(Vec::<String>::new());
     let composer_draft = RwSignal::new(String::new());
     let user_email = RwSignal::new(read_stored_email());
+    let bot_version = RwSignal::new(None::<String>);
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
     let sidebar_open = RwSignal::new(false);
+
+    spawn_local(async move {
+        if let Ok(config) = chat_ui::api::fetch_auth_config().await {
+            let version = config.version.trim();
+            bot_version.set((!version.is_empty()).then(|| version.to_string()));
+        }
+    });
 
     let load_example_prompts = move |jwt: String| {
         spawn_local(async move {
@@ -373,6 +381,7 @@ pub fn App() -> impl IntoView {
                     active_session_id=Signal::derive(move || Some(session_id.get()))
                     sidebar_open=Signal::derive(move || sidebar_open.get())
                     user_email=Signal::derive(move || user_email.get())
+                    bot_version=Signal::derive(move || bot_version.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat

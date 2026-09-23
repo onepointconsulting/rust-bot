@@ -14,6 +14,7 @@ pub fn ChatShell(
     #[prop(into)] active_session_id: Signal<Option<String>>,
     #[prop(into)] sidebar_open: Signal<bool>,
     #[prop(into)] user_email: Signal<Option<String>>,
+    #[prop(into)] bot_version: Signal<Option<String>>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Send + Sync + Copy,
@@ -54,6 +55,7 @@ pub fn ChatShell(
                     <ChatHeaderActions
                         expanded=expanded
                         email=user_email
+                        version=bot_version
                         on_new_chat=on_new_chat
                         on_logout=on_logout
                         on_minimize=on_minimize

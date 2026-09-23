@@ -3,7 +3,10 @@ use std::path::PathBuf;
 use async_trait::async_trait;
 use base64::Engine;
 
-use crate::{agent::tools::base::Tool, config::schema::ImageGenerationToolConfig};
+use crate::{
+    agent::tools::base::Tool, agent::workspace_context::current_tool_workspace,
+    config::schema::ImageGenerationToolConfig,
+};
 
 fn image_gen_err(msg: impl Into<String>) -> String {
     let msg = msg.into();
@@ -13,7 +16,10 @@ fn image_gen_err(msg: impl Into<String>) -> String {
 
 pub struct ImageGenerationTool {
     config: ImageGenerationToolConfig,
-    image_folder: PathBuf,
+    /// Construction-time default workspace. The live destination is resolved
+    /// per call via [`Self::resolve_image_folder`] so a session-level
+    /// workspace-scope switch takes effect without reconstructing the tool.
+    workspace: PathBuf,
     http_client: reqwest::Client,
 }
 
@@ -33,12 +39,21 @@ impl ImageGenerationTool {
             .default_headers(header_map)
             .build()
             .unwrap_or_default();
-        let image_folder = workspace.join("images_generation");
         Self {
             config,
-            image_folder,
+            workspace,
             http_client,
         }
+    }
+
+    /// `workspace/images_generation`, preferring the ambient per-turn
+    /// workspace scope when one is bound (same helper as `read_file` /
+    /// `write_file`).
+    fn resolve_image_folder(&self) -> PathBuf {
+        let tw = current_tool_workspace(Some(self.workspace.clone()), true, false);
+        tw.project_path
+            .unwrap_or_else(|| self.workspace.clone())
+            .join("images_generation")
     }
 }
 
@@ -286,16 +301,15 @@ This tool returns the path to a local file that contains the generated image or 
             }
         };
 
-        if let Err(e) = std::fs::create_dir_all(&self.image_folder) {
+        let image_folder = self.resolve_image_folder();
+        if let Err(e) = std::fs::create_dir_all(&image_folder) {
             return image_gen_err(format!(
                 "Error: failed to create image folder {}: {e}",
-                self.image_folder.display()
+                image_folder.display()
             ));
         }
 
-        let file_path = self
-            .image_folder
-            .join(format!("{}.png", uuid::Uuid::new_v4()));
+        let file_path = image_folder.join(format!("{}.png", uuid::Uuid::new_v4()));
         if let Err(e) = std::fs::write(&file_path, &image_bytes) {
             return image_gen_err(format!(
                 "Error: failed to write image file {}: {e}",
@@ -358,11 +372,60 @@ mod tests {
             }))
             .is_err()
         );
-        assert!(
-            extract_input_references(&json!({
-                "input_references": [{ "type": "image_url", "image_url": { "url": "/tmp/local.png" } }]
-            }))
-            .is_err()
+        assert!(extract_input_references(&json!({
+            "input_references": [{ "type": "image_url", "image_url": { "url": "/tmp/local.png" } }]
+        }))
+        .is_err());
+    }
+
+    #[test]
+    fn resolve_image_folder_falls_back_to_construction_workspace() {
+        let dir = tempfile::tempdir().unwrap();
+        let tool = ImageGenerationTool::new(
+            ImageGenerationToolConfig::default(),
+            dir.path().to_path_buf(),
+        );
+        assert_eq!(
+            tool.resolve_image_folder(),
+            dir.path().join("images_generation")
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_image_folder_uses_ambient_scope_without_reconstruction() {
+        use crate::agent::workspace_context::{
+            bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
+        };
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
+
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        let tool = ImageGenerationTool::new(
+            ImageGenerationToolConfig::default(),
+            dir_a.path().to_path_buf(),
+        );
+
+        assert_eq!(
+            tool.resolve_image_folder(),
+            dir_a.path().join("images_generation")
+        );
+
+        with_workspace_scope_stack(|| async {
+            let scope = build_workspace_scope(dir_b.path(), WorkspaceAccessMode::Full, None);
+            let token = bind_workspace_scope(scope);
+
+            assert_eq!(
+                tool.resolve_image_folder(),
+                dir_b.path().join("images_generation")
+            );
+
+            reset_workspace_scope(token);
+        })
+        .await;
+
+        assert_eq!(
+            tool.resolve_image_folder(),
+            dir_a.path().join("images_generation")
         );
     }
 }

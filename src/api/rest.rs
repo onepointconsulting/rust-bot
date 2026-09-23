@@ -24,7 +24,8 @@ use utoipa_swagger_ui::SwaggerUi;
 use uuid::Uuid;
 
 use crate::api::login::{
-    __path_login, JwtAuthState, LoginState, jwt_auth_state_from_config, login,
+    __path_auth_config, __path_login, AuthConfigResponse, JwtAuthState, LoginState, auth_config,
+    jwt_auth_state_from_config, login,
 };
 use crate::api::types::{ChatLoginRequest, ChatLoginResponse};
 use crate::api::user_registry::UserRegistry;
@@ -111,7 +112,7 @@ impl Modify for SecurityAddon {
 
 #[derive(OpenApi)]
 #[openapi(
-    paths(health, chat_completions, chat_commands, list_sessions, login, example_prompts),
+    paths(health, chat_completions, chat_commands, list_sessions, login, auth_config, example_prompts),
     components(schemas(
         ChatCompletionRequest,
         ChatCompletionResponse,
@@ -126,6 +127,7 @@ impl Modify for SecurityAddon {
         SessionsListResponse,
         ChatLoginRequest,
         ChatLoginResponse,
+        AuthConfigResponse,
         ExamplePromptsResponse,
     )),
     modifiers(&SecurityAddon),
@@ -563,6 +565,17 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
         .route("/v1/login", post(login))
         .with_state(login_state);
 
+    // Unauthenticated by design — see `AuthConfigResponse`'s doc comment.
+    // web-chat reads `version`; `require_login` / `login_available` follow
+    // this server's JWT setting (the REST API has no guest mode).
+    let auth_config_router = Router::new()
+        .route("/v1/auth/config", get(auth_config))
+        .with_state(AuthConfigResponse {
+            require_login: jwt_enabled,
+            login_available: jwt_enabled,
+            version: crate::PKG_VERSION.to_string(),
+        });
+
     let state = Arc::new(AppState::from(server));
 
     let protected = Router::new()
@@ -578,6 +591,7 @@ pub async fn create_api_server(server: ApiServer) -> std::io::Result<()> {
     let mut app = Router::new()
         .route("/health", get(health))
         .merge(login_router)
+        .merge(auth_config_router)
         .merge(SwaggerUi::new("/swagger-ui").url("/api-docs/openapi.json", ApiDoc::openapi()))
         .merge(protected)
         .layer(build_cors_layer(&cors))

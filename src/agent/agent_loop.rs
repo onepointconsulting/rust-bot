@@ -714,13 +714,31 @@ impl AgentLoop {
         project_path: &std::path::Path,
         access_mode: WorkspaceAccessMode,
     ) -> Result<WorkspaceScope, WorkspaceScopeError> {
+        Self::set_session_workspace_scope_from_payload(
+            session_manager,
+            session_key,
+            project_path,
+            access_mode,
+            &self.workspace,
+            self.restrict_to_workspace,
+        )
+    }
+
+    pub fn set_session_workspace_scope_from_payload(
+        session_manager: &mut SessionManager,
+        session_key: &str,
+        project_path: &std::path::Path,
+        access_mode: WorkspaceAccessMode,
+        workspace: &PathBuf,
+        restrict_to_workspace: bool,
+    ) -> Result<WorkspaceScope, WorkspaceScopeError> {
         let scope = validate_workspace_scope_payload(
             &serde_json::json!({
                 "project_path": project_path.display().to_string(),
                 "access_mode": access_mode.as_str(),
             }),
-            &self.workspace,
-            self.restrict_to_workspace,
+            workspace,
+            restrict_to_workspace,
             None,
         )?;
 
@@ -737,11 +755,7 @@ impl AgentLoop {
 
     /// Clear a session's workspace-scope override, reverting to the
     /// process-wide default on its next turn.
-    pub fn clear_session_workspace_scope(
-        &self,
-        session_manager: &mut SessionManager,
-        session_key: &str,
-    ) {
+    pub fn clear_session_workspace_scope(session_manager: &mut SessionManager, session_key: &str) {
         let session = session_manager.get_or_create_session(session_key);
         session.metadata.remove(WORKSPACE_SCOPE_METADATA_KEY);
         let snapshot = session.clone();
@@ -2946,7 +2960,7 @@ mod tests {
                 .session_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
-            loop_.clear_session_workspace_scope(&mut manager, "test:workspace_scope_clear");
+            AgentLoop::clear_session_workspace_scope(&mut manager, "test:workspace_scope_clear");
         }
 
         let mut manager = loop_

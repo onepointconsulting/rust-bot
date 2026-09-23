@@ -24,7 +24,8 @@ use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
     now_rfc3339, ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem,
-    SessionSummaryPopup, SessionTokenUsage, SkillSummary,
+    SessionSummaryPopup, SessionTokenUsage, SkillSummary, WorkspaceDialogState,
+    WorkspaceDirectoryEntry,
 };
 
 use crate::api::{self, WsSender};
@@ -381,6 +382,9 @@ struct WsContext {
     /// Sidebar Summary dialog: `None` when closed, `Some` with empty
     /// `text` while the `get_session_summary` reply is in flight.
     summary_popup: RwSignal<Option<SessionSummaryPopup>>,
+    /// Sidebar Workspace dialog: `None` when closed, `Some` with `path: None`
+    /// while the first `directories` reply is in flight.
+    workspace_popup: RwSignal<Option<WorkspaceDialogState>>,
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -776,6 +780,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::Error {
             turn_id, detail, ..
         } => {
+            if turn_id.is_none() && ctx.workspace_popup.get_untracked().is_some() {
+                ctx.workspace_popup.update(|current| {
+                    if let Some(state) = current {
+                        state.error = Some(detail.clone());
+                    }
+                });
+                return;
+            }
             // A Stop click that lost the race against turn completion. Not
             // worth a banner — the turn the user wanted stopped is already
             // over — and it must not fall through to the generic handling
@@ -910,6 +922,17 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::ModeSet { mode, .. } => {
             ctx.agent_mode.set(mode);
+        }
+        ServerEvent::Directories {
+            chat_id,
+            path,
+            parent,
+            entries,
+        } => {
+            handle_directories(ctx, chat_id, path, parent, entries);
+        }
+        ServerEvent::WorkspaceScopeSet { .. } => {
+            ctx.workspace_popup.set(None);
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
@@ -1210,6 +1233,105 @@ fn request_summary(ctx: &WsContext, chat_id: String) {
         protocol::ClientEnvelope::get_session_summary(chat_id),
         "Failed to encode the session-summary request.",
     );
+}
+
+fn request_workspace(ctx: &WsContext, chat_id: String) {
+    ctx.workspace_popup.set(Some(WorkspaceDialogState {
+        chat_id: chat_id.clone(),
+        path: None,
+        parent: None,
+        entries: Vec::new(),
+        error: None,
+    }));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_directories(chat_id, None),
+        "Failed to encode the list-directories request.",
+    );
+}
+
+fn request_workspace_browse(ctx: &WsContext, path: String) {
+    let Some(chat_id) = ctx
+        .workspace_popup
+        .get_untracked()
+        .map(|state| state.chat_id)
+    else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_directories(chat_id, Some(path)),
+        "Failed to encode the list-directories request.",
+    );
+}
+
+fn request_set_workspace_scope(ctx: &WsContext, workspace_folder: String, access_mode: String) {
+    let Some(chat_id) = ctx
+        .workspace_popup
+        .get_untracked()
+        .map(|state| state.chat_id)
+    else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_workspace_scope(chat_id, workspace_folder, Some(access_mode)),
+        "Failed to encode the set-workspace-scope request.",
+    );
+}
+
+fn request_default_workspace_scope(ctx: &WsContext) {
+    let Some(chat_id) = ctx
+        .workspace_popup
+        .get_untracked()
+        .map(|state| state.chat_id)
+    else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_workspace_scope(chat_id, "default", None),
+        "Failed to encode the set-workspace-scope request.",
+    );
+}
+
+fn handle_directories(
+    ctx: &WsContext,
+    chat_id: String,
+    path: String,
+    parent: Option<String>,
+    entries: Vec<protocol::DirectoryEntry>,
+) {
+    let matches_open = ctx
+        .workspace_popup
+        .get_untracked()
+        .is_some_and(|popup| popup.chat_id == chat_id);
+    if !matches_open {
+        return;
+    }
+    ctx.workspace_popup.set(Some(WorkspaceDialogState {
+        chat_id,
+        path: Some(path),
+        parent,
+        entries: entries
+            .into_iter()
+            .map(|entry| WorkspaceDirectoryEntry {
+                name: entry.name,
+                path: entry.path,
+            })
+            .collect(),
+        error: None,
+    }));
+}
+
+fn page_is_localhost() -> bool {
+    let hostname = web_sys::window()
+        .and_then(|window| window.location().hostname().ok())
+        .unwrap_or_default();
+    hostname.eq_ignore_ascii_case("localhost")
+        || hostname == "127.0.0.1"
+        || hostname == "[::1]"
+        || hostname == "::1"
 }
 
 /// Ask the gateway to cancel the in-flight turn on the active chat.
@@ -1549,6 +1671,7 @@ pub fn App() -> impl IntoView {
             .and_then(crate::sso_handoff::email_from_jwt)
             .inspect(|email| persist_email(email))
     }));
+    let bot_version = RwSignal::new(None::<String>);
     let token_streaming = RwSignal::new(false);
     let sessions = RwSignal::new(Vec::<SessionListItem>::new());
     let sidebar_open =
@@ -1561,6 +1684,7 @@ pub fn App() -> impl IntoView {
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
     let skills = RwSignal::new(Vec::<SkillSummary>::new());
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
+    let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
 
     let ws_context = WsContext {
         token,
@@ -1588,6 +1712,7 @@ pub fn App() -> impl IntoView {
         session_usage,
         skills,
         summary_popup,
+        workspace_popup,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -1611,6 +1736,8 @@ pub fn App() -> impl IntoView {
             match chat_ui::api::fetch_auth_config().await {
                 Ok(config) => {
                     require_login.set(Some(config.require_login));
+                    let version = config.version.trim();
+                    bot_version.set((!version.is_empty()).then(|| version.to_string()));
                     // A guest-capable instance with no session restored yet:
                     // connect immediately rather than waiting for the user
                     // to do anything, since there is no `LoginForm` to wait
@@ -1696,6 +1823,8 @@ pub fn App() -> impl IntoView {
         model_preset.set("default".to_string());
         session_usage.set(None);
         skills.set(Vec::new());
+        summary_popup.set(None);
+        workspace_popup.set(None);
     };
 
     let do_send = move |outgoing: OutgoingMessage| {
@@ -1759,6 +1888,22 @@ pub fn App() -> impl IntoView {
     };
     let on_rename_session = move |id: String, title: String| {
         request_rename(&ws_context, id, title);
+    };
+    let show_workspace = page_is_localhost();
+    let on_workspace_session = move |id: String| {
+        request_workspace(&ws_context, id);
+    };
+    let on_close_workspace = move || {
+        ws_context.workspace_popup.set(None);
+    };
+    let on_browse_workspace = move |path: String| {
+        request_workspace_browse(&ws_context, path);
+    };
+    let on_save_workspace = move |folder: String, access_mode: String| {
+        request_set_workspace_scope(&ws_context, folder, access_mode);
+    };
+    let on_default_workspace = move || {
+        request_default_workspace_scope(&ws_context);
     };
     let on_summary_session = move |id: String| {
         request_summary(&ws_context, id);
@@ -1839,6 +1984,7 @@ pub fn App() -> impl IntoView {
                     active_session_id=Signal::derive(move || chat_id.get())
                     sidebar_open=Signal::derive(move || sidebar_open.get())
                     user_email=Signal::derive(move || user_email.get())
+                    bot_version=Signal::derive(move || bot_version.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat
@@ -1851,6 +1997,13 @@ pub fn App() -> impl IntoView {
                     on_close_sidebar=close_sidebar
                     on_select_session=on_select_session
                     on_rename_session=on_rename_session
+                    show_workspace=show_workspace
+                    workspace_popup=Signal::derive(move || workspace_popup.get())
+                    on_workspace_session=on_workspace_session
+                    on_close_workspace=on_close_workspace
+                    on_browse_workspace=on_browse_workspace
+                    on_save_workspace=on_save_workspace
+                    on_default_workspace=on_default_workspace
                     on_summary_session=on_summary_session
                     summary_popup=Signal::derive(move || summary_popup.get())
                     on_close_summary=on_close_summary
