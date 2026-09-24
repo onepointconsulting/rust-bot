@@ -30,6 +30,8 @@ use crate::channels::websocket::runtime::WebSocketChannel;
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
 use crate::cli::cancel::wait_for_escape_cancel;
+use crate::agent::tool_approval::ToolApprovalBroker;
+use crate::cli::confirm_tools::WebsocketsAskHook;
 use crate::cli::onboard::run_onboard;
 use crate::cli::wizard::resolve_onboard_config_path;
 use crate::command::types::DREAM_JOB_NAME;
@@ -1060,7 +1062,22 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let port_override = args.port;
     let web_root_override = args.web_root.clone();
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
-    let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone(), None));
+
+    let tool_approvals = config
+        .tools
+        .confirm_before_execute
+        .then(|| Arc::new(ToolApprovalBroker::new()));
+    let confirm_hook = tool_approvals
+        .as_ref()
+        .map(|broker| Arc::new(WebsocketsAskHook::new(Arc::clone(broker))));
+    let hooks = confirm_hook
+        .clone()
+        .map(|hook| vec![hook as Arc<dyn AgentHook>]);
+
+    let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone(), hooks));
+    if let Some(hook) = &confirm_hook {
+        hook.set_bus(agent_loop.bus());
+    }
     let session_manager = agent_loop.session_manager.clone();
     let cron = agent_loop.cron_service.clone();
 
@@ -1218,6 +1235,12 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             .shared()
             .gateway_services
             .set_work_canceller(SessionWorkCanceller::new(Arc::clone(&agent_loop)));
+        if let Some(broker) = &tool_approvals {
+            ws_channel
+                .shared()
+                .gateway_services
+                .set_tool_approvals(Arc::clone(broker));
+        }
     }
     let mut channel_manager = ChannelManager::new(
         Arc::clone(&config),

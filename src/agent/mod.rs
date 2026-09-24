@@ -10,5 +10,6 @@ pub mod modes;
 pub mod runner;
 pub mod skills;
 pub mod subagent;
+pub mod tool_approval;
 pub mod tools;
 pub mod workspace_context;

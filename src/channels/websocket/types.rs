@@ -86,6 +86,10 @@ pub enum EnvelopeType {
     /// addition with no nanobot precedent — the Python reference never
     /// exposes session summaries on the wire.
     GetSessionSummary,
+    /// Answer a pending `tool_approval_request` with the call ids the user
+    /// approved (`approved_ids`); every other call in the request is denied.
+    /// Rust-side addition, no nanobot precedent.
+    ToolApprovalResponse,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
@@ -118,6 +122,7 @@ impl From<&str> for EnvelopeType {
             "set_mode" => Self::SetMode,
             "clear_session" => Self::ClearSession,
             "get_session_summary" => Self::GetSessionSummary,
+            "tool_approval_response" => Self::ToolApprovalResponse,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -181,6 +186,11 @@ pub enum WsOutboundEvent {
     WorkspaceScopeSet,
     /// Reply to [`EnvelopeType::ListDirectories`].
     Directories,
+    /// Fan-out asking the chat's user to approve a batch of tool calls.
+    ToolApprovalRequest,
+    /// Fan-out after [`EnvelopeType::ToolApprovalResponse`] resolved a
+    /// request, so every other tab closes its approval card.
+    ToolApprovalResolved,
 }
 
 impl WsOutboundEvent {
@@ -205,6 +215,8 @@ impl WsOutboundEvent {
             Self::SessionSummary => "session_summary",
             Self::WorkspaceScopeSet => "workspace_scope_set",
             Self::Directories => "directories",
+            Self::ToolApprovalRequest => "tool_approval_request",
+            Self::ToolApprovalResolved => "tool_approval_resolved",
         }
     }
 }
@@ -584,6 +596,22 @@ mod tests {
         assert_eq!(
             EnvelopeType::from("get_session_summary"),
             EnvelopeType::GetSessionSummary
+        );
+        assert_eq!(
+            EnvelopeType::from("tool_approval_response"),
+            EnvelopeType::ToolApprovalResponse
+        );
+    }
+
+    #[test]
+    fn ws_outbound_event_tool_approval_names() {
+        assert_eq!(
+            WsOutboundEvent::ToolApprovalRequest.as_str(),
+            "tool_approval_request"
+        );
+        assert_eq!(
+            WsOutboundEvent::ToolApprovalResolved.as_str(),
+            "tool_approval_resolved"
         );
     }
 

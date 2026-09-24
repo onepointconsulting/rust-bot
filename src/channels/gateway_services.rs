@@ -2,7 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    agent::agent_loop::AgentLoop, bus::events::InboundMessage,
+    agent::agent_loop::AgentLoop, agent::tool_approval::ToolApprovalBroker,
+    bus::events::InboundMessage,
     channels::websocket::webui::transcript::WebUiTranscriptRecorder, config::paths::get_webui_dir,
     security::WebUIIngressPolicy, session::websocket_turns::WebsocketTurnRegistry,
 };
@@ -60,6 +61,9 @@ pub struct GatewayServices {
     /// `None` until `run_gateway` injects it via [`Self::set_work_canceller`]
     /// — see [`SessionWorkCanceller`]'s doc comment.
     work_canceller: Arc<Mutex<Option<SessionWorkCanceller>>>,
+    /// `None` unless `tools.confirmBeforeExecute` is on and `run_gateway`
+    /// injected the broker via [`Self::set_tool_approvals`].
+    tool_approvals: Arc<Mutex<Option<Arc<ToolApprovalBroker>>>>,
 }
 
 impl GatewayServices {
@@ -72,6 +76,7 @@ impl GatewayServices {
             turn_registry: Arc::new(Mutex::new(WebsocketTurnRegistry::default())),
             transcripts: Arc::new(Mutex::new(WebUiTranscriptRecorder::new(webui_dir))),
             work_canceller: Arc::new(Mutex::new(None)),
+            tool_approvals: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -92,6 +97,23 @@ impl GatewayServices {
     /// builds `GatewayServices` directly (no real `AgentLoop` around).
     pub fn work_canceller(&self) -> Option<SessionWorkCanceller> {
         self.work_canceller
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Inject the broker that `tool_approval_response` envelopes resolve
+    /// against. Same "before `router()`" requirement as
+    /// [`Self::set_work_canceller`].
+    pub fn set_tool_approvals(&self, broker: Arc<ToolApprovalBroker>) {
+        *self
+            .tool_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(broker);
+    }
+
+    pub fn tool_approvals(&self) -> Option<Arc<ToolApprovalBroker>> {
+        self.tool_approvals
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()

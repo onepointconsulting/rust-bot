@@ -16,6 +16,8 @@ use std::collections::HashMap;
 
 use chat_ui::models::{ChatEntry, ImageAttachment, Role, SessionListItem, ToolEvent};
 
+use crate::protocol::ToolApprovalCall;
+
 /// Prefix identifying a gateway-served media URL (`serve_media` in
 /// `src/channels/websocket/webui/media.rs`) rather than a `data:` or
 /// arbitrary `http(s)://` reference — see [`authorize_media_attachments`].
@@ -677,9 +679,87 @@ pub fn build_ws_url(
     url
 }
 
+/// An open `tool_approval_request` plus the user's per-call choice so far.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingApproval {
+    pub request_id: String,
+    pub calls: Vec<PendingApprovalCall>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingApprovalCall {
+    pub call: ToolApprovalCall,
+    pub approved: bool,
+}
+
+impl PendingApproval {
+    /// Every call starts approved, so "Run selected" with no changes runs all.
+    pub fn new(request_id: String, calls: Vec<ToolApprovalCall>) -> Self {
+        Self {
+            request_id,
+            calls: calls
+                .into_iter()
+                .map(|call| PendingApprovalCall {
+                    call,
+                    approved: true,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn toggle_call(&mut self, call_id: &str) {
+        if let Some(entry) = self.calls.iter_mut().find(|entry| entry.call.id == call_id) {
+            entry.approved = !entry.approved;
+        }
+    }
+
+    pub fn approved_ids(&self) -> Vec<String> {
+        self.calls
+            .iter()
+            .filter(|entry| entry.approved)
+            .map(|entry| entry.call.id.clone())
+            .collect()
+    }
+
+    pub fn all_ids(&self) -> Vec<String> {
+        self.calls.iter().map(|entry| entry.call.id.clone()).collect()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn approval_call(id: &str) -> ToolApprovalCall {
+        ToolApprovalCall {
+            id: id.to_string(),
+            name: "exec".to_string(),
+            arguments_preview: "{}".to_string(),
+        }
+    }
+
+    #[test]
+    fn pending_approval_starts_all_approved() {
+        let pending = PendingApproval::new(
+            "req-1".to_string(),
+            vec![approval_call("a"), approval_call("b")],
+        );
+        assert_eq!(pending.approved_ids(), vec!["a", "b"]);
+        assert_eq!(pending.all_ids(), vec!["a", "b"]);
+    }
+
+    #[test]
+    fn pending_approval_toggle_flips_one_call() {
+        let mut pending = PendingApproval::new(
+            "req-1".to_string(),
+            vec![approval_call("a"), approval_call("b")],
+        );
+        pending.toggle_call("a");
+        assert_eq!(pending.approved_ids(), vec!["b"]);
+        pending.toggle_call("a");
+        pending.toggle_call("unknown");
+        assert_eq!(pending.approved_ids(), vec!["a", "b"]);
+    }
     use chat_ui::models::{ImageAttachment, Role};
 
     fn assistant_entry(id: u64) -> ChatEntry {

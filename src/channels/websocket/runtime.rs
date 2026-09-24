@@ -27,6 +27,7 @@ use crate::agent::agent_loop::AgentLoop;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::skills::SkillsLoader;
+use crate::agent::tool_approval::{ToolApprovalBroker, ToolApprovalCall};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
@@ -649,6 +650,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::GetSessionSummary => {
             handle_envelope_get_session_summary(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ToolApprovalResponse => {
+            handle_envelope_tool_approval_response(envelope_dispatch_context).await;
         }
         EnvelopeType::Unrecognized(t) => {
             send_event(
@@ -1310,6 +1314,7 @@ async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchC
     }
 
     attach_chat(connection_id, cid, shared).await;
+    resend_pending_tool_approvals(shared, connection_id, cid).await;
 }
 
 async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
@@ -1710,6 +1715,173 @@ async fn handle_envelope_abort_turn<'a>(envelope_dispatch_context: EnvelopeDispa
         shared,
     )
     .await;
+}
+
+/// `tool_approval_request` frame, shared by the live fan-out in
+/// `WebSocketChannel::send` and the re-send on `attach`.
+fn tool_approval_request_payload(
+    chat_id: &str,
+    turn_id: Option<&str>,
+    request_id: &str,
+    calls: &[ToolApprovalCall],
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "event": WsOutboundEvent::ToolApprovalRequest.as_str(),
+        "chat_id": chat_id,
+        "request_id": request_id,
+        "tool_calls": calls,
+    });
+    if let Some(turn_id) = turn_id {
+        body["turn_id"] = serde_json::json!(turn_id);
+    }
+    body
+}
+
+/// Handle a `tool_approval_response` envelope: hand `approved_ids` to the
+/// waiting [`ToolApprovalBroker`] request, then tell every tab on the chat
+/// that the request is settled. A missing or malformed `approved_ids` counts
+/// as "deny everything" rather than an error, so the turn never hangs on a
+/// half-understood answer.
+async fn handle_envelope_tool_approval_response<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
+        return;
+    }
+
+    let Some(request_id) = envelope_dispatch_context
+        .envelope
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing_request_id"}),
+        )
+        .await;
+        return;
+    };
+    let approved_ids: Vec<String> = envelope_dispatch_context
+        .envelope
+        .get("approved_ids")
+        .and_then(|v| v.as_array())
+        .map(|ids| {
+            ids.iter()
+                .filter_map(|id| id.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default();
+
+    let Some(broker) = shared.gateway_services.tool_approvals() else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "approval_not_found", "request_id": request_id}),
+        )
+        .await;
+        return;
+    };
+    if let Err(err) = broker.resolve(cid, request_id, approved_ids) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": err.as_detail(), "request_id": request_id}),
+        )
+        .await;
+        return;
+    }
+
+    let recipients = {
+        let connections = shared.connections.lock().await;
+        let mut recipients = connections.senders_for_chat(cid);
+        if !recipients.iter().any(|(id, _)| id == connection_id)
+            && let Some(sender) = connections.sender_for(connection_id)
+        {
+            recipients.push((connection_id.to_string(), sender));
+        }
+        recipients
+    };
+    let raw = serde_json::json!({
+        "event": WsOutboundEvent::ToolApprovalResolved.as_str(),
+        "chat_id": cid,
+        "request_id": request_id,
+    })
+    .to_string();
+    for (recipient_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&recipient_id);
+        }
+    }
+}
+
+/// Re-send any approval still waiting on `chat_id` to one connection, so a
+/// reloaded or late-joining tab can answer it.
+async fn resend_pending_tool_approvals(shared: &WsShared, connection_id: &str, chat_id: &str) {
+    let Some(broker) = shared.gateway_services.tool_approvals() else {
+        return;
+    };
+    let pending = broker.pending_for_chat(chat_id);
+    if pending.is_empty() {
+        return;
+    }
+    let turn_id = shared
+        .gateway_services
+        .turn_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .websocket_turn_id(chat_id);
+    let Some(sender) = shared.connections.lock().await.sender_for(connection_id) else {
+        return;
+    };
+    for request in pending {
+        let body = tool_approval_request_payload(
+            chat_id,
+            turn_id.as_deref(),
+            &request.request_id,
+            &request.calls,
+        );
+        if sender.send(Message::text(body.to_string())).is_err() {
+            return;
+        }
+    }
 }
 
 /// Tell every connection subscribed to `chat_id` that its in-flight turn was
@@ -3722,6 +3894,22 @@ impl BaseChannel for WebSocketChannel {
                 payload
             }
             None => Self::build_message_payload(&msg, &media_urls),
+            Some(OutboundEvent::ToolApprovalRequest(event)) => {
+                let turn_id = self
+                    .gateway_services
+                    .turn_registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .websocket_turn_id(&msg.chat_id);
+                let body = tool_approval_request_payload(
+                    &msg.chat_id,
+                    turn_id.as_deref(),
+                    &event.request_id,
+                    &event.calls,
+                );
+                self.fan_out_to_chat(&msg.chat_id, &body.to_string()).await;
+                return Ok(());
+            }
             Some(other) => {
                 log::warn!(
                     "WebSocket channel: no wire mapping yet for {other:?} event \
@@ -8111,6 +8299,209 @@ mod tests {
         tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
             .await
             .expect("handle_envelope_abort_turn must not hang");
+    }
+
+    async fn dispatch_tool_approval_response(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: &str,
+        request_id: Option<&str>,
+        approved_ids: Option<serde_json::Value>,
+    ) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert(
+            "type".to_string(),
+            serde_json::json!("tool_approval_response"),
+        );
+        envelope.insert("chat_id".to_string(), serde_json::json!(chat_id));
+        if let Some(request_id) = request_id {
+            envelope.insert("request_id".to_string(), serde_json::json!(request_id));
+        }
+        if let Some(approved_ids) = approved_ids {
+            envelope.insert("approved_ids".to_string(), approved_ids);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_tool_approval_response must not hang");
+    }
+
+    fn approval_call(id: &str) -> ToolApprovalCall {
+        ToolApprovalCall {
+            id: id.to_string(),
+            name: "exec".to_string(),
+            arguments_preview: "{}".to_string(),
+        }
+    }
+
+    fn drain_json(rx: &mut mpsc::UnboundedReceiver<Message>) -> Vec<serde_json::Value> {
+        let mut frames = Vec::new();
+        while let Ok(msg) = rx.try_recv() {
+            frames.push(serde_json::from_str(&msg.into_text().unwrap()).unwrap());
+        }
+        frames
+    }
+
+    #[tokio::test]
+    async fn tool_approval_response_resolves_and_notifies_every_tab() {
+        let shared = test_shared("browser");
+        let broker = Arc::new(ToolApprovalBroker::new());
+        shared
+            .gateway_services
+            .set_tool_approvals(Arc::clone(&broker));
+        let (tx1, mut rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, mut rx2) = mpsc::unbounded_channel::<Message>();
+        {
+            let mut connections = shared.connections.lock().await;
+            connections.register("conn-1", "chat-1", tx1);
+            connections.attach("conn-2", "chat-1");
+            connections.register("conn-2", "chat-1", tx2);
+        }
+        let (request_id, rx) =
+            broker.register("chat-1", vec![approval_call("a"), approval_call("b")]);
+
+        dispatch_tool_approval_response(
+            &shared,
+            "conn-1",
+            "chat-1",
+            Some(&request_id),
+            Some(serde_json::json!(["b"])),
+        )
+        .await;
+
+        assert_eq!(rx.await.unwrap(), vec!["b".to_string()]);
+        for rx in [&mut rx1, &mut rx2] {
+            let body = recv_json(rx);
+            assert_eq!(body["event"], "tool_approval_resolved");
+            assert_eq!(body["chat_id"], "chat-1");
+            assert_eq!(body["request_id"], request_id.as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn tool_approval_response_without_ids_denies_everything() {
+        let shared = test_shared("browser");
+        let broker = Arc::new(ToolApprovalBroker::new());
+        shared
+            .gateway_services
+            .set_tool_approvals(Arc::clone(&broker));
+        let (tx, _rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        let (request_id, rx) = broker.register("chat-1", vec![approval_call("a")]);
+
+        dispatch_tool_approval_response(&shared, "conn-1", "chat-1", Some(&request_id), None)
+            .await;
+
+        assert!(rx.await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn tool_approval_response_rejects_unknown_and_foreign_requests() {
+        let shared = test_shared("browser");
+        let broker = Arc::new(ToolApprovalBroker::new());
+        shared
+            .gateway_services
+            .set_tool_approvals(Arc::clone(&broker));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-2", tx);
+
+        dispatch_tool_approval_response(&shared, "conn-1", "chat-2", Some("nope"), None).await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "approval_not_found");
+
+        let (request_id, _pending) = broker.register("chat-1", vec![approval_call("a")]);
+        dispatch_tool_approval_response(
+            &shared,
+            "conn-1",
+            "chat-2",
+            Some(&request_id),
+            Some(serde_json::json!(["a"])),
+        )
+        .await;
+        let body = recv_json(&mut rx);
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(broker.pending_for_chat("chat-1").len(), 1);
+
+        dispatch_tool_approval_response(&shared, "conn-1", "chat-2", None, None).await;
+        assert_eq!(recv_json(&mut rx)["detail"], "missing_request_id");
+    }
+
+    #[tokio::test]
+    async fn attach_resends_pending_tool_approvals() {
+        let shared = test_shared("browser");
+        let broker = Arc::new(ToolApprovalBroker::new());
+        shared
+            .gateway_services
+            .set_tool_approvals(Arc::clone(&broker));
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-0", tx);
+        let (request_id, _pending) = broker.register("chat-1", vec![approval_call("a")]);
+
+        dispatch_attach(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        let frames = drain_json(&mut rx);
+        let request = frames
+            .iter()
+            .find(|f| f["event"] == "tool_approval_request")
+            .expect("pending approval re-sent on attach");
+        assert_eq!(request["chat_id"], "chat-1");
+        assert_eq!(request["request_id"], request_id.as_str());
+        assert_eq!(request["tool_calls"][0]["id"], "a");
+        assert_eq!(request["tool_calls"][0]["arguments_preview"], "{}");
+    }
+
+    #[tokio::test]
+    async fn send_tool_approval_request_fans_out_to_chat() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        BaseChannel::send(
+            &channel,
+            outbound(
+                "chat-1",
+                "",
+                Some(OutboundEvent::ToolApprovalRequest(
+                    crate::bus::outbound_events::ToolApprovalRequestEvent {
+                        request_id: "req-1".to_string(),
+                        calls: vec![approval_call("a")],
+                    },
+                )),
+            ),
+        )
+        .await
+        .unwrap();
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "tool_approval_request");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["request_id"], "req-1");
+        assert_eq!(body["tool_calls"][0]["name"], "exec");
+        assert!(body.get("turn_id").is_none());
     }
 
     fn start_registry_turn(shared: &WsShared, chat_id: &str, turn_id: Option<&str>) {

@@ -1079,6 +1079,8 @@ impl AgentLoop {
                 concurrent_tools: true,
                 workspace: Some(self.workspace.clone()),
                 session_key: session_key.clone(),
+                channel: Some(channel.to_string()),
+                chat_id: Some(chat_id.to_string()),
                 context_window_tokens: Some(runtime.context_window_tokens),
                 context_block_limit: self.context_block_limit,
                 provider_retry_mode: self.provider_retry_mode.clone(),

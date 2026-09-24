@@ -70,6 +70,14 @@ pub struct ClientEnvelope {
     /// Set only by [`Self::set_workspace_scope`] — `restricted` or `full`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub access_mode: Option<String>,
+    /// Set only by [`Self::tool_approval_response`] — the
+    /// `tool_approval_request` being answered.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub request_id: Option<String>,
+    /// Set only by [`Self::tool_approval_response`] — call ids the user
+    /// approved; every other call in the request is denied.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub approved_ids: Option<Vec<String>>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -98,6 +106,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -121,6 +131,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -143,6 +155,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -178,6 +192,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -198,6 +214,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -218,6 +236,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -241,6 +261,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -264,6 +286,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -289,6 +313,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -312,6 +338,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -341,6 +369,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -364,6 +394,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -383,6 +415,8 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -405,6 +439,8 @@ impl ClientEnvelope {
             path,
             workspace_folder: None,
             access_mode: None,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
@@ -429,9 +465,50 @@ impl ClientEnvelope {
             path: None,
             workspace_folder: Some(workspace_folder.into()),
             access_mode,
+            request_id: None,
+            approved_ids: None,
             webui: true,
         }
     }
+
+    /// Answer a `tool_approval_request`. `approved_ids` is always sent (an
+    /// empty list denies every call). The reply is a `tool_approval_resolved`
+    /// fanned out to every tab on `chat_id`; rejections come back as `error`
+    /// (`approval_not_found`, `access_denied`, `missing_request_id`).
+    pub fn tool_approval_response(
+        chat_id: impl Into<String>,
+        request_id: impl Into<String>,
+        approved_ids: Vec<String>,
+    ) -> Self {
+        Self {
+            type_: "tool_approval_response",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: None,
+            before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
+            request_id: Some(request_id.into()),
+            approved_ids: Some(approved_ids),
+            webui: true,
+        }
+    }
+}
+
+/// One tool call inside a `tool_approval_request` — mirrors the backend's
+/// `ToolApprovalCall` (`src/agent/tool_approval.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolApprovalCall {
+    pub id: String,
+    pub name: String,
+    /// JSON-encoded arguments, truncated server-side (ends in `...` when cut).
+    #[serde(default)]
+    pub arguments_preview: String,
 }
 
 /// One chat summary entry inside a `chats` event's list — mirrors the
@@ -653,6 +730,17 @@ pub enum ServerEvent {
         access_mode: Option<String>,
         detail: Option<String>,
     },
+    /// The agent is waiting for the user to approve `tool_calls` before
+    /// running them. Answer with [`ClientEnvelope::tool_approval_response`].
+    /// Also re-sent after `attached` while the request is still open.
+    ToolApprovalRequest {
+        chat_id: String,
+        turn_id: Option<String>,
+        request_id: String,
+        tool_calls: Vec<ToolApprovalCall>,
+    },
+    /// `request_id` was answered (possibly from another tab); close its card.
+    ToolApprovalResolved { chat_id: String, request_id: String },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -683,7 +771,9 @@ impl ServerEvent {
             | ServerEvent::FileEdit { chat_id, .. }
             | ServerEvent::TurnAborted { chat_id, .. }
             | ServerEvent::ModelPresetSet { chat_id, .. }
-            | ServerEvent::ModeSet { chat_id, .. } => Some(chat_id.as_str()),
+            | ServerEvent::ModeSet { chat_id, .. }
+            | ServerEvent::ToolApprovalRequest { chat_id, .. }
+            | ServerEvent::ToolApprovalResolved { chat_id, .. } => Some(chat_id.as_str()),
             ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
@@ -1050,6 +1140,22 @@ struct WorkspaceScopeSetWire {
     detail: Option<String>,
 }
 
+#[derive(Deserialize)]
+struct ToolApprovalRequestWire {
+    chat_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+    request_id: String,
+    #[serde(default)]
+    tool_calls: Vec<ToolApprovalCall>,
+}
+
+#[derive(Deserialize)]
+struct ToolApprovalResolvedWire {
+    chat_id: String,
+    request_id: String,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -1197,6 +1303,22 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 workspace_folder: w.workspace_folder,
                 access_mode: w.access_mode,
                 detail: w.detail,
+            })
+        }
+        "tool_approval_request" => {
+            decode::<ToolApprovalRequestWire>(&value).map(|w| ServerEvent::ToolApprovalRequest {
+                chat_id: w.chat_id,
+                turn_id: w.turn_id,
+                request_id: w.request_id,
+                tool_calls: w.tool_calls,
+            })
+        }
+        "tool_approval_resolved" => {
+            decode::<ToolApprovalResolvedWire>(&value).map(|w| {
+                ServerEvent::ToolApprovalResolved {
+                    chat_id: w.chat_id,
+                    request_id: w.request_id,
+                }
             })
         }
         _ => Ok(ServerEvent::Unknown(value)),
@@ -2275,6 +2397,64 @@ mod tests {
             }
         );
         assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn parses_tool_approval_request() {
+        let raw = r#"{"event":"tool_approval_request","chat_id":"chat-1","turn_id":"turn-1","request_id":"req-1","tool_calls":[{"id":"call_1","name":"exec","arguments_preview":"{\"cmd\":\"ls\"}"}]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ToolApprovalRequest {
+                chat_id: "chat-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                request_id: "req-1".to_string(),
+                tool_calls: vec![ToolApprovalCall {
+                    id: "call_1".to_string(),
+                    name: "exec".to_string(),
+                    arguments_preview: r#"{"cmd":"ls"}"#.to_string(),
+                }],
+            }
+        );
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn parses_tool_approval_resolved() {
+        let raw = r#"{"event":"tool_approval_resolved","chat_id":"chat-1","request_id":"req-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ToolApprovalResolved {
+                chat_id: "chat-1".to_string(),
+                request_id: "req-1".to_string(),
+            }
+        );
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn client_envelope_tool_approval_response_serializes_expected_shape() {
+        let envelope =
+            ClientEnvelope::tool_approval_response("chat-1", "req-1", vec!["call_1".to_string()]);
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "tool_approval_response",
+                "chat_id": "chat-1",
+                "request_id": "req-1",
+                "approved_ids": ["call_1"],
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_tool_approval_response_keeps_empty_approved_ids() {
+        let envelope = ClientEnvelope::tool_approval_response("chat-1", "req-1", Vec::new());
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(value["approved_ids"], serde_json::json!([]));
     }
 
     #[test]

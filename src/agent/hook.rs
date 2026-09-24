@@ -23,6 +23,10 @@ pub struct AgentHookContext {
     pub final_content: Option<String>,
     pub stop_reason: Option<String>,
     pub error: Option<String>,
+    /// Channel the turn came from (e.g. `"websocket"`), when the runner knows it.
+    pub channel: Option<String>,
+    /// Chat id within [`Self::channel`], when the runner knows it.
+    pub chat_id: Option<String>,
 }
 
 impl AgentHookContext {
@@ -38,6 +42,8 @@ impl AgentHookContext {
             final_content: None,
             stop_reason: None,
             error: None,
+            channel: None,
+            chat_id: None,
         }
     }
 }

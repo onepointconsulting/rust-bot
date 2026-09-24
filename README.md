@@ -55,6 +55,12 @@ Integration tests:
 cargo test --tests
 ```
 
+Quick tests:
+
+```
+cargo test --lib
+```
+
 
 
 ## Build

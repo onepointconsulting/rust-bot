@@ -362,7 +362,7 @@ async fn test_grep_tool() {
         "content": "I am looking for content about food in the workspace directory."
     })];
     let workspace_path = prepare_workspace();
-    let tool = Box::new(GrepTool::new(Some(workspace_path.clone()), None, None));
+    let tool = Box::new(GrepTool::new(Some(workspace_path.clone()), Some(workspace_path.clone()), None));
     let mut tool_registry = ToolRegistry::new();
     tool_registry.register(tool);
     let (_openai_api_key, _openai_api_base, openai_api_model) = read_env();

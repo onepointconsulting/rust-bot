@@ -63,6 +63,10 @@ pub struct AgentRunSpec {
     pub fail_on_tool_error: bool,
     pub workspace: Option<PathBuf>,
     pub session_key: Option<String>,
+    /// Origin channel of the turn, copied onto every [`AgentHookContext`].
+    pub channel: Option<String>,
+    /// Origin chat id of the turn, copied onto every [`AgentHookContext`].
+    pub chat_id: Option<String>,
     pub context_window_tokens: Option<u64>,
     pub context_block_limit: Option<u32>,
     pub provider_retry_mode: String,
@@ -88,6 +92,8 @@ impl Default for AgentRunSpec {
             fail_on_tool_error: false,
             workspace: None,
             session_key: None,
+            channel: None,
+            chat_id: None,
             context_window_tokens: None,
             context_block_limit: None,
             provider_retry_mode: "standard".to_string(),
@@ -1153,6 +1159,8 @@ impl AgentRunner {
             let messages_for_model = self.snip_history(&spec, budgeted);
 
             let mut ctx = AgentHookContext::new(iteration, messages.clone());
+            ctx.channel = spec.channel.clone();
+            ctx.chat_id = spec.chat_id.clone();
             hook.before_iteration(&mut ctx).await;
 
             log::debug!(

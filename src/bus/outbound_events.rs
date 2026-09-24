@@ -2,6 +2,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::agent::tool_approval::ToolApprovalCall;
 use crate::bus::events::OutboundMessage;
 
 /// Discriminant for progress updates. Variants are mutually exclusive —
@@ -94,6 +95,14 @@ pub struct TurnModelUpdatedEvent {
     pub model: Option<String>,
 }
 
+/// Ask the chat's user to approve a batch of tool calls; answered through
+/// [`crate::agent::tool_approval::ToolApprovalBroker::resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolApprovalRequestEvent {
+    pub request_id: String,
+    pub calls: Vec<ToolApprovalCall>,
+}
+
 /// Typed outbound control/event envelope. Display text stays on
 /// [`crate::bus::events::OutboundMessage::content`]; variants carry only
 /// discriminant + control fields.
@@ -110,6 +119,7 @@ pub enum OutboundEvent {
     SessionUpdated(SessionUpdatedEvent),
     RuntimeModelUpdated(RuntimeModelUpdatedEvent),
     TurnModelUpdated(TurnModelUpdatedEvent),
+    ToolApprovalRequest(ToolApprovalRequestEvent),
 }
 
 /// Build an :class:`OutboundMessage` for a typed event.
