@@ -94,7 +94,7 @@ const AVAILABLE_TOOLS: [&str; 7] = [
     TOOL_IMAGE_GENERATION,
 ];
 
-const WEB_SEARCH_PROVIDERS: [&str; 3] = ["duckduckgo", "brave", "exa"];
+const WEB_SEARCH_PROVIDERS: [&str; 4] = ["exa_free", "duckduckgo", "brave", "exa"];
 const EXEC_SANDBOX_OPTIONS: [&str; 2] = ["none", "bwrap"];
 const OCR_PROVIDERS: [&str; 1] = ["anthropic"];
 const MCP_TRANSPORT_OPTIONS: [&str; 4] = ["auto", "stdio", "sse", "streamableHttp"];
@@ -1135,15 +1135,19 @@ fn configure_web_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
         .unwrap_or(0);
     let provider = Select::new("Web search provider", WEB_SEARCH_PROVIDERS.to_vec())
         .with_starting_cursor(provider_idx)
-        .with_help_message("duckduckgo (no registration required), brave, or exa")
+        .with_help_message("exa_free (default, no API key), duckduckgo, brave, or exa")
         .prompt()?;
     web.search.provider = match provider {
+        "duckduckgo" => WebSearchProvider::DuckDuckGo,
         "brave" => WebSearchProvider::Brave,
         "exa" => WebSearchProvider::Exa,
-        _ => WebSearchProvider::DuckDuckGo,
+        _ => WebSearchProvider::ExaFree,
     };
 
-    if web.search.provider == WebSearchProvider::DuckDuckGo {
+    if matches!(
+        web.search.provider,
+        WebSearchProvider::DuckDuckGo | WebSearchProvider::ExaFree
+    ) {
         web.search.api_key.clear();
     } else {
         let api_key = web.search.api_key.clone();

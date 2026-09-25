@@ -920,20 +920,24 @@ impl Default for GatewayConfig {
 
 /// Search backend used by the `web_search` tool.
 ///
-/// `DuckDuckGo` requires no registration/API key and is the default. `Brave`
-/// and `Exa` require an API key (read from `BRAVE_API_KEY` / `EXA_API_KEY`
-/// respectively, or the `api_key` config field). See `WebSearchTool::execute`
-/// in `src/agent/tools/web.rs` for the dispatch logic.
+/// `ExaFree` (Exa's keyless MCP endpoint) is the default; it and `DuckDuckGo`
+/// require no registration/API key. `Brave` and `Exa` require an API key (read
+/// from `BRAVE_API_KEY` / `EXA_API_KEY` respectively, or the `api_key` config
+/// field). See `WebSearchTool::execute` in `src/agent/tools/web.rs` for the
+/// dispatch logic.
 #[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
 #[serde(rename_all = "lowercase")]
 pub enum WebSearchProvider {
-    /// No registration/API key required — the default.
-    #[default]
+    /// DuckDuckGo Instant Answer API. No registration/API key required.
     DuckDuckGo,
     /// Requires a Brave Search API key.
     Brave,
     /// Requires an Exa API key.
     Exa,
+    /// Exa's keyless MCP endpoint (`mcp.exa.ai`) — the default. Rate-limited.
+    #[default]
+    #[serde(rename = "exa_free", alias = "exafree")]
+    ExaFree,
 }
 
 impl std::fmt::Display for WebSearchProvider {
@@ -948,12 +952,13 @@ impl WebSearchProvider {
             Self::DuckDuckGo => "duckduckgo",
             Self::Brave => "brave",
             Self::Exa => "exa",
+            Self::ExaFree => "exa_free",
         }
     }
 }
 
 fn default_web_search_provider() -> WebSearchProvider {
-    WebSearchProvider::DuckDuckGo
+    WebSearchProvider::ExaFree
 }
 fn default_web_search_max_results() -> u32 {
     20
@@ -966,8 +971,8 @@ fn default_web_search_timeout() -> u32 {
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct WebSearchConfig {
-    /// Search backend: `"duckduckgo"` (default, no registration required),
-    /// `"brave"`, or `"exa"`.
+    /// Search backend: `"exa_free"` (default, no registration required),
+    /// `"duckduckgo"` (no registration required), `"brave"`, or `"exa"`.
     #[serde(alias = "provider", default = "default_web_search_provider")]
     #[garde(skip)]
     pub provider: WebSearchProvider,
@@ -2505,7 +2510,7 @@ mod tests {
     #[test]
     fn test_web_search_defaults() {
         let cfg = WebSearchConfig::default();
-        assert_eq!(cfg.provider, WebSearchProvider::DuckDuckGo);
+        assert_eq!(cfg.provider, WebSearchProvider::ExaFree);
         assert_eq!(cfg.api_key, "");
         assert_eq!(cfg.base_url, "");
         assert_eq!(cfg.max_results, 20);
@@ -2547,6 +2552,23 @@ mod tests {
     }
 
     #[test]
+    fn test_web_search_exa_free_round_trip() {
+        let cfg: WebSearchConfig = serde_json::from_str(r#"{"provider": "exa_free"}"#).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::ExaFree);
+        assert_eq!(
+            serde_json::to_value(WebSearchProvider::ExaFree).unwrap(),
+            serde_json::json!("exa_free")
+        );
+        assert_eq!(WebSearchProvider::ExaFree.as_str(), "exa_free");
+    }
+
+    #[test]
+    fn test_web_search_deserialize_duckduckgo_explicit() {
+        let cfg: WebSearchConfig = serde_json::from_str(r#"{"provider": "duckduckgo"}"#).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::DuckDuckGo);
+    }
+
+    #[test]
     fn test_web_search_deserialize_rejects_unknown_provider() {
         let json = r#"{"provider": "tavily"}"#;
         assert!(serde_json::from_str::<WebSearchConfig>(json).is_err());
@@ -2575,7 +2597,7 @@ mod tests {
         assert_eq!(cfg.proxy, None);
         assert_eq!(cfg.timeout, 60);
         // nested search should carry WebSearchConfig defaults
-        assert_eq!(cfg.search.provider, WebSearchProvider::DuckDuckGo);
+        assert_eq!(cfg.search.provider, WebSearchProvider::ExaFree);
         assert_eq!(cfg.search.max_results, 20);
         assert_eq!(cfg.search.timeout, 30);
         assert!(cfg.validate().is_ok());
@@ -2588,7 +2610,7 @@ mod tests {
         assert!(!cfg.enable);
         assert_eq!(cfg.proxy, None);
         assert_eq!(cfg.timeout, 60);
-        assert_eq!(cfg.search.provider, WebSearchProvider::DuckDuckGo);
+        assert_eq!(cfg.search.provider, WebSearchProvider::ExaFree);
         assert!(cfg.validate().is_ok());
     }
 
