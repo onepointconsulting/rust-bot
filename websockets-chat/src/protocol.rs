@@ -78,6 +78,14 @@ pub struct ClientEnvelope {
     /// approved; every other call in the request is denied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_ids: Option<Vec<String>>,
+    /// Set only by [`Self::question_response`] — the id of the
+    /// `question_request` option the user picked, if any.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub option_id: Option<String>,
+    /// Set only by [`Self::question_response`] — the user's free-text
+    /// answer, if they typed one instead of picking an option.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub free_text: Option<String>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -108,6 +116,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -133,6 +143,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -157,6 +169,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -194,6 +208,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -216,6 +232,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -238,6 +256,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -263,6 +283,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -288,6 +310,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -315,6 +339,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -340,6 +366,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -371,6 +399,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -396,6 +426,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -417,6 +449,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -441,6 +475,8 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -467,6 +503,8 @@ impl ClientEnvelope {
             access_mode,
             request_id: None,
             approved_ids: None,
+            option_id: None,
+            free_text: None,
             webui: true,
         }
     }
@@ -495,6 +533,40 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: Some(request_id.into()),
             approved_ids: Some(approved_ids),
+            option_id: None,
+            free_text: None,
+            webui: true,
+        }
+    }
+
+    /// Answer a `question_request`. Exactly one of `option_id`/`free_text`
+    /// is normally set (an option pick or a typed answer); the reply is a
+    /// `question_resolved` fanned out to every tab on `chat_id`. Rejections
+    /// come back as `error` (`question_not_found`, `access_denied`,
+    /// `missing_request_id`).
+    pub fn question_response(
+        chat_id: impl Into<String>,
+        request_id: impl Into<String>,
+        option_id: Option<String>,
+        free_text: Option<String>,
+    ) -> Self {
+        Self {
+            type_: "question_response",
+            chat_id: Some(chat_id.into()),
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: None,
+            before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
+            request_id: Some(request_id.into()),
+            approved_ids: None,
+            option_id,
+            free_text,
             webui: true,
         }
     }
@@ -509,6 +581,16 @@ pub struct ToolApprovalCall {
     /// JSON-encoded arguments, truncated server-side (ends in `...` when cut).
     #[serde(default)]
     pub arguments_preview: String,
+}
+
+/// One option inside a `question_request` — mirrors the backend's
+/// `QuestionChoice` (`src/agent/question_broker.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct QuestionChoice {
+    pub id: String,
+    pub label: String,
+    #[serde(default)]
+    pub description: Option<String>,
 }
 
 /// One chat summary entry inside a `chats` event's list — mirrors the
@@ -741,6 +823,19 @@ pub enum ServerEvent {
     },
     /// `request_id` was answered (possibly from another tab); close its card.
     ToolApprovalResolved { chat_id: String, request_id: String },
+    /// The agent is waiting for the user to answer a clarifying question —
+    /// pick one of `options` or type free text. Answer with
+    /// [`ClientEnvelope::question_response`]. Also re-sent after `attached`
+    /// while the request is still open.
+    QuestionRequest {
+        chat_id: String,
+        turn_id: Option<String>,
+        request_id: String,
+        question: String,
+        options: Vec<QuestionChoice>,
+    },
+    /// `request_id` was answered (possibly from another tab); close its card.
+    QuestionResolved { chat_id: String, request_id: String },
     /// An `event` value this crate doesn't recognize (or a missing/non-string
     /// `event` field), carrying the raw decoded JSON so nothing is lost.
     Unknown(serde_json::Value),
@@ -773,7 +868,9 @@ impl ServerEvent {
             | ServerEvent::ModelPresetSet { chat_id, .. }
             | ServerEvent::ModeSet { chat_id, .. }
             | ServerEvent::ToolApprovalRequest { chat_id, .. }
-            | ServerEvent::ToolApprovalResolved { chat_id, .. } => Some(chat_id.as_str()),
+            | ServerEvent::ToolApprovalResolved { chat_id, .. }
+            | ServerEvent::QuestionRequest { chat_id, .. }
+            | ServerEvent::QuestionResolved { chat_id, .. } => Some(chat_id.as_str()),
             ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
             ServerEvent::SessionUpdated(value) | ServerEvent::GoalState(value) => {
                 value.get("chat_id").and_then(serde_json::Value::as_str)
@@ -1156,6 +1253,24 @@ struct ToolApprovalResolvedWire {
     request_id: String,
 }
 
+#[derive(Deserialize)]
+struct QuestionRequestWire {
+    chat_id: String,
+    #[serde(default)]
+    turn_id: Option<String>,
+    request_id: String,
+    #[serde(default)]
+    question: String,
+    #[serde(default)]
+    options: Vec<QuestionChoice>,
+}
+
+#[derive(Deserialize)]
+struct QuestionResolvedWire {
+    chat_id: String,
+    request_id: String,
+}
+
 /// Deserialize `value` into a specific wire shape, mapping any failure into a
 /// [`ProtocolError`] rather than a raw `serde_json::Error`.
 fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T, ProtocolError> {
@@ -1319,6 +1434,19 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                     chat_id: w.chat_id,
                     request_id: w.request_id,
                 }
+            })
+        }
+        "question_request" => decode::<QuestionRequestWire>(&value).map(|w| ServerEvent::QuestionRequest {
+            chat_id: w.chat_id,
+            turn_id: w.turn_id,
+            request_id: w.request_id,
+            question: w.question,
+            options: w.options,
+        }),
+        "question_resolved" => {
+            decode::<QuestionResolvedWire>(&value).map(|w| ServerEvent::QuestionResolved {
+                chat_id: w.chat_id,
+                request_id: w.request_id,
             })
         }
         _ => Ok(ServerEvent::Unknown(value)),
@@ -2455,6 +2583,86 @@ mod tests {
         let envelope = ClientEnvelope::tool_approval_response("chat-1", "req-1", Vec::new());
         let value = serde_json::to_value(&envelope).expect("should serialize");
         assert_eq!(value["approved_ids"], serde_json::json!([]));
+    }
+
+    #[test]
+    fn parses_question_request() {
+        let raw = r#"{"event":"question_request","chat_id":"chat-1","turn_id":"turn-1","request_id":"req-1","question":"Which one?","options":[{"id":"0","label":"A","description":"first"},{"id":"1","label":"B"}]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::QuestionRequest {
+                chat_id: "chat-1".to_string(),
+                turn_id: Some("turn-1".to_string()),
+                request_id: "req-1".to_string(),
+                question: "Which one?".to_string(),
+                options: vec![
+                    QuestionChoice {
+                        id: "0".to_string(),
+                        label: "A".to_string(),
+                        description: Some("first".to_string()),
+                    },
+                    QuestionChoice {
+                        id: "1".to_string(),
+                        label: "B".to_string(),
+                        description: None,
+                    },
+                ],
+            }
+        );
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn parses_question_resolved() {
+        let raw = r#"{"event":"question_resolved","chat_id":"chat-1","request_id":"req-1"}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::QuestionResolved {
+                chat_id: "chat-1".to_string(),
+                request_id: "req-1".to_string(),
+            }
+        );
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn client_envelope_question_response_serializes_selected_option() {
+        let envelope =
+            ClientEnvelope::question_response("chat-1", "req-1", Some("0".to_string()), None);
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "question_response",
+                "chat_id": "chat-1",
+                "request_id": "req-1",
+                "option_id": "0",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_question_response_serializes_free_text() {
+        let envelope = ClientEnvelope::question_response(
+            "chat-1",
+            "req-1",
+            None,
+            Some("my own answer".to_string()),
+        );
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "question_response",
+                "chat_id": "chat-1",
+                "request_id": "req-1",
+                "free_text": "my own answer",
+                "webui": true,
+            })
+        );
     }
 
     #[test]

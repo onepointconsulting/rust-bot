@@ -2,6 +2,7 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 
+use crate::agent::question_broker::QuestionChoice;
 use crate::agent::tool_approval::ToolApprovalCall;
 use crate::bus::events::OutboundMessage;
 
@@ -103,6 +104,16 @@ pub struct ToolApprovalRequestEvent {
     pub calls: Vec<ToolApprovalCall>,
 }
 
+/// Ask the chat's user a clarifying question with multiple-choice options
+/// (plus an always-available free-text fallback); answered through
+/// [`crate::agent::question_broker::QuestionBroker::resolve`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuestionRequestEvent {
+    pub request_id: String,
+    pub question: String,
+    pub options: Vec<QuestionChoice>,
+}
+
 /// Typed outbound control/event envelope. Display text stays on
 /// [`crate::bus::events::OutboundMessage::content`]; variants carry only
 /// discriminant + control fields.
@@ -120,6 +131,7 @@ pub enum OutboundEvent {
     RuntimeModelUpdated(RuntimeModelUpdatedEvent),
     TurnModelUpdated(TurnModelUpdatedEvent),
     ToolApprovalRequest(ToolApprovalRequestEvent),
+    QuestionRequest(QuestionRequestEvent),
 }
 
 /// Build an :class:`OutboundMessage` for a typed event.

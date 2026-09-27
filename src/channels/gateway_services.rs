@@ -2,8 +2,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use crate::{
-    agent::agent_loop::AgentLoop, agent::tool_approval::ToolApprovalBroker,
-    bus::events::InboundMessage,
+    agent::agent_loop::AgentLoop, agent::question_broker::QuestionBroker,
+    agent::tool_approval::ToolApprovalBroker, bus::events::InboundMessage,
     channels::websocket::webui::transcript::WebUiTranscriptRecorder, config::paths::get_webui_dir,
     security::WebUIIngressPolicy, session::websocket_turns::WebsocketTurnRegistry,
 };
@@ -64,6 +64,9 @@ pub struct GatewayServices {
     /// `None` unless `tools.confirmBeforeExecute` is on and `run_gateway`
     /// injected the broker via [`Self::set_tool_approvals`].
     tool_approvals: Arc<Mutex<Option<Arc<ToolApprovalBroker>>>>,
+    /// `None` unless the `question` tool is enabled and `run_gateway`
+    /// injected its broker via [`Self::set_question_broker`].
+    question_broker: Arc<Mutex<Option<Arc<QuestionBroker>>>>,
 }
 
 impl GatewayServices {
@@ -77,6 +80,7 @@ impl GatewayServices {
             transcripts: Arc::new(Mutex::new(WebUiTranscriptRecorder::new(webui_dir))),
             work_canceller: Arc::new(Mutex::new(None)),
             tool_approvals: Arc::new(Mutex::new(None)),
+            question_broker: Arc::new(Mutex::new(None)),
         }
     }
 
@@ -114,6 +118,22 @@ impl GatewayServices {
 
     pub fn tool_approvals(&self) -> Option<Arc<ToolApprovalBroker>> {
         self.tool_approvals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Inject the broker that `question_response` envelopes resolve against.
+    /// Same "before `router()`" requirement as [`Self::set_work_canceller`].
+    pub fn set_question_broker(&self, broker: Arc<QuestionBroker>) {
+        *self
+            .question_broker
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(broker);
+    }
+
+    pub fn question_broker(&self) -> Option<Arc<QuestionBroker>> {
+        self.question_broker
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone()

@@ -5,8 +5,8 @@ use chat_ui::models::{
 };
 use leptos::prelude::*;
 
-use crate::components::{MessageList, ToolApprovalCard};
-use crate::state::{ConnectionStatus, PendingApproval};
+use crate::components::{AskQuestionCard, MessageList, ToolApprovalCard};
+use crate::state::{ConnectionStatus, PendingApproval, PendingQuestion};
 
 /// Small dot + label in the header showing the gateway WebSocket's current
 /// lifecycle state (see [`ConnectionStatus`] for what drives it).
@@ -68,6 +68,9 @@ pub fn ChatShell(
     #[prop(into)] pending_approval: Signal<Option<PendingApproval>>,
     on_toggle_approval_call: impl Fn(String) + 'static + Send + Sync + Copy,
     on_answer_approval: impl Fn(Vec<String>) + 'static + Send + Sync + Copy,
+    #[prop(into)] pending_question: Signal<Option<PendingQuestion>>,
+    on_select_question_option: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_answer_question_free_text: impl Fn(String) + 'static + Send + Sync + Copy,
     #[prop(into)] model_presets: Signal<Vec<String>>,
     #[prop(into)] selected_model_preset: Signal<String>,
     on_select_model_preset: impl Fn(String) + 'static + Send + Sync + Copy,
@@ -165,6 +168,11 @@ pub fn ChatShell(
                     approval=pending_approval
                     on_toggle=Callback::new(move |id| on_toggle_approval_call(id))
                     on_answer=Callback::new(move |ids| on_answer_approval(ids))
+                />
+                <AskQuestionCard
+                    question=pending_question
+                    on_select=Callback::new(move |id| on_select_question_option(id))
+                    on_free_text=Callback::new(move |text| on_answer_question_free_text(text))
                 />
                 <ChatInput
                     pending=pending

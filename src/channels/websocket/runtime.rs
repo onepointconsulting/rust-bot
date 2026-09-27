@@ -27,6 +27,7 @@ use crate::agent::agent_loop::AgentLoop;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::skills::SkillsLoader;
+use crate::agent::question_broker::{QuestionChoice, ResolveError};
 use crate::agent::tool_approval::ToolApprovalCall;
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
@@ -653,6 +654,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::ToolApprovalResponse => {
             handle_envelope_tool_approval_response(envelope_dispatch_context).await;
+        }
+        EnvelopeType::QuestionResponse => {
+            handle_envelope_question_response(envelope_dispatch_context).await;
         }
         EnvelopeType::Unrecognized(t) => {
             send_event(
@@ -1315,6 +1319,7 @@ async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchC
 
     attach_chat(connection_id, cid, shared).await;
     resend_pending_tool_approvals(shared, connection_id, cid).await;
+    resend_pending_questions(shared, connection_id, cid).await;
 }
 
 async fn handle_envelope_new_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
@@ -1877,6 +1882,180 @@ async fn resend_pending_tool_approvals(shared: &WsShared, connection_id: &str, c
             turn_id.as_deref(),
             &request.request_id,
             &request.calls,
+        );
+        if sender.send(Message::text(body.to_string())).is_err() {
+            return;
+        }
+    }
+}
+
+/// `question_request` frame, shared by the live fan-out in
+/// `WebSocketChannel::send` and the re-send on `attach`.
+fn question_request_payload(
+    chat_id: &str,
+    turn_id: Option<&str>,
+    request_id: &str,
+    question: &str,
+    options: &[QuestionChoice],
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "event": WsOutboundEvent::QuestionRequest.as_str(),
+        "chat_id": chat_id,
+        "request_id": request_id,
+        "question": question,
+        "options": options,
+    });
+    if let Some(turn_id) = turn_id {
+        body["turn_id"] = serde_json::json!(turn_id);
+    }
+    body
+}
+
+/// Handle a `question_response` envelope: hand `option_id`/`free_text` to
+/// the waiting [`crate::agent::question_broker::QuestionBroker`] request,
+/// then tell every tab on the chat that the request is settled. A missing or
+/// malformed answer counts as "no answer" rather than an error, so the turn
+/// never hangs on a half-understood reply.
+async fn handle_envelope_question_response<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
+        return;
+    }
+
+    let Some(request_id) = envelope_dispatch_context
+        .envelope
+        .get("request_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+    else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing_request_id"}),
+        )
+        .await;
+        return;
+    };
+    let option_id = envelope_dispatch_context
+        .envelope
+        .get("option_id")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+    let free_text = envelope_dispatch_context
+        .envelope
+        .get("free_text")
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(str::to_string);
+
+    let Some(broker) = shared.gateway_services.question_broker() else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "question_not_found", "request_id": request_id}),
+        )
+        .await;
+        return;
+    };
+    if let Err(err) = broker.resolve(cid, request_id, option_id, free_text) {
+        let detail = match err {
+            ResolveError::NotFound => "question_not_found",
+            ResolveError::ChatMismatch => "access_denied",
+        };
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": detail, "request_id": request_id}),
+        )
+        .await;
+        return;
+    }
+
+    let recipients = {
+        let connections = shared.connections.lock().await;
+        let mut recipients = connections.senders_for_chat(cid);
+        if !recipients.iter().any(|(id, _)| id == connection_id)
+            && let Some(sender) = connections.sender_for(connection_id)
+        {
+            recipients.push((connection_id.to_string(), sender));
+        }
+        recipients
+    };
+    let raw = serde_json::json!({
+        "event": WsOutboundEvent::QuestionResolved.as_str(),
+        "chat_id": cid,
+        "request_id": request_id,
+    })
+    .to_string();
+    for (recipient_id, tx) in recipients {
+        if tx.send(Message::text(raw.clone())).is_err() {
+            shared
+                .connections
+                .lock()
+                .await
+                .cleanup_connection(&recipient_id);
+        }
+    }
+}
+
+/// Re-send any question still waiting on `chat_id` to one connection, so a
+/// reloaded or late-joining tab can answer it.
+async fn resend_pending_questions(shared: &WsShared, connection_id: &str, chat_id: &str) {
+    let Some(broker) = shared.gateway_services.question_broker() else {
+        return;
+    };
+    let pending = broker.pending_for_chat(chat_id);
+    if pending.is_empty() {
+        return;
+    }
+    let turn_id = shared
+        .gateway_services
+        .turn_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .websocket_turn_id(chat_id);
+    let Some(sender) = shared.connections.lock().await.sender_for(connection_id) else {
+        return;
+    };
+    for request in pending {
+        let body = question_request_payload(
+            chat_id,
+            turn_id.as_deref(),
+            &request.request_id,
+            &request.question,
+            &request.options,
         );
         if sender.send(Message::text(body.to_string())).is_err() {
             return;
@@ -3906,6 +4085,23 @@ impl BaseChannel for WebSocketChannel {
                     turn_id.as_deref(),
                     &event.request_id,
                     &event.calls,
+                );
+                self.fan_out_to_chat(&msg.chat_id, &body.to_string()).await;
+                return Ok(());
+            }
+            Some(OutboundEvent::QuestionRequest(event)) => {
+                let turn_id = self
+                    .gateway_services
+                    .turn_registry
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .websocket_turn_id(&msg.chat_id);
+                let body = question_request_payload(
+                    &msg.chat_id,
+                    turn_id.as_deref(),
+                    &event.request_id,
+                    &event.question,
+                    &event.options,
                 );
                 self.fan_out_to_chat(&msg.chat_id, &body.to_string()).await;
                 return Ok(());

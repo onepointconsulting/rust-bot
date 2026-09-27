@@ -16,7 +16,7 @@ use std::collections::HashMap;
 
 use chat_ui::models::{ChatEntry, ImageAttachment, Role, SessionListItem, ToolEvent};
 
-use crate::protocol::ToolApprovalCall;
+use crate::protocol::{QuestionChoice, ToolApprovalCall};
 
 /// Prefix identifying a gateway-served media URL (`serve_media` in
 /// `src/channels/websocket/webui/media.rs`) rather than a `data:` or
@@ -726,6 +726,26 @@ impl PendingApproval {
     }
 }
 
+/// An open `question_request` awaiting an answer. Plain data on the parent's
+/// signal, same reasoning as [`PendingApproval`] — a re-sent request (after
+/// reconnect) mustn't desync from what the card is showing.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PendingQuestion {
+    pub request_id: String,
+    pub question: String,
+    pub options: Vec<QuestionChoice>,
+}
+
+impl PendingQuestion {
+    pub fn new(request_id: String, question: String, options: Vec<QuestionChoice>) -> Self {
+        Self {
+            request_id,
+            question,
+            options,
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -760,6 +780,27 @@ mod tests {
         pending.toggle_call("unknown");
         assert_eq!(pending.approved_ids(), vec!["a", "b"]);
     }
+
+    fn question_choice(id: &str) -> QuestionChoice {
+        QuestionChoice {
+            id: id.to_string(),
+            label: format!("Option {id}"),
+            description: None,
+        }
+    }
+
+    #[test]
+    fn pending_question_holds_the_question_and_options() {
+        let pending = PendingQuestion::new(
+            "req-1".to_string(),
+            "Which one?".to_string(),
+            vec![question_choice("0"), question_choice("1")],
+        );
+        assert_eq!(pending.request_id, "req-1");
+        assert_eq!(pending.question, "Which one?");
+        assert_eq!(pending.options, vec![question_choice("0"), question_choice("1")]);
+    }
+
     use chat_ui::models::{ImageAttachment, Role};
 
     fn assistant_entry(id: u64) -> ChatEntry {

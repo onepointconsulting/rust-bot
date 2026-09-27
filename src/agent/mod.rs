@@ -7,6 +7,7 @@ pub mod hook;
 pub mod memory;
 pub mod model_runtime;
 pub mod modes;
+pub mod question_broker;
 pub mod runner;
 pub mod skills;
 pub mod subagent;

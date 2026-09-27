@@ -1260,6 +1260,12 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                 .gateway_services
                 .set_tool_approvals(Arc::clone(broker));
         }
+        if let Some(broker) = with_question_tool(&agent_loop, |tool| tool.broker()) {
+            ws_channel
+                .shared()
+                .gateway_services
+                .set_question_broker(broker);
+        }
     }
     let mut channel_manager = ChannelManager::new(
         Arc::clone(&config),
@@ -1748,20 +1754,19 @@ async fn handle_cli_system_message(
     agent_loop.process_system_message(msg).await
 }
 
-/// Run `f` against the registered `question` tool, if any. Used to wire the
-/// CLI-only spinner renderer and Herdr reporter into it the same way
-/// `CliAskHook`'s are wired, since `Tool::execute` has no access to either.
-fn with_question_tool<F: FnOnce(&QuestionTool)>(agent_loop: &AgentLoop, f: F) {
+/// Run `f` against the registered `question` tool, if any, and return its
+/// result. Used to wire the CLI-only spinner renderer and Herdr reporter into
+/// it the same way `CliAskHook`'s are wired, and to pull out its
+/// `QuestionBroker` for the WebSocket channel's `GatewayServices` — in both
+/// cases since `Tool::execute` has no access to any of them directly.
+fn with_question_tool<F: FnOnce(&QuestionTool) -> R, R>(agent_loop: &AgentLoop, f: F) -> Option<R> {
     let tool = {
         let guard = agent_loop.tools.lock().unwrap_or_else(|e| e.into_inner());
         guard.get(QUESTION_TOOL_NAME)
     };
-    if let Some(tool) = tool
-        .as_ref()
+    tool.as_ref()
         .and_then(|t| (t.as_ref() as &dyn std::any::Any).downcast_ref::<QuestionTool>())
-    {
-        f(tool);
-    }
+        .map(f)
 }
 
 async fn message_session(
@@ -1784,7 +1789,7 @@ async fn message_session(
     if let Some(hook) = &confirm_hook {
         hook.set_renderer(Arc::clone(&renderer));
     }
-    with_question_tool(&agent_loop, |tool| {
+    let _ = with_question_tool(&agent_loop, |tool| {
         tool.set_renderer(Arc::clone(&renderer));
         tool.set_herdr(Arc::clone(&herdr));
     });
@@ -1811,7 +1816,7 @@ async fn message_session(
             if let Some(hook) = &confirm_hook {
                 hook.clear_renderer();
             }
-            with_question_tool(&agent_loop, |tool| tool.clear_renderer());
+            let _ = with_question_tool(&agent_loop, |tool| tool.clear_renderer());
             herdr.report_idle();
             println!("Cancelled.");
             return Ok(());
@@ -1835,7 +1840,7 @@ async fn message_session(
     if let Some(hook) = &confirm_hook {
         hook.clear_renderer();
     }
-    with_question_tool(&agent_loop, |tool| tool.clear_renderer());
+    let _ = with_question_tool(&agent_loop, |tool| tool.clear_renderer());
     herdr.report_idle();
     Ok(())
 }

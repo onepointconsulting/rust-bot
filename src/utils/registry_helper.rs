@@ -1,4 +1,5 @@
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use crate::{
     agent::{
@@ -16,6 +17,7 @@ use crate::{
             web::{WebFetchTool, WebSearchTool},
         },
     },
+    bus::queue::MessageBus,
     config::schema::{
         DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig,
         QuestionToolConfig, WebToolsConfig,
@@ -156,12 +158,16 @@ pub fn register_image_generation_tools(
     tools.register(Box::new(tool));
 }
 
-pub fn register_question_tool(question_config: &QuestionToolConfig, tools: &mut ToolRegistry) {
+pub fn register_question_tool(
+    question_config: &QuestionToolConfig,
+    bus: Arc<MessageBus>,
+    tools: &mut ToolRegistry,
+) {
     if !question_config.enabled {
         return;
     }
     log::debug!("Registering question tool");
-    tools.register(Box::new(QuestionTool::new()));
+    tools.register(Box::new(QuestionTool::new(Some(bus))));
 }
 
 #[cfg(test)]

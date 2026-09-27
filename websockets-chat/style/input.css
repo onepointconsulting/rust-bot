@@ -133,6 +133,79 @@
     white-space: pre-wrap;
     word-break: break-all;
   }
+
+  /* Ask-question card above the composer (components/ask_question.rs). */
+  .ask-question {
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    max-height: 40%;
+    overflow-y: auto;
+    border-top: 1px solid #bfdbfe; /* blue-200 */
+    background-color: #eff6ff; /* blue-50 */
+    padding: 0.625rem 1rem;
+  }
+  .ask-question__title {
+    font-size: 0.75rem;
+    font-weight: 600;
+    color: #1e40af; /* blue-800 */
+  }
+  .ask-question__list {
+    display: flex;
+    flex-direction: column;
+    gap: 0.375rem;
+  }
+  .ask-question__option {
+    display: flex;
+    flex-direction: column;
+    width: 100%;
+    border-radius: 0.5rem;
+    background-color: #ffffff;
+    padding: 0.375rem 0.625rem;
+    text-align: left;
+    font-size: 0.75rem;
+    color: #334155; /* slate-700 */
+    box-shadow: 0 0 0 1px #bfdbfe; /* blue-200 */
+    cursor: pointer;
+  }
+  .ask-question__option:hover {
+    background-color: #dbeafe; /* blue-100 */
+  }
+  .ask-question__option-label {
+    font-weight: 600;
+  }
+  .ask-question__option-description {
+    margin-top: 0.125rem;
+    font-size: 0.7rem;
+    color: #64748b; /* slate-500 */
+  }
+  .ask-question__free-text {
+    display: flex;
+    align-items: center;
+    gap: 0.375rem;
+  }
+  .ask-question__free-text-input {
+    flex: 1;
+    border-radius: 0.5rem;
+    border: 1px solid #bfdbfe; /* blue-200 */
+    padding: 0.375rem 0.625rem;
+    font-size: 0.75rem;
+    outline: none;
+  }
+  .ask-question__free-text-input:focus {
+    border-color: #3b82f6; /* blue-500 */
+  }
+  .ask-question__free-text-submit {
+    border-radius: 9999px;
+    background-color: #2563eb; /* blue-600 */
+    padding: 0.25rem 0.75rem;
+    font-size: 0.75rem;
+    font-weight: 500;
+    color: #ffffff;
+  }
+  .ask-question__free-text-submit:hover {
+    background-color: #1d4ed8; /* blue-700 */
+  }
 }
 
 @keyframes ws-chat-pulse {

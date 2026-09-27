@@ -89,6 +89,10 @@ pub enum EnvelopeType {
     /// approved (`approved_ids`); every other call in the request is denied.
     /// Rust-side addition, no nanobot precedent.
     ToolApprovalResponse,
+    /// Answer a pending `question_request` with either the id of the option
+    /// the user picked or free text (or neither, if unanswered). Rust-side
+    /// addition, no nanobot precedent.
+    QuestionResponse,
     /// An envelope whose `type` didn't match any known variant. Carries the
     /// raw type string so the dispatcher can reply with nanobot's
     /// `f"unknown type: {t!r}"` (`runtime.py:850`) — by the time an envelope
@@ -122,6 +126,7 @@ impl From<&str> for EnvelopeType {
             "clear_session" => Self::ClearSession,
             "get_session_summary" => Self::GetSessionSummary,
             "tool_approval_response" => Self::ToolApprovalResponse,
+            "question_response" => Self::QuestionResponse,
             other => Self::Unrecognized(other.to_string()),
         }
     }
@@ -190,6 +195,12 @@ pub enum WsOutboundEvent {
     /// Fan-out after [`EnvelopeType::ToolApprovalResponse`] resolved a
     /// request, so every other tab closes its approval card.
     ToolApprovalResolved,
+    /// Fan-out asking the chat's user a clarifying question with
+    /// multiple-choice options (plus a free-text fallback).
+    QuestionRequest,
+    /// Fan-out after [`EnvelopeType::QuestionResponse`] resolved a request,
+    /// so every other tab closes its question card.
+    QuestionResolved,
 }
 
 impl WsOutboundEvent {
@@ -216,6 +227,8 @@ impl WsOutboundEvent {
             Self::Directories => "directories",
             Self::ToolApprovalRequest => "tool_approval_request",
             Self::ToolApprovalResolved => "tool_approval_resolved",
+            Self::QuestionRequest => "question_request",
+            Self::QuestionResolved => "question_resolved",
         }
     }
 }
@@ -600,6 +613,10 @@ mod tests {
             EnvelopeType::from("tool_approval_response"),
             EnvelopeType::ToolApprovalResponse
         );
+        assert_eq!(
+            EnvelopeType::from("question_response"),
+            EnvelopeType::QuestionResponse
+        );
     }
 
     #[test]
@@ -611,6 +628,18 @@ mod tests {
         assert_eq!(
             WsOutboundEvent::ToolApprovalResolved.as_str(),
             "tool_approval_resolved"
+        );
+    }
+
+    #[test]
+    fn ws_outbound_event_question_names() {
+        assert_eq!(
+            WsOutboundEvent::QuestionRequest.as_str(),
+            "question_request"
+        );
+        assert_eq!(
+            WsOutboundEvent::QuestionResolved.as_str(),
+            "question_resolved"
         );
     }
 

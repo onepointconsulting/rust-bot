@@ -387,14 +387,19 @@ struct WsContext {
     workspace_popup: RwSignal<Option<WorkspaceDialogState>>,
     /// Open `tool_approval_request` for the active chat, shown as the
     /// approval card above the composer. Cleared on `tool_approval_resolved`
-    /// and wherever the turn itself ends (see [`clear_turn_approval`]).
+    /// and wherever the turn itself ends (see [`clear_turn_prompts`]).
     pending_approval: RwSignal<Option<state::PendingApproval>>,
+    /// Open `question_request` for the active chat, shown as the question
+    /// card above the composer. Cleared on `question_resolved` and wherever
+    /// the turn itself ends (see [`clear_turn_prompts`]).
+    pending_question: RwSignal<Option<state::PendingQuestion>>,
 }
 
-/// Drop the approval card. Called alongside every `active_turn_id` reset:
-/// once the turn is over, nothing is waiting on the answer anymore.
-fn clear_turn_approval(ctx: &WsContext) {
+/// Drop the approval/question cards. Called alongside every `active_turn_id`
+/// reset: once the turn is over, nothing is waiting on an answer anymore.
+fn clear_turn_prompts(ctx: &WsContext) {
     ctx.pending_approval.set(None);
+    ctx.pending_question.set(None);
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -526,7 +531,7 @@ fn handle_message_event(
                         );
                     });
                     ctx.active_turn_id.set(None);
-                    clear_turn_approval(ctx);
+                    clear_turn_prompts(ctx);
                     ctx.split_stream_on_next_delta.set(false);
                     request_chat_list(ctx);
                     schedule_delayed_chat_list_refresh(*ctx);
@@ -617,7 +622,7 @@ fn handle_stream_end(
     } else {
         ctx.split_stream_on_next_delta.set(false);
         ctx.active_turn_id.set(None);
-        clear_turn_approval(ctx);
+        clear_turn_prompts(ctx);
         request_chat_list(ctx);
         schedule_delayed_chat_list_refresh(*ctx);
     }
@@ -666,7 +671,7 @@ fn handle_turn_aborted(ctx: &WsContext, turn_id: Option<String>) {
         state::apply_turn_aborted(entries, index, &active_turn_id);
     });
     ctx.active_turn_id.set(None);
-    clear_turn_approval(ctx);
+    clear_turn_prompts(ctx);
     ctx.split_stream_on_next_delta.set(false);
     // The aborted turn still persisted its user message, so the chat's
     // sidebar ordering (and possibly its generated title) has moved on.
@@ -814,7 +819,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // the turn itself (if any) is unaffected, so just drop the card.
             if matches!(detail.as_str(), "approval_not_found" | "missing_request_id") {
                 log::info!("tool approval rejected: {detail}");
-                clear_turn_approval(ctx);
+                clear_turn_prompts(ctx);
                 return;
             }
             if matches!(
@@ -838,7 +843,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 });
             }
             ctx.active_turn_id.set(None);
-            clear_turn_approval(ctx);
+            clear_turn_prompts(ctx);
             ctx.split_stream_on_next_delta.set(false);
         }
         ServerEvent::Attached {
@@ -858,7 +863,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.turn_index.set(HashMap::new());
             ctx.active_turn_id.set(None);
             // A still-open request is re-sent right after `attached`.
-            clear_turn_approval(ctx);
+            clear_turn_prompts(ctx);
             ctx.split_stream_on_next_delta.set(false);
             // Older gateway with no catalog yet: leave whatever was last
             // known rather than flashing the picker away. The selection
@@ -971,7 +976,25 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 .get_untracked()
                 .is_some_and(|pending| pending.request_id == request_id)
             {
-                clear_turn_approval(ctx);
+                ctx.pending_approval.set(None);
+            }
+        }
+        ServerEvent::QuestionRequest {
+            request_id,
+            question,
+            options,
+            ..
+        } => {
+            ctx.pending_question
+                .set(Some(state::PendingQuestion::new(request_id, question, options)));
+        }
+        ServerEvent::QuestionResolved { request_id, .. } => {
+            if ctx
+                .pending_question
+                .get_untracked()
+                .is_some_and(|pending| pending.request_id == request_id)
+            {
+                ctx.pending_question.set(None);
             }
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
@@ -1410,6 +1433,31 @@ fn request_tool_approval_response(ctx: &WsContext, approved_ids: Vec<String>) {
     );
 }
 
+/// Answer the active chat's pending `question_request` with either a picked
+/// option id or free text.
+fn request_question_response(
+    ctx: &WsContext,
+    option_id: Option<String>,
+    free_text: Option<String>,
+) {
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    let Some(pending) = ctx.pending_question.get_untracked() else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::question_response(
+            chat_id,
+            pending.request_id,
+            option_id,
+            free_text,
+        ),
+        "Failed to encode the question response.",
+    );
+}
+
 /// Ask the gateway to change the active chat's model-preset override.
 ///
 /// Applies `name` optimistically (before the ack) so the trigger label
@@ -1457,7 +1505,7 @@ fn reset_local_transcript(ctx: &WsContext) {
     ctx.next_id.set(0);
     ctx.turn_index.set(HashMap::new());
     ctx.active_turn_id.set(None);
-    clear_turn_approval(ctx);
+    clear_turn_prompts(ctx);
     ctx.chat_id.set(None);
     ctx.chat_error.set(None);
     ctx.split_stream_on_next_delta.set(false);
@@ -1568,7 +1616,7 @@ fn handle_session_cleared(ctx: &WsContext, chat_id: String) {
     ctx.next_id.set(0);
     ctx.turn_index.set(HashMap::new());
     ctx.active_turn_id.set(None);
-    clear_turn_approval(ctx);
+    clear_turn_prompts(ctx);
     ctx.split_stream_on_next_delta.set(false);
     ctx.chat_error.set(None);
     ctx.session_usage.set(None);
@@ -1745,6 +1793,7 @@ pub fn App() -> impl IntoView {
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
     let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
     let pending_approval = RwSignal::new(None::<state::PendingApproval>);
+    let pending_question = RwSignal::new(None::<state::PendingQuestion>);
 
     let ws_context = WsContext {
         token,
@@ -1774,6 +1823,7 @@ pub fn App() -> impl IntoView {
         summary_popup,
         workspace_popup,
         pending_approval,
+        pending_question,
     };
 
     // Session restored from a previous page load: reopen the WebSocket so a
@@ -1835,6 +1885,7 @@ pub fn App() -> impl IntoView {
                     turn_index.set(HashMap::new());
                     active_turn_id.set(None);
                     pending_approval.set(None);
+                    pending_question.set(None);
                     split_stream_on_next_delta.set(false);
                     reconnect_attempt.set(0);
                     reconnect_exhausted.set(false);
@@ -1873,6 +1924,7 @@ pub fn App() -> impl IntoView {
         turn_index.set(HashMap::new());
         active_turn_id.set(None);
         pending_approval.set(None);
+        pending_question.set(None);
         split_stream_on_next_delta.set(false);
         composer_draft.set(String::new());
         chat_error.set(None);
@@ -2008,6 +2060,12 @@ pub fn App() -> impl IntoView {
     let on_answer_approval = move |approved_ids: Vec<String>| {
         request_tool_approval_response(&ws_context, approved_ids);
     };
+    let on_select_question_option = move |option_id: String| {
+        request_question_response(&ws_context, Some(option_id), None);
+    };
+    let on_answer_question_free_text = move |free_text: String| {
+        request_question_response(&ws_context, None, Some(free_text));
+    };
     let on_select_model_preset = move |name: String| request_set_model_preset(&ws_context, name);
     let on_select_agent_mode = move |name: String| request_set_agent_mode(&ws_context, name);
 
@@ -2088,6 +2146,9 @@ pub fn App() -> impl IntoView {
                     pending_approval=Signal::derive(move || pending_approval.get())
                     on_toggle_approval_call=on_toggle_approval_call
                     on_answer_approval=on_answer_approval
+                    pending_question=Signal::derive(move || pending_question.get())
+                    on_select_question_option=on_select_question_option
+                    on_answer_question_free_text=on_answer_question_free_text
                     model_presets=Signal::derive(move || model_presets.get())
                     selected_model_preset=Signal::derive(move || model_preset.get())
                     on_select_model_preset=on_select_model_preset

@@ -75,7 +75,7 @@ use crate::utils::registry_helper::{
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
 
-const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron", "update_goal"];
+const CONTEXT_AWARE_TOOLS: &[&str] = &["message", "spawn", "cron", "update_goal", "question"];
 
 // Match Python's optional async callbacks (`tool_hint=True` keyword in
 // Python). The `ProgressKind` discriminant tells sinks what kind of update
@@ -781,7 +781,7 @@ impl AgentLoop {
             tools,
         );
         register_image_generation_tools(image_generation_config, workspace, tools);
-        register_question_tool(question_config, tools);
+        register_question_tool(question_config, bus.clone(), tools);
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",
