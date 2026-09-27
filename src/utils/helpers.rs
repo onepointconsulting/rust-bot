@@ -682,7 +682,7 @@ pub fn build_status_content(
             ctx_used_str, ctx_total_str, ctx_pct
         ),
         format!("💬 Session: {} messages", session_msg_count),
-        format!("⏱ Uptime: {}", uptime),
+        format!("⏱  Uptime: {}", uptime),
     ];
     if let Some(s) = search_usage_text {
         lines.push(s.to_string());

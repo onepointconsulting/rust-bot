@@ -16,7 +16,7 @@ use crate::{
         outbound_events::{OutboundEvent, ProgressKind},
         queue::MessageBus,
     },
-    channels::{base::BaseChannel, registry::discover_all, websocket::CHANNEL_NAME},
+    channels::{base::BaseChannel, registry::discover_all},
     config::schema::Config,
     security::workspace_requests::WorkspaceRequestHandler,
     session::manager::SessionManager,
@@ -618,6 +618,7 @@ impl ChannelManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::channels::websocket::CHANNEL_NAME;
     use crate::config::schema::ChannelsConfig;
     use serde_json::json;
 

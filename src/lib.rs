@@ -7,6 +7,7 @@ pub mod command;
 pub mod config;
 pub mod cron;
 pub mod heartbeat;
+pub mod integrations;
 pub mod pairing;
 pub mod providers;
 pub mod runtime_context;

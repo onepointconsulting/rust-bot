@@ -16,6 +16,7 @@ use crate::bus::queue::MessageBus;
 use crate::channels::websocket::CHANNEL_NAME as WEBSOCKET_CHANNEL;
 use crate::cli::cancel::pause_for_prompt;
 use crate::cli::stream::StreamRenderer;
+use crate::integrations::herdr::HerdrReporter;
 use crate::providers::base::ToolCallRequest;
 
 const ARG_PREVIEW_LIMIT: usize = 120;
@@ -25,12 +26,14 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// CLI-only hook that asks before each tool call when stdin is a terminal.
 pub struct CliAskHook {
     renderer: StdMutex<Option<Arc<Mutex<StreamRenderer>>>>,
+    herdr: Arc<HerdrReporter>,
 }
 
 impl CliAskHook {
-    pub fn new() -> Self {
+    pub fn new(herdr: Arc<HerdrReporter>) -> Self {
         Self {
             renderer: StdMutex::new(None),
+            herdr,
         }
     }
 
@@ -106,6 +109,7 @@ impl AgentHook for CliAskHook {
         if let Some(renderer) = self.renderer() {
             renderer.lock().await.stop_for_input();
         }
+        self.herdr.report_blocked(None);
         let _pause = pause_for_prompt();
         let tool_calls = context.tool_calls.clone();
         let denied_ids = tokio::task::spawn_blocking(move || prompt_tool_calls(&tool_calls))
@@ -118,6 +122,7 @@ impl AgentHook for CliAskHook {
                     .collect()
             });
         drop(_pause);
+        self.herdr.report_working();
         if let Some(renderer) = self.renderer() {
             renderer.lock().await.resume_after_input();
         }
@@ -305,7 +310,7 @@ mod tests {
         if std::io::stdin().is_terminal() {
             return;
         }
-        let hook = CliAskHook::new();
+        let hook = CliAskHook::new(HerdrReporter::disabled_for_test());
         let mut ctx = AgentHookContext::new(0, vec![]);
         ctx.tool_calls.push(make_tool_call(
             "call_1",
@@ -328,7 +333,9 @@ mod tests {
         ctx
     }
 
-    fn websocket_hook(broker: &Arc<ToolApprovalBroker>) -> (Arc<WebsocketsAskHook>, Arc<MessageBus>) {
+    fn websocket_hook(
+        broker: &Arc<ToolApprovalBroker>,
+    ) -> (Arc<WebsocketsAskHook>, Arc<MessageBus>) {
         let bus = Arc::new(MessageBus::new());
         let hook = WebsocketsAskHook::new(Arc::clone(broker));
         hook.set_bus(Arc::clone(&bus));

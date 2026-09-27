@@ -9,6 +9,7 @@ use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::agent::cron_context::with_cron_context_stack;
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::tool_approval::ToolApprovalBroker;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
 use crate::api::login::{
@@ -30,7 +31,6 @@ use crate::channels::websocket::runtime::WebSocketChannel;
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
 use crate::cli::cancel::wait_for_escape_cancel;
-use crate::agent::tool_approval::ToolApprovalBroker;
 use crate::cli::confirm_tools::WebsocketsAskHook;
 use crate::cli::onboard::run_onboard;
 use crate::cli::wizard::resolve_onboard_config_path;
@@ -42,6 +42,7 @@ use crate::cron::CronPayloadKind;
 use crate::cron::compute_next_run;
 use crate::cron::service::now_ms;
 use crate::heartbeat::service::HeartbeatService;
+use crate::integrations::herdr::HerdrReporter;
 use crate::security::jwt::{
     DEFAULT_EXPIRES_IN_MONTHS, JwtError, generate_jwt_keypair, generate_jwt_token,
 };
@@ -635,8 +636,18 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     init_runtime_logging(logs, None);
 
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
+    let herdr = HerdrReporter::from_env(&session_id, &config.workspace_path());
+    herdr.report_session(if args.message.as_deref().is_some_and(|m| !m.is_empty()) {
+        "cli-message"
+    } else {
+        "cli-interactive"
+    });
+    // Herdr only starts tracking a pane as an agent once it has received both
+    // the session identity above and at least one state update — session
+    // identity alone leaves the pane absent from `herdr agent list`.
+    herdr.report_idle();
     let confirm_hook = if config.tools.confirm_before_execute {
-        Some(Arc::new(CliAskHook::new()))
+        Some(Arc::new(CliAskHook::new(Arc::clone(&herdr))))
     } else {
         None
     };
@@ -672,6 +683,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 Arc::clone(&agent_loop),
                 true,
                 confirm_hook.clone(),
+                Arc::clone(&herdr),
             )
             .await
         }
@@ -683,6 +695,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
                 &config.channels,
                 &session_id,
                 confirm_hook.clone(),
+                Arc::clone(&herdr),
             )
             .await
         }
@@ -693,6 +706,11 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     // Drain title generation / consolidation before exit. One-shot `-m`
     // otherwise kills those background tasks before they persist.
     agent_loop.close_mcp().await;
+    // Releases this pane's Herdr agent status and flushes it before exit —
+    // `#[tokio::main]` drops the runtime the instant we return, and without an
+    // explicit release Herdr has no other way to notice a self-reporting
+    // agent like this one has exited, leaving a stale entry in the agent pane.
+    herdr.shutdown().await;
     result
 }
 
@@ -1738,6 +1756,7 @@ async fn message_session(
     agent_loop: Arc<AgentLoop>,
     stream: bool,
     confirm_hook: Option<Arc<CliAskHook>>,
+    herdr: Arc<HerdrReporter>,
 ) -> Result<(), CliError> {
     log::info!("message={message}");
     for media_path in &media {
@@ -1750,6 +1769,7 @@ async fn message_session(
     }
     let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
     let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
+    herdr.report_working();
     // Esc cancels the in-flight turn instead of exiting the process (unlike
     // Ctrl+C, which `cmd.exe` intercepts as a batch-job kill when launched via
     // scripts/start_rust_bot.bat). Losing the race just drops `process_direct`,
@@ -1770,6 +1790,7 @@ async fn message_session(
             if let Some(hook) = &confirm_hook {
                 hook.clear_renderer();
             }
+            herdr.report_idle();
             println!("Cancelled.");
             return Ok(());
         }
@@ -1792,6 +1813,7 @@ async fn message_session(
     if let Some(hook) = &confirm_hook {
         hook.clear_renderer();
     }
+    herdr.report_idle();
     Ok(())
 }
 
@@ -1919,6 +1941,7 @@ async fn interactive_session(
     channels_config: &ChannelsConfig,
     session_id: &str,
     confirm_hook: Option<Arc<CliAskHook>>,
+    herdr: Arc<HerdrReporter>,
 ) -> Result<(), CliError> {
     let welcome = interactive_welcome_text(markdown);
     print_agent_response_with_header(&welcome, markdown, None, true);
@@ -1990,6 +2013,7 @@ async fn interactive_session(
                     Arc::clone(&agent_loop),
                     !markdown,
                     confirm_hook.clone(),
+                    Arc::clone(&herdr),
                 )
                 .await;
                 for media_path in media {

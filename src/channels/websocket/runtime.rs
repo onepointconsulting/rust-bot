@@ -27,7 +27,7 @@ use crate::agent::agent_loop::AgentLoop;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::skills::SkillsLoader;
-use crate::agent::tool_approval::{ToolApprovalBroker, ToolApprovalCall};
+use crate::agent::tool_approval::ToolApprovalCall;
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
@@ -4229,6 +4229,7 @@ fn builtin_command_starts_agent_turn(text: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tool_approval::ToolApprovalBroker;
     use crate::bus::outbound_events::ProgressEvent;
     use crate::config::schema::JwtConfig;
     use crate::providers::base::LLMUsage;

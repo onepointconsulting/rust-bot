@@ -15,7 +15,6 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent::model_runtime::ModelRuntimeResolver;
-use crate::agent::tools::web;
 use crate::{
     bus::queue::MessageBus,
     channels::gateway_services::GatewayServices,

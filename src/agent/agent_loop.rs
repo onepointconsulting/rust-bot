@@ -19,7 +19,7 @@ use crate::agent::autocompact::Autocompact;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
 use crate::agent::hook::{
-    AgentHook, AgentHookContext, CompositeHook, LoopHookChain, ToolHookDecision,
+    AgentHook, AgentHookContext, LoopHookChain, ToolHookDecision,
 };
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};

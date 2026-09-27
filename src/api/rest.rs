@@ -186,6 +186,7 @@ impl ApiError {
         }
     }
 
+    #[cfg(test)]
     pub(crate) fn message(&self) -> &str {
         &self.message
     }
