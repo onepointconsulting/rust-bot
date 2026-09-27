@@ -8,6 +8,7 @@ pub mod image_generation;
 pub mod mcp;
 pub mod message;
 pub mod ocr;
+pub mod question;
 pub mod registry;
 pub mod sandbox;
 pub mod search;

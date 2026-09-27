@@ -12,6 +12,7 @@ use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::tool_approval::ToolApprovalBroker;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
+use crate::agent::tools::question::{QUESTION_TOOL_NAME, QuestionTool};
 use crate::api::login::{
     AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
 };
@@ -1747,6 +1748,22 @@ async fn handle_cli_system_message(
     agent_loop.process_system_message(msg).await
 }
 
+/// Run `f` against the registered `question` tool, if any. Used to wire the
+/// CLI-only spinner renderer and Herdr reporter into it the same way
+/// `CliAskHook`'s are wired, since `Tool::execute` has no access to either.
+fn with_question_tool<F: FnOnce(&QuestionTool)>(agent_loop: &AgentLoop, f: F) {
+    let tool = {
+        let guard = agent_loop.tools.lock().unwrap_or_else(|e| e.into_inner());
+        guard.get(QUESTION_TOOL_NAME)
+    };
+    if let Some(tool) = tool
+        .as_ref()
+        .and_then(|t| (t.as_ref() as &dyn std::any::Any).downcast_ref::<QuestionTool>())
+    {
+        f(tool);
+    }
+}
+
 async fn message_session(
     message: &str,
     media: Vec<String>,
@@ -1767,6 +1784,10 @@ async fn message_session(
     if let Some(hook) = &confirm_hook {
         hook.set_renderer(Arc::clone(&renderer));
     }
+    with_question_tool(&agent_loop, |tool| {
+        tool.set_renderer(Arc::clone(&renderer));
+        tool.set_herdr(Arc::clone(&herdr));
+    });
     let on_progress = create_on_progress(channels_config.clone(), Arc::clone(&renderer));
     let (on_stream, on_stream_end) = stream_callbacks(Arc::clone(&renderer));
     herdr.report_working();
@@ -1775,7 +1796,7 @@ async fn message_session(
     // scripts/start_rust_bot.bat). Losing the race just drops `process_direct`,
     // which is already the agent loop's intended cancellation path.
     let response = tokio::select! {
-        response = agent_loop.process_direct(
+        response = Arc::clone(&agent_loop).process_direct(
             &message,
             Some(&session_id),
             None,
@@ -1790,6 +1811,7 @@ async fn message_session(
             if let Some(hook) = &confirm_hook {
                 hook.clear_renderer();
             }
+            with_question_tool(&agent_loop, |tool| tool.clear_renderer());
             herdr.report_idle();
             println!("Cancelled.");
             return Ok(());
@@ -1813,6 +1835,7 @@ async fn message_session(
     if let Some(hook) = &confirm_hook {
         hook.clear_renderer();
     }
+    with_question_tool(&agent_loop, |tool| tool.clear_renderer());
     herdr.report_idle();
     Ok(())
 }

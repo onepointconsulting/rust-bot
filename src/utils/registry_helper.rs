@@ -10,13 +10,15 @@ use crate::{
             gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool},
             image_generation::ImageGenerationTool,
             ocr::OcrTool,
+            question::QuestionTool,
             registry::ToolRegistry,
             search::{GlobTool, GrepTool},
             web::{WebFetchTool, WebSearchTool},
         },
     },
     config::schema::{
-        DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig, WebToolsConfig,
+        DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig,
+        QuestionToolConfig, WebToolsConfig,
     },
 };
 
@@ -152,6 +154,14 @@ pub fn register_image_generation_tools(
     log::debug!("Registering image generation tool");
     let tool = ImageGenerationTool::new(image_generation_config.clone(), workspace.clone());
     tools.register(Box::new(tool));
+}
+
+pub fn register_question_tool(question_config: &QuestionToolConfig, tools: &mut ToolRegistry) {
+    if !question_config.enabled {
+        return;
+    }
+    log::debug!("Registering question tool");
+    tools.register(Box::new(QuestionTool::new()));
 }
 
 #[cfg(test)]

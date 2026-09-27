@@ -1169,6 +1169,30 @@ impl Default for DocxToolConfig {
     }
 }
 
+// ── QuestionToolConfig ───────────────────────────────────────────────────────
+
+fn default_question_tool_enabled() -> bool {
+    true
+}
+
+/// Question Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QuestionToolConfig {
+    /// Enable or disable the question tool. Default: `true`.
+    #[serde(alias = "enable", default = "default_question_tool_enabled")]
+    #[garde(skip)]
+    pub enabled: bool,
+}
+
+impl Default for QuestionToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_question_tool_enabled(),
+        }
+    }
+}
+
 // ── ImageGenerationToolConfig ───────────────────────────────────────────────────────────
 
 fn default_image_generation_tool_enable() -> bool {
@@ -1494,6 +1518,10 @@ pub struct ToolsConfig {
     #[serde(alias = "image_generation")]
     #[garde(dive)]
     pub image_generation: ImageGenerationToolConfig,
+
+    #[serde(alias = "question")]
+    #[garde(dive)]
+    pub question: QuestionToolConfig,
 }
 
 impl Default for ToolsConfig {
@@ -1509,6 +1537,7 @@ impl Default for ToolsConfig {
             docx: DocxToolConfig::default(),
             ocr: OcrToolConfig::default(),
             image_generation: ImageGenerationToolConfig::default(),
+            question: QuestionToolConfig::default(),
             mcp_presets_path: default_mcp_presets_path(),
         }
     }
@@ -2654,6 +2683,29 @@ mod tests {
         assert_eq!(cfg.search.api_key, "bk-key");
         assert_eq!(cfg.search.max_results, 8);
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── QuestionToolConfig ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_question_tool_defaults() {
+        let cfg = QuestionToolConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_question_tool_deserialize_disable() {
+        let json = r#"{"enabled": false}"#;
+        let cfg: QuestionToolConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn test_question_tool_deserialize_disable_via_enable_alias() {
+        let json = r#"{"enable": false}"#;
+        let cfg: QuestionToolConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
     }
 
     #[test]

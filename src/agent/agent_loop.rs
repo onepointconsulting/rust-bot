@@ -52,8 +52,8 @@ use crate::command::types::ChatCommand;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
     ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig,
-    ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, RESERVED_MODEL_PRESET_NAME,
-    WebToolsConfig,
+    ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, QuestionToolConfig,
+    RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::{LLMProviderDyn, LLMUsage};
@@ -69,7 +69,8 @@ use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
     filesystem_tool_scope, register_conversion_tools, register_filesystem_tools,
-    register_gmail_tools, register_image_generation_tools, register_ocr_tools, register_web_tools,
+    register_gmail_tools, register_image_generation_tools, register_ocr_tools,
+    register_question_tool, register_web_tools,
 };
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
@@ -346,6 +347,7 @@ impl AgentLoop {
         let ocr_config = tools_cfg.ocr.clone();
         let docx_config = tools_cfg.docx.clone();
         let image_generation_config = tools_cfg.image_generation.clone();
+        let question_config = tools_cfg.question.clone();
         let restrict_to_workspace = tools_cfg.restrict_to_workspace;
         let workspace_scopes =
             WorkspaceScopeResolver::new(workspace.clone(), restrict_to_workspace);
@@ -400,6 +402,7 @@ impl AgentLoop {
             &ocr_config,
             &docx_config,
             &image_generation_config,
+            &question_config,
             bus.clone(),
             &cron_service,
             &timezone,
@@ -740,6 +743,7 @@ impl AgentLoop {
         ocr_config: &OcrToolConfig,
         docx_config: &DocxToolConfig,
         image_generation_config: &ImageGenerationToolConfig,
+        question_config: &QuestionToolConfig,
         bus: Arc<MessageBus>,
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
@@ -777,6 +781,7 @@ impl AgentLoop {
             tools,
         );
         register_image_generation_tools(image_generation_config, workspace, tools);
+        register_question_tool(question_config, tools);
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",
