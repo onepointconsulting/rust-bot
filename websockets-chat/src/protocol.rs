@@ -86,6 +86,10 @@ pub struct ClientEnvelope {
     /// answer, if they typed one instead of picking an option.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub free_text: Option<String>,
+    /// Set only by [`Self::question_chat_about`] — the user wants to discuss
+    /// the question instead of answering it.
+    #[serde(skip_serializing_if = "std::ops::Not::not")]
+    pub chat_about: bool,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -118,6 +122,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -145,6 +150,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -171,6 +177,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -210,6 +217,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -234,6 +242,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -258,6 +267,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -285,6 +295,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -312,6 +323,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -341,6 +353,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -368,6 +381,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -401,6 +415,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -428,6 +443,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -451,6 +467,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -477,6 +494,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -505,6 +523,7 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -535,6 +554,7 @@ impl ClientEnvelope {
             approved_ids: Some(approved_ids),
             option_id: None,
             free_text: None,
+            chat_about: false,
             webui: true,
         }
     }
@@ -567,7 +587,18 @@ impl ClientEnvelope {
             approved_ids: None,
             option_id,
             free_text,
+            chat_about: false,
             webui: true,
+        }
+    }
+
+    /// Decline a `question_request` in favour of discussing it: the agent is
+    /// told to ask what the user wants to clarify. Same reply/rejections as
+    /// [`Self::question_response`].
+    pub fn question_chat_about(chat_id: impl Into<String>, request_id: impl Into<String>) -> Self {
+        Self {
+            chat_about: true,
+            ..Self::question_response(chat_id, request_id, None, None)
         }
     }
 }
@@ -2660,6 +2691,22 @@ mod tests {
                 "chat_id": "chat-1",
                 "request_id": "req-1",
                 "free_text": "my own answer",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_question_chat_about_serializes_flag() {
+        let envelope = ClientEnvelope::question_chat_about("chat-1", "req-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "question_response",
+                "chat_id": "chat-1",
+                "request_id": "req-1",
+                "chat_about": true,
                 "webui": true,
             })
         );

@@ -1458,6 +1458,22 @@ fn request_question_response(
     );
 }
 
+/// Decline the active chat's pending `question_request` so the agent asks
+/// what the user wants to clarify instead.
+fn request_question_chat_about(ctx: &WsContext) {
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    let Some(pending) = ctx.pending_question.get_untracked() else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::question_chat_about(chat_id, pending.request_id),
+        "Failed to encode the question response.",
+    );
+}
+
 /// Ask the gateway to change the active chat's model-preset override.
 ///
 /// Applies `name` optimistically (before the ack) so the trigger label
@@ -2066,6 +2082,7 @@ pub fn App() -> impl IntoView {
     let on_answer_question_free_text = move |free_text: String| {
         request_question_response(&ws_context, None, Some(free_text));
     };
+    let on_chat_about_question = move || request_question_chat_about(&ws_context);
     let on_select_model_preset = move |name: String| request_set_model_preset(&ws_context, name);
     let on_select_agent_mode = move |name: String| request_set_agent_mode(&ws_context, name);
 
@@ -2149,6 +2166,7 @@ pub fn App() -> impl IntoView {
                     pending_question=Signal::derive(move || pending_question.get())
                     on_select_question_option=on_select_question_option
                     on_answer_question_free_text=on_answer_question_free_text
+                    on_chat_about_question=on_chat_about_question
                     model_presets=Signal::derive(move || model_presets.get())
                     selected_model_preset=Signal::derive(move || model_preset.get())
                     on_select_model_preset=on_select_model_preset

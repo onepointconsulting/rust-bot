@@ -4,7 +4,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
-use inquire::{InquireError, Select, Text};
 use serde_json::Value;
 
 use crate::agent::question_broker::{QuestionAnswer, QuestionBroker, QuestionChoice};
@@ -13,14 +12,11 @@ use crate::bus::outbound_events::{OutboundEvent, QuestionRequestEvent, outbound_
 use crate::bus::queue::MessageBus;
 use crate::channels::websocket::CHANNEL_NAME as WEBSOCKET_CHANNEL;
 use crate::cli::pause_for_prompt;
+use crate::cli::question_prompt::{PromptChoice, PromptOutcome, run_question_prompt};
 use crate::cli::stream::StreamRenderer;
 use crate::integrations::herdr::HerdrReporter;
 
 pub const QUESTION_TOOL_NAME: &str = "question";
-
-/// Sentinel choice appended to every CLI prompt so the user can always
-/// escape a closed option list with a free-text answer.
-const OTHER_SENTINEL: &str = "Other (type your own answer)";
 
 /// How long a websocket-channel question waits for an answer before the
 /// agent gets told the user cancelled. Longer than tool-approval's 300s
@@ -111,7 +107,7 @@ impl QuestionTool {
         self.bus.lock().unwrap_or_else(|e| e.into_inner()).clone()
     }
 
-    /// Blocking CLI prompt, unchanged from the terminal-only original.
+    /// Blocking CLI prompt rendered by [`run_question_prompt`].
     async fn execute_cli(&self, question: String, options: Vec<QuestionOption>) -> String {
         if !std::io::stdin().is_terminal() {
             return "Error: interactive input not available in this context (no TTY); \
@@ -144,9 +140,6 @@ impl QuestionTool {
 
         match result {
             Ok(Ok(answer)) => answer,
-            Ok(Err(InquireError::OperationCanceled | InquireError::OperationInterrupted)) => {
-                CANCELLED_ANSWER.to_string()
-            }
             Ok(Err(e)) => format!("Error: failed to prompt user: {e}"),
             Err(join_err) => format!("Error: prompt task failed: {join_err}"),
         }
@@ -202,6 +195,9 @@ impl QuestionTool {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => return CANCELLED_ANSWER.to_string(),
         };
+        if answer.chat_about {
+            return CHAT_ABOUT_ANSWER.to_string();
+        }
 
         let chosen = answer
             .option_id
@@ -273,18 +269,14 @@ fn parse_options(params: &Value) -> Result<(String, Vec<QuestionOption>), String
     Ok((question.to_string(), options))
 }
 
-/// Render each option as `"label"` or `"label (description)"`, plus a
-/// trailing free-text sentinel.
-fn build_choice_labels(options: &[QuestionOption]) -> Vec<String> {
-    let mut labels: Vec<String> = options
+fn build_prompt_choices(options: &[QuestionOption]) -> Vec<PromptChoice> {
+    options
         .iter()
-        .map(|opt| match &opt.description {
-            Some(desc) => format!("{} ({})", opt.label, desc),
-            None => opt.label.clone(),
+        .map(|opt| PromptChoice {
+            label: opt.label.clone(),
+            description: opt.description.clone(),
         })
-        .collect();
-    labels.push(OTHER_SENTINEL.to_string());
-    labels
+        .collect()
 }
 
 /// Build the natural-language string returned to the LLM as the tool result.
@@ -304,24 +296,19 @@ fn format_answer(chosen: Option<&QuestionOption>, free_text: Option<&str>) -> St
 
 const CANCELLED_ANSWER: &str = "User cancelled the question without answering.";
 
-/// Blocking prompt: runs on a `spawn_blocking` thread, never on the async runtime.
-fn run_blocking_prompt(question: &str, options: &[QuestionOption]) -> Result<String, InquireError> {
-    let choices = build_choice_labels(options);
-    let selection = Select::new(question, choices).prompt()?;
+const CHAT_ABOUT_ANSWER: &str = "User declined to pick an answer and wants to chat about this \
+    question first. Do not call the question tool again now; end your turn by asking the user, \
+    in plain text, what they would like to clarify about the question.";
 
-    if selection == OTHER_SENTINEL {
-        let free_text = Text::new("Your answer:").prompt()?;
-        Ok(format_answer(None, Some(&free_text)))
-    } else {
-        let chosen = options.iter().find(|opt| {
-            selection == opt.label
-                || opt
-                    .description
-                    .as_deref()
-                    .is_some_and(|desc| selection == format!("{} ({})", opt.label, desc))
-        });
-        Ok(format_answer(chosen, None))
-    }
+/// Blocking prompt: runs on a `spawn_blocking` thread, never on the async runtime.
+fn run_blocking_prompt(question: &str, options: &[QuestionOption]) -> std::io::Result<String> {
+    let outcome = run_question_prompt(question, &build_prompt_choices(options))?;
+    Ok(match outcome {
+        PromptOutcome::Selected(i) => format_answer(options.get(i), None),
+        PromptOutcome::FreeText(text) => format_answer(None, Some(&text)),
+        PromptOutcome::ChatAbout => CHAT_ABOUT_ANSWER.to_string(),
+        PromptOutcome::Cancelled => CANCELLED_ANSWER.to_string(),
+    })
 }
 
 #[async_trait]
@@ -470,10 +457,10 @@ mod tests {
         );
     }
 
-    // ── build_choice_labels ─────────────────────────────────────────────────
+    // ── build_prompt_choices ────────────────────────────────────────────────
 
     #[test]
-    fn build_choice_labels_appends_sentinel_and_renders_descriptions() {
+    fn build_prompt_choices_keeps_label_and_description_separate() {
         let options = vec![
             QuestionOption {
                 label: "A".to_string(),
@@ -484,13 +471,17 @@ mod tests {
                 description: None,
             },
         ];
-        let labels = build_choice_labels(&options);
         assert_eq!(
-            labels,
+            build_prompt_choices(&options),
             vec![
-                "A (first)".to_string(),
-                "B".to_string(),
-                OTHER_SENTINEL.to_string(),
+                PromptChoice {
+                    label: "A".to_string(),
+                    description: Some("first".to_string()),
+                },
+                PromptChoice {
+                    label: "B".to_string(),
+                    description: None,
+                },
             ]
         );
     }
@@ -663,11 +654,38 @@ mod tests {
             tokio::task::yield_now().await;
         };
         broker
-            .resolve("chat-1", &request_id, Some("1".to_string()), None)
+            .resolve("chat-1", &request_id, Some("1".to_string()), None, false)
             .unwrap();
 
         let result = run.await.unwrap();
         assert_eq!(result, "User selected: B (second)");
+    }
+
+    #[tokio::test]
+    async fn execute_websocket_chat_about_returns_chat_about_answer() {
+        let bus = Arc::new(MessageBus::new());
+        let tool = QuestionTool::new(Some(Arc::clone(&bus)));
+        tool.set_tool_context(WEBSOCKET_CHANNEL, "chat-1", None);
+        let broker = tool.broker();
+
+        let run = tokio::spawn(async move {
+            tool.execute(&serde_json::json!({
+                "question": "Which one?",
+                "options": [{"label": "A"}],
+            }))
+            .await
+        });
+
+        let request_id = loop {
+            let pending = broker.pending_for_chat("chat-1");
+            if let Some(entry) = pending.into_iter().next() {
+                break entry.request_id;
+            }
+            tokio::task::yield_now().await;
+        };
+        broker.resolve("chat-1", &request_id, None, None, true).unwrap();
+
+        assert_eq!(run.await.unwrap(), CHAT_ABOUT_ANSWER);
     }
 
     #[tokio::test]
@@ -699,7 +717,7 @@ mod tests {
         }]);
 
         broker
-            .resolve("chat-1", &event.request_id, None, Some("free text".to_string()))
+            .resolve("chat-1", &event.request_id, None, Some("free text".to_string()), false)
             .unwrap();
         assert_eq!(run.await.unwrap(), "User answered: free text");
     }

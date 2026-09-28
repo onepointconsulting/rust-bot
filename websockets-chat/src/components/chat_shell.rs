@@ -71,6 +71,7 @@ pub fn ChatShell(
     #[prop(into)] pending_question: Signal<Option<PendingQuestion>>,
     on_select_question_option: impl Fn(String) + 'static + Send + Sync + Copy,
     on_answer_question_free_text: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_chat_about_question: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(into)] model_presets: Signal<Vec<String>>,
     #[prop(into)] selected_model_preset: Signal<String>,
     on_select_model_preset: impl Fn(String) + 'static + Send + Sync + Copy,
@@ -173,6 +174,7 @@ pub fn ChatShell(
                     question=pending_question
                     on_select=Callback::new(move |id| on_select_question_option(id))
                     on_free_text=Callback::new(move |text| on_answer_question_free_text(text))
+                    on_chat_about=Callback::new(move |()| on_chat_about_question())
                 />
                 <ChatInput
                     pending=pending

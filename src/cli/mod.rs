@@ -4,6 +4,7 @@ mod confirm_tools;
 pub mod onboard;
 mod paste_edit_mode;
 pub mod progress;
+pub mod question_prompt;
 pub mod stream;
 pub mod wizard;
 

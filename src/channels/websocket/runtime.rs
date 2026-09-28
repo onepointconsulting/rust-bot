@@ -1911,7 +1911,7 @@ fn question_request_payload(
     body
 }
 
-/// Handle a `question_response` envelope: hand `option_id`/`free_text` to
+/// Handle a `question_response` envelope: hand `option_id`/`free_text`/`chat_about` to
 /// the waiting [`crate::agent::question_broker::QuestionBroker`] request,
 /// then tell every tab on the chat that the request is settled. A missing or
 /// malformed answer counts as "no answer" rather than an error, so the turn
@@ -1975,6 +1975,11 @@ async fn handle_envelope_question_response<'a>(envelope_dispatch_context: Envelo
         .and_then(|v| v.as_str())
         .filter(|s| !s.is_empty())
         .map(str::to_string);
+    let chat_about = envelope_dispatch_context
+        .envelope
+        .get("chat_about")
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
 
     let Some(broker) = shared.gateway_services.question_broker() else {
         send_event(
@@ -1987,7 +1992,7 @@ async fn handle_envelope_question_response<'a>(envelope_dispatch_context: Envelo
         .await;
         return;
     };
-    if let Err(err) = broker.resolve(cid, request_id, option_id, free_text) {
+    if let Err(err) = broker.resolve(cid, request_id, option_id, free_text, chat_about) {
         let detail = match err {
             ResolveError::NotFound => "question_not_found",
             ResolveError::ChatMismatch => "access_denied",

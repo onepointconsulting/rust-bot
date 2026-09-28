@@ -23,11 +23,13 @@ pub struct QuestionChoice {
 }
 
 /// The user's answer: the id of a [`QuestionChoice`] they picked, free text,
-/// or neither if the request timed out or was cancelled.
+/// a request to chat about the question instead, or none of these if the
+/// request timed out or was cancelled.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct QuestionAnswer {
     pub option_id: Option<String>,
     pub free_text: Option<String>,
+    pub chat_about: bool,
 }
 
 struct PendingQuestion {
@@ -86,6 +88,7 @@ impl QuestionBroker {
         request_id: &str,
         option_id: Option<String>,
         free_text: Option<String>,
+        chat_about: bool,
     ) -> Result<(), ResolveError> {
         let mut pending = self.lock();
         match pending.get(request_id) {
@@ -102,6 +105,7 @@ impl QuestionBroker {
         let _ = entry.tx.send(QuestionAnswer {
             option_id,
             free_text,
+            chat_about,
         });
         Ok(())
     }
@@ -146,7 +150,7 @@ mod tests {
         let (request_id, rx) =
             broker.register("chat-1", "Which?".to_string(), vec![choice("0"), choice("1")]);
         broker
-            .resolve("chat-1", &request_id, Some("1".to_string()), None)
+            .resolve("chat-1", &request_id, Some("1".to_string()), None, false)
             .unwrap();
         let answer = rx.await.unwrap();
         assert_eq!(answer.option_id.as_deref(), Some("1"));
@@ -164,6 +168,7 @@ mod tests {
                 &request_id,
                 Some("zzz".to_string()),
                 Some("my own answer".to_string()),
+                false,
             )
             .unwrap();
         let answer = rx.await.unwrap();
@@ -175,15 +180,23 @@ mod tests {
     async fn resolve_with_no_answer_delivers_empty_answer() {
         let broker = QuestionBroker::new();
         let (request_id, rx) = broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
-        broker.resolve("chat-1", &request_id, None, None).unwrap();
+        broker.resolve("chat-1", &request_id, None, None, false).unwrap();
         assert_eq!(rx.await.unwrap(), QuestionAnswer::default());
+    }
+
+    #[tokio::test]
+    async fn resolve_delivers_chat_about() {
+        let broker = QuestionBroker::new();
+        let (request_id, rx) = broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
+        broker.resolve("chat-1", &request_id, None, None, true).unwrap();
+        assert!(rx.await.unwrap().chat_about);
     }
 
     #[test]
     fn resolve_rejects_unknown_request() {
         let broker = QuestionBroker::new();
         assert_eq!(
-            broker.resolve("chat-1", "nope", None, None),
+            broker.resolve("chat-1", "nope", None, None, false),
             Err(ResolveError::NotFound)
         );
     }
@@ -194,7 +207,7 @@ mod tests {
         let (request_id, _rx) =
             broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
         assert_eq!(
-            broker.resolve("chat-2", &request_id, Some("0".to_string()), None),
+            broker.resolve("chat-2", &request_id, Some("0".to_string()), None, false),
             Err(ResolveError::ChatMismatch)
         );
         assert_eq!(broker.pending_for_chat("chat-1").len(), 1);
