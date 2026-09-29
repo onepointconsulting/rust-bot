@@ -48,6 +48,8 @@ use crate::security::jwt::{
     DEFAULT_EXPIRES_IN_MONTHS, JwtError, generate_jwt_keypair, generate_jwt_token,
 };
 use crate::security::workspace_requests::WorkspaceRequestHandler;
+use crate::session::history_visibility::is_hidden_history_message;
+use crate::session::keys::COMMAND_KEY;
 use crate::session::manager::SessionManager;
 use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
 use crate::utils::evaluator::evaluate_response;
@@ -1853,7 +1855,7 @@ fn load_runtime_config(config: PathBuf, workspace: Option<PathBuf>) -> Config {
     }
     set_config_path(config.clone());
     let loaded = resolve_config_env_vars(&load_config(Some(config.clone())));
-    println!("Using config: {}", config.display());
+    log::info!("Using config: {}", config.display());
     match loaded {
         Ok(mut loaded) => {
             if let Some(workspace) = workspace {
@@ -1973,6 +1975,7 @@ async fn interactive_session(
 ) -> Result<(), CliError> {
     let welcome = interactive_welcome_text(markdown);
     print_agent_response_with_header(&welcome, markdown, None, true);
+    print_previous_messages(&agent_loop, session_id, markdown);
     let text_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let image_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let mut line_editor = init_prompt_session(text_captures.clone());
@@ -2062,6 +2065,112 @@ async fn interactive_session(
     }
 
     Ok(())
+}
+
+/// How many prior user/assistant turns to replay when an interactive session starts.
+const PREVIOUS_MESSAGE_COUNT: usize = 10;
+
+/// Replay the tail of a persisted session so a restarted CLI shows where the
+/// conversation left off. Reads the JSONL without creating a session.
+fn print_previous_messages(agent_loop: &AgentLoop, session_id: &str, markdown: bool) {
+    let messages = {
+        let manager = agent_loop
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        manager
+            .get_session_internal(session_id)
+            .map(|session| session.messages)
+            .unwrap_or_default()
+    };
+    let recent = recent_cli_transcript(&messages, PREVIOUS_MESSAGE_COUNT);
+    if recent.is_empty() {
+        return;
+    }
+
+    let dim = Style::new().dimmed();
+    println!();
+    println!(
+        "{}Previous conversation{}",
+        dim.render(),
+        dim.render_reset()
+    );
+    let you = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
+    let bot = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Cyan)));
+    for (role, text) in recent {
+        let (label, style) = if role == "user" {
+            ("you", you)
+        } else {
+            ("rust-bot", bot)
+        };
+        println!();
+        println!("{}{label}{}", style.render(), style.render_reset());
+        // One trailing blank here, plus the blank line that opens the next
+        // turn, is two line breaks between messages. The shared response
+        // printer adds a third when it draws its own header.
+        let mut body = response_body(&text, markdown && role != "user", None);
+        if !body.ends_with('\n') {
+            body.push('\n');
+        }
+        print!("{body}");
+        println!();
+    }
+}
+
+/// Last `max_messages` displayable turns: `user`/`assistant` only, skipping
+/// slash commands, hidden/automation rows, and empty text. The window starts
+/// on a user turn when one exists, so a replay does not open mid-reply.
+fn recent_cli_transcript(messages: &[Value], max_messages: usize) -> Vec<(String, String)> {
+    if max_messages == 0 {
+        return Vec::new();
+    }
+    let mut visible: Vec<(String, String)> = messages
+        .iter()
+        .filter(|message| {
+            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
+            (role == "user" || role == "assistant")
+                && message.get(COMMAND_KEY).is_none()
+                && !is_hidden_history_message(message)
+        })
+        .filter_map(|message| {
+            let role = message.get("role").and_then(Value::as_str)?;
+            let text = persisted_message_text(message.get("content"));
+            if text.is_empty() {
+                None
+            } else {
+                Some((role.to_string(), text))
+            }
+        })
+        .collect();
+
+    if visible.len() > max_messages {
+        let start = visible.len() - max_messages;
+        visible = visible.split_off(start);
+    }
+    if let Some(start) = visible.iter().position(|(role, _)| role == "user")
+        && start > 0
+    {
+        visible = visible.split_off(start);
+    }
+    visible
+}
+
+/// Flatten a persisted `content` field. Image turns are stored as a block
+/// array, so `as_str()` would print them blank. Placeholders such as
+/// `[image: path]` stay in the text — the CLI has no thumbnail to show instead.
+fn persisted_message_text(content: Option<&Value>) -> String {
+    match content {
+        Some(Value::String(text)) => text.trim().to_string(),
+        Some(Value::Array(blocks)) => blocks
+            .iter()
+            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
+            .filter_map(|block| block.get("text").and_then(Value::as_str))
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+            .collect::<Vec<_>>()
+            .join("\n"),
+        _ => String::new(),
+    }
 }
 
 fn interactive_welcome_text(markdown: bool) -> String {
@@ -2185,6 +2294,7 @@ mod tests {
         channels::websocket::types::DEFAULT_AUD,
         utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel},
     };
+    use serde_json::json;
 
     #[test]
     fn extract_images_resolves_captures_by_index_and_strips_sentinels() {
@@ -2242,6 +2352,64 @@ mod tests {
         let captures = vec!["content".to_string()];
         let text = replace_text_sentinels(&line, &captures);
         assert_eq!(text, "a content b");
+    }
+
+    #[test]
+    fn recent_cli_transcript_keeps_the_tail_and_starts_on_a_user_turn() {
+        let messages = vec![
+            json!({"role": "user", "content": "oldest"}),
+            json!({"role": "assistant", "content": "old reply"}),
+            json!({"role": "assistant", "content": "dangling"}),
+            json!({"role": "user", "content": "latest question"}),
+            json!({"role": "assistant", "content": "latest answer"}),
+        ];
+        let recent = recent_cli_transcript(&messages, 3);
+        assert_eq!(
+            recent,
+            vec![
+                ("user".to_string(), "latest question".to_string()),
+                ("assistant".to_string(), "latest answer".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_cli_transcript_skips_tools_commands_hidden_and_empty() {
+        let messages = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]}),
+            json!({"role": "tool", "content": "tool output"}),
+            json!({"role": "user", "content": "/help", "_command": true}),
+            json!({"role": "assistant", "content": "help text", "_command": true}),
+            json!({"role": "user", "content": "cron", "_hidden_history": true}),
+            json!({
+                "role": "user",
+                "content": [
+                    {"type": "text", "text": "see this"},
+                    {"type": "text", "text": "[image: /tmp/shot.png]"},
+                ],
+            }),
+            json!({"role": "assistant", "content": "saw it"}),
+        ];
+        let recent = recent_cli_transcript(&messages, 10);
+        assert_eq!(
+            recent,
+            vec![
+                ("user".to_string(), "hi".to_string()),
+                (
+                    "user".to_string(),
+                    "see this\n[image: /tmp/shot.png]".to_string()
+                ),
+                ("assistant".to_string(), "saw it".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn recent_cli_transcript_empty_when_nothing_is_visible() {
+        assert!(recent_cli_transcript(&[], 10).is_empty());
+        assert!(recent_cli_transcript(&[json!({"role": "tool", "content": "x"})], 10).is_empty());
+        assert!(recent_cli_transcript(&[json!({"role": "user", "content": "hi"})], 0).is_empty());
     }
 
     // --- resolve_websocket_channel ---
