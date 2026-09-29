@@ -425,6 +425,48 @@ Key paths verified against `src/config/schema.rs`: shell is `tools.exec.enable` 
 
 **Phase 6 — MCP server role (`rust-bot mcp`).** Enable rmcp server features in production (decision 21); stdio MCP server on rmcp `ServerHandler` exposing `rust_bot_chat` + ACP tools; same stdout hygiene; reuses `process_direct`.
 
+## Milestones
+
+The phases above are the full plan. Work ships in milestones, each with a "done" definition that can be tested by hand before the next one starts.
+
+### Milestone 1 — `rust-bot acp` as a standalone ACP agent (scenario 4: Zed, JetBrains, any ACP client)
+
+**Goal:** an ACP client can launch `rust-bot acp --config <abs path>`, hold a conversation with it, see its tool activity, approve or deny its tool calls, cancel a turn, and close it cleanly. Nothing else exists yet: no children, no overlay, no client role, no MCP server.
+
+**In scope (decisions used):**
+- Crate spike and thin adapter (18): `agent-client-protocol = "2.2"`, v1 only; settles the runtime model against non-`Send` provider futures. `docs/acp/acp_peer.rs` is updated or removed.
+- `Acp(AcpArgs)` subcommand, headless, with `--config` made absolute and a missing config as a startup error (20). No `--overlay` yet.
+- stdout hygiene (11): protocol-mode logging to stderr, OS-level stdout redirect, protocol writer owns the real stdout.
+- Agent role (`agent_mode.rs`): `initialize` (`loadSession: false`, `authMethods: []`), `session/new`, `session/prompt`, `session/cancel`. Each session maps to session key `acp:<sessionId>` in the configured workspace.
+- Project scope (1): `session/new.cwd` becomes the session's `WorkspaceScope.project_path`, `restricted`; validated absolute and existing. Denied subtrees and the "no rust-bot home" rule wait for Milestone 3, where a parent hands out `cwd` values.
+- `AcpSessionHook` (16): `tool_call` / `tool_call_update` with kinds, `rawInput`, `locations`; text and reasoning chunks from the existing callbacks.
+- Fail-closed permissions (9): `session/request_permission` for `edit` / `execute` / `fetch` / `other`; deny on error, cancel or timeout; `CliAskHook` never installed. No `permissionPolicy` yet (that is the parent side).
+- Cancellation (15): each turn in its own task, `session/cancel` aborts it, `stopReason: "cancelled"`. The shared tree-kill helper is moved to `utils::process`, only as far as the shell tool needs.
+- No `spawn` tool in `acp` mode (17).
+- Graceful stop on stdin EOF: drain background work via `close_mcp()`, `dream.run()`, exit 0 (13). No tree-kill fallback yet; that is a parent-side feature.
+
+**Out of scope for M1** (later milestones): `session/load` and session replay, `--overlay` and overlay allowlist, child store, `.acp.lock` and atomic writes, ACP client role and `acp_*` tools, `tools.acp` config, MCP server, external presets, `ToolProgress`, `resolve_program`, `disabledTools`.
+
+**Done means (all must pass):**
+
+1. `cargo build` and `cargo test` pass; the existing test suite is unchanged and green.
+2. **stdout stays clean.** `rust-bot acp --config <abs> --logs` with `RUST_LOG=debug`, given one `initialize` request on stdin and EOF, prints exactly one JSON-RPC line on stdout (`2> stderr.log` holds the logs). A deliberate `println!` in a test tool appears on stderr, never stdout.
+3. **Automated conversation test** (`tests/acp_agent_test.rs`, mock LLM provider, the crate's client role as the test client): `initialize` → `session/new` → `session/prompt` with a tool call → receives `agent_message_chunk`, `tool_call` (id, kind, `rawInput`, `locations`), `tool_call_update` (`completed`) and `stopReason: end_turn`; a second prompt in the same session sees the first turn's context.
+4. **Permissions:** in the same test, a `shell` call triggers `session/request_permission`; approve → runs; deny → the model gets "denied by client" and the transcript stays well-formed; client error, `cancelled` outcome and a timeout each deny; `read_file` never asks; `CliAskHook` is not installed.
+5. **Cancel:** `session/cancel` during a long `shell` call → the prompt answers `stopReason: "cancelled"`, the shell process tree is gone, and the next prompt in that session works.
+6. **Project scope:** with `cwd` = a temp project, `read_file` inside it works and outside it is refused; a relative or missing `cwd` is rejected.
+7. **Clean stop:** closing stdin after a turn → the process exits 0 within a few seconds; `MEMORY.md` and the session file parse cleanly. `--config does-not-exist.json` → non-zero exit and a JSON-RPC error on `initialize`, not a start on defaults.
+8. **`spawn` is absent** from the `acp` tool list and still present in the CLI tool list.
+9. **Manual check in a real client (Zed):** register `rust-bot acp` as a custom agent server (absolute exe path and absolute `--config`; check Zed's current settings format), open a project folder, ask it to read a file → the tool call shows live; ask it to run a shell command → Zed asks for permission; deny → the agent reports the denial; stop a long command from Zed → it stops. Closing the thread ends the process (Task Manager).
+
+**Estimated effort:** roughly 12–20 hours of agent working time, plus your review and the Zed check.
+
+### Later milestones (outline)
+
+- **M2 — Sessions and safety plumbing:** `session/load` and replay, `.acp.lock`, `write_atomic`, `--overlay` with the allowlist and `validate_overlay`, derived child environment (19).
+- **M3 — Rust-bot children (scenario 2):** ACP client role, child store, `acp_*` tools, project-scope rules for parents, `AcpManager`, graceful stop with tree-kill fallback, `ToolProgress` and cancel-on-drop (22), `permissionPolicy`.
+- **M4 — External agents and MCP (scenarios 3 and 1):** launch presets with `resolve_program`, `rust-bot mcp`.
+
 ## Security notes
 
 - Spawn is code execution: dynamic agents only reference **preset keys**; argv arrays only.
