@@ -15,5 +15,6 @@ pub mod registry_helper;
 pub mod restart;
 pub mod runtime;
 pub mod searchusage;
+pub mod stdio_redirect;
 pub mod tool_hints;
 pub mod whatsapp;

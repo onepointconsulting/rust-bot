@@ -612,6 +612,17 @@ impl AgentLoop {
         Ok(mode)
     }
 
+    /// Remove tools by name from the shared registry.
+    ///
+    /// Used by headless entry points (e.g. `rust-bot acp`) to drop tools that
+    /// cannot work there. Unknown names are ignored.
+    pub fn unregister_tools(&self, names: &[&str]) {
+        let mut tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        for name in names {
+            tools.unregister(name);
+        }
+    }
+
     /// Tools visible to this session after applying its agent mode.
     pub fn tools_for_session(&self, session: Option<&Session>) -> ToolRegistry {
         let mode = self.mode_for_session(session);

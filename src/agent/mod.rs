@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod agent_loop;
 pub mod autocompact;
 pub mod circuit_breaker;
