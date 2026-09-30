@@ -119,6 +119,9 @@ pub async fn acquire(
     poll: Duration,
 ) -> Result<WorkspaceLock, LockError> {
     fs::create_dir_all(workspace).map_err(LockError::Io)?;
+    // A relative workspace (e.g. `.\.rust-bot\workspace` in a config) resolves
+    // against the client's working directory; name the real folder in messages.
+    let shown = std::path::absolute(workspace).unwrap_or_else(|_| workspace.to_path_buf());
     let file = OpenOptions::new()
         .create(true)
         .read(true)
@@ -140,7 +143,7 @@ pub async fn acquire(
                     // logs will explain the pause.
                     eprintln!(
                         "rust-bot acp: workspace {} is in use by {}; waiting up to {}s for it",
-                        workspace.display(),
+                        shown.display(),
                         read_owner(workspace)
                             .map(|owner| format!("process {}", owner.pid))
                             .unwrap_or_else(|| "another process".to_string()),
@@ -151,7 +154,7 @@ pub async fn acquire(
                 if waited >= wait {
                     return Err(LockError::HeldBy {
                         owner: read_owner(workspace),
-                        workspace: workspace.to_path_buf(),
+                        workspace: shown,
                         waited,
                     });
                 }
@@ -232,6 +235,29 @@ mod tests {
             "it must actually have waited"
         );
         releaser.await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_error_names_the_absolute_workspace_even_for_a_relative_path() {
+        // Relative on purpose: it resolves against the working directory, which
+        // is exactly what made the original message ambiguous.
+        let relative =
+            PathBuf::from("target").join(format!("acp-lock-relative-{}", std::process::id()));
+        let _held = acquire(&relative, Duration::ZERO, SHORT).await.unwrap();
+
+        let error = acquire(&relative, Duration::ZERO, SHORT).await.unwrap_err();
+
+        let LockError::HeldBy { workspace, .. } = &error else {
+            panic!("expected HeldBy, got {error:?}");
+        };
+        assert!(workspace.is_absolute(), "{workspace:?}");
+        let message = error.to_string();
+        assert!(
+            message.contains(&workspace.display().to_string()),
+            "{message}"
+        );
+        drop(_held);
+        let _ = fs::remove_dir_all(&relative);
     }
 
     #[tokio::test]
