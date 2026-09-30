@@ -22,6 +22,7 @@ use crate::{
         SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, history_visibility::is_hidden_history_message,
         keys::COMMAND_KEY,
     },
+    utils::fs::write_atomic,
     utils::helpers::{
         ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
     },
@@ -657,8 +658,6 @@ impl SessionManager {
             return Ok(());
         }
         let path = self.get_session_path(&session.key);
-
-        let mut file = File::create(&path)?;
         log::info!("Saving session to {}", path.display());
 
         let metadata_line = json!({
@@ -669,11 +668,13 @@ impl SessionManager {
             "metadata": session.metadata,
             "last_consolidated": session.last_consolidated,
         });
-        writeln!(file, "{}", serde_json::to_string(&metadata_line)?)?;
-
+        let mut contents = Vec::new();
+        writeln!(contents, "{}", serde_json::to_string(&metadata_line)?)?;
         for msg in &session.messages {
-            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+            writeln!(contents, "{}", serde_json::to_string(msg)?)?;
         }
+        // Atomic: a crash or kill mid-save must not truncate the whole conversation.
+        write_atomic(&path, &contents)?;
 
         self.cache.insert(session.key.clone(), session);
         Ok(())
@@ -1982,6 +1983,43 @@ mod tests {
         let msg1: Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(msg1["role"], json!("assistant"));
         assert_eq!(msg1["content"], json!("world"));
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        let mut session = Session::new("atomic".into());
+        session.add_message("user", "hello", Map::new());
+        mgr.save(session.clone()).expect("first save");
+        // A reader that opened the file before the next save must still see
+        // the complete old session (truncate-and-rewrite would change it).
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("atomic")));
+        let mut early_reader = File::open(&path).unwrap();
+        session.add_message("assistant", "again", Map::new());
+        mgr.save(session).expect("second save");
+        let mut old_content = String::new();
+        std::io::Read::read_to_string(&mut early_reader, &mut old_content).unwrap();
+        assert_eq!(
+            old_content.lines().count(),
+            2,
+            "old metadata plus the first message"
+        );
+
+        let names: Vec<String> = fs::read_dir(&mgr.sessions_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".tmp")),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 1, "only the session file: {names:?}");
+        let content = fs::read_to_string(mgr.sessions_dir.join(&names[0])).unwrap();
+        assert_eq!(content.lines().count(), 3, "metadata plus both messages");
     }
 
     #[test]

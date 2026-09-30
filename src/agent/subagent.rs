@@ -79,6 +79,8 @@ pub struct SubagentManager {
     pub image_generation_config: ImageGenerationToolConfig,
     pub subagent_config: SubagentConfig,
     pub restrict_to_workspace: bool,
+    /// Tool names subagents never get (`tools.disabledTools`).
+    disabled_tools: Vec<String>,
     running_tasks: Arc<Mutex<HashMap<String, std::thread::JoinHandle<()>>>>,
     session_tasks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
 }
@@ -114,9 +116,16 @@ impl SubagentManager {
                 .unwrap_or(ImageGenerationToolConfig::default()),
             subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
+            disabled_tools: Vec::new(),
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             session_tasks: Arc::new(Mutex::new(HashMap::new())),
         }
+    }
+
+    /// Tools (by name) that subagents must not get, mirroring `tools.disabledTools`.
+    pub fn with_disabled_tools(mut self, names: Vec<String>) -> Self {
+        self.disabled_tools = names;
+        self
     }
 
     /// Convenience constructor for tests/tools that don't care about presets
@@ -250,16 +259,10 @@ impl SubagentManager {
         }
     }
 
-    async fn run_subagent_inner(
-        &self,
-        task_id: &str,
-        task: &str,
-        label: &str,
-        origin: &HashMap<String, String>,
-        session_key: Option<&str>,
-    ) -> Result<(), String> {
-        log::info!("Subagent [{}] starting task: {}", task_id, label);
-        // Build subagent tools (no message tool, no spawn tool)
+    /// The tools a subagent gets: files, shell (when enabled), web, gmail, OCR,
+    /// document conversion and image generation. Never the message or spawn
+    /// tool, and never a tool named in `tools.disabledTools`.
+    fn build_tool_registry(&self) -> ToolRegistry {
         let mut tools = ToolRegistry::new();
         let (allowed_dir, extra_read) = filesystem_tool_scope(
             &self.workspace,
@@ -306,6 +309,22 @@ impl SubagentManager {
             &mut tools,
         );
         register_image_generation_tools(&self.image_generation_config, &self.workspace, &mut tools);
+        for name in &self.disabled_tools {
+            tools.unregister(name);
+        }
+        tools
+    }
+
+    async fn run_subagent_inner(
+        &self,
+        task_id: &str,
+        task: &str,
+        label: &str,
+        origin: &HashMap<String, String>,
+        session_key: Option<&str>,
+    ) -> Result<(), String> {
+        log::info!("Subagent [{}] starting task: {}", task_id, label);
+        let tools = self.build_tool_registry();
 
         let system_prompt = self.build_subagent_prompt();
         if system_prompt.is_empty() {
@@ -1066,6 +1085,47 @@ mod tests {
             .await
             .expect("announce should publish");
         (result, msg)
+    }
+
+    fn subagent_tool_names(disabled: &[&str]) -> Vec<String> {
+        let tmp = TempDir::new().unwrap();
+        let manager = SubagentManager::new_simple(
+            ScriptedProvider::arc(vec![]),
+            tmp.path().to_path_buf(),
+            Arc::new(MessageBus::new()),
+            4096,
+        )
+        .with_disabled_tools(disabled.iter().map(|name| name.to_string()).collect());
+        manager.build_tool_registry().tool_names()
+    }
+
+    #[test]
+    fn subagents_get_the_usual_tools_but_never_spawn_or_message() {
+        let names = subagent_tool_names(&[]);
+        for expected in ["read_file", "write_file", "edit_file", "shell"] {
+            assert!(
+                names.iter().any(|name| name == expected),
+                "{expected} missing: {names:?}"
+            );
+        }
+        for never in ["spawn", "message"] {
+            assert!(
+                !names.iter().any(|name| name == never),
+                "{never} present: {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn disabled_tools_are_not_given_to_subagents() {
+        let names = subagent_tool_names(&["write_file", "edit_file", "shell"]);
+        for gone in ["write_file", "edit_file", "shell"] {
+            assert!(
+                !names.iter().any(|name| name == gone),
+                "{gone} present: {names:?}"
+            );
+        }
+        assert!(names.iter().any(|name| name == "read_file"));
     }
 
     #[tokio::test]

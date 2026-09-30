@@ -5,6 +5,7 @@ pub mod embedded_static;
 pub mod embedded_templates;
 pub mod evaluator;
 pub mod exit_codes;
+pub mod fs;
 pub mod gitstore;
 pub mod helpers;
 pub mod logo;

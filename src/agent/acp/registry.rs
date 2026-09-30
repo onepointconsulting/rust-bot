@@ -50,6 +50,13 @@ impl SessionRegistry {
             .map(|entry| entry.cwd.clone())
     }
 
+    /// Whether the session currently has a turn in flight.
+    pub fn is_running(&self, session_id: &str) -> bool {
+        self.sessions()
+            .get(session_id)
+            .is_some_and(|entry| entry.running.is_some())
+    }
+
     /// Mark a turn as running, or explain why it cannot start.
     pub fn begin_turn(&self, session_id: &str, handle: AbortHandle) -> Result<(), TurnError> {
         let mut sessions = self.sessions();
@@ -130,6 +137,19 @@ mod tests {
         registry.end_turn("s1");
         let (third, _third_future) = idle_handle();
         assert_eq!(registry.begin_turn("s1", third), Ok(()));
+    }
+
+    #[test]
+    fn is_running_follows_the_turn() {
+        let registry = SessionRegistry::new();
+        registry.insert("s1".into(), PathBuf::from("/work"));
+        assert!(!registry.is_running("s1"));
+        let (handle, _future) = idle_handle();
+        registry.begin_turn("s1", handle).unwrap();
+        assert!(registry.is_running("s1"));
+        registry.end_turn("s1");
+        assert!(!registry.is_running("s1"));
+        assert!(!registry.is_running("unknown"));
     }
 
     #[test]

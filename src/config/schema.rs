@@ -1483,6 +1483,12 @@ pub struct ToolsConfig {
     #[garde(skip)]
     pub restrict_to_workspace: bool,
 
+    /// Tool names that are never registered (including MCP tools and the ones
+    /// subagents get), e.g. `["write_file", "edit_file"]` for a read-only agent.
+    #[serde(alias = "disabled_tools")]
+    #[garde(skip)]
+    pub disabled_tools: Vec<String>,
+
     /// When true, the CLI `agent` command asks before each tool call.
     #[serde(alias = "confirm_before_execute")]
     #[garde(skip)]
@@ -1530,6 +1536,7 @@ impl Default for ToolsConfig {
             web: WebToolsConfig::default(),
             exec: ExecToolConfig::default(),
             restrict_to_workspace: false,
+            disabled_tools: Vec::new(),
             confirm_before_execute: false,
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),

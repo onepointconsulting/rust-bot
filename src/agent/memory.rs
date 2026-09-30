@@ -12,6 +12,7 @@ use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::LLMResponse;
 use crate::session::manager::{Session, SessionManager};
+use crate::utils::fs::write_atomic;
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
     empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain,
@@ -354,17 +355,12 @@ impl MemoryStore {
             );
             return 0;
         }
-        if let Ok(mut f) = File::create(&self.cursor_file) {
-            if let Err(e) = write!(f, "{}", cursor) {
-                log::error!(
-                    "Failed to write cursor file {}: {}",
-                    self.cursor_file.display(),
-                    e
-                );
-                return 0;
-            }
-        } else {
-            log::error!("Failed to open cursor file: {}", self.cursor_file.display());
+        if let Err(e) = write_atomic(&self.cursor_file, cursor.to_string().as_bytes()) {
+            log::error!(
+                "Failed to write cursor file {}: {}",
+                self.cursor_file.display(),
+                e
+            );
             return 0;
         }
         cursor
@@ -487,15 +483,15 @@ impl MemoryStore {
 
     /// Overwrite history.jsonl with the given entries.
     fn write_entries(&self, entries: Vec<serde_json::Value>) -> Result<(), io::Error> {
-        let mut file = File::create(&self.history_file)?;
+        let mut contents = Vec::new();
         for entry in entries {
             write!(
-                file,
+                contents,
                 "{}\n",
                 serde_json::to_string(&entry).map_err(io::Error::other)?
             )?;
         }
-        Ok(())
+        write_atomic(&self.history_file, &contents)
     }
 
     // Dream cursor
@@ -522,7 +518,7 @@ impl MemoryStore {
     }
 
     pub fn set_last_dream_cursor(&self, cursor: u64) {
-        if let Err(e) = std::fs::write(&self.dream_cursor_file, cursor.to_string().as_bytes()) {
+        if let Err(e) = write_atomic(&self.dream_cursor_file, cursor.to_string().as_bytes()) {
             log::error!("Failed to write dream cursor file: {}", e);
         }
     }
@@ -639,22 +635,9 @@ impl MemoryStore {
     }
 
     fn write_safe(content: &str, path: &PathBuf) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-        {
-            let result = file.write_all(content.as_bytes());
-            if result.is_err() {
-                log::error!(
-                    "Failed to write file: {} due to {}",
-                    path.display(),
-                    result.err().unwrap()
-                );
-            }
-        } else {
-            log::error!("Failed to write file: {}", path.display());
+        // Atomic: a kill mid-write must not leave MEMORY.md, SOUL.md or USER.md truncated.
+        if let Err(e) = write_atomic(path, content.as_bytes()) {
+            log::error!("Failed to write file: {} due to {}", path.display(), e);
         }
     }
 
@@ -3069,6 +3052,38 @@ mod tests {
     }
 
     // ── append_history ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_writes_are_atomic_and_leave_no_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+
+        store.write_memory("first version of the memory");
+        // A reader that opened the file before the next write still sees the
+        // complete old content (truncate-and-rewrite would change it).
+        let mut early_reader = File::open(&store.memory_file).unwrap();
+        store.write_memory("second version");
+        let mut old_content = String::new();
+        early_reader.read_to_string(&mut old_content).unwrap();
+        assert_eq!(old_content, "first version of the memory");
+        store.set_last_dream_cursor(7);
+        store.append_history("an entry");
+
+        assert_eq!(
+            fs::read_to_string(&store.memory_file).unwrap(),
+            "second version"
+        );
+        assert_eq!(store.get_last_dream_cursor(), 7);
+        for folder in [tmp.path().to_path_buf(), store.memory_dir.clone()] {
+            let temp_files: Vec<String> = fs::read_dir(&folder)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(temp_files.is_empty(), "{folder:?}: {temp_files:?}");
+        }
+    }
 
     #[test]
     fn append_history_first_entry_writes_jsonl_cursor_and_returns_one() {

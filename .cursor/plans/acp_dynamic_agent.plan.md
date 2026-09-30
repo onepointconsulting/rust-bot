@@ -126,6 +126,15 @@ In ACP, the process that is *launched* plays the **Agent** role and the launcher
    - **Enforced in two places, one function.** `validate_overlay(parent, overlay) -> Result<(), OverlayError>` is called by `acp_create_agent` / `acp_update_agent` (immediate, clear error for the LLM) and by `load_config_with_overlay` on every child start (the real guarantee — also catches a hand-edited or tampered `overlay.json`, which makes the child fail `initialize` with the error rather than start widened).
    - **Narrow-only keys combine as "strictest wins", not "overlay replaces".** Because inheritance is live, the parent may tighten a setting after the overlay was written (e.g. add a name to `disabledTools`, lower `maxDepth`). Plain RFC 7386 replacement would then let the older overlay value undo the parent's tightening. So for narrow-only paths the child's effective value is the stricter of parent and overlay: booleans AND/OR towards the safe side, `maxDepth` = min, `disabledTools` = union, `enabledTools` = intersection. A parent change can therefore only ever make its children stricter, never break or widen them. When the parent loosens, the child keeps its own stricter value. `validate_overlay` still rejects a widening overlay value when it is written, so the LLM gets feedback instead of a silently ignored setting.
 
+   **As built in Milestone 2** (`config/overlay.rs`, `config/child_env.rs`):
+   - **Table today:** `agents.model`, `agents.modelPreset`, `agents.provider` (free); `tools.exec.enable`, `tools.restrictToWorkspace`, `tools.disabledTools` (narrow-only); `tools.mcpServers.<name>` (drop with `null`) and its `enabledTools` (narrow-only). The `tools.acp.*` entries (`enabled`, `allowDynamicAgents`, `maxDepth`) are added in Milestone 3 together with `AcpConfig`; an overlay cannot reference a config section that does not exist yet.
+   - **Keys are the canonical camelCase names only**; aliases (snake_case) are not accepted, so there is exactly one spelling to check. The error for a rejected setting names the exact path, e.g. `providers.openai.apiBase` or `tools.mcpServers.docs.env.A`.
+   - **Two entry points, one table:** `validate_overlay` (write time: allowlist + "nothing looser than the parent *now*") and `load_config_with_overlay` (every start: allowlist, then strictest wins). A value that loosens the parent is an error when written but is *clamped, not fatal* at start, so a tampered file can never widen a child and a parent that tightens later can never break one.
+   - **`--overlay` requires `--workspace`** (enforced by the command line): a child has its own home and must never share its parent's memory and sessions. The parent's workspace is never touched by a child (tested).
+   - **Config-rewriting commands refuse in a child.** `/mcp-preset enable|disable` save the config to the global config path, which in a child is the *parent's* file — a child could give its parent a new MCP server. They now refuse when the process runs on an overlay (`overlay_is_active()`), with a message pointing at the parent.
+   - **`tools.disabledTools`** is enforced in three places: at registration in `AgentLoop::new`, for MCP tools that connect later (`connect_mcp` skips them), and for the tools subagents get (`SubagentManager::build_tool_registry`).
+   - **Child environment (decision 19), pure parts only:** `referenced_env_vars` (shares the loader's regex) and `child_environment` (base set + referenced variables + key variables of used providers; unset referenced variable → `MissingEnvVars` naming all of them; `RUST_BOT_ACP_DEPTH` set). Spawning with it comes with M3.
+
 3. **Memory isolation comes from the workspace, not from the ACP session.** `MemoryStore`, `SessionManager`, `ContextBuilder` and dream all key off the workspace path. A separate child workspace gives the child its own long-term memory that persists across ACP sessions, process restarts, and parent restarts (step 9). The ACP session (`session/load` / `session/resume`) only restores the *conversation* thread.
 
 4. **Session scope.** `tools.acp.sessionScope`:
@@ -165,6 +174,13 @@ In ACP, the process that is *launched* plays the **Agent** role and the launcher
     - Add one shared helper, `utils::fs::write_atomic(path, bytes)`: write to a temp file in the same directory, `sync_all`, then `std::fs::rename` over the target (atomic on the same volume; replaces the target on Windows too). Retry the rename a few times on transient Windows errors (antivirus or indexer holding the file).
     - `save_config` and the `sessions.json` registry use it. It is also the helper for the follow-up in decision 13 (atomic `MemoryStore` / `SessionManager` writes), so that later change is a call-site swap, not new code.
     - In `acp` mode, a config that fails to parse is reported as a JSON-RPC error on `initialize` and a non-zero exit, not a panic.
+
+    **As built in Milestone 2** (refinements of the text above):
+    - **Startup order** (`cli/acp.rs`): claim stdout → start reading stdin in a background thread (`stdin_pump`, buffers the bytes and reports EOF) → load the config *read-only* → take the lock → only then create workspace files and build the runtime. Building the runtime writes to the workspace (templates, git store), so it must not happen before the lock is held. EOF while waiting exits 0 without touching anything; a free lock is taken even if stdin has already closed (`biased` select), so a client that sends its requests and closes stdin at once is still served.
+    - **Bounded wait instead of an unbounded queue:** `--lock-wait-secs` (default 30). When it runs out, `initialize` fails with an error naming the holder's pid, instead of a client UI that hangs: a second client window or thread that ends up on the same workspace must explain itself. (Whether a given client starts one process per thread or shares one is client-specific and is checked in the manual Zed run.) A parent spawning a child passes a larger value, derived from `timeoutSecs`.
+    - **Owner record in a sidecar:** on Windows a held lock is mandatory — other processes cannot read the locked file — so the holder records `{pid, since}` in `.acp.lock.owner`, never in the lock file. It is diagnostic only; the OS lock decides ownership.
+    - **Scope:** only `rust-bot acp` takes the lock. The gateway and the CLI do not yet, so they can still run on a workspace that an `acp` process holds (noted in the README/limits, candidate for M3).
+    - **Atomic writes** (`utils::fs::write_atomic`): temp file in the same folder → `sync_all` → rename, plus (a) permissions of an existing file kept on Unix (a config holding secrets may be `0600`), (b) a symlink target is written through instead of replaced, (c) the rename step is serialized inside a process and retried on `PermissionDenied` — on Windows several renames replacing one destination at once fail with "access denied" and keep colliding. Call sites: `save_config`, `SessionManager::save`, `MemoryStore` (`write_safe`, both cursor files, the history rewrite); appending to `history.jsonl` stays an append. A crash can leave a hidden `.name.pid.n.tmp` file behind; nothing cleans those yet.
 
 11. **stdout is the protocol.** In `acp` (and `mcp`) mode, a stray byte on stdout corrupts the JSON-RPC stream. Today stdout is polluted in three ways: logging defaults to stdout (`init_runtime_logging`, `log.rs:60-64, 118-121`, and a failed log-file open falls back to stdout, `log.rs:136`); fixed startup prints (`println!("log file: …")`, `log.rs:127`; `println!("Using config: …")`, `commands.rs:1856`); and ~58 `println!`/`print!` calls across agent, provider, tool and config modules, some on runtime paths (e.g. `filesystem.rs`, `shell.rs`, `providers/base.rs`). Auditing them one by one is fragile — the next `println!` anyone adds would break the protocol again. Three layers:
     - **Logging to stderr in protocol mode.** `init_runtime_logging` gets a mode parameter. In protocol mode a stdout destination becomes stderr, a file destination stays, the "log file:" notice goes to stderr, and a failed file open falls back to stderr. `load_runtime_config` skips the "Using config" print in these modes.
@@ -424,6 +440,72 @@ Key paths verified against `src/config/schema.rs`: shell is `tools.exec.enable` 
 **Phase 5 — permissions + lifecycle.** Policy table (decision 9); `ToolApprovalBroker` escalation; graceful stop on stdin EOF with Dream on shutdown (decision 13); keep-alive pool + reaper; tree-kill as fallback only.
 
 **Phase 6 — MCP server role (`rust-bot mcp`).** Enable rmcp server features in production (decision 21); stdio MCP server on rmcp `ServerHandler` exposing `rust_bot_chat` + ACP tools; same stdout hygiene; reuses `process_direct`.
+
+## Milestones
+
+The phases above are the full plan. Work ships in milestones, each with a "done" definition that can be tested by hand before the next one starts.
+
+### Milestone 1 — `rust-bot acp` as a standalone ACP agent (scenario 4: Zed, JetBrains, any ACP client)
+
+**Goal:** an ACP client can launch `rust-bot acp --config <abs path>`, hold a conversation with it, see its tool activity, approve or deny its tool calls, cancel a turn, and close it cleanly. Nothing else exists yet: no children, no overlay, no client role, no MCP server.
+
+**In scope (decisions used):**
+- Crate spike and thin adapter (18): `agent-client-protocol = "2.2"`, v1 only; settles the runtime model against non-`Send` provider futures. `docs/acp/acp_peer.rs` is updated or removed.
+- `Acp(AcpArgs)` subcommand, headless, with `--config` made absolute and a missing config as a startup error (20). No `--overlay` yet.
+- stdout hygiene (11): protocol-mode logging to stderr, OS-level stdout redirect, protocol writer owns the real stdout.
+- Agent role (`agent_mode.rs`): `initialize` (`loadSession: false`, `authMethods: []`), `session/new`, `session/prompt`, `session/cancel`. Each session maps to session key `acp:<sessionId>` in the configured workspace.
+- Project scope (1): `session/new.cwd` becomes the session's `WorkspaceScope.project_path`, `restricted`; validated absolute and existing. Denied subtrees and the "no rust-bot home" rule wait for Milestone 3, where a parent hands out `cwd` values.
+- `AcpSessionHook` (16): `tool_call` / `tool_call_update` with kinds, `rawInput`, `locations`; text and reasoning chunks from the existing callbacks.
+- Fail-closed permissions (9): `session/request_permission` for `edit` / `execute` / `fetch` / `other`; deny on error, cancel or timeout; `CliAskHook` never installed. No `permissionPolicy` yet (that is the parent side).
+- Cancellation (15): each turn in its own task, `session/cancel` aborts it, `stopReason: "cancelled"`. The shared tree-kill helper is moved to `utils::process`, only as far as the shell tool needs.
+- No `spawn` tool in `acp` mode (17).
+- Graceful stop on stdin EOF: drain background work via `close_mcp()`, `dream.run()`, exit 0 (13). No tree-kill fallback yet; that is a parent-side feature.
+
+**Out of scope for M1** (later milestones): `session/load` and session replay, `--overlay` and overlay allowlist, child store, `.acp.lock` and atomic writes, ACP client role and `acp_*` tools, `tools.acp` config, MCP server, external presets, `ToolProgress`, `resolve_program`, `disabledTools`.
+
+**Done means (all must pass):**
+
+1. `cargo build` and `cargo test` pass; the existing test suite is unchanged and green.
+2. **stdout stays clean.** `rust-bot acp --config <abs> --logs` with `RUST_LOG=debug`, given one `initialize` request on stdin and EOF, prints exactly one JSON-RPC line on stdout (`2> stderr.log` holds the logs). A deliberate `println!` in a test tool appears on stderr, never stdout.
+3. **Automated conversation test** (`tests/acp_agent_test.rs`, mock LLM provider, the crate's client role as the test client): `initialize` → `session/new` → `session/prompt` with a tool call → receives `agent_message_chunk`, `tool_call` (id, kind, `rawInput`, `locations`), `tool_call_update` (`completed`) and `stopReason: end_turn`; a second prompt in the same session sees the first turn's context.
+4. **Permissions:** in the same test, a `shell` call triggers `session/request_permission`; approve → runs; deny → the model gets "denied by client" and the transcript stays well-formed; client error, `cancelled` outcome and a timeout each deny; `read_file` never asks; `CliAskHook` is not installed.
+5. **Cancel:** `session/cancel` during a long `shell` call → the prompt answers `stopReason: "cancelled"`, the shell process tree is gone, and the next prompt in that session works.
+6. **Project scope:** with `cwd` = a temp project, `read_file` inside it works and outside it is refused; a relative or missing `cwd` is rejected.
+7. **Clean stop:** closing stdin after a turn → the process exits 0 within a few seconds; `MEMORY.md` and the session file parse cleanly. `--config does-not-exist.json` → non-zero exit and a JSON-RPC error on `initialize`, not a start on defaults.
+8. **`spawn` is absent** from the `acp` tool list and still present in the CLI tool list.
+9. **Manual check in a real client (Zed):** register `rust-bot acp` as a custom agent server (absolute exe path and absolute `--config`; check Zed's current settings format), open a project folder, ask it to read a file → the tool call shows live; ask it to run a shell command → Zed asks for permission; deny → the agent reports the denial; stop a long command from Zed → it stops. Closing the thread ends the process (Task Manager).
+
+**Estimated effort:** roughly 12–20 hours of agent working time, plus your review and the Zed check.
+
+### Milestone 2 — sessions and safety plumbing (still standalone `rust-bot acp`)
+
+**Goal:** everything a parent rust-bot will later rely on, built and testable while `rust-bot acp` is still launched by hand or by Zed: resumable sessions, no two processes on one workspace, no half-written files, and a config overlay that can never give a child more power than its parent. Still no ACP client role, child store, `acp_*` tools or MCP server.
+
+**In scope (decisions used):**
+- **Atomic writes (10):** `utils::fs::write_atomic` (temp file in the same folder, `sync_all`, rename over the target, bounded retry on transient Windows errors). Used by `save_config`, `SessionManager::save` and the `MemoryStore` file writes; appending to `history.jsonl` stays an append.
+- **Cross-process lock (10):** `rust-bot acp` takes an exclusive OS lock (`std::fs::File::lock`) on `<workspace>/.acp.lock` before answering `initialize`, and keeps it until exit. If the lock is held it waits up to `--lock-wait-secs` (default 30), logging who holds it; then it answers `initialize` with a JSON-RPC error naming the holder's pid instead of hanging. EOF on stdin while waiting exits without touching any file. The holder's pid and start time are written into the lock file for diagnostics only. The OS releases the lock on any exit, including a kill.
+- **`session/load` (8):** advertise `loadSession: true`; replay the stored conversation as `session/update` notifications (user text, agent text, tool calls with results), then answer; re-scope the session to the request's `cwd`; unknown session → JSON-RPC error. Replay never writes to the session history.
+- **Overlay (2, 19, 20):** `rust-bot acp --overlay <file>`; `config/overlay.rs` with the code-level allowlist, `validate_overlay`, strictest-wins merge for narrow-only keys, raw-config → validate + merge → `${VAR}` expansion order; new `tools.disabledTools` setting (filtered in `register_default_tools`).
+- **Child environment, pure parts (19):** collecting the `${VAR}` names of a raw config with the same regex the loader uses, and building the child environment (base set + referenced variables, provider key variables only for used providers, missing variable → error naming it). Not used for spawning until M3.
+
+**Out of scope for M2:** ACP client role, `ChildAgentStore`, `acp_*` tools, `AcpManager` and its in-process lock, `sessions.json` registry, `ToolProgress`, `resolve_program`, MCP server, external presets, the gateway and CLI taking the lock (only `rust-bot acp` does).
+
+**Done means (all must pass):**
+
+1. `cargo build` and `cargo test --lib` are green (baseline 2235 passed), plus the M1 integration tests unchanged.
+2. **Atomic writes.** `write_atomic` unit tests (replace existing file, temp file in the same folder, no temp file left behind, retry path). A reader looping on `load_config` while another thread calls `save_config` repeatedly never sees invalid JSON. `SessionManager::save` and the memory writes go through it.
+3. **Lock.** Two real `rust-bot acp` processes on one workspace: the second does not answer `initialize` until the first exits; with `--lock-wait-secs 1` it fails fast with an error naming the holder's pid; killing the holder releases the lock; closing stdin while waiting exits cleanly without creating or changing workspace files; a different workspace is not blocked.
+4. **`session/load`.** With the mock LLM: create a session, prompt, disconnect; a new connection loads it and receives the replayed user and agent text and the tool call with its result in order; a following prompt sees the earlier context; the replay adds nothing to the stored history; `cwd` is re-applied (a file outside the new folder is unreadable); an unknown id is an error; the `initialize` response advertises `loadSession: true`.
+5. **Overlay.** Rejected: `providers.*.apiBase` / `apiKey` / `extraHeaders`, a new `tools.mcpServers` entry or a changed command/env of an inherited one, `tools.acp.launchPresets`, `tools.exec.enable: true` under a parent with `false`, `restrictToWorkspace: null` under a parent with `true`, `disabledTools` missing a parent entry, `maxDepth` above the parent's, an unknown path, `agents.provider` naming an unconfigured provider. Accepted: the read-only reviewer overlay, `agents.model`, dropping an inherited MCP server with `null`. Strictest wins when the parent tightens after the overlay was written. A tampered overlay file makes the real binary answer `initialize` with the validation error and exit non-zero. `disabledTools: ["write_file", "edit_file"]` removes those tools from a real `acp` agent.
+6. **Environment derivation.** A `${MCP_HEADERS_JWT}` placeholder anywhere in the merged config ends up in the child environment; variables not referenced are absent; the base set is present; an unset referenced variable is an error naming it; `validate_overlay` sees placeholders, never secrets.
+7. **Manual check in Zed:** close a thread that had a conversation, reopen it from Zed's thread history → the conversation is shown again and a follow-up message still knows the earlier context. Opening a second Zed window on the same workspace does not corrupt anything (it waits or reports who holds the workspace).
+
+**Status (2026-09-30): implemented.** Done-checks 1–6 pass automatically: lib tests 2306 green (baseline 2235), plus `acp_agent_test` (17), `acp_binary_test` (13, real processes) and `acp_startup_test` (13). Core mechanisms were mutation-checked (lock always succeeding, session save back to truncate-and-rewrite, `session/load` ignoring the new `cwd`): each makes the tests fail. **Pending:** check 7, the manual Zed run (resume a thread from history; a second window on the same workspace).
+
+### Later milestones (outline)
+
+- **M3 — Rust-bot children (scenario 2):** ACP client role, child store, `acp_*` tools, project-scope rules for parents, `AcpManager`, graceful stop with tree-kill fallback, `ToolProgress` and cancel-on-drop (22), `permissionPolicy`.
+- **M4 — External agents and MCP (scenarios 3 and 1):** launch presets with `resolve_program`, `rust-bot mcp`.
 
 ## Security notes
 

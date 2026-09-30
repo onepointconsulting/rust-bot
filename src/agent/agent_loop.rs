@@ -285,6 +285,9 @@ pub struct AgentLoop {
     exec_config: ExecToolConfig,
     pub cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
+    /// Tool names that are never registered (`tools.disabledTools`), including
+    /// MCP tools that connect later.
+    disabled_tools: Vec<String>,
     /// Resolves the effective per-turn workspace scope (see
     /// `security::workspace_access`), from a session's persisted override
     /// if any, else this loop's fixed `workspace`/`restrict_to_workspace`.
@@ -377,21 +380,24 @@ impl AgentLoop {
         });
         let runtime_resolver =
             Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
-        let subagents = Arc::new(SubagentManager::new(
-            runtime_resolver.clone(),
-            session_manager.clone(),
-            workspace.clone(),
-            bus.clone(),
-            max_tool_result_chars as usize,
-            Some(web_config.clone()),
-            Some(exec_config.clone()),
-            Some(gmail_config.clone()),
-            Some(ocr_config.clone()),
-            Some(docx_config.clone()),
-            Some(image_generation_config.clone()),
-            Some(subagent_config.clone()),
-            Some(restrict_to_workspace),
-        ));
+        let subagents = Arc::new(
+            SubagentManager::new(
+                runtime_resolver.clone(),
+                session_manager.clone(),
+                workspace.clone(),
+                bus.clone(),
+                max_tool_result_chars as usize,
+                Some(web_config.clone()),
+                Some(exec_config.clone()),
+                Some(gmail_config.clone()),
+                Some(ocr_config.clone()),
+                Some(docx_config.clone()),
+                Some(image_generation_config.clone()),
+                Some(subagent_config.clone()),
+                Some(restrict_to_workspace),
+            )
+            .with_disabled_tools(tools_cfg.disabled_tools.clone()),
+        );
         let mut tools = ToolRegistry::new();
         AgentLoop::register_default_tools(
             &mut tools,
@@ -410,6 +416,9 @@ impl AgentLoop {
             session_manager.clone(),
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
+        for name in &tools_cfg.disabled_tools {
+            tools.unregister(name);
+        }
         let tools = Arc::new(Mutex::new(tools));
         let context = Arc::new(ContextBuilder::with_default_mode(
             workspace.clone(),
@@ -448,6 +457,7 @@ impl AgentLoop {
             exec_config: exec_config.clone(),
             cron_service,
             restrict_to_workspace,
+            disabled_tools: tools_cfg.disabled_tools.clone(),
             workspace_scopes,
             _timezone: timezone,
             start_time: SystemTime::now(),
@@ -833,6 +843,9 @@ impl AgentLoop {
                     for session in &mut sessions {
                         mcp_tool_count += session.tools.len();
                         for tool in session.tools.drain(..) {
+                            if self.disabled_tools.contains(&tool.name()) {
+                                continue;
+                            }
                             registry.register(tool);
                         }
                     }

@@ -15,8 +15,9 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
     AgentCapabilities, CancelNotification, ContentBlock, ContentChunk, Implementation,
-    InitializeRequest, InitializeResponse, NewSessionRequest, NewSessionResponse, PromptRequest,
-    PromptResponse, SessionUpdate, StopReason, TextContent,
+    InitializeRequest, InitializeResponse, LoadSessionRequest, LoadSessionResponse,
+    NewSessionRequest, NewSessionResponse, PromptRequest, PromptResponse, SessionNotification,
+    SessionUpdate, StopReason, TextContent,
 };
 use agent_client_protocol::{
     Agent, Client, ConnectTo, ConnectionTo, Error, Responder, on_receive_notification,
@@ -27,6 +28,7 @@ use futures::future::abortable;
 use super::ACP_CHANNEL;
 use super::link::{AcpLink, ConnectionSlot};
 use super::registry::{SessionRegistry, TurnError};
+use super::replay::replay_updates;
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback, StreamCallback};
 use crate::bus::outbound_events::ProgressKind;
 use crate::security::workspace_access::WorkspaceAccessMode;
@@ -41,12 +43,12 @@ pub fn session_key(session_id: &str) -> String {
 
 /// Answer to `initialize`: the client's protocol version if we speak it, else ours.
 ///
-/// Capabilities are deliberately minimal for this milestone: no `session/load`,
-/// text prompts only, no authentication.
+/// Capabilities are deliberately small: `session/load` (conversations can be
+/// resumed), text prompts only, no authentication.
 pub fn initialize_response(request: &InitializeRequest) -> InitializeResponse {
     let protocol_version = request.protocol_version.min(ProtocolVersion::LATEST);
     InitializeResponse::new(protocol_version)
-        .agent_capabilities(AgentCapabilities::new().load_session(false))
+        .agent_capabilities(AgentCapabilities::new().load_session(true))
         .auth_methods(vec![])
         .agent_info(Implementation::new(AGENT_NAME, env!("CARGO_PKG_VERSION")))
 }
@@ -76,6 +78,48 @@ pub fn create_session(
     .map_err(|error| Error::invalid_params().data(error.to_string()))?;
     registry.insert(session_id.clone(), scope.project_path);
     Ok(session_id)
+}
+
+/// Re-open a stored ACP session and return the notifications that replay it.
+///
+/// * The session must exist on disk and must not have a turn in flight.
+/// * `cwd` is validated exactly like in `session/new` and becomes the session's
+///   project folder again, so the scope of an old conversation never outlives
+///   the folder the client opens it with.
+/// * Replaying only reads the stored messages; the history is not changed.
+pub fn load_session(
+    agent_loop: &AgentLoop,
+    registry: &SessionRegistry,
+    session_id: &str,
+    cwd: &Path,
+) -> Result<Vec<SessionUpdate>, Error> {
+    if registry.is_running(session_id) {
+        return Err(turn_error(TurnError::Busy));
+    }
+    let key = session_key(session_id);
+    let stored = agent_loop
+        .session_manager
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_session_internal(&key)
+        .ok_or_else(|| Error::resource_not_found(Some(session_id.to_string())))?;
+
+    let scope = {
+        let mut manager = agent_loop
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        agent_loop.set_session_workspace_scope(
+            &mut manager,
+            &key,
+            cwd,
+            WorkspaceAccessMode::Restricted,
+        )
+    }
+    .map_err(|error| Error::invalid_params().data(error.to_string()))?;
+
+    registry.insert(session_id.to_string(), scope.project_path.clone());
+    Ok(replay_updates(&stored.messages, Some(&scope.project_path)))
 }
 
 /// Flatten prompt content blocks into the text the agent loop takes.
@@ -237,7 +281,9 @@ pub async fn serve(
     slot: Arc<ConnectionSlot>,
     transport: impl ConnectTo<Agent> + 'static,
 ) -> Result<(), Error> {
-    let (initialize_slot, new_session_slot) = (Arc::clone(&slot), Arc::clone(&slot));
+    let (initialize_slot, new_session_slot, load_slot) =
+        (Arc::clone(&slot), Arc::clone(&slot), Arc::clone(&slot));
+    let (load_loop, load_registry) = (Arc::clone(&agent_loop), Arc::clone(&registry));
     let (new_session_loop, new_session_registry) = (Arc::clone(&agent_loop), Arc::clone(&registry));
     let (prompt_loop, prompt_registry, prompt_slot) =
         (Arc::clone(&agent_loop), Arc::clone(&registry), slot);
@@ -258,6 +304,26 @@ pub async fn serve(
                 new_session_slot.bind(&connection);
                 match create_session(&new_session_loop, &new_session_registry, &request.cwd) {
                     Ok(session_id) => responder.respond(NewSessionResponse::new(session_id)),
+                    Err(error) => responder.respond_with_error(error),
+                }
+            },
+            on_receive_request!(),
+        )
+        .on_receive_request(
+            async move |request: LoadSessionRequest, responder, connection| {
+                load_slot.bind(&connection);
+                let session_id = request.session_id.0.to_string();
+                match load_session(&load_loop, &load_registry, &session_id, &request.cwd) {
+                    Ok(updates) => {
+                        // Notifications are queued in order ahead of the response.
+                        for update in updates {
+                            connection.send_notification(SessionNotification::new(
+                                session_id.clone(),
+                                update,
+                            ))?;
+                        }
+                        responder.respond(LoadSessionResponse::new())
+                    }
                     Err(error) => responder.respond_with_error(error),
                 }
             },
@@ -345,9 +411,9 @@ mod tests {
     }
 
     #[test]
-    fn initialize_advertises_no_load_session_and_no_auth() {
+    fn initialize_advertises_load_session_and_no_auth() {
         let response = initialize_response(&InitializeRequest::new(ProtocolVersion::V1));
-        assert!(!response.agent_capabilities.load_session);
+        assert!(response.agent_capabilities.load_session);
         assert!(response.auth_methods.is_empty());
         assert_eq!(response.agent_info.unwrap().name, "rust-bot");
     }

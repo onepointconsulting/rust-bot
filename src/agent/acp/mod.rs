@@ -8,13 +8,19 @@
 //! * [`session_hook`]: structured tool events and fail-closed permissions.
 //! * [`mapping`]: pure tool-call to ACP-event rules.
 //! * [`registry`]: per-session project folder and running turn.
+//! * [`replay`]: stored conversation to `session/update` notifications.
 //! * [`link`]: the hook's view of the client connection.
+//! * [`workspace_lock`]: one `rust-bot acp` process per workspace.
+//! * [`stdin_pump`]: reads stdin from the start and reports EOF.
 
 pub mod agent_mode;
 pub mod link;
 pub mod mapping;
 pub mod registry;
+pub mod replay;
 pub mod session_hook;
+pub mod stdin_pump;
+pub mod workspace_lock;
 
 /// Channel name of every turn that comes from an ACP client.
 pub const ACP_CHANNEL: &str = "acp";

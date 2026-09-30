@@ -613,18 +613,6 @@ fn prepare_workspace(config: PathBuf, workspace: Option<PathBuf>) -> (Config, Pa
     (config, workspace)
 }
 
-/// [`prepare_workspace`] that reports a bad config as an error instead of exiting.
-pub(crate) fn try_prepare_workspace(
-    config: PathBuf,
-    workspace: Option<PathBuf>,
-) -> Result<(Config, PathBuf), String> {
-    let config = try_load_runtime_config(config, workspace)?;
-    let workspace = config.workspace_path();
-    ensure_dir(&workspace);
-    sync_workspace_templates(&workspace, false);
-    Ok((config, workspace))
-}
-
 fn init_agent_loop(
     config: &Config,
     workspace: PathBuf,

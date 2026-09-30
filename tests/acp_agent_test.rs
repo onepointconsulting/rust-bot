@@ -13,10 +13,10 @@ use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
-    CancelNotification, ContentBlock, InitializeRequest, NewSessionRequest, PromptRequest,
-    RequestPermissionOutcome, RequestPermissionRequest, RequestPermissionResponse,
-    SelectedPermissionOutcome, SessionNotification, SessionUpdate, StopReason, TextContent,
-    ToolCallStatus, ToolKind,
+    CancelNotification, ContentBlock, InitializeRequest, InitializeResponse, LoadSessionRequest,
+    LoadSessionResponse, NewSessionRequest, PromptRequest, RequestPermissionOutcome,
+    RequestPermissionRequest, RequestPermissionResponse, SelectedPermissionOutcome,
+    SessionNotification, SessionUpdate, StopReason, TextContent, ToolCallStatus, ToolKind,
 };
 use agent_client_protocol::{
     Agent, Channel, Client, ConnectionTo, Error, on_receive_notification, on_receive_request,
@@ -302,6 +302,26 @@ async fn initialize(connection: &ConnectionTo<Agent>) -> Result<(), Error> {
     Ok(())
 }
 
+async fn initialize_with_response(
+    connection: &ConnectionTo<Agent>,
+) -> Result<InitializeResponse, Error> {
+    connection
+        .send_request(InitializeRequest::new(ProtocolVersion::V1))
+        .block_task()
+        .await
+}
+
+async fn load_session(
+    connection: &ConnectionTo<Agent>,
+    session_id: &str,
+    cwd: &Path,
+) -> Result<LoadSessionResponse, Error> {
+    connection
+        .send_request(LoadSessionRequest::new(session_id.to_string(), cwd))
+        .block_task()
+        .await
+}
+
 async fn new_session(connection: &ConnectionTo<Agent>, cwd: &Path) -> Result<String, Error> {
     let response = connection
         .send_request(NewSessionRequest::new(cwd))
@@ -331,16 +351,50 @@ struct Fixture {
     runtime: AcpRuntime,
     provider: Arc<ScriptedProvider>,
     project: tempfile::TempDir,
-    _workspace: tempfile::TempDir,
+    workspace: tempfile::TempDir,
+}
+
+impl Fixture {
+    /// A fresh runtime on the same workspace, like a restarted `rust-bot acp`
+    /// process: new agent loop, new registry, new connection slot.
+    fn restarted_runtime(&self, script: Vec<LLMResponse>) -> (AcpRuntime, Arc<ScriptedProvider>) {
+        let mut config = Config::default();
+        config.agents.workspace = self.workspace.path().to_string_lossy().into_owned();
+        let provider = ScriptedProvider::new(script);
+        let for_agent: Arc<dyn LLMProviderDyn> = Arc::new(SharedProvider(Arc::clone(&provider)));
+        let runtime = assemble_acp_runtime(&config, self.workspace.path().to_path_buf(), for_agent);
+        (runtime, provider)
+    }
+
+    /// Stored message lines (everything after the metadata line) of a session.
+    fn stored_messages(&self, session_id: &str) -> Vec<String> {
+        let path = self
+            .workspace
+            .path()
+            .join("sessions")
+            .join(format!("acp_{session_id}.jsonl"));
+        std::fs::read_to_string(path)
+            .expect("the session file exists")
+            .lines()
+            .skip(1)
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 fn fixture(script: Vec<LLMResponse>) -> Fixture {
+    fixture_with(script, |_| {})
+}
+
+/// [`fixture`] with a chance to adjust the config before the agent is built.
+fn fixture_with(script: Vec<LLMResponse>, adjust: impl FnOnce(&mut Config)) -> Fixture {
     let workspace = tempfile::tempdir().unwrap();
     let project = tempfile::tempdir().unwrap();
     sync_workspace_templates(workspace.path(), false);
 
     let mut config = Config::default();
     config.agents.workspace = workspace.path().to_string_lossy().into_owned();
+    adjust(&mut config);
 
     let provider = ScriptedProvider::new(script);
     let provider_for_agent: Arc<dyn LLMProviderDyn> =
@@ -350,7 +404,7 @@ fn fixture(script: Vec<LLMResponse>) -> Fixture {
         runtime,
         provider,
         project,
-        _workspace: workspace,
+        workspace,
     }
 }
 
@@ -698,6 +752,30 @@ async fn headless_tool_list_has_no_spawn_question_or_message() {
 }
 
 #[tokio::test]
+async fn disabled_tools_are_removed_from_the_acp_agent() {
+    let fixture = fixture_with(vec![], |config| {
+        config.tools.disabled_tools = vec!["write_file".to_string(), "edit_file".to_string()];
+    });
+    let names = fixture
+        .runtime
+        .agent_loop
+        .tools_for_session(None)
+        .tool_names();
+    for gone in ["write_file", "edit_file"] {
+        assert!(
+            !names.iter().any(|name| name == gone),
+            "{gone} must be absent: {names:?}"
+        );
+    }
+    for kept in ["read_file", "shell", "grep"] {
+        assert!(
+            names.iter().any(|name| name == kept),
+            "{kept} must stay: {names:?}"
+        );
+    }
+}
+
+#[tokio::test]
 async fn cli_mode_tool_list_still_has_spawn() {
     // Same assembly minus the ACP-specific removal: what `rust-bot agent` builds.
     let workspace = tempfile::tempdir().unwrap();
@@ -831,4 +909,217 @@ async fn cancel_stops_the_turn_kills_the_shell_tree_and_the_session_still_works(
     .await;
 
     assert!(log.agent_text().contains("still alive after the cancel"));
+}
+
+// ── session/load ────────────────────────────────────────────────────────────
+
+/// Create a session that has had one conversation, then disconnect.
+/// Returns the session id.
+async fn conversation_to_resume(fixture: &Fixture) -> String {
+    let created = Arc::new(Mutex::new(String::new()));
+    let log = Arc::new(ClientLog::default());
+    write_project_file(
+        fixture.project.path(),
+        "notes.txt",
+        "hello from the project",
+    );
+    let slot = Arc::clone(&created);
+    run_client(
+        &fixture.runtime,
+        Permission::Allow,
+        &log,
+        async |connection| {
+            initialize(&connection).await?;
+            let session = new_session(&connection, fixture.project.path()).await?;
+            prompt(&connection, &session, "what is in notes.txt?").await?;
+            *slot.lock().unwrap() = session;
+            Ok(())
+        },
+    )
+    .await;
+    created.lock().unwrap().clone()
+}
+
+fn first_conversation_script() -> Vec<LLMResponse> {
+    vec![
+        tool_call_reply("call-1", "read_file", json!({"path": "notes.txt"})),
+        text_reply("The file says: hello from the project"),
+    ]
+}
+
+#[tokio::test]
+async fn initialize_advertises_load_session() {
+    let fixture = fixture(vec![]);
+    let log = Arc::new(ClientLog::default());
+    let advertised = Arc::new(Mutex::new(false));
+    let flag = Arc::clone(&advertised);
+
+    run_client(
+        &fixture.runtime,
+        Permission::Allow,
+        &log,
+        async |connection| {
+            let response = initialize_with_response(&connection).await?;
+            *flag.lock().unwrap() = response.agent_capabilities.load_session;
+            Ok(())
+        },
+    )
+    .await;
+
+    assert!(
+        *advertised.lock().unwrap(),
+        "loadSession must be advertised"
+    );
+}
+
+#[tokio::test]
+async fn a_stored_session_is_replayed_and_the_conversation_continues() {
+    let fixture = fixture(first_conversation_script());
+    let session_id = conversation_to_resume(&fixture).await;
+    let stored_before = fixture.stored_messages(&session_id);
+    assert!(!stored_before.is_empty());
+
+    // A restarted process: nothing in memory, only what is on disk.
+    let (runtime, provider) =
+        fixture.restarted_runtime(vec![text_reply("Earlier you asked what is in notes.txt")]);
+    let log = Arc::new(ClientLog::default());
+    let replayed_before_follow_up = Arc::new(Mutex::new(Vec::new()));
+    let snapshot = Arc::clone(&replayed_before_follow_up);
+    let stored_after_load = Arc::new(Mutex::new(Vec::new()));
+    let after_load = Arc::clone(&stored_after_load);
+
+    run_client(&runtime, Permission::Allow, &log, async |connection| {
+        initialize(&connection).await?;
+        load_session(&connection, &session_id, fixture.project.path()).await?;
+        // Everything replayed so far, captured before the follow-up runs.
+        *snapshot.lock().unwrap() = log.updates();
+        *after_load.lock().unwrap() = fixture.stored_messages(&session_id);
+        let stop = prompt(&connection, &session_id, "what did I ask before?").await?;
+        assert_eq!(stop, StopReason::EndTurn);
+        Ok(())
+    })
+    .await;
+
+    // The replay shows the first conversation, in order.
+    let replayed = replayed_before_follow_up.lock().unwrap().clone();
+    let summary: Vec<&str> = replayed
+        .iter()
+        .map(|update| match update {
+            SessionUpdate::UserMessageChunk(_) => "user",
+            SessionUpdate::AgentMessageChunk(_) => "agent",
+            SessionUpdate::ToolCall(_) => "tool_call",
+            SessionUpdate::ToolCallUpdate(_) => "tool_update",
+            _ => "other",
+        })
+        .collect();
+    assert_eq!(summary, vec!["user", "tool_call", "tool_update", "agent"]);
+    match &replayed[1] {
+        SessionUpdate::ToolCall(call) => {
+            assert_eq!(call.tool_call_id.0.as_ref(), "call-1");
+            assert_eq!(call.kind, ToolKind::Read);
+        }
+        other => panic!("expected the tool call, got {other:?}"),
+    }
+
+    // Replaying changed nothing in the stored history.
+    assert_eq!(*stored_after_load.lock().unwrap(), stored_before);
+
+    // The follow-up sees the earlier conversation.
+    let seen = provider.everything_seen();
+    assert!(seen.contains("what is in notes.txt?"), "{seen}");
+    assert!(
+        seen.contains("The file says: hello from the project"),
+        "{seen}"
+    );
+    assert!(seen.contains("what did I ask before?"), "{seen}");
+}
+
+#[tokio::test]
+async fn loading_reapplies_the_project_folder_of_the_new_request() {
+    let fixture = fixture(first_conversation_script());
+    let session_id = conversation_to_resume(&fixture).await;
+
+    // Reopen the same conversation with a different project folder. A file of the
+    // original project must no longer be readable.
+    let other_project = tempfile::tempdir().unwrap();
+    let old_file = fixture.project.path().join("notes.txt");
+    let (runtime, _provider) = fixture.restarted_runtime(vec![
+        tool_call_reply("r-1", "read_file", json!({"path": old_file})),
+        text_reply("done"),
+    ]);
+    let log = Arc::new(ClientLog::default());
+
+    run_client(&runtime, Permission::Allow, &log, async |connection| {
+        initialize(&connection).await?;
+        load_session(&connection, &session_id, other_project.path()).await?;
+        prompt(&connection, &session_id, "read the old file").await?;
+        Ok(())
+    })
+    .await;
+
+    assert_eq!(
+        log.tool_statuses().last(),
+        Some(&("r-1".to_string(), ToolCallStatus::Failed)),
+        "the old project folder must be out of scope"
+    );
+}
+
+#[tokio::test]
+async fn loading_an_unknown_session_is_an_error() {
+    let fixture = fixture(vec![]);
+    let log = Arc::new(ClientLog::default());
+
+    run_client(
+        &fixture.runtime,
+        Permission::Allow,
+        &log,
+        async |connection| {
+            initialize(&connection).await?;
+            let result = load_session(&connection, "no-such-session", fixture.project.path()).await;
+            assert!(result.is_err());
+            // Nothing was replayed and the connection is still usable.
+            assert!(log.updates().is_empty());
+            assert!(
+                new_session(&connection, fixture.project.path())
+                    .await
+                    .is_ok()
+            );
+            Ok(())
+        },
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn loading_rejects_a_relative_or_missing_project_folder() {
+    let fixture = fixture(first_conversation_script());
+    let session_id = conversation_to_resume(&fixture).await;
+    let (runtime, _provider) = fixture.restarted_runtime(vec![]);
+    let log = Arc::new(ClientLog::default());
+
+    run_client(&runtime, Permission::Allow, &log, async |connection| {
+        initialize(&connection).await?;
+        assert!(
+            load_session(&connection, &session_id, Path::new("relative/dir"))
+                .await
+                .is_err()
+        );
+        assert!(
+            load_session(
+                &connection,
+                &session_id,
+                &fixture.project.path().join("gone")
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            load_session(&connection, &session_id, fixture.project.path())
+                .await
+                .is_ok(),
+            "a valid folder still works after the rejected attempts"
+        );
+        Ok(())
+    })
+    .await;
 }

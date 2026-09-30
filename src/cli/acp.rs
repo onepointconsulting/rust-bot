@@ -1,12 +1,21 @@
 //! `rust-bot acp`: serve rust-bot as an Agent Client Protocol agent over stdio.
 //!
-//! Startup order matters. stdout is the protocol, so it is claimed before
-//! anything can print, logging is forced away from stdout, and only then is the
-//! config loaded. A config or provider problem is reported to the client as a
-//! JSON-RPC error on `initialize`, not as a silently dead process.
+//! Startup order matters:
+//!
+//! 1. stdout is the protocol, so it is claimed before anything can print, and
+//!    logging is forced away from it.
+//! 2. stdin is read from the start, so a client that disconnects while we wait
+//!    is noticed.
+//! 3. The config is loaded read-only to learn the workspace.
+//! 4. The workspace lock is taken. Only the lock holder may touch the workspace;
+//!    waiting for it never writes anything, and EOF while waiting exits quietly.
+//! 5. Only now is the runtime built (which creates workspace files) and served.
+//!
+//! A config, lock or provider problem is reported to the client as a JSON-RPC
+//! error on `initialize`, not as a silently dead process.
 
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,21 +27,29 @@ use crate::agent::acp::agent_mode::{serve, serve_startup_failure};
 use crate::agent::acp::link::{AcpLink, ConnectionSlot};
 use crate::agent::acp::registry::SessionRegistry;
 use crate::agent::acp::session_hook::{AcpSessionHook, DEFAULT_PERMISSION_TIMEOUT};
+use crate::agent::acp::stdin_pump::{EofSignal, StdinPump, spawn_pump};
+use crate::agent::acp::workspace_lock::{DEFAULT_POLL_INTERVAL, WorkspaceLock, acquire};
 use crate::agent::agent_loop::AgentLoop;
 use crate::agent::hook::AgentHook;
 use crate::cli::commands::{
     CliError, DEFAULT_CONFIG_PATH, eprint_error, init_agent_loop_with_provider,
-    try_create_provider, try_prepare_workspace,
+    try_create_provider, try_load_runtime_config,
 };
+use crate::config::loader::set_config_path;
 use crate::config::log::init_protocol_logging;
+use crate::config::overlay::{load_config_with_overlay, mark_overlay_active};
 use crate::config::schema::Config;
 use crate::providers::base::LLMProviderDyn;
 use crate::utils::exit_codes::{self, GENERAL_ERROR};
+use crate::utils::helpers::{ensure_dir, sync_workspace_templates};
 use crate::utils::stdio_redirect::claim_protocol_stdout;
 
 /// Longest the process waits, after the client has gone, for background memory
 /// work and Dream to finish before exiting anyway.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// Default for `--lock-wait-secs`.
+pub const DEFAULT_LOCK_WAIT_SECS: u64 = 30;
 
 #[derive(Debug, Parser)]
 pub struct AcpArgs {
@@ -47,6 +64,19 @@ pub struct AcpArgs {
     /// Write rust-bot runtime logs to stderr (or to `RUST_LOG_FILE`). Never to stdout.
     #[arg(long, default_value_t = false)]
     pub logs: bool,
+
+    /// Run as a child of another rust-bot: `--config` is the parent's config and
+    /// this file is a JSON merge patch applied on top of it. Only a short
+    /// allowlist of settings may be overridden, and only towards less power (see
+    /// `config::overlay`). Needs `--workspace`: a child has its own home, it must
+    /// never share its parent's memory and sessions.
+    #[arg(long, requires = "workspace")]
+    pub overlay: Option<PathBuf>,
+
+    /// How long to wait for another `rust-bot acp` process to release the workspace
+    /// before failing `initialize` with an error that names it.
+    #[arg(long, default_value_t = DEFAULT_LOCK_WAIT_SECS)]
+    pub lock_wait_secs: u64,
 }
 
 /// Everything the agent role needs, built from the config.
@@ -56,18 +86,24 @@ pub struct AcpRuntime {
     pub slot: Arc<ConnectionSlot>,
 }
 
-/// Make `--config` absolute and require that the file exists.
+/// Make `path` absolute and require that the file exists. `what` names the
+/// file in the error ("Config file", "Overlay file").
 ///
 /// The client launches rust-bot from an arbitrary working directory, so a
 /// relative path would silently load a different file (or none, which the
-/// loader would turn into the default config).
-pub fn resolve_acp_config_path(config: PathBuf) -> Result<PathBuf, String> {
-    let absolute = std::path::absolute(&config)
-        .map_err(|e| format!("Invalid config path {}: {e}", config.display()))?;
+/// config loader would turn into the default config).
+fn resolve_existing_file(path: PathBuf, what: &str) -> Result<PathBuf, String> {
+    let absolute = std::path::absolute(&path)
+        .map_err(|e| format!("Invalid {what} path {}: {e}", path.display()))?;
     if !absolute.is_file() {
-        return Err(format!("Config file not found: {}", absolute.display()));
+        return Err(format!("{what} not found: {}", absolute.display()));
     }
     Ok(absolute)
+}
+
+/// Make `--config` absolute and require that the file exists.
+pub fn resolve_acp_config_path(config: PathBuf) -> Result<PathBuf, String> {
+    resolve_existing_file(config, "Config file")
 }
 
 /// Text of a caught panic payload.
@@ -79,20 +115,62 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
         .unwrap_or_else(|| "unknown error".to_string())
 }
 
-/// Load the config and build the ACP runtime from it.
-pub fn build_acp_runtime(args: &AcpArgs) -> Result<AcpRuntime, String> {
+/// A loaded config and the workspace it names. Nothing has been written yet.
+pub struct AcpStartup {
+    pub config: Config,
+    pub workspace: PathBuf,
+}
+
+/// Load the config read-only to learn the workspace.
+///
+/// Does not create or change any file: the workspace lock has to be taken
+/// before anything in the workspace is touched.
+pub fn load_acp_config(args: &AcpArgs) -> Result<AcpStartup, String> {
     let config_path = resolve_acp_config_path(args.config.clone())?;
     // The config loader panics on malformed JSON; turn that into an error.
-    let (config, workspace) = std::panic::catch_unwind(AssertUnwindSafe(|| {
-        try_prepare_workspace(config_path, args.workspace.clone())
+    let loaded = std::panic::catch_unwind(AssertUnwindSafe(|| match &args.overlay {
+        None => try_load_runtime_config(config_path.clone(), args.workspace.clone()),
+        Some(overlay) => load_child_config(&config_path, overlay, args.workspace.as_deref()),
     }))
     .map_err(|payload| {
         format!(
             "Config file could not be loaded: {}",
             panic_message(payload.as_ref())
         )
-    })??;
+    })?;
+    let config = loaded?;
+    let workspace = config.workspace_path();
+    Ok(AcpStartup { config, workspace })
+}
 
+/// The parent's config with the overlay applied and the child's own workspace.
+///
+/// The overlay is validated against the allowlist and merged *before* `${VAR}`
+/// placeholders are expanded (see `config::overlay`). Marks the process as a
+/// child so commands that would rewrite the parent's config refuse to run.
+fn load_child_config(
+    config_path: &Path,
+    overlay: &Path,
+    workspace: Option<&Path>,
+) -> Result<Config, String> {
+    let overlay_path = resolve_existing_file(overlay.to_path_buf(), "Overlay file")?;
+    // The data folder (logs, media) follows the parent's config path.
+    set_config_path(config_path.to_path_buf());
+    let mut config =
+        load_config_with_overlay(config_path, &overlay_path).map_err(|e| e.to_string())?;
+    let workspace = workspace.ok_or("--overlay needs --workspace: a child has its own home")?;
+    config.agents.workspace = workspace.to_string_lossy().into_owned();
+    mark_overlay_active();
+    Ok(config)
+}
+
+/// Create the workspace files and build the ACP runtime.
+///
+/// Call this only while holding the workspace lock.
+pub fn build_acp_runtime(startup: AcpStartup) -> Result<AcpRuntime, String> {
+    let AcpStartup { config, workspace } = startup;
+    ensure_dir(&workspace);
+    sync_workspace_templates(&workspace, false);
     let provider = try_create_provider(&config)?;
     Ok(assemble_acp_runtime(&config, workspace, provider))
 }
@@ -157,18 +235,18 @@ pub async fn run_acp(args: AcpArgs) -> Result<(), CliError> {
     };
     init_protocol_logging(args.logs, None);
 
-    let transport = ByteStreams::new(
-        blocking::Unblock::new(protocol_stdout),
-        blocking::Unblock::new(std::io::stdin()),
-    );
+    // Read stdin from the start so a disconnect during startup is noticed.
+    let StdinPump { reader, mut eof } = spawn_pump(std::io::stdin());
+    let transport = ByteStreams::new(blocking::Unblock::new(protocol_stdout), reader);
 
-    match build_acp_runtime(&args) {
-        Err(message) => {
+    match start(&args, &mut eof).await {
+        Startup::ClientGone => Ok(()),
+        Startup::Failed(message) => {
             eprint_error(&message);
             let _ = serve_startup_failure(message, transport).await;
             exit_codes::exit(GENERAL_ERROR);
         }
-        Ok(runtime) => {
+        Startup::Ready { runtime, lock } => {
             let served = serve(
                 Arc::clone(&runtime.agent_loop),
                 Arc::clone(&runtime.registry),
@@ -177,8 +255,50 @@ pub async fn run_acp(args: AcpArgs) -> Result<(), CliError> {
             )
             .await;
             drain_and_dream(&runtime).await;
+            drop(lock);
             served.map_err(|error| CliError::Other(format!("ACP connection failed: {error}")))
         }
+    }
+}
+
+/// How startup ended.
+pub enum Startup {
+    /// The workspace is locked by us and the runtime is built.
+    Ready {
+        runtime: AcpRuntime,
+        lock: WorkspaceLock,
+    },
+    /// The client closed stdin while we were waiting for the lock. Nothing in
+    /// the workspace was touched.
+    ClientGone,
+    /// Startup failed; the message is what the client should be told.
+    Failed(String),
+}
+
+/// Load the config, take the workspace lock (waiting up to `--lock-wait-secs`,
+/// and giving up at once if the client disconnects), then build the runtime.
+pub async fn start(args: &AcpArgs, eof: &mut EofSignal) -> Startup {
+    let startup = match load_acp_config(args) {
+        Ok(startup) => startup,
+        Err(message) => return Startup::Failed(message),
+    };
+
+    let wait = Duration::from_secs(args.lock_wait_secs);
+    let locked = tokio::select! {
+        // A free lock is taken even if stdin has already closed, so a client
+        // that sends its requests and closes stdin at once is still served.
+        biased;
+        result = acquire(&startup.workspace, wait, DEFAULT_POLL_INTERVAL) => result,
+        _ = eof.reached() => return Startup::ClientGone,
+    };
+    let lock = match locked {
+        Ok(lock) => lock,
+        Err(error) => return Startup::Failed(error.to_string()),
+    };
+
+    match build_acp_runtime(startup) {
+        Ok(runtime) => Startup::Ready { runtime, lock },
+        Err(message) => Startup::Failed(message),
     }
 }
 
@@ -221,5 +341,6 @@ mod tests {
         assert_eq!(args.config, PathBuf::from(DEFAULT_CONFIG_PATH));
         assert!(!args.logs);
         assert!(args.workspace.is_none());
+        assert_eq!(args.lock_wait_secs, DEFAULT_LOCK_WAIT_SECS);
     }
 }

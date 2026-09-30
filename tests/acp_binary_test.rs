@@ -109,6 +109,15 @@ impl RunningAgent {
             .expect("a line on stdout")
     }
 
+    /// Next stdout line if one arrives within `timeout`.
+    fn stdout_line_within(&self, timeout: Duration) -> Option<String> {
+        self.stdout_lines.recv_timeout(timeout).ok()
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
     /// Wait for the process to exit; kills it (and fails) on timeout.
     fn wait_for_exit(&mut self) -> std::process::ExitStatus {
         let deadline = Instant::now() + EXIT_TIMEOUT;
@@ -284,4 +293,255 @@ fn closing_stdin_stops_cleanly_and_leaves_valid_files() {
     {
         serde_json::from_str::<Value>(line).expect("every session line is valid JSON");
     }
+}
+
+// ── workspace lock across real processes ────────────────────────────────────
+
+/// Launch an agent on `config` and complete the `initialize` handshake.
+fn launch_initialized(dir: &Path, config: &Path, extra_args: &[&str]) -> RunningAgent {
+    let mut args = vec!["--config", config.to_str().unwrap()];
+    args.extend_from_slice(extra_args);
+    let mut agent = launch(dir, &args, &[]);
+    agent.send(&initialize_request());
+    let response = parse_frame(&agent.next_stdout_line());
+    assert!(response.get("result").is_some(), "{response}");
+    agent
+}
+
+fn sorted_entries(dir: &Path) -> Vec<(String, u64)> {
+    let mut entries: Vec<(String, u64)> = std::fs::read_dir(dir)
+        .unwrap()
+        .filter_map(Result::ok)
+        .map(|entry| {
+            let len = entry.metadata().map(|m| m.len()).unwrap_or(0);
+            (entry.file_name().to_string_lossy().into_owned(), len)
+        })
+        .collect();
+    entries.sort();
+    entries
+}
+
+#[test]
+fn a_second_process_waits_for_the_workspace_then_proceeds_when_the_first_exits() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let mut first = launch_initialized(dir.path(), &config, &[]);
+
+    let mut second = launch(dir.path(), &["--config", config.to_str().unwrap()], &[]);
+    second.send(&initialize_request());
+    assert!(
+        second
+            .stdout_line_within(Duration::from_millis(1500))
+            .is_none(),
+        "the second process must not answer initialize while the workspace is held"
+    );
+
+    first.close_stdin();
+    assert!(first.wait_for_exit().success());
+
+    let response = parse_frame(&second.next_stdout_line());
+    assert!(response.get("result").is_some(), "{response}");
+    second.close_stdin();
+    assert!(second.wait_for_exit().success());
+}
+
+#[test]
+fn a_short_lock_wait_fails_initialize_with_the_holders_pid() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let mut holder = launch_initialized(dir.path(), &config, &[]);
+
+    let mut refused = launch(
+        dir.path(),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--lock-wait-secs",
+            "1",
+        ],
+        &[],
+    );
+    refused.send(&initialize_request());
+    let response = parse_frame(&refused.next_stdout_line());
+
+    assert!(response.get("result").is_none(), "{response}");
+    let error = response["error"].to_string();
+    assert!(error.contains("in use"), "{error}");
+    assert!(error.contains(&holder.pid().to_string()), "{error}");
+    assert!(!refused.wait_for_exit().success());
+
+    holder.close_stdin();
+    holder.wait_for_exit();
+}
+
+#[test]
+fn killing_the_holder_releases_the_workspace() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let mut holder = launch_initialized(dir.path(), &config, &[]);
+
+    let mut waiting = launch(dir.path(), &["--config", config.to_str().unwrap()], &[]);
+    waiting.send(&initialize_request());
+    assert!(
+        waiting
+            .stdout_line_within(Duration::from_millis(1000))
+            .is_none()
+    );
+
+    holder.child.kill().expect("kill the holder");
+    holder.wait_for_exit();
+
+    let response = parse_frame(&waiting.next_stdout_line());
+    assert!(
+        response.get("result").is_some(),
+        "the lock must be free after the holder was killed: {response}"
+    );
+    waiting.close_stdin();
+    assert!(waiting.wait_for_exit().success());
+}
+
+#[test]
+fn a_disconnect_while_waiting_exits_cleanly_and_leaves_the_workspace_untouched() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let mut holder = launch_initialized(dir.path(), &config, &[]);
+    let workspace = dir.path().join("workspace");
+    let before = sorted_entries(&workspace);
+
+    let mut waiting = launch(dir.path(), &["--config", config.to_str().unwrap()], &[]);
+    waiting.send(&initialize_request());
+    assert!(
+        waiting
+            .stdout_line_within(Duration::from_millis(800))
+            .is_none()
+    );
+    waiting.close_stdin();
+    let status = waiting.wait_for_exit();
+
+    assert!(status.success(), "exit status: {status:?}");
+    assert!(waiting.remaining_stdout().is_empty());
+    assert_eq!(sorted_entries(&workspace), before);
+
+    holder.close_stdin();
+    holder.wait_for_exit();
+}
+
+#[test]
+fn a_different_workspace_is_not_blocked() {
+    let first_dir = tempfile::tempdir().unwrap();
+    let second_dir = tempfile::tempdir().unwrap();
+    let first_config = write_valid_config(first_dir.path());
+    let second_config = write_valid_config(second_dir.path());
+
+    let mut first = launch_initialized(first_dir.path(), &first_config, &[]);
+    let mut second = launch_initialized(second_dir.path(), &second_config, &[]);
+
+    first.close_stdin();
+    second.close_stdin();
+    assert!(first.wait_for_exit().success());
+    assert!(second.wait_for_exit().success());
+}
+
+// ── child agents through the real binary ────────────────────────────────────
+
+fn write_overlay_file(dir: &Path, overlay: Value) -> PathBuf {
+    let path = dir.join("overlay.json");
+    std::fs::write(&path, serde_json::to_string_pretty(&overlay).unwrap()).unwrap();
+    path
+}
+
+#[test]
+fn a_child_with_a_valid_overlay_starts_locks_its_own_home_and_stops_cleanly() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let overlay = write_overlay_file(
+        dir.path(),
+        json!({"tools": {"exec": {"enable": false}, "disabledTools": ["write_file", "edit_file"]}}),
+    );
+    let home = dir.path().join("child-home");
+    let mut child = launch(
+        dir.path(),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--overlay",
+            overlay.to_str().unwrap(),
+            "--workspace",
+            home.to_str().unwrap(),
+        ],
+        &[],
+    );
+
+    child.send(&initialize_request());
+    let response = parse_frame(&child.next_stdout_line());
+    assert!(response.get("result").is_some(), "{response}");
+    assert!(
+        home.join(".acp.lock").is_file(),
+        "the child locks its own home"
+    );
+    assert!(
+        !dir.path().join("workspace").exists(),
+        "the parent's workspace must not be touched"
+    );
+
+    child.close_stdin();
+    assert!(child.wait_for_exit().success());
+}
+
+#[test]
+fn a_tampered_overlay_reaches_the_client_as_an_initialize_error_and_a_failing_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let overlay = write_overlay_file(
+        dir.path(),
+        json!({"providers": {"openai": {"apiBase": "https://evil.example"}}}),
+    );
+    let home = dir.path().join("child-home");
+    let mut child = launch(
+        dir.path(),
+        &[
+            "--config",
+            config.to_str().unwrap(),
+            "--overlay",
+            overlay.to_str().unwrap(),
+            "--workspace",
+            home.to_str().unwrap(),
+        ],
+        &[],
+    );
+
+    child.send(&initialize_request());
+    let response = parse_frame(&child.next_stdout_line());
+
+    assert!(response.get("result").is_none(), "{response}");
+    let error = response["error"].to_string();
+    assert!(error.contains("providers.openai.apiBase"), "{error}");
+    assert!(!child.wait_for_exit().success());
+    assert!(
+        !home.exists(),
+        "a refused overlay must not create the child's home"
+    );
+}
+
+#[test]
+fn an_overlay_without_a_workspace_is_refused_by_the_command_line() {
+    let dir = tempfile::tempdir().unwrap();
+    let config = write_valid_config(dir.path());
+    let overlay = write_overlay_file(dir.path(), json!({}));
+    let output = Command::new(env!("CARGO_BIN_EXE_rust-bot"))
+        .args([
+            "acp",
+            "--config",
+            config.to_str().unwrap(),
+            "--overlay",
+            overlay.to_str().unwrap(),
+        ])
+        .current_dir(dir.path())
+        .output()
+        .expect("run rust-bot acp");
+
+    assert!(!output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(stderr.contains("--workspace"), "{stderr}");
+    assert!(output.stdout.is_empty(), "nothing may reach stdout");
 }
