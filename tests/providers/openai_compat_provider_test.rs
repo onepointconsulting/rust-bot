@@ -11,9 +11,9 @@ fn creates_provider_via_trait_constructor() {
     let provider = create_openrouter_provider();
 
     assert!(provider.api_key().is_some());
-    assert!(provider.api_key().unwrap().len() > 0);
+    assert!(!provider.api_key().unwrap().is_empty());
     assert!(provider.api_base().is_some());
-    assert!(provider.get_default_model().len() > 0);
+    assert!(!provider.get_default_model().is_empty());
     assert!(provider.get_default_model() == openai_api_model);
     assert!(provider.spec().is_none());
     assert!(provider.extra_headers().is_some());
@@ -26,7 +26,7 @@ fn test_create_openrouter_provider_with_spec() {
     let provider = create_openrouter_provider_with_spec();
     assert!(provider.api_key().is_some());
     assert!(provider.api_base().is_some());
-    assert!(provider.get_default_model().len() > 0);
+    assert!(!provider.get_default_model().is_empty());
     assert_eq!(provider.get_default_model(), openai_api_model);
     assert!(provider.spec().is_some());
     assert_eq!(provider.spec().unwrap().name, "openrouter");
@@ -44,10 +44,10 @@ async fn simple_test_chat_system(system_message: &str, user_message: &str) -> LL
             "content": user_message
         }),
     ];
-    let response = provider
+    
+    provider
         .chat(messages, None, None, 100, Some(0.5), None, None)
-        .await;
-    response
+        .await
 }
 
 async fn simple_test_chat(message: &str) -> LLMResponse {
@@ -56,10 +56,10 @@ async fn simple_test_chat(message: &str) -> LLMResponse {
         "role": "user",
         "content": message
     })];
-    let response = provider
+    
+    provider
         .chat(messages, None, None, 1000, Some(0.5), None, None)
-        .await;
-    response
+        .await
 }
 
 fn simple_weather_tool() -> serde_json::Value {
@@ -93,7 +93,8 @@ async fn simple_test_safe_chat(message: &str) -> LLMResponse {
         "role": "user",
         "content": message
     })];
-    let response = provider
+    
+    provider
         .safe_chat(
             messages,
             Some(vec![simple_weather_tool()]),
@@ -103,8 +104,7 @@ async fn simple_test_safe_chat(message: &str) -> LLMResponse {
             None,
             None,
         )
-        .await;
-    response
+        .await
 }
 
 #[tokio::test]
@@ -161,7 +161,7 @@ fn create_openrouter_provider_with_long_message() -> (OpenAICompatProvider, Vec<
         "role": "user",
         "content": "Can you tell me a really long joke?"
     })];
-    return (provider, messages);
+    (provider, messages)
 }
 
 fn create_openrouter_provider_with_long_message_2(
@@ -172,7 +172,7 @@ fn create_openrouter_provider_with_long_message_2(
         "role": "user",
         "content": message
     })];
-    return (provider, messages);
+    (provider, messages)
 }
 
 #[tokio::test]
@@ -194,7 +194,7 @@ async fn test_chat_stream_success() {
         )
         .await;
     assert!(response.content.is_some());
-    assert!(response.content.unwrap().len() > 0);
+    assert!(!response.content.unwrap().is_empty());
     // println!("response: {}", response.content.unwrap());
 }
 
@@ -217,7 +217,7 @@ async fn test_safe_chat_stream_success() {
         )
         .await;
     assert!(response.content.is_some());
-    assert!(response.content.unwrap().len() > 0);
+    assert!(!response.content.unwrap().is_empty());
     // println!("response: {}", response.content.unwrap());
 }
 
@@ -240,7 +240,7 @@ async fn test_safe_chat_stream_with_retry_success() {
         )
         .await;
     assert!(response.content.is_some());
-    assert!(response.content.unwrap().len() > 0);
+    assert!(!response.content.unwrap().is_empty());
     // println!("response: {}", response.content.unwrap());
 }
 
@@ -264,6 +264,6 @@ async fn test_safe_chat_stream_with_retry_success_2() {
         )
         .await;
     assert!(response.content.is_some());
-    assert!(response.content.unwrap().len() > 0);
+    assert!(!response.content.unwrap().is_empty());
     // println!("response: {}", response.content.unwrap());
 }

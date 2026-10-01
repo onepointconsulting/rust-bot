@@ -522,31 +522,28 @@ impl BaseChannel for WhatsAppChannel {
             return false;
         }
         let session_db_path = self.session_db_path();
-        if force {
-            if let Err(e) = self.clear_session_store() {
+        if force
+            && let Err(e) = self.clear_session_store() {
                 log::error!("{e}");
                 return false;
             }
-        }
-        if let Some(parent) = session_db_path.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = session_db_path.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 log::error!(
                     "Failed to create WhatsApp session directory '{}': {e}",
                     parent.display()
                 );
                 return false;
             }
-        }
         let media_dir = self.media_download_dir();
-        if !self.config.media_download_dir.trim().is_empty() {
-            if let Err(e) = std::fs::create_dir_all(&media_dir) {
+        if !self.config.media_download_dir.trim().is_empty()
+            && let Err(e) = std::fs::create_dir_all(&media_dir) {
                 log::error!(
                     "Failed to create WhatsApp media directory '{}': {e}",
                     media_dir.display()
                 );
                 return false;
             }
-        }
         let Ok(store) = self.create_store().await else {
             return false;
         };

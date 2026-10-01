@@ -136,14 +136,14 @@ pub fn format_tool_hints(tool_calls: Vec<ToolCallRequest>) -> String {
         hints.push(hint);
     }
 
-    return hints.join(", ");
+    hints.join(", ")
 }
 
 /// Group consecutive calls to the same tool: [(name, count, first), ...].
 fn group_consecutive(calls: Vec<ToolCallRequest>) -> Vec<ToolCallGroup> {
     let mut groups: Vec<ToolCallGroup> = Vec::new();
     for tc in calls {
-        if groups.len() > 0 && groups.last().unwrap().name == tc.name {
+        if !groups.is_empty() && groups.last().unwrap().name == tc.name {
             let last_index = groups.len() - 1;
             groups[last_index] = ToolCallGroup {
                 name: tc.name.clone(),
@@ -158,7 +158,7 @@ fn group_consecutive(calls: Vec<ToolCallRequest>) -> Vec<ToolCallGroup> {
             });
         }
     }
-    return groups;
+    groups
 }
 
 /// Format a registered tool using its template.
@@ -192,22 +192,17 @@ fn extract_arg(tc: &ToolCallRequest, key_args: &[&str]) -> Option<String> {
         let val_option = args.get(*key);
         if let Some(val) = val_option
             && val.is_string()
-        {
-            if let Some(val_str) = val.as_str() {
-                if !val_str.is_empty() {
+            && let Some(val_str) = val.as_str()
+                && !val_str.is_empty() {
                     return Some(val_str.to_string());
                 }
-            }
-        }
     }
     for val in args.values() {
-        if val.is_string() {
-            if let Some(val_str) = val.as_str() {
-                if !val_str.is_empty() {
+        if val.is_string()
+            && let Some(val_str) = val.as_str()
+                && !val_str.is_empty() {
                     return Some(val_str.to_string());
                 }
-            }
-        }
     }
     None
 }
@@ -220,11 +215,10 @@ fn get_args(tc: &ToolCallRequest) -> &HashMap<String, serde_json::Value> {
 /// First non-empty string value from tool arguments.
 fn first_string_arg(args: &HashMap<String, serde_json::Value>) -> Option<&str> {
     for val in args.values() {
-        if let Some(s) = val.as_str() {
-            if !s.is_empty() {
+        if let Some(s) = val.as_str()
+            && !s.is_empty() {
                 return Some(s);
             }
-        }
     }
     None
 }

@@ -216,7 +216,7 @@ impl EmailChannel {
         Self {
             base: BaseChannelCommon::new(bus, session_manager, workspace_request_handler),
             channels_config,
-            config: config,
+            config,
             last_subject_by_chat_id: Mutex::new(HashMap::new()),
             last_message_id_by_chat: Mutex::new(HashMap::new()),
             processed_uids: Mutex::new(HashSet::new()),
@@ -513,11 +513,10 @@ impl EmailChannel {
                     }
                 }
             }
-            if mark_seen {
-                if let Err(e) = session.uid_store(uid, "+FLAGS (\\Seen)").await {
+            if mark_seen
+                && let Err(e) = session.uid_store(uid, "+FLAGS (\\Seen)").await {
                     log::warn!("Email channel: Failed to mark message uid={uid} as seen: {e}");
                 }
-            }
         }
 
         Ok(())
@@ -966,8 +965,7 @@ impl BaseChannel for EmailChannel {
 
         if !msg.metadata.is_empty() {
             let subject_option = msg.metadata.get("subject");
-            if subject_option
-                .and_then(|v| Some(v.is_string()))
+            if subject_option.map(|v| v.is_string())
                 .unwrap_or(false)
             {
                 let override_subject = subject_option.and_then(|v| v.as_str()).unwrap_or("");
@@ -1022,13 +1020,11 @@ impl BaseChannel for EmailChannel {
             .unwrap()
             .get(&to_addr)
             .cloned()
-        {
-            if !in_reply_to.trim().is_empty() {
+            && !in_reply_to.trim().is_empty() {
                 builder = builder
                     .in_reply_to(in_reply_to.clone())
                     .references(in_reply_to);
             }
-        }
 
         let email_msg = Self::build_email_message(msg, builder)?;
 

@@ -107,7 +107,7 @@ impl ShellTool {
             if IS_WINDOWS {
                 log::warn!(
                     "Sandbox '{}' is not supported on Windows; running unsandboxed",
-                    sandbox.to_string()
+                    sandbox
                 )
             } else {
                 let workspace = tw
@@ -341,20 +341,19 @@ impl ShellTool {
         // ── 1. Deny patterns ─────────────────────────────────────────────────
         if let Some(deny) = &self.deny_patterns {
             for pattern in deny {
-                if let Ok(re) = Regex::new(pattern) {
-                    if re.is_match(&lower) {
+                if let Ok(re) = Regex::new(pattern)
+                    && re.is_match(&lower) {
                         return Some(
                             "Error: Command blocked by safety guard (dangerous pattern detected)"
                                 .to_string(),
                         );
                     }
-                }
             }
         }
 
         // ── 2. Allow patterns ─────────────────────────────────────────────────
-        if let Some(allow) = &self.allow_patterns {
-            if !allow.is_empty() {
+        if let Some(allow) = &self.allow_patterns
+            && !allow.is_empty() {
                 let permitted = allow
                     .iter()
                     .any(|p| Regex::new(p).map(|re| re.is_match(&lower)).unwrap_or(false));
@@ -364,7 +363,6 @@ impl ShellTool {
                     );
                 }
             }
-        }
 
         // ── 3. Workspace restriction ──────────────────────────────────────────
         if restrict_to_workspace {
@@ -588,13 +586,13 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> String {
-        return r#"Execute a shell command and return its output.
+        r#"Execute a shell command and return its output.
 Prefer read_file/write_file/edit_file over cat/echo/sed, and grep/glob over shell find/grep. 
 Use -y or --yes flags to avoid interactive prompts.
 Output is truncated at 10 000 chars; timeout defaults to 60s."#
             .to_string()
             .trim()
-            .to_string();
+            .to_string()
     }
 
     fn exclusive(&self) -> bool {
@@ -782,7 +780,7 @@ mod tests {
             .execute_command(if IS_WINDOWS { "vol" } else { "lsblk -f" }, None, None)
             .await;
         println!("result: {result}");
-        assert!(result.len() > 0, "result should not be empty");
+        assert!(!result.is_empty(), "result should not be empty");
     }
 
     // --- ambient workspace-scope consultation ---

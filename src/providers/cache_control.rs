@@ -48,13 +48,12 @@ pub fn apply_cache_control(
         }
     }
 
-    let mut new_messages: Vec<Value> = messages.iter().cloned().collect();
+    let mut new_messages: Vec<Value> = messages.to_vec();
 
-    if let Some(first) = new_messages.get_mut(0) {
-        if first.get("role").and_then(|v| v.as_str()) == Some("system") {
+    if let Some(first) = new_messages.get_mut(0)
+        && first.get("role").and_then(|v| v.as_str()) == Some("system") {
             *first = mark_message(first, &cache_marker);
         }
-    }
     if new_messages.len() >= 3 {
         let idx = new_messages.len() - 2;
         let target = &mut new_messages[idx];
@@ -62,14 +61,13 @@ pub fn apply_cache_control(
     }
 
     let new_tools = tools.map(|tools_slice| {
-        let mut new_vec: Vec<Value> = tools_slice.iter().cloned().collect();
-        if let Some(last) = new_vec.last_mut() {
-            if let Some(obj) = last.as_object() {
+        let mut new_vec: Vec<Value> = tools_slice.to_vec();
+        if let Some(last) = new_vec.last_mut()
+            && let Some(obj) = last.as_object() {
                 let mut last_obj = obj.clone();
                 last_obj.insert("cache_control".to_string(), cache_marker.clone());
                 *last = Value::Object(last_obj);
             }
-        }
         new_vec
     });
 

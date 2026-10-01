@@ -111,7 +111,7 @@ fn pagination_note(limit: Option<usize>, offset: usize, truncated: bool) -> Opti
 fn matches_type(name: &str, file_type: Option<&str>) -> bool {
     match file_type {
         None => {
-            return true;
+            true
         }
         Some(file_type) => {
             let lowered = file_type.trim().to_lowercase();
@@ -124,11 +124,11 @@ fn matches_type(name: &str, file_type: Option<&str>) -> bool {
             } else {
                 &[fallback.as_str()]
             };
-            return patterns.iter().any(|p| {
+            patterns.iter().any(|p| {
                 glob::Pattern::new(&p.to_lowercase())
                     .map(|pat| pat.matches(&name.to_lowercase()))
                     .unwrap_or(false)
-            });
+            })
         }
     }
 }
@@ -357,8 +357,8 @@ Skips .git, node_modules, __pycache__, and other noise directories."
                 }
             }
         };
-        let include_files = vec!["files", "both"].contains(&entry_type);
-        let include_dirs = vec!["dirs", "both"].contains(&entry_type);
+        let include_files = ["files", "both"].contains(&entry_type);
+        let include_dirs = ["dirs", "both"].contains(&entry_type);
         let mut matches: Vec<(String, f64)> = Vec::new();
         for entry in self.search.iter_entries(&root, include_files, include_dirs) {
             let rel_path = self
@@ -744,12 +744,11 @@ impl Tool for GrepTool {
                 blocks.push(block);
             }
 
-            if output_mode == "count" && file_had_match {
-                if !matching_files.contains(&display_path) {
+            if output_mode == "count" && file_had_match
+                && !matching_files.contains(&display_path) {
                     matching_files.push(display_path.clone());
                     file_mtimes.insert(display_path.clone(), mtime);
                 }
-            }
             if matches!(output_mode, "count" | "files_with_matches") && file_had_match {
                 continue;
             }

@@ -18,6 +18,7 @@ use crate::{
 /// LLM provider configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
 pub struct ProviderConfig {
     /// API key for the provider. Defaults to an empty string so it can be
     /// supplied via an environment variable at runtime instead.
@@ -36,15 +37,6 @@ pub struct ProviderConfig {
     pub extra_headers: Option<HashMap<String, String>>,
 }
 
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            api_base: None,
-            extra_headers: None,
-        }
-    }
-}
 
 // ── ChannelsConfig ────────────────────────────────────────────────────────────
 
@@ -541,6 +533,7 @@ impl Default for AgentsConfig {
 /// config file are silently filled in with safe no-op values.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
 pub struct ProvidersConfig {
     /// Any OpenAI-compatible endpoint (custom deployments, local models, etc.).
     #[serde(alias = "custom")]
@@ -578,19 +571,6 @@ pub struct ProvidersConfig {
     pub groq: ProviderConfig,
 }
 
-impl Default for ProvidersConfig {
-    fn default() -> Self {
-        Self {
-            custom: ProviderConfig::default(),
-            azure_openai: ProviderConfig::default(),
-            anthropic: ProviderConfig::default(),
-            openai: ProviderConfig::default(),
-            openrouter: ProviderConfig::default(),
-            gemini: ProviderConfig::default(),
-            groq: ProviderConfig::default(),
-        }
-    }
-}
 
 impl ProvidersConfig {
     /// Return the [`ProviderConfig`] for the given provider name (e.g. `"openai"`).
@@ -1650,7 +1630,7 @@ impl Config {
         let model_replaced = model_lower.replace('-', "_");
         let model_normalized = model_replaced.as_str();
         let model_prefix = if model_lower.contains('/') {
-            model_lower.splitn(2, '/').next().unwrap_or(&model_lower)
+            model_lower.split('/').next().unwrap_or(&model_lower)
         } else {
             ""
         };
@@ -1674,7 +1654,7 @@ impl Config {
                 if spec
                     .keywords
                     .iter()
-                    .any(|kw| kw_matches(kw, &model_lower, &model_normalized))
+                    .any(|kw| kw_matches(kw, &model_lower, model_normalized))
                     && (spec.is_oauth || spec.is_local || !p.api_key.is_empty())
                 {
                     return (Some(p), Some(spec.name.clone()));
@@ -1736,7 +1716,7 @@ impl Config {
     /// Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
     pub fn get_provider(&self, model: Option<&str>) -> Option<&ProviderConfig> {
         let (p, _) = self.match_provider(model);
-        return p;
+        p
     }
 
     pub fn get_provider_name(&self, model: Option<&str>) -> Option<String> {
@@ -1756,19 +1736,16 @@ impl Config {
     pub fn get_api_base(&self, model: Option<&str>) -> Option<String> {
         let (p, name) = self.match_provider(model);
 
-        if let Some(p) = p {
-            if p.api_base.is_some() {
+        if let Some(p) = p
+            && p.api_base.is_some() {
                 return p.api_base.clone();
             }
-        }
 
-        if let Some(name) = name {
-            if let Some(spec) = crate::providers::registry::find_by_name(&name) {
-                if (spec.is_gateway || spec.is_local) && spec.default_api_base.is_some() {
+        if let Some(name) = name
+            && let Some(spec) = crate::providers::registry::find_by_name(&name)
+                && (spec.is_gateway || spec.is_local) && spec.default_api_base.is_some() {
                     return spec.default_api_base;
                 }
-            }
-        }
 
         None
     }
@@ -1821,24 +1798,22 @@ pub fn validate_model_presets(config: &Config) -> Result<(), String> {
         }
     }
 
-    if let Some(selected) = &config.agents.model_preset {
-        if selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
+    if let Some(selected) = &config.agents.model_preset
+        && selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
             return Err(format!(
                 "agents.modelPreset references unknown preset '{selected}'; known presets: {:?}",
                 config.model_presets.keys().collect::<Vec<_>>()
             ));
         }
-    }
 
-    if let Some(selected) = &config.agents.dream.dream_model_preset {
-        if selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
+    if let Some(selected) = &config.agents.dream.dream_model_preset
+        && selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
             return Err(format!(
                 "agents.dream.dreamModelPreset references unknown preset '{selected}'; \
                  known presets: {:?}",
                 config.model_presets.keys().collect::<Vec<_>>()
             ));
         }
-    }
 
     Ok(())
 }

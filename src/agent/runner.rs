@@ -161,11 +161,10 @@ impl AgentRunner {
                         }
                     }
                 }
-            } else if role == "tool" {
-                if let Some(tid) = msg.get("tool_call_id").and_then(Value::as_str) {
+            } else if role == "tool"
+                && let Some(tid) = msg.get("tool_call_id").and_then(Value::as_str) {
                     fulfilled.insert(tid.to_string());
                 }
-            }
         }
 
         let missing: Vec<(usize, String, String)> = declared
@@ -272,11 +271,10 @@ impl AgentRunner {
             spec.max_tool_result_chars,
         );
 
-        if let Value::String(ref s) = content {
-            if spec.max_tool_result_chars > 0 && s.len() > spec.max_tool_result_chars {
+        if let Value::String(ref s) = content
+            && spec.max_tool_result_chars > 0 && s.len() > spec.max_tool_result_chars {
                 return Value::String(truncate_text(s, spec.max_tool_result_chars));
             }
-        }
         content
     }
 
@@ -524,11 +522,10 @@ impl AgentRunner {
     /// reply, dropping tool calls and their (usually huge) results.
     fn compact_prior_turn(turn: &[Value]) -> Vec<Value> {
         let mut out = Vec::new();
-        if let Some(first) = turn.first() {
-            if first.get("role").and_then(Value::as_str) == Some("user") {
+        if let Some(first) = turn.first()
+            && first.get("role").and_then(Value::as_str) == Some("user") {
                 out.push(first.clone());
             }
-        }
         if let Some(assistant) = turn.iter().rev().find(|m| {
             m.get("role").and_then(Value::as_str) == Some("assistant")
                 && Self::assistant_has_text(m)
@@ -609,7 +606,7 @@ impl AgentRunner {
                     tools_opt,
                     Some(spec.model.clone()),
                     spec.max_tokens,
-                    spec.temperature.map(|t| t as f32),
+                    spec.temperature.map(|t| t),
                     spec.reasoning_effort.clone(),
                     None,
                     Some(callback),
@@ -624,7 +621,7 @@ impl AgentRunner {
                 tools_opt,
                 Some(spec.model.clone()),
                 spec.max_tokens,
-                spec.temperature.map(|t| t as f32),
+                spec.temperature.map(|t| t),
                 spec.reasoning_effort.clone(),
                 None,
             )
@@ -961,9 +958,7 @@ impl AgentRunner {
         if let Some(err) = prep_error {
             // Strip the leading "Error: " / "Error: Tool '…':" prefix for the
             // short telemetry detail (mirrors Python's `split(": ", 1)[-1]`).
-            let detail: String = err
-                .splitn(2, ": ")
-                .nth(1)
+            let detail: String = err.split_once(": ").map(|x| x.1)
                 .unwrap_or(&err)
                 .chars()
                 .take(120)
@@ -1114,8 +1109,8 @@ impl AgentRunner {
                 retry_messages,
                 Option::None,
                 Some(spec.model.clone()),
-                spec.max_tokens.clone(),
-                spec.temperature.clone(),
+                spec.max_tokens,
+                spec.temperature,
                 spec.reasoning_effort.clone(),
                 Option::None,
             )
@@ -1327,7 +1322,7 @@ impl AgentRunner {
                 }
 
                 // Append normalised tool result messages.
-                for (tc, result) in response.tool_calls.iter().zip(results.into_iter()) {
+                for (tc, result) in response.tool_calls.iter().zip(results) {
                     let normalized = self.normalize_tool_result(
                         &spec,
                         &tc.id,
@@ -2813,9 +2808,9 @@ mod tests {
             reasoning_effort: Some("medium".to_string()),
             ..Default::default()
         };
-        let mut messages = Vec::new();
+        let messages = Vec::new();
         let result = runner
-            .request_finalization_retry(&spec, &mut messages)
+            .request_finalization_retry(&spec, &messages)
             .await;
         assert_eq!(result.content, Some("Hello, world!".to_string()));
     }

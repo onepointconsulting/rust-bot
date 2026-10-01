@@ -138,17 +138,15 @@ impl OpenAICompatProvider {
         // we can simulate by checking if value["model_dump"] is a function,
         // but in Rust/serde_json we can't call arbitrary functions.
         // Instead, we handle the case where value is an object with a field "model_dump" that's an object
-        if let Some(obj) = value.as_object() {
-            if let Some(model_dump_value) = obj.get("model_dump") {
+        if let Some(obj) = value.as_object()
+            && let Some(model_dump_value) = obj.get("model_dump") {
                 // If "model_dump" itself is an object, try returning it non-empty
-                if let Some(dumped) = model_dump_value.as_object() {
-                    if !dumped.is_empty() {
+                if let Some(dumped) = model_dump_value.as_object()
+                    && !dumped.is_empty() {
                         return Some(dumped.clone());
                     }
-                }
                 // If "model_dump" is a function placeholder, we can't handle it -- out of scope
             }
-        }
 
         None
     }
@@ -182,7 +180,7 @@ impl OpenAICompatProvider {
         }
 
         // 1. extra_content extraction
-        let extra_content = get(tc, "extra_content").and_then(|v| coerce_dict(v));
+        let extra_content = get(tc, "extra_content").and_then(coerce_dict);
 
         // Try to get tc as a dict (serde_json::Map)
         let tc_dict = coerce_dict(tc);
@@ -205,8 +203,8 @@ impl OpenAICompatProvider {
                 prov = Some(leftover);
             }
 
-            if let Some(fn_value) = dict.get("function") {
-                if let Some(fn_map) = coerce_dict(fn_value) {
+            if let Some(fn_value) = dict.get("function")
+                && let Some(fn_map) = coerce_dict(fn_value) {
                     let mut fn_leftover = serde_json::Map::new();
                     for (k, v) in fn_map.iter() {
                         if !OpenAICompatProvider::STANDARD_FN_KEYS.contains(&k.as_str())
@@ -219,12 +217,11 @@ impl OpenAICompatProvider {
                         fn_prov = Some(fn_leftover);
                     }
                 }
-            }
         } else {
             // Fallback if tc was not already a map
-            prov = get(tc, "provider_specific_fields").and_then(|v| coerce_dict(v));
+            prov = get(tc, "provider_specific_fields").and_then(coerce_dict);
             if let Some(fn_obj) = get(tc, "function") {
-                fn_prov = get(fn_obj, "provider_specific_fields").and_then(|v| coerce_dict(v));
+                fn_prov = get(fn_obj, "provider_specific_fields").and_then(coerce_dict);
             }
         }
 
@@ -233,11 +230,10 @@ impl OpenAICompatProvider {
 
     fn uses_openrouter_attribution(spec: Option<&ProviderSpec>, api_base: Option<&str>) -> bool {
         // Apply Rust-bot attribution headers to OpenRouter requests by default.
-        if let Some(spec) = spec {
-            if spec.name == "openrouter" {
+        if let Some(spec) = spec
+            && spec.name == "openrouter" {
                 return true;
             }
-        }
         if let Some(base) = api_base {
             return base.to_lowercase().contains("openrouter");
         }
@@ -263,11 +259,7 @@ impl OpenAICompatProvider {
                 );
             });
             // SAFETY: single-threaded at provider init time; no other threads read this env var concurrently.
-            if spec.is_gateway {
-                unsafe {
-                    std::env::set_var(&spec.env_key, &api_key);
-                }
-            } else if std::env::var_os(&spec.env_key).is_none() {
+            if spec.is_gateway || std::env::var_os(&spec.env_key).is_none() {
                 unsafe {
                     std::env::set_var(&spec.env_key, &api_key);
                 }
@@ -275,7 +267,7 @@ impl OpenAICompatProvider {
 
             let effective_base_str = api_base
                 .as_ref()
-                .or_else(|| spec.default_api_base.as_ref())
+                .or(spec.default_api_base.as_ref())
                 .map(|s| s.as_str())
                 .unwrap_or_default();
 
@@ -332,8 +324,8 @@ impl OpenAICompatProvider {
 
         for clean in sanitized.iter_mut() {
             // tool_calls normalization
-            if let Some(tool_calls) = clean.get_mut("tool_calls") {
-                if let Some(tc_arr) = tool_calls.as_array_mut() {
+            if let Some(tool_calls) = clean.get_mut("tool_calls")
+                && let Some(tc_arr) = tool_calls.as_array_mut() {
                     let mut normalized = Vec::with_capacity(tc_arr.len());
                     for tc in tc_arr.drain(..) {
                         if let Some(mut tc_obj) = tc.as_object().cloned() {
@@ -349,13 +341,11 @@ impl OpenAICompatProvider {
                     }
                     *tool_calls = serde_json::Value::Array(normalized);
                 }
-            }
             // tool_call_id normalization
-            if let Some(val) = clean.get_mut("tool_call_id") {
-                if !val.is_null() {
+            if let Some(val) = clean.get_mut("tool_call_id")
+                && !val.is_null() {
                     *val = map_id(&mut id_map, val);
                 }
-            }
         }
 
         sanitized
@@ -489,11 +479,10 @@ impl OpenAICompatProvider {
         out.insert("role".into(), serde_json::json!(role));
 
         for key in ["name", "reasoning_content", "extra_content"] {
-            if let Some(value) = msg.get(key) {
-                if !value.is_null() {
+            if let Some(value) = msg.get(key)
+                && !value.is_null() {
                     out.insert(key.to_string(), value.clone());
                 }
-            }
         }
 
         match role {
@@ -555,7 +544,7 @@ impl OpenAICompatProvider {
         let (cached_messages, cached_tools) = if let Some(spec) = spec_option {
             if spec.supports_prompt_caching {
                 let (new_messages, new_tools) =
-                    apply_cache_control(&messages, tools.as_ref().map(|t| t.as_slice()));
+                    apply_cache_control(messages, tools.as_deref());
                 (Some(new_messages), new_tools)
             } else {
                 (None, None)
@@ -566,15 +555,13 @@ impl OpenAICompatProvider {
         if let Some(ref cached) = cached_messages {
             messages = cached.as_slice();
         }
-        if let Some(spec) = spec_option {
-            if spec.strip_model_prefix {
-                model_name = model_name
-                    .rsplitn(2, '/')
+        if let Some(spec) = spec_option
+            && spec.strip_model_prefix {
+                model_name = model_name.rsplit('/')
                     .next()
                     .unwrap_or(&model_name)
                     .to_string();
             }
-        }
         let sanitized_messages = Self::sanitize_messages(
             OpenAICompatProvider::sanitize_empty_content(messages).as_slice(),
         );
@@ -594,17 +581,15 @@ impl OpenAICompatProvider {
         }
 
         let effective_tools = cached_tools.or(tools);
-        if let Some(tool_list) = effective_tools {
-            if !tool_list.is_empty() {
+        if let Some(tool_list) = effective_tools
+            && !tool_list.is_empty() {
                 request["tools"] = serde_json::Value::Array(tool_list);
             }
-        }
 
-        if let Some(effort) = reasoning_effort {
-            if !effort.is_empty() {
+        if let Some(effort) = reasoning_effort
+            && !effort.is_empty() {
                 request["reasoning_effort"] = serde_json::Value::String(effort);
             }
-        }
         if let Some(tc) = tool_choice {
             request["tool_choice"] = tc;
         }
@@ -731,20 +716,18 @@ impl OpenAICompatProvider {
         for ch in choices {
             let ch_map = maybe_mapping(ch).unwrap_or(&empty_map);
             let msg = ch_map.get("message").unwrap_or(&serde_json::Value::Null);
-            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array()) {
-                if !tcs.is_empty() {
+            if let Some(tcs) = msg.get("tool_calls").and_then(|v| v.as_array())
+                && !tcs.is_empty() {
                     for tc in tcs {
                         if let Some(parsed) = Self::parse_json_tool_call(tc) {
                             tool_calls.push(parsed);
                         }
                     }
-                    if let Some(reason) = Self::json_finish_reason(ch_map) {
-                        if reason == "tool_calls" || reason == "stop" {
+                    if let Some(reason) = Self::json_finish_reason(ch_map)
+                        && (reason == "tool_calls" || reason == "stop") {
                             finish_reason = reason;
                         }
-                    }
                 }
-            }
             if content.is_none() {
                 content = Self::extract_message_content(msg);
             }
@@ -757,7 +740,7 @@ impl OpenAICompatProvider {
             usage: raw_json
                 .get("usage")
                 .map(Self::parse_usage)
-                .unwrap_or_else(LLMUsage::new),
+                .unwrap_or_default(),
             reasoning_content: Self::extract_reasoning_content(raw_json),
             thinking_blocks: None,
         }
@@ -778,11 +761,10 @@ impl OpenAICompatProvider {
     }
 
     fn parse_json_tool_call(tc: &serde_json::Value) -> Option<ToolCallRequest> {
-        if let Some(kind) = tc.get("type").and_then(|t| t.as_str()) {
-            if kind != "function" {
+        if let Some(kind) = tc.get("type").and_then(|t| t.as_str())
+            && kind != "function" {
                 return None;
             }
-        }
         let func = tc.get("function")?;
         let name = func.get("name")?.as_str()?.to_string();
         let arguments = match func.get("arguments") {
@@ -824,11 +806,10 @@ impl OpenAICompatProvider {
             .filter(|s| !s.is_empty())
             .map(|s| s.to_string());
 
-        if reasoning_content.is_none() {
-            if let Some(reasoning) = msg0.get("reasoning") {
+        if reasoning_content.is_none()
+            && let Some(reasoning) = msg0.get("reasoning") {
                 reasoning_content = Self::extract_text_content(reasoning).filter(|s| !s.is_empty());
             }
-        }
 
         if reasoning_content.is_none() {
             for ch in choices {
@@ -860,12 +841,11 @@ impl OpenAICompatProvider {
         } else if let Some(arr) = value.as_array() {
             let mut parts: Vec<String> = vec![];
             for item in arr {
-                if let Some(item_map) = maybe_mapping(item) {
-                    if let Some(text) = item_map.get("text").and_then(|t| t.as_str()) {
+                if let Some(item_map) = maybe_mapping(item)
+                    && let Some(text) = item_map.get("text").and_then(|t| t.as_str()) {
                         parts.push(text.to_string());
                         continue;
                     }
-                }
                 if let Some(s) = item.as_str() {
                     parts.push(s.to_string());
                 }
@@ -954,11 +934,10 @@ impl OpenAICompatProvider {
         if let Some(msg) = Self::api_error_message_from_json(raw) {
             return msg;
         }
-        if let Some(start) = raw.find('{') {
-            if let Some(msg) = Self::api_error_message_from_json(&raw[start..]) {
+        if let Some(start) = raw.find('{')
+            && let Some(msg) = Self::api_error_message_from_json(&raw[start..]) {
                 return msg;
             }
-        }
         raw.to_string()
     }
 
@@ -1052,7 +1031,7 @@ impl LLMProvider for OpenAICompatProvider {
             api_base: effective_base,
             default_model: Some(default_model),
             extra_headers,
-            spec: spec,
+            spec,
             generation: GenerationSettings::new(),
             http_client,
             chat_completions_url,

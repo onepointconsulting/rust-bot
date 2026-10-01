@@ -141,7 +141,7 @@ impl SessionsListResponse {
     pub fn from_session_entries(entries: &[serde_json::Value]) -> Self {
         let sessions = entries
             .iter()
-            .filter_map(|entry| SessionSummary::from_entry(entry))
+            .filter_map(SessionSummary::from_entry)
             .collect();
         Self { sessions }
     }

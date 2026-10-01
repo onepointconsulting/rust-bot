@@ -109,6 +109,7 @@ pub struct CronRunRecord {
 /// Runtime state of a job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
 pub struct CronJobState {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub next_run_at_ms: Option<i64>,
@@ -122,17 +123,6 @@ pub struct CronJobState {
     pub run_history: Vec<CronRunRecord>,
 }
 
-impl Default for CronJobState {
-    fn default() -> Self {
-        Self {
-            next_run_at_ms: None,
-            last_run_at_ms: None,
-            last_status: None,
-            last_error: None,
-            run_history: Vec::new(),
-        }
-    }
-}
 
 /// A scheduled job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

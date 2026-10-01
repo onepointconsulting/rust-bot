@@ -49,7 +49,7 @@ fn strip_tags(text: &str) -> String {
 /// Normalize whitespace.
 fn normalize(text: &str) -> String {
     let text = WHITESPACE_RE.replace_all(text, " ");
-    return NEWLINE_RE.replace_all(&text, "\n\n").into_owned();
+    NEWLINE_RE.replace_all(&text, "\n\n").into_owned()
 }
 
 fn looks_like_html(text: &str) -> bool {
@@ -81,7 +81,7 @@ fn extract_with_readability(html: &str, url: &str, extract_mode: &str) -> Result
     let content = if extract_mode == "markdown" {
         article.text_content.to_string()
     } else {
-        normalize(&strip_tags(&article.content.to_string()))
+        normalize(&strip_tags(article.content.as_ref()))
     };
     Ok(if article.title.is_empty() {
         content
@@ -392,7 +392,7 @@ impl WebSearchTool {
             description: "Search the web. Returns titles, URLs, and snippets. \
 Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
                 .to_string(),
-            config: config.unwrap_or(WebSearchConfig::default()),
+            config: config.unwrap_or_default(),
             client: build_http_client(
                 proxy.as_deref(),
                 timeout_secs.unwrap_or(DEFAULT_HTTP_TIMEOUT_SECS),
@@ -406,8 +406,8 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
             &[("q", query), ("format", "json"), ("no_html", "1")],
         )
         .expect("duckduckgo base url failed");
-        if let Ok(response) = self.client.get(url).send().await {
-            if let Ok(body) = response.text().await {
+        if let Ok(response) = self.client.get(url).send().await
+            && let Ok(body) = response.text().await {
                 let json = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
                 let related_topics = json
                     .get("RelatedTopics")
@@ -420,7 +420,6 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
                     .map(ddg_topic_to_result)
                     .collect();
             }
-        }
         vec![]
     }
 

@@ -168,11 +168,10 @@ impl ContextBuilder {
             parts.push(format!("[Archived Context Summary]\n\n{summary}"));
         }
 
-        if parts.is_empty() {
-            if let Some(fallback) = mode.fallback_system_prompt() {
+        if parts.is_empty()
+            && let Some(fallback) = mode.fallback_system_prompt() {
                 return fallback.to_string();
             }
-        }
 
         parts.join("\n\n---\n\n")
     }
@@ -216,8 +215,8 @@ impl ContextBuilder {
         id_context.insert("runtime", &runtime);
         id_context.insert("platform_policy", platform_policy.as_str());
         id_context.insert("channel", &channel.unwrap_or("cli"));
-        return render_template("agent/identity.md", &id_context, true)
-            .unwrap_or_else(|_| "".to_string());
+        render_template("agent/identity.md", &id_context, true)
+            .unwrap_or_else(|_| "".to_string())
     }
 
     /// Build untrusted runtime metadata block for injection before the user message.
@@ -232,13 +231,11 @@ impl ContextBuilder {
         let mut lines = vec![format!("Current Time: {}", current_time_str(timezone))];
         if let Some(channel) = channel_option
             && let Some(chat_id) = chat_id_option
-        {
-            if !channel.is_empty() && !chat_id.is_empty() {
+            && !channel.is_empty() && !chat_id.is_empty() {
                 lines.push(format!("Channel: {}", channel));
                 lines.push(format!("Chat ID: {}", chat_id));
             }
-        }
-        return format!("{RUNTIME_CONTEXT_TAG}\n{}", lines.join("\n"));
+        format!("{RUNTIME_CONTEXT_TAG}\n{}", lines.join("\n"))
     }
 
     /// Guess an image MIME type from a file's extension. Used as a fallback when
@@ -308,7 +305,7 @@ impl ContextBuilder {
             {
                 return format!("{left_str}\n\n{}", right.as_str().unwrap_or("")).into();
             }
-            return right.into();
+            return right;
         }
         fn to_blocks(value: serde_json::Value) -> Vec<serde_json::Value> {
             if value.is_array() {
@@ -336,11 +333,11 @@ impl ContextBuilder {
                 .as_str()
                 .map(|s| s.to_owned())
                 .unwrap_or_else(|| value.to_string());
-            return vec![serde_json::json!({"type": "text", "text": text})];
+            vec![serde_json::json!({"type": "text", "text": text})]
         }
         let mut merged = to_blocks(left);
         merged.extend(to_blocks(right));
-        return merged.into();
+        merged.into()
     }
 
     /// Load the given bootstrap files from the workspace.
@@ -399,15 +396,14 @@ impl MessageBuilder for ContextBuilder {
         let mode = self.resolve_mode(session_metadata);
         let mut runtime_ctx =
             ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
-        if mode.include_goal_runtime() {
-            if let Some(metadata) = session_metadata {
+        if mode.include_goal_runtime()
+            && let Some(metadata) = session_metadata {
                 let goal_lines = crate::session::goal_state::goal_state_runtime_lines(metadata);
                 if !goal_lines.is_empty() {
                     runtime_ctx.push('\n');
                     runtime_ctx.push_str(&goal_lines.join("\n"));
                 }
             }
-        }
         let user_content = self.build_user_content(current_message, media);
 
         // Merge runtime context block and user content into a single value so
@@ -783,7 +779,7 @@ mod tests {
         fs::write(&img_path, &png).unwrap();
         let path_str = img_path.to_string_lossy().into_owned();
         let b = make_builder(&tmp);
-        let result = b.build_user_content("text", Some(&[path_str.clone()]));
+        let result = b.build_user_content("text", Some(std::slice::from_ref(&path_str)));
         let arr = result.as_array().unwrap();
         assert_eq!(arr[0]["_meta"]["path"], path_str);
     }
@@ -811,8 +807,8 @@ mod tests {
         let png_magic = [0x89u8, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
         let p1 = tmp.path().join("a.png");
         let p2 = tmp.path().join("b.png");
-        fs::write(&p1, &png_magic).unwrap();
-        fs::write(&p2, &png_magic).unwrap();
+        fs::write(&p1, png_magic).unwrap();
+        fs::write(&p2, png_magic).unwrap();
         let b = make_builder(&tmp);
         let result = b.build_user_content(
             "two images",

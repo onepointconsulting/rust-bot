@@ -56,8 +56,8 @@ impl ToolRegistry {
             }
         }
 
-        builtins.sort_by_key(|s| Self::schema_name(s));
-        mcp_tools.sort_by_key(|s| Self::schema_name(s));
+        builtins.sort_by_key(Self::schema_name);
+        mcp_tools.sort_by_key(Self::schema_name);
         builtins.extend(mcp_tools);
         builtins
     }

@@ -242,6 +242,12 @@ pub struct GenerationSettings {
     reasoning_effort: Option<String>,
 }
 
+impl Default for GenerationSettings {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl GenerationSettings {
     pub fn new() -> Self {
         Self {
@@ -558,8 +564,8 @@ pub trait LLMProvider: Send + Sync {
                 v.get(key).and_then(|s| s.as_str())
             }
 
-            if let Some(content_str) = content.and_then(|v| v.as_str()) {
-                if content_str.is_empty() {
+            if let Some(content_str) = content.and_then(|v| v.as_str())
+                && content_str.is_empty() {
                     // Clone whole msg, replace "content"
                     let mut clean = msg.clone();
                     let is_assistant = get_str(msg, "role") == Some("assistant");
@@ -575,7 +581,6 @@ pub trait LLMProvider: Send + Sync {
                     result.push(clean);
                     continue;
                 }
-            }
 
             if let Some(content_arr) = content.and_then(|v| v.as_array()) {
                 let mut new_items = Vec::new();
@@ -712,11 +717,10 @@ pub trait LLMProvider: Send + Sync {
 
         let mut ordered_unique = Vec::new();
         for idx in [last_builtin_idx, Some(tail_idx)] {
-            if let Some(idx) = idx {
-                if !ordered_unique.contains(&idx) {
+            if let Some(idx) = idx
+                && !ordered_unique.contains(&idx) {
                     ordered_unique.push(idx);
                 }
-            }
         }
         Some(ordered_unique)
     }
@@ -924,11 +928,10 @@ pub trait LLMProvider: Send + Sync {
                 )
                 .await;
 
-            if let Some(on_delta) = on_content_delta {
-                if let Some(ref content) = response.content {
+            if let Some(on_delta) = on_content_delta
+                && let Some(ref content) = response.content {
                     on_delta(content.clone()).await;
                 }
-            }
 
             response
         }
@@ -1210,14 +1213,14 @@ pub trait LLMProvider: Send + Sync {
     }
 
     fn handle_error(e: Box<dyn std::error::Error>) -> crate::providers::base::LLMResponse {
-        return crate::providers::base::LLMResponse {
+        crate::providers::base::LLMResponse {
             content: Some(e.to_string()),
             finish_reason: "error".to_string(),
             tool_calls: Vec::new(),
             usage: LLMUsage::new(),
             reasoning_content: None,
             thinking_blocks: None,
-        };
+        }
     }
 }
 
@@ -1314,27 +1317,27 @@ mod tests {
         }
 
         fn api_key(&self) -> Option<String> {
-            return self.api_key.clone();
+            self.api_key.clone()
         }
 
         fn api_base(&self) -> Option<String> {
-            return self.api_base.clone();
+            self.api_base.clone()
         }
 
         fn generation_settings(&self) -> &GenerationSettings {
-            return &self.generation;
+            &self.generation
         }
 
         fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
-            return &mut self.generation;
+            &mut self.generation
         }
 
         fn extra_headers(&self) -> Option<HashMap<String, String>> {
-            return None;
+            None
         }
 
         fn spec(&self) -> Option<&ProviderSpec> {
-            return None;
+            None
         }
 
         async fn chat(
@@ -1358,7 +1361,7 @@ mod tests {
         }
 
         fn get_default_model(&self) -> String {
-            return "test".to_string();
+            "test".to_string()
         }
 
         async fn chat_stream<F, Fut>(
@@ -1381,15 +1384,15 @@ mod tests {
                 on_delta("Hello, ".to_string()).await;
                 on_delta("world!".to_string()).await;
             }
-            let response = LLMResponse {
+            
+            LLMResponse {
                 content: Some("Hello, world!".to_string()),
                 finish_reason: "stop".to_string(),
                 tool_calls: Vec::new(),
                 usage: LLMUsage::new(),
                 reasoning_content: None,
                 thinking_blocks: None,
-            };
-            response
+            }
         }
     }
 
@@ -1553,12 +1556,10 @@ mod tests {
 
     #[test]
     fn test_sanitize_request_messages() {
-        let allowed_keys = HashSet::from(
-            ["role", "content", "tool_calls", "tool_call_id", "name"]
+        let allowed_keys = ["role", "content", "tool_calls", "tool_call_id", "name"]
                 .iter()
                 .map(|s| s.to_string())
-                .collect::<HashSet<String>>(),
-        );
+                .collect::<HashSet<String>>();
         let messages = vec![
             serde_json::json!({
                 "role": "user",

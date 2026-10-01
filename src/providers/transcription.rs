@@ -70,7 +70,7 @@ pub trait TranscriptionProvider: Send + Sync {
         };
 
         let response_result = client
-            .post(&self.get_api_url())
+            .post(self.get_api_url())
             .header("Authorization", format!("Bearer {}", self.get_api_key()))
             .multipart(form)
             .send()

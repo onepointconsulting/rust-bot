@@ -139,11 +139,10 @@ fn _resolve_path(
         }
     }
 
-    if !p.is_absolute() {
-        if let Some(ref ws) = workspace {
+    if !p.is_absolute()
+        && let Some(ref ws) = workspace {
             p = ws.join(&p);
         }
-    }
     // Soft-resolve so non-existent targets still collapse `..` before the
     // allowed-dir check (strict canonicalize alone is not enough).
     let resolved = soft_resolve(&p);
@@ -557,11 +556,10 @@ For large files, write an initial chunk with this tool, then append further sect
             Err(e) => return format!("Error: {:?}", e),
         };
 
-        if let Some(parent) = fp.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = fp.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 return format!("Error writing file: {}", e);
             }
-        }
 
         match std::fs::write(&fp, content.as_bytes()) {
             Ok(_) => format!(
@@ -800,7 +798,7 @@ impl Tool for ListDirTool {
                 if item.is_dir() {
                     items.push(format!("{}/", posix_rel));
                 } else {
-                    items.push(format!("{}", posix_rel));
+                    items.push(posix_rel.to_string());
                 }
             }
         } else {
@@ -983,7 +981,7 @@ mod tests {
             None,
         )
         .expect("new file inside workspace should be allowed");
-        assert!(soft_resolve(&resolved).starts_with(&soft_resolve(&workspace)));
+        assert!(soft_resolve(&resolved).starts_with(soft_resolve(&workspace)));
         assert_eq!(
             resolved.file_name().and_then(|n| n.to_str()),
             Some("new_file.txt")
@@ -1063,7 +1061,7 @@ mod tests {
             .execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" }))
             .await;
         println!("result: {}", result);
-        assert!(result.contains(format!("Successfully wrote").as_str()));
+        assert!(result.contains("Successfully wrote".to_string().as_str()));
         assert!(Path::new(notes_text).exists());
     }
 
@@ -1111,7 +1109,7 @@ mod tests {
             }))
             .await;
         println!("result: {}", result);
-        assert!(result.contains(format!("Successfully edited").as_str()));
+        assert!(result.contains("Successfully edited".to_string().as_str()));
         assert!(sample_file.exists());
 
         let content = std::fs::read_to_string(&sample_file).unwrap();
@@ -1134,7 +1132,7 @@ mod tests {
             }))
             .await;
         println!("result: {}", result);
-        assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
+        assert!(result.contains("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.".to_string().as_str()));
     }
 
     #[tokio::test]

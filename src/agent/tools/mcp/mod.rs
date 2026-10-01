@@ -30,14 +30,13 @@ fn extract_nullable_branch(options: Value) -> Option<(Value, bool)> {
         if !option.is_object() {
             return None;
         }
-        if let Some(type_value) = option.get("type") {
-            if let Some(type_str) = type_value.as_str()
+        if let Some(type_value) = option.get("type")
+            && let Some(type_str) = type_value.as_str()
                 && type_str == "null"
             {
                 saw_null = true;
                 continue;
             }
-        }
         non_null.push(option.clone());
     }
     if saw_null && non_null.len() == 1 {
@@ -178,8 +177,8 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
     let mut normalized = obj.clone();
 
     // Expand nullable type arrays: ["string","null"] → type:"string", nullable:true
-    if let Some(raw_type) = normalized.get("type").cloned() {
-        if let Some(type_arr) = raw_type.as_array() {
+    if let Some(raw_type) = normalized.get("type").cloned()
+        && let Some(type_arr) = raw_type.as_array() {
             let non_null: Vec<&Value> = type_arr
                 .iter()
                 .filter(|t| t.as_str() != Some("null"))
@@ -190,12 +189,11 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
                 normalized.insert("nullable".to_string(), Value::Bool(true));
             }
         }
-    }
 
     // Flatten nullable oneOf/anyOf unions
     'outer: for key in ["oneOf", "anyOf"] {
-        if let Some(options) = normalized.get(key).cloned() {
-            if let Some((branch, _)) = extract_nullable_branch(options) {
+        if let Some(options) = normalized.get(key).cloned()
+            && let Some((branch, _)) = extract_nullable_branch(options) {
                 normalized.remove(key);
                 if let Some(branch_obj) = branch.as_object() {
                     for (k, v) in branch_obj {
@@ -205,12 +203,11 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
                 normalized.insert("nullable".to_string(), Value::Bool(true));
                 break 'outer;
             }
-        }
     }
 
     // Recursively normalize each property schema
-    if let Some(props) = normalized.get("properties").cloned() {
-        if let Some(props_obj) = props.as_object() {
+    if let Some(props) = normalized.get("properties").cloned()
+        && let Some(props_obj) = props.as_object() {
             let new_props: Map<String, Value> = props_obj
                 .iter()
                 .map(|(name, prop)| {
@@ -224,17 +221,15 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
                 .collect();
             normalized.insert("properties".to_string(), Value::Object(new_props));
         }
-    }
 
     // Recursively normalize items schema
-    if let Some(items) = normalized.get("items").cloned() {
-        if items.is_object() {
+    if let Some(items) = normalized.get("items").cloned()
+        && items.is_object() {
             normalized.insert(
                 "items".to_string(),
                 normalize_schema_for_openai_inner(&items),
             );
         }
-    }
 
     // Recursively normalize composition / additionalProperties schemas
     for key in ["anyOf", "oneOf", "allOf"] {
@@ -252,14 +247,13 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
             normalized.insert(key.to_string(), Value::Array(normalized_options));
         }
     }
-    if let Some(additional) = normalized.get("additionalProperties").cloned() {
-        if additional.is_object() {
+    if let Some(additional) = normalized.get("additionalProperties").cloned()
+        && additional.is_object() {
             normalized.insert(
                 "additionalProperties".to_string(),
                 normalize_schema_for_openai_inner(&additional),
             );
         }
-    }
 
     // Non-object schemas are returned without the extra defaults
     if normalized.get("type").and_then(|t| t.as_str()) != Some("object") {
@@ -329,7 +323,7 @@ pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpClient, C
         .transport_type
         .as_ref()
         .cloned()
-        .or_else(|| {
+        .or({
             if !config.command.is_empty() {
                 Some(McpTransportType::Stdio)
             } else if !config.url.is_empty() {

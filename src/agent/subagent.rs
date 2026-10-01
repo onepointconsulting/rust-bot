@@ -107,14 +107,14 @@ impl SubagentManager {
             max_tool_result_chars,
             runtime_resolver,
             sessions,
-            web_config: web_config.unwrap_or(WebToolsConfig::default()),
-            exec_config: exec_config.unwrap_or(ExecToolConfig::default()),
-            gmail_config: gmail_config.unwrap_or(GmailToolConfig::default()),
-            ocr_config: ocr_config.unwrap_or(OcrToolConfig::default()),
-            docx_config: docx_config.unwrap_or(DocxToolConfig::default()),
+            web_config: web_config.unwrap_or_default(),
+            exec_config: exec_config.unwrap_or_default(),
+            gmail_config: gmail_config.unwrap_or_default(),
+            ocr_config: ocr_config.unwrap_or_default(),
+            docx_config: docx_config.unwrap_or_default(),
             image_generation_config: image_generation_config
-                .unwrap_or(ImageGenerationToolConfig::default()),
-            subagent_config: subagent_config.unwrap_or(SubagentConfig::default()),
+                .unwrap_or_default(),
+            subagent_config: subagent_config.unwrap_or_default(),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             disabled_tools: Vec::new(),
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
@@ -211,12 +211,11 @@ impl SubagentManager {
                     log::info!("Completed: {}", task_id_bg);
                     running_tasks.lock().unwrap().remove(&task_id_bg);
                     log::info!("Removed from running tasks: {}", task_id_bg);
-                    if let Some(session_key) = session_key_owned {
-                        if let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key) {
+                    if let Some(session_key) = session_key_owned
+                        && let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key) {
                             tasks.remove(&task_id_bg);
                             log::info!("Removed from tasks: {}", task_id_bg);
                         }
-                    }
                 });
         });
 
@@ -234,9 +233,9 @@ impl SubagentManager {
         }
 
         log::info!("Spawned subagent [{}]: {}", task_id, display_label_owned);
-        return format!(
+        format!(
             "Subagent [{display_label_owned}] started (id: {task_id}). I'll notify you when it completes."
-        );
+        )
     }
 
     /// Execute the subagent task and announce the result.
@@ -345,7 +344,7 @@ impl SubagentManager {
         let result = runner
             .run(AgentRunSpec {
                 initial_messages: messages,
-                tools: tools,
+                tools,
                 model: runtime.model.clone(),
                 max_iterations: 15,
                 max_tool_result_chars: self.max_tool_result_chars,

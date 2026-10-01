@@ -213,11 +213,10 @@ impl CommandHandler for CmdStatus {
         let search_usage_text = usage.format();
         let mut metadata = ctx.msg.metadata.clone();
         metadata.insert("render_as".to_string(), "text".into());
-        let last_usage = agent_loop
+        let last_usage = *agent_loop
             .last_usage
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
         let start_time_secs = agent_loop
             .start_time
             .duration_since(std::time::UNIX_EPOCH)

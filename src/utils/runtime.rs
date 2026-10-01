@@ -50,11 +50,10 @@ pub fn ensure_nonempty_tool_result(tool_name: &str, content: Value) -> Value {
             if blocks.is_empty() {
                 return Value::String(empty_tool_result_message(tool_name));
             }
-            if let Some(text) = stringify_text_blocks(blocks) {
-                if text.trim().is_empty() {
+            if let Some(text) = stringify_text_blocks(blocks)
+                && text.trim().is_empty() {
                     return Value::String(empty_tool_result_message(tool_name));
                 }
-            }
             content
         }
 
@@ -97,7 +96,7 @@ pub fn coerce_tool_execute_result(result: String) -> Value {
 
 /// Returns `true` when `content` is `None` or contains only whitespace.
 pub fn is_blank_text(content: Option<&str>) -> bool {
-    content.map_or(true, |s| s.trim().is_empty())
+    content.is_none_or(|s| s.trim().is_empty())
 }
 
 // ── finalization / recovery messages ─────────────────────────────────────────

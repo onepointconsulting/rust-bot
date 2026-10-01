@@ -200,7 +200,7 @@ impl AnthropicProvider {
                 continue;
             }
         }
-        return (system, AnthropicProvider::merge_consecutive(raw));
+        (system, AnthropicProvider::merge_consecutive(raw))
     }
 
     fn convert_tools(tools: Option<Vec<serde_json::Value>>) -> Option<Vec<serde_json::Value>> {
@@ -257,13 +257,12 @@ impl AnthropicProvider {
                         "text": cur_c.as_str().unwrap_or(""),
                     }]);
                 }
-                if cur_c.is_array() {
-                    if let (Some(prev_arr), Some(cur_arr)) =
+                if cur_c.is_array()
+                    && let (Some(prev_arr), Some(cur_arr)) =
                         (prev_c.as_array_mut(), cur_c.as_array())
                     {
                         prev_arr.extend(cur_arr.iter().cloned());
                     }
-                }
                 last["content"] = prev_c;
             } else {
                 merged.push(msg);
@@ -321,11 +320,10 @@ impl AnthropicProvider {
 
         match content {
             Some(v) if v.is_string() => {
-                if let Some(text) = v.as_str() {
-                    if !text.is_empty() {
+                if let Some(text) = v.as_str()
+                    && !text.is_empty() {
                         blocks.push(json!({ "type": "text", "text": text }));
                     }
-                }
             }
             Some(v) if v.is_array() => {
                 for item in v.as_array().unwrap() {
@@ -603,15 +601,14 @@ impl AnthropicProvider {
     }
 
     fn format_api_error(status: u16, body: &str) -> String {
-        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body) {
-            if let Some(message) = json
+        if let Ok(json) = serde_json::from_str::<serde_json::Value>(body)
+            && let Some(message) = json
                 .get("error")
                 .and_then(|error| error.get("message"))
                 .and_then(|message| message.as_str())
             {
                 return format!("Anthropic API error ({status}): {message}");
             }
-        }
 
         let trimmed = body.trim();
         if trimmed.is_empty() {
@@ -734,7 +731,7 @@ impl AnthropicProvider {
                     let block_input = block
                         .get("input")
                         .and_then(|t| t.as_object())
-                        .unwrap_or_else(|| &default_input);
+                        .unwrap_or(&default_input);
                     tool_calls.push(ToolCallRequest {
                         id: block_id.to_string(),
                         name: block_name.to_string(),
@@ -788,7 +785,7 @@ impl AnthropicProvider {
         let usage = content
             .get("usage")
             .map(Self::parse_usage)
-            .unwrap_or_else(LLMUsage::new);
+            .unwrap_or_default();
 
         let joined = content_parts.join("");
         LLMResponse {

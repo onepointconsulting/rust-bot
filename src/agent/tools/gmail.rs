@@ -410,10 +410,10 @@ fn show_error_and_exit(path: &PathBuf) {
 
 fn validate_secret_and_token_cache_paths(secret_path: &PathBuf, token_cache_path: &PathBuf) {
     if !Path::new(&secret_path).exists() {
-        show_error_and_exit(&secret_path);
+        show_error_and_exit(secret_path);
     }
     if !Path::new(&token_cache_path).exists() {
-        show_error_and_exit(&token_cache_path);
+        show_error_and_exit(token_cache_path);
     }
 }
 
@@ -551,11 +551,10 @@ impl GmailEmailsTool {
     }
 
     fn extract_body_by_mime(payload: &serde_json::Value, target_mime: &str) -> Option<String> {
-        if payload["mimeType"].as_str() == Some(target_mime) {
-            if let Some(data) = payload["body"]["data"].as_str() {
+        if payload["mimeType"].as_str() == Some(target_mime)
+            && let Some(data) = payload["body"]["data"].as_str() {
                 return Self::decode_gmail_body_data(data);
             }
-        }
         if let Some(parts) = payload["parts"].as_array() {
             for part in parts {
                 if let Some(text) = Self::extract_body_by_mime(part, target_mime) {
@@ -578,13 +577,11 @@ impl GmailEmailsTool {
 
     fn extract_filename_from_part(part: &serde_json::Value) -> Option<String> {
         let disposition = Self::extract_header(part, "Content-Disposition", "");
-        if !disposition.is_empty() {
-            if let Some(name) = parse_filename_from_disposition(&disposition) {
-                if !name.is_empty() {
+        if !disposition.is_empty()
+            && let Some(name) = parse_filename_from_disposition(&disposition)
+                && !name.is_empty() {
                     return Some(name);
                 }
-            }
-        }
         None
     }
 
@@ -650,11 +647,10 @@ impl GmailEmailsTool {
             // Prefer plain text, then HTML
             for mime in ["text/plain", "text/html"] {
                 for part in parts {
-                    if part["mimeType"].as_str() == Some(mime) {
-                        if let Some(text) = GmailEmailsTool::extract_body(part) {
+                    if part["mimeType"].as_str() == Some(mime)
+                        && let Some(text) = GmailEmailsTool::extract_body(part) {
                             return Some(text);
                         }
-                    }
                 }
             }
             // Fallback: any nested part

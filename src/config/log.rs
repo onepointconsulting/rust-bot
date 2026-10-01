@@ -64,11 +64,10 @@ fn rust_log_mentions_target(target: &str) -> bool {
 
 /// Open (or create) a log file, creating parent directories when needed.
 fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
-    }
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)

@@ -690,15 +690,14 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         .map(|hook| vec![hook as Arc<dyn AgentHook>]);
     let agent_loop = init_agent_loop(&config, workspace, hooks);
 
-    if let Some(restart_notice) = consume_restart_notice_from_env() {
-        if should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
+    if let Some(restart_notice) = consume_restart_notice_from_env()
+        && should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
             print_agent_response(
                 &format_restart_completed_message(&restart_notice.started_at_raw),
                 false,
                 None,
             );
         }
-    }
 
     let agent_loop = Arc::new(agent_loop);
     // Subagent completions publish system-channel messages to the inbound bus.
@@ -916,7 +915,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     let (config, workspace) = prepare_workspace(args.config, None);
     let agent_loop = init_agent_loop(&config, workspace.clone(), None);
     let host = args.host.unwrap_or_else(|| config.api.host.clone());
-    let port = args.port.unwrap_or_else(|| config.api.port);
+    let port = args.port.unwrap_or(config.api.port);
     let model_name = config.agents.model.clone();
     let session_id = args.session.clone();
     let timeout = args.timeout;
@@ -1193,15 +1192,13 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                             None,
                         )
                         .await;
-                    if let Some(token) = cron_token {
-                        if let Some(tool) = cron_tool.as_ref() {
-                            if let Some(cron_tool) =
+                    if let Some(token) = cron_token
+                        && let Some(tool) = cron_tool.as_ref()
+                            && let Some(cron_tool) =
                                 (tool.as_ref() as &dyn std::any::Any).downcast_ref::<CronTool>()
                             {
                                 cron_tool.reset_cron_context(token);
                             }
-                        }
-                    }
 
                     // If the message tool already delivered the reply, we're done.
                     let already_sent = {
@@ -1835,8 +1832,8 @@ async fn message_session(
     // which is already the agent loop's intended cancellation path.
     let response = tokio::select! {
         response = Arc::clone(&agent_loop).process_direct(
-            &message,
-            Some(&session_id),
+            message,
+            Some(session_id),
             None,
             None,
             Some(media),
@@ -1864,7 +1861,7 @@ async fn message_session(
     }
     if !streamed {
         print_agent_response_with_header(
-            &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
+            response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
             markdown,
             response.as_ref().map(|r| &r.metadata),
             !header_printed,

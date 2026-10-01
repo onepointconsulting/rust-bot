@@ -25,7 +25,7 @@ pub fn get_config_path() -> PathBuf {
     if let Some(current_config_path) = CURRENT_CONFIG_PATH.get() {
         return current_config_path.clone();
     }
-    return PathBuf::from(expand_tilde_path("~/.rust-bot/config.json").as_ref());
+    PathBuf::from(expand_tilde_path("~/.rust-bot/config.json").as_ref())
 }
 
 /// Load configuration from a file, or create a default configuration if
@@ -40,7 +40,7 @@ pub fn get_config_path() -> PathBuf {
 ///
 /// The loaded (or default) configuration object.
 pub fn load_config(path_option: Option<PathBuf>) -> Config {
-    let path = path_option.unwrap_or_else(|| get_config_path());
+    let path = path_option.unwrap_or_else(get_config_path);
     let mut config = Config::default();
     if path.exists() && path.is_file() {
         let file = File::open(&path).unwrap_or_else(|e| {
@@ -333,7 +333,7 @@ mod tests {
             vec!["100.64.0.0/10".to_string(), "192.168.0.0/16".to_string()];
         assert!(!config.tools.ssrf_whitelist.is_empty());
         assert!(config.tools.ssrf_whitelist.len() == 2);
-        assert!(config.tools.ssrf_whitelist.get(0).unwrap() == "100.64.0.0/10");
+        assert!(config.tools.ssrf_whitelist.first().unwrap() == "100.64.0.0/10");
         assert!(config.tools.ssrf_whitelist.get(1).unwrap() == "192.168.0.0/16");
         println!("Config: {}", serde_json::to_string_pretty(&config).unwrap());
     }
