@@ -12,6 +12,7 @@ use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::providers::base::LLMResponse;
 use crate::session::manager::{Session, SessionManager};
+use crate::utils::fs::write_atomic;
 use crate::utils::gitstore::GitStore;
 use crate::utils::helpers::{
     empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain,
@@ -87,7 +88,7 @@ impl MemoryStore {
             user_file,
             cursor_file,
             dream_cursor_file,
-            git: git,
+            git,
         };
         store.maybe_migrate_legacy_history();
         store
@@ -239,13 +240,12 @@ impl MemoryStore {
                 break;
             }
         }
-        if let Some(first_nonempty) = first_nonempty_option {
-            if let Some(matched) = LEGACY_TIMESTAMP.captures(first_nonempty) {
+        if let Some(first_nonempty) = first_nonempty_option
+            && let Some(matched) = LEGACY_TIMESTAMP.captures(first_nonempty) {
                 let end = matched.get(0).unwrap().end();
                 let slice = first_nonempty[end..].trim_start();
                 return slice.starts_with(RAW_MARKER);
             }
-        }
         false
     }
 
@@ -312,11 +312,11 @@ impl MemoryStore {
     }
 
     pub fn get_memory_context(&self) -> String {
-        let long_term = self.read_memory().unwrap_or(String::new());
+        let long_term = self.read_memory().unwrap_or_default();
         if long_term.is_empty() {
             return String::new();
         }
-        return format!("## Long-term memory:\n{}", long_term);
+        format!("## Long-term memory:\n{}", long_term)
     }
 
     pub fn append_history(&self, entry: &str) -> u64 {
@@ -354,17 +354,12 @@ impl MemoryStore {
             );
             return 0;
         }
-        if let Ok(mut f) = File::create(&self.cursor_file) {
-            if let Err(e) = write!(f, "{}", cursor) {
-                log::error!(
-                    "Failed to write cursor file {}: {}",
-                    self.cursor_file.display(),
-                    e
-                );
-                return 0;
-            }
-        } else {
-            log::error!("Failed to open cursor file: {}", self.cursor_file.display());
+        if let Err(e) = write_atomic(&self.cursor_file, cursor.to_string().as_bytes()) {
+            log::error!(
+                "Failed to write cursor file {}: {}",
+                self.cursor_file.display(),
+                e
+            );
             return 0;
         }
         cursor
@@ -375,23 +370,16 @@ impl MemoryStore {
     /// Mirrors Python `_next_cursor`: prefer [`Self::cursor_file`] if readable as an integer base;
     /// otherwise derive from [`Self::read_last_entry`]'s `"cursor"`; default `1`.
     fn next_cursor(&self) -> u64 {
-        if self.cursor_file.exists() {
-            match std::fs::read_to_string(&self.cursor_file) {
-                Ok(text) => {
-                    if let Ok(n) = text.trim().parse::<u64>() {
-                        return n.saturating_add(1);
-                    }
-                }
-                Err(_) => {}
-            }
-        }
-        if let Some(last) = self.read_last_entry() {
-            if let Some(c) = last.get("cursor") {
-                if let Some(n) = Self::parse_entry_cursor(c) {
+        if self.cursor_file.exists()
+            && let Ok(text) = std::fs::read_to_string(&self.cursor_file)
+                && let Ok(n) = text.trim().parse::<u64>() {
                     return n.saturating_add(1);
                 }
-            }
-        }
+        if let Some(last) = self.read_last_entry()
+            && let Some(c) = last.get("cursor")
+                && let Some(n) = Self::parse_entry_cursor(c) {
+                    return n.saturating_add(1);
+                }
         1
     }
 
@@ -439,7 +427,7 @@ impl MemoryStore {
             log::info!("Dream: reader created");
             for line_result in reader.lines() {
                 if let Ok(line) = line_result {
-                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(&line.trim()) {
+                    if let Ok(entry) = serde_json::from_str::<serde_json::Value>(line.trim()) {
                         entries.push(entry);
                     } else {
                         log::error!("Failed to parse JSONL line: {}", line);
@@ -487,15 +475,15 @@ impl MemoryStore {
 
     /// Overwrite history.jsonl with the given entries.
     fn write_entries(&self, entries: Vec<serde_json::Value>) -> Result<(), io::Error> {
-        let mut file = File::create(&self.history_file)?;
+        let mut contents = Vec::new();
         for entry in entries {
-            write!(
-                file,
-                "{}\n",
+            writeln!(
+                contents,
+                "{}",
                 serde_json::to_string(&entry).map_err(io::Error::other)?
             )?;
         }
-        Ok(())
+        write_atomic(&self.history_file, &contents)
     }
 
     // Dream cursor
@@ -518,11 +506,11 @@ impl MemoryStore {
                 }
             }
         }
-        return 0;
+        0
     }
 
     pub fn set_last_dream_cursor(&self, cursor: u64) {
-        if let Err(e) = std::fs::write(&self.dream_cursor_file, cursor.to_string().as_bytes()) {
+        if let Err(e) = write_atomic(&self.dream_cursor_file, cursor.to_string().as_bytes()) {
             log::error!("Failed to write dream cursor file: {}", e);
         }
     }
@@ -639,22 +627,9 @@ impl MemoryStore {
     }
 
     fn write_safe(content: &str, path: &PathBuf) {
-        if let Ok(mut file) = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .open(path)
-        {
-            let result = file.write_all(content.as_bytes());
-            if result.is_err() {
-                log::error!(
-                    "Failed to write file: {} due to {}",
-                    path.display(),
-                    result.err().unwrap()
-                );
-            }
-        } else {
-            log::error!("Failed to write file: {}", path.display());
+        // Atomic: a kill mid-write must not leave MEMORY.md, SOUL.md or USER.md truncated.
+        if let Err(e) = write_atomic(path, content.as_bytes()) {
+            log::error!("Failed to write file: {} due to {}", path.display(), e);
         }
     }
 
@@ -729,7 +704,7 @@ impl Consolidator {
         max_completion_tokens: usize,
     ) -> Self {
         Self {
-            store: store,
+            store,
             runtime_resolver,
             sessions,
             context_window_tokens,
@@ -868,15 +843,15 @@ impl Consolidator {
         }
 
         // Match `append_history`: treat blank / whitespace-only summaries like missing output.
-        let summary_entry = response.content.as_ref().and_then(|entry| {
+        let summary_entry = response.content.as_ref().map(|entry| {
             let mut c = strip_think(entry.trim_end());
             if c.is_empty() {
                 c = entry.trim_end().to_string();
             }
             if c.trim().is_empty() {
-                Some("[no summary]")
+                "[no summary]"
             } else {
-                Some(entry.as_str())
+                entry.as_str()
             }
         });
         match summary_entry {
@@ -2597,7 +2572,7 @@ mod tests {
         let bak2 = store.memory_dir.join("HISTORY.md.bak.2");
         assert!(bak2.exists(), "should fall through to .bak.2");
         assert_eq!(
-            fs::read_to_string(&store.memory_dir.join("HISTORY.md.bak")).unwrap(),
+            fs::read_to_string(store.memory_dir.join("HISTORY.md.bak")).unwrap(),
             "older",
             "previous backup must be preserved"
         );
@@ -2786,7 +2761,7 @@ mod tests {
         let store = make_store(&tmp);
         let good = json!({"ok": true});
         let mut body = String::from("totally not json\n");
-        body.push_str("\n");
+        body.push('\n');
         body.push_str("   \t  \n");
         body.push_str(&format!("{}\n", serde_json::to_string(&good).unwrap()));
         fs::write(&store.history_file, body).unwrap();
@@ -3069,6 +3044,38 @@ mod tests {
     }
 
     // ── append_history ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn memory_writes_are_atomic_and_leave_no_temp_files() {
+        let tmp = TempDir::new().unwrap();
+        let store = make_store(&tmp);
+
+        store.write_memory("first version of the memory");
+        // A reader that opened the file before the next write still sees the
+        // complete old content (truncate-and-rewrite would change it).
+        let mut early_reader = File::open(&store.memory_file).unwrap();
+        store.write_memory("second version");
+        let mut old_content = String::new();
+        early_reader.read_to_string(&mut old_content).unwrap();
+        assert_eq!(old_content, "first version of the memory");
+        store.set_last_dream_cursor(7);
+        store.append_history("an entry");
+
+        assert_eq!(
+            fs::read_to_string(&store.memory_file).unwrap(),
+            "second version"
+        );
+        assert_eq!(store.get_last_dream_cursor(), 7);
+        for folder in [tmp.path().to_path_buf(), store.memory_dir.clone()] {
+            let temp_files: Vec<String> = fs::read_dir(&folder)
+                .unwrap()
+                .filter_map(Result::ok)
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .filter(|name| name.ends_with(".tmp"))
+                .collect();
+            assert!(temp_files.is_empty(), "{folder:?}: {temp_files:?}");
+        }
+    }
 
     #[test]
     fn append_history_first_entry_writes_jsonl_cursor_and_returns_one() {

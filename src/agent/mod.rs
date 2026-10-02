@@ -1,3 +1,4 @@
+pub mod acp;
 pub mod agent_loop;
 pub mod autocompact;
 pub mod circuit_breaker;
@@ -12,5 +13,6 @@ pub mod runner;
 pub mod skills;
 pub mod subagent;
 pub mod tool_approval;
+pub mod tool_progress;
 pub mod tools;
 pub mod workspace_context;

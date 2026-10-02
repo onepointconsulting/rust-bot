@@ -31,7 +31,7 @@ use crate::channels::websocket::webui::metadata::USER_ID_METADATA_KEY;
 /// (`webui/transcript.py:30`).
 const MAX_TRANSCRIPT_FILE_BYTES: usize = 8 * 1024 * 1024;
 
-const TARGET_ACTIVE_TRANSCRIPT_BYTES: usize = (MAX_TRANSCRIPT_FILE_BYTES / 2) as usize;
+const TARGET_ACTIVE_TRANSCRIPT_BYTES: usize = MAX_TRANSCRIPT_FILE_BYTES / 2;
 
 const WEBUI_FORK_MARKER_EVENT: &str = "fork_marker";
 
@@ -739,9 +739,9 @@ impl WebUiTranscriptRecorder {
     }
 
     fn segment_file_path(&self, session_key: &str, segment_id: &str) -> PathBuf {
-        return self
+        self
             .webui_transcript_segments_dir(session_key)
-            .join(format!("{segment_id}.jsonl"));
+            .join(format!("{segment_id}.jsonl"))
     }
 
     /// Flatten turn groups into a single record list. Mirrors `_flatten_turns`.
@@ -1243,11 +1243,10 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             });
             if let Some(timestamp) = row.get("timestamp").and_then(Value::as_str) {
                 entry["timestamp"] = serde_json::json!(timestamp);
-            } else if let Some(ms) = valid_created_at_ms(row.get("created_at_ms")) {
-                if let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
+            } else if let Some(ms) = valid_created_at_ms(row.get("created_at_ms"))
+                && let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
                     entry["timestamp"] = serde_json::json!(dt.to_rfc3339());
                 }
-            }
             // Prefer the folded `reasoning_end` text (how the WebUI transcript
             // actually stores a completed trace). Fall back to a
             // `reasoning_content`/`reasoning` field on the answer row itself,

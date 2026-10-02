@@ -63,7 +63,7 @@ pub async fn handle_message(
         log::error!("{}", msg);
         return Err(SendError(msg));
     }
-    return Ok(());
+    Ok(())
 }
 
 /// Abstract base class for chat channel implementations.
@@ -73,11 +73,11 @@ pub async fn handle_message(
 pub trait BaseChannel: std::any::Any + Send + Sync {
     /// Channel name
     fn name(&self) -> &'static str {
-        return "base";
+        "base"
     }
     /// Channel display name
     fn display_name(&self) -> &'static str {
-        return "Base";
+        "Base"
     }
 
     /// Transcription provider name, if configured.
@@ -255,7 +255,7 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
         if allow_list.contains(&"*".to_string()) {
             return true;
         }
-        return allow_list.contains(&sender_id.to_string());
+        allow_list.contains(&sender_id.to_string())
     }
 
     /// Handle an incoming message from the chat platform.
@@ -339,11 +339,11 @@ pub trait BaseChannel: std::any::Any + Send + Sync {
     fn default_config(&self) -> HashMap<String, serde_json::Value> {
         let mut map = HashMap::new();
         map.insert("enabled".to_string(), serde_json::json!(false));
-        return map;
+        map
     }
 
     fn is_running(&self) -> bool {
-        return self.running();
+        self.running()
     }
 }
 

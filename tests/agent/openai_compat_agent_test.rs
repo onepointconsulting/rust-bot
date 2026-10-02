@@ -120,7 +120,7 @@ async fn test_simple_run_no_tools() {
 fn completion_message_check(result: &AgentRunResult) {
     if let Some(final_message) = result.final_content.as_ref() {
         let final_message = final_message.as_str();
-        assert!(final_message.len() > 0);
+        assert!(!final_message.is_empty());
         assert!(
             result.stop_reason == "completed",
             "stop_reason: {}",
@@ -395,7 +395,7 @@ async fn test_mcp_tool() {
     });
 
     // Connect the client side and discover the tools the server advertises
-    let client_service = DummyMcpClient::default()
+    let client_service = DummyMcpClient
         .serve(client_transport)
         .await
         .expect("MCP client failed to connect");

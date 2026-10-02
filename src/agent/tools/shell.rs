@@ -2,6 +2,7 @@ use crate::agent::tools::base::Tool;
 use crate::agent::tools::sandbox::wrap_command;
 use crate::agent::workspace_context::current_tool_workspace;
 use crate::config::paths::get_media_dir;
+use crate::utils::process::kill_process_tree_sync;
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
@@ -32,7 +33,7 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if self.armed {
-            ShellTool::kill_process_tree_sync(self.pid);
+            kill_process_tree_sync(self.pid);
         }
     }
 }
@@ -107,7 +108,7 @@ impl ShellTool {
             if IS_WINDOWS {
                 log::warn!(
                     "Sandbox '{}' is not supported on Windows; running unsandboxed",
-                    sandbox.to_string()
+                    sandbox
                 )
             } else {
                 let workspace = tw
@@ -341,20 +342,19 @@ impl ShellTool {
         // ── 1. Deny patterns ─────────────────────────────────────────────────
         if let Some(deny) = &self.deny_patterns {
             for pattern in deny {
-                if let Ok(re) = Regex::new(pattern) {
-                    if re.is_match(&lower) {
+                if let Ok(re) = Regex::new(pattern)
+                    && re.is_match(&lower) {
                         return Some(
                             "Error: Command blocked by safety guard (dangerous pattern detected)"
                                 .to_string(),
                         );
                     }
-                }
             }
         }
 
         // ── 2. Allow patterns ─────────────────────────────────────────────────
-        if let Some(allow) = &self.allow_patterns {
-            if !allow.is_empty() {
+        if let Some(allow) = &self.allow_patterns
+            && !allow.is_empty() {
                 let permitted = allow
                     .iter()
                     .any(|p| Regex::new(p).map(|re| re.is_match(&lower)).unwrap_or(false));
@@ -364,7 +364,6 @@ impl ShellTool {
                     );
                 }
             }
-        }
 
         // ── 3. Workspace restriction ──────────────────────────────────────────
         if restrict_to_workspace {
@@ -516,20 +515,6 @@ impl ShellTool {
         }
     }
 
-    /// Forcefully terminate a process and its descendants by PID.
-    fn kill_process_tree_sync(pid: u32) {
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
-        }
-        #[cfg(unix)]
-        {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-        }
-    }
-
     /// Kill a subprocess and its entire process tree, then reap it.
     ///
     /// On **Windows**, `taskkill /F /T /PID` is used instead of `Child::kill()`
@@ -543,7 +528,7 @@ impl ShellTool {
     ///
     /// In both cases the function waits up to 5 seconds for the process to exit.
     async fn kill_process(child: &mut Child) {
-        Self::kill_process_tree_sync(child.id());
+        kill_process_tree_sync(child.id());
 
         // Wait up to 5 s for the process to exit.
         //
@@ -588,13 +573,13 @@ impl Tool for ShellTool {
     }
 
     fn description(&self) -> String {
-        return r#"Execute a shell command and return its output.
+        r#"Execute a shell command and return its output.
 Prefer read_file/write_file/edit_file over cat/echo/sed, and grep/glob over shell find/grep. 
 Use -y or --yes flags to avoid interactive prompts.
 Output is truncated at 10 000 chars; timeout defaults to 60s."#
             .to_string()
             .trim()
-            .to_string();
+            .to_string()
     }
 
     fn exclusive(&self) -> bool {
@@ -782,7 +767,7 @@ mod tests {
             .execute_command(if IS_WINDOWS { "vol" } else { "lsblk -f" }, None, None)
             .await;
         println!("result: {result}");
-        assert!(result.len() > 0, "result should not be empty");
+        assert!(!result.is_empty(), "result should not be empty");
     }
 
     // --- ambient workspace-scope consultation ---

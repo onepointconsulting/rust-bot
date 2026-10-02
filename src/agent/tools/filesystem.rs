@@ -10,6 +10,62 @@ pub enum ResolvePathError {
     HomeDirUnavailable,
     NotUnderAllowedDir { path: PathBuf, allowed: PathBuf },
     NotUnderAnyAllowedDir { path: PathBuf },
+    /// The path lies inside a subtree the scope denies (another rust-bot's home).
+    InDeniedRoot { path: PathBuf, denied: PathBuf },
+}
+
+impl ResolvePathError {
+    /// A message the model can act on (the tools print `{:?}` for the other cases).
+    pub fn describe(&self) -> String {
+        match self {
+            ResolvePathError::HomeDirUnavailable => {
+                "home directory unavailable for path expansion".to_string()
+            }
+            ResolvePathError::NotUnderAllowedDir { path, allowed } => format!(
+                "path {} is outside allowed directory {}",
+                path.display(),
+                allowed.display()
+            ),
+            ResolvePathError::NotUnderAnyAllowedDir { path } => {
+                format!("path {} is outside allowed directories", path.display())
+            }
+            ResolvePathError::InDeniedRoot { path, denied } => format!(
+                "path {} is inside {}, which is off limits (it belongs to another rust-bot)",
+                path.display(),
+                denied.display()
+            ),
+        }
+    }
+}
+
+/// A path-resolution failure as the model should read it: the denied-folder
+/// case in words, the others as they have always been shown.
+pub(crate) fn resolve_error_message(error: &ResolvePathError) -> String {
+    match error {
+        ResolvePathError::InDeniedRoot { .. } => error.describe(),
+        other => format!("{other:?}"),
+    }
+}
+
+/// `denied_roots` resolved the way [`FsToolConfig::resolve`] resolves paths, so
+/// folder walks can compare entries with a plain prefix check instead of
+/// canonicalizing every entry.
+pub(crate) fn resolved_denied_roots(denied_roots: &[PathBuf]) -> Vec<PathBuf> {
+    denied_roots.iter().map(|root| soft_resolve(root)).collect()
+}
+
+/// Whether `entry`, found while walking below an already resolved folder, lies
+/// inside one of the `resolved` denied roots.
+pub(crate) fn is_denied_entry(entry: &Path, resolved: &[PathBuf]) -> bool {
+    resolved.iter().any(|root| entry.starts_with(root))
+}
+
+/// The denied root that contains `path`, if any.
+pub(crate) fn denied_root_containing(path: &Path, denied_roots: &[PathBuf]) -> Option<PathBuf> {
+    denied_roots
+        .iter()
+        .find(|root| _is_under(path, root))
+        .cloned()
 }
 
 fn absolute_path(path: &Path) -> PathBuf {
@@ -76,7 +132,7 @@ fn strip_verbatim_prefix(path: PathBuf) -> PathBuf {
 /// file about to be written), lexically normalize `..`/`.` then canonicalize the
 /// longest existing ancestor and re-join the remainder — matching Python's
 /// non-strict `Path.resolve()` closely enough to keep `..` from escaping.
-fn soft_resolve(path: &Path) -> PathBuf {
+pub(crate) fn soft_resolve(path: &Path) -> PathBuf {
     let abs = absolute_path(path);
     if let Ok(canon) = abs.canonicalize() {
         return strip_verbatim_prefix(canon);
@@ -139,11 +195,10 @@ fn _resolve_path(
         }
     }
 
-    if !p.is_absolute() {
-        if let Some(ref ws) = workspace {
+    if !p.is_absolute()
+        && let Some(ref ws) = workspace {
             p = ws.join(&p);
         }
-    }
     // Soft-resolve so non-existent targets still collapse `..` before the
     // allowed-dir check (strict canonicalize alone is not enough).
     let resolved = soft_resolve(&p);
@@ -239,20 +294,38 @@ impl FsToolConfig {
     /// or move that.
     pub fn resolve(&self, path: &str) -> Result<PathBuf, ResolvePathError> {
         let scope_applies = self.allowed_dir.is_none() || self.allowed_dir == self.workspace;
-        let (workspace, allowed_dir) = if scope_applies {
+        let (workspace, allowed_dir, denied_roots) = if scope_applies {
             let tw =
                 current_tool_workspace(self.workspace.clone(), self.allowed_dir.is_some(), false);
             let allowed = tw.allowed_root();
-            (tw.project_path, allowed)
+            (tw.project_path, allowed, tw.denied_roots)
         } else {
-            (self.workspace.clone(), self.allowed_dir.clone())
+            (self.workspace.clone(), self.allowed_dir.clone(), Vec::new())
         };
-        _resolve_path(
+        let resolved = _resolve_path(
             path,
             workspace,
             allowed_dir,
             self.extra_allowed_dirs.clone(),
-        )
+        )?;
+        match denied_root_containing(&resolved, &denied_roots) {
+            Some(denied) => Err(ResolvePathError::InDeniedRoot {
+                path: resolved,
+                denied,
+            }),
+            None => Ok(resolved),
+        }
+    }
+
+    /// The subtrees the current turn's scope denies, for tools that walk folders
+    /// and must skip them (the path check alone only sees the walk's starting point).
+    pub fn denied_roots(&self) -> Vec<PathBuf> {
+        let scope_applies = self.allowed_dir.is_none() || self.allowed_dir == self.workspace;
+        if !scope_applies {
+            return Vec::new();
+        }
+        current_tool_workspace(self.workspace.clone(), self.allowed_dir.is_some(), false)
+            .denied_roots
     }
 }
 
@@ -435,7 +508,7 @@ impl Tool for ReadFileTool {
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
-            Err(e) => return format!("Error: {:?}", e),
+            Err(e) => return format!("Error: {}", resolve_error_message(&e)),
         };
 
         if !fp.exists() {
@@ -554,14 +627,13 @@ For large files, write an initial chunk with this tool, then append further sect
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
-            Err(e) => return format!("Error: {:?}", e),
+            Err(e) => return format!("Error: {}", resolve_error_message(&e)),
         };
 
-        if let Some(parent) = fp.parent() {
-            if let Err(e) = std::fs::create_dir_all(parent) {
+        if let Some(parent) = fp.parent()
+            && let Err(e) = std::fs::create_dir_all(parent) {
                 return format!("Error writing file: {}", e);
             }
-        }
 
         match std::fs::write(&fp, content.as_bytes()) {
             Ok(_) => format!(
@@ -630,7 +702,7 @@ impl Tool for EditFileTool {
 
         let fp = match self.fs.resolve(path) {
             Ok(p) => p,
-            Err(e) => return format!("Error: {:?}", e),
+            Err(e) => return format!("Error: {}", resolve_error_message(&e)),
         };
 
         if !fp.exists() {
@@ -745,7 +817,7 @@ impl Tool for ListDirTool {
 
         let dp = match self.fs.resolve(path) {
             Ok(p) => p,
-            Err(e) => return format!("Error: {:?}", e),
+            Err(e) => return format!("Error: {}", resolve_error_message(&e)),
         };
 
         if !dp.exists() {
@@ -761,6 +833,7 @@ impl Tool for ListDirTool {
 
         let mut items: Vec<String> = Vec::new();
         let mut total = 0_usize;
+        let denied = resolved_denied_roots(&self.fs.denied_roots());
 
         if recursive {
             let walker = match GlobWalkerBuilder::from_patterns(&dp, &["**/*"]).build() {
@@ -786,7 +859,7 @@ impl Tool for ListDirTool {
                         false
                     }
                 });
-                if ignored {
+                if ignored || is_denied_entry(item, &denied) {
                     continue;
                 }
                 total += 1;
@@ -800,7 +873,7 @@ impl Tool for ListDirTool {
                 if item.is_dir() {
                     items.push(format!("{}/", posix_rel));
                 } else {
-                    items.push(format!("{}", posix_rel));
+                    items.push(posix_rel.to_string());
                 }
             }
         } else {
@@ -813,6 +886,7 @@ impl Tool for ListDirTool {
             };
             entries.sort_by_key(|e| e.path());
 
+            entries.retain(|entry| !is_denied_entry(&entry.path(), &denied));
             for entry in entries.iter().take(cap) {
                 total += 1;
                 let entry_path = entry.path();
@@ -983,7 +1057,7 @@ mod tests {
             None,
         )
         .expect("new file inside workspace should be allowed");
-        assert!(soft_resolve(&resolved).starts_with(&soft_resolve(&workspace)));
+        assert!(soft_resolve(&resolved).starts_with(soft_resolve(&workspace)));
         assert_eq!(
             resolved.file_name().and_then(|n| n.to_str()),
             Some("new_file.txt")
@@ -1063,7 +1137,7 @@ mod tests {
             .execute(&serde_json::json!({ "path": notes_text, "content": "Hello, world!" }))
             .await;
         println!("result: {}", result);
-        assert!(result.contains(format!("Successfully wrote").as_str()));
+        assert!(result.contains("Successfully wrote".to_string().as_str()));
         assert!(Path::new(notes_text).exists());
     }
 
@@ -1111,7 +1185,7 @@ mod tests {
             }))
             .await;
         println!("result: {}", result);
-        assert!(result.contains(format!("Successfully edited").as_str()));
+        assert!(result.contains("Successfully edited".to_string().as_str()));
         assert!(sample_file.exists());
 
         let content = std::fs::read_to_string(&sample_file).unwrap();
@@ -1134,7 +1208,7 @@ mod tests {
             }))
             .await;
         println!("result: {}", result);
-        assert!(result.contains(format!("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.").as_str()));
+        assert!(result.contains("Warning: old_text appears 2 times. Provide more context to make it unique, or set replace_all=true.".to_string().as_str()));
     }
 
     #[tokio::test]
@@ -1191,6 +1265,104 @@ mod tests {
         assert!(result.contains("agent/mod.rs"));
         assert!(result.contains("agent/tools/mod.rs"));
         assert!(result.split("\n").count() <= limit);
+    }
+
+
+    // --- denied subtrees (a child working on a repo that holds a rust-bot home) ---
+
+    /// A project folder with a file of its own and a rust-bot home inside it.
+    fn project_with_a_home() -> (tempfile::TempDir, PathBuf, PathBuf) {
+        let project = tempfile::tempdir().unwrap();
+        fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
+        let home = project.path().join(".rust-bot").join("workspace");
+        fs::create_dir_all(home.join("memory")).unwrap();
+        fs::write(home.join("memory").join("MEMORY.md"), "the parent's secrets\n").unwrap();
+        let project_path = project.path().canonicalize().unwrap();
+        let home = home.canonicalize().unwrap();
+        (project, project_path, home)
+    }
+
+    /// Run `body` with a restricted scope on `project` that denies `denied`.
+    async fn with_denied_scope<F, Fut>(project: &Path, denied: &Path, body: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use crate::agent::workspace_context::{bind_workspace_scope, with_workspace_scope_stack};
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
+        let scope = build_workspace_scope(project, WorkspaceAccessMode::Restricted, None)
+            .with_denied_roots(&[denied.to_path_buf()]);
+        with_workspace_scope_stack(|| async {
+            bind_workspace_scope(scope);
+            body().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn resolve_refuses_a_path_inside_a_denied_root_and_allows_the_rest() {
+        let (_keep, project, home) = project_with_a_home();
+        let fs_config = FsToolConfig::new(Some(project.clone()), Some(project.clone()), None);
+
+        with_denied_scope(&project, &home, || async {
+            assert!(fs_config.resolve("main.rs").is_ok());
+            let error = fs_config
+                .resolve(".rust-bot/workspace/memory/MEMORY.md")
+                .unwrap_err();
+            assert!(matches!(error, ResolvePathError::InDeniedRoot { .. }), "{error:?}");
+            assert!(error.describe().contains("off limits"), "{}", error.describe());
+            // The denied folder itself, and a `..` detour into it, are refused too.
+            assert!(fs_config.resolve(".rust-bot/workspace").is_err());
+            assert!(fs_config.resolve("src/../.rust-bot/workspace/memory").is_err());
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn without_denied_roots_the_same_path_resolves() {
+        let (_keep, project, _home) = project_with_a_home();
+        let fs_config = FsToolConfig::new(Some(project.clone()), Some(project.clone()), None);
+        assert!(
+            fs_config
+                .resolve(".rust-bot/workspace/memory/MEMORY.md")
+                .is_ok()
+        );
+    }
+
+    #[tokio::test]
+    async fn read_file_cannot_read_a_denied_file_but_reads_other_project_files() {
+        let (_keep, project, home) = project_with_a_home();
+        let tool = ReadFileTool::new(Some(project.clone()), Some(project.clone()), None);
+
+        with_denied_scope(&project, &home, || async {
+            let denied = tool
+                .execute(&serde_json::json!({"path": ".rust-bot/workspace/memory/MEMORY.md"}))
+                .await;
+            assert!(!denied.contains("the parent's secrets"), "{denied}");
+            assert!(denied.contains("off limits") || denied.contains("InDeniedRoot"), "{denied}");
+
+            let allowed = tool.execute(&serde_json::json!({"path": "main.rs"})).await;
+            assert!(allowed.contains("fn main"), "{allowed}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn list_dir_hides_a_denied_subtree_in_both_modes() {
+        let (_keep, project, home) = project_with_a_home();
+        let tool = ListDirTool::new(Some(project.clone()), Some(project.clone()), None);
+
+        with_denied_scope(&project, &home, || async {
+            let flat = tool.execute(&serde_json::json!({"path": ".rust-bot"})).await;
+            assert!(!flat.contains("workspace"), "{flat}");
+            let recursive = tool
+                .execute(&serde_json::json!({"path": ".", "recursive": true}))
+                .await;
+            assert!(recursive.contains("main.rs"), "{recursive}");
+            assert!(!recursive.contains("MEMORY.md"), "{recursive}");
+            assert!(!recursive.contains("memory"), "{recursive}");
+        })
+        .await;
     }
 
     // --- ambient workspace-scope consultation ---

@@ -83,7 +83,7 @@ use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, save_config, set_config_path};
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
-use crate::config::schema::{ChannelsConfig, Config};
+use crate::config::schema::{AcpPermissionPolicy, ChannelsConfig, Config};
 use crate::cron::{CronJob, CronService};
 use crate::providers::base::LLMProviderDyn;
 use crate::providers::factory::create_provider_for;
@@ -124,6 +124,10 @@ pub enum Commands {
 
     /// Run the gateway server
     Gateway(GatewayArgs),
+
+    /// Serve rust-bot as an Agent Client Protocol (ACP) agent over stdio
+    /// (launched by an ACP client such as Zed)
+    Acp(crate::cli::acp::AcpArgs),
 
     /// Perform interactive channel login (e.g. WhatsApp QR pairing)
     Login(LoginArgs),
@@ -421,6 +425,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Agent(args) => run_agent(args).await,
         Commands::Api(args) => run_api(args).await,
         Commands::Gateway(args) => run_gateway(args).await,
+        Commands::Acp(args) => crate::cli::acp::run_acp(args).await,
         Commands::Login(args) => run_login(args).await,
         Commands::Onboard(args) => run_onboard(args),
         Commands::GenerateJwtKeypair(args) => run_generate_keypair(args),
@@ -613,14 +618,41 @@ fn init_agent_loop(
     workspace: PathBuf,
     hooks: Option<Vec<Arc<dyn AgentHook>>>,
 ) -> AgentLoop {
+    try_init_agent_loop(config, workspace, hooks).unwrap_or_else(|e| {
+        eprint_error(e);
+        exit_codes::exit(INVALID_PROVIDER);
+    })
+}
+
+/// [`init_agent_loop`] that reports an unusable provider as an error instead of exiting.
+pub(crate) fn try_init_agent_loop(
+    config: &Config,
+    workspace: PathBuf,
+    hooks: Option<Vec<Arc<dyn AgentHook>>>,
+) -> Result<AgentLoop, String> {
+    let provider = try_create_provider(config)?;
+    Ok(init_agent_loop_with_provider(
+        config, workspace, provider, hooks,
+    ))
+}
+
+/// Build the agent loop around an already-created provider.
+///
+/// Separate from [`try_init_agent_loop`] so entry points (and tests) that
+/// bring their own provider share the exact same assembly.
+pub(crate) fn init_agent_loop_with_provider(
+    config: &Config,
+    workspace: PathBuf,
+    provider: Arc<dyn LLMProviderDyn>,
+    hooks: Option<Vec<Arc<dyn AgentHook>>>,
+) -> AgentLoop {
     let bus = MessageBus::new();
-    let provider = create_provider(&config);
     log::info!("provider api base: {:?}", provider.api_base());
 
     let cron_store_path = config.workspace_path().join("cron").join("jobs.json");
     let cron_service = CronService::new(cron_store_path, None);
 
-    let agent_loop = AgentLoop::new(
+    AgentLoop::new(
         Arc::new(bus),
         provider,
         workspace,
@@ -628,8 +660,7 @@ fn init_agent_loop(
         Some(cron_service),
         None,
         hooks,
-    );
-    agent_loop
+    )
 }
 
 async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
@@ -659,15 +690,14 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         .map(|hook| vec![hook as Arc<dyn AgentHook>]);
     let agent_loop = init_agent_loop(&config, workspace, hooks);
 
-    if let Some(restart_notice) = consume_restart_notice_from_env() {
-        if should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
+    if let Some(restart_notice) = consume_restart_notice_from_env()
+        && should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
             print_agent_response(
                 &format_restart_completed_message(&restart_notice.started_at_raw),
                 false,
                 None,
             );
         }
-    }
 
     let agent_loop = Arc::new(agent_loop);
     // Subagent completions publish system-channel messages to the inbound bus.
@@ -885,7 +915,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
     let (config, workspace) = prepare_workspace(args.config, None);
     let agent_loop = init_agent_loop(&config, workspace.clone(), None);
     let host = args.host.unwrap_or_else(|| config.api.host.clone());
-    let port = args.port.unwrap_or_else(|| config.api.port);
+    let port = args.port.unwrap_or(config.api.port);
     let model_name = config.agents.model.clone();
     let session_id = args.session.clone();
     let timeout = args.timeout;
@@ -1084,12 +1114,15 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let web_root_override = args.web_root.clone();
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
 
-    let tool_approvals = config
-        .tools
-        .confirm_before_execute
+    // The broker also carries a child agent's permission questions when
+    // `tools.acp.permissionPolicy` is `escalate`, so it exists for that too.
+    let escalates_child_permissions = config.tools.acp.enabled
+        && config.tools.acp.permission_policy == AcpPermissionPolicy::Escalate;
+    let tool_approvals = (config.tools.confirm_before_execute || escalates_child_permissions)
         .then(|| Arc::new(ToolApprovalBroker::new()));
     let confirm_hook = tool_approvals
         .as_ref()
+        .filter(|_| config.tools.confirm_before_execute)
         .map(|broker| Arc::new(WebsocketsAskHook::new(Arc::clone(broker))));
     let hooks = confirm_hook
         .clone()
@@ -1098,6 +1131,9 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone(), hooks));
     if let Some(hook) = &confirm_hook {
         hook.set_bus(agent_loop.bus());
+    }
+    if let (Some(acp_tools), Some(broker)) = (agent_loop.acp_tools(), &tool_approvals) {
+        acp_tools.set_escalation(Arc::clone(broker), agent_loop.bus());
     }
     let session_manager = agent_loop.session_manager.clone();
     let cron = agent_loop.cron_service.clone();
@@ -1162,15 +1198,13 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                             None,
                         )
                         .await;
-                    if let Some(token) = cron_token {
-                        if let Some(tool) = cron_tool.as_ref() {
-                            if let Some(cron_tool) =
+                    if let Some(token) = cron_token
+                        && let Some(tool) = cron_tool.as_ref()
+                            && let Some(cron_tool) =
                                 (tool.as_ref() as &dyn std::any::Any).downcast_ref::<CronTool>()
                             {
                                 cron_tool.reset_cron_context(token);
                             }
-                        }
-                    }
 
                     // If the message tool already delivered the reply, we're done.
                     let already_sent = {
@@ -1804,8 +1838,8 @@ async fn message_session(
     // which is already the agent loop's intended cancellation path.
     let response = tokio::select! {
         response = Arc::clone(&agent_loop).process_direct(
-            &message,
-            Some(&session_id),
+            message,
+            Some(session_id),
             None,
             None,
             Some(media),
@@ -1833,7 +1867,7 @@ async fn message_session(
     }
     if !streamed {
         print_agent_response_with_header(
-            &response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
+            response.as_ref().map(|r| r.content.as_str()).unwrap_or(""),
             markdown,
             response.as_ref().map(|r| &r.metadata),
             !header_printed,
@@ -1849,41 +1883,43 @@ async fn message_session(
 
 /// Load config and optionally override the active workspace.
 fn load_runtime_config(config: PathBuf, workspace: Option<PathBuf>) -> Config {
-    if !config.exists() {
-        eprint_error(format!("Config file not found: {}", config.display()));
+    try_load_runtime_config(config, workspace).unwrap_or_else(|e| {
+        eprint_error(e);
         exit_codes::exit(GENERAL_ERROR);
+    })
+}
+
+/// [`load_runtime_config`] that reports a missing or unusable config as an
+/// error instead of exiting the process.
+pub(crate) fn try_load_runtime_config(
+    config: PathBuf,
+    workspace: Option<PathBuf>,
+) -> Result<Config, String> {
+    if !config.exists() {
+        return Err(format!("Config file not found: {}", config.display()));
     }
     set_config_path(config.clone());
-    let loaded = resolve_config_env_vars(&load_config(Some(config.clone())));
+    let mut loaded =
+        resolve_config_env_vars(&load_config(Some(config.clone()))).map_err(|e| e.to_string())?;
     log::info!("Using config: {}", config.display());
-    match loaded {
-        Ok(mut loaded) => {
-            if let Some(workspace) = workspace {
-                loaded.agents.workspace = workspace.clone().to_string_lossy().into_owned();
-            }
-            loaded
-        }
-        Err(e) => {
-            eprint_error(e);
-            exit_codes::exit(GENERAL_ERROR);
-        }
+    if let Some(workspace) = workspace {
+        loaded.agents.workspace = workspace.to_string_lossy().into_owned();
     }
+    Ok(loaded)
 }
 
 /// Build the process-wide startup provider from `config.agents.model`/`.provider`.
 ///
 /// Thin wrapper around [`create_provider_for`], which holds the actual
 /// provider-selection logic shared with [`ModelRuntimeResolver`]
-/// (`agent::model_runtime`) so named model presets resolve identically.
-fn create_provider(config: &Config) -> Arc<dyn LLMProviderDyn> {
+/// (`agent::model_runtime`) so named model presets resolve identically. An
+/// unusable provider is an error here; the CLI entry points turn it into an exit.
+pub(crate) fn try_create_provider(config: &Config) -> Result<Arc<dyn LLMProviderDyn>, String> {
     let model = config.agents.model.clone();
     let provider_name = config.agents.provider.clone();
     log::info!("Provider Name: {:?}", provider_name);
     log::info!("Model: {:?}", model);
-    create_provider_for(config, &model, &provider_name).unwrap_or_else(|e| {
-        eprint_error(e);
-        exit_codes::exit(INVALID_PROVIDER);
-    })
+    create_provider_for(config, &model, &provider_name)
 }
 
 fn extract_images(

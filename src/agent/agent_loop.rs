@@ -38,6 +38,8 @@ use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::tool_progress::with_tool_progress;
+use crate::agent::tools::acp::{AcpToolsContext, register_acp_tools};
 use crate::agent::workspace_context::{
     bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
 };
@@ -147,9 +149,7 @@ impl LoopHook {
 
 /// Remove <think>…</think> blocks that some models embed in content.
 fn safe_strip_think(text: Option<&str>) -> Option<String> {
-    if text.is_none() {
-        return None;
-    }
+    text?;
     let text = strip_think(text.unwrap());
     if text.is_empty() { None } else { Some(text) }
 }
@@ -184,11 +184,10 @@ impl AgentHook for LoopHook {
             new_clean.get(prev_clean.len()..).unwrap_or("").to_string()
         };
 
-        if !incremental.is_empty() {
-            if let Some(on_stream) = &self.on_stream {
+        if !incremental.is_empty()
+            && let Some(on_stream) = &self.on_stream {
                 on_stream(incremental).await;
             }
-        }
     }
 
     async fn on_stream_end(&self, _ctx: &mut AgentHookContext, resuming: bool) {
@@ -285,6 +284,9 @@ pub struct AgentLoop {
     exec_config: ExecToolConfig,
     pub cron_service: Option<Arc<CronService>>,
     restrict_to_workspace: bool,
+    /// Tool names that are never registered (`tools.disabledTools`), including
+    /// MCP tools that connect later.
+    disabled_tools: Vec<String>,
     /// Resolves the effective per-turn workspace scope (see
     /// `security::workspace_access`), from a session's persisted override
     /// if any, else this loop's fixed `workspace`/`restrict_to_workspace`.
@@ -304,6 +306,9 @@ pub struct AgentLoop {
     context: Arc<ContextBuilder>,
     pub(crate) tools: Arc<Mutex<ToolRegistry>>,
     pub subagents: Arc<SubagentManager>,
+    /// The `acp_*` tools' shared state; `None` when ACP is off or this process
+    /// is already as deep as `tools.acp.maxDepth` allows.
+    acp_tools: Option<Arc<AcpToolsContext>>,
     /// In-flight per-session tasks, keyed by session then by a unique task id so
     /// each task can remove itself on completion (the `add_done_callback` analog).
     pub active_tasks: Arc<AsyncMutex<HashMap<String, HashMap<u64, JoinHandle<()>>>>>,
@@ -357,7 +362,7 @@ impl AgentLoop {
         let max_tool_result_chars = agents_cfg.max_tool_result_chars;
         let max_iterations = agents_cfg.max_tool_iterations;
         let context_block_limit = agents_cfg.context_block_limit;
-        let provider_retry_mode = agents_cfg.provider_retry_mode.clone();
+        let provider_retry_mode = agents_cfg.provider_retry_mode;
 
         let max = std::env::var("RUST_BOT_MAX_CONCURRENT_REQUESTS")
             .unwrap_or_else(|_| "3".to_string())
@@ -377,21 +382,24 @@ impl AgentLoop {
         });
         let runtime_resolver =
             Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
-        let subagents = Arc::new(SubagentManager::new(
-            runtime_resolver.clone(),
-            session_manager.clone(),
-            workspace.clone(),
-            bus.clone(),
-            max_tool_result_chars as usize,
-            Some(web_config.clone()),
-            Some(exec_config.clone()),
-            Some(gmail_config.clone()),
-            Some(ocr_config.clone()),
-            Some(docx_config.clone()),
-            Some(image_generation_config.clone()),
-            Some(subagent_config.clone()),
-            Some(restrict_to_workspace),
-        ));
+        let subagents = Arc::new(
+            SubagentManager::new(
+                runtime_resolver.clone(),
+                session_manager.clone(),
+                workspace.clone(),
+                bus.clone(),
+                max_tool_result_chars as usize,
+                Some(web_config.clone()),
+                Some(exec_config.clone()),
+                Some(gmail_config.clone()),
+                Some(ocr_config.clone()),
+                Some(docx_config.clone()),
+                Some(image_generation_config.clone()),
+                Some(subagent_config.clone()),
+                Some(restrict_to_workspace),
+            )
+            .with_disabled_tools(tools_cfg.disabled_tools.clone()),
+        );
         let mut tools = ToolRegistry::new();
         AgentLoop::register_default_tools(
             &mut tools,
@@ -410,13 +418,31 @@ impl AgentLoop {
             session_manager.clone(),
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
+        // The acp_* tools exist only when enabled and not already at maxDepth.
+        let acp_tools = AcpToolsContext::for_process(
+            &tools_cfg.acp,
+            workspace.clone(),
+            restrict_to_workspace,
+        );
+        if let Some(acp_tools) = &acp_tools {
+            register_acp_tools(&mut tools, acp_tools);
+        }
+        for name in &tools_cfg.disabled_tools {
+            tools.unregister(name);
+        }
         let tools = Arc::new(Mutex::new(tools));
-        let context = Arc::new(ContextBuilder::with_default_mode(
+        let mut context_builder = ContextBuilder::with_default_mode(
             workspace.clone(),
             timezone.clone(),
             tools.clone(),
             agents_cfg.mode,
-        ));
+        );
+        if let Some(acp_tools) = &acp_tools {
+            let acp_tools = Arc::clone(acp_tools);
+            context_builder =
+                context_builder.with_prompt_section(Arc::new(move || acp_tools.prompt_section()));
+        }
+        let context = Arc::new(context_builder);
         let consolidator = Arc::new(Consolidator::new(
             Arc::clone(&context.memory),
             runtime_resolver.clone(),
@@ -435,7 +461,8 @@ impl AgentLoop {
 
         let dream_cfg = agents_cfg.dream.clone();
 
-        let agent_loop = Self {
+        
+        Self {
             bus: bus.clone(),
             _channels_config: channels_config,
             runtime_resolver: runtime_resolver.clone(),
@@ -448,15 +475,17 @@ impl AgentLoop {
             exec_config: exec_config.clone(),
             cron_service,
             restrict_to_workspace,
+            disabled_tools: tools_cfg.disabled_tools.clone(),
             workspace_scopes,
             _timezone: timezone,
             start_time: SystemTime::now(),
             last_usage: Mutex::new(LLMUsage::new()),
-            extra_hooks: hooks.unwrap_or(Vec::new()),
+            extra_hooks: hooks.unwrap_or_default(),
             context: context.clone(),
             session_manager: session_manager.clone(),
             tools,
             subagents,
+            acp_tools,
             running: AtomicBool::new(false),
             mcp_servers,
             mcp_connected: AtomicBool::new(false),
@@ -487,8 +516,7 @@ impl AgentLoop {
                 router
             },
             config,
-        };
-        agent_loop
+        }
     }
 
     /// The process-wide default model (read-through onto the resolver's
@@ -610,6 +638,29 @@ impl AgentLoop {
             .save(snapshot)
             .map_err(|e| format!("Failed to save session: {e}"))?;
         Ok(mode)
+    }
+
+    /// The `acp_*` tools' shared state, to wire escalation to the web-socket chat.
+    pub fn acp_tools(&self) -> Option<&Arc<AcpToolsContext>> {
+        self.acp_tools.as_ref()
+    }
+
+    /// Deny `denied_roots` to the file tools in every session's scope (another
+    /// rust-bot's home that lies inside the project a child works on).
+    pub fn with_denied_roots(mut self, denied_roots: Vec<PathBuf>) -> Self {
+        self.workspace_scopes = self.workspace_scopes.with_denied_roots(denied_roots);
+        self
+    }
+
+    /// Remove tools by name from the shared registry.
+    ///
+    /// Used by headless entry points (e.g. `rust-bot acp`) to drop tools that
+    /// cannot work there. Unknown names are ignored.
+    pub fn unregister_tools(&self, names: &[&str]) {
+        let mut tools = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        for name in names {
+            tools.unregister(name);
+        }
     }
 
     /// Tools visible to this session after applying its agent mode.
@@ -822,6 +873,9 @@ impl AgentLoop {
                     for session in &mut sessions {
                         mcp_tool_count += session.tools.len();
                         for tool in session.tools.drain(..) {
+                            if self.disabled_tools.contains(&tool.name()) {
+                                continue;
+                            }
                             registry.register(tool);
                         }
                     }
@@ -1019,6 +1073,8 @@ impl AgentLoop {
         chat_id: &str,
         message_id: Option<&str>,
     ) -> AgentRunResult {
+        // The same progress callback, for tools that report while they block.
+        let tool_progress = on_progress.clone();
         let loop_hook = LoopHook::with_context(
             Arc::clone(self),
             on_progress,
@@ -1070,8 +1126,9 @@ impl AgentLoop {
         let workspace_scope_token = bind_workspace_scope(scope);
 
         let runner = AgentRunner::new(runtime.provider.clone());
-        let result = runner
-            .run(AgentRunSpec {
+        let result = with_tool_progress(
+            tool_progress,
+            runner.run(AgentRunSpec {
                 initial_messages,
                 tools: run_tools,
                 model: runtime.model.clone(),
@@ -1096,10 +1153,11 @@ impl AgentLoop {
                 max_iterations_message: None,
                 max_tokens: Some(runtime.max_tokens as usize),
                 reasoning_effort: runtime.reasoning_effort.clone(),
-            })
-            .await;
+            }),
+        )
+        .await;
         reset_workspace_scope(workspace_scope_token);
-        *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage.clone();
+        *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage;
         if result.stop_reason == "max_iterations" {
             log::warn!("Max iterations ({}) reached", self.max_iterations);
         } else if result.stop_reason == "error" {
@@ -1114,8 +1172,8 @@ impl AgentLoop {
         } else if result.stop_reason == CIRCUIT_BREAKER_STOP_REASON {
             log::warn!("Message circuit breaker tripped");
         }
-        if let Some(session_key) = session_key {
-            if result.usage != LLMUsage::new() {
+        if let Some(session_key) = session_key
+            && result.usage != LLMUsage::new() {
                 let mut manager = self
                     .session_manager
                     .lock()
@@ -1127,7 +1185,6 @@ impl AgentLoop {
                     log::error!("Failed to save session token usage for {session_key}: {e}");
                 }
             }
-        }
         result
     }
 
@@ -1231,11 +1288,10 @@ impl AgentLoop {
             } else if msg.channel.eq_ignore_ascii_case("system") {
                 // System messages may run consolidation, which calls the `?Send`
                 // LLM provider — handled on the run-loop task, not via `spawn`.
-                if let Some(response) = Arc::clone(self).process_system_message(msg).await {
-                    if let Err(error) = self.bus.publish_outbound(response) {
+                if let Some(response) = Arc::clone(self).process_system_message(msg).await
+                    && let Err(error) = self.bus.publish_outbound(response) {
                         log::error!("Failed to publish outbound message: {error}");
                     }
-                }
             } else {
                 // Everything else is dispatched as its own task so the loop stays
                 // responsive (and the task is cancellable via /stop).
@@ -1836,7 +1892,7 @@ impl AgentLoop {
         on_stream_end: Option<StreamEndCallback>,
     ) -> Option<OutboundMessage> {
         let preview = if msg.content.len() > 80 {
-            format!("{}...", &msg.content.chars().take(80).collect::<String>())
+            format!("{}...", msg.content.chars().take(80).collect::<String>())
         } else {
             msg.content.clone()
         };
@@ -1865,11 +1921,10 @@ impl AgentLoop {
             let restored = self.restore_runtime_checkpoint(session);
             // End the `&mut session` borrow before re-borrowing the manager to save.
             let snapshot = session.clone();
-            if restored {
-                if let Err(e) = session_manager.save(snapshot.clone()) {
+            if restored
+                && let Err(e) = session_manager.save(snapshot.clone()) {
                     log::error!("Failed to save restored session: {e}");
                 }
-            }
             snapshot
         };
 
@@ -1886,12 +1941,11 @@ impl AgentLoop {
         // Priority commands (/stop, /restart, /status) are normally handled inline by
         // `run()`'s bus loop before it ever reaches `dispatch()`. Callers that skip the
         // bus (API, CLI `process_direct`) still need them to be recognized here.
-        if self.commands.is_priority(raw) {
-            if let Some(result) = self.commands.dispatch_priority(&ctx).await {
+        if self.commands.is_priority(raw)
+            && let Some(result) = self.commands.dispatch_priority(&ctx).await {
                 self.persist_command_turn(&key, &msg.content, raw, &result);
                 return Some(result);
             }
-        }
         if let Some(result) = self.commands.dispatch(&mut ctx).await {
             self.persist_command_turn(&key, &msg.content, raw, &result);
             return Some(result);
@@ -1931,7 +1985,7 @@ impl AgentLoop {
         let (mut session, pending_summary) = self.auto_compact.prepare_session(session, &key);
         let history = session.get_history(Some(0));
         let media = if !msg.media.is_empty() {
-            Some(&msg.media.as_slice()[..])
+            Some(msg.media.as_slice())
         } else {
             None
         };
@@ -2030,7 +2084,7 @@ impl AgentLoop {
             &mut session,
             &all_msgs,
             1 + history.len() as u32,
-            result.usage.clone(),
+            result.usage,
             "processing message",
         );
         let consolidator = Arc::clone(&self.consolidator);
@@ -2044,26 +2098,21 @@ impl AgentLoop {
         if stop_reason == CIRCUIT_BREAKER_STOP_REASON {
             log::warn!("Message circuit breaker tripped; delivering stop notice");
         }
-        if stop_reason != CIRCUIT_BREAKER_STOP_REASON {
-            if let Some(message_tool) = self
+        if stop_reason != CIRCUIT_BREAKER_STOP_REASON
+            && let Some(message_tool) = self
                 .tools
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get("message")
-            {
-                if let Some(message_tool) =
+                && let Some(message_tool) =
                     (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
-                {
-                    if *message_tool
+                    && *message_tool
                         .sent_in_turn
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
                     {
                         return None;
                     }
-                }
-            }
-        }
         let limit: usize = 120;
         let preview = if final_content.len() > limit {
             format!(

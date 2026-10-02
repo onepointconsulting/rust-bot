@@ -66,8 +66,8 @@ impl StreamAccumulator {
             let empty = serde_json::Value::Null;
             let delta = choice.get("delta").unwrap_or(&empty);
 
-            if let Some(content_val) = delta.get("content") {
-                if let Some(text) = OpenAICompatProvider::extract_text_content(content_val) {
+            if let Some(content_val) = delta.get("content")
+                && let Some(text) = OpenAICompatProvider::extract_text_content(content_val) {
                     let normalized =
                         OpenAICompatProvider::non_overlapping_suffix(&self.content, text.as_str());
                     if !normalized.is_empty() {
@@ -78,13 +78,12 @@ impl StreamAccumulator {
                         }
                     }
                 }
-            }
 
             let reasoning_val = delta
                 .get("reasoning_content")
                 .or_else(|| delta.get("reasoning"));
-            if let Some(reasoning_val) = reasoning_val {
-                if let Some(text) = OpenAICompatProvider::extract_text_content(reasoning_val)
+            if let Some(reasoning_val) = reasoning_val
+                && let Some(text) = OpenAICompatProvider::extract_text_content(reasoning_val)
                     .filter(|s| !s.is_empty())
                 {
                     self.reasoning.push_str(&text);
@@ -93,7 +92,6 @@ impl StreamAccumulator {
                         None => deltas.reasoning = Some(text),
                     }
                 }
-            }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
@@ -129,11 +127,10 @@ impl StreamAccumulator {
                 }
             }
 
-            if let Some(obj) = choice.as_object() {
-                if let Some(reason) = OpenAICompatProvider::json_finish_reason(obj) {
+            if let Some(obj) = choice.as_object()
+                && let Some(reason) = OpenAICompatProvider::json_finish_reason(obj) {
                     self.finish_reason = reason;
                 }
-            }
         }
         Ok(deltas)
     }
@@ -219,15 +216,14 @@ where
         while let Some(event) = take_sse_event(&mut buffer) {
             match event {
                 Ok(SseData::Done) => {
-                    if !acc.reasoning.is_empty() {
-                        if let Some(progress) = progress {
+                    if !acc.reasoning.is_empty()
+                        && let Some(progress) = progress {
                             progress(
                                 String::new(),
                                 crate::bus::outbound_events::ProgressKind::ReasoningEnd,
                             )
                             .await;
                         }
-                    }
                     return acc.into_response();
                 }
                 Ok(SseData::Json(chunk)) => match acc.apply_chunk(&chunk) {
@@ -290,15 +286,14 @@ where
                         }
                     }
                 }
-                if !acc.reasoning.is_empty() {
-                    if let Some(progress) = progress {
+                if !acc.reasoning.is_empty()
+                    && let Some(progress) = progress {
                         progress(
                             String::new(),
                             crate::bus::outbound_events::ProgressKind::ReasoningEnd,
                         )
                         .await;
                     }
-                }
                 return acc.into_response();
             }
             Ok(Some(Ok(chunk))) => buffer.extend_from_slice(chunk.as_ref()),

@@ -18,6 +18,7 @@ use crate::{
 /// LLM provider configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
 pub struct ProviderConfig {
     /// API key for the provider. Defaults to an empty string so it can be
     /// supplied via an environment variable at runtime instead.
@@ -36,15 +37,6 @@ pub struct ProviderConfig {
     pub extra_headers: Option<HashMap<String, String>>,
 }
 
-impl Default for ProviderConfig {
-    fn default() -> Self {
-        Self {
-            api_key: String::new(),
-            api_base: None,
-            extra_headers: None,
-        }
-    }
-}
 
 // ── ChannelsConfig ────────────────────────────────────────────────────────────
 
@@ -541,6 +533,7 @@ impl Default for AgentsConfig {
 /// config file are silently filled in with safe no-op values.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
 pub struct ProvidersConfig {
     /// Any OpenAI-compatible endpoint (custom deployments, local models, etc.).
     #[serde(alias = "custom")]
@@ -578,19 +571,6 @@ pub struct ProvidersConfig {
     pub groq: ProviderConfig,
 }
 
-impl Default for ProvidersConfig {
-    fn default() -> Self {
-        Self {
-            custom: ProviderConfig::default(),
-            azure_openai: ProviderConfig::default(),
-            anthropic: ProviderConfig::default(),
-            openai: ProviderConfig::default(),
-            openrouter: ProviderConfig::default(),
-            gemini: ProviderConfig::default(),
-            groq: ProviderConfig::default(),
-        }
-    }
-}
 
 impl ProvidersConfig {
     /// Return the [`ProviderConfig`] for the given provider name (e.g. `"openai"`).
@@ -1483,6 +1463,12 @@ pub struct ToolsConfig {
     #[garde(skip)]
     pub restrict_to_workspace: bool,
 
+    /// Tool names that are never registered (including MCP tools and the ones
+    /// subagents get), e.g. `["write_file", "edit_file"]` for a read-only agent.
+    #[serde(alias = "disabled_tools")]
+    #[garde(skip)]
+    pub disabled_tools: Vec<String>,
+
     /// When true, the CLI `agent` command asks before each tool call.
     #[serde(alias = "confirm_before_execute")]
     #[garde(skip)]
@@ -1522,6 +1508,11 @@ pub struct ToolsConfig {
     #[serde(alias = "question")]
     #[garde(dive)]
     pub question: QuestionToolConfig,
+
+    /// Driving child agents over ACP (`acp_*` tools).
+    #[serde(alias = "acp")]
+    #[garde(dive)]
+    pub acp: AcpConfig,
 }
 
 impl Default for ToolsConfig {
@@ -1530,6 +1521,7 @@ impl Default for ToolsConfig {
             web: WebToolsConfig::default(),
             exec: ExecToolConfig::default(),
             restrict_to_workspace: false,
+            disabled_tools: Vec::new(),
             confirm_before_execute: false,
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
@@ -1538,7 +1530,137 @@ impl Default for ToolsConfig {
             ocr: OcrToolConfig::default(),
             image_generation: ImageGenerationToolConfig::default(),
             question: QuestionToolConfig::default(),
+            acp: AcpConfig::default(),
             mcp_presets_path: default_mcp_presets_path(),
+        }
+    }
+}
+
+// ── AcpConfig ───────────────────────────────────────────────────────────────
+
+fn default_acp_max_depth() -> u32 {
+    2
+}
+
+fn default_acp_allow_dynamic_agents() -> bool {
+    true
+}
+
+fn default_acp_timeout_secs() -> u64 {
+    600
+}
+
+fn default_acp_shutdown_grace_secs() -> u64 {
+    180
+}
+
+/// How a parent answers a child's `session/request_permission`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcpPermissionPolicy {
+    /// Approve `read` / `search` calls, deny everything else.
+    #[default]
+    AutoApproveRead,
+    /// Ask the human through the tool-approval broker on the parent turn's
+    /// channel; deny when that channel cannot ask.
+    Escalate,
+    /// Approve every request. Explicit opt-in only.
+    AllowAll,
+}
+
+/// Which ACP session a parent session talks to inside a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AcpSessionScope {
+    /// One child session per `(agent, parent session)`: two operators chatting
+    /// with the parent do not see each other's thread in the child.
+    #[default]
+    PerParentSession,
+    /// One child session per agent.
+    Shared,
+}
+
+/// How to launch an ACP agent: an argv array, never a shell string.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AcpLaunchPreset {
+    /// Program and arguments. `"self"` as the program means this executable.
+    #[garde(length(min = 1))]
+    pub command: Vec<String>,
+}
+
+/// ACP (Agent Client Protocol) settings: this process driving child agents.
+///
+/// `enabled` defaults to `false`: the `acp_*` tools only exist when an operator
+/// turns them on. Children inherit this section through the config overlay, which
+/// can only narrow it (see `config::overlay`).
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AcpConfig {
+    /// Register the `acp_*` tools. Default: `false`.
+    #[serde(alias = "enable")]
+    #[garde(skip)]
+    pub enabled: bool,
+
+    /// How many levels of children may exist below this process. `0` means none.
+    #[serde(alias = "max_depth", default = "default_acp_max_depth")]
+    #[garde(skip)]
+    pub max_depth: u32,
+
+    /// Whether the LLM may create and update agents (running existing ones is
+    /// always allowed while `enabled`).
+    #[serde(
+        alias = "allow_dynamic_agents",
+        default = "default_acp_allow_dynamic_agents"
+    )]
+    #[garde(skip)]
+    pub allow_dynamic_agents: bool,
+
+    /// Seconds one child turn may take before it is cancelled.
+    #[serde(
+        alias = "default_timeout_secs",
+        default = "default_acp_timeout_secs"
+    )]
+    #[garde(range(min = 1))]
+    pub default_timeout_secs: u64,
+
+    /// Seconds a child gets to exit after its input is closed (it drains
+    /// background work and dreams) before its process tree is killed.
+    #[serde(
+        alias = "shutdown_grace_secs",
+        default = "default_acp_shutdown_grace_secs"
+    )]
+    #[garde(range(min = 1))]
+    pub shutdown_grace_secs: u64,
+
+    /// How the child's permission requests are answered.
+    #[serde(alias = "permission_policy")]
+    #[garde(skip)]
+    pub permission_policy: AcpPermissionPolicy,
+
+    /// Child session sharing.
+    #[serde(alias = "session_scope")]
+    #[garde(skip)]
+    pub session_scope: AcpSessionScope,
+
+    /// Named launch commands. The built-in `rustbot` preset (this executable)
+    /// always exists and need not be listed. Never settable by an overlay.
+    #[serde(alias = "launch_presets")]
+    #[garde(dive)]
+    pub launch_presets: HashMap<String, AcpLaunchPreset>,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_depth: default_acp_max_depth(),
+            allow_dynamic_agents: default_acp_allow_dynamic_agents(),
+            default_timeout_secs: default_acp_timeout_secs(),
+            shutdown_grace_secs: default_acp_shutdown_grace_secs(),
+            permission_policy: AcpPermissionPolicy::default(),
+            session_scope: AcpSessionScope::default(),
+            launch_presets: HashMap::new(),
         }
     }
 }
@@ -1643,7 +1765,7 @@ impl Config {
         let model_replaced = model_lower.replace('-', "_");
         let model_normalized = model_replaced.as_str();
         let model_prefix = if model_lower.contains('/') {
-            model_lower.splitn(2, '/').next().unwrap_or(&model_lower)
+            model_lower.split('/').next().unwrap_or(&model_lower)
         } else {
             ""
         };
@@ -1667,7 +1789,7 @@ impl Config {
                 if spec
                     .keywords
                     .iter()
-                    .any(|kw| kw_matches(kw, &model_lower, &model_normalized))
+                    .any(|kw| kw_matches(kw, &model_lower, model_normalized))
                     && (spec.is_oauth || spec.is_local || !p.api_key.is_empty())
                 {
                     return (Some(p), Some(spec.name.clone()));
@@ -1729,7 +1851,7 @@ impl Config {
     /// Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
     pub fn get_provider(&self, model: Option<&str>) -> Option<&ProviderConfig> {
         let (p, _) = self.match_provider(model);
-        return p;
+        p
     }
 
     pub fn get_provider_name(&self, model: Option<&str>) -> Option<String> {
@@ -1749,19 +1871,16 @@ impl Config {
     pub fn get_api_base(&self, model: Option<&str>) -> Option<String> {
         let (p, name) = self.match_provider(model);
 
-        if let Some(p) = p {
-            if p.api_base.is_some() {
+        if let Some(p) = p
+            && p.api_base.is_some() {
                 return p.api_base.clone();
             }
-        }
 
-        if let Some(name) = name {
-            if let Some(spec) = crate::providers::registry::find_by_name(&name) {
-                if (spec.is_gateway || spec.is_local) && spec.default_api_base.is_some() {
+        if let Some(name) = name
+            && let Some(spec) = crate::providers::registry::find_by_name(&name)
+                && (spec.is_gateway || spec.is_local) && spec.default_api_base.is_some() {
                     return spec.default_api_base;
                 }
-            }
-        }
 
         None
     }
@@ -1814,24 +1933,22 @@ pub fn validate_model_presets(config: &Config) -> Result<(), String> {
         }
     }
 
-    if let Some(selected) = &config.agents.model_preset {
-        if selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
+    if let Some(selected) = &config.agents.model_preset
+        && selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
             return Err(format!(
                 "agents.modelPreset references unknown preset '{selected}'; known presets: {:?}",
                 config.model_presets.keys().collect::<Vec<_>>()
             ));
         }
-    }
 
-    if let Some(selected) = &config.agents.dream.dream_model_preset {
-        if selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
+    if let Some(selected) = &config.agents.dream.dream_model_preset
+        && selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
             return Err(format!(
                 "agents.dream.dreamModelPreset references unknown preset '{selected}'; \
                  known presets: {:?}",
                 config.model_presets.keys().collect::<Vec<_>>()
             ));
         }
-    }
 
     Ok(())
 }
@@ -3163,5 +3280,81 @@ mod tests {
         let cfg = Config::default();
         assert!(cfg.model_presets.is_empty());
         assert!(validate_model_presets(&cfg).is_ok());
+    }
+
+    // ── tools.acp ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn acp_defaults_are_off_and_conservative() {
+        let acp = AcpConfig::default();
+        assert!(!acp.enabled);
+        assert_eq!(acp.max_depth, 2);
+        assert!(acp.allow_dynamic_agents);
+        assert_eq!(acp.default_timeout_secs, 600);
+        assert_eq!(acp.shutdown_grace_secs, 180);
+        assert_eq!(acp.permission_policy, AcpPermissionPolicy::AutoApproveRead);
+        assert_eq!(acp.session_scope, AcpSessionScope::PerParentSession);
+        assert!(acp.launch_presets.is_empty());
+        assert!(!Config::default().tools.acp.enabled);
+    }
+
+    #[test]
+    fn acp_parses_camel_case_and_snake_case() {
+        let camel: AcpConfig = serde_json::from_str(
+            r#"{"enabled": true, "maxDepth": 1, "allowDynamicAgents": false,
+                "defaultTimeoutSecs": 30, "shutdownGraceSecs": 5,
+                "permissionPolicy": "escalate", "sessionScope": "shared",
+                "launchPresets": {"gemini": {"command": ["gemini", "--acp"]}}}"#,
+        )
+        .unwrap();
+        assert!(camel.enabled);
+        assert_eq!(camel.max_depth, 1);
+        assert!(!camel.allow_dynamic_agents);
+        assert_eq!(camel.default_timeout_secs, 30);
+        assert_eq!(camel.shutdown_grace_secs, 5);
+        assert_eq!(camel.permission_policy, AcpPermissionPolicy::Escalate);
+        assert_eq!(camel.session_scope, AcpSessionScope::Shared);
+        assert_eq!(
+            camel.launch_presets["gemini"].command,
+            vec!["gemini", "--acp"]
+        );
+
+        let snake: AcpConfig = serde_json::from_str(
+            r#"{"max_depth": 3, "allow_dynamic_agents": false, "permission_policy": "allow-all"}"#,
+        )
+        .unwrap();
+        assert_eq!(snake.max_depth, 3);
+        assert!(!snake.allow_dynamic_agents);
+        assert_eq!(snake.permission_policy, AcpPermissionPolicy::AllowAll);
+    }
+
+    #[test]
+    fn acp_rejects_an_unknown_policy() {
+        assert!(serde_json::from_str::<AcpConfig>(r#"{"permissionPolicy": "yolo"}"#).is_err());
+        assert!(serde_json::from_str::<AcpConfig>(r#"{"sessionScope": "everyone"}"#).is_err());
+    }
+
+    #[test]
+    fn acp_validation_rejects_zero_timeouts_and_empty_presets() {
+        let zero_timeout: AcpConfig = serde_json::from_str(r#"{"defaultTimeoutSecs": 0}"#).unwrap();
+        assert!(zero_timeout.validate().is_err());
+        let zero_grace: AcpConfig = serde_json::from_str(r#"{"shutdownGraceSecs": 0}"#).unwrap();
+        assert!(zero_grace.validate().is_err());
+        let empty_preset: AcpConfig =
+            serde_json::from_str(r#"{"launchPresets": {"x": {"command": []}}}"#).unwrap();
+        assert!(empty_preset.validate().is_err());
+        assert!(AcpConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn acp_round_trips_inside_the_tools_config() {
+        let mut tools = ToolsConfig::default();
+        tools.acp.enabled = true;
+        tools.acp.permission_policy = AcpPermissionPolicy::Escalate;
+        let text = serde_json::to_string(&tools).unwrap();
+        assert!(text.contains(r#""permissionPolicy":"escalate""#), "{text}");
+        let back: ToolsConfig = serde_json::from_str(&text).unwrap();
+        assert!(back.acp.enabled);
+        assert_eq!(back.acp.permission_policy, AcpPermissionPolicy::Escalate);
     }
 }

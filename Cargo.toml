@@ -87,6 +87,9 @@ ed25519-dalek = { version = "2.1", features = ["pem", "rand_core"] }
 rand_core = { version = "0.6", features = ["getrandom"] }
 pkcs8 = { version = "0.10", features = ["std"] }
 argon2 = "0.5.3"
+agent-client-protocol = "2.2"
+blocking = "1"
+async-process = "2"
 
 # On Linux, statically link OpenSSL so release binaries do not require libssl.so.3.
 # Windows/macOS use platform TLS (SChannel / Secure Transport), so this is Linux-only.
@@ -97,6 +100,11 @@ openssl = { version = "0.10", features = ["vendored"] }
 # return to column 0 (see src/cli/cancel.rs).
 [target.'cfg(unix)'.dependencies]
 libc = "0.2"
+
+# Windows: redirect the process stdout to stderr for protocol mode
+# (see src/utils/stdio_redirect.rs).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_Console"] }
 
 [dev-dependencies]
 tempfile = "3"

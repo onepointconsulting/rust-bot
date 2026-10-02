@@ -66,7 +66,7 @@ impl Autocompact {
             (session.messages[start..].to_vec(), session.key.clone())
         };
         let mut probe = Session {
-            key: key,
+            key,
             messages: tail,
             created_at: Utc::now(),
             updated_at: Utc::now(),
@@ -304,18 +304,15 @@ impl Autocompact {
             .metadata
             .get(SessionManager::LAST_SUMMARY_KEY)
             .and_then(|v| v.as_object())
-        {
-            if let (Some(text), Some(last_active_str)) = (
+            && let (Some(text), Some(last_active_str)) = (
                 meta.get("text").and_then(|v| v.as_str()),
                 meta.get(SessionManager::LAST_ACTIVE_KEY)
                     .and_then(|v| v.as_str()),
-            ) {
-                if let Ok(dt) = DateTime::parse_from_rfc3339(last_active_str) {
+            )
+                && let Ok(dt) = DateTime::parse_from_rfc3339(last_active_str) {
                     let formatted = Self::format_summary(text, dt.with_timezone(&Utc));
                     return (session, Some(formatted));
                 }
-            }
-        }
 
         (session, None)
     }

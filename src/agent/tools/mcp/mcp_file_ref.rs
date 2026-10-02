@@ -305,6 +305,7 @@ fn describe_resolve_error(err: &ResolvePathError) -> String {
         ResolvePathError::NotUnderAnyAllowedDir { .. } => {
             "not under any allowed directory".to_string()
         }
+        denied @ ResolvePathError::InDeniedRoot { .. } => denied.describe(),
     }
 }
 
@@ -570,6 +571,39 @@ mod tests {
 
         assert_eq!(out, params, "non-sentinel arguments must pass through");
         assert!(notes.is_empty());
+    }
+
+    #[tokio::test]
+    async fn rejects_a_file_inside_a_denied_subtree_but_reads_the_rest_of_the_project() {
+        use crate::agent::workspace_context::{bind_workspace_scope, with_workspace_scope_stack};
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
+
+        let project = tempfile::tempdir().unwrap();
+        let project_path = project.path().canonicalize().unwrap();
+        let home = project_path.join(".rust-bot").join("workspace");
+        std::fs::create_dir_all(&home).unwrap();
+        std::fs::write(home.join("memory.bin"), b"parent secret").unwrap();
+        std::fs::write(project_path.join("ok.bin"), b"fine").unwrap();
+        let home = home.canonicalize().unwrap();
+        let resolver = FileRefResolver::with_scope(
+            Some(project_path.clone()),
+            Some(project_path.clone()),
+            vec![],
+        );
+        let scope = build_workspace_scope(&project_path, WorkspaceAccessMode::Restricted, None)
+            .with_denied_roots(&[home.clone()]);
+
+        with_workspace_scope_stack(|| async {
+            bind_workspace_scope(scope);
+            let denied = json!({"content": format!("file://{}", path_arg(&home.join("memory.bin")))});
+            let err = resolver.expand(&denied).expect_err("the denied subtree is off limits");
+            assert!(matches!(err, FileRefError::Denied { .. }), "{err:?}");
+            assert!(err.to_string().contains("off limits"), "{err}");
+
+            let allowed = json!({"content": format!("file://{}", path_arg(&project_path.join("ok.bin")))});
+            assert!(resolver.expand(&allowed).is_ok());
+        })
+        .await;
     }
 
     #[test]

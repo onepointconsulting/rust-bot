@@ -118,10 +118,7 @@ fn confine_outbound_media_with_limit(
 
     let mut confined = Vec::new();
     for path in paths {
-        match confine_one(path, &dest_dir, &canonical_root, max_file_bytes) {
-            Some(saved) => confined.push(saved),
-            None => {}
-        }
+        if let Some(saved) = confine_one(path, &dest_dir, &canonical_root, max_file_bytes) { confined.push(saved) }
     }
     confined
 }

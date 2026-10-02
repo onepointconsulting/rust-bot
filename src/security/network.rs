@@ -37,11 +37,10 @@ pub fn configure_ssrf_whitelist(whitelist: Vec<String>) {
 /// Returns `true` if the address falls within a blocked (private/reserved) network,
 /// unless it is explicitly whitelisted via [`configure_ssrf_whitelist`].
 pub fn is_private(addr: IpAddr) -> bool {
-    if let Some(allowed) = ALLOWED_NETWORKS.get() {
-        if allowed.iter().any(|net| net.contains(&addr)) {
+    if let Some(allowed) = ALLOWED_NETWORKS.get()
+        && allowed.iter().any(|net| net.contains(&addr)) {
             return false;
         }
-    }
     BLOCKED_NETWORKS.iter().any(|net| net.contains(&addr))
 }
 

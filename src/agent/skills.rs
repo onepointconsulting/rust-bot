@@ -102,7 +102,7 @@ impl SkillsLoader {
                 continue;
             }
             let file_name_result = file.file_name();
-            if let None = file_name_result {
+            if file_name_result.is_none() {
                 log::error!("Failed to get file name.");
                 continue;
             }
@@ -118,7 +118,7 @@ impl SkillsLoader {
                 "source": source,
             }));
         }
-        return entries;
+        entries
     }
 
     /// List all available skills.
@@ -299,9 +299,9 @@ impl SkillsLoader {
         let matched_option = STRIP_SKILL_FRONTMATTER.captures(content);
         match matched_option {
             Some(captures) => {
-                return content[captures.get(0).unwrap().end()..].trim().to_string();
+                content[captures.get(0).unwrap().end()..].trim().to_string()
             }
-            None => return content.to_string(),
+            None => content.to_string(),
         }
     }
 
@@ -330,7 +330,7 @@ impl SkillsLoader {
                 }
             }
         }
-        return serde_json::json!({});
+        serde_json::json!({})
     }
 
     /// Returns whether skill requirements are met (executables on `PATH`, non-empty env vars).
@@ -392,25 +392,23 @@ impl SkillsLoader {
         // Check for missing CLI binaries
         if let Some(bins) = required_bins.as_array() {
             for bin in bins {
-                if let Some(command_name) = bin.as_str() {
-                    if which::which(command_name).is_err() {
+                if let Some(command_name) = bin.as_str()
+                    && which::which(command_name).is_err() {
                         missing.push(format!("CLI: {}", command_name));
                     }
-                }
             }
         }
 
         // Check for missing environment variables (unset or empty, like Python truthiness)
         if let Some(env_vars) = required_env_vars.as_array() {
             for env_var in env_vars {
-                if let Some(env_name) = env_var.as_str() {
-                    if std::env::var(env_name)
+                if let Some(env_name) = env_var.as_str()
+                    && std::env::var(env_name)
                         .map(|v| v.is_empty())
                         .unwrap_or(true)
                     {
                         missing.push(format!("ENV: {}", env_name));
                     }
-                }
             }
         }
 
@@ -431,26 +429,24 @@ impl SkillsLoader {
                 return None;
             }
             let matched_option = STRIP_SKILL_FRONTMATTER.captures(content.as_str());
-            match matched_option {
-                Some(captures) => {
-                    let group1 = captures.get(1).map(|m| m.as_str());
-                    let mut metadata: HashMap<String, String> = HashMap::new();
-                    if let Some(group1) = group1 {
-                        for line in group1.lines() {
-                            if !line.contains(":") {
-                                continue;
-                            }
-                            let (key, value) = line.split_once(':').unwrap();
-                            metadata
-                                .insert(key.trim().to_string(), strip_surrounding_quotes(value));
+            {
+                let captures = matched_option?;
+                let group1 = captures.get(1).map(|m| m.as_str());
+                let mut metadata: HashMap<String, String> = HashMap::new();
+                if let Some(group1) = group1 {
+                    for line in group1.lines() {
+                        if !line.contains(":") {
+                            continue;
                         }
+                        let (key, value) = line.split_once(':').unwrap();
+                        metadata
+                            .insert(key.trim().to_string(), strip_surrounding_quotes(value));
                     }
-                    return Some(serde_json::json!(metadata));
                 }
-                None => return None,
+                Some(serde_json::json!(metadata))
             }
         } else {
-            return None;
+            None
         }
     }
 }

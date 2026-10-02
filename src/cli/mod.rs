@@ -1,3 +1,4 @@
+pub mod acp;
 mod cancel;
 pub mod commands;
 mod confirm_tools;

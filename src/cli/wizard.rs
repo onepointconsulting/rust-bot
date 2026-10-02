@@ -161,14 +161,12 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
 
 //Configure LLM providers.
 pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, CliError> {
-    let provider_names = vec![
-        PROVIDER_OPENROUTER,
+    let provider_names = [PROVIDER_OPENROUTER,
         PROVIDER_ANTHROPIC,
         PROVIDER_EDENAI,
         PROVIDER_REQUESTY,
         PROVIDER_NANOGPT,
-        PROVIDER_ZAI_SUBSCRIPTION,
-    ];
+        PROVIDER_ZAI_SUBSCRIPTION];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
         provider_names.to_vec().clone(),
@@ -176,18 +174,18 @@ pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, C
     .prompt_skippable()?;
     match answer {
         Some(provider) => {
-            configure_provider(config, &provider)?;
-            configure_api_base(config, &provider)?;
+            configure_provider(config, provider)?;
+            configure_api_base(config, provider)?;
             if advanced {
-                configure_extra_headers(config, &provider)?;
+                configure_extra_headers(config, provider)?;
             }
-            if let Some(slot) = provider_config_slot(&provider) {
+            if let Some(slot) = provider_config_slot(provider) {
                 config.agents.provider = slot.to_string();
             }
         }
         None => return Ok(config.clone()), // caller re-shows the main menu
     }
-    return Ok(config.clone());
+    Ok(config.clone())
 }
 
 /// Config field that stores credentials for a wizard LLM-provider choice.
@@ -217,7 +215,7 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
         Some("custom") => config.providers.custom.api_key = api_key,
         _ => return Err(invalid_provider_error()),
     }
-    return Ok(config.clone());
+    Ok(config.clone())
 }
 
 pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
@@ -243,7 +241,7 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
         Some("custom") => config.providers.custom.api_base = Some(endpoint),
         _ => return Err(invalid_provider_error()),
     }
-    return Ok(config.clone());
+    Ok(config.clone())
 }
 
 /// Prompt for zero or more custom HTTP headers (`extraHeaders`) for a provider.

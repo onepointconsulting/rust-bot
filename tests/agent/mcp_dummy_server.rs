@@ -12,6 +12,12 @@ pub struct HelloServer {
     tool_router: ToolRouter<Self>,
 }
 
+impl Default for HelloServer {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 impl HelloServer {
     pub fn new() -> Self {
         Self {

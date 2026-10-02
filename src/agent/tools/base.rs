@@ -101,7 +101,7 @@ pub trait Tool: std::any::Any + Send + Sync {
         {
             return params.clone();
         }
-        return self._cast_object(params.clone(), &schema);
+        self._cast_object(params.clone(), &schema)
     }
 
     fn _cast_object(
@@ -157,9 +157,9 @@ pub trait Tool: std::any::Any + Send + Sync {
             return val;
         }
         let _type_map = json_type_map();
-        if let Some(target_type_str) = target_type.as_str() {
-            if let Some(rust_type_name) = _type_map.get(target_type_str) {
-                if !["boolean", "integer", "array", "object"].contains(&target_type_str) {
+        if let Some(target_type_str) = target_type.as_str()
+            && let Some(rust_type_name) = _type_map.get(target_type_str)
+                && !["boolean", "integer", "array", "object"].contains(&target_type_str) {
                     let type_matches = match rust_type_name.first().copied().unwrap_or("") {
                         "String" => val.is_string(),
                         "f64" | "f32" => val.is_number(),
@@ -170,10 +170,8 @@ pub trait Tool: std::any::Any + Send + Sync {
                         return val;
                     }
                 }
-            }
-        }
-        if target_type == "integer" && val.is_string() {
-            if let Some(val_str) = val.as_str() {
+        if target_type == "integer" && val.is_string()
+            && let Some(val_str) = val.as_str() {
                 // Try to parse the string as an integer
                 if let Ok(parsed) = val_str.parse::<i64>() {
                     return serde_json::Value::from(parsed);
@@ -181,9 +179,8 @@ pub trait Tool: std::any::Any + Send + Sync {
                     return val;
                 }
             }
-        }
-        if target_type == "number" && val.is_string() {
-            if let Some(val_str) = val.as_str() {
+        if target_type == "number" && val.is_string()
+            && let Some(val_str) = val.as_str() {
                 // Try to parse the string as an integer
                 if let Ok(parsed) = val_str.parse::<f64>() {
                     return serde_json::Value::from(parsed);
@@ -191,7 +188,6 @@ pub trait Tool: std::any::Any + Send + Sync {
                     return val;
                 }
             }
-        }
         if target_type == "string" {
             // If val is null, return as is; otherwise, ensure it's a string
             if val.is_null() {
@@ -200,8 +196,8 @@ pub trait Tool: std::any::Any + Send + Sync {
                 return serde_json::Value::String(val.to_string());
             }
         }
-        if target_type == "boolean" && val.is_string() {
-            if let Some(val_str) = val.as_str() {
+        if target_type == "boolean" && val.is_string()
+            && let Some(val_str) = val.as_str() {
                 let val_lower = val_str.to_lowercase();
                 if ["true", "1", "yes"].contains(&val_lower.as_str()) {
                     return serde_json::Value::Bool(true);
@@ -211,18 +207,16 @@ pub trait Tool: std::any::Any + Send + Sync {
                 }
                 return val;
             }
-        }
         if target_type == "array" && val.is_array() {
             let item_schema = schema.get("items");
-            if let Some(item_schema) = item_schema {
-                if let Some(array) = val.as_array() {
+            if let Some(item_schema) = item_schema
+                && let Some(array) = val.as_array() {
                     let casted_array: Vec<serde_json::Value> = array
                         .iter()
                         .map(|item| self._cast_value(item.clone(), item_schema))
                         .collect();
                     return serde_json::Value::Array(casted_array);
                 }
-            }
             return val;
         }
         if target_type == "object" && val.is_object() {
@@ -297,11 +291,10 @@ pub trait Tool: std::any::Any + Send + Sync {
                     return vec![format!("{} should be array", label)];
                 }
             }
-            Some("object") => {
-                if !val.is_object() {
+            Some("object")
+                if !val.is_object() => {
                     return vec![format!("{} should be object", label)];
                 }
-            }
             _ => {
                 // Unknown type: don't enforce type at this stage.
             }
@@ -325,35 +318,30 @@ pub trait Tool: std::any::Any + Send + Sync {
         if t == Some("integer") || t == Some("number") {
             let val_f64 = val.as_f64();
             if let Some(val_f64) = val_f64 {
-                if let Some(minv) = schema.get("minimum").and_then(|v| v.as_f64()) {
-                    if val_f64 < minv {
+                if let Some(minv) = schema.get("minimum").and_then(|v| v.as_f64())
+                    && val_f64 < minv {
                         errors.push(format!("{} must be >= {}", label, minv));
                     }
-                }
-                if let Some(maxv) = schema.get("maximum").and_then(|v| v.as_f64()) {
-                    if val_f64 > maxv {
+                if let Some(maxv) = schema.get("maximum").and_then(|v| v.as_f64())
+                    && val_f64 > maxv {
                         errors.push(format!("{} must be <= {}", label, maxv));
                     }
-                }
             }
         }
 
         // string constraints
-        if t == Some("string") {
-            if let Some(s) = val.as_str() {
+        if t == Some("string")
+            && let Some(s) = val.as_str() {
                 let len = s.chars().count();
-                if let Some(min_len) = schema.get("minLength").and_then(|v| v.as_u64()) {
-                    if len < min_len as usize {
+                if let Some(min_len) = schema.get("minLength").and_then(|v| v.as_u64())
+                    && len < min_len as usize {
                         errors.push(format!("{} must be at least {} chars", label, min_len));
                     }
-                }
-                if let Some(max_len) = schema.get("maxLength").and_then(|v| v.as_u64()) {
-                    if len > max_len as usize {
+                if let Some(max_len) = schema.get("maxLength").and_then(|v| v.as_u64())
+                    && len > max_len as usize {
                         errors.push(format!("{} must be at most {} chars", label, max_len));
                     }
-                }
             }
-        }
 
         // object constraints + recursion
         if t == Some("object") {
@@ -371,8 +359,8 @@ pub trait Tool: std::any::Any + Send + Sync {
 
             if let Some(obj) = val.as_object() {
                 for req_key in required {
-                    if let Some(k) = req_key.as_str() {
-                        if !obj.contains_key(k) {
+                    if let Some(k) = req_key.as_str()
+                        && !obj.contains_key(k) {
                             let missing_path = if path.is_empty() {
                                 k.to_string()
                             } else {
@@ -380,7 +368,6 @@ pub trait Tool: std::any::Any + Send + Sync {
                             };
                             errors.push(format!("missing required {}", missing_path));
                         }
-                    }
                 }
 
                 for (k, v) in obj {
@@ -397,9 +384,9 @@ pub trait Tool: std::any::Any + Send + Sync {
         }
 
         // array recursion
-        if t == Some("array") {
-            if let Some(items_schema) = schema.get("items") {
-                if let Some(arr) = val.as_array() {
+        if t == Some("array")
+            && let Some(items_schema) = schema.get("items")
+                && let Some(arr) = val.as_array() {
                     for (i, item) in arr.iter().enumerate() {
                         let item_path = if path.is_empty() {
                             format!("[{}]", i)
@@ -409,8 +396,6 @@ pub trait Tool: std::any::Any + Send + Sync {
                         errors.extend(self._validate(item.clone(), items_schema, &item_path));
                     }
                 }
-            }
-        }
 
         errors
     }
@@ -503,14 +488,14 @@ mod tests {
             "query": "hi", "count": 0
         });
         let errors = tool.validate_params(&params);
-        assert!(errors.len() > 0);
+        assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("count must be >= 1")));
 
         let params = serde_json::json!({
             "query": "hi", "count": "2"
         });
         let errors = tool.validate_params(&params);
-        assert!(errors.len() > 0);
+        assert!(!errors.is_empty());
         assert!(errors.iter().any(|e| e.contains("count should be integer")));
     }
 
@@ -521,7 +506,7 @@ mod tests {
             "query": "hi", "count": 2, "mode": "fool"
         });
         let errors = tool.validate_params(&params);
-        assert!(errors.len() > 0);
+        assert!(!errors.is_empty());
         assert!(
             errors
                 .iter()
@@ -538,7 +523,7 @@ mod tests {
             "meta": {"flags": [1, "ok"]},
         });
         let errors = tool.validate_params(&params);
-        assert!(errors.len() > 0);
+        assert!(!errors.is_empty());
         assert!(
             errors
                 .iter()
@@ -556,6 +541,6 @@ mod tests {
         let tool = SampleTool;
         let params = serde_json::json!({"query": "hi", "count": 2, "extra": "x"});
         let errors = tool.validate_params(&params);
-        assert!(errors.len() == 0);
+        assert!(errors.is_empty());
     }
 }

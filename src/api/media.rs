@@ -110,13 +110,12 @@ async fn materialize_http_url(url: &str) -> Result<String, ApiError> {
         )));
     }
 
-    if let Some(len) = response.content_length() {
-        if len as usize > MAX_IMAGE_BYTES {
+    if let Some(len) = response.content_length()
+        && len as usize > MAX_IMAGE_BYTES {
             return Err(ApiError::bad_request(format!(
                 "Image at '{url}' exceeds the maximum allowed size of {MAX_IMAGE_BYTES} bytes"
             )));
         }
-    }
 
     let raw = response
         .bytes()

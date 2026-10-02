@@ -7,7 +7,10 @@ use std::{
 
 use crate::agent::tools::{
     base::Tool,
-    filesystem::{FsToolConfig, ListDirTool},
+    filesystem::{
+        FsToolConfig, ListDirTool, ResolvePathError, is_denied_entry, resolve_error_message,
+        resolved_denied_roots,
+    },
 };
 
 const DEFAULT_HEAD_LIMIT: usize = 250;
@@ -111,7 +114,7 @@ fn pagination_note(limit: Option<usize>, offset: usize, truncated: bool) -> Opti
 fn matches_type(name: &str, file_type: Option<&str>) -> bool {
     match file_type {
         None => {
-            return true;
+            true
         }
         Some(file_type) => {
             let lowered = file_type.trim().to_lowercase();
@@ -124,11 +127,11 @@ fn matches_type(name: &str, file_type: Option<&str>) -> bool {
             } else {
                 &[fallback.as_str()]
             };
-            return patterns.iter().any(|p| {
+            patterns.iter().any(|p| {
                 glob::Pattern::new(&p.to_lowercase())
                     .map(|pat| pat.matches(&name.to_lowercase()))
                     .unwrap_or(false)
-            });
+            })
         }
     }
 }
@@ -194,6 +197,7 @@ impl SearchTool {
         }
 
         let ignore = Self::ignore_dirs();
+        let denied = resolved_denied_roots(&self.fs.denied_roots());
         let mut results = Vec::new();
 
         let mut stack: Vec<PathBuf> = vec![root.to_path_buf()];
@@ -211,6 +215,9 @@ impl SearchTool {
 
             for entry in entries.flatten() {
                 let path = entry.path();
+                if is_denied_entry(&path, &denied) {
+                    continue;
+                }
                 let name = entry.file_name();
                 let name_str = name.to_string_lossy();
                 if path.is_dir() {
@@ -333,7 +340,13 @@ Skips .git, node_modules, __pycache__, and other noise directories."
             .and_then(|v| v.as_str())
             .unwrap_or("files");
 
-        let root = self.search.fs.resolve(path).unwrap_or(PathBuf::from("."));
+        let root = match self.search.fs.resolve(path) {
+            Ok(root) => root,
+            Err(error @ ResolvePathError::InDeniedRoot { .. }) => {
+                return format!("Error: {}", resolve_error_message(&error));
+            }
+            Err(_) => PathBuf::from("."),
+        };
         if !root.exists() {
             return format!("Error: Does not exist: {}", path);
         }
@@ -357,8 +370,8 @@ Skips .git, node_modules, __pycache__, and other noise directories."
                 }
             }
         };
-        let include_files = vec!["files", "both"].contains(&entry_type);
-        let include_dirs = vec!["dirs", "both"].contains(&entry_type);
+        let include_files = ["files", "both"].contains(&entry_type);
+        let include_dirs = ["dirs", "both"].contains(&entry_type);
         let mut matches: Vec<(String, f64)> = Vec::new();
         for entry in self.search.iter_entries(&root, include_files, include_dirs) {
             let rel_path = self
@@ -593,7 +606,13 @@ impl Tool for GrepTool {
             .unwrap_or(0) as usize;
         let offset = params.get("offset").and_then(|v| v.as_u64()).unwrap_or(0) as usize;
 
-        let target = self.search.fs.resolve(path).unwrap_or(PathBuf::from("."));
+        let target = match self.search.fs.resolve(path) {
+            Ok(target) => target,
+            Err(error @ ResolvePathError::InDeniedRoot { .. }) => {
+                return format!("Error: {}", resolve_error_message(&error));
+            }
+            Err(_) => PathBuf::from("."),
+        };
         if !target.exists() {
             return format!("Error: Path not found: {}", path);
         }
@@ -744,12 +763,11 @@ impl Tool for GrepTool {
                 blocks.push(block);
             }
 
-            if output_mode == "count" && file_had_match {
-                if !matching_files.contains(&display_path) {
+            if output_mode == "count" && file_had_match
+                && !matching_files.contains(&display_path) {
                     matching_files.push(display_path.clone());
                     file_mtimes.insert(display_path.clone(), mtime);
                 }
-            }
             if matches!(output_mode, "count" | "files_with_matches") && file_had_match {
                 continue;
             }
@@ -1597,5 +1615,74 @@ mod tests {
             result.starts_with("Error: invalid regex pattern"),
             "got: {result}"
         );
+    }
+
+    // ── denied subtrees ──────────────────────────────────────────────────────
+
+    /// A project with a file of its own and a rust-bot home that holds a secret.
+    fn project_with_a_home() -> (TempDir, PathBuf, PathBuf) {
+        let project = TempDir::new().unwrap();
+        fs::write(project.path().join("main.rs"), "needle in the project\n").unwrap();
+        let home = project.path().join(".rust-bot").join("workspace");
+        fs::create_dir_all(home.join("memory")).unwrap();
+        fs::write(home.join("memory").join("MEMORY.md"), "needle in the secret\n").unwrap();
+        let root = project.path().canonicalize().unwrap();
+        let home = home.canonicalize().unwrap();
+        (project, root, home)
+    }
+
+    async fn with_denied_scope<F, Fut>(project: &std::path::Path, denied: &std::path::Path, body: F)
+    where
+        F: FnOnce() -> Fut,
+        Fut: std::future::Future<Output = ()>,
+    {
+        use crate::agent::workspace_context::{bind_workspace_scope, with_workspace_scope_stack};
+        use crate::security::workspace_access::{WorkspaceAccessMode, build_workspace_scope};
+        let scope = build_workspace_scope(project, WorkspaceAccessMode::Restricted, None)
+            .with_denied_roots(&[denied.to_path_buf()]);
+        with_workspace_scope_stack(|| async {
+            bind_workspace_scope(scope);
+            body().await;
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn grep_skips_a_denied_subtree_but_finds_the_rest() {
+        let (_keep, project, home) = project_with_a_home();
+        let tool = GrepTool::new(Some(project.clone()), Some(project.clone()), None);
+
+        with_denied_scope(&project, &home, || async {
+            let result = tool
+                .execute(&serde_json::json!({"pattern": "needle", "output_mode": "content"}))
+                .await;
+            assert!(result.contains("needle in the project"), "{result}");
+            assert!(!result.contains("secret"), "{result}");
+        })
+        .await;
+    }
+
+    #[tokio::test]
+    async fn grep_without_denied_roots_does_find_the_nested_home() {
+        let (_keep, project, _home) = project_with_a_home();
+        let tool = GrepTool::new(Some(project.clone()), Some(project.clone()), None);
+        let result = tool
+            .execute(&serde_json::json!({"pattern": "needle", "output_mode": "content"}))
+            .await;
+        assert!(result.contains("needle in the secret"), "{result}");
+    }
+
+    #[tokio::test]
+    async fn glob_skips_a_denied_subtree() {
+        let (_keep, project, home) = project_with_a_home();
+        let tool = GlobTool::new(Some(project.clone()), Some(project.clone()), None);
+
+        with_denied_scope(&project, &home, || async {
+            let result = tool.execute(&serde_json::json!({"pattern": "**/*.md"})).await;
+            assert!(!result.contains("MEMORY.md"), "{result}");
+            let result = tool.execute(&serde_json::json!({"pattern": "**/*.rs"})).await;
+            assert!(result.contains("main.rs"), "{result}");
+        })
+        .await;
     }
 }

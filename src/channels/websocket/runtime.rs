@@ -688,7 +688,7 @@ async fn handle_envelope_set_model_preset<'a>(
         return;
     };
 
-    let rejection_fields = create_rejection_fields(&cid);
+    let rejection_fields = create_rejection_fields(cid);
 
     if !sender_allowed(&shared.channels_config, client_id) {
         send_event(
@@ -803,7 +803,7 @@ async fn handle_envelope_set_mode<'a>(envelope_dispatch_context: EnvelopeDispatc
         return;
     };
 
-    let rejection_fields = create_rejection_fields(&cid);
+    let rejection_fields = create_rejection_fields(cid);
 
     if !sender_allowed(&shared.channels_config, client_id) {
         send_event(
@@ -1537,7 +1537,7 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
         return;
     };
 
-    let rejection_fields = create_rejection_fields(&cid);
+    let rejection_fields = create_rejection_fields(cid);
 
     if !sender_allowed(&shared.channels_config, client_id) {
         send_event(
@@ -3621,10 +3621,7 @@ async fn handle_envelope_get_session_summary<'a>(
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        match session_manager.get_session_internal(&get_session_id(cid)) {
-            None => None,
-            Some(session) => Some(session_summary_fields(&session)),
-        }
+        session_manager.get_session_internal(&get_session_id(cid)).map(|session| session_summary_fields(&session))
     };
     match summary {
         None => {
@@ -3964,7 +3961,7 @@ impl WebSocketChannel {
         let shared = self.shared();
         send_goal_status(&msg.chat_id, "idle", None, turn_id, &shared).await;
         self.fan_out_session_token_usage(&msg.chat_id).await;
-        return Ok(());
+        Ok(())
     }
 }
 
@@ -4839,7 +4836,7 @@ mod tests {
     fn authorize_rejects_missing_token_when_jwt_enabled() {
         let (shared, _private_key_path) = shared_with_jwt_enabled();
         let result = authorize(&shared, None);
-        assert_eq!(result.is_err(), true);
+        assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
@@ -4848,7 +4845,7 @@ mod tests {
     fn authorize_rejects_invalid_token() {
         let (shared, _private_key_path) = shared_with_jwt_enabled();
         let result = authorize(&shared, Some("not-a-real-token"));
-        assert_eq!(result.is_err(), true);
+        assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }
@@ -4866,7 +4863,7 @@ mod tests {
         let (mut shared, _private_key_path) = shared_with_jwt_enabled();
         shared.require_auth = false;
         let result = authorize(&shared, Some("not-a-real-token"));
-        assert_eq!(result.is_err(), true);
+        assert!(result.is_err());
         let err = result.unwrap_err();
         assert_eq!(err, StatusCode::UNAUTHORIZED);
     }

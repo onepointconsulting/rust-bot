@@ -22,6 +22,33 @@ enum LogDestination {
     File(PathBuf),
 }
 
+/// What standard output is used for in this process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LogMode {
+    /// Ordinary CLI use: stdout is free for logs and program output.
+    Console,
+    /// Protocol use (`rust-bot acp`): stdout carries only JSON-RPC frames, so
+    /// logs must never go there.
+    Protocol,
+}
+
+/// Apply the [`LogMode`] to a requested destination: in protocol mode a stdout
+/// destination is moved to stderr, everything else is kept.
+fn destination_for_mode(destination: LogDestination, mode: LogMode) -> LogDestination {
+    match (mode, destination) {
+        (LogMode::Protocol, LogDestination::Stdout) => LogDestination::Stderr,
+        (_, destination) => destination,
+    }
+}
+
+/// The stream used for notices and as the fallback when a log file cannot be opened.
+fn fallback_target(mode: LogMode) -> env_logger::Target {
+    match mode {
+        LogMode::Console => env_logger::Target::Stdout,
+        LogMode::Protocol => env_logger::Target::Stderr,
+    }
+}
+
 fn rust_log_mentions_target_in(rust_log: &str, target: &str) -> bool {
     rust_log.split(',').any(|part| {
         let name = part.split('=').next().unwrap_or(part).trim();
@@ -37,11 +64,10 @@ fn rust_log_mentions_target(target: &str) -> bool {
 
 /// Open (or create) a log file, creating parent directories when needed.
 fn open_log_file(path: &Path) -> io::Result<std::fs::File> {
-    if let Some(parent) = path.parent() {
-        if !parent.as_os_str().is_empty() {
+    if let Some(parent) = path.parent()
+        && !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
-    }
     std::fs::OpenOptions::new()
         .create(true)
         .append(true)
@@ -81,7 +107,17 @@ fn rust_log_destination() -> LogDestination {
 ///   appended to that file (parent directories are created if missing). This works
 ///   even without `--logs`, so agent chat stays clean while still writing a log file.
 pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
-    let destination = rust_log_destination();
+    init_runtime_logging_with_mode(logs, debug, LogMode::Console);
+}
+
+/// [`init_runtime_logging`] for protocol mode: nothing is ever written to stdout.
+pub fn init_protocol_logging(logs: bool, debug: Option<bool>) {
+    init_runtime_logging_with_mode(logs, debug, LogMode::Protocol);
+}
+
+/// Shared implementation of [`init_runtime_logging`] and [`init_protocol_logging`].
+pub fn init_runtime_logging_with_mode(logs: bool, debug: Option<bool>, mode: LogMode) {
+    let destination = destination_for_mode(rust_log_destination(), mode);
     // A file destination implies logging is wanted even when `--logs` is off (CLI chat).
     let logs = logs || matches!(destination, LogDestination::File(_));
     let has_rust_log = std::env::var_os("RUST_LOG").is_some();
@@ -124,16 +160,23 @@ pub fn init_runtime_logging(logs: bool, debug: Option<bool>) {
         }
         LogDestination::File(path) => match open_log_file(path) {
             Ok(file) => {
-                println!("log file: {}", path.display());
+                match mode {
+                    LogMode::Console => println!("log file: {}", path.display()),
+                    LogMode::Protocol => eprintln!("log file: {}", path.display()),
+                }
                 builder.target(env_logger::Target::Pipe(Box::new(file)));
                 builder.write_style(env_logger::WriteStyle::Never);
             }
             Err(err) => {
                 eprintln!(
-                    "Warning: failed to open {RUST_LOG_FILE_ENV} {}: {err}; falling back to stdout",
-                    path.display()
+                    "Warning: failed to open {RUST_LOG_FILE_ENV} {}: {err}; falling back to {}",
+                    path.display(),
+                    match mode {
+                        LogMode::Console => "stdout",
+                        LogMode::Protocol => "stderr",
+                    }
                 );
-                builder.target(env_logger::Target::Stdout);
+                builder.target(fallback_target(mode));
             }
         },
     }
@@ -157,6 +200,34 @@ mod tests {
         assert!(rust_log_mentions_target_in(rust_log, "rust_bot::cli"));
         assert!(rust_log_mentions_target_in(rust_log, "hyper"));
         assert!(!rust_log_mentions_target_in(rust_log, "reqwest"));
+    }
+
+    #[test]
+    fn protocol_mode_moves_stdout_logs_to_stderr_and_keeps_the_rest() {
+        assert_eq!(
+            destination_for_mode(LogDestination::Stdout, LogMode::Protocol),
+            LogDestination::Stderr
+        );
+        assert_eq!(
+            destination_for_mode(LogDestination::Stderr, LogMode::Protocol),
+            LogDestination::Stderr
+        );
+        let file = LogDestination::File(PathBuf::from("x.log"));
+        assert_eq!(destination_for_mode(file.clone(), LogMode::Protocol), file);
+    }
+
+    #[test]
+    fn console_mode_leaves_every_destination_unchanged() {
+        for destination in [
+            LogDestination::Stdout,
+            LogDestination::Stderr,
+            LogDestination::File(PathBuf::from("x.log")),
+        ] {
+            assert_eq!(
+                destination_for_mode(destination.clone(), LogMode::Console),
+                destination
+            );
+        }
     }
 
     #[test]

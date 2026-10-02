@@ -125,13 +125,11 @@ pub fn validate_schedule_for_add(schedule: &CronSchedule) -> Result<(), String> 
         return Err("tz can only be used with cron schedules".into());
     }
 
-    if schedule.kind == CronScheduleKind::Cron {
-        if let Some(tz) = schedule.tz.as_deref() {
-            if let Some(msg) = validate_timezone(tz) {
+    if schedule.kind == CronScheduleKind::Cron
+        && let Some(tz) = schedule.tz.as_deref()
+            && let Some(msg) = validate_timezone(tz) {
                 return Err(msg.trim_start_matches("Error: ").to_string());
             }
-        }
-    }
 
     Ok(())
 }

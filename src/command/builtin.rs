@@ -9,6 +9,7 @@ use crate::{
     command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
     config::{
         loader::{load_config, resolve_config_env_vars, save_config},
+        overlay::overlay_is_active,
         schema::McpServerConfig,
     },
     security::workspace_access::WorkspaceAccessMode,
@@ -212,11 +213,10 @@ impl CommandHandler for CmdStatus {
         let search_usage_text = usage.format();
         let mut metadata = ctx.msg.metadata.clone();
         metadata.insert("render_as".to_string(), "text".into());
-        let last_usage = agent_loop
+        let last_usage = *agent_loop
             .last_usage
             .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .clone();
+            .unwrap_or_else(|e| e.into_inner());
         let start_time_secs = agent_loop
             .start_time
             .duration_since(std::time::UNIX_EPOCH)
@@ -470,7 +470,22 @@ fn handle_mcp_preset_list(ctx: &CommandContext) -> OutboundMessage {
     reply_as_text(ctx, format_preset_list(&presets, &config.tools.mcp_servers))
 }
 
+/// Commands that rewrite the config file must not run inside a child agent:
+/// its config path is the **parent's** file, so a child could give its parent
+/// (for example) a new MCP server that the parent then starts.
+fn refuse_config_change_in_child(ctx: &CommandContext, in_child: bool) -> Option<OutboundMessage> {
+    in_child.then(|| {
+        reply_as_text(
+            ctx,
+            "Error: this agent runs on its parent's configuration and cannot change it.              Change the parent's MCP servers instead.",
+        )
+    })
+}
+
 fn handle_mcp_preset_enable(ctx: &CommandContext, rest: &str) -> OutboundMessage {
+    if let Some(refusal) = refuse_config_change_in_child(ctx, overlay_is_active()) {
+        return refusal;
+    }
     let (name, field_args) = rest.split_once(char::is_whitespace).unwrap_or((rest, ""));
     let name = name.trim();
     if name.is_empty() {
@@ -514,6 +529,9 @@ fn handle_mcp_preset_enable(ctx: &CommandContext, rest: &str) -> OutboundMessage
 }
 
 fn handle_mcp_preset_disable(ctx: &CommandContext, name: &str) -> OutboundMessage {
+    if let Some(refusal) = refuse_config_change_in_child(ctx, overlay_is_active()) {
+        return refusal;
+    }
     let name = name.trim();
     if name.is_empty() {
         return reply_as_text(ctx, "Usage: /mcp-preset disable <name>");
@@ -1270,6 +1288,18 @@ mod tests {
             "",
             agent_loop,
         )
+    }
+
+    #[test]
+    fn config_changes_are_refused_in_a_child_and_allowed_elsewhere() {
+        let ctx = stop_ctx(None);
+        let refusal = refuse_config_change_in_child(&ctx, true).expect("a child must be refused");
+        assert!(
+            refusal.content.contains("cannot change it"),
+            "{}",
+            refusal.content
+        );
+        assert!(refuse_config_change_in_child(&ctx, false).is_none());
     }
 
     #[tokio::test]

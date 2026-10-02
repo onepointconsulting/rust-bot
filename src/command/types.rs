@@ -27,8 +27,10 @@ impl std::fmt::Display for CommandLifecycle {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize, ToSchema)]
 #[serde(rename_all = "lowercase")]
+#[derive(Default)]
 pub enum ChatCommand {
     Help,
+    #[default]
     New,
     Stop,
     Restart,
@@ -51,11 +53,6 @@ pub enum ChatCommand {
     ExamplePrompts,
 }
 
-impl Default for ChatCommand {
-    fn default() -> Self {
-        Self::New
-    }
-}
 
 impl std::str::FromStr for ChatCommand {
     type Err = ();

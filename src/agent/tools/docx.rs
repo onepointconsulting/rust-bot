@@ -37,6 +37,9 @@ impl DocxConversionTool {
                 "Error: path {} is outside allowed directories",
                 path.display()
             ),
+            denied @ ResolvePathError::InDeniedRoot { .. } => {
+                format!("Error: {}", denied.describe())
+            }
         })
     }
 

@@ -1,6 +1,7 @@
+use std::collections::BTreeSet;
 use std::env;
 use std::fs::{self, File};
-use std::io::{BufReader, Write};
+use std::io::BufReader;
 use std::path::PathBuf;
 use std::sync::{LazyLock, OnceLock};
 
@@ -9,6 +10,7 @@ use regex::Regex;
 use crate::cli::CliError;
 use crate::config::schema::{Config, validate_model_presets};
 use crate::security::network::configure_ssrf_whitelist;
+use crate::utils::fs::write_atomic;
 use crate::utils::helpers::expand_tilde_path;
 
 static CURRENT_CONFIG_PATH: OnceLock<PathBuf> = OnceLock::new();
@@ -23,7 +25,7 @@ pub fn get_config_path() -> PathBuf {
     if let Some(current_config_path) = CURRENT_CONFIG_PATH.get() {
         return current_config_path.clone();
     }
-    return PathBuf::from(expand_tilde_path("~/.rust-bot/config.json").as_ref());
+    PathBuf::from(expand_tilde_path("~/.rust-bot/config.json").as_ref())
 }
 
 /// Load configuration from a file, or create a default configuration if
@@ -38,7 +40,7 @@ pub fn get_config_path() -> PathBuf {
 ///
 /// The loaded (or default) configuration object.
 pub fn load_config(path_option: Option<PathBuf>) -> Config {
-    let path = path_option.unwrap_or_else(|| get_config_path());
+    let path = path_option.unwrap_or_else(get_config_path);
     let mut config = Config::default();
     if path.exists() && path.is_file() {
         let file = File::open(&path).unwrap_or_else(|e| {
@@ -82,14 +84,9 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) -> Result<(), 
         panic!("Failed to serialise config: {e}");
     });
 
-    let mut file = File::create(&path).unwrap_or_else(|e| {
-        panic!(
-            "Failed to open config file '{}' for writing: {e}",
-            path.display()
-        );
-    });
-
-    file.write_all(json.as_bytes()).unwrap_or_else(|e| {
+    // Atomic: other rust-bot processes (e.g. ACP children) re-read this file on
+    // every start and must never see a half-written config.
+    write_atomic(&path, json.as_bytes()).unwrap_or_else(|e| {
         panic!("Failed to write config file '{}': {e}", path.display());
     });
     Ok(())
@@ -97,6 +94,33 @@ pub fn save_config(config: &Config, path_option: Option<PathBuf>) -> Result<(), 
 
 static ENV_VAR_RE: LazyLock<Regex> =
     LazyLock::new(|| Regex::new(r"\$\{([A-Za-z_][A-Za-z0-9_]*)\}").unwrap());
+
+/// Names of every `${VAR}` placeholder in the string values of `value`.
+///
+/// Uses the same pattern as [`resolve_config_env_vars`], so it finds exactly the
+/// variables that resolving would need. Only values are scanned, not keys.
+pub fn referenced_env_vars(value: &serde_json::Value) -> BTreeSet<String> {
+    let mut names = BTreeSet::new();
+    collect_env_var_names(value, &mut names);
+    names
+}
+
+fn collect_env_var_names(value: &serde_json::Value, names: &mut BTreeSet<String>) {
+    match value {
+        serde_json::Value::String(text) => {
+            for captures in ENV_VAR_RE.captures_iter(text) {
+                names.insert(captures[1].to_string());
+            }
+        }
+        serde_json::Value::Object(map) => {
+            map.values().for_each(|v| collect_env_var_names(v, names))
+        }
+        serde_json::Value::Array(items) => {
+            items.iter().for_each(|v| collect_env_var_names(v, names))
+        }
+        _ => {}
+    }
+}
 
 /// Return a copy of `config` with every `${VAR}` placeholder in string values
 /// replaced by the corresponding environment variable.
@@ -155,6 +179,64 @@ fn apply_ssrf_whitelist(config: &Config) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn referenced_env_vars_finds_placeholders_anywhere_in_values() {
+        let value = serde_json::json!({
+            "headers": {"Authorization": "Bearer ${MCP_TOKEN}"},
+            "list": ["${FIRST}-${SECOND}", "plain", 7],
+            "deep": {"a": {"b": "${DEEP}"}},
+            "${NOT_A_KEY}": "no placeholder here"
+        });
+        let names: Vec<String> = referenced_env_vars(&value).into_iter().collect();
+        assert_eq!(names, vec!["DEEP", "FIRST", "MCP_TOKEN", "SECOND"]);
+        assert!(referenced_env_vars(&serde_json::json!({"a": "no placeholders"})).is_empty());
+    }
+
+    #[test]
+    fn save_config_is_atomic_for_a_concurrent_reader() {
+        // Children re-read the parent's config on every start while
+        // `/mcp-preset enable|disable` rewrites it: the reader must never see
+        // a half-written file.
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.json");
+        let mut first = Config::default();
+        first.agents.model = "model-a".repeat(2_000);
+        let mut second = Config::default();
+        second.agents.model = "model-b".to_string();
+        save_config(&first, Some(path.clone())).unwrap();
+
+        let stop = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let (path, stop) = (path.clone(), std::sync::Arc::clone(&stop));
+            let (first, second) = (first.clone(), second.clone());
+            std::thread::spawn(move || {
+                let mut use_first = false;
+                while !stop.load(std::sync::atomic::Ordering::Relaxed) {
+                    let config = if use_first { &first } else { &second };
+                    save_config(config, Some(path.clone())).unwrap();
+                    use_first = !use_first;
+                }
+            })
+        };
+
+        let mut parsed = 0;
+        for _ in 0..200 {
+            // A transient read error during the replace is not a partial read.
+            if let Ok(text) = fs::read_to_string(&path) {
+                let config: Config = serde_json::from_str(&text)
+                    .unwrap_or_else(|e| panic!("saw a partial config ({e}): {} bytes", text.len()));
+                assert!(
+                    config.agents.model == first.agents.model
+                        || config.agents.model == second.agents.model
+                );
+                parsed += 1;
+            }
+        }
+        stop.store(true, std::sync::atomic::Ordering::Relaxed);
+        writer.join().unwrap();
+        assert!(parsed > 0);
+    }
 
     #[test]
     fn test_get_config_path() {
@@ -251,7 +333,7 @@ mod tests {
             vec!["100.64.0.0/10".to_string(), "192.168.0.0/16".to_string()];
         assert!(!config.tools.ssrf_whitelist.is_empty());
         assert!(config.tools.ssrf_whitelist.len() == 2);
-        assert!(config.tools.ssrf_whitelist.get(0).unwrap() == "100.64.0.0/10");
+        assert!(config.tools.ssrf_whitelist.first().unwrap() == "100.64.0.0/10");
         assert!(config.tools.ssrf_whitelist.get(1).unwrap() == "192.168.0.0/16");
         println!("Config: {}", serde_json::to_string_pretty(&config).unwrap());
     }

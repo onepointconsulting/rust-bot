@@ -22,6 +22,7 @@ use crate::{
         SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, history_visibility::is_hidden_history_message,
         keys::COMMAND_KEY,
     },
+    utils::fs::write_atomic,
     utils::helpers::{
         ensure_dir, find_legal_message_start, safe_filename, strip_think, truncate_text,
     },
@@ -111,12 +112,11 @@ impl Session {
 
         // Avoid starting mid-turn when possible.
         for i in 0..sliced.len() {
-            if let Some(role) = sliced[i].get("role").and_then(|v| v.as_str()) {
-                if role == "user" {
+            if let Some(role) = sliced[i].get("role").and_then(|v| v.as_str())
+                && role == "user" {
                     sliced = sliced[i..].to_vec();
                     break;
                 }
-            }
         }
 
         let mut out: Vec<Value> = Vec::new();
@@ -129,7 +129,7 @@ impl Session {
                 "content": message.get("content").and_then(|v| v.as_str()).unwrap_or(""),
                 "timestamp": message.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
             });
-            for key in vec!["tool_calls", "tool_call_id", "name", "reasoning_content"] {
+            for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"] {
                 if message.get(key).is_some() {
                     entry[key] = message.get(key).unwrap().clone();
                 }
@@ -483,12 +483,12 @@ impl SessionManager {
     /// The file path for the session.
     fn get_session_path(&self, key: &str) -> PathBuf {
         let safe_key = safe_filename(key);
-        return self.sessions_dir.join(format!("{}.jsonl", safe_key));
+        self.sessions_dir.join(format!("{}.jsonl", safe_key))
     }
 
     fn get_legacy_session_path(&self, key: &str) -> PathBuf {
         let safe_key = safe_filename(key);
-        return self.legacy_sessions_dir.join(format!("{}.jsonl", safe_key));
+        self.legacy_sessions_dir.join(format!("{}.jsonl", safe_key))
     }
 
     /// Existing session from cache or disk. Does not create a session and does
@@ -592,8 +592,8 @@ impl SessionManager {
                         key
                     );
                 }
-                if let Some(created_at_val) = data.get("created_at") {
-                    if let Some(created_at_str) = created_at_val.as_str() {
+                if let Some(created_at_val) = data.get("created_at")
+                    && let Some(created_at_str) = created_at_val.as_str() {
                         let parsed =
                             NaiveDateTime::parse_from_str(created_at_str, "%Y-%m-%dT%H:%M:%S%.f")
                                 .or_else(|_| {
@@ -608,9 +608,8 @@ impl SessionManager {
                             created_at = dt.with_timezone(&Utc);
                         }
                     }
-                }
-                if let Some(updated_at_val) = data.get("updated_at") {
-                    if let Some(updated_at_str) = updated_at_val.as_str() {
+                if let Some(updated_at_val) = data.get("updated_at")
+                    && let Some(updated_at_str) = updated_at_val.as_str() {
                         let parsed =
                             NaiveDateTime::parse_from_str(updated_at_str, "%Y-%m-%dT%H:%M:%S%.f")
                                 .or_else(|_| {
@@ -625,7 +624,6 @@ impl SessionManager {
                             updated_at = dt.with_timezone(&Utc);
                         }
                     }
-                }
                 if let Some(v) = data.get("last_consolidated") {
                     last_consolidated = json_value_as_last_consolidated(v);
                 }
@@ -657,8 +655,6 @@ impl SessionManager {
             return Ok(());
         }
         let path = self.get_session_path(&session.key);
-
-        let mut file = File::create(&path)?;
         log::info!("Saving session to {}", path.display());
 
         let metadata_line = json!({
@@ -669,11 +665,13 @@ impl SessionManager {
             "metadata": session.metadata,
             "last_consolidated": session.last_consolidated,
         });
-        writeln!(file, "{}", serde_json::to_string(&metadata_line)?)?;
-
+        let mut contents = Vec::new();
+        writeln!(contents, "{}", serde_json::to_string(&metadata_line)?)?;
         for msg in &session.messages {
-            writeln!(file, "{}", serde_json::to_string(msg)?)?;
+            writeln!(contents, "{}", serde_json::to_string(msg)?)?;
         }
+        // Atomic: a crash or kill mid-save must not truncate the whole conversation.
+        write_atomic(&path, &contents)?;
 
         self.cache.insert(session.key.clone(), session);
         Ok(())
@@ -856,14 +854,13 @@ impl SessionManager {
             if let Ok(file) = File::open(&path) {
                 let reader = BufReader::new(file);
                 // Read single line from reader
-                if let Some(line_result) = reader.lines().next() {
-                    if let Ok(line) = line_result {
-                        if let Ok(metadata) = serde_json::from_str::<Value>(&line) {
-                            if let Some(metadata_type) = metadata.get("_type")
+                if let Some(line_result) = reader.lines().next()
+                    && let Ok(line) = line_result
+                        && let Ok(metadata) = serde_json::from_str::<Value>(&line)
+                            && let Some(metadata_type) = metadata.get("_type")
                                 && let Some(metadata_type_str) = metadata_type.as_str()
                                 && metadata_type_str == "metadata"
-                            {
-                                if let Some(key) = metadata
+                                && let Some(key) = metadata
                                     .get("key")
                                     .and_then(|v| v.as_str())
                                     .filter(|k| !k.is_empty())
@@ -878,10 +875,6 @@ impl SessionManager {
                                         "has_summary": listed_session_has_summary(&metadata),
                                     }));
                                 }
-                            }
-                        }
-                    }
-                }
             }
         }
         sessions.sort_by(|a, b| {
@@ -1982,6 +1975,43 @@ mod tests {
         let msg1: Value = serde_json::from_str(lines[2]).unwrap();
         assert_eq!(msg1["role"], json!("assistant"));
         assert_eq!(msg1["content"], json!("world"));
+    }
+
+    #[test]
+    fn save_is_atomic_and_leaves_no_temp_file_behind() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        let mut session = Session::new("atomic".into());
+        session.add_message("user", "hello", Map::new());
+        mgr.save(session.clone()).expect("first save");
+        // A reader that opened the file before the next save must still see
+        // the complete old session (truncate-and-rewrite would change it).
+        let path = mgr
+            .sessions_dir
+            .join(format!("{}.jsonl", safe_filename("atomic")));
+        let mut early_reader = File::open(&path).unwrap();
+        session.add_message("assistant", "again", Map::new());
+        mgr.save(session).expect("second save");
+        let mut old_content = String::new();
+        std::io::Read::read_to_string(&mut early_reader, &mut old_content).unwrap();
+        assert_eq!(
+            old_content.lines().count(),
+            2,
+            "old metadata plus the first message"
+        );
+
+        let names: Vec<String> = fs::read_dir(&mgr.sessions_dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .map(|entry| entry.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            names.iter().all(|name| !name.ends_with(".tmp")),
+            "{names:?}"
+        );
+        assert_eq!(names.len(), 1, "only the session file: {names:?}");
+        let content = fs::read_to_string(mgr.sessions_dir.join(&names[0])).unwrap();
+        assert_eq!(content.lines().count(), 3, "metadata plus both messages");
     }
 
     #[test]
