@@ -11,6 +11,7 @@ pub mod helpers;
 pub mod logo;
 pub mod media_decode;
 pub mod path;
+pub mod process;
 pub mod prompt_templates;
 pub mod registry_helper;
 pub mod restart;

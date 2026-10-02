@@ -164,9 +164,24 @@ pub struct WorkspaceScope {
     pub restrict_to_workspace: bool,
     pub sandbox_status: WorkspaceSandboxStatus,
     pub source_channel: Option<String>,
+    /// Folders inside the project that file tools must not touch (another
+    /// rust-bot's home, so a child working on a repo cannot read its parent's
+    /// memory). Never persisted: the process that owns the scope supplies them.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub denied_roots: Vec<PathBuf>,
 }
 
 impl WorkspaceScope {
+    /// This scope with `denied_roots` added to its denied subtrees.
+    pub fn with_denied_roots(mut self, denied_roots: &[PathBuf]) -> Self {
+        for root in denied_roots {
+            if !self.denied_roots.contains(root) {
+                self.denied_roots.push(root.clone());
+            }
+        }
+        self
+    }
+
     pub fn project_name(&self) -> String {
         self.project_path
             .file_name()
@@ -206,6 +221,8 @@ pub struct ToolWorkspace {
     pub project_path: Option<PathBuf>,
     pub restrict_to_workspace: bool,
     pub scope: Option<WorkspaceScope>,
+    /// Subtrees the file tools refuse, whatever the access mode.
+    pub denied_roots: Vec<PathBuf>,
 }
 
 impl ToolWorkspace {
@@ -233,6 +250,9 @@ pub struct WorkspaceScopeResolver {
     pub default_workspace: PathBuf,
     pub default_restrict_to_workspace: bool,
     pub scoped_channel: String,
+    /// Subtrees every scope this resolver produces refuses (see
+    /// [`WorkspaceScope::denied_roots`]).
+    pub denied_roots: Vec<PathBuf>,
 }
 
 impl WorkspaceScopeResolver {
@@ -241,7 +261,14 @@ impl WorkspaceScopeResolver {
             default_workspace,
             default_restrict_to_workspace,
             scoped_channel: CHANNEL_NAME.to_string(),
+            denied_roots: Vec::new(),
         }
+    }
+
+    /// Deny `denied_roots` in every scope this resolver produces.
+    pub fn with_denied_roots(mut self, denied_roots: Vec<PathBuf>) -> Self {
+        self.denied_roots = denied_roots;
+        self
     }
 
     pub fn default(&self) -> WorkspaceScope {
@@ -250,6 +277,7 @@ impl WorkspaceScopeResolver {
             self.default_restrict_to_workspace,
             None,
         )
+        .with_denied_roots(&self.denied_roots)
     }
 
     /// Resolve the effective scope for a turn from persisted session
@@ -260,6 +288,7 @@ impl WorkspaceScopeResolver {
             &self.default_workspace,
             self.default_restrict_to_workspace,
         )
+        .with_denied_roots(&self.denied_roots)
     }
 }
 
@@ -284,6 +313,7 @@ pub fn build_workspace_scope(
         restrict_to_workspace,
         sandbox_status,
         source_channel: source_channel.map(str::to_string),
+        denied_roots: Vec::new(),
     }
 }
 
@@ -609,6 +639,7 @@ mod tests {
             project_path: Some(PathBuf::from("/some/path")),
             restrict_to_workspace: false,
             scope: None,
+            denied_roots: Vec::new(),
         };
         assert_eq!(tw.allowed_root(), None);
     }
@@ -619,6 +650,7 @@ mod tests {
             project_path: Some(PathBuf::from("/some/path")),
             restrict_to_workspace: true,
             scope: None,
+            denied_roots: Vec::new(),
         };
         assert_eq!(tw.allowed_root(), Some(PathBuf::from("/some/path")));
     }
@@ -647,5 +679,35 @@ mod tests {
         let resolver = WorkspaceScopeResolver::new(dir.path().to_path_buf(), true);
         assert_eq!(resolver.default().project_path, dir.path());
         assert_eq!(resolver.for_session(None).project_path, dir.path());
+    }
+
+    #[test]
+    fn resolver_adds_its_denied_roots_to_every_scope_it_produces() {
+        let dir = tempfile::tempdir().unwrap();
+        let denied = PathBuf::from("/parent/home");
+        let resolver = WorkspaceScopeResolver::new(dir.path().to_path_buf(), true)
+            .with_denied_roots(vec![denied.clone()]);
+
+        assert_eq!(resolver.default().denied_roots, vec![denied.clone()]);
+        assert_eq!(resolver.for_session(None).denied_roots, vec![denied.clone()]);
+        let mut metadata = HashMap::new();
+        metadata.insert(
+            WORKSPACE_SCOPE_METADATA_KEY.to_string(),
+            json!({"project_path": dir.path().display().to_string(), "access_mode": "full"}),
+        );
+        assert_eq!(
+            resolver.for_session(Some(&metadata)).denied_roots,
+            vec![denied]
+        );
+    }
+
+    #[test]
+    fn denied_roots_are_not_persisted_and_not_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let denied = PathBuf::from("/parent/home");
+        let scope = build_workspace_scope(dir.path(), WorkspaceAccessMode::Restricted, None)
+            .with_denied_roots(&[denied.clone(), denied.clone()]);
+        assert_eq!(scope.denied_roots, vec![denied]);
+        assert!(!scope.metadata().to_string().contains("denied"));
     }
 }

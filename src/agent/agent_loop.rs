@@ -38,6 +38,8 @@ use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::tool_progress::with_tool_progress;
+use crate::agent::tools::acp::{AcpToolsContext, register_acp_tools};
 use crate::agent::workspace_context::{
     bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
 };
@@ -304,6 +306,9 @@ pub struct AgentLoop {
     context: Arc<ContextBuilder>,
     pub(crate) tools: Arc<Mutex<ToolRegistry>>,
     pub subagents: Arc<SubagentManager>,
+    /// The `acp_*` tools' shared state; `None` when ACP is off or this process
+    /// is already as deep as `tools.acp.maxDepth` allows.
+    acp_tools: Option<Arc<AcpToolsContext>>,
     /// In-flight per-session tasks, keyed by session then by a unique task id so
     /// each task can remove itself on completion (the `add_done_callback` analog).
     pub active_tasks: Arc<AsyncMutex<HashMap<String, HashMap<u64, JoinHandle<()>>>>>,
@@ -413,16 +418,31 @@ impl AgentLoop {
             session_manager.clone(),
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
+        // The acp_* tools exist only when enabled and not already at maxDepth.
+        let acp_tools = AcpToolsContext::for_process(
+            &tools_cfg.acp,
+            workspace.clone(),
+            restrict_to_workspace,
+        );
+        if let Some(acp_tools) = &acp_tools {
+            register_acp_tools(&mut tools, acp_tools);
+        }
         for name in &tools_cfg.disabled_tools {
             tools.unregister(name);
         }
         let tools = Arc::new(Mutex::new(tools));
-        let context = Arc::new(ContextBuilder::with_default_mode(
+        let mut context_builder = ContextBuilder::with_default_mode(
             workspace.clone(),
             timezone.clone(),
             tools.clone(),
             agents_cfg.mode,
-        ));
+        );
+        if let Some(acp_tools) = &acp_tools {
+            let acp_tools = Arc::clone(acp_tools);
+            context_builder =
+                context_builder.with_prompt_section(Arc::new(move || acp_tools.prompt_section()));
+        }
+        let context = Arc::new(context_builder);
         let consolidator = Arc::new(Consolidator::new(
             Arc::clone(&context.memory),
             runtime_resolver.clone(),
@@ -465,6 +485,7 @@ impl AgentLoop {
             session_manager: session_manager.clone(),
             tools,
             subagents,
+            acp_tools,
             running: AtomicBool::new(false),
             mcp_servers,
             mcp_connected: AtomicBool::new(false),
@@ -617,6 +638,18 @@ impl AgentLoop {
             .save(snapshot)
             .map_err(|e| format!("Failed to save session: {e}"))?;
         Ok(mode)
+    }
+
+    /// The `acp_*` tools' shared state, to wire escalation to the web-socket chat.
+    pub fn acp_tools(&self) -> Option<&Arc<AcpToolsContext>> {
+        self.acp_tools.as_ref()
+    }
+
+    /// Deny `denied_roots` to the file tools in every session's scope (another
+    /// rust-bot's home that lies inside the project a child works on).
+    pub fn with_denied_roots(mut self, denied_roots: Vec<PathBuf>) -> Self {
+        self.workspace_scopes = self.workspace_scopes.with_denied_roots(denied_roots);
+        self
     }
 
     /// Remove tools by name from the shared registry.
@@ -1040,6 +1073,8 @@ impl AgentLoop {
         chat_id: &str,
         message_id: Option<&str>,
     ) -> AgentRunResult {
+        // The same progress callback, for tools that report while they block.
+        let tool_progress = on_progress.clone();
         let loop_hook = LoopHook::with_context(
             Arc::clone(self),
             on_progress,
@@ -1091,8 +1126,9 @@ impl AgentLoop {
         let workspace_scope_token = bind_workspace_scope(scope);
 
         let runner = AgentRunner::new(runtime.provider.clone());
-        let result = runner
-            .run(AgentRunSpec {
+        let result = with_tool_progress(
+            tool_progress,
+            runner.run(AgentRunSpec {
                 initial_messages,
                 tools: run_tools,
                 model: runtime.model.clone(),
@@ -1117,8 +1153,9 @@ impl AgentLoop {
                 max_iterations_message: None,
                 max_tokens: Some(runtime.max_tokens as usize),
                 reasoning_effort: runtime.reasoning_effort.clone(),
-            })
-            .await;
+            }),
+        )
+        .await;
         reset_workspace_scope(workspace_scope_token);
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage;
         if result.stop_reason == "max_iterations" {

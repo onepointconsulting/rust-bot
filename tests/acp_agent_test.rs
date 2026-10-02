@@ -6,10 +6,8 @@
 //! `assemble_acp_runtime` the binary uses, so the ACP hook, the tool list and
 //! the session scope are the production ones.
 
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
 
 use agent_client_protocol::schema::ProtocolVersion;
 use agent_client_protocol::schema::v1::{
@@ -22,167 +20,18 @@ use agent_client_protocol::{
     Agent, Channel, Client, ConnectionTo, Error, on_receive_notification, on_receive_request,
 };
 use rust_bot::agent::acp::agent_mode::serve;
-use rust_bot::cli::acp::{AcpRuntime, assemble_acp_runtime};
+use rust_bot::cli::acp::AcpRuntime;
 use rust_bot::config::schema::Config;
-use rust_bot::providers::base::{
-    BoxedProgressCallback, GenerationSettings, LLMProvider, LLMProviderDyn, LLMResponse, LLMUsage,
-    ToolCallRequest,
+use rust_bot::providers::base::{LLMProviderDyn, LLMResponse};
+use serde_json::json;
+
+mod support;
+
+use support::{
+    Fixture, ScriptedProvider, SharedProvider, fixture, fixture_with, long_running_command,
+    running_process_count, text_reply, tool_call_reply, wait_until, write_project_file,
+    long_running_process_name,
 };
-use rust_bot::providers::registry::ProviderSpec;
-use rust_bot::utils::helpers::sync_workspace_templates;
-use serde_json::{Value, json};
-
-// ── scripted LLM ────────────────────────────────────────────────────────────
-
-/// Replies from a fixed script (one per streamed agent-turn call); records every
-/// message list a turn was given.
-struct ScriptedProvider {
-    script: Mutex<VecDeque<LLMResponse>>,
-    seen_messages: Mutex<Vec<Vec<Value>>>,
-    generation: GenerationSettings,
-}
-
-impl ScriptedProvider {
-    fn new(script: Vec<LLMResponse>) -> Arc<Self> {
-        Arc::new(Self {
-            script: Mutex::new(script.into()),
-            seen_messages: Mutex::new(Vec::new()),
-            generation: GenerationSettings::new(),
-        })
-    }
-
-    fn next_response(&self, messages: Vec<Value>) -> LLMResponse {
-        self.seen_messages.lock().unwrap().push(messages);
-        self.script
-            .lock()
-            .unwrap()
-            .pop_front()
-            .unwrap_or_else(|| text_reply("(script exhausted)"))
-    }
-
-    /// Text of every message the model was shown, across all calls.
-    fn everything_seen(&self) -> String {
-        serde_json::to_string(&*self.seen_messages.lock().unwrap()).unwrap()
-    }
-}
-
-fn text_reply(text: &str) -> LLMResponse {
-    LLMResponse {
-        content: Some(text.to_string()),
-        tool_calls: Vec::new(),
-        finish_reason: "stop".to_string(),
-        usage: LLMUsage::new(),
-        reasoning_content: None,
-        thinking_blocks: None,
-    }
-}
-
-fn tool_call_reply(id: &str, name: &str, arguments: Value) -> LLMResponse {
-    LLMResponse {
-        content: None,
-        tool_calls: vec![ToolCallRequest {
-            id: id.to_string(),
-            name: name.to_string(),
-            arguments: arguments
-                .as_object()
-                .unwrap()
-                .clone()
-                .into_iter()
-                .collect::<HashMap<_, _>>(),
-            extra_content: None,
-            provider_specific_fields: None,
-            function_provider_specific_fields: None,
-        }],
-        finish_reason: "tool_calls".to_string(),
-        usage: LLMUsage::new(),
-        reasoning_content: None,
-        thinking_blocks: None,
-    }
-}
-
-/// `Arc<ScriptedProvider>` is what the test keeps; this newtype is what the agent owns.
-struct SharedProvider(Arc<ScriptedProvider>);
-
-impl LLMProvider for SharedProvider {
-    fn new(
-        _api_key: Option<String>,
-        _api_base: Option<String>,
-        _default_model: Option<String>,
-        _extra_headers: Option<HashMap<String, String>>,
-        _spec: Option<ProviderSpec>,
-    ) -> Self {
-        SharedProvider(ScriptedProvider::new(Vec::new()))
-    }
-
-    fn api_key(&self) -> Option<String> {
-        None
-    }
-
-    fn api_base(&self) -> Option<String> {
-        None
-    }
-
-    fn extra_headers(&self) -> Option<HashMap<String, String>> {
-        None
-    }
-
-    fn generation_settings(&self) -> &GenerationSettings {
-        &self.0.generation
-    }
-
-    fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
-        // Only reachable before the provider is shared; the tests never call it.
-        unimplemented!("generation settings are fixed for the scripted provider")
-    }
-
-    fn spec(&self) -> Option<&ProviderSpec> {
-        None
-    }
-
-    fn get_default_model(&self) -> String {
-        "scripted".to_string()
-    }
-
-    async fn chat(
-        &self,
-        messages: Vec<Value>,
-        _tools: Option<Vec<Value>>,
-        _model: Option<String>,
-        _max_tokens: usize,
-        _temperature: Option<f32>,
-        _reasoning_effort: Option<String>,
-        _tool_choice: Option<Value>,
-    ) -> LLMResponse {
-        // Non-streaming calls are background utilities (session title, memory
-        // consolidation): agent turns always stream. They must not consume the
-        // replies scripted for the turns.
-        let _ = messages;
-        text_reply("Scripted title")
-    }
-
-    async fn chat_stream<F, Fut>(
-        &self,
-        messages: Vec<Value>,
-        _tools: Option<Vec<Value>>,
-        _model: Option<String>,
-        _max_tokens: usize,
-        _temperature: Option<f32>,
-        _reasoning_effort: Option<String>,
-        _tool_choice: Option<Value>,
-        on_content_delta: &Option<F>,
-        _on_progress: &Option<BoxedProgressCallback>,
-    ) -> LLMResponse
-    where
-        F: Fn(String) -> Fut + Send + Sync,
-        Fut: std::future::Future<Output = ()> + Send,
-    {
-        let response = self.0.next_response(messages);
-        if let (Some(callback), Some(text)) = (on_content_delta, &response.content) {
-            callback(text.clone()).await;
-        }
-        response
-    }
-}
 
 // ── test client ─────────────────────────────────────────────────────────────
 
@@ -346,73 +195,6 @@ async fn prompt(
 }
 
 // ── fixtures ────────────────────────────────────────────────────────────────
-
-struct Fixture {
-    runtime: AcpRuntime,
-    provider: Arc<ScriptedProvider>,
-    project: tempfile::TempDir,
-    workspace: tempfile::TempDir,
-}
-
-impl Fixture {
-    /// A fresh runtime on the same workspace, like a restarted `rust-bot acp`
-    /// process: new agent loop, new registry, new connection slot.
-    fn restarted_runtime(&self, script: Vec<LLMResponse>) -> (AcpRuntime, Arc<ScriptedProvider>) {
-        let mut config = Config::default();
-        config.agents.workspace = self.workspace.path().to_string_lossy().into_owned();
-        let provider = ScriptedProvider::new(script);
-        let for_agent: Arc<dyn LLMProviderDyn> = Arc::new(SharedProvider(Arc::clone(&provider)));
-        let runtime = assemble_acp_runtime(&config, self.workspace.path().to_path_buf(), for_agent);
-        (runtime, provider)
-    }
-
-    /// Stored message lines (everything after the metadata line) of a session.
-    fn stored_messages(&self, session_id: &str) -> Vec<String> {
-        let path = self
-            .workspace
-            .path()
-            .join("sessions")
-            .join(format!("acp_{session_id}.jsonl"));
-        std::fs::read_to_string(path)
-            .expect("the session file exists")
-            .lines()
-            .skip(1)
-            .map(str::to_string)
-            .collect()
-    }
-}
-
-fn fixture(script: Vec<LLMResponse>) -> Fixture {
-    fixture_with(script, |_| {})
-}
-
-/// [`fixture`] with a chance to adjust the config before the agent is built.
-fn fixture_with(script: Vec<LLMResponse>, adjust: impl FnOnce(&mut Config)) -> Fixture {
-    let workspace = tempfile::tempdir().unwrap();
-    let project = tempfile::tempdir().unwrap();
-    sync_workspace_templates(workspace.path(), false);
-
-    let mut config = Config::default();
-    config.agents.workspace = workspace.path().to_string_lossy().into_owned();
-    adjust(&mut config);
-
-    let provider = ScriptedProvider::new(script);
-    let provider_for_agent: Arc<dyn LLMProviderDyn> =
-        Arc::new(SharedProvider(Arc::clone(&provider)));
-    let runtime = assemble_acp_runtime(&config, workspace.path().to_path_buf(), provider_for_agent);
-    Fixture {
-        runtime,
-        provider,
-        project,
-        workspace,
-    }
-}
-
-fn write_project_file(project: &Path, name: &str, contents: &str) -> PathBuf {
-    let path = project.join(name);
-    std::fs::write(&path, contents).unwrap();
-    path
-}
 
 // ── tests ───────────────────────────────────────────────────────────────────
 
@@ -797,60 +579,6 @@ async fn cli_mode_tool_list_still_has_spawn() {
 
 // ── cancellation ────────────────────────────────────────────────────────────
 
-/// Number of running processes whose command line contains `needle`.
-fn running_process_count(needle: &str) -> usize {
-    if cfg!(windows) {
-        let output = std::process::Command::new("tasklist")
-            .args(["/FI", &format!("IMAGENAME eq {needle}"), "/NH"])
-            .output()
-            .expect("run tasklist");
-        String::from_utf8_lossy(&output.stdout)
-            .lines()
-            .filter(|line| {
-                line.to_ascii_lowercase()
-                    .contains(&needle.to_ascii_lowercase())
-            })
-            .count()
-    } else {
-        let output = std::process::Command::new("pgrep")
-            .args(["-c", "-f", needle])
-            .output()
-            .expect("run pgrep");
-        String::from_utf8_lossy(&output.stdout)
-            .trim()
-            .parse()
-            .unwrap_or(0)
-    }
-}
-
-/// A shell command that runs for a long time and is easy to recognise.
-fn long_running_command() -> &'static str {
-    if cfg!(windows) {
-        "ping -n 41 127.0.0.1 > nul"
-    } else {
-        "sleep 41"
-    }
-}
-
-/// Name to look for in the process list while the long command runs.
-fn long_running_process_name() -> &'static str {
-    if cfg!(windows) {
-        "PING.EXE"
-    } else {
-        "sleep 41"
-    }
-}
-
-async fn wait_until(mut condition: impl FnMut() -> bool, what: &str) {
-    for _ in 0..100 {
-        if condition() {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    panic!("timed out waiting for: {what}");
-}
-
 #[tokio::test]
 async fn cancel_stops_the_turn_kills_the_shell_tree_and_the_session_still_works() {
     let fixture = fixture(vec![
@@ -1122,4 +850,84 @@ async fn loading_rejects_a_relative_or_missing_project_folder() {
         Ok(())
     })
     .await;
+}
+
+// ── denied subtrees (a project that contains another rust-bot's home) ───────
+
+/// A project with a file of its own and a rust-bot home inside it holding a secret.
+fn put_a_home_in_the_project(project: &Path) -> PathBuf {
+    write_project_file(project, "main.rs", "fn main() { /* needle in the code */ }\n");
+    let home = project.join(".rust-bot").join("workspace");
+    std::fs::create_dir_all(home.join("memory")).unwrap();
+    std::fs::create_dir_all(home.join("sessions")).unwrap();
+    std::fs::write(home.join("SOUL.md"), "soul").unwrap();
+    std::fs::write(
+        home.join("memory").join("MEMORY.md"),
+        "needle in the parent's secret memory\n",
+    )
+    .unwrap();
+    home
+}
+
+#[tokio::test]
+async fn a_denied_home_inside_the_project_is_off_limits_to_every_file_tool() {
+    // The home is created inside the project folder before the agent is built,
+    // exactly as a parent computes it and passes it with `--deny-path`.
+    let fixture = support::fixture_denying(
+        vec![
+            tool_call_reply("r1", "read_file", json!({"path": ".rust-bot/workspace/memory/MEMORY.md"})),
+            tool_call_reply("g1", "grep", json!({"pattern": "needle", "output_mode": "content"})),
+            tool_call_reply("l1", "list_dir", json!({"path": ".rust-bot", "recursive": true})),
+            tool_call_reply("m1", "glob", json!({"pattern": "**/*.md"})),
+            tool_call_reply("ok", "read_file", json!({"path": "main.rs"})),
+            text_reply("done"),
+        ],
+        |_| {},
+        |project| vec![put_a_home_in_the_project(project)],
+    );
+    let log = Arc::new(ClientLog::default());
+
+    run_client(&fixture.runtime, Permission::Allow, &log, async |connection| {
+        initialize(&connection).await?;
+        let session = new_session(&connection, fixture.project.path()).await?;
+        prompt(&connection, &session, "poke around").await?;
+        Ok(())
+    })
+    .await;
+
+    let seen = fixture.provider.everything_seen();
+    // The code outside the home is readable and found by grep ...
+    assert!(seen.contains("needle in the code"), "{seen}");
+    // ... the home's memory never reaches the model through any tool.
+    assert!(!seen.contains("secret memory"), "a file tool leaked the denied home: {seen}");
+    // The direct read says why it was refused.
+    assert!(seen.contains("off limits"), "{seen}");
+}
+
+#[tokio::test]
+async fn without_a_denied_root_the_same_home_is_readable() {
+    // The control: the very same layout, without the denial, leaks. This keeps
+    // the test above honest.
+    let fixture = support::fixture_denying(
+        vec![
+            tool_call_reply("r1", "read_file", json!({"path": ".rust-bot/workspace/memory/MEMORY.md"})),
+            text_reply("done"),
+        ],
+        |_| {},
+        |project| {
+            put_a_home_in_the_project(project);
+            Vec::new()
+        },
+    );
+    let log = Arc::new(ClientLog::default());
+
+    run_client(&fixture.runtime, Permission::Allow, &log, async |connection| {
+        initialize(&connection).await?;
+        let session = new_session(&connection, fixture.project.path()).await?;
+        prompt(&connection, &session, "read the memory").await?;
+        Ok(())
+    })
+    .await;
+
+    assert!(fixture.provider.everything_seen().contains("secret memory"));
 }

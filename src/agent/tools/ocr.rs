@@ -99,6 +99,9 @@ fn format_resolve_error(err: ResolvePathError) -> String {
             "Error: path {} is outside allowed directories",
             path.display()
         )),
+        denied @ ResolvePathError::InDeniedRoot { .. } => {
+            ocr_err(format!("Error: {}", denied.describe()))
+        }
     }
 }
 

@@ -83,7 +83,7 @@ use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, save_config, set_config_path};
 use crate::config::log::init_runtime_logging;
 use crate::config::paths::get_cli_history_path;
-use crate::config::schema::{ChannelsConfig, Config};
+use crate::config::schema::{AcpPermissionPolicy, ChannelsConfig, Config};
 use crate::cron::{CronJob, CronService};
 use crate::providers::base::LLMProviderDyn;
 use crate::providers::factory::create_provider_for;
@@ -1114,12 +1114,15 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let web_root_override = args.web_root.clone();
     let (config, workspace) = prepare_workspace(args.config, args.workspace);
 
-    let tool_approvals = config
-        .tools
-        .confirm_before_execute
+    // The broker also carries a child agent's permission questions when
+    // `tools.acp.permissionPolicy` is `escalate`, so it exists for that too.
+    let escalates_child_permissions = config.tools.acp.enabled
+        && config.tools.acp.permission_policy == AcpPermissionPolicy::Escalate;
+    let tool_approvals = (config.tools.confirm_before_execute || escalates_child_permissions)
         .then(|| Arc::new(ToolApprovalBroker::new()));
     let confirm_hook = tool_approvals
         .as_ref()
+        .filter(|_| config.tools.confirm_before_execute)
         .map(|broker| Arc::new(WebsocketsAskHook::new(Arc::clone(broker))));
     let hooks = confirm_hook
         .clone()
@@ -1128,6 +1131,9 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone(), hooks));
     if let Some(hook) = &confirm_hook {
         hook.set_bus(agent_loop.bus());
+    }
+    if let (Some(acp_tools), Some(broker)) = (agent_loop.acp_tools(), &tool_approvals) {
+        acp_tools.set_escalation(Arc::clone(broker), agent_loop.bus());
     }
     let session_manager = agent_loop.session_manager.clone();
     let cron = agent_loop.cron_service.clone();

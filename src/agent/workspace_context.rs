@@ -65,6 +65,7 @@ pub fn current_tool_workspace(
         return ToolWorkspace {
             project_path: Some(scope.project_path.clone()),
             restrict_to_workspace: scope.restrict_to_workspace || sandbox_restricts_workspace,
+            denied_roots: scope.denied_roots.clone(),
             scope: Some(scope),
         };
     }
@@ -72,6 +73,7 @@ pub fn current_tool_workspace(
         project_path: default_workspace,
         restrict_to_workspace: restrict_to_workspace || sandbox_restricts_workspace,
         scope: None,
+        denied_roots: Vec::new(),
     }
 }
 

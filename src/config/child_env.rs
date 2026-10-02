@@ -19,6 +19,20 @@ use crate::providers::registry::find_by_name;
 /// Set on every child so it (and its own children) know how deep the chain is.
 pub const DEPTH_ENV_VAR: &str = "RUST_BOT_ACP_DEPTH";
 
+/// How deep in a chain of children this process is: `0` for a process the
+/// operator started, the parent's depth plus one for a child (see
+/// [`DEPTH_ENV_VAR`], set by the parent when it launches a child).
+pub fn current_depth() -> u32 {
+    depth_from(std::env::var(DEPTH_ENV_VAR).ok().as_deref())
+}
+
+/// The depth a [`DEPTH_ENV_VAR`] value stands for; anything unusable is `0`.
+fn depth_from(value: Option<&str>) -> u32 {
+    value
+        .and_then(|text| text.trim().parse().ok())
+        .unwrap_or(0)
+}
+
 /// rust-bot's own settings plus `PATH`, which every child needs.
 const RUST_BOT_VARS: [&str; 3] = ["PATH", "RUST_LOG", "RUST_LOG_FILE"];
 
@@ -131,6 +145,16 @@ pub fn child_environment(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn depth_comes_from_the_variable_and_defaults_to_the_root() {
+        assert_eq!(depth_from(None), 0);
+        assert_eq!(depth_from(Some("2")), 2);
+        assert_eq!(depth_from(Some(" 1 ")), 1);
+        for unusable in ["", "x", "-1", "1.5"] {
+            assert_eq!(depth_from(Some(unusable)), 0, "{unusable:?}");
+        }
+    }
     use serde_json::json;
 
     fn env(pairs: &[(&str, &str)]) -> HashMap<String, String> {

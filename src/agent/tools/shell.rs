@@ -2,6 +2,7 @@ use crate::agent::tools::base::Tool;
 use crate::agent::tools::sandbox::wrap_command;
 use crate::agent::workspace_context::current_tool_workspace;
 use crate::config::paths::get_media_dir;
+use crate::utils::process::kill_process_tree_sync;
 use async_trait::async_trait;
 use regex::Regex;
 use std::collections::HashMap;
@@ -32,7 +33,7 @@ impl ChildGuard {
 impl Drop for ChildGuard {
     fn drop(&mut self) {
         if self.armed {
-            ShellTool::kill_process_tree_sync(self.pid);
+            kill_process_tree_sync(self.pid);
         }
     }
 }
@@ -514,20 +515,6 @@ impl ShellTool {
         }
     }
 
-    /// Forcefully terminate a process and its descendants by PID.
-    fn kill_process_tree_sync(pid: u32) {
-        #[cfg(windows)]
-        {
-            let _ = Command::new("taskkill")
-                .args(["/F", "/T", "/PID", &pid.to_string()])
-                .output();
-        }
-        #[cfg(unix)]
-        {
-            let _ = Command::new("kill").args(["-9", &pid.to_string()]).output();
-        }
-    }
-
     /// Kill a subprocess and its entire process tree, then reap it.
     ///
     /// On **Windows**, `taskkill /F /T /PID` is used instead of `Child::kill()`
@@ -541,7 +528,7 @@ impl ShellTool {
     ///
     /// In both cases the function waits up to 5 seconds for the process to exit.
     async fn kill_process(child: &mut Child) {
-        Self::kill_process_tree_sync(child.id());
+        kill_process_tree_sync(child.id());
 
         // Wait up to 5 s for the process to exit.
         //

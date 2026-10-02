@@ -32,9 +32,10 @@ fn args(config: PathBuf, lock_wait_secs: u64) -> AcpArgs {
     AcpArgs {
         config,
         workspace: None,
-        overlay: None,
+        overlay: Vec::new(),
         logs: false,
         lock_wait_secs,
+        deny_path: Vec::new(),
     }
 }
 
@@ -224,9 +225,10 @@ fn child_args(parent: PathBuf, overlay: PathBuf, home: PathBuf) -> AcpArgs {
     AcpArgs {
         config: parent,
         workspace: Some(home),
-        overlay: Some(overlay),
+        overlay: vec![overlay],
         logs: false,
         lock_wait_secs: 0,
+        deny_path: Vec::new(),
     }
 }
 

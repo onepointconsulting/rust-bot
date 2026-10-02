@@ -37,7 +37,7 @@ use crate::cli::commands::{
 };
 use crate::config::loader::set_config_path;
 use crate::config::log::init_protocol_logging;
-use crate::config::overlay::{load_config_with_overlay, mark_overlay_active};
+use crate::config::overlay::{load_config_with_overlays, mark_overlay_active};
 use crate::config::schema::Config;
 use crate::providers::base::LLMProviderDyn;
 use crate::utils::exit_codes::{self, GENERAL_ERROR};
@@ -68,15 +68,22 @@ pub struct AcpArgs {
     /// Run as a child of another rust-bot: `--config` is the parent's config and
     /// this file is a JSON merge patch applied on top of it. Only a short
     /// allowlist of settings may be overridden, and only towards less power (see
-    /// `config::overlay`). Needs `--workspace`: a child has its own home, it must
-    /// never share its parent's memory and sessions.
+    /// `config::overlay`). Repeat it for a child of a child: the overlays apply in
+    /// the order given, outermost first, each checked against the one before.
+    /// Needs `--workspace`: a child has its own home, it must never share its
+    /// parent's memory and sessions.
     #[arg(long, requires = "workspace")]
-    pub overlay: Option<PathBuf>,
+    pub overlay: Vec<PathBuf>,
 
     /// How long to wait for another `rust-bot acp` process to release the workspace
     /// before failing `initialize` with an error that names it.
     #[arg(long, default_value_t = DEFAULT_LOCK_WAIT_SECS)]
     pub lock_wait_secs: u64,
+
+    /// A folder the file tools must refuse, e.g. the parent's own home when the
+    /// project a child works on contains it. Repeatable. Set by a parent rust-bot.
+    #[arg(long = "deny-path")]
+    pub deny_path: Vec<PathBuf>,
 }
 
 /// Everything the agent role needs, built from the config.
@@ -119,6 +126,8 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 pub struct AcpStartup {
     pub config: Config,
     pub workspace: PathBuf,
+    /// Folders the file tools refuse (from `--deny-path`).
+    pub denied_roots: Vec<PathBuf>,
 }
 
 /// Load the config read-only to learn the workspace.
@@ -128,9 +137,12 @@ pub struct AcpStartup {
 pub fn load_acp_config(args: &AcpArgs) -> Result<AcpStartup, String> {
     let config_path = resolve_acp_config_path(args.config.clone())?;
     // The config loader panics on malformed JSON; turn that into an error.
-    let loaded = std::panic::catch_unwind(AssertUnwindSafe(|| match &args.overlay {
-        None => try_load_runtime_config(config_path.clone(), args.workspace.clone()),
-        Some(overlay) => load_child_config(&config_path, overlay, args.workspace.as_deref()),
+    let loaded = std::panic::catch_unwind(AssertUnwindSafe(|| {
+        if args.overlay.is_empty() {
+            try_load_runtime_config(config_path.clone(), args.workspace.clone())
+        } else {
+            load_child_config(&config_path, &args.overlay, args.workspace.as_deref())
+        }
     }))
     .map_err(|payload| {
         format!(
@@ -140,27 +152,35 @@ pub fn load_acp_config(args: &AcpArgs) -> Result<AcpStartup, String> {
     })?;
     let config = loaded?;
     let workspace = config.workspace_path();
-    Ok(AcpStartup { config, workspace })
+    Ok(AcpStartup {
+        config,
+        workspace,
+        denied_roots: args.deny_path.clone(),
+    })
 }
 
-/// The parent's config with the overlay applied and the child's own workspace.
+/// The parent's config with the overlays applied and the child's own workspace.
 ///
-/// The overlay is validated against the allowlist and merged *before* `${VAR}`
+/// The overlays are validated against the allowlist and merged *before* `${VAR}`
 /// placeholders are expanded (see `config::overlay`). Marks the process as a
-/// child so commands that would rewrite the parent's config refuse to run.
+/// child so commands that would rewrite the parent's config refuse to run, and
+/// remembers the chain so this child's own children inherit through it.
 fn load_child_config(
     config_path: &Path,
-    overlay: &Path,
+    overlays: &[PathBuf],
     workspace: Option<&Path>,
 ) -> Result<Config, String> {
-    let overlay_path = resolve_existing_file(overlay.to_path_buf(), "Overlay file")?;
+    let overlay_paths = overlays
+        .iter()
+        .map(|overlay| resolve_existing_file(overlay.clone(), "Overlay file"))
+        .collect::<Result<Vec<_>, _>>()?;
     // The data folder (logs, media) follows the parent's config path.
     set_config_path(config_path.to_path_buf());
     let mut config =
-        load_config_with_overlay(config_path, &overlay_path).map_err(|e| e.to_string())?;
+        load_config_with_overlays(config_path, &overlay_paths).map_err(|e| e.to_string())?;
     let workspace = workspace.ok_or("--overlay needs --workspace: a child has its own home")?;
     config.agents.workspace = workspace.to_string_lossy().into_owned();
-    mark_overlay_active();
+    mark_overlay_active(&overlay_paths);
     Ok(config)
 }
 
@@ -168,11 +188,20 @@ fn load_child_config(
 ///
 /// Call this only while holding the workspace lock.
 pub fn build_acp_runtime(startup: AcpStartup) -> Result<AcpRuntime, String> {
-    let AcpStartup { config, workspace } = startup;
+    let AcpStartup {
+        config,
+        workspace,
+        denied_roots,
+    } = startup;
     ensure_dir(&workspace);
     sync_workspace_templates(&workspace, false);
     let provider = try_create_provider(&config)?;
-    Ok(assemble_acp_runtime(&config, workspace, provider))
+    Ok(assemble_acp_runtime_denying(
+        &config,
+        workspace,
+        provider,
+        denied_roots,
+    ))
 }
 
 /// Build the ACP runtime around an existing provider: the ACP hook installed,
@@ -186,6 +215,16 @@ pub fn assemble_acp_runtime(
     workspace: PathBuf,
     provider: Arc<dyn LLMProviderDyn>,
 ) -> AcpRuntime {
+    assemble_acp_runtime_denying(config, workspace, provider, Vec::new())
+}
+
+/// [`assemble_acp_runtime`] with folders the file tools must refuse.
+pub fn assemble_acp_runtime_denying(
+    config: &Config,
+    workspace: PathBuf,
+    provider: Arc<dyn LLMProviderDyn>,
+    denied_roots: Vec<PathBuf>,
+) -> AcpRuntime {
     let registry = Arc::new(SessionRegistry::new());
     let slot = Arc::new(ConnectionSlot::new());
     let link: Arc<dyn AcpLink> = slot.clone();
@@ -196,7 +235,8 @@ pub fn assemble_acp_runtime(
         DEFAULT_PERMISSION_TIMEOUT,
     ));
 
-    let agent_loop = init_agent_loop_with_provider(config, workspace, provider, Some(vec![hook]));
+    let agent_loop = init_agent_loop_with_provider(config, workspace, provider, Some(vec![hook]))
+        .with_denied_roots(denied_roots);
     agent_loop.unregister_tools(&HEADLESS_DISABLED_TOOLS);
     AcpRuntime {
         agent_loop: Arc::new(agent_loop),
@@ -342,5 +382,13 @@ mod tests {
         assert!(!args.logs);
         assert!(args.workspace.is_none());
         assert_eq!(args.lock_wait_secs, DEFAULT_LOCK_WAIT_SECS);
+        assert!(args.deny_path.is_empty());
+    }
+
+    #[test]
+    fn deny_path_can_be_repeated() {
+        let args =
+            AcpArgs::try_parse_from(["acp", "--deny-path", "/a", "--deny-path", "/b"]).unwrap();
+        assert_eq!(args.deny_path, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
     }
 }

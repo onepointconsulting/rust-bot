@@ -12,14 +12,37 @@
 //! * [`link`]: the hook's view of the client connection.
 //! * [`workspace_lock`]: one `rust-bot acp` process per workspace.
 //! * [`stdin_pump`]: reads stdin from the start and reports EOF.
+//!
+//! Milestone 3: rust-bot as the parent of child rust-bots.
+//!
+//! * [`store`]: the children's folders (`acp/agents/<name>/`).
+//! * [`project_folder`]: which project folder a parent may give a child.
+//! * [`agents_section`]: the "Available ACP agents" part of the system prompt.
+//! * [`client`]: the client role, one turn of a child agent.
+//! * [`escalation`]: asking the human for a child's permission request.
+//! * [`launch`]: command line and environment of a child rust-bot.
+//! * [`manager`]: runs one turn of a named child (lock, launch, turn, stop).
+//! * [`permission`]: how the parent answers its child's permission requests.
+//! * [`transport`]: a child ACP agent as a process (environment, stop signal, kill).
+//! * [`session_index`]: which child ACP session belongs to which parent session.
 
 pub mod agent_mode;
+pub mod agents_section;
+pub mod client;
+pub mod escalation;
+pub mod launch;
 pub mod link;
+pub mod manager;
 pub mod mapping;
+pub mod permission;
+pub mod project_folder;
 pub mod registry;
 pub mod replay;
 pub mod session_hook;
+pub mod session_index;
 pub mod stdin_pump;
+pub mod store;
+pub mod transport;
 pub mod workspace_lock;
 
 /// Channel name of every turn that comes from an ACP client.

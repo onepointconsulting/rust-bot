@@ -26,6 +26,11 @@ pub const TOOLS_FILE: &str = "TOOLS.md";
 pub const BOOTSTRAP_FILES: [&str; 4] = [AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS_FILE];
 
 const MAX_RECENT_HISTORY: usize = 50;
+
+/// A part of the system prompt that is worked out each time a prompt is built
+/// (it may change between turns, e.g. the agents that exist now).
+pub type PromptSection = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+
 pub struct ContextBuilder {
     workspace: PathBuf,
     timezone: Option<String>,
@@ -33,6 +38,7 @@ pub struct ContextBuilder {
     skills: SkillsLoader,
     tools: Arc<Mutex<ToolRegistry>>,
     default_mode: AgentMode,
+    prompt_sections: Vec<PromptSection>,
 }
 
 impl ContextBuilder {
@@ -59,7 +65,14 @@ impl ContextBuilder {
             memory,
             tools,
             default_mode,
+            prompt_sections: Vec::new(),
         }
+    }
+
+    /// Add a section to every full system prompt, after the skills.
+    pub fn with_prompt_section(mut self, section: PromptSection) -> Self {
+        self.prompt_sections.push(section);
+        self
     }
 
     fn resolve_mode(
@@ -141,6 +154,10 @@ impl ContextBuilder {
                     parts.push(rendered);
                 }
             }
+        }
+
+        if mode.include_skills() {
+            parts.extend(self.prompt_sections.iter().filter_map(|section| section()));
         }
 
         if mode.include_recent_history() {

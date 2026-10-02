@@ -89,6 +89,7 @@ pkcs8 = { version = "0.10", features = ["std"] }
 argon2 = "0.5.3"
 agent-client-protocol = "2.2"
 blocking = "1"
+async-process = "2"
 
 # On Linux, statically link OpenSSL so release binaries do not require libssl.so.3.
 # Windows/macOS use platform TLS (SChannel / Secure Transport), so this is Linux-only.
