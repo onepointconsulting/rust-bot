@@ -134,3 +134,7 @@ strip = true        # drop symbols from the final binary
 # `-C prefer-dynamic` and link the prebuilt libstd (panic_unwind). Mixing that
 # with abort fails with: "the linked panic runtime `panic_unwind` is not
 # compiled with this crate's panic strategy `abort`".
+
+[toolchain]
+channel = "stable"
+targets = ["wasm32-unknown-unknown"]
