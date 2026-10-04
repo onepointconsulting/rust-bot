@@ -49,6 +49,7 @@ const PROVIDER_REQUESTY: &str = "requesty";
 const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_NANOGPT: &str = "nanogpt";
 const PROVIDER_ZAI_SUBSCRIPTION: &str = "zai_subscription";
+const PROVIDER_XIAOMI_SUBSCRIPTION: &str = "xiaomi_subscription";
 
 const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
@@ -161,12 +162,15 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
 
 //Configure LLM providers.
 pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, CliError> {
-    let provider_names = [PROVIDER_OPENROUTER,
+    let provider_names = [
+        PROVIDER_OPENROUTER,
         PROVIDER_ANTHROPIC,
         PROVIDER_EDENAI,
         PROVIDER_REQUESTY,
         PROVIDER_NANOGPT,
-        PROVIDER_ZAI_SUBSCRIPTION];
+        PROVIDER_ZAI_SUBSCRIPTION,
+        PROVIDER_XIAOMI_SUBSCRIPTION,
+    ];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
         provider_names.to_vec().clone(),
@@ -193,9 +197,11 @@ fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         PROVIDER_OPENROUTER => Some("openrouter"),
         PROVIDER_ANTHROPIC => Some("anthropic"),
-        PROVIDER_EDENAI | PROVIDER_REQUESTY | PROVIDER_NANOGPT | PROVIDER_ZAI_SUBSCRIPTION => {
-            Some("custom")
-        }
+        PROVIDER_EDENAI
+        | PROVIDER_REQUESTY
+        | PROVIDER_NANOGPT
+        | PROVIDER_ZAI_SUBSCRIPTION
+        | PROVIDER_XIAOMI_SUBSCRIPTION => Some("custom"),
         _ => None,
     }
 }
@@ -227,6 +233,7 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
             PROVIDER_ANTHROPIC => AnthropicProvider::DEFAULT_API_BASE,
             PROVIDER_NANOGPT => "https://nano-gpt.com/api/v1",
             PROVIDER_ZAI_SUBSCRIPTION => "https://api.z.ai/api/coding/paas/v4",
+            PROVIDER_XIAOMI_SUBSCRIPTION => "https://token-plan-ams.xiaomimimo.com/v1",
             _ => "",
         }
     }
@@ -718,9 +725,13 @@ pub fn config_model(
     let model = agents.model.clone();
     let custom = &providers.custom;
     let (default_model, help_message) = if let Some(api_base) = &custom.api_base
-        && api_base.contains("z.ai")
+        && (api_base.contains("z.ai") || api_base.contains("xiaomi"))
     {
-        ("glm-5.3-flash", "e.g. glm-5.3, glm-5.3-flash")
+        if api_base.contains("z.ai") {
+            ("glm-5.3-flash", "e.g. glm-5.3, glm-5.3-flash")
+        } else {
+            ("mimo-v2.6-pro", "e.g. mimo-v2.6, mimo-v2.6-flash")
+        }
     } else {
         (
             model.as_str(),
