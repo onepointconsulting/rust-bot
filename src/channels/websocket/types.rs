@@ -15,6 +15,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::tools::registry::ToolRegistry;
 use crate::{
     bus::queue::MessageBus,
     channels::gateway_services::GatewayServices,
@@ -52,6 +53,7 @@ pub enum EnvelopeType {
     /// precedent — the Python reference has no skills-discovery envelope;
     /// skills only appear in the agent system prompt.
     ListSkills,
+    ListTools,
     /// Persist a new display title on an existing `websocket:{chat_id}`
     /// session. Rust-side addition with no nanobot precedent — the Python
     /// reference has no rename envelope; titles are LLM-generated only.
@@ -121,6 +123,7 @@ impl From<&str> for EnvelopeType {
             "message" => Self::Message,
             "list_chats" => Self::ListChats,
             "list_skills" => Self::ListSkills,
+            "list_tools" => Self::ListTools,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
             "clear_session" => Self::ClearSession,
@@ -155,6 +158,9 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::ListSkills`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     SkillsList,
+    /// Reply to [`EnvelopeType::ListTools`] — the tools visible to the chat's
+    /// agent mode, as `{name, description}` entries.
+    ToolsList,
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatRenamed,
@@ -215,6 +221,7 @@ impl WsOutboundEvent {
             Self::GoalStatus => "goal_status",
             Self::ChatsList => "chats",
             Self::SkillsList => "skills",
+            Self::ToolsList => "tools",
             Self::ChatRenamed => "chat_renamed",
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
@@ -419,6 +426,10 @@ pub struct WsShared {
     /// Process-wide `agents.mode` default used when a session has no
     /// persisted override (or an invalid one).
     pub default_agent_mode: crate::agent::modes::AgentMode,
+    /// Same `Arc` as `AgentLoop::tools`, so `list_tools` sees the live
+    /// registry (including MCP tools registered after startup). `None` when
+    /// no agent loop was wired in (tests, channel-only setups).
+    pub tool_registry: Option<Arc<StdMutex<ToolRegistry>>>,
 }
 
 /// Upgrade-time JWT outcome for one WebSocket connection. Produced by

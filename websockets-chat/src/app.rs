@@ -24,7 +24,7 @@ use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
     now_rfc3339, ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem,
-    SessionSummaryPopup, SessionTokenUsage, SkillSummary, WorkspaceDialogState,
+    SessionSummaryPopup, SessionTokenUsage, SkillSummary, ToolSummary, WorkspaceDialogState,
     WorkspaceDirectoryEntry,
 };
 
@@ -379,6 +379,11 @@ struct WsContext {
     /// (or on an older gateway that doesn't send it), which hides
     /// `ChatInput`'s skills popup.
     skills: RwSignal<Vec<SkillSummary>>,
+    /// Tools visible under the active chat's agent mode, from the gateway's
+    /// `tools` event. Chat- and mode-scoped (unlike `skills`), so it is
+    /// re-requested each time the tools popup opens rather than once per
+    /// connection. Empty until the first reply.
+    tools: RwSignal<Vec<ToolSummary>>,
     /// Sidebar Summary dialog: `None` when closed, `Some` with empty
     /// `text` while the `get_session_summary` reply is in flight.
     summary_popup: RwSignal<Option<SessionSummaryPopup>>,
@@ -925,6 +930,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::SkillsList { skills } => {
             ctx.skills.set(skills);
         }
+        ServerEvent::ToolsList { tools, .. } => {
+            ctx.tools.set(tools);
+        }
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
         }
@@ -1195,6 +1203,21 @@ fn request_skills_list(ctx: &WsContext) {
         *ctx,
         protocol::ClientEnvelope::list_skills(),
         "Failed to encode the skills list request.",
+    );
+}
+
+/// Ask the gateway which tools the active chat's agent mode exposes.
+/// Fire-and-forget like [`request_skills_list`]; a no-op before the chat id
+/// is known. Stale replies from a previous chat are dropped by
+/// [`should_drop_event`].
+fn request_tools_list(ctx: &WsContext) {
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_tools(chat_id),
+        "Failed to encode the tools list request.",
     );
 }
 
@@ -1806,6 +1829,7 @@ pub fn App() -> impl IntoView {
     let agent_mode = RwSignal::new("standard".to_string());
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
     let skills = RwSignal::new(Vec::<SkillSummary>::new());
+    let tools = RwSignal::new(Vec::<ToolSummary>::new());
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
     let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
     let pending_approval = RwSignal::new(None::<state::PendingApproval>);
@@ -1836,6 +1860,7 @@ pub fn App() -> impl IntoView {
         agent_mode,
         session_usage,
         skills,
+        tools,
         summary_popup,
         workspace_popup,
         pending_approval,
@@ -1954,6 +1979,7 @@ pub fn App() -> impl IntoView {
         model_preset.set("default".to_string());
         session_usage.set(None);
         skills.set(Vec::new());
+        tools.set(Vec::new());
         summary_popup.set(None);
         workspace_popup.set(None);
     };
@@ -2085,6 +2111,7 @@ pub fn App() -> impl IntoView {
     let on_chat_about_question = move || request_question_chat_about(&ws_context);
     let on_select_model_preset = move |name: String| request_set_model_preset(&ws_context, name);
     let on_select_agent_mode = move |name: String| request_set_agent_mode(&ws_context, name);
+    let on_open_tools = move || request_tools_list(&ws_context);
 
     // A turn stays in flight across tool waits, even though those pauses
     // clear `streaming` on the current bubble so the next LLM round can
@@ -2174,6 +2201,8 @@ pub fn App() -> impl IntoView {
                     on_select_agent_mode=on_select_agent_mode
                     session_usage=Signal::derive(move || session_usage.get())
                     skills=Signal::derive(move || skills.get())
+                    tools=Signal::derive(move || tools.get())
+                    on_open_tools=on_open_tools
                     show_logout=!embed_mode
                     show_minimize=!embed_mode
                 />

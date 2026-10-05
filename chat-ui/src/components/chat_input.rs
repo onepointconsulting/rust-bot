@@ -6,6 +6,7 @@ use web_sys::{File, FileList, HtmlInputElement, HtmlTextAreaElement};
 
 use crate::models::{
     format_compact_tokens, ImageAttachment, OutgoingMessage, SessionTokenUsage, SkillSummary,
+    ToolSummary,
 };
 
 const MAX_TEXTAREA_HEIGHT_PX: f64 = 160.0;
@@ -468,6 +469,104 @@ fn SkillsPopup(skills: Signal<Vec<SkillSummary>>) -> impl IntoView {
     }
 }
 
+/// Tools drop-up, rendered on the toolbar row right after [`SkillsPopup`].
+/// A wrench button opens a table of tool name + description. Unlike the
+/// skills popup it is always shown (the list is fetched on demand, so it is
+/// legitimately empty before the first click): `on_open` fires each time the
+/// popup opens so the caller can request the list for the chat's *current*
+/// agent mode. Read-only.
+#[component]
+fn ToolsPopup(tools: Signal<Vec<ToolSummary>>, on_open: Callback<()>) -> impl IntoView {
+    let menu_open = RwSignal::new(false);
+
+    view! {
+        <div class="relative">
+            <button
+                type="button"
+                aria-haspopup="dialog"
+                aria-expanded=move || if menu_open.get() { "true" } else { "false" }
+                aria-label="Available tools"
+                title="Available tools"
+                class="flex h-8 w-8 shrink-0 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                on:click=move |_| {
+                    let opening = !menu_open.get_untracked();
+                    menu_open.set(opening);
+                    if opening {
+                        on_open.run(());
+                    }
+                }
+            >
+                <svg
+                    xmlns="http://www.w3.org/2000/svg"
+                    viewBox="0 0 24 24"
+                    fill="none"
+                    stroke="currentColor"
+                    stroke-width="2"
+                    stroke-linecap="round"
+                    stroke-linejoin="round"
+                    class="h-4 w-4"
+                    aria-hidden="true"
+                >
+                    <path d="M14.7 6.3a1 1 0 0 0 0 1.4l1.6 1.6a1 1 0 0 0 1.4 0l3.77-3.77a6 6 0 0 1-7.94 7.94l-6.91 6.91a2.12 2.12 0 0 1-3-3l6.91-6.91a6 6 0 0 1 7.94-7.94l-3.76 3.76z" />
+                </svg>
+            </button>
+            <div class=move || {
+                if menu_open.get() { "block" } else { "hidden" }
+            }>
+                <div
+                    class="fixed inset-0 z-10"
+                    aria-hidden="true"
+                    on:click=move |_| menu_open.set(false)
+                ></div>
+                <div
+                    role="dialog"
+                    aria-label=move || format!("Available tools ({})", tools.get().len())
+                    class="absolute bottom-full left-0 z-20 mb-1 max-h-72 w-[min(34rem,calc(100vw-4rem))] overflow-y-auto rounded-xl bg-white shadow-lg ring-1 ring-slate-200"
+                >
+                    <p class="px-3 pb-1 pt-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                        {move || format!("Tools ({})", tools.get().len())}
+                    </p>
+                    <Show
+                        when=move || !tools.get().is_empty()
+                        fallback=|| {
+                            view! {
+                                <p class="px-3 py-4 text-center text-xs text-slate-400">
+                                    "No tools available."
+                                </p>
+                            }
+                        }
+                    >
+                        <table class="w-full table-fixed border-collapse text-left">
+                            <thead class="sticky top-0 bg-white">
+                                <tr class="border-b border-slate-200 text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                    <th class="w-2/5 px-3 py-2">"Tool"</th>
+                                    <th class="px-3 py-2">"Description"</th>
+                                </tr>
+                            </thead>
+                            <tbody>
+                                <For
+                                    each=move || tools.get()
+                                    key=|tool| tool.name.clone()
+                                    let(tool)
+                                >
+                                    <tr class="border-b border-slate-100 align-top last:border-0">
+                                        <td class="break-words px-3 py-2 font-mono text-xs font-medium text-slate-700">
+                                            {tool.name.clone()}
+                                        </td>
+                                        <td class="px-3 py-2 text-xs text-slate-500">
+                                            {tool.description.clone()}
+                                        </td>
+                                    </tr>
+                                </For>
+                            </tbody>
+                        </table>
+                    </Show>
+                </div>
+            </div>
+        </div>
+    }
+}
+
 #[component]
 fn AttachmentChip(
     index: usize,
@@ -530,6 +629,15 @@ pub fn ChatInput(
     /// entirely — `web-chat` (no gateway skills protocol) never sets this.
     #[prop(into, optional)]
     skills: Option<Signal<Vec<SkillSummary>>>,
+    /// Tools visible under the chat's current agent mode. Omitted hides the
+    /// tools button entirely — `web-chat` (no gateway tools protocol) never
+    /// sets this. Requires `on_open_tools` to also be set.
+    #[prop(into, optional)]
+    tools: Option<Signal<Vec<ToolSummary>>>,
+    /// Fired each time the tools popup opens, so the caller can (re)request
+    /// the list for the chat's current mode.
+    #[prop(optional)]
+    on_open_tools: Option<Callback<()>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -819,6 +927,14 @@ pub fn ChatInput(
                     match skills {
                         Some(skills) => view! { <SkillsPopup skills=skills /> }.into_any(),
                         None => view! { <></> }.into_any(),
+                    }
+                }}
+                {move || {
+                    match (tools, on_open_tools) {
+                        (Some(tools), Some(on_open)) => {
+                            view! { <ToolsPopup tools=tools on_open=on_open /> }.into_any()
+                        }
+                        _ => view! { <></> }.into_any(),
                     }
                 }}
                 {move || {

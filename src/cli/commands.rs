@@ -12,6 +12,7 @@ use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::tool_approval::ToolApprovalBroker;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
+use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::question::{QUESTION_TOOL_NAME, QuestionTool};
 use crate::api::login::{
     AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
@@ -972,6 +973,7 @@ fn resolve_websocket_channel(
     session_manager: Arc<StdMutex<SessionManager>>,
     workspace_request_handler: WorkspaceRequestHandler,
     runtime_resolver: Arc<ModelRuntimeResolver>,
+    tool_registry: Arc<StdMutex<ToolRegistry>>,
 ) -> Option<Arc<WebSocketChannel>> {
     let raw = config.channels.extra.get(CHANNEL_NAME)?.clone();
     let cfg: WebSocketConfig = serde_json::from_value(raw)
@@ -989,6 +991,7 @@ fn resolve_websocket_channel(
         runtime_resolver,
     );
     channel.default_agent_mode = config.agents.mode;
+    channel.tool_registry = Some(tool_registry);
     Some(Arc::new(channel))
 }
 
@@ -1280,6 +1283,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         Arc::clone(&session_manager),
         agent_loop.workspace_request_handler(),
         Arc::clone(&agent_loop.runtime_resolver),
+        Arc::clone(&agent_loop.tools),
     );
     // Give the WebSocket channel's `delete_chat` handler something to abort
     // in-flight work through. Must happen before `ws_channel.router()` is
@@ -2472,6 +2476,10 @@ mod tests {
         ModelRuntimeResolver::for_tests()
     }
 
+    fn test_tool_registry() -> Arc<StdMutex<ToolRegistry>> {
+        Arc::new(StdMutex::new(ToolRegistry::new()))
+    }
+
     #[test]
     fn resolve_websocket_channel_is_none_when_key_absent() {
         let config = Config::default();
@@ -2483,6 +2491,7 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
             test_runtime_resolver(),
+            test_tool_registry(),
         );
 
         assert!(
@@ -2506,6 +2515,7 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
             test_runtime_resolver(),
+            test_tool_registry(),
         );
 
         assert!(resolved.is_none());
@@ -2525,6 +2535,7 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
             test_runtime_resolver(),
+            test_tool_registry(),
         );
 
         assert!(resolved.is_some());
@@ -2544,6 +2555,7 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
             test_runtime_resolver(),
+            test_tool_registry(),
         );
 
         assert!(resolved.is_none());

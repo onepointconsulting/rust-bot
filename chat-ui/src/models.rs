@@ -127,6 +127,17 @@ pub struct SkillSummary {
     pub description: String,
 }
 
+/// One tool the agent can call, as surfaced by the gateway's `tools` event.
+///
+/// Mirrors the backend's `ToolSummary` (`src/agent/tools/registry.rs`) — a
+/// plain re-declaration for the same reason as [`SkillSummary`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
 /// Current UTC time as RFC3339 (`Date.toISOString()`). Used to stamp live
 /// [`ChatEntry`]s in the browser; not called from host `#[test]`s, where
 /// `js_sys::Date` has no runtime.

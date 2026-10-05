@@ -6,6 +6,13 @@ use crate::agent::tools::base::Tool;
 
 const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
 
+/// Display-oriented view of one registered tool (no parameter schema).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ToolSummary {
+    pub name: String,
+    pub description: String,
+}
+
 // ── ToolRegistry ──────────────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct ToolRegistry {
@@ -128,6 +135,21 @@ impl ToolRegistry {
 
     pub fn tool_names(&self) -> Vec<String> {
         self.tools.keys().cloned().collect()
+    }
+
+    /// Name and description of every registered tool, sorted by name so the
+    /// order is stable across calls (the backing map is unordered).
+    pub fn tool_summaries(&self) -> Vec<ToolSummary> {
+        let mut summaries: Vec<ToolSummary> = self
+            .tools
+            .values()
+            .map(|tool| ToolSummary {
+                name: tool.name(),
+                description: tool.description(),
+            })
+            .collect();
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+        summaries
     }
 
     pub fn len(&self) -> usize {
@@ -327,6 +349,24 @@ mod tests {
         reg.register(Box::new(EchoTool));
         assert_eq!(reg.len(), 1);
         assert!(!reg.is_empty());
+    }
+
+    #[test]
+    fn test_tool_summaries_are_sorted_by_name_and_carry_descriptions() {
+        let reg = registry_with_defaults();
+        let summaries = reg.tool_summaries();
+        let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
+        assert_eq!(names, vec!["add", "echo"]);
+        for summary in &summaries {
+            let tool = reg.get(&summary.name).unwrap();
+            assert_eq!(summary.description, tool.description());
+            assert!(!summary.description.is_empty());
+        }
+    }
+
+    #[test]
+    fn test_tool_summaries_empty_registry() {
+        assert!(ToolRegistry::new().tool_summaries().is_empty());
     }
 
     #[test]

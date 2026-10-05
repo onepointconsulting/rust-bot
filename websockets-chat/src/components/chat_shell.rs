@@ -1,7 +1,7 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsSidebarToggle};
 use chat_ui::models::{
     ChatEntry, OutgoingMessage, SessionListItem, SessionSummaryPopup, SessionTokenUsage,
-    SkillSummary, WorkspaceDialogState,
+    SkillSummary, ToolSummary, WorkspaceDialogState,
 };
 use leptos::prelude::*;
 
@@ -79,6 +79,8 @@ pub fn ChatShell(
     on_select_agent_mode: impl Fn(String) + 'static + Send + Sync + Copy,
     #[prop(into)] session_usage: Signal<Option<SessionTokenUsage>>,
     #[prop(into)] skills: Signal<Vec<SkillSummary>>,
+    #[prop(into)] tools: Signal<Vec<ToolSummary>>,
+    on_open_tools: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(default = true)] show_logout: bool,
     #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
@@ -188,6 +190,8 @@ pub fn ChatShell(
                     on_select_agent_mode=Callback::new(move |name| on_select_agent_mode(name))
                     session_usage=session_usage
                     skills=skills
+                    tools=tools
+                    on_open_tools=Callback::new(move |()| on_open_tools())
                 />
             </div>
         </div>

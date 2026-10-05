@@ -26,9 +26,10 @@ use uuid::Uuid;
 use crate::agent::agent_loop::AgentLoop;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
-use crate::agent::skills::SkillsLoader;
 use crate::agent::question_broker::{QuestionChoice, ResolveError};
+use crate::agent::skills::SkillsLoader;
 use crate::agent::tool_approval::ToolApprovalCall;
+use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
@@ -639,6 +640,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::ListSkills => {
             handle_envelope_list_skills(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListTools => {
+            handle_list_tools(envelope_dispatch_context).await;
         }
         EnvelopeType::SetModelPreset => {
             handle_envelope_set_model_preset(envelope_dispatch_context).await;
@@ -1916,7 +1920,9 @@ fn question_request_payload(
 /// then tell every tab on the chat that the request is settled. A missing or
 /// malformed answer counts as "no answer" rather than an error, so the turn
 /// never hangs on a half-understood reply.
-async fn handle_envelope_question_response<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+async fn handle_envelope_question_response<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
     let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
     let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
@@ -2468,6 +2474,50 @@ async fn handle_envelope_list_skills<'a>(envelope_dispatch_context: EnvelopeDisp
         WsOutboundEvent::SkillsList,
         None,
         serde_json::json!({"skills": summaries}),
+    )
+    .await;
+}
+
+/// Name and description of every tool visible under `session`'s agent mode
+/// (session override, else the process default). Empty when no tool registry
+/// was wired into `shared`.
+fn visible_tool_summaries(shared: &WsShared, session: Option<&Session>) -> Vec<ToolSummary> {
+    let Some(tool_registry) = &shared.tool_registry else {
+        return Vec::new();
+    };
+    let mode = AgentMode::resolve(shared.default_agent_mode, session.map(|s| &s.metadata));
+    tool_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .restrict(mode.allowed_tool_names())
+        .tool_summaries()
+}
+
+/// Handle a `list_tools` envelope: reply with a `tools` event carrying the
+/// `{name, description}` of every tool the chat's agent mode exposes.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_list_tools<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    let tools = {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before
+        // `send_event`'s `.await` below — same discipline as every other
+        // `session_manager` use in this file.
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = session_manager.get_session_internal(&get_session_id(cid));
+        visible_tool_summaries(shared, session.as_ref())
+    };
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ToolsList,
+        None,
+        serde_json::json!({"chat_id": cid, "tools": tools}),
     )
     .await;
 }
@@ -3621,7 +3671,9 @@ async fn handle_envelope_get_session_summary<'a>(
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        session_manager.get_session_internal(&get_session_id(cid)).map(|session| session_summary_fields(&session))
+        session_manager
+            .get_session_internal(&get_session_id(cid))
+            .map(|session| session_summary_fields(&session))
     };
     match summary {
         None => {
@@ -3727,6 +3779,9 @@ pub struct WebSocketChannel {
     /// [`WsShared`] snapshot — see [`Self::shared`].
     runtime_resolver: Arc<ModelRuntimeResolver>,
     pub(crate) default_agent_mode: AgentMode,
+    /// Same `Arc` as `AgentLoop::tools`, cloned into every [`WsShared`]
+    /// snapshot — see [`Self::shared`]. `None` until set by the gateway.
+    pub(crate) tool_registry: Option<Arc<StdMutex<ToolRegistry>>>,
     /// Filesystem root [`serve_media`] confines keys to. Captured at
     /// construction (`get_media_dir(None)`) so tests can point it at a
     /// tempdir the same way they override `gateway_services`.
@@ -3769,6 +3824,7 @@ impl WebSocketChannel {
             reasoning_buffers: StdMutex::new(HashMap::new()),
             runtime_resolver,
             default_agent_mode: AgentMode::Standard,
+            tool_registry: None,
             media_root: get_media_dir(None),
         }
     }
@@ -3883,6 +3939,7 @@ impl WebSocketChannel {
             media_root: self.media_root.clone(),
             runtime_resolver: Arc::clone(&self.runtime_resolver),
             default_agent_mode: self.default_agent_mode,
+            tool_registry: self.tool_registry.clone(),
         }
     }
 
@@ -4753,6 +4810,7 @@ mod tests {
             media_root: tempfile::tempdir().unwrap().keep(),
             runtime_resolver: ModelRuntimeResolver::for_tests(),
             default_agent_mode: AgentMode::Standard,
+            tool_registry: None,
         }
     }
 
@@ -7130,6 +7188,147 @@ mod tests {
         assert!(chat_ids.contains("chat-b"));
     }
 
+    /// Minimal stand-in registering tools under the given names, so the
+    /// `list_tools` tests can exercise mode filtering (`edit_file`/`shell`
+    /// are the Minimal-mode allow-list).
+    struct NamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::agent::tools::base::Tool for NamedTool {
+        fn name(&self) -> String {
+            self.0.to_string()
+        }
+        fn description(&self) -> String {
+            format!("{} description", self.0)
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+        }
+        async fn execute(&self, _params: &serde_json::Value) -> String {
+            String::new()
+        }
+    }
+
+    fn shared_with_tools(tool_names: &[&'static str]) -> WsShared {
+        let mut registry = ToolRegistry::new();
+        for name in tool_names {
+            registry.register(Box::new(NamedTool(name)));
+        }
+        let mut shared = test_shared("browser");
+        shared.tool_registry = Some(Arc::new(StdMutex::new(registry)));
+        shared
+    }
+
+    /// Send a `list_tools` envelope for `chat_id` and return the reply frame.
+    async fn dispatch_list_tools(shared: &WsShared, chat_id: &str) -> serde_json::Value {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_tools"));
+        envelope.insert("chat_id".to_string(), serde_json::json!(chat_id));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+        dispatch_envelope(ctx).await;
+        let frame = rx.try_recv().expect("expected a tools frame");
+        serde_json::from_str(&frame.into_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn handle_list_tools_returns_every_tool_in_standard_mode() {
+        let shared = shared_with_tools(&["shell", "edit_file", "web_search"]);
+        let chat_id = Uuid::new_v4().to_string();
+
+        let body = dispatch_list_tools(&shared, &chat_id).await;
+
+        assert_eq!(body["event"], "tools");
+        assert_eq!(body["chat_id"], chat_id);
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["edit_file", "shell", "web_search"]);
+        assert_eq!(body["tools"][0]["description"], "edit_file description");
+    }
+
+    #[tokio::test]
+    async fn handle_list_tools_restricts_to_the_process_default_mode() {
+        let mut shared = shared_with_tools(&["shell", "edit_file", "web_search"]);
+        shared.default_agent_mode = AgentMode::Minimal;
+        let chat_id = Uuid::new_v4().to_string();
+
+        let body = dispatch_list_tools(&shared, &chat_id).await;
+
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|t| t["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(names, vec!["edit_file", "shell"]);
+    }
+
+    #[test]
+    fn visible_tool_summaries_honours_the_session_mode_override() {
+        let shared = shared_with_tools(&["shell", "edit_file", "web_search"]);
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.metadata.insert(
+            SESSION_AGENT_MODE_METADATA_KEY.to_string(),
+            serde_json::json!("minimal"),
+        );
+
+        let names: Vec<String> = visible_tool_summaries(&shared, Some(&session))
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+
+        assert_eq!(names, vec!["edit_file", "shell"]);
+    }
+
+    #[test]
+    fn visible_tool_summaries_is_empty_without_a_registry() {
+        let shared = test_shared("browser");
+        assert!(visible_tool_summaries(&shared, None).is_empty());
+    }
+
+    #[tokio::test]
+    async fn handle_list_tools_rejects_a_missing_chat_id() {
+        let shared = shared_with_tools(&["shell"]);
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_tools"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared: &shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+
+        dispatch_envelope(ctx).await;
+
+        let frame = rx.try_recv().expect("expected an error frame");
+        let body: serde_json::Value = serde_json::from_str(&frame.into_text().unwrap()).unwrap();
+        assert_eq!(body["event"], "error");
+    }
+
     #[tokio::test]
     async fn handle_envelope_list_skills_includes_workspace_skill_name_and_description() {
         let shared = test_shared("browser");
@@ -8599,8 +8798,7 @@ mod tests {
             .register("conn-1", "chat-1", tx);
         let (request_id, rx) = broker.register("chat-1", vec![approval_call("a")]);
 
-        dispatch_tool_approval_response(&shared, "conn-1", "chat-1", Some(&request_id), None)
-            .await;
+        dispatch_tool_approval_response(&shared, "conn-1", "chat-1", Some(&request_id), None).await;
 
         assert!(rx.await.unwrap().is_empty());
     }

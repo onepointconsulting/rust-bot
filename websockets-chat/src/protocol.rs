@@ -19,7 +19,7 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    ChatEntry, ImageAttachment, Role, SessionTokenUsage, SkillSummary, ToolEvent,
+    ChatEntry, ImageAttachment, Role, SessionTokenUsage, SkillSummary, ToolEvent, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -253,6 +253,33 @@ impl ClientEnvelope {
         Self {
             type_: "list_skills",
             chat_id: None,
+            turn_id: None,
+            content: None,
+            media: None,
+            title: None,
+            model_preset: None,
+            mode: None,
+            before_user_index: None,
+            path: None,
+            workspace_folder: None,
+            access_mode: None,
+            request_id: None,
+            approved_ids: None,
+            option_id: None,
+            free_text: None,
+            chat_about: false,
+            webui: true,
+        }
+    }
+
+    /// Ask the gateway which tools `chat_id`'s agent mode exposes. Unlike
+    /// [`ClientEnvelope::list_skills`] this is chat-scoped, because the
+    /// `minimal` mode hides most tools. The reply is a `tools` event (see
+    /// [`ServerEvent::ToolsList`]).
+    pub fn list_tools(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "list_tools",
+            chat_id: Some(chat_id.into()),
             turn_id: None,
             content: None,
             media: None,
@@ -792,6 +819,12 @@ pub enum ServerEvent {
     /// process (workspace + builtin). Not scoped to any one `chat_id` —
     /// see [`ServerEvent::chat_id`].
     SkillsList { skills: Vec<SkillSummary> },
+    /// Reply to a [`ClientEnvelope::list_tools`] envelope: the tools visible
+    /// under `chat_id`'s agent mode, sorted by name.
+    ToolsList {
+        chat_id: String,
+        tools: Vec<ToolSummary>,
+    },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
     /// Reply to a `delete_chat` envelope, fanned out to every connection
@@ -898,6 +931,7 @@ impl ServerEvent {
             | ServerEvent::TurnAborted { chat_id, .. }
             | ServerEvent::ModelPresetSet { chat_id, .. }
             | ServerEvent::ModeSet { chat_id, .. }
+            | ServerEvent::ToolsList { chat_id, .. }
             | ServerEvent::ToolApprovalRequest { chat_id, .. }
             | ServerEvent::ToolApprovalResolved { chat_id, .. }
             | ServerEvent::QuestionRequest { chat_id, .. }
@@ -1205,6 +1239,12 @@ struct SkillsListWire {
 }
 
 #[derive(Deserialize)]
+struct ToolsListWire {
+    chat_id: String,
+    tools: Vec<ToolSummary>,
+}
+
+#[derive(Deserialize)]
 struct ChatRenamedWire {
     chat_id: String,
     title: String,
@@ -1407,6 +1447,10 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "skills" => {
             decode::<SkillsListWire>(&value).map(|w| ServerEvent::SkillsList { skills: w.skills })
         }
+        "tools" => decode::<ToolsListWire>(&value).map(|w| ServerEvent::ToolsList {
+            chat_id: w.chat_id,
+            tools: w.tools,
+        }),
         "chat_renamed" => decode::<ChatRenamedWire>(&value).map(|w| ServerEvent::ChatRenamed {
             chat_id: w.chat_id,
             title: w.title,
@@ -2224,6 +2268,54 @@ mod tests {
             value,
             serde_json::json!({
                 "type": "list_skills",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_tools_list() {
+        let raw = r#"{"event":"tools","chat_id":"chat-1","tools":[
+            {"name":"edit_file","description":"Edit a file"},
+            {"name":"shell"}
+        ]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ToolsList {
+                chat_id: "chat-1".to_string(),
+                tools: vec![
+                    ToolSummary {
+                        name: "edit_file".to_string(),
+                        description: "Edit a file".to_string(),
+                    },
+                    ToolSummary {
+                        name: "shell".to_string(),
+                        description: String::new(),
+                    },
+                ],
+            }
+        );
+    }
+
+    #[test]
+    fn tools_list_is_scoped_to_its_chat_id() {
+        let event = ServerEvent::ToolsList {
+            chat_id: "chat-1".to_string(),
+            tools: Vec::new(),
+        };
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn client_envelope_list_tools_serializes_expected_shape() {
+        let envelope = ClientEnvelope::list_tools("chat-1");
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "list_tools",
+                "chat_id": "chat-1",
                 "webui": true,
             })
         );
