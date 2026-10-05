@@ -9,7 +9,7 @@
 /// and read by [`crate::agent::model_runtime::ModelRuntimeResolver::runtime_for_session`].
 pub const SESSION_MODEL_PRESET_METADATA_KEY: &str = "model_preset";
 
-/// Session-scoped agent mode override (`standard` / `minimal`), written by
+/// Session-scoped agent mode override (`standard` / `minimal` / `no_mcp`), written by
 /// `/mode <name>` and `set_mode`. Absent or invalid falls back to the
 /// process-wide `agents.mode` default.
 pub const SESSION_AGENT_MODE_METADATA_KEY: &str = "mode";

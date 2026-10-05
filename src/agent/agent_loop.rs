@@ -627,7 +627,10 @@ impl AgentLoop {
             return Ok(self.config.agents.mode);
         }
         let mode = AgentMode::parse(name).ok_or_else(|| {
-            format!("Unknown agent mode '{name}'. Available modes: standard, minimal")
+            format!(
+                "Unknown agent mode '{name}'. Available modes: {}",
+                AgentMode::available_names()
+            )
         })?;
         session.metadata.insert(
             SESSION_AGENT_MODE_METADATA_KEY.to_string(),
@@ -666,10 +669,8 @@ impl AgentLoop {
     /// Tools visible to this session after applying its agent mode.
     pub fn tools_for_session(&self, session: Option<&Session>) -> ToolRegistry {
         let mode = self.mode_for_session(session);
-        self.tools
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .restrict(mode.allowed_tool_names())
+        let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        mode.restrict_tools(&registry)
     }
 
     /// Resolve the workspace scope a session would use right now (its

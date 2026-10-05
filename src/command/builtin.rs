@@ -838,7 +838,7 @@ struct CmdMode;
 
 /// Show or switch the agent composition mode used by this chat session.
 ///
-/// `/mode` (no args) reports the effective mode. `/mode standard|minimal`
+/// `/mode` (no args) reports the effective mode. `/mode standard|minimal|no_mcp`
 /// persists an override for this session only. `/mode default` clears it.
 #[async_trait]
 impl CommandHandler for CmdMode {
@@ -1207,7 +1207,7 @@ fn build_help_text() -> String {
         "/model — Show the current model",
         "/model-preset — Show the current preset's model and provider or switch to a different preset",
         "/model-presets — List available model presets",
-        "/mode — Show this session's agent mode, or switch it: /mode standard|minimal, /mode default to clear",
+        "/mode — Show this session's agent mode, or switch it: /mode standard|minimal|no_mcp, /mode default to clear",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
         "/dream-restore — Revert memory to a previous state",

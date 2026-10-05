@@ -187,10 +187,20 @@ fn ModelPresetPicker(
     }
 }
 
+/// Display text for an agent-mode wire value: `no_mcp` reads as "no mcp".
+fn agent_mode_label(mode: &str) -> String {
+    mode.replace('_', " ")
+}
+
 #[component]
 fn AgentModePicker(selected: Signal<String>, on_select: Callback<String>) -> impl IntoView {
     let menu_open = RwSignal::new(false);
-    let modes = vec!["standard".to_string(), "minimal".to_string()];
+    // Wire values; `agent_mode_label` renders them for display.
+    let modes = vec![
+        "standard".to_string(),
+        "minimal".to_string(),
+        "no_mcp".to_string(),
+    ];
 
     view! {
         <div class="relative">
@@ -203,7 +213,7 @@ fn AgentModePicker(selected: Signal<String>, on_select: Callback<String>) -> imp
                 class="flex items-center gap-1 rounded-full px-2.5 py-1 text-xs font-medium text-slate-500 hover:bg-slate-100 hover:text-slate-700"
                 on:click=move |_| menu_open.update(|open| *open = !*open)
             >
-                <span>{move || selected.get()}</span>
+                <span>{move || agent_mode_label(&selected.get())}</span>
                 <svg
                     xmlns="http://www.w3.org/2000/svg"
                     viewBox="0 0 24 24"
@@ -246,7 +256,7 @@ fn AgentModePicker(selected: Signal<String>, on_select: Callback<String>) -> imp
                                         on_select.run(name_for_click.clone());
                                     }
                                 >
-                                    <span>{name.clone()}</span>
+                                    <span>{agent_mode_label(&name)}</span>
                                     <Show when=move || selected.get() == name_for_check>
                                         <span aria-hidden="true">"\u{2713}"</span>
                                     </Show>
@@ -616,7 +626,7 @@ pub fn ChatInput(
     #[prop(into, optional)]
     selected_model_preset: Option<Signal<String>>,
     #[prop(optional)] on_select_model_preset: Option<Callback<String>>,
-    /// Current agent mode (`standard` / `minimal`). Omitted hides the picker.
+    /// Current agent mode (`standard` / `minimal` / `no_mcp`). Omitted hides the picker.
     #[prop(into, optional)]
     selected_agent_mode: Option<Signal<String>>,
     #[prop(optional)] on_select_agent_mode: Option<Callback<String>>,
@@ -971,5 +981,21 @@ pub fn ChatInput(
                 }}
             </div>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::agent_mode_label;
+
+    #[test]
+    fn agent_mode_label_replaces_underscores_with_spaces() {
+        assert_eq!(agent_mode_label("no_mcp"), "no mcp");
+    }
+
+    #[test]
+    fn agent_mode_label_leaves_plain_names_alone() {
+        assert_eq!(agent_mode_label("standard"), "standard");
+        assert_eq!(agent_mode_label("minimal"), "minimal");
     }
 }

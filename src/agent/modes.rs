@@ -1,4 +1,5 @@
-//! Per-session agent composition modes (Standard vs pragmatic Minimal).
+//! Per-session agent composition modes (Standard, pragmatic Minimal, and
+//! NoMcp, which is Standard without the MCP-provided tools).
 //!
 //! Mode is a view over the process-wide tool registry and system prompt, not a
 //! second catalog. Resolution: session metadata override if present and valid,
@@ -7,6 +8,8 @@
 use std::collections::HashMap;
 
 use serde::{Deserialize, Serialize};
+
+use crate::agent::tools::registry::ToolRegistry;
 
 pub use crate::session::keys::SESSION_AGENT_MODE_METADATA_KEY;
 
@@ -25,6 +28,9 @@ pub enum AgentMode {
     #[default]
     Standard,
     Minimal,
+    /// Standard prompt and tools, minus every `mcp_*` tool.
+    #[serde(rename = "no_mcp")]
+    NoMcp,
 }
 
 impl std::fmt::Display for AgentMode {
@@ -34,19 +40,31 @@ impl std::fmt::Display for AgentMode {
 }
 
 impl AgentMode {
+    /// Every mode, in the order clients should list them.
+    pub const ALL: [Self; 3] = [Self::Standard, Self::Minimal, Self::NoMcp];
+
     pub fn as_str(self) -> &'static str {
         match self {
             Self::Standard => "standard",
             Self::Minimal => "minimal",
+            Self::NoMcp => "no_mcp",
         }
     }
 
+    /// Comma-separated mode names for user-facing "available modes" errors.
+    pub fn available_names() -> String {
+        Self::ALL.map(Self::as_str).join(", ")
+    }
+
     /// Parse a mode name. `"default"` is not a mode — callers treat it as
-    /// "clear the session override."
+    /// "clear the session override." Spaces and hyphens are accepted in place
+    /// of underscores, so `no_mcp`, `no-mcp` and `no mcp` are the same mode.
     pub fn parse(name: &str) -> Option<Self> {
-        match name.trim().to_ascii_lowercase().as_str() {
+        let normalized = name.trim().to_ascii_lowercase().replace([' ', '-'], "_");
+        match normalized.as_str() {
             "standard" => Some(Self::Standard),
             "minimal" => Some(Self::Minimal),
+            "no_mcp" => Some(Self::NoMcp),
             _ => None,
         }
     }
@@ -68,45 +86,61 @@ impl AgentMode {
         Self::parse(name).unwrap_or(default)
     }
 
-    /// `None` means every registered tool is visible (Standard).
-    pub fn allowed_tool_names(self) -> Option<&'static [&'static str]> {
+    /// Whether the tool called `name` is visible in this mode. A predicate
+    /// rather than a static allow-list because NoMcp is "everything except
+    /// `mcp_*`", which a fixed list of names cannot express (MCP tools are
+    /// registered at runtime).
+    pub fn allows_tool(self, name: &str) -> bool {
         match self {
-            Self::Standard => None,
-            Self::Minimal => Some(MINIMAL_TOOLS),
+            Self::Standard => true,
+            Self::Minimal => MINIMAL_TOOLS.contains(&name),
+            Self::NoMcp => !ToolRegistry::is_mcp_tool_name(name),
         }
     }
 
+    /// The tools of `registry` that this mode exposes.
+    pub fn restrict_tools(self, registry: &ToolRegistry) -> ToolRegistry {
+        registry.restrict_by(|name| self.allows_tool(name))
+    }
+
+    /// Standard prompt composition: everything except Minimal's pared-down one.
+    fn uses_standard_prompt(self) -> bool {
+        matches!(self, Self::Standard | Self::NoMcp)
+    }
+
     pub fn bootstrap_files(self) -> &'static [&'static str] {
-        match self {
-            Self::Standard => STANDARD_BOOTSTRAP_FILES,
-            Self::Minimal => MINIMAL_BOOTSTRAP_FILES,
+        if self.uses_standard_prompt() {
+            STANDARD_BOOTSTRAP_FILES
+        } else {
+            MINIMAL_BOOTSTRAP_FILES
         }
     }
 
     pub fn include_identity(self) -> bool {
-        matches!(self, Self::Standard)
+        self.uses_standard_prompt()
     }
 
     pub fn include_memory(self) -> bool {
-        matches!(self, Self::Standard)
+        self.uses_standard_prompt()
     }
 
     pub fn include_skills(self) -> bool {
-        matches!(self, Self::Standard)
+        self.uses_standard_prompt()
     }
 
     pub fn include_recent_history(self) -> bool {
-        matches!(self, Self::Standard)
+        self.uses_standard_prompt()
     }
 
     pub fn include_goal_runtime(self) -> bool {
-        matches!(self, Self::Standard)
+        self.uses_standard_prompt()
     }
 
     pub fn fallback_system_prompt(self) -> Option<&'static str> {
-        match self {
-            Self::Standard => None,
-            Self::Minimal => Some(MINIMAL_FALLBACK_PROMPT),
+        if self.uses_standard_prompt() {
+            None
+        } else {
+            Some(MINIMAL_FALLBACK_PROMPT)
         }
     }
 }
@@ -177,10 +211,77 @@ mod tests {
     }
 
     #[test]
-    fn minimal_allow_list_is_shell_and_edit_file() {
-        assert_eq!(AgentMode::Standard.allowed_tool_names(), None);
-        let names = AgentMode::Minimal.allowed_tool_names().unwrap();
-        assert_eq!(names, ["edit_file", "shell"]);
+    fn parse_accepts_no_mcp_spellings() {
+        for spelling in ["no_mcp", "NO_MCP", "no mcp", "  No-Mcp  "] {
+            assert_eq!(
+                AgentMode::parse(spelling),
+                Some(AgentMode::NoMcp),
+                "{spelling}"
+            );
+        }
+        assert_eq!(AgentMode::parse("nomcp"), None);
+    }
+
+    #[test]
+    fn as_str_round_trips_through_parse_for_every_mode() {
+        for mode in AgentMode::ALL {
+            assert_eq!(AgentMode::parse(mode.as_str()), Some(mode));
+        }
+    }
+
+    #[test]
+    fn available_names_lists_every_mode() {
+        assert_eq!(AgentMode::available_names(), "standard, minimal, no_mcp");
+    }
+
+    #[test]
+    fn resolve_honors_a_no_mcp_session_override() {
+        let mut meta = HashMap::new();
+        meta.insert(
+            SESSION_AGENT_MODE_METADATA_KEY.to_string(),
+            serde_json::json!("no_mcp"),
+        );
+        assert_eq!(
+            AgentMode::resolve(AgentMode::Standard, Some(&meta)),
+            AgentMode::NoMcp
+        );
+    }
+
+    #[test]
+    fn standard_allows_every_tool() {
+        assert!(AgentMode::Standard.allows_tool("shell"));
+        assert!(AgentMode::Standard.allows_tool("mcp_search"));
+    }
+
+    #[test]
+    fn minimal_allows_only_shell_and_edit_file() {
+        assert!(AgentMode::Minimal.allows_tool("edit_file"));
+        assert!(AgentMode::Minimal.allows_tool("shell"));
+        assert!(!AgentMode::Minimal.allows_tool("web_search"));
+        assert!(!AgentMode::Minimal.allows_tool("mcp_search"));
+    }
+
+    #[test]
+    fn no_mcp_hides_only_mcp_prefixed_tools() {
+        assert!(AgentMode::NoMcp.allows_tool("shell"));
+        assert!(AgentMode::NoMcp.allows_tool("web_search"));
+        assert!(!AgentMode::NoMcp.allows_tool("mcp_search"));
+        assert!(!AgentMode::NoMcp.allows_tool("mcp_github_create_issue"));
+    }
+
+    #[test]
+    fn no_mcp_uses_the_standard_prompt_composition() {
+        let mode = AgentMode::NoMcp;
+        assert!(mode.include_identity());
+        assert!(mode.include_memory());
+        assert!(mode.include_skills());
+        assert!(mode.include_recent_history());
+        assert!(mode.include_goal_runtime());
+        assert_eq!(
+            mode.bootstrap_files(),
+            AgentMode::Standard.bootstrap_files()
+        );
+        assert!(mode.fallback_system_prompt().is_none());
     }
 
     #[test]
@@ -219,6 +320,14 @@ mod tests {
         assert_eq!(
             serde_json::from_str::<AgentMode>("\"standard\"").unwrap(),
             AgentMode::Standard
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentMode::NoMcp).unwrap(),
+            "\"no_mcp\""
+        );
+        assert_eq!(
+            serde_json::from_str::<AgentMode>("\"no_mcp\"").unwrap(),
+            AgentMode::NoMcp
         );
     }
 }

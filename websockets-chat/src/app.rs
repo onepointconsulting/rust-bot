@@ -366,7 +366,7 @@ struct WsContext {
     /// [`request_set_model_preset`] and reconciled by the `attached` /
     /// `model_preset_set` acks.
     model_preset: RwSignal<String>,
-    /// This chat's resolved agent mode (`standard` / `minimal`).
+    /// This chat's resolved agent mode (`standard` / `minimal` / `no_mcp`).
     agent_mode: RwSignal<String>,
     /// This chat's lifetime token/cost totals, from the active chat's
     /// `attached` frame and refreshed by `session_updated` after each turn.

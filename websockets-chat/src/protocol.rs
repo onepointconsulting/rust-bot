@@ -49,7 +49,7 @@ pub struct ClientEnvelope {
     /// envelope type.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub model_preset: Option<String>,
-    /// Set only by [`Self::set_mode`] — `standard` / `minimal` / `default`.
+    /// Set only by [`Self::set_mode`] — `standard` / `minimal` / `no_mcp` / `default`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<String>,
     /// Set only by [`Self::fork_chat_before`]: a 0-based index into the

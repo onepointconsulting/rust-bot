@@ -2486,11 +2486,8 @@ fn visible_tool_summaries(shared: &WsShared, session: Option<&Session>) -> Vec<T
         return Vec::new();
     };
     let mode = AgentMode::resolve(shared.default_agent_mode, session.map(|s| &s.metadata));
-    tool_registry
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .restrict(mode.allowed_tool_names())
-        .tool_summaries()
+    let registry = tool_registry.lock().unwrap_or_else(|e| e.into_inner());
+    mode.restrict_tools(&registry).tool_summaries()
 }
 
 /// Handle a `list_tools` envelope: reply with a `tools` event carrying the
@@ -7294,6 +7291,19 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["edit_file", "shell"]);
+    }
+
+    #[test]
+    fn visible_tool_summaries_hides_mcp_tools_in_no_mcp_mode() {
+        let mut shared = shared_with_tools(&["shell", "mcp_github_search", "web_search"]);
+        shared.default_agent_mode = AgentMode::NoMcp;
+
+        let names: Vec<String> = visible_tool_summaries(&shared, None)
+            .into_iter()
+            .map(|summary| summary.name)
+            .collect();
+
+        assert_eq!(names, vec!["shell", "web_search"]);
     }
 
     #[test]

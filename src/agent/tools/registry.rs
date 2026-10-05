@@ -4,6 +4,9 @@ use std::sync::Arc;
 
 use crate::agent::tools::base::Tool;
 
+/// Name prefix every MCP-provided tool is registered under.
+pub const MCP_TOOL_PREFIX: &str = "mcp_";
+
 const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
 
 /// Display-oriented view of one registered tool (no parameter schema).
@@ -56,7 +59,7 @@ impl ToolRegistry {
         let mut mcp_tools: Vec<serde_json::Value> = Vec::new();
 
         for schema in self.tools.values().map(|t| t.to_schema()) {
-            if Self::schema_name(&schema).starts_with("mcp_") {
+            if Self::is_mcp_tool_name(&Self::schema_name(&schema)) {
                 mcp_tools.push(schema);
             } else {
                 builtins.push(schema);
@@ -164,19 +167,21 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
-    /// Return a registry that exposes only `allow`, or `self` cloned when
-    /// `allow` is `None` (Standard: every registered tool stays visible).
-    pub fn restrict(&self, allow: Option<&[&str]>) -> ToolRegistry {
-        let Some(allow) = allow else {
-            return self.clone();
-        };
-        let mut tools = HashMap::new();
-        for name in allow {
-            if let Some(tool) = self.tools.get(*name) {
-                tools.insert((*name).to_string(), tool.clone());
-            }
-        }
+    /// Return a registry exposing only the tools whose name satisfies `keep`.
+    /// The original registry is untouched, so this is a per-call view.
+    pub fn restrict_by(&self, keep: impl Fn(&str) -> bool) -> ToolRegistry {
+        let tools = self
+            .tools
+            .iter()
+            .filter(|(name, _)| keep(name))
+            .map(|(name, tool)| (name.clone(), tool.clone()))
+            .collect();
         ToolRegistry { tools }
+    }
+
+    /// Whether `name` is an MCP-provided tool (see [`MCP_TOOL_PREFIX`]).
+    pub fn is_mcp_tool_name(name: &str) -> bool {
+        name.starts_with(MCP_TOOL_PREFIX)
     }
 
     /// Extract a normalised tool name from either OpenAI-wrapped or flat schemas.
@@ -385,19 +390,38 @@ mod tests {
     }
 
     #[test]
-    fn restrict_none_clones_the_full_catalog() {
+    fn restrict_by_keeping_everything_clones_the_full_catalog() {
         let reg = registry_with_defaults();
-        let view = reg.restrict(None);
+        let view = reg.restrict_by(|_| true);
         let mut names = view.tool_names();
         names.sort();
         assert_eq!(names, vec!["add", "echo"]);
     }
 
     #[test]
-    fn restrict_keep_listed_tools_and_drops_the_rest() {
+    fn restrict_by_can_drop_only_mcp_tools() {
         let mut reg = registry_with_defaults();
         reg.register(Box::new(McpSearchTool));
-        let view = reg.restrict(Some(&["echo"]));
+        let view = reg.restrict_by(|name| !ToolRegistry::is_mcp_tool_name(name));
+        let mut names = view.tool_names();
+        names.sort();
+        assert_eq!(names, vec!["add", "echo"]);
+        // The source registry still has the MCP tool.
+        assert!(reg.has("mcp_search"));
+    }
+
+    #[test]
+    fn is_mcp_tool_name_matches_the_prefix_only() {
+        assert!(ToolRegistry::is_mcp_tool_name("mcp_search"));
+        assert!(!ToolRegistry::is_mcp_tool_name("search_mcp"));
+        assert!(!ToolRegistry::is_mcp_tool_name("echo"));
+    }
+
+    #[test]
+    fn restrict_by_keeps_listed_tools_and_drops_the_rest() {
+        let mut reg = registry_with_defaults();
+        reg.register(Box::new(McpSearchTool));
+        let view = reg.restrict_by(|name| name == "echo");
         assert!(view.has("echo"));
         assert!(!view.has("add"));
         assert!(!view.has("mcp_search"));

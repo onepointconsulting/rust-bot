@@ -489,7 +489,7 @@ pub struct AgentsConfig {
     #[garde(skip)]
     pub model_preset: Option<String>,
 
-    /// Process-wide default agent composition (`standard` or `minimal`).
+    /// Process-wide default agent composition (`standard`, `minimal` or `no_mcp`).
     /// Sessions may override this via `/mode` / `set_mode`.
     #[serde(alias = "mode", default = "default_agent_mode")]
     #[garde(skip)]
