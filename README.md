@@ -8,25 +8,9 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 - [Testing](#testing)
 - [Build](#build)
 - [Quick start](#quick-start)
-- [Command line](#command-line)
-  - `agent` [subcommand](#agent-subcommand)
-  - [JWT keypair and tokens](#jwt-keypair-and-tokens)
-  - [Exit codes](#exit-codes)
-  - [Examples](#examples)
-- [Interactive console](#interactive-console)
-  - [Starting the console](#starting-the-console)
-  - [Key bindings](#key-bindings)
-  - [History](#history)
-  - [Image paste](#image-paste)
-  - [Multi-line input](#multi-line-input)
-  - [Leaving the console](#leaving-the-console)
-- [Chat commands](#chat-commands)
-  - `[/mcp-preset](#mcp-preset)`
-- [Gmail support](#gmail-support)
-  - [Google Cloud setup](#google-cloud-setup)
-  - [OAuth helper (](#oauth-helper-gmail-auth)`gmail-auth`[)](#oauth-helper-gmail-auth)
-  - [Enabling the Gmail tools](#enabling-the-gmail-tools)
-  - [Gmail agent tools](#gmail-agent-tools)
+- [Command line](#command-line) (see [docs/COMMAND_LINE.md](docs/COMMAND_LINE.md))
+- [Interactive console](#interactive-console) (including chat commands; see [docs/INTERACTIVE_CONSOLE.md](docs/INTERACTIVE_CONSOLE.md))
+- [Gmail support](#gmail-support) (see [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md))
 - [Configuration](#configuration)
 - [Project layout](#project-layout)
 
@@ -65,6 +49,8 @@ cargo test --lib
 
 ## Build
 
+In order to build the whole project you can use the build script:
+
 ```
 cargo build -r
 ```
@@ -81,11 +67,15 @@ This produces `target/release/gmail-auth` (or `.\target\release\gmail-auth.exe` 
 
 To build both the CLI and the web-chat UI in one step (requires [Trunk](https://trunkrs.dev); see [Web chat UI](#web-chat-ui)):
 
+Linux:
 ```bash
 ./scripts/build_all.sh
 ```
 
-
+Windows:
+```ps1
+.\scripts\build_all.bat [--release]
+```
 
 ## Quick start
 
@@ -93,7 +83,7 @@ Pre-built packages are on [GitHub Releases](https://github.com/onepointconsultin
 
 ```bash
 # Download the binary distribution with wget
-VERSION=0.1.8
+VERSION=0.3.0
 wget "https://github.com/onepointconsulting/rust-bot/releases/download/v${VERSION}/rust-bot-${VERSION}-linux-x86_64.tar.gz"
 
 # Unpack
@@ -107,7 +97,7 @@ cd "rust-bot-${VERSION}-linux-x86_64"
 ./rust-bot agent -c ./.rust-bot/config.json -m "Hello!"
 ```
 
-Omit `-m` to enter the [interactive console](#interactive-console). Windows, Linux ARM64, and macOS archives are `rust-bot-<version>-windows-x86_64.zip`, `rust-bot-<version>-linux-aarch64.tar.gz`, and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
+Omit `-m` to enter the [interactive console](docs/INTERACTIVE_CONSOLE.md). Windows, Linux ARM64, and macOS archives are `rust-bot-<version>-windows-x86_64.zip`, `rust-bot-<version>-linux-aarch64.tar.gz`, and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
 
 ---
 
@@ -115,138 +105,8 @@ Omit `-m` to enter the [interactive console](#interactive-console). Windows, Lin
 
 ## Command line
 
-Run the agent from the terminal:
+The full command-line reference (the `agent` subcommand and its flags, JWT keypair and token generation, exit codes, and examples) lives in [docs/COMMAND_LINE.md](docs/COMMAND_LINE.md).
 
-```
-cargo run -- agent [OPTIONS]
-```
-
-After a release build (`cargo build -r`), use:
-
-```
-rust-bot agent [OPTIONS]
-```
-
-
-
-### `agent` subcommand
-
-Run the agent from the command line. For the full, up-to-date option list:
-
-```
-cargo run -- agent --help
-```
-
-
-| Flag                           | Default                   | Description                                                                                  |
-| ------------------------------ | ------------------------- | -------------------------------------------------------------------------------------------- |
-| `-m`, `--message`              | *(none)*                  | Message to send to the agent. Omit to enter the [interactive console](#interactive-console). |
-| `-s`, `--session`              | `cli:direct`              | Session ID                                                                                   |
-| `-w`, `--workspace`            | `~/.rust-bot/workspace`   | Workspace directory                                                                          |
-| `-c`, `--config`               | `~/.rust-bot/config.json` | Config file path                                                                             |
-| `--markdown` / `--no-markdown` | `true`                    | Render assistant output as Markdown                                                          |
-| `--logs` / `--no-logs`         | `false`                   | Show runtime logs during chat                                                                |
-
-
-### JWT keypair and tokens
-
-JWT auth for the REST API and WebSocket gateway is configured through two
-`rust-bot` subcommands (no separate helper binary).
-
-Generate an Ed25519 keypair and write the key paths into the config:
-
-```
-cargo run -- generate-jwt-keypair --config ./path/to/config.json
-```
-
-After a release build:
-
-```
-rust-bot generate-jwt-keypair --config ./path/to/config.json
-```
-
-Keys are written to `./.rust-bot/credentials/` by default. Pass
-`--credentials-dir` to choose another directory, or `--force` to overwrite
-existing keys.
-
-Mint a bearer token and register a user:
-
-```
-cargo run -- generate-jwt-token --config ./path/to/config.json \
-  --user-email user@example.com --users-file ./path/to/users.json \
-  --password "correct horse battery staple"
-```
-
-`--user-email`, `--users-file`, and `--password` are required. Optional
-flags: `--iss`, `--aud`, `--purpose` (e.g. `webui` for the WebSocket chat
-UI), `--expires-in-months` (default: 6). The JWT is printed to stdout. The
-password is hashed with Argon2id and stored in the users file for
-`/v1/login`.
-
-For the full option list:
-
-```
-cargo run -- generate-jwt-keypair --help
-cargo run -- generate-jwt-token --help
-```
-
-
-### Exit codes
-
-
-| Code | Constant                   | Meaning                                                                  |
-| ---- | -------------------------- | ------------------------------------------------------------------------ |
-| `0`  | `SUCCESS`                  | Success (also used after spawning a restarted process on Windows)        |
-| `1`  | `GENERAL_ERROR`            | Config or general CLI error                                              |
-| `3`  | `INVALID_PROVIDER`         | Invalid provider (unknown value in `agents.provider`)                    |
-| `4`  | `GMAIL_CONFIG_ERROR`       | Gmail tool credentials missing (OAuth client secret or token cache)      |
-| `5`  | `CHANNEL_ALLOW_FROM_EMPTY` | Channel has an empty `allowFrom` list (set `["*"]` or specific user IDs) |
-
-
-Constants live in `src/utils/exit_codes.rs`.
-
-Workspace seed files (`AGENTS.md`, `SOUL.md`, `TOOLS.md`, `USER.md`, …) are compiled into the
-binary, so onboarding always works even without a sibling `templates/` folder. Drop a
-`templates/` directory next to the binary (or set `RUST_BOT_TEMPLATES_DIR`) to override the
-bundled defaults with your own.
-
-### Examples
-
-```bash
-# Single message
-cargo run -- agent -m "What files are in the workspace?" \
-    --config ./configs/openai-compat/config.json
-
-# Custom session and workspace
-cargo run -- agent -m "hello" -s myproject:cli -w ~/.rust-bot/workspace
-
-# Plain-text output, with runtime logs
-cargo run -- agent -m "status" --no-markdown --logs
-```
-
-```ps1
-cargo run -- agent -m "How is the weather in London?" --config ./configs/openai-compat/config.json --logs
-cargo run -- agent -m "How is the weather in London?" --config ./configs/openai-compat/config.json --no-logs
-cargo run -- agent -m "Can you please give me a quick summary of the services offered by Onepoint Consulting Ltd from London? Then please write this summary to a file called onepoint.html in the workspace folder." --config ./configs/openai-compat/config.json --logs
-cargo run -- agent -m "Which are the main competitors of Onepoint Consulting Ltd? Can you create an html page with the information on competitors with the onepoint_competitors?" --config ./configs/openai-compat/config.json --logs
-cargo run -- agent -m "Can you produce a commit message for the staged files in the current git project (current folder)?" --config ./configs/openai-compat/config_current_folder.json --logs
-cargo run -- agent -m "Can you add all files that are not staged to the staging area in the current folder? Use git ..." --config ./configs/openai-compat/config_current_folder.json --logs
-cargo run -- agent -m "Can you write a nice commit message for the staged files? Use git ..." --config ./configs/openai-compat/config_current_folder.json --logs
-
-# Interactive mode (see the Interactive console section below)
-cargo run -- agent --config ./configs/openai-compat/config_current_folder.json --logs
-```
-
-```bash
-cargo build -r
-./target/release/rust-bot agent -m "What files are in the workspace?"
-```
-
-```ps1
-cargo build -r
-.\target\release\rust-bot agent -m "What files are in the workspace?"
-.\target\release\rust-bot agent --config ./configs/openai-compat/config_current_folder.json --no-logs
-```
 
 ---
 
@@ -254,208 +114,7 @@ cargo build -r
 
 ## Interactive console
 
-Rust Bot ships with a small REPL-style interactive console built on `[reedline](https://github.com/nushell/reedline)`. It uses Emacs-style keybindings by default, supports history, and lets you paste images, paste clipboard text, and write multi-line prompts without leaving the terminal.
-
-### Starting the console
-
-Launch `rust-bot agent` **without** the `-m` / `--message` flag and the binary will drop you into the console:
-
-```bash
-cargo run -- agent --config ./configs/openai-compat/config_current_folder.json --logs
-```
-
-A short banner is printed, showing the logo and the available shortcuts. Then the prompt appears and the agent is ready for input. Each line you submit is sent to the agent and the response is rendered in the same terminal — Markdown by default, plain text if you passed `--no-markdown`.
-
-> Note: the console requires a real TTY. If stdin is redirected (for example, in a non-interactive pipe), the binary returns a non-zero exit instead of dropping into the REPL.
-
-
-
-### Key bindings
-
-The line editor uses **Emacs** keybindings. The full default set is available; the table below highlights the bindings that are most useful day-to-day. Custom bindings added by Rust Bot are marked.
-
-#### Movement
-
-
-| Key            | Action                             |
-| -------------- | ---------------------------------- |
-| `Ctrl+F` / `→` | Move cursor one character forward  |
-| `Ctrl+B` / `←` | Move cursor one character backward |
-| `Alt+F`        | Move cursor one word forward       |
-| `Alt+B`        | Move cursor one word backward      |
-| `Ctrl+A`       | Move to start of line              |
-| `Ctrl+E`       | Move to end of line                |
-| `Ctrl+N` / `↓` | Next history entry                 |
-| `Ctrl+P` / `↑` | Previous history entry             |
-| `Ctrl+→`       | Move forward by word               |
-| `Ctrl+←`       | Move backward by word              |
-
-
-
-
-#### Editing
-
-
-| Key                         | Action                                                                                                                   |
-| --------------------------- | ------------------------------------------------------------------------------------------------------------------------ |
-| `Ctrl+D`                    | Delete character under cursor; exits the console if the line is empty                                                    |
-| `Ctrl+H` / `Backspace`      | Delete character before cursor                                                                                           |
-| `Alt+D`                     | Delete word forward                                                                                                      |
-| `Alt+Backspace`             | Delete word backward                                                                                                     |
-| `Ctrl+K`                    | Kill to end of line                                                                                                      |
-| `Ctrl+U`                    | Kill to start of line                                                                                                    |
-| `Ctrl+W`                    | Kill previous word                                                                                                       |
-| `Ctrl+Y`                    | Yank (paste) last killed text                                                                                            |
-| `Ctrl+T`                    | Transpose characters                                                                                                     |
-| `Alt+T`                     | Transpose words                                                                                                          |
-| `Ctrl+I` / `Tab`            | *(custom)* Paste image from clipboard — see [Image paste](#image-paste)                                                  |
-| `Alt+V`                     | *(custom)* Paste clipboard text into the current prompt — see [Text paste](#text-paste)                                  |
-| `Ctrl+O`                    | *(custom)* Insert a newline, do not submit — see [Multi-line input](#multi-line-input)                                   |
-| `Alt+Enter` / `Shift+Enter` | Insert a newline, do not submit (only on terminals that report the modifier — see [Multi-line input](#multi-line-input)) |
-| `Ctrl+C`                    | Cancel the current line and re-show the prompt (does not exit)                                                           |
-| `Ctrl+L`                    | Clear the screen                                                                                                         |
-
-
-
-
-#### History search
-
-
-| Key      | Action                                                                                             |
-| -------- | -------------------------------------------------------------------------------------------------- |
-| `Ctrl+R` | Start incremental reverse search; type to narrow, `Enter` to accept, `Ctrl+C` / `Ctrl+G` to cancel |
-| `Ctrl+S` | Forward search (continues a `Ctrl+R` session)                                                      |
-
-
-
-
-#### Submission
-
-
-| Key     | Action                                            |
-| ------- | ------------------------------------------------- |
-| `Enter` | Submit the current line as a message to the agent |
-
-
-
-
-### History
-
-The console keeps the **last 100 lines** in a file-backed history, loaded automatically on the next start. The file lives at `~/.rust-bot/cli_history` (see `get_cli_history_path` in `src/config/paths.rs`) and is created on first use. Use `↑` / `↓` to walk it, or `Ctrl+R` to fuzzy-search.
-
-If the history file is unreadable (permissions, first run, etc.) the console starts with an empty history and logs a warning.
-
-### Image paste
-
-Pressing `Ctrl+I` (or `Tab`) reads the current clipboard image and inserts a sentinel token into the buffer. On submit, the sentinel is replaced by the actual image and sent to the agent alongside the text.
-
-- The image is stored in a temporary file in the workspace; if the message is sent successfully the file is cleaned up.
-- `Ctrl+I` is bound to image paste because `Tab` would otherwise complete completions; if you don't have an image on the clipboard the binding is a safe no-op (the sentinel stays in the buffer and is stripped on submit).
-- The console uses **bracketed paste mode**, so multi-line text pasted from the terminal is treated as one block rather than being submitted early.
-
-
-
-### Text paste
-
-Pressing `Alt+V` captures the current clipboard text and inserts it into the prompt at the cursor position. The text is sent as part of the same message when you press `Enter`.
-
-This is useful when pasting larger snippets, code, logs, or text that may contain newlines. Internally, each paste is recorded with an index and a line-count hint (e.g. `[PASTED_TEXT-#0 12 lines]`). On submit, every sentinel is replaced by its corresponding captured text using that index, so the substitution is always correct regardless of cursor position or paste order.
-
-- **Single-line text** is inserted directly into the buffer as plain text — no sentinel is used.
-- **Multi-line text** is stored separately and represented by an indexed sentinel in the buffer. The sentinel shows the paste index and line count so you can see what is queued.
-- Multiple `Alt+V` presses in one prompt are fully supported; each paste gets its own index and is substituted independently on submit.
-- If clipboard text cannot be read, the paste is treated as empty and the placeholder is stripped on submit.
-
-
-
-### Multi-line input
-
-By default, `Enter` submits the current line. To continue a thought on a new line without sending the message, press `Ctrl+O` — a newline is inserted and you can keep typing. The whole block is sent to the agent as a single message when you finally press `Enter`.
-
-This is useful for pasting code blocks, listing steps, or writing prompts that span several lines.
-
-> **Why not** `Ctrl+Enter`**?** The console enables `ENABLE_VIRTUAL_TERMINAL_INPUT` (required for bracketed paste). In that mode Windows Terminal reports `Ctrl+Enter`, `Shift+Enter`, and `Alt+Enter` all as a plain `Enter`, so the modifier is lost before it reaches the line editor. A `Ctrl`+letter combo (`Ctrl+O`) arrives as a distinct control byte and works reliably on every platform. `Alt+Enter` / `Shift+Enter` still work on terminals that disambiguate them (e.g. kitty-protocol-capable emulators on Unix).
-
-
-
-### Leaving the console
-
-Any of the following will exit the console:
-
-- Type `exit` or `quit` and press `Enter`.
-- Press `Ctrl+D` on an empty line.
-- Send an interrupt (the binary is still long-running after the console returns, so this only closes the prompt, not the process).
-
-The console always prints the banner on entry — that's the easiest way to confirm you've launched interactive mode rather than one-shot mode.
-
----
-
-
-
-## Chat commands
-
-These are typed directly into a running conversation (the interactive console, or
-any connected channel) — distinct from the `rust-bot <subcommand>` process
-launchers documented under [Command line](#command-line).
-
-
-| Command            | Description                                                                     |
-| ------------------ | ------------------------------------------------------------------------------- |
-| `/new`             | Start a new conversation                                                        |
-| `/stop`            | Stop the current task                                                           |
-| `/restart`         | Restart the bot                                                                 |
-| `/status`          | Show bot status                                                                 |
-| `/model`           | Show the current model                                                          |
-| `/model-preset`    | Show the current preset's model and provider, or switch: `/model-preset <name>` |
-| `/model-presets`   | List available model presets                                                    |
-| `/dream`           | Manually trigger Dream consolidation                                            |
-| `/dream-log`       | Show what the last Dream changed                                                |
-| `/dream-restore`   | Revert memory to a previous state                                               |
-| `/help`            | Show available commands                                                         |
-| `/mcp-list`        | List connected MCP servers                                                      |
-| `/mcp-preset`      | Manage built-in MCP server presets — see [below](#mcp-preset)                   |
-| `/tools`           | List available tools                                                            |
-| `/workspace`       | Show or switch the session's workspace scope                                    |
-| `/goal`            | Start/check/cancel a sustained session goal                                     |
-| `/cleanup`         | Remove stray files from the workspace                                           |
-| `/list-sessions`   | List available sessions in the current workspace                                |
-| `/example-prompts` | List example prompts                                                            |
-
-
-
-
-### `/mcp-preset`
-
-Enable, disable, test, or list built-in MCP server presets (GitHub, Playwright,
-Brave Search, etc.) without hand-editing `config.json`. The catalog is loaded
-from the bundled defaults, merged with any overrides/extras at the path in
-`tools.mcpPresetsPath` (default `~/.rust-bot/mcp_presets.json`) — a user entry
-with the same name as a bundled preset overrides it; new names are pure
-additions.
-
-```bash
-/mcp-preset list
-/mcp-preset enable github github_token=ghp_xxx
-/mcp-preset test github
-/mcp-preset disable github
-```
-
-- `list` — shows every preset with its status (`configured`,
-`missing_credentials`, `missing_dependency`, `not_installed`), plus any
-custom (non-preset) MCP servers already in `config.json`.
-- `enable <name> [field=value ...]` — materializes the preset into a full
-MCP server config and writes it into `config.json`. Any field a preset needs
-(an API key, a token) can be supplied inline as `field=value`; if omitted, an
-already-configured value is reused, and failing that, a matching environment
-variable is referenced as `${VAR_NAME}` in the saved config (the secret
-itself is never copied into `config.json` if it's only set as an env var).
-**Requires a restart** — the running process only reads its MCP server list
-once at startup.
-- `disable <name>` — removes the server from `config.json`. Also requires
-a restart.
-- `test <name>` — connects to an already-enabled server right away (no
-restart needed) and reports how many tools it exposes, or why the connection
-failed.
+Rust Bot ships with a REPL-style interactive console (Emacs-style keybindings, history, image and text paste, multi-line prompts). Key bindings, history, paste behaviour, how to leave the console, and the chat commands (such as `/mcp-preset`) are documented in [docs/INTERACTIVE_CONSOLE.md](docs/INTERACTIVE_CONSOLE.md).
 
 ---
 
@@ -463,127 +122,7 @@ failed.
 
 ## Gmail support
 
-Rust Bot can expose two Gmail agent tools when enabled in config:
-
-- `gmail` — reads messages from the user's inbox (read-only)
-- `gmail_email_send` — sends an email to a recipient (plain text or HTML)
-
-Access is granted through Google OAuth; credentials are stored on disk and reused by the agent. Both tools share the same `client_secret.json` and `token_cache.json` paths from config.
-
-### Google Cloud setup
-
-1. Open the [Google Cloud Console](https://console.cloud.google.com/) and create or select a project.
-2. Enable the **Gmail API** for that project.
-3. Configure the **OAuth consent screen** (External or Internal, depending on your use case). If you plan to use send, ensure the consent screen allows the **Send email on your behalf** scope (`gmail.send`).
-4. Create an OAuth **Desktop app** client and download the client secret JSON.
-5. Ensure the client allows the redirect URI `http://localhost:8080` (required for the installed-app flow used by `gmail-auth`).
-
-Save the downloaded file as `client_secret.json` before running the OAuth helper (see below). The `gmail-auth` helper looks for `./credentials/client_secret.json` by default; the agent expects credential files under `~/.rust-bot/credentials/` unless you override the paths in config (see [Enabling the Gmail tools](#enabling-the-gmail-tools)).
-
-> Credential files contain secrets and are gitignored. Do not commit `client_secret.json` or `token_cache.json`.
-
-
-
-### OAuth helper (`gmail-auth`)
-
-The `gmail-auth` binary is a standalone utility (not part of the main agent loop) that walks through Google login, requests Gmail **read** and **send** access, and writes a `token_cache.json` file containing the refresh and access tokens. Run it once per machine (or again if tokens are revoked or scopes change).
-
-**Prerequisites:** place `client_secret.json` in `./credentials/` (or update the path in `src/bin/gmail-auth.rs`).
-
-```bash
-# Run the OAuth flow (opens a browser, listens on localhost:8080)
-cargo run --bin gmail-auth
-
-# Or build a release binary
-cargo build --release --bin gmail-auth
-./target/release/gmail-auth
-```
-
-On Windows (PowerShell):
-
-```ps1
-cargo run --bin gmail-auth
-cargo build --release --bin gmail-auth
-.\target\release\gmail-auth.exe
-```
-
-What happens:
-
-1. A local HTTP server on port **8080** receives the OAuth callback (no manual code copy-paste).
-2. You sign in with Google and grant Gmail read and send permission.
-3. Tokens are persisted to `token_cache.json` in the project root.
-4. The helper fetches a few inbox subjects to confirm read access works.
-
-If you previously authenticated with read-only scope, delete the old `token_cache.json` and run `gmail-auth` again so the cache includes `gmail.send`.
-
-Copy the generated files to the credential directory the agent uses (defaults shown):
-
-```bash
-mkdir -p ~/.rust-bot/credentials
-cp client_secret.json ~/.rust-bot/credentials/
-cp token_cache.json ~/.rust-bot/credentials/
-```
-
-If your config points elsewhere (for example `configs/openai-compat/config_gmail.json` uses `~/.rust-bot/workspace/credentials/`), copy the files to those paths instead.
-
-### Enabling the Gmail tools
-
-Enable both tools in your agent config under `tools.gmail`:
-
-```json
-"gmail": {
-  "enable": true,
-  "client_secret_path": "~/.rust-bot/credentials/client_secret.json",
-  "token_cache_path": "~/.rust-bot/credentials/token_cache.json",
-  "max_results": 20
-}
-```
-
-There is no separate flag for send — when `enable` is `true`, the agent registers `gmail` and `gmail_email_send`.
-
-A sample config with Gmail enabled is in `configs/openai-compat/config_gmail.json`. Run the agent with that config once credentials are in place:
-
-```bash
-# Read inbox
-cargo run -- agent -m "Summarize my latest inbox emails" \
-  --config ./configs/openai-compat/config_gmail.json
-
-# Send plain-text email (the model chooses the gmail_email_send tool)
-cargo run -- agent -m "Send an email to alice@example.com with subject Hello and body Hi Alice" \
-  --config ./configs/openai-compat/config_gmail.json
-
-# Send HTML email (ask the model to use format html and HTML in the body)
-cargo run -- agent -m "Send an HTML email to alice@example.com with subject Report and body containing a bold greeting" \
-  --config ./configs/openai-compat/config_gmail.json
-```
-
-The agent uses the cached tokens from `token_cache.json` and refreshes them automatically via `yup-oauth2` when they expire.
-
-### Gmail agent tools
-
-
-| Tool name          | Purpose                      | Key parameters                                           |
-| ------------------ | ---------------------------- | -------------------------------------------------------- |
-| `gmail`            | List and read inbox messages | `limit`, `after`, `before`, `only_subject`, `body_limit` |
-| `gmail_email_send` | Send an email                | `to`, `subject`, `body` (required); `format` (optional)  |
-
-
-
-
-#### `gmail_email_send` parameters
-
-
-| Parameter | Required | Default | Description                                               |
-| --------- | -------- | ------- | --------------------------------------------------------- |
-| `to`      | yes      | —       | Recipient email address                                   |
-| `subject` | yes      | —       | Email subject (non-ASCII characters are RFC 2047–encoded) |
-| `body`    | yes      | —       | Message body: plain text or HTML, depending on `format`   |
-| `format`  | no       | `plain` | `plain` for `text/plain`, or `html` for `text/html`       |
-
-
-When `format` is `html`, pass HTML markup in `body` (for example `<p>Hello</p>`). Gmail renders it as HTML in the recipient's client. When omitted or set to `plain`, the body is sent as plain text.
-
-Send uses the Gmail API `users.messages.send` endpoint with an RFC 2822 MIME message encoded as base64url. Messages are sent from the authenticated Google account.
+The agent can read and send email through Gmail. Google Cloud setup, the `gmail-auth` OAuth helper, enabling the Gmail tools, and the tool parameters are documented in [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md).
 
 ---
 
