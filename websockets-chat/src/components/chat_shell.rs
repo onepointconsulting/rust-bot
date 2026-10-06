@@ -85,6 +85,12 @@ pub fn ChatShell(
     #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
+    // Starting a new chat should leave the cursor ready in the composer.
+    let composer_focus_request = RwSignal::new(0_u32);
+    let on_new_chat_and_focus = move || {
+        on_new_chat();
+        composer_focus_request.update(|count| *count += 1);
+    };
     let shell_class = move || {
         if expanded.get() {
             "fixed inset-0 z-50 flex h-full w-full flex-row overflow-hidden bg-slate-50"
@@ -129,7 +135,7 @@ pub fn ChatShell(
                             expanded=expanded
                             email=user_email
                             version=bot_version
-                            on_new_chat=on_new_chat
+                            on_new_chat=on_new_chat_and_focus
                             on_logout=on_logout
                             on_minimize=on_minimize
                             on_toggle_expand=on_toggle_expand
@@ -192,6 +198,7 @@ pub fn ChatShell(
                     skills=skills
                     tools=tools
                     on_open_tools=Callback::new(move |()| on_open_tools())
+                    focus_request=composer_focus_request
                 />
             </div>
         </div>

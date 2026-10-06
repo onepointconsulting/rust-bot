@@ -648,6 +648,11 @@ pub fn ChatInput(
     /// the list for the chat's current mode.
     #[prop(optional)]
     on_open_tools: Option<Callback<()>>,
+    /// Counter the caller bumps to move keyboard focus into the textarea
+    /// (e.g. after "New chat"). The initial value is ignored; only later
+    /// increments focus. Omitted means the composer never steals focus.
+    #[prop(optional)]
+    focus_request: Option<RwSignal<u32>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -655,6 +660,18 @@ pub fn ChatInput(
     let drag_over = RwSignal::new(false);
     let textarea_ref = NodeRef::<Textarea>::new();
     let file_input_ref = NodeRef::<Input>::new();
+
+    Effect::new(move |_| {
+        let Some(request) = focus_request else {
+            return;
+        };
+        if request.get() == 0 {
+            return;
+        }
+        if let Some(el) = textarea_ref.get() {
+            let _ = el.focus();
+        }
+    });
 
     // When something outside the composer (e.g. an example-prompt click)
     // sets `draft`, keep the textarea's auto-sized height in sync too.
