@@ -150,31 +150,52 @@ rust-bot/
 ├── src/
 │   ├── bin/
 │   │   └── gmail-auth.rs   # OAuth helper for Gmail token setup
-│   ├── agent/        # Agent loop, runner, tools, skills
+│   ├── agent/        # Agent loop, runner, tools, skills, subagents, ACP client
+│   ├── api/          # REST API server (login, SSO, media, user registry)
 │   ├── bus/          # Internal event bus
+│   ├── channels/     # Chat channels and gateway (WebSocket, WhatsApp, email)
 │   ├── cli/          # CLI commands, stream rendering, interactive console
 │   ├── command/      # Slash-style command router and builtins
 │   ├── config/       # Config schema, loader, paths
 │   ├── cron/         # Scheduled reminder service
+│   ├── heartbeat/    # Periodic heartbeat task service
+│   ├── integrations/ # External integrations (Herdr)
 │   ├── providers/    # Model providers (Anthropic, OpenAI-compat, …)
-│   ├── security/     # Sandboxing and policy
+│   ├── security/     # JWT, sandboxing, ingress and workspace access policy
 │   ├── session/      # Session manager
-│   └── utils/        # Helpers (clipboard, restart, prompts, …)
+│   ├── utils/        # Helpers (clipboard, restart, prompts, embedded UI/templates, …)
+│   ├── pairing.rs          # DM sender pairing store
+│   └── runtime_context.rs  # Persistent context appended to the user prompt
 ├── configs/          # Sample provider configs
 ├── templates/        # Workspace seed files (also embedded into the binary at build time)
 ├── tests/            # Unit and integration tests
-├── web-chat/         # Leptos (Rust + WASM) chat UI, independent workspace member — see web-chat/README.md
+├── chat-ui/          # Shared Leptos components (login form, composer, markdown, message bubbles) used by both chat UIs
+├── websockets-chat/  # Leptos (Rust + WASM) chat UI for the WebSocket gateway, streaming replies — see websockets-chat/README.md
+├── web-chat/         # Leptos (Rust + WASM) chat UI for the REST API (superseded by websockets-chat) — see web-chat/README.md
+├── docs/             # Detailed documentation (command line, interactive console, Gmail support, …)
 └── README.md
 ```
 
 
 
-### Web chat UI
+### Chat UIs
+
+The Cargo workspace contains three browser-side crates (all Leptos + WASM, built with [Trunk](https://trunkrs.dev)):
+
+| Crate             | Talks to                                      | Status                                         |
+| ----------------- | --------------------------------------------- | ---------------------------------------------- |
+| `websockets-chat` | WebSocket gateway (`rust-bot gateway`)        | Current UI: token streaming, tool chips, reasoning panels |
+| `web-chat`        | REST API (`rust-bot api`)                     | Superseded by `websockets-chat`                |
+| `chat-ui`         | — (library, no transport)                     | Shared components used by the two UIs above    |
+
+See [docs/WEBSOCKETS_CHAT.md](docs/WEBSOCKETS_CHAT.md) for how `websockets-chat` is built, embedded into the `rust-bot` binary and run, and [websockets-chat/README.md](websockets-chat/README.md) for the app's own details. The rest of this section covers the older `web-chat` UI.
+
+#### Web chat UI (`web-chat`)
 
 `web-chat/` is a small Leptos + Tailwind chat UI (login + chat) that talks
-to the REST API over HTTP only — it shares no code with the rest of the
-crate. Build it with [Trunk](https://trunkrs.dev) and serve the output
-alongside the API.
+to the REST API over HTTP only — it shares no code with the main
+`rust-bot` crate (only the `chat-ui` components). Build it with [Trunk](https://trunkrs.dev) and serve the output
+alongside the API. This chat interface has been superseded by the Websockets Chat UI.
 
 Install the WASM target and [Trunk](https://trunkrs.dev) once:
 

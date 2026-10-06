@@ -23,9 +23,31 @@ Save the downloaded file as `client_secret.json` before running the OAuth helper
 
 ## OAuth helper (`gmail-auth`)
 
-The `gmail-auth` binary is a standalone utility (not part of the main agent loop) that walks through Google login, requests Gmail **read** and **send** access, and writes a `token_cache.json` file containing the refresh and access tokens. Run it once per machine (or again if tokens are revoked or scopes change).
+The `gmail-auth` binary is a standalone utility (not part of the main agent loop) that walks through Google login, requests Gmail **read** and **send** access, and writes a `token_cache.json` file containing the refresh and access tokens, in the same directory as `client_secret.json`. Run it once per machine (or again if tokens are revoked or scopes change).
 
-**Prerequisites:** place `client_secret.json` in `./credentials/` (or update the path in `src/bin/gmail-auth.rs`).
+**Prerequisites:** have the `client_secret.json` file downloaded from Google Cloud Console available (see [Google Cloud setup](#google-cloud-setup)).
+
+**Usage:**
+
+```
+gmail-auth [CLIENT_SECRET_PATH]
+```
+
+The first (optional) argument is the location of the `client_secret.json` file. When omitted, it defaults to `./credentials/client_secret.json`. If the file does not exist, the helper prints an error and exits with a non-zero code.
+
+```bash
+# Use the default location (./credentials/client_secret.json)
+./target/release/gmail-auth
+
+# Use a client secret stored elsewhere
+./target/release/gmail-auth /path/to/client_secret.json
+```
+
+When running through Cargo, put the argument after `--`:
+
+```bash
+cargo run --bin gmail-auth -- /path/to/client_secret.json
+```
 
 ```bash
 # Run the OAuth flow (opens a browser, listens on localhost:8080)
@@ -42,23 +64,25 @@ On Windows (PowerShell):
 cargo run --bin gmail-auth
 cargo build --release --bin gmail-auth
 .\target\release\gmail-auth.exe
+# With an explicit client secret location
+.\target\release\gmail-auth.exe C:\path\to\client_secret.json
 ```
 
 What happens:
 
 1. A local HTTP server on port **8080** receives the OAuth callback (no manual code copy-paste).
 2. You sign in with Google and grant Gmail read and send permission.
-3. Tokens are persisted to `token_cache.json` in the project root.
+3. Tokens are persisted to `token_cache.json` in the same directory as the `client_secret.json` file you passed in (for the default location, `./credentials/token_cache.json`). The chosen path is printed at startup.
 4. The helper fetches a few inbox subjects to confirm read access works.
 
 If you previously authenticated with read-only scope, delete the old `token_cache.json` and run `gmail-auth` again so the cache includes `gmail.send`.
 
-Copy the generated files to the credential directory the agent uses (defaults shown):
+Because both files end up in the same folder, you can copy that folder's contents to the credential directory the agent uses (defaults shown):
 
 ```bash
 mkdir -p ~/.rust-bot/credentials
-cp client_secret.json ~/.rust-bot/credentials/
-cp token_cache.json ~/.rust-bot/credentials/
+cp ./credentials/client_secret.json ~/.rust-bot/credentials/
+cp ./credentials/token_cache.json ~/.rust-bot/credentials/
 ```
 
 If your config points elsewhere (for example `configs/openai-compat/config_gmail.json` uses `~/.rust-bot/workspace/credentials/`), copy the files to those paths instead.
