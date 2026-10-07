@@ -57,6 +57,426 @@ pub struct Session {
     pub last_consolidated: usize,
 }
 
+/// Persistence backend for [`Session`] records.
+///
+/// [`SessionManager`] only talks to this trait, so the storage format (JSONL
+/// files today, SQLite or anything else later) can be swapped by passing a
+/// different implementation to [`SessionManager::with_store`]. Implementations
+/// are stateless from the manager's point of view: caching and tombstoning of
+/// deleted keys stay in the manager.
+pub trait SessionStore: Send + Sync {
+    /// Load the session stored under `key`, or `None` when it does not exist
+    /// or cannot be read.
+    fn load(&self, key: &str) -> Option<Session>;
+
+    /// Durably persist `session`, replacing any previous version of that key.
+    fn save(&self, session: &Session) -> std::io::Result<()>;
+
+    /// Whether anything is persisted under `key`.
+    fn exists(&self, key: &str) -> bool;
+
+    /// Remove everything persisted under `key`. Idempotent: deleting a key
+    /// that is not stored is `Ok(())`.
+    fn delete_session(&self, key: &str) -> std::io::Result<()>;
+
+    /// Summaries of all stored sessions (`key`, `created_at`, `updated_at`,
+    /// `path`, `title`, `owner_client_id`, `has_summary`), most recently
+    /// updated first.
+    fn list_sessions(&self) -> Vec<Value>;
+
+    /// Read-only snapshot of a stored session that preserves raw timestamp
+    /// strings. Implementations should attempt best-effort recovery of
+    /// corrupt data before returning `None`.
+    fn read_session_payload(&self, key: &str) -> Option<SessionPayload>;
+}
+
+/// [`SessionStore`] that keeps one JSONL file per session: a metadata line
+/// followed by one line per message.
+pub struct JSONLSessionStore {
+    sessions_dir: PathBuf,
+    legacy_sessions_dir: PathBuf,
+}
+
+impl JSONLSessionStore {
+    /// Create a store reading and writing `<sessions_dir>/<safe key>.jsonl`.
+    /// `legacy_sessions_dir` is only consulted by [`SessionStore::exists`]
+    /// and [`SessionStore::delete_session`] so old files are not left behind.
+    pub fn new(sessions_dir: PathBuf, legacy_sessions_dir: PathBuf) -> Self {
+        Self {
+            sessions_dir,
+            legacy_sessions_dir,
+        }
+    }
+
+    /// File path of the session identified by `key`.
+    pub fn session_path(&self, key: &str) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}.jsonl", safe_filename(key)))
+    }
+
+    /// File path the session identified by `key` used before the workspace layout.
+    fn legacy_session_path(&self, key: &str) -> PathBuf {
+        self.legacy_sessions_dir
+            .join(format!("{}.jsonl", safe_filename(key)))
+    }
+
+    /// Strict read of `path` into a [`SessionPayload`]; any malformed line is an error.
+    fn try_read_session_payload(&self, key: &str, path: &Path) -> Result<SessionPayload, String> {
+        let file = File::open(path).map_err(|e| e.to_string())?;
+        let reader = BufReader::new(file);
+
+        let mut messages: Vec<HashMap<String, Value>> = Vec::new();
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        let mut created_at: Option<String> = None;
+        let mut updated_at: Option<String> = None;
+        let mut stored_key: Option<String> = None;
+
+        for line_result in reader.lines() {
+            let line = line_result.map_err(|e| e.to_string())?;
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let raw_data: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
+            let data = value_as_object_map(raw_data)?;
+
+            if data.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
+                metadata = match data.get("metadata") {
+                    Some(Value::Object(map)) => {
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                    _ => HashMap::new(),
+                };
+                created_at = data
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                updated_at = data
+                    .get("updated_at")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+                stored_key = data
+                    .get("key")
+                    .and_then(|v| v.as_str())
+                    .map(|s| s.to_string());
+            } else {
+                messages.push(data);
+            }
+        }
+
+        Ok(SessionPayload {
+            key: stored_key.unwrap_or_else(|| key.to_string()),
+            created_at,
+            updated_at,
+            metadata,
+            messages,
+        })
+    }
+
+    /// Best-effort recovery from a corrupt JSONL session file (nanobot's
+    /// `SessionManager.repair`). Skips bad lines instead of failing the read.
+    fn repair(&self, key: &str, path: &Path) -> Option<Session> {
+        if !path.exists() {
+            return None;
+        }
+
+        let file = match File::open(path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Repair failed for session {}: {}", key, e);
+                return None;
+            }
+        };
+
+        let mut messages: Vec<Value> = Vec::new();
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        let mut created_at: Option<DateTime<Utc>> = None;
+        let mut updated_at: Option<DateTime<Utc>> = None;
+        let mut last_consolidated: usize = 0;
+        let mut skipped = 0usize;
+
+        let reader = BufReader::new(file);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let raw_data: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(_) => {
+                    skipped += 1;
+                    continue;
+                }
+            };
+            let Some(data) = raw_data.as_object() else {
+                skipped += 1;
+                continue;
+            };
+
+            if data.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
+                metadata = match data.get("metadata") {
+                    Some(Value::Object(map)) => {
+                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
+                    }
+                    _ => HashMap::new(),
+                };
+                if let Some(s) = data
+                    .get("created_at")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    created_at = parse_session_timestamp(s);
+                }
+                if let Some(s) = data
+                    .get("updated_at")
+                    .and_then(|v| v.as_str())
+                    .filter(|s| !s.is_empty())
+                {
+                    updated_at = parse_session_timestamp(s);
+                }
+                if let Some(v) = data.get("last_consolidated") {
+                    last_consolidated = json_value_as_last_consolidated(v);
+                }
+            } else {
+                messages.push(Value::Object(data.clone()));
+            }
+        }
+
+        if skipped > 0 {
+            log::warn!("Skipped {} corrupt lines in session {}", skipped, key);
+        }
+        if messages.is_empty() && metadata.is_empty() {
+            return None;
+        }
+
+        Some(Session {
+            key: key.to_string(),
+            messages,
+            created_at: created_at.unwrap_or_else(Utc::now),
+            updated_at: updated_at.unwrap_or_else(Utc::now),
+            metadata,
+            last_consolidated,
+        })
+    }
+}
+
+impl SessionStore for JSONLSessionStore {
+    fn load(&self, key: &str) -> Option<Session> {
+        let path = self.session_path(key);
+        if !path.exists() {
+            return None;
+        }
+
+        let file = match File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log::warn!("Failed to open session file {}: {}", path.display(), e);
+                return None;
+            }
+        };
+
+        let mut messages: Vec<Value> = Vec::new();
+        let mut metadata: HashMap<String, Value> = HashMap::new();
+        let mut created_at = Utc::now();
+        let mut updated_at = Utc::now();
+        let mut last_consolidated: usize = 0;
+
+        let reader = BufReader::new(file);
+        for line_result in reader.lines() {
+            let line = match line_result {
+                Ok(l) => l,
+                Err(e) => {
+                    log::warn!("Failed reading session {} line: {}", key, e);
+                    continue;
+                }
+            };
+            let line = line.trim();
+            if line.is_empty() {
+                continue;
+            }
+            let data: Value = match serde_json::from_str(line) {
+                Ok(v) => v,
+                Err(e) => {
+                    log::warn!("Skipping invalid JSON in session {}: {}", key, e);
+                    continue;
+                }
+            };
+            if data.get("_type").and_then(Value::as_str) == Some("metadata") {
+                let metadata_data = data.get("metadata").cloned().unwrap_or(Value::Null);
+                if let Some(meta_obj) = metadata_data.as_object() {
+                    for (meta_key, value) in meta_obj.iter() {
+                        metadata.insert(meta_key.clone(), value.clone());
+                    }
+                } else if !metadata_data.is_null() {
+                    log::warn!(
+                        "Session {} metadata line has non-object metadata field; skipping merge",
+                        key
+                    );
+                }
+                if let Some(parsed) = data
+                    .get("created_at")
+                    .and_then(Value::as_str)
+                    .and_then(parse_session_timestamp)
+                {
+                    created_at = parsed;
+                }
+                if let Some(parsed) = data
+                    .get("updated_at")
+                    .and_then(Value::as_str)
+                    .and_then(parse_session_timestamp)
+                {
+                    updated_at = parsed;
+                }
+                if let Some(v) = data.get("last_consolidated") {
+                    last_consolidated = json_value_as_last_consolidated(v);
+                }
+            } else {
+                messages.push(data);
+            }
+        }
+
+        Some(Session {
+            key: key.to_string(),
+            messages,
+            created_at,
+            updated_at,
+            metadata,
+            last_consolidated,
+        })
+    }
+
+    /// Writes a single metadata line followed by one line per message.
+    fn save(&self, session: &Session) -> std::io::Result<()> {
+        let path = self.session_path(&session.key);
+        log::info!("Saving session to {}", path.display());
+
+        let metadata_line = json!({
+            "_type": "metadata",
+            "key": session.key,
+            "created_at": session.created_at.to_rfc3339(),
+            "updated_at": session.updated_at.to_rfc3339(),
+            "metadata": session.metadata,
+            "last_consolidated": session.last_consolidated,
+        });
+        let mut contents = Vec::new();
+        writeln!(contents, "{}", serde_json::to_string(&metadata_line)?)?;
+        for msg in &session.messages {
+            writeln!(contents, "{}", serde_json::to_string(msg)?)?;
+        }
+        // Atomic: a crash or kill mid-save must not truncate the whole conversation.
+        write_atomic(&path, &contents)?;
+        Ok(())
+    }
+
+    fn exists(&self, key: &str) -> bool {
+        self.session_path(key).exists() || self.legacy_session_path(key).exists()
+    }
+
+    /// Unlinks the current file and, if present, the legacy one.
+    fn delete_session(&self, key: &str) -> std::io::Result<()> {
+        for candidate in [self.session_path(key), self.legacy_session_path(key)] {
+            if let Err(e) = fs::remove_file(&candidate)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                return Err(e);
+            }
+        }
+        Ok(())
+    }
+
+    /// Reads only the first (metadata) line of every `*.jsonl` file.
+    fn list_sessions(&self) -> Vec<Value> {
+        let mut sessions = Vec::new();
+        let entries = match fs::read_dir(&self.sessions_dir) {
+            Ok(e) => e,
+            Err(e) => {
+                log::warn!("Failed to list sessions dir: {}", e);
+                return sessions;
+            }
+        };
+        for path in entries
+            .filter_map(|e| e.ok())
+            .map(|e| e.path())
+            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
+        {
+            if let Ok(file) = File::open(&path) {
+                let reader = BufReader::new(file);
+                if let Some(line_result) = reader.lines().next()
+                    && let Ok(line) = line_result
+                    && let Ok(metadata) = serde_json::from_str::<Value>(&line)
+                    && let Some(metadata_type) = metadata.get("_type")
+                    && let Some(metadata_type_str) = metadata_type.as_str()
+                    && metadata_type_str == "metadata"
+                    && let Some(key) = metadata
+                        .get("key")
+                        .and_then(|v| v.as_str())
+                        .filter(|k| !k.is_empty())
+                {
+                    sessions.push(json!({
+                        "key": key,
+                        "created_at": metadata.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        "updated_at": metadata.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
+                        "path": path.display().to_string(),
+                        "title": listed_session_title(&metadata),
+                        "owner_client_id": listed_session_owner_client_id(&metadata),
+                        "has_summary": listed_session_has_summary(&metadata),
+                    }));
+                }
+            }
+        }
+        sessions.sort_by(|a, b| {
+            let a_ts = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            let b_ts = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
+            b_ts.cmp(a_ts)
+        });
+        sessions
+    }
+
+    /// Does not migrate legacy paths; on corrupt input falls back to [`Self::repair`].
+    fn read_session_payload(&self, key: &str) -> Option<SessionPayload> {
+        let path = self.session_path(key);
+        if !path.exists() {
+            return None;
+        }
+
+        match self.try_read_session_payload(key, &path) {
+            Ok(payload) => Some(payload),
+            Err(e) => {
+                log::warn!("Failed to read session {}: {}", key, e);
+                let repaired = self.repair(key, &path)?;
+                log::info!("Recovered read-only session view {} from corrupt file", key);
+                Some(session_payload(&repaired))
+            }
+        }
+    }
+}
+
+/// Build a [`SessionPayload`] from an in-memory [`Session`].
+fn session_payload(session: &Session) -> SessionPayload {
+    let messages = session
+        .messages
+        .iter()
+        .filter_map(|msg| match msg {
+            Value::Object(map) => Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()),
+            _ => None,
+        })
+        .collect();
+    SessionPayload {
+        key: session.key.clone(),
+        created_at: Some(session.created_at.to_rfc3339()),
+        updated_at: Some(session.updated_at.to_rfc3339()),
+        metadata: session.metadata.clone(),
+        messages,
+    }
+}
+
 impl Session {
     pub fn new(key: String) -> Self {
         Self {
@@ -113,10 +533,11 @@ impl Session {
         // Avoid starting mid-turn when possible.
         for i in 0..sliced.len() {
             if let Some(role) = sliced[i].get("role").and_then(|v| v.as_str())
-                && role == "user" {
-                    sliced = sliced[i..].to_vec();
-                    break;
-                }
+                && role == "user"
+            {
+                sliced = sliced[i..].to_vec();
+                break;
+            }
         }
 
         let mut out: Vec<Value> = Vec::new();
@@ -267,18 +688,6 @@ fn value_as_object_map(value: Value) -> Result<HashMap<String, Value>, String> {
     }
 }
 
-/// Rename `src` to `dst`, or copy + remove `src` if rename fails (e.g. cross-volume).
-fn migrate_session_file(src: &Path, dst: &Path) -> std::io::Result<()> {
-    match fs::rename(src, dst) {
-        Ok(()) => Ok(()),
-        Err(_) => {
-            fs::copy(src, dst)?;
-            fs::remove_file(src)?;
-            Ok(())
-        }
-    }
-}
-
 fn json_value_as_last_consolidated(v: &Value) -> usize {
     v.as_u64()
         .map(|u| u as usize)
@@ -405,6 +814,8 @@ pub struct SessionManager {
     pub workspace: PathBuf,
     pub sessions_dir: PathBuf,
     pub legacy_sessions_dir: PathBuf,
+    /// Persistence backend; the manager never touches the storage format directly.
+    store: Box<dyn SessionStore>,
     cache: HashMap<String, Session>,
     /// Keys tombstoned by [`Self::delete_session`], for the lifetime of this
     /// process. Not persisted anywhere — if the process restarts, a deleted
@@ -451,10 +862,31 @@ impl SessionManager {
         session_eviction_threshold_hours: u32,
         session_eviction_cron_interval_hours: u32,
     ) -> Self {
+        let sessions_dir = ensure_dir(workspace.join("sessions"));
+        let legacy_sessions_dir = get_legacy_sessions_dir();
+        let store = JSONLSessionStore::new(sessions_dir, legacy_sessions_dir);
+        Self::with_store(
+            workspace,
+            Box::new(store),
+            session_eviction_threshold_hours,
+            session_eviction_cron_interval_hours,
+        )
+    }
+
+    /// Create a manager persisting through `store` instead of the default
+    /// [`JSONLSessionStore`]. `sessions_dir` / `legacy_sessions_dir` still
+    /// point at the workspace's JSONL layout, which other components read.
+    pub fn with_store(
+        workspace: PathBuf,
+        store: Box<dyn SessionStore>,
+        session_eviction_threshold_hours: u32,
+        session_eviction_cron_interval_hours: u32,
+    ) -> Self {
         Self {
-            workspace: workspace.clone(),
             sessions_dir: ensure_dir(workspace.join("sessions")),
             legacy_sessions_dir: get_legacy_sessions_dir(),
+            workspace,
+            store,
             cache: HashMap::new(),
             deleted: HashSet::new(),
             session_eviction_threshold_hours,
@@ -470,25 +902,6 @@ impl SessionManager {
     /// Hours between cache-cleanup cron ticks. `0` disables the job.
     pub fn session_eviction_cron_interval_hours(&self) -> u32 {
         self.session_eviction_cron_interval_hours
-    }
-
-    /// Get the file path for a session.
-    ///
-    /// # Arguments
-    ///
-    /// * `key` - The key of the session.
-    ///
-    /// # Returns
-    ///
-    /// The file path for the session.
-    fn get_session_path(&self, key: &str) -> PathBuf {
-        let safe_key = safe_filename(key);
-        self.sessions_dir.join(format!("{}.jsonl", safe_key))
-    }
-
-    fn get_legacy_session_path(&self, key: &str) -> PathBuf {
-        let safe_key = safe_filename(key);
-        self.legacy_sessions_dir.join(format!("{}.jsonl", safe_key))
     }
 
     /// Existing session from cache or disk. Does not create a session and does
@@ -525,154 +938,23 @@ impl SessionManager {
         self.cache.get_mut(key).expect("session is in cache")
     }
 
+    /// Load a session from the backing store, bypassing the cache.
     fn load(&self, key: &str) -> Option<Session> {
-        let path = self.get_session_path(key);
-        if !path.exists() {
-            let legacy_path = self.get_legacy_session_path(key);
-            if legacy_path.exists() {
-                if let Some(parent) = path.parent() {
-                    let _ = fs::create_dir_all(parent);
-                }
-                match migrate_session_file(&legacy_path, &path) {
-                    Ok(()) => log::info!("Migrated session {} from legacy path", key),
-                    Err(e) => log::error!("Failed to migrate session {}: {:?}", key, e),
-                }
-            }
-        }
-        if !path.exists() {
-            return None;
-        }
-
-        let file = match File::open(&path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("Failed to open session file {}: {}", path.display(), e);
-                return None;
-            }
-        };
-
-        let mut messages: Vec<Value> = Vec::new();
-        let mut metadata: HashMap<String, Value> = HashMap::new();
-        let mut created_at = Utc::now();
-        let mut updated_at = Utc::now();
-        let mut last_consolidated: usize = 0;
-
-        let reader = BufReader::new(file);
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(e) => {
-                    log::warn!("Failed reading session {} line: {}", key, e);
-                    continue;
-                }
-            };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let data: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(e) => {
-                    log::warn!("Skipping invalid JSON in session {}: {}", key, e);
-                    continue;
-                }
-            };
-            if let Some(data_type) = data.get("_type")
-                && let Some(data_type_str) = data_type.as_str()
-                && data_type_str == "metadata"
-            {
-                let metadata_data = data.get("metadata").cloned().unwrap_or(Value::Null);
-                if let Some(meta_obj) = metadata_data.as_object() {
-                    for (meta_key, value) in meta_obj.iter() {
-                        metadata.insert(meta_key.clone(), value.clone());
-                    }
-                } else if !metadata_data.is_null() {
-                    log::warn!(
-                        "Session {} metadata line has non-object metadata field; skipping merge",
-                        key
-                    );
-                }
-                if let Some(created_at_val) = data.get("created_at")
-                    && let Some(created_at_str) = created_at_val.as_str() {
-                        let parsed =
-                            NaiveDateTime::parse_from_str(created_at_str, "%Y-%m-%dT%H:%M:%S%.f")
-                                .or_else(|_| {
-                                    NaiveDateTime::parse_from_str(
-                                        created_at_str,
-                                        "%Y-%m-%dT%H:%M:%S",
-                                    )
-                                });
-                        if let Ok(naive_dt) = parsed {
-                            created_at = Utc.from_utc_datetime(&naive_dt);
-                        } else if let Ok(dt) = DateTime::parse_from_rfc3339(created_at_str) {
-                            created_at = dt.with_timezone(&Utc);
-                        }
-                    }
-                if let Some(updated_at_val) = data.get("updated_at")
-                    && let Some(updated_at_str) = updated_at_val.as_str() {
-                        let parsed =
-                            NaiveDateTime::parse_from_str(updated_at_str, "%Y-%m-%dT%H:%M:%S%.f")
-                                .or_else(|_| {
-                                    NaiveDateTime::parse_from_str(
-                                        updated_at_str,
-                                        "%Y-%m-%dT%H:%M:%S",
-                                    )
-                                });
-                        if let Ok(naive_dt) = parsed {
-                            updated_at = Utc.from_utc_datetime(&naive_dt);
-                        } else if let Ok(dt) = DateTime::parse_from_rfc3339(updated_at_str) {
-                            updated_at = dt.with_timezone(&Utc);
-                        }
-                    }
-                if let Some(v) = data.get("last_consolidated") {
-                    last_consolidated = json_value_as_last_consolidated(v);
-                }
-            } else {
-                messages.push(data);
-            }
-        }
-
-        Some(Session {
-            key: key.to_string(),
-            messages,
-            created_at,
-            updated_at,
-            metadata,
-            last_consolidated,
-        })
+        self.store.load(key)
     }
 
-    /// Save a session to disk and update the cache.
+    /// Persist a session through the store and update the cache.
     ///
-    /// Writes a single metadata line followed by one line per message (JSONL).
-    /// Returns an error if the file cannot be created or written.
+    /// Returns an error if the store cannot write the session.
     ///
-    /// A no-op (`Ok(())`, no `File::create`, no cache write) if this key was
+    /// A no-op (`Ok(())`, nothing written to the store, no cache write) if this key was
     /// tombstoned by [`Self::delete_session`] — see the [`Self::deleted`]
     /// field doc comment for why this check exists.
     pub fn save(&mut self, session: Session) -> std::io::Result<()> {
         if self.deleted.contains(&session.key) {
             return Ok(());
         }
-        let path = self.get_session_path(&session.key);
-        log::info!("Saving session to {}", path.display());
-
-        let metadata_line = json!({
-            "_type": "metadata",
-            "key": session.key,
-            "created_at": session.created_at.to_rfc3339(),
-            "updated_at": session.updated_at.to_rfc3339(),
-            "metadata": session.metadata,
-            "last_consolidated": session.last_consolidated,
-        });
-        let mut contents = Vec::new();
-        writeln!(contents, "{}", serde_json::to_string(&metadata_line)?)?;
-        for msg in &session.messages {
-            writeln!(contents, "{}", serde_json::to_string(msg)?)?;
-        }
-        // Atomic: a crash or kill mid-save must not truncate the whole conversation.
-        write_atomic(&path, &contents)?;
-
+        self.store.save(&session)?;
         self.cache.insert(session.key.clone(), session);
         Ok(())
     }
@@ -695,8 +977,8 @@ impl SessionManager {
     }
 
     /// Permanently delete a session: tombstone the key, drop it from the
-    /// cache, and unlink its JSONL file (current path and, if present, the
-    /// legacy path). Missing keys return [`DeleteSessionError::NotFound`] —
+    /// cache, and remove it from the store (for JSONL: the current file and,
+    /// if present, the legacy one). Missing keys return [`DeleteSessionError::NotFound`] —
     /// same "don't pretend to act on nothing" bar as [`Self::rename_session`].
     ///
     /// The tombstone (not just the unlink) is what makes this safe against a
@@ -708,24 +990,15 @@ impl SessionManager {
     /// active turn for this key so a stale write does not keep happening
     /// indefinitely into an inert placeholder.
     pub fn delete_session(&mut self, key: &str) -> Result<(), DeleteSessionError> {
-        let path = self.get_session_path(key);
-        let legacy_path = self.get_legacy_session_path(key);
-        let exists = self.cache.contains_key(key) || path.exists() || legacy_path.exists();
-        if !exists {
+        if !self.cache.contains_key(key) && !self.store.exists(key) {
             return Err(DeleteSessionError::NotFound);
         }
 
         self.deleted.insert(key.to_string());
         self.invalidate(key);
-
-        for candidate in [&path, &legacy_path] {
-            if let Err(e) = fs::remove_file(candidate)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(DeleteSessionError::Io(e));
-            }
-        }
-        Ok(())
+        self.store
+            .delete_session(key)
+            .map_err(DeleteSessionError::Io)
     }
 
     /// Create `target_key` from `source_key` before a global user-message index.
@@ -836,244 +1109,18 @@ impl SessionManager {
         message
     }
 
+    /// Summaries of all stored sessions, most recently updated first.
     pub fn list_sessions(&self) -> Vec<Value> {
-        let mut sessions = Vec::new();
-        let entries = match std::fs::read_dir(&self.sessions_dir) {
-            Ok(e) => e,
-            Err(e) => {
-                log::warn!("Failed to list sessions dir: {}", e);
-                return sessions;
-            }
-        };
-        for path in entries
-            .filter_map(|e| e.ok())
-            .map(|e| e.path())
-            .filter(|p| p.extension().and_then(|s| s.to_str()) == Some("jsonl"))
-        {
-            // Read just the metadata line
-            if let Ok(file) = File::open(&path) {
-                let reader = BufReader::new(file);
-                // Read single line from reader
-                if let Some(line_result) = reader.lines().next()
-                    && let Ok(line) = line_result
-                        && let Ok(metadata) = serde_json::from_str::<Value>(&line)
-                            && let Some(metadata_type) = metadata.get("_type")
-                                && let Some(metadata_type_str) = metadata_type.as_str()
-                                && metadata_type_str == "metadata"
-                                && let Some(key) = metadata
-                                    .get("key")
-                                    .and_then(|v| v.as_str())
-                                    .filter(|k| !k.is_empty())
-                                {
-                                    sessions.push(json!({
-                                        "key": key,
-                                        "created_at": metadata.get("created_at").and_then(|v| v.as_str()).unwrap_or(""),
-                                        "updated_at": metadata.get("updated_at").and_then(|v| v.as_str()).unwrap_or(""),
-                                        "path": path.display().to_string(),
-                                        "title": listed_session_title(&metadata),
-                                        "owner_client_id": listed_session_owner_client_id(&metadata),
-                                        "has_summary": listed_session_has_summary(&metadata),
-                                    }));
-                                }
-            }
-        }
-        sessions.sort_by(|a, b| {
-            let a_ts = a.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
-            let b_ts = b.get("updated_at").and_then(|v| v.as_str()).unwrap_or("");
-            b_ts.cmp(a_ts)
-        });
-        sessions
+        self.store.list_sessions()
     }
 
-    /// Read-only session view from disk (nanobot's `SessionManager.read`).
+    /// Read-only session view from the store (nanobot's `SessionManager.read`).
     ///
     /// Unlike [`Self::load`], this preserves raw timestamp strings, does not
-    /// migrate legacy paths, and on corrupt input attempts [`Self::repair`]
+    /// migrate legacy paths, and on corrupt input the store attempts recovery
     /// before giving up.
     pub fn read_session_file(&self, key: &str) -> Option<SessionPayload> {
-        let path: PathBuf = self.get_session_path(key);
-        if !path.exists() {
-            return None;
-        }
-
-        match self.try_read_session_payload(key, &path) {
-            Ok(payload) => Some(payload),
-            Err(e) => {
-                log::warn!("Failed to read session {}: {}", key, e);
-                let repaired = self.repair(key, Some(&path))?;
-                log::info!("Recovered read-only session view {} from corrupt file", key);
-                Some(Self::session_payload(&repaired))
-            }
-        }
-    }
-
-    fn try_read_session_payload(&self, key: &str, path: &Path) -> Result<SessionPayload, String> {
-        let file = File::open(path).map_err(|e| e.to_string())?;
-        let reader = BufReader::new(file);
-
-        let mut messages: Vec<HashMap<String, Value>> = Vec::new();
-        let mut metadata: HashMap<String, Value> = HashMap::new();
-        let mut created_at: Option<String> = None;
-        let mut updated_at: Option<String> = None;
-        let mut stored_key: Option<String> = None;
-
-        for line_result in reader.lines() {
-            let line = line_result.map_err(|e| e.to_string())?;
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let raw_data: Value = serde_json::from_str(line).map_err(|e| e.to_string())?;
-            let data = value_as_object_map(raw_data)?;
-
-            if data.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
-                metadata = match data.get("metadata") {
-                    Some(Value::Object(map)) => {
-                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    }
-                    Some(_) => HashMap::new(),
-                    None => HashMap::new(),
-                };
-                created_at = data
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                updated_at = data
-                    .get("updated_at")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-                stored_key = data
-                    .get("key")
-                    .and_then(|v| v.as_str())
-                    .map(|s| s.to_string());
-            } else {
-                messages.push(data);
-            }
-        }
-
-        Ok(SessionPayload {
-            key: stored_key.unwrap_or_else(|| key.to_string()),
-            created_at,
-            updated_at,
-            metadata,
-            messages,
-        })
-    }
-
-    /// Best-effort recovery from a corrupt JSONL session file (nanobot's
-    /// `SessionManager.repair`). Skips bad lines instead of failing the read.
-    fn repair(&self, key: &str, path: Option<&Path>) -> Option<Session> {
-        let default_path = self.get_session_path(key);
-        let path = path.unwrap_or(default_path.as_path());
-        if !path.exists() {
-            return None;
-        }
-
-        let file = match File::open(path) {
-            Ok(f) => f,
-            Err(e) => {
-                log::warn!("Repair failed for session {}: {}", key, e);
-                return None;
-            }
-        };
-
-        let mut messages: Vec<Value> = Vec::new();
-        let mut metadata: HashMap<String, Value> = HashMap::new();
-        let mut created_at: Option<DateTime<Utc>> = None;
-        let mut updated_at: Option<DateTime<Utc>> = None;
-        let mut last_consolidated: usize = 0;
-        let mut skipped = 0usize;
-
-        let reader = BufReader::new(file);
-        for line_result in reader.lines() {
-            let line = match line_result {
-                Ok(l) => l,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let line = line.trim();
-            if line.is_empty() {
-                continue;
-            }
-            let raw_data: Value = match serde_json::from_str(line) {
-                Ok(v) => v,
-                Err(_) => {
-                    skipped += 1;
-                    continue;
-                }
-            };
-            let Some(data) = raw_data.as_object() else {
-                skipped += 1;
-                continue;
-            };
-
-            if data.get("_type").and_then(|v| v.as_str()) == Some("metadata") {
-                metadata = match data.get("metadata") {
-                    Some(Value::Object(map)) => {
-                        map.iter().map(|(k, v)| (k.clone(), v.clone())).collect()
-                    }
-                    _ => HashMap::new(),
-                };
-                if let Some(s) = data
-                    .get("created_at")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    created_at = parse_session_timestamp(s);
-                }
-                if let Some(s) = data
-                    .get("updated_at")
-                    .and_then(|v| v.as_str())
-                    .filter(|s| !s.is_empty())
-                {
-                    updated_at = parse_session_timestamp(s);
-                }
-                if let Some(v) = data.get("last_consolidated") {
-                    last_consolidated = json_value_as_last_consolidated(v);
-                }
-            } else {
-                messages.push(Value::Object(data.clone()));
-            }
-        }
-
-        if skipped > 0 {
-            log::warn!("Skipped {} corrupt lines in session {}", skipped, key);
-        }
-        if messages.is_empty() && metadata.is_empty() {
-            return None;
-        }
-
-        Some(Session {
-            key: key.to_string(),
-            messages,
-            created_at: created_at.unwrap_or_else(Utc::now),
-            updated_at: updated_at.unwrap_or_else(Utc::now),
-            metadata,
-            last_consolidated,
-        })
-    }
-
-    /// Build a [`SessionPayload`] from an in-memory [`Session`].
-    fn session_payload(session: &Session) -> SessionPayload {
-        let messages = session
-            .messages
-            .iter()
-            .filter_map(|msg| match msg {
-                Value::Object(map) => {
-                    Some(map.iter().map(|(k, v)| (k.clone(), v.clone())).collect())
-                }
-                _ => None,
-            })
-            .collect();
-        SessionPayload {
-            key: session.key.clone(),
-            created_at: Some(session.created_at.to_rfc3339()),
-            updated_at: Some(session.updated_at.to_rfc3339()),
-            metadata: session.metadata.clone(),
-            messages,
-        }
+        self.store.read_session_payload(key)
     }
 
     /// True when this session has user text and no stored title yet.
@@ -1420,6 +1467,12 @@ mod tests {
         let usage = session.usage().unwrap();
         assert_eq!(usage.input_tokens, Some(4));
         assert_eq!(usage.output_tokens, Some(1));
+    }
+
+    /// JSONL file backing `key` in a manager built with the default store.
+    fn jsonl_path(mgr: &SessionManager, key: &str) -> PathBuf {
+        JSONLSessionStore::new(mgr.sessions_dir.clone(), mgr.legacy_sessions_dir.clone())
+            .session_path(key)
     }
 
     fn fixture_message(role: &str, content: &str) -> Value {
@@ -1860,7 +1913,7 @@ mod tests {
         let mut stale = Session::new("stale".to_string());
         stale.updated_at = Utc::now() - Duration::hours(2);
         mgr.save(stale).unwrap();
-        let stale_path = mgr.get_session_path("stale");
+        let stale_path = jsonl_path(&mgr, "stale");
 
         let mut fresh = Session::new("fresh".to_string());
         fresh.updated_at = Utc::now();
@@ -2369,7 +2422,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         mgr.save(Session::new("chat".to_string())).unwrap();
-        let path = mgr.get_session_path("chat");
+        let path = jsonl_path(&mgr, "chat");
         assert!(path.exists());
 
         mgr.delete_session("chat").expect("delete");
@@ -2407,7 +2460,7 @@ mod tests {
         let mut session = Session::new("chat".to_string());
         session.add_message("user", "hello", Map::new());
         mgr.save(session.clone()).unwrap();
-        let path = mgr.get_session_path("chat");
+        let path = jsonl_path(&mgr, "chat");
 
         mgr.delete_session("chat").expect("delete");
         assert!(!path.exists());
@@ -2440,7 +2493,7 @@ mod tests {
         );
         placeholder.add_message("user", "post-delete write", Map::new());
 
-        let path = mgr.get_session_path("chat");
+        let path = jsonl_path(&mgr, "chat");
         assert!(
             !path.exists(),
             "mutating the placeholder must not touch disk without a save"
@@ -2910,5 +2963,106 @@ mod tests {
                 .metadata
                 .contains_key(SessionManager::LAST_SUMMARY_KEY)
         );
+    }
+
+    /// In-memory [`SessionStore`] proving the manager works against the trait only.
+    #[derive(Default)]
+    struct InMemorySessionStore {
+        sessions: Mutex<HashMap<String, Session>>,
+    }
+
+    impl SessionStore for InMemorySessionStore {
+        fn load(&self, key: &str) -> Option<Session> {
+            self.sessions.lock().unwrap().get(key).cloned()
+        }
+        fn save(&self, session: &Session) -> std::io::Result<()> {
+            self.sessions
+                .lock()
+                .unwrap()
+                .insert(session.key.clone(), session.clone());
+            Ok(())
+        }
+        fn exists(&self, key: &str) -> bool {
+            self.sessions.lock().unwrap().contains_key(key)
+        }
+        fn delete_session(&self, key: &str) -> std::io::Result<()> {
+            self.sessions.lock().unwrap().remove(key);
+            Ok(())
+        }
+        fn list_sessions(&self) -> Vec<Value> {
+            self.sessions
+                .lock()
+                .unwrap()
+                .keys()
+                .map(|key| json!({ "key": key }))
+                .collect()
+        }
+        fn read_session_payload(&self, key: &str) -> Option<SessionPayload> {
+            self.load(key).map(|session| session_payload(&session))
+        }
+    }
+
+    #[test]
+    fn manager_persists_through_a_custom_store_without_touching_disk() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_store(
+            dir.path().join("ws"),
+            Box::new(InMemorySessionStore::default()),
+            3,
+            1,
+        );
+        let mut session = Session::new("mem".to_string());
+        session.add_message("user", "hello", Map::new());
+        mgr.save(session).unwrap();
+
+        mgr.invalidate("mem");
+        assert_eq!(mgr.get_or_create_session("mem").messages.len(), 1);
+        assert_eq!(mgr.list_sessions().len(), 1);
+        assert!(mgr.read_session_file("mem").is_some());
+        assert!(!jsonl_path(&mgr, "mem").exists());
+
+        mgr.delete_session("mem").unwrap();
+        assert!(mgr.list_sessions().is_empty());
+        assert!(matches!(
+            mgr.delete_session("mem"),
+            Err(DeleteSessionError::NotFound)
+        ));
+    }
+
+    #[test]
+    fn jsonl_store_round_trips_and_delete_is_idempotent() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = JSONLSessionStore::new(dir.path().join("s"), dir.path().join("legacy"));
+        fs::create_dir_all(dir.path().join("s")).unwrap();
+        assert!(!store.exists("k"));
+        assert!(store.load("k").is_none());
+
+        let mut session = Session::new("k".to_string());
+        session.add_message("user", "hi", Map::new());
+        session.last_consolidated = 1;
+        store.save(&session).unwrap();
+
+        assert!(store.exists("k"));
+        let loaded = store.load("k").expect("load");
+        assert_eq!(loaded.messages.len(), 1);
+        assert_eq!(loaded.last_consolidated, 1);
+        assert_eq!(store.list_sessions().len(), 1);
+
+        store.delete_session("k").unwrap();
+        store.delete_session("k").unwrap();
+        assert!(!store.exists("k"));
+    }
+
+    #[test]
+    fn jsonl_store_delete_removes_legacy_copy() {
+        let dir = tempfile::tempdir().unwrap();
+        let legacy = dir.path().join("legacy");
+        fs::create_dir_all(&legacy).unwrap();
+        fs::write(legacy.join("old.jsonl"), "").unwrap();
+        let store = JSONLSessionStore::new(dir.path().join("s"), legacy.clone());
+
+        assert!(store.exists("old"));
+        store.delete_session("old").unwrap();
+        assert!(!legacy.join("old.jsonl").exists());
     }
 }

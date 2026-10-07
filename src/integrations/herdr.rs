@@ -234,7 +234,7 @@ fn parse_herdr_env(lookup: impl Fn(&str) -> Option<String>) -> Option<HerdrHostI
 
 /// Where `SessionManager` would read/write `session_id`'s on-disk transcript,
 /// without requiring a constructed `SessionManager`. Mirrors
-/// `SessionManager::get_session_path`'s sanitization by reusing the same
+/// `JSONLSessionStore::session_path`'s sanitization by reusing the same
 /// public [`safe_filename`] helper, falling back to `legacy_dir` when only a
 /// pre-migration copy exists there. The file need not exist yet at either
 /// location — Herdr is just told where the session lives, not asked to read it.

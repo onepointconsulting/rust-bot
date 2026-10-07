@@ -205,7 +205,7 @@ impl AcpToolsContext {
 
 // ── parameters ──────────────────────────────────────────────────────────────
 
-fn string_param<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
+fn string_param<'params>(params: &'params Value, name: &str) -> Option<&'params str> {
     params
         .get(name)
         .and_then(Value::as_str)
@@ -213,7 +213,7 @@ fn string_param<'a>(params: &'a Value, name: &str) -> Option<&'a str> {
         .filter(|text| !text.is_empty())
 }
 
-fn required_string<'a>(params: &'a Value, name: &str) -> Result<&'a str, String> {
+fn required_string<'params>(params: &'params Value, name: &str) -> Result<&'params str, String> {
     string_param(params, name).ok_or_else(|| format!("Error: '{name}' is required"))
 }
 
