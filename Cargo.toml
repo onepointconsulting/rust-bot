@@ -7,6 +7,7 @@ resolver = "2"
 name = "rust-bot"
 version = "0.3.1"
 edition = "2024"
+license = "MIT"
 default-run = "rust-bot"
 
 [dependencies]

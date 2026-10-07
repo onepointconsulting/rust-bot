@@ -218,4 +218,6 @@ for local development (`trunk serve`) instructions.
 
 ## License
 
-See repository for license information.
+[MIT](LICENSE) — anyone is free to use, modify, and distribute this code, with attribution.
+
+rust-bot is based on [nanobot](https://github.com/HKUDS/nanobot) (also MIT, © Xubin Ren and the nanobot contributors), which is gratefully acknowledged.
