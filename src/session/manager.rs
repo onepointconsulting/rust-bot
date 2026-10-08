@@ -88,6 +88,19 @@ pub trait SessionStore: Send + Sync {
     /// strings. Implementations should attempt best-effort recovery of
     /// corrupt data before returning `None`.
     fn read_session_payload(&self, key: &str) -> Option<SessionPayload>;
+
+    /// Append `messages` to the long-term archive of `key`.
+    ///
+    /// The archive holds messages that were already consolidated and therefore
+    /// dropped from the live [`Session::messages`]; it is append-only and
+    /// ordered oldest first, so no raw conversation history is ever lost.
+    fn append_archive(&self, key: &str, messages: &[Value]) -> std::io::Result<()>;
+
+    /// Every archived message of `key`, oldest first (empty when none).
+    fn load_archive(&self, key: &str) -> Vec<Value>;
+
+    /// Remove the archive of `key`. Idempotent.
+    fn delete_archive(&self, key: &str) -> std::io::Result<()>;
 }
 
 /// [`SessionStore`] that keeps one JSONL file per session: a metadata line
@@ -112,6 +125,15 @@ impl JSONLSessionStore {
     pub fn session_path(&self, key: &str) -> PathBuf {
         self.sessions_dir
             .join(format!("{}.jsonl", safe_filename(key)))
+    }
+
+    /// File path of the consolidated-message archive of `key`.
+    ///
+    /// Deliberately not `*.jsonl`: [`SessionStore::list_sessions`] scans for
+    /// that extension and must not report an archive as a session.
+    pub fn archive_path(&self, key: &str) -> PathBuf {
+        self.sessions_dir
+            .join(format!("{}.archive", safe_filename(key)))
     }
 
     /// File path the session identified by `key` used before the workspace layout.
@@ -382,13 +404,52 @@ impl SessionStore for JSONLSessionStore {
     /// Unlinks the current file and, if present, the legacy one.
     fn delete_session(&self, key: &str) -> std::io::Result<()> {
         for candidate in [self.session_path(key), self.legacy_session_path(key)] {
-            if let Err(e) = fs::remove_file(&candidate)
-                && e.kind() != std::io::ErrorKind::NotFound
-            {
-                return Err(e);
-            }
+            remove_file_if_present(&candidate)?;
         }
-        Ok(())
+        self.delete_archive(key)
+    }
+
+    /// Appends one JSON line per message to the archive file, creating it on first use.
+    fn append_archive(&self, key: &str, messages: &[Value]) -> std::io::Result<()> {
+        if messages.is_empty() {
+            return Ok(());
+        }
+        let mut contents = Vec::new();
+        for msg in messages {
+            writeln!(contents, "{}", serde_json::to_string(msg)?)?;
+        }
+        let path = self.archive_path(key);
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        let mut file = fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)?;
+        file.write_all(&contents)
+    }
+
+    /// Reads the archive file; unparsable lines are skipped with a warning.
+    fn load_archive(&self, key: &str) -> Vec<Value> {
+        let Ok(file) = File::open(self.archive_path(key)) else {
+            return Vec::new();
+        };
+        BufReader::new(file)
+            .lines()
+            .map_while(Result::ok)
+            .filter(|line| !line.trim().is_empty())
+            .filter_map(|line| match serde_json::from_str::<Value>(&line) {
+                Ok(value) => Some(value),
+                Err(e) => {
+                    log::warn!("Skipping corrupt archive line for session {key}: {e}");
+                    None
+                }
+            })
+            .collect()
+    }
+
+    fn delete_archive(&self, key: &str) -> std::io::Result<()> {
+        remove_file_if_present(&self.archive_path(key))
     }
 
     /// Reads only the first (metadata) line of every `*.jsonl` file.
@@ -560,6 +621,25 @@ impl Session {
         out
     }
 
+    /// Number of leading messages that are already consolidated, clamped to the
+    /// message count (a persisted cursor can outlive a shortened history).
+    pub fn consolidated_len(&self) -> usize {
+        self.last_consolidated.min(self.messages.len())
+    }
+
+    /// Remove the consolidated prefix from memory and return it, leaving only
+    /// the live tail with `last_consolidated == 0`.
+    ///
+    /// Callers must persist the returned messages (see
+    /// [`SessionStore::append_archive`]) before the session is saved, or they
+    /// are lost. The prompt window ([`Self::get_history`]) is unaffected
+    /// because it already starts at the cursor.
+    pub fn take_consolidated_prefix(&mut self) -> Vec<Value> {
+        let prefix_len = self.consolidated_len();
+        self.last_consolidated = 0;
+        self.messages.drain(..prefix_len).collect()
+    }
+
     /// Clears conversation messages and resets consolidation cursor.
     ///
     /// Also drops conversation-scoped metadata that would be wrong on an
@@ -685,6 +765,14 @@ fn value_as_object_map(value: Value) -> Result<HashMap<String, Value>, String> {
     match value {
         Value::Object(map) => Ok(map.into_iter().collect()),
         _ => Err("session records must be JSON objects".to_string()),
+    }
+}
+
+/// Remove `path`; a file that is already gone counts as success.
+fn remove_file_if_present(path: &Path) -> std::io::Result<()> {
+    match fs::remove_file(path) {
+        Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+        _ => Ok(()),
     }
 }
 
@@ -913,6 +1001,19 @@ impl SessionManager {
         self.load(session_key)
     }
 
+    /// Like [`Self::get_session_internal`], but with the archived (already
+    /// consolidated) messages prepended so the result is the whole
+    /// conversation, and `last_consolidated` shifted to match. For display and
+    /// export only: the in-memory session intentionally holds just the live tail.
+    pub(crate) fn get_session_with_archive(&self, session_key: &str) -> Option<Session> {
+        let mut session = self.get_session_internal(session_key)?;
+        let mut messages = self.store.load_archive(session_key);
+        session.last_consolidated += messages.len();
+        messages.append(&mut session.messages);
+        session.messages = messages;
+        Some(session)
+    }
+
     /// Get an existing session or create a new one.
     ///
     /// Cache first; on a miss, load from disk or insert a fresh session.
@@ -950,13 +1051,32 @@ impl SessionManager {
     /// A no-op (`Ok(())`, nothing written to the store, no cache write) if this key was
     /// tombstoned by [`Self::delete_session`] — see the [`Self::deleted`]
     /// field doc comment for why this check exists.
-    pub fn save(&mut self, session: Session) -> std::io::Result<()> {
+    ///
+    /// Messages before `last_consolidated` are moved out of the session into
+    /// the store's archive first, so neither the cache nor the session file
+    /// grows with conversation length while the raw history is kept. The
+    /// archive is written before the session file: a crash in between leaves
+    /// a duplicated (never a missing) range in the archive.
+    pub fn save(&mut self, mut session: Session) -> std::io::Result<()> {
         if self.deleted.contains(&session.key) {
             return Ok(());
         }
+        let consolidated_len = session.consolidated_len();
+        self.store
+            .append_archive(&session.key, &session.messages[..consolidated_len])?;
+        session.take_consolidated_prefix();
         self.store.save(&session)?;
         self.cache.insert(session.key.clone(), session);
         Ok(())
+    }
+
+    /// Wipe the conversation of `session` (including its archive) and persist
+    /// the empty session. Use instead of `Session::clear` + [`Self::save`],
+    /// which would leave the archived history behind.
+    pub fn reset_session(&mut self, mut session: Session) -> std::io::Result<()> {
+        self.store.delete_archive(&session.key)?;
+        session.clear();
+        self.save(session)
     }
 
     pub fn invalidate(&mut self, key: &str) -> Option<Session> {
@@ -1018,10 +1138,16 @@ impl SessionManager {
             .get_session_internal(source_key)
             .ok_or(ForkSessionError::NotFound)?;
 
+        // Indices are global over the whole conversation, so the archived
+        // prefix counts: the live `last_consolidated` shifts by its length.
+        let mut full_history = self.store.load_archive(source_key);
+        let source_last_consolidated = full_history.len() + source.last_consolidated;
+        full_history.extend(source.messages.iter().cloned());
+
         let mut copied: Vec<Value> = Vec::new();
         let mut user_index = 0;
         let mut found_target = false;
-        for message in &source.messages {
+        for message in &full_history {
             if message.get("role").and_then(Value::as_str) == Some("user") {
                 if user_index == before_user_index {
                     found_target = true;
@@ -1043,8 +1169,8 @@ impl SessionManager {
             metadata.remove(key);
         }
 
-        let mut last_consolidated = source.last_consolidated.min(copied.len());
-        if source.last_consolidated > copied.len() {
+        let mut last_consolidated = source_last_consolidated.min(copied.len());
+        if source_last_consolidated > copied.len() {
             metadata.remove(Self::LAST_SUMMARY_KEY);
             last_consolidated = 0;
         }
@@ -2000,7 +2126,6 @@ mod tests {
         session.add_message("user", "hello", Map::new());
         session.add_message("assistant", "world", Map::new());
         session.metadata.insert("x".into(), json!(42));
-        session.last_consolidated = 1;
 
         mgr.save(session).expect("save");
 
@@ -2016,7 +2141,7 @@ mod tests {
         assert_eq!(meta["_type"], json!("metadata"));
         assert_eq!(meta["key"], json!("k1"));
         assert_eq!(meta["metadata"]["x"], json!(42));
-        assert_eq!(meta["last_consolidated"], json!(1));
+        assert_eq!(meta["last_consolidated"], json!(0));
         assert!(meta["created_at"].as_str().is_some());
         assert!(meta["updated_at"].as_str().is_some());
 
@@ -2090,7 +2215,6 @@ mod tests {
         session.add_message("user", "a", Map::new());
         session.add_message("assistant", "b", Map::new());
         session.metadata.insert("env".into(), json!("test"));
-        session.last_consolidated = 1;
         let saved_created_at = session.created_at;
 
         mgr.save(session).expect("save");
@@ -2104,7 +2228,7 @@ mod tests {
         assert_eq!(loaded.messages[0]["role"], json!("user"));
         assert_eq!(loaded.messages[1]["role"], json!("assistant"));
         assert_eq!(loaded.metadata.get("env"), Some(&json!("test")));
-        assert_eq!(loaded.last_consolidated, 1);
+        assert_eq!(loaded.last_consolidated, 0);
         // created_at survives the round-trip (compare at second granularity).
         let diff = (loaded.created_at - saved_created_at).num_seconds().abs();
         assert!(diff < 2, "created_at should survive the round-trip");
@@ -2887,6 +3011,139 @@ mod tests {
         mgr.save(session).unwrap();
     }
 
+    fn archive_contents(mgr: &SessionManager, key: &str) -> Vec<String> {
+        JSONLSessionStore::new(mgr.sessions_dir.clone(), mgr.legacy_sessions_dir.clone())
+            .load_archive(key)
+            .iter()
+            .map(|m| m["content"].as_str().unwrap().to_string())
+            .collect()
+    }
+
+    #[test]
+    fn take_consolidated_prefix_drains_prefix_and_resets_cursor() {
+        let mut session = Session::new("k".into());
+        for content in ["u0", "a0", "u1"] {
+            session.add_message("user", content, Map::new());
+        }
+        session.last_consolidated = 2;
+
+        let prefix = session.take_consolidated_prefix();
+
+        assert_eq!(prefix.len(), 2);
+        assert_eq!(session.messages.len(), 1);
+        assert_eq!(session.messages[0]["content"], json!("u1"));
+        assert_eq!(session.last_consolidated, 0);
+    }
+
+    #[test]
+    fn take_consolidated_prefix_clamps_cursor_beyond_length() {
+        let mut session = Session::new("k".into());
+        session.add_message("user", "only", Map::new());
+        session.last_consolidated = 99;
+
+        assert_eq!(session.take_consolidated_prefix().len(), 1);
+        assert!(session.messages.is_empty());
+        assert_eq!(session.last_consolidated, 0);
+    }
+
+    #[test]
+    fn save_moves_consolidated_prefix_to_archive_and_trims_memory_and_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        let cached = mgr.get_or_create_session("src");
+        assert_eq!(cached.messages.len(), 2);
+        assert_eq!(cached.last_consolidated, 0);
+        assert_eq!(archive_contents(&mgr, "src"), ["u0", "a0"]);
+
+        mgr.invalidate("src");
+        let reloaded = mgr.get_or_create_session("src");
+        assert_eq!(reloaded.messages.len(), 2);
+        assert_eq!(reloaded.messages[0]["content"], json!("u1"));
+    }
+
+    #[test]
+    fn repeated_saves_do_not_duplicate_archive_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        let session = mgr.get_session_internal("src").unwrap();
+        mgr.save(session).unwrap();
+
+        assert_eq!(archive_contents(&mgr, "src"), ["u0", "a0"]);
+    }
+
+    #[test]
+    fn archive_is_not_listed_as_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        assert_eq!(mgr.list_sessions().len(), 1);
+    }
+
+    #[test]
+    fn reset_session_wipes_messages_and_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        let session = mgr.get_session_internal("src").unwrap();
+        mgr.reset_session(session).unwrap();
+
+        assert!(mgr.get_session_internal("src").unwrap().messages.is_empty());
+        assert!(archive_contents(&mgr, "src").is_empty());
+    }
+
+    #[test]
+    fn delete_session_removes_archive() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        mgr.delete_session("src").unwrap();
+
+        assert!(archive_contents(&mgr, "src").is_empty());
+    }
+
+    #[test]
+    fn fork_includes_archived_history_and_counts_user_indices_globally() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        // u0/a0 are archived; the live tail is u1/a1.
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
+
+        let forked = mgr.get_session_internal("dst").unwrap();
+        // Both copied messages were consolidated in the source, so the fork's
+        // own save archives them and keeps no live tail.
+        assert!(forked.messages.is_empty());
+        assert_eq!(archive_contents(&mgr, "dst"), ["u0", "a0"]);
+    }
+
+    #[test]
+    fn fork_of_archived_session_keeps_full_prefix() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        // before_user_index == total user count copies the whole conversation.
+        mgr.fork_session_before_user_index("src", "dst", 2).unwrap();
+
+        let forked = mgr.get_session_internal("dst").unwrap();
+        let mut all = archive_contents(&mgr, "dst");
+        all.extend(
+            forked
+                .messages
+                .iter()
+                .map(|m| m["content"].as_str().unwrap().to_string()),
+        );
+        assert_eq!(all, ["u0", "a0", "u1", "a1"]);
+    }
+
     #[test]
     fn fork_session_before_user_index_zero_stops_before_first_user() {
         let dir = tempfile::tempdir().unwrap();
@@ -2920,9 +3177,30 @@ mod tests {
         save_two_turn_session(&mut mgr, "src", 1);
 
         mgr.fork_session_before_user_index("src", "dst", 2).unwrap();
-        let forked = mgr.get_session_internal("dst").unwrap();
+        // The fork's save moved the consolidated message to its archive.
+        let forked = mgr.get_session_with_archive("dst").unwrap();
         assert_eq!(forked.messages.len(), 4);
         assert_eq!(forked.last_consolidated, 1);
+        assert_eq!(archive_contents(&mgr, "dst"), ["u0"]);
+    }
+
+    #[test]
+    fn get_session_with_archive_prepends_archive_and_shifts_cursor() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 2);
+
+        let full = mgr.get_session_with_archive("src").unwrap();
+
+        let contents: Vec<&str> = full
+            .messages
+            .iter()
+            .map(|m| m["content"].as_str().unwrap())
+            .collect();
+        assert_eq!(contents, ["u0", "a0", "u1", "a1"]);
+        assert_eq!(full.last_consolidated, 2);
+        // The cached live session stays trimmed.
+        assert_eq!(mgr.get_or_create_session("src").messages.len(), 2);
     }
 
     #[test]
@@ -2969,6 +3247,7 @@ mod tests {
     #[derive(Default)]
     struct InMemorySessionStore {
         sessions: Mutex<HashMap<String, Session>>,
+        archives: Mutex<HashMap<String, Vec<Value>>>,
     }
 
     impl SessionStore for InMemorySessionStore {
@@ -2987,6 +3266,27 @@ mod tests {
         }
         fn delete_session(&self, key: &str) -> std::io::Result<()> {
             self.sessions.lock().unwrap().remove(key);
+            self.delete_archive(key)
+        }
+        fn append_archive(&self, key: &str, messages: &[Value]) -> std::io::Result<()> {
+            self.archives
+                .lock()
+                .unwrap()
+                .entry(key.to_string())
+                .or_default()
+                .extend_from_slice(messages);
+            Ok(())
+        }
+        fn load_archive(&self, key: &str) -> Vec<Value> {
+            self.archives
+                .lock()
+                .unwrap()
+                .get(key)
+                .cloned()
+                .unwrap_or_default()
+        }
+        fn delete_archive(&self, key: &str) -> std::io::Result<()> {
+            self.archives.lock().unwrap().remove(key);
             Ok(())
         }
         fn list_sessions(&self) -> Vec<Value> {

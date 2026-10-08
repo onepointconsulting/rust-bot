@@ -153,14 +153,13 @@ impl CommandHandler for CmdNew {
         let Some(agent_loop) = &ctx.agent_loop else {
             return reply_no_loop(ctx, "/new");
         };
-        let (mut session_manager, mut session) = ctx.lock_session_manager_and_session(agent_loop);
+        let (mut session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
         let session_key = session.key.clone();
         let snapshot = session
             .messages
             .get(session.last_consolidated..)
             .map(<[_]>::to_vec);
-        session.clear();
-        if let Err(e) = session_manager.save(session) {
+        if let Err(e) = session_manager.reset_session(session) {
             log::error!("Failed to save session: {e}");
         }
         if let Some(_snapshot) = snapshot {

@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::ops::Index;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
@@ -241,11 +242,12 @@ impl MemoryStore {
             }
         }
         if let Some(first_nonempty) = first_nonempty_option
-            && let Some(matched) = LEGACY_TIMESTAMP.captures(first_nonempty) {
-                let end = matched.get(0).unwrap().end();
-                let slice = first_nonempty[end..].trim_start();
-                return slice.starts_with(RAW_MARKER);
-            }
+            && let Some(matched) = LEGACY_TIMESTAMP.captures(first_nonempty)
+        {
+            let end = matched.get(0).unwrap().end();
+            let slice = first_nonempty[end..].trim_start();
+            return slice.starts_with(RAW_MARKER);
+        }
         false
     }
 
@@ -372,14 +374,16 @@ impl MemoryStore {
     fn next_cursor(&self) -> u64 {
         if self.cursor_file.exists()
             && let Ok(text) = std::fs::read_to_string(&self.cursor_file)
-                && let Ok(n) = text.trim().parse::<u64>() {
-                    return n.saturating_add(1);
-                }
+            && let Ok(n) = text.trim().parse::<u64>()
+        {
+            return n.saturating_add(1);
+        }
         if let Some(last) = self.read_last_entry()
             && let Some(c) = last.get("cursor")
-                && let Some(n) = Self::parse_entry_cursor(c) {
-                    return n.saturating_add(1);
-                }
+            && let Some(n) = Self::parse_entry_cursor(c)
+        {
+            return n.saturating_add(1);
+        }
         1
     }
 
@@ -1882,9 +1886,10 @@ mod tests {
         let reloaded = {
             let mut guard = sessions.lock().unwrap();
             guard.invalidate("cli:test");
-            guard.get_or_create_session("cli:test").clone()
+            guard.get_session_with_archive("cli:test").unwrap()
         };
 
+        // Archive + live tail: the idle compaction must not lose raw history.
         assert_eq!(reloaded.messages.len(), 40);
         assert_eq!(
             reloaded.messages[0].get("content"),
@@ -1955,7 +1960,7 @@ mod tests {
         let reloaded = {
             let mut guard = sessions.lock().unwrap();
             guard.invalidate("cli:fail");
-            guard.get_or_create_session("cli:fail").clone()
+            guard.get_session_with_archive("cli:fail").unwrap()
         };
         assert_eq!(
             reloaded.messages.len(),

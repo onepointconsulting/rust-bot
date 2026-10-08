@@ -2119,7 +2119,7 @@ fn print_previous_messages(agent_loop: &AgentLoop, session_id: &str, markdown: b
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         manager
-            .get_session_internal(session_id)
+            .get_session_with_archive(session_id)
             .map(|session| session.messages)
             .unwrap_or_default()
     };

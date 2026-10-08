@@ -2192,7 +2192,7 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             session_manager
-                .get_session_internal(&key)
+                .get_session_with_archive(&key)
                 .map(|session| {
                     session
                         .messages
@@ -2815,7 +2815,7 @@ async fn attach_chat(connection_id: &str, chat_id: &str, shared: &WsShared) {
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        session_manager.get_session_internal(&session_key)
+        session_manager.get_session_with_archive(&session_key)
     };
     let mut history = if !transcript_history.is_empty() {
         transcript_history
@@ -3572,10 +3572,7 @@ async fn handle_envelope_clear_session<'a>(envelope_dispatch_context: EnvelopeDi
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         match session_manager.get_session_internal(&get_session_id(cid)) {
-            Some(mut session) => {
-                session.clear();
-                Some(session_manager.save(session))
-            }
+            Some(session) => Some(session_manager.reset_session(session)),
             None => None,
         }
     };
