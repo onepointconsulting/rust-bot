@@ -1,10 +1,11 @@
-use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsSidebarToggle};
+use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsStrip};
 use chat_ui::models::{
     ChatEntry, OutgoingMessage, SessionListItem, SessionSummaryPopup, SessionTokenUsage,
     SkillSummary, ToolSummary, WorkspaceDialogState,
 };
 use leptos::prelude::*;
 
+use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
 use crate::components::{AskQuestionCard, MessageList, ToolApprovalCard};
 use crate::state::{ConnectionStatus, PendingApproval, PendingQuestion};
 
@@ -91,6 +92,25 @@ pub fn ChatShell(
         on_new_chat();
         composer_focus_request.update(|count| *count += 1);
     };
+    // Ctrl/Cmd+B toggles the sidebar from anywhere (including the composer).
+    // Registered once for the component's lifetime; Leptos removes it on
+    // unmount.
+    window_event_listener(leptos::ev::keydown, move |event| {
+        if is_sidebar_toggle_shortcut(
+            event.ctrl_key(),
+            event.meta_key(),
+            event.alt_key(),
+            event.shift_key(),
+            &event.key(),
+        ) {
+            event.prevent_default();
+            on_toggle_sidebar();
+        }
+    });
+    let shortcut_label = sidebar_shortcut_label();
+    // The floating widget (not expanded) gets a narrower strip and sidebar.
+    let compact = Signal::derive(move || !expanded.get());
+    let on_new_chat_callback = Callback::new(move |()| on_new_chat_and_focus());
     let shell_class = move || {
         if expanded.get() {
             "fixed inset-0 z-50 flex h-full w-full flex-row overflow-hidden bg-slate-50"
@@ -100,6 +120,14 @@ pub fn ChatShell(
     };
     view! {
         <div class=shell_class>
+            <Show when=move || !sidebar_open.get()>
+                <SessionsStrip
+                    on_open=on_toggle_sidebar
+                    on_new_chat=on_new_chat_callback
+                    open_hint=shortcut_label.to_string()
+                    compact=compact
+                />
+            </Show>
             <SessionsSidebar
                 sessions=sessions
                 active_id=active_session_id
@@ -119,23 +147,23 @@ pub fn ChatShell(
                 on_fork=Callback::new(move |id| on_fork_session(id))
                 on_clear=Callback::new(move |id| on_clear_session(id))
                 on_delete=Callback::new(move |id| on_delete_session(id))
+                on_new_chat=on_new_chat_callback
+                show_brand=true
+                collapse_hint=shortcut_label.to_string()
+                compact=compact
             />
             <div class="flex min-w-0 flex-1 flex-col overflow-hidden">
                 <header class="relative z-10 flex items-center justify-between gap-2 border-b border-slate-200 bg-white px-4 py-3">
                     <div class="flex min-w-0 items-center gap-2">
-                        <SessionsSidebarToggle open=sidebar_open on_toggle=on_toggle_sidebar />
-                        <div class="min-w-0">
-                            <h1 class="text-base font-semibold text-slate-900">"Rust Bot"</h1>
-                            <p class="text-xs text-slate-400">"Live chat"</p>
-                        </div>
+                        <ConnectionBadge status=connection_status />
                     </div>
                     <div class="flex min-w-0 items-center gap-1">
-                        <ConnectionBadge status=connection_status />
                         <ChatHeaderActions
                             expanded=expanded
                             email=user_email
                             version=bot_version
                             on_new_chat=on_new_chat_and_focus
+                            show_new_chat=false
                             on_logout=on_logout
                             on_minimize=on_minimize
                             on_toggle_expand=on_toggle_expand

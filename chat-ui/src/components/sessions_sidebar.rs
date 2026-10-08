@@ -35,6 +35,7 @@ use std::collections::HashSet;
 use leptos::html::Input;
 use leptos::prelude::*;
 
+use crate::components::brand::BrandLogo;
 use crate::models::{SessionListItem, SessionSummaryPopup, WorkspaceDialogState};
 use crate::session_groups::{group_sessions, SessionGroup};
 
@@ -48,8 +49,10 @@ fn icon_class() -> &'static str {
     "h-4 w-4"
 }
 
+/// Panel-with-left-rail glyph shared by the sidebar's collapse button, the
+/// legacy header toggle and the collapsed-state icon strip.
 #[component]
-fn IconSidebarPanel() -> impl IntoView {
+pub(crate) fn IconSidebarPanel() -> impl IntoView {
     view! {
         <svg
             xmlns="http://www.w3.org/2000/svg"
@@ -64,6 +67,29 @@ fn IconSidebarPanel() -> impl IntoView {
         >
             <rect width="18" height="18" x="3" y="3" rx="2" ry="2" />
             <line x1="9" x2="9" y1="3" y2="21" />
+        </svg>
+    }
+}
+
+/// Speech bubble with a `+` (DeepSeek's "New Session" glyph), used by the
+/// sidebar's "New chat" button and the icon strip's new-chat button.
+#[component]
+pub(crate) fn IconChatPlus() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <path d="M21 11.5a8.4 8.4 0 0 1-9 8.4 8.6 8.6 0 0 1-3.6-.8L3 21l1.9-5.4A8.4 8.4 0 0 1 3 11.5 8.5 8.5 0 0 1 12 3a8.5 8.5 0 0 1 9 8.5Z" />
+            <line x1="12" x2="12" y1="8" y2="15" />
+            <line x1="8.5" x2="15.5" y1="11.5" y2="11.5" />
         </svg>
     }
 }
@@ -235,6 +261,15 @@ fn IconClose() -> impl IntoView {
             <path d="M18 6L6 18" />
             <path d="M6 6l12 12" />
         </svg>
+    }
+}
+
+/// Tooltip for the sidebar's collapse button: `"Collapse"`, or
+/// `"Close sidebar <hint>"` when the caller supplies a shortcut hint.
+fn collapse_tooltip(hint: Option<&str>) -> String {
+    match hint {
+        Some(hint) => format!("Close sidebar {hint}"),
+        None => "Collapse".to_string(),
     }
 }
 
@@ -679,6 +714,23 @@ pub fn SessionsSidebar(
     /// dialog. Omitted by `web-chat`, which has no delete API yet.
     #[prop(optional)]
     on_delete: Option<Callback<String>>,
+    /// When set, a full-width "New chat" button is shown at the top of the
+    /// list column (below the header row). Omitted by `web-chat`, whose
+    /// header carries its own "New chat" button.
+    #[prop(optional)]
+    on_new_chat: Option<Callback<()>>,
+    /// When `true`, the header row shows the rust-bot logo + title instead of
+    /// the "Chats" label.
+    #[prop(default = false)]
+    show_brand: bool,
+    /// Appended to the collapse button's tooltip (e.g. the keyboard
+    /// shortcut: `"Close sidebar Ctrl+B"`). `None` keeps the plain tooltip.
+    #[prop(optional)]
+    collapse_hint: Option<String>,
+    /// Narrower docked panel (`sm:w-48` instead of `sm:w-64`) for the small
+    /// floating-widget window.
+    #[prop(into, default = Signal::stored(false))]
+    compact: Signal<bool>,
 ) -> impl IntoView {
     // Which groups' "··· More" disclosure has been opened. Hoisted above
     // `body` (rather than living inside `SessionGroupSection`, as it used
@@ -810,6 +862,10 @@ pub fn SessionsSidebar(
         close_delete();
     };
 
+    // `StoredValue` is `Copy`, which keeps `body` callable from both the docked
+    // aside and the mobile overlay.
+    let collapse_title = StoredValue::new(collapse_tooltip(collapse_hint.as_deref()));
+
     let body = move || {
         let group_sections = move || {
             group_sessions(&sessions.get(), js_sys::Date::now() as i64)
@@ -844,13 +900,28 @@ pub fn SessionsSidebar(
         view! {
             <div class="flex h-full flex-col">
                 <div class="flex items-center justify-between border-b border-slate-200 px-3 py-3 min-h-[4rem]">
-                    <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">
-                        "Chats"
-                    </span>
+                    {if show_brand {
+                        view! {
+                            <span class="flex min-w-0 items-center gap-2">
+                                <BrandLogo class="h-6 w-6 shrink-0" />
+                                <span class="truncate text-base font-semibold text-slate-900">
+                                    "rust-bot"
+                                </span>
+                            </span>
+                        }
+                        .into_any()
+                    } else {
+                        view! {
+                            <span class="text-xs font-semibold uppercase tracking-wide text-slate-400">
+                                "Chats"
+                            </span>
+                        }
+                        .into_any()
+                    }}
                     <button
                         type="button"
                         aria-label="Collapse chats panel"
-                        title="Collapse"
+                        title=collapse_title.get_value()
                         class="flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
                         on:click=move |_| {
                             on_close()
@@ -859,6 +930,20 @@ pub fn SessionsSidebar(
                         <IconSidebarPanel />
                     </button>
                 </div>
+                {on_new_chat.map(|on_new_chat| {
+                    view! {
+                        <div class="px-2 pt-3">
+                            <button
+                                type="button"
+                                class="flex w-full items-center justify-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-2.5 text-sm font-medium text-slate-700 shadow-sm hover:bg-slate-50"
+                                on:click=move |_| on_new_chat.run(())
+                            >
+                                <IconChatPlus />
+                                "New chat"
+                            </button>
+                        </div>
+                    }
+                })}
                 <div class="flex-1 overflow-y-auto px-2 py-2">
                     {move || {
                         if sessions.get().is_empty() {
@@ -878,7 +963,13 @@ pub fn SessionsSidebar(
     view! {
         <>
             <Show when=move || open.get()>
-                <aside class="hidden shrink-0 border-r border-slate-200 bg-white sm:flex sm:w-64 sm:flex-col">
+                <aside class=move || {
+                    if compact.get() {
+                        "hidden shrink-0 border-r border-slate-200 bg-white sm:flex sm:w-48 sm:flex-col"
+                    } else {
+                        "hidden shrink-0 border-r border-slate-200 bg-white sm:flex sm:w-64 sm:flex-col"
+                    }
+                }>
                     {body()}
                 </aside>
             </Show>
@@ -1370,5 +1461,20 @@ pub fn SessionsSidebar(
                 </div>
             </Show>
         </>
+    }
+}
+
+#[cfg(test)]
+mod collapse_tooltip_tests {
+    use super::collapse_tooltip;
+
+    #[test]
+    fn plain_tooltip_without_hint() {
+        assert_eq!(collapse_tooltip(None), "Collapse");
+    }
+
+    #[test]
+    fn tooltip_includes_shortcut_hint() {
+        assert_eq!(collapse_tooltip(Some("Ctrl+B")), "Close sidebar Ctrl+B");
     }
 }

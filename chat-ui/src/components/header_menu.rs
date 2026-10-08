@@ -130,6 +130,11 @@ pub fn ChatHeaderActions(
     on_toggle_expand: impl Fn() + 'static + Copy,
     #[prop(default = true)] show_logout: bool,
     #[prop(default = true)] show_minimize: bool,
+    /// `false` hides both "New chat" entries (inline button and mobile kebab
+    /// item) — `websockets-chat` offers New chat from its sessions sidebar /
+    /// icon strip instead. `on_new_chat` is then simply unused.
+    #[prop(default = true)]
+    show_new_chat: bool,
 ) -> impl IntoView {
     let menu_open = RwSignal::new(false);
 
@@ -163,9 +168,11 @@ pub fn ChatHeaderActions(
     view! {
         <div class="flex shrink-0 items-center gap-1">
             <div class="hidden items-center gap-1 sm:flex">
-                <button type="button" class=TEXT_BTN on:click=do_new_chat>
-                    "New chat"
-                </button>
+                {show_new_chat.then(|| view! {
+                    <button type="button" class=TEXT_BTN on:click=do_new_chat>
+                        "New chat"
+                    </button>
+                })}
                 <button
                     type="button"
                     aria-label=expand_aria
@@ -220,9 +227,11 @@ pub fn ChatHeaderActions(
                         role="menu"
                         class="absolute right-0 z-20 mt-1 w-44 overflow-hidden rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
                     >
-                        <button type="button" role="menuitem" class=MENU_ITEM on:click=do_new_chat>
-                            "New chat"
-                        </button>
+                        {show_new_chat.then(|| view! {
+                            <button type="button" role="menuitem" class=MENU_ITEM on:click=do_new_chat>
+                                "New chat"
+                            </button>
+                        })}
                         <button
                             type="button"
                             role="menuitem"
