@@ -899,7 +899,7 @@ pub fn SessionsSidebar(
 
         view! {
             <div class="flex h-full flex-col">
-                <div class="flex items-center justify-between border-b border-slate-200 px-3 py-3 min-h-[4rem]">
+                <div class="flex items-center justify-between border-b border-slate-200 px-3 py-3 h-14">
                     {if show_brand {
                         view! {
                             <span class="flex min-w-0 items-center gap-2">

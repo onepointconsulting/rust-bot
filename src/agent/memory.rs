@@ -1,7 +1,6 @@
 use std::collections::HashMap;
 use std::fs::File;
 use std::io::{self, BufRead, BufReader, Read, Seek, SeekFrom, Write};
-use std::ops::Index;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, LazyLock, Mutex};
 use std::time::SystemTime;
