@@ -14,6 +14,7 @@ pub mod path;
 pub mod process;
 pub mod prompt_templates;
 pub mod registry_helper;
+pub mod relative_time;
 pub mod restart;
 pub mod runtime;
 pub mod searchusage;

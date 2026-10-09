@@ -341,8 +341,20 @@ pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpClient, C
     }
 }
 
+/// Resolve `command` to the executable that will actually be spawned.
+///
+/// `Command::new("npx")` on Windows only tries `npx.exe`, so shims such as `npx.cmd`
+/// are reported as "program not found". `which` honors `PATHEXT`, so it finds them.
+/// Falls back to the command as written (e.g. relative paths, or genuinely missing
+/// programs, which then fail at spawn with the usual error).
+fn resolve_stdio_command(command: &str) -> std::ffi::OsString {
+    which::which(command)
+        .map(std::path::PathBuf::into_os_string)
+        .unwrap_or_else(|_| command.into())
+}
+
 async fn connect_stdio(config: &McpServerConfig) -> Result<McpClient, ConnectMcpError> {
-    let mut cmd = tokio::process::Command::new(&config.command);
+    let mut cmd = tokio::process::Command::new(resolve_stdio_command(&config.command));
     cmd.args(&config.args);
     for (k, v) in &config.env {
         cmd.env(k, v);
@@ -659,6 +671,43 @@ fn mcp_cast_params(params: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn resolve_stdio_command_keeps_unknown_command_as_written() {
+        assert_eq!(
+            resolve_stdio_command("definitely-not-a-real-program-xyz"),
+            std::ffi::OsString::from("definitely-not-a-real-program-xyz")
+        );
+    }
+
+    #[test]
+    fn resolve_stdio_command_finds_program_on_path() {
+        // `cargo` is on PATH whenever this test runs; on Windows it resolves via PATHEXT.
+        let resolved = std::path::PathBuf::from(resolve_stdio_command("cargo"));
+        assert!(
+            resolved.is_absolute(),
+            "expected absolute path, got {resolved:?}"
+        );
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn resolve_stdio_command_finds_cmd_shim_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let shim = dir.path().join("rust_bot_fake_shim.cmd");
+        std::fs::write(&shim, "@echo off").unwrap();
+        let original_path = std::env::var_os("PATH").unwrap_or_default();
+        let mut paths = vec![dir.path().to_path_buf()];
+        paths.extend(std::env::split_paths(&original_path));
+        unsafe {
+            std::env::set_var("PATH", std::env::join_paths(paths).unwrap());
+        }
+        let resolved = resolve_stdio_command("rust_bot_fake_shim");
+        unsafe {
+            std::env::set_var("PATH", original_path);
+        }
+        assert_eq!(std::path::PathBuf::from(resolved), shim);
+    }
 
     // ── positive cases ────────────────────────────────────────────────────────
 

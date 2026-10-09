@@ -5,7 +5,7 @@ use std::{
 };
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 
 use crate::{
     agent::{
@@ -30,10 +30,117 @@ use crate::{
             register_gmail_tools, register_image_generation_tools, register_ocr_tools,
             register_web_tools,
         },
+        relative_time::format_relative_time,
     },
 };
 
 use tera::Context;
+
+/// Longest label derived from a task when the caller gave none.
+const DERIVED_LABEL_MAX_CHARS: usize = 30;
+/// Longest task text kept in a [`SubagentRecord`].
+const TASK_SUMMARY_MAX_CHARS: usize = 80;
+/// How many finished records are kept; running ones are never pruned.
+const MAX_FINISHED_RECORDS: usize = 50;
+
+/// Where a spawned sub-agent is in its life. Terminal states never change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentStatus {
+    Running,
+    Completed,
+    /// Stopped by a tool error; the announcement carries the partial progress.
+    Partial,
+    Failed,
+    Cancelled,
+}
+
+impl SubagentStatus {
+    /// Lower-case token shown in listings.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SubagentStatus::Running => "running",
+            SubagentStatus::Completed => "completed",
+            SubagentStatus::Partial => "partial",
+            SubagentStatus::Failed => "failed",
+            SubagentStatus::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// What is remembered about one spawned sub-agent (in memory, this process only).
+#[derive(Debug, Clone)]
+pub struct SubagentRecord {
+    pub task_id: String,
+    pub label: String,
+    /// The first [`TASK_SUMMARY_MAX_CHARS`] characters of the task.
+    pub task_summary: String,
+    pub session_key: Option<String>,
+    pub channel: String,
+    pub chat_id: String,
+    pub spawned_at: DateTime<Utc>,
+    /// Set once, when the status leaves [`SubagentStatus::Running`].
+    pub finished_at: Option<DateTime<Utc>>,
+    pub status: SubagentStatus,
+}
+
+/// `text` cut to `max_chars` characters (never inside a multi-byte character),
+/// with `...` appended when something was cut.
+fn truncate_chars(text: &str, max_chars: usize) -> String {
+    if text.chars().count() > max_chars {
+        format!("{}...", text.chars().take(max_chars).collect::<String>())
+    } else {
+        text.to_string()
+    }
+}
+
+/// Render `records` as the "Spawn tasks" section of `/subagents`. Rows of
+/// `current_session` are marked with `*`. Records are rendered in the order
+/// given (see [`SubagentManager::list`]).
+pub fn format_subagents_list(records: &[SubagentRecord], current_session: Option<&str>) -> String {
+    format_subagents_list_at(records, current_session, Utc::now())
+}
+
+/// [`format_subagents_list`] with an explicit "now", for deterministic tests.
+fn format_subagents_list_at(
+    records: &[SubagentRecord],
+    current_session: Option<&str>,
+    now: DateTime<Utc>,
+) -> String {
+    if records.is_empty() {
+        return "No spawn tasks.".to_string();
+    }
+    let mut lines = vec!["Spawn tasks (runs, this process):".to_string()];
+    for record in records {
+        let marker =
+            if current_session.is_some() && record.session_key.as_deref() == current_session {
+                "*"
+            } else {
+                " "
+            };
+        let mut timing = format!("spawned {}", format_relative_time(now, record.spawned_at));
+        if let Some(finished_at) = record.finished_at {
+            timing.push_str(&format!(
+                ", finished {}",
+                format_relative_time(now, finished_at)
+            ));
+        }
+        lines.push(format!(
+            "{marker} {id} [{status}] {label} — {summary} (session: {session}; {timing})",
+            id = record.task_id,
+            status = record.status.as_str().to_uppercase(),
+            label = record.label,
+            summary = record.task_summary,
+            session = record.session_key.as_deref().unwrap_or("—"),
+        ));
+    }
+    if current_session.is_some() {
+        lines.push("(* = this session)".to_string());
+    }
+    lines.join(
+        "
+",
+    )
+}
 
 struct SubagentHook {
     _task_id: String,
@@ -83,6 +190,8 @@ pub struct SubagentManager {
     disabled_tools: Vec<String>,
     running_tasks: Arc<Mutex<HashMap<String, std::thread::JoinHandle<()>>>>,
     session_tasks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
+    /// One record per spawned sub-agent, kept after it finishes (bounded).
+    tasks: Arc<Mutex<HashMap<String, SubagentRecord>>>,
 }
 
 impl SubagentManager {
@@ -112,13 +221,13 @@ impl SubagentManager {
             gmail_config: gmail_config.unwrap_or_default(),
             ocr_config: ocr_config.unwrap_or_default(),
             docx_config: docx_config.unwrap_or_default(),
-            image_generation_config: image_generation_config
-                .unwrap_or_default(),
+            image_generation_config: image_generation_config.unwrap_or_default(),
             subagent_config: subagent_config.unwrap_or_default(),
             restrict_to_workspace: restrict_to_workspace.unwrap_or(false),
             disabled_tools: Vec::new(),
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             session_tasks: Arc::new(Mutex::new(HashMap::new())),
+            tasks: Arc::new(Mutex::new(HashMap::new())),
         }
     }
 
@@ -170,13 +279,9 @@ impl SubagentManager {
         let original_channel = original_channel_option.unwrap_or("cli");
         let origin_chat_id = origin_chat_id_option.unwrap_or("direct");
         let task_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
-        let display_label = label.map(str::to_string).unwrap_or_else(|| {
-            if task.len() > 30 {
-                format!("{}...", &task[..30])
-            } else {
-                task.to_string()
-            }
-        });
+        let display_label = label
+            .map(str::to_string)
+            .unwrap_or_else(|| truncate_chars(task, DERIVED_LABEL_MAX_CHARS));
         let display_label_owned = display_label.clone();
         let origin = HashMap::from([
             ("channel".to_string(), original_channel.to_string()),
@@ -189,6 +294,17 @@ impl SubagentManager {
         let session_tasks = Arc::clone(&self.session_tasks);
         let task_id_bg = task_id.clone();
         let session_key_owned = session_key.map(str::to_string);
+        self.insert_running_record(SubagentRecord {
+            task_id: task_id.clone(),
+            label: display_label.clone(),
+            task_summary: truncate_chars(task, TASK_SUMMARY_MAX_CHARS),
+            session_key: session_key_owned.clone(),
+            channel: original_channel.to_string(),
+            chat_id: origin_chat_id.to_string(),
+            spawned_at: Utc::now(),
+            finished_at: None,
+            status: SubagentStatus::Running,
+        });
 
         // LLMProviderDyn uses `?Send` futures; run on a dedicated thread with a
         // single-threaded runtime instead of `tokio::spawn`.
@@ -209,13 +325,17 @@ impl SubagentManager {
                         )
                         .await;
                     log::info!("Completed: {}", task_id_bg);
+                    // Safety net for a run that ended without reporting a status;
+                    // a no-op whenever one was already recorded (first writer wins).
+                    manager.set_status(&task_id_bg, SubagentStatus::Failed);
                     running_tasks.lock().unwrap().remove(&task_id_bg);
                     log::info!("Removed from running tasks: {}", task_id_bg);
                     if let Some(session_key) = session_key_owned
-                        && let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key) {
-                            tasks.remove(&task_id_bg);
-                            log::info!("Removed from tasks: {}", task_id_bg);
-                        }
+                        && let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key)
+                    {
+                        tasks.remove(&task_id_bg);
+                        log::info!("Removed from tasks: {}", task_id_bg);
+                    }
                 });
         });
 
@@ -238,6 +358,59 @@ impl SubagentManager {
         )
     }
 
+    /// Store a freshly spawned record, then drop the oldest finished records
+    /// beyond [`MAX_FINISHED_RECORDS`]. Running records are never dropped.
+    fn insert_running_record(&self, record: SubagentRecord) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        tasks.insert(record.task_id.clone(), record);
+        let mut finished: Vec<(DateTime<Utc>, String)> = tasks
+            .values()
+            .filter(|record| record.status != SubagentStatus::Running)
+            .map(|record| (record.spawned_at, record.task_id.clone()))
+            .collect();
+        if finished.len() <= MAX_FINISHED_RECORDS {
+            return;
+        }
+        finished.sort();
+        let surplus = finished.len() - MAX_FINISHED_RECORDS;
+        for (_, task_id) in finished.into_iter().take(surplus) {
+            tasks.remove(&task_id);
+        }
+    }
+
+    /// Move a record out of [`SubagentStatus::Running`]. One-shot: the first
+    /// terminal status wins, later calls (and unknown ids) are ignored. This is
+    /// what keeps a cancelled task `Cancelled` when it still finishes later.
+    fn set_status(&self, task_id: &str, status: SubagentStatus) {
+        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(record) = tasks.get_mut(task_id)
+            && record.status == SubagentStatus::Running
+        {
+            record.status = status;
+            record.finished_at = Some(Utc::now());
+        }
+    }
+
+    /// A snapshot of every sub-agent this process has spawned, in all sessions:
+    /// running ones first, then the rest; each group newest first.
+    pub fn list(&self) -> Vec<SubagentRecord> {
+        let mut records: Vec<SubagentRecord> = self
+            .tasks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .values()
+            .cloned()
+            .collect();
+        records.sort_by(|a, b| {
+            let a_running = a.status == SubagentStatus::Running;
+            let b_running = b.status == SubagentStatus::Running;
+            b_running
+                .cmp(&a_running)
+                .then(b.spawned_at.cmp(&a.spawned_at))
+        });
+        records
+    }
+
     /// Execute the subagent task and announce the result.
     async fn run_subagent(
         &self,
@@ -252,6 +425,7 @@ impl SubagentManager {
             .await
         {
             log::error!("Subagent [{task_id}] failed: {e}");
+            self.set_status(task_id, SubagentStatus::Failed);
             let error_msg = format!("Error: {e}");
             self.announce_result(task_id, label, task, &error_msg, origin, "error")
                 .await;
@@ -358,12 +532,14 @@ impl SubagentManager {
             })
             .await;
         if result.stop_reason == "tool_error" {
+            self.set_status(task_id, SubagentStatus::Partial);
             let progress = SubagentManager::format_partial_progress(result);
             self.announce_result(task_id, label, task, &progress, origin, "error")
                 .await;
             return Ok(());
         }
         if result.stop_reason == "error" {
+            self.set_status(task_id, SubagentStatus::Failed);
             let error = result
                 .error
                 .or(result.final_content)
@@ -376,6 +552,7 @@ impl SubagentManager {
             .final_content
             .unwrap_or("Task completed but no final response was generated.".to_string());
         log::info!("Subagent [{task_id}] completed successfully");
+        self.set_status(task_id, SubagentStatus::Completed);
         self.announce_result(task_id, label, task, &final_result, origin, "ok")
             .await;
         Ok(())
@@ -512,6 +689,7 @@ impl SubagentManager {
             .unwrap_or_default();
 
         let mut handles = Vec::new();
+        let mut cancelled_ids = Vec::new();
         {
             let mut running = self.running_tasks.lock().unwrap();
             for tid in task_ids {
@@ -523,8 +701,14 @@ impl SubagentManager {
                 }
                 if let Some(handle) = running.remove(&tid) {
                     handles.push(handle);
+                    cancelled_ids.push(tid);
                 }
             }
+        }
+        // Before waiting: the task keeps running until it ends, but a result it
+        // reports afterwards must not overwrite `Cancelled`.
+        for task_id in &cancelled_ids {
+            self.set_status(task_id, SubagentStatus::Cancelled);
         }
 
         let count = handles.len() as u32;
@@ -1190,6 +1374,323 @@ mod tests {
         assert!(result.is_ok());
         assert!(msg.content.contains("completed successfully"));
         assert!(msg.content.contains("couldn't produce a final answer"));
+    }
+
+    // ── spawn-task records, list(), format_subagents_list ────────────────────
+
+    use super::{
+        MAX_FINISHED_RECORDS, SubagentRecord, SubagentStatus, format_subagents_list,
+        format_subagents_list_at, truncate_chars,
+    };
+    use chrono::{DateTime, Duration, Utc};
+
+    fn test_manager(provider: Arc<dyn LLMProviderDyn>) -> (Arc<SubagentManager>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(SubagentManager::new_simple(
+            provider,
+            tmp.path().to_path_buf(),
+            Arc::new(MessageBus::new()),
+            4096,
+        ));
+        (manager, tmp)
+    }
+
+    fn record_at(
+        task_id: &str,
+        session_key: Option<&str>,
+        status: SubagentStatus,
+        spawned_at: DateTime<Utc>,
+    ) -> SubagentRecord {
+        SubagentRecord {
+            task_id: task_id.to_string(),
+            label: format!("label-{task_id}"),
+            task_summary: format!("summary-{task_id}"),
+            session_key: session_key.map(str::to_string),
+            channel: "cli".to_string(),
+            chat_id: "direct".to_string(),
+            spawned_at,
+            finished_at: None,
+            status,
+        }
+    }
+
+    /// Insert a record as `spawn()` does, then move it to `status` the way a
+    /// finished run does.
+    fn seed(manager: &SubagentManager, record: SubagentRecord) {
+        let status = record.status;
+        let task_id = record.task_id.clone();
+        manager.insert_running_record(SubagentRecord {
+            status: SubagentStatus::Running,
+            ..record
+        });
+        if status != SubagentStatus::Running {
+            manager.set_status(&task_id, status);
+        }
+    }
+
+    #[test]
+    fn empty_manager_lists_nothing() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        assert!(manager.list().is_empty());
+        assert_eq!(format_subagents_list(&[], None), "No spawn tasks.");
+    }
+
+    #[tokio::test]
+    async fn spawn_records_metadata_and_run_completes_the_record() {
+        let (manager, _tmp) = test_manager(ScriptedProvider::arc(vec![llm_text("All done.")]));
+        let task = "summarise the logs of the nightly batch run";
+        let ack = Arc::clone(&manager).spawn(
+            task,
+            None,
+            Some("telegram"),
+            Some("chat-42"),
+            Some("telegram:chat-42"),
+        );
+
+        let records = manager.list();
+        assert_eq!(records.len(), 1);
+        let record = &records[0];
+        assert!(ack.contains(&record.task_id));
+        assert_eq!(record.label, "summarise the logs of the nigh...");
+        assert_eq!(record.task_summary, task);
+        assert_eq!(record.session_key.as_deref(), Some("telegram:chat-42"));
+        assert_eq!(record.channel, "telegram");
+        assert_eq!(record.chat_id, "chat-42");
+        assert!(Utc::now() - record.spawned_at < Duration::seconds(30));
+
+        // The run finishes on its own thread; the record is kept and completed.
+        let mut finished = None;
+        for _ in 0..200 {
+            let current = manager.list().remove(0);
+            if current.status != SubagentStatus::Running {
+                finished = Some(current);
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+        let finished = finished.expect("sub-agent run should finish");
+        assert_eq!(finished.status, SubagentStatus::Completed);
+        assert!(finished.finished_at.is_some());
+    }
+
+    #[test]
+    fn explicit_label_is_kept() {
+        let (manager, _tmp) = test_manager(ScriptedProvider::arc(vec![llm_text("ok")]));
+        Arc::clone(&manager).spawn("task", Some("my label"), None, None, None);
+        let record = manager.list().remove(0);
+        assert_eq!(record.label, "my label");
+        assert_eq!(record.session_key, None);
+        assert_eq!(record.channel, "cli");
+        assert_eq!(record.chat_id, "direct");
+    }
+
+    #[tokio::test]
+    async fn run_outcomes_map_to_statuses() {
+        let cases: Vec<(Vec<LLMResponse>, SubagentStatus)> = vec![
+            (vec![llm_text("fine")], SubagentStatus::Completed),
+            (vec![llm_read_missing_file()], SubagentStatus::Partial),
+            (vec![llm_error("boom")], SubagentStatus::Failed),
+        ];
+        for (responses, expected) in cases {
+            let (manager, _tmp) = test_manager(ScriptedProvider::arc(responses));
+            seed(
+                &manager,
+                record_at("task-1", None, SubagentStatus::Running, Utc::now()),
+            );
+            let result = manager
+                .run_subagent_inner("task-1", "task", "label", &origin("cli", "direct"), None)
+                .await;
+            assert!(result.is_ok());
+            let record = manager.list().remove(0);
+            assert_eq!(record.status, expected);
+            assert!(record.finished_at.is_some());
+        }
+    }
+
+    #[test]
+    fn status_is_one_shot_and_unknown_ids_are_ignored() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        seed(
+            &manager,
+            record_at("task-1", None, SubagentStatus::Running, Utc::now()),
+        );
+        manager.set_status("task-1", SubagentStatus::Cancelled);
+        let first_finish = manager.list()[0].finished_at;
+        manager.set_status("task-1", SubagentStatus::Completed);
+        manager.set_status("missing", SubagentStatus::Failed);
+
+        let records = manager.list();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].status, SubagentStatus::Cancelled);
+        assert_eq!(records[0].finished_at, first_finish);
+    }
+
+    #[tokio::test]
+    async fn cancel_by_session_marks_running_tasks_cancelled_for_good() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        seed(
+            &manager,
+            record_at("task-1", Some("cli:a"), SubagentStatus::Running, Utc::now()),
+        );
+        let handle = std::thread::spawn(|| {
+            std::thread::sleep(std::time::Duration::from_millis(100));
+        });
+        manager
+            .running_tasks
+            .lock()
+            .unwrap()
+            .insert("task-1".to_string(), handle);
+        manager
+            .session_tasks
+            .lock()
+            .unwrap()
+            .entry("cli:a".to_string())
+            .or_default()
+            .insert("task-1".to_string());
+
+        assert_eq!(manager.cancel_by_session("cli:a").await, 1);
+        // The run still ends later and reports success: it must not overwrite.
+        manager.set_status("task-1", SubagentStatus::Completed);
+        assert_eq!(manager.list()[0].status, SubagentStatus::Cancelled);
+    }
+
+    #[test]
+    fn list_puts_running_first_then_newest_first() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        let now = Utc::now();
+        let minutes_ago = |minutes: i64| now - Duration::minutes(minutes);
+        seed(
+            &manager,
+            record_at("old-done", None, SubagentStatus::Completed, minutes_ago(30)),
+        );
+        seed(
+            &manager,
+            record_at("old-run", None, SubagentStatus::Running, minutes_ago(20)),
+        );
+        seed(
+            &manager,
+            record_at("new-done", None, SubagentStatus::Failed, minutes_ago(5)),
+        );
+        seed(
+            &manager,
+            record_at("new-run", None, SubagentStatus::Running, minutes_ago(1)),
+        );
+
+        let ids: Vec<String> = manager.list().into_iter().map(|r| r.task_id).collect();
+        assert_eq!(ids, ["new-run", "old-run", "new-done", "old-done"]);
+    }
+
+    #[test]
+    fn retention_prunes_oldest_finished_but_never_running() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        let now = Utc::now();
+        seed(
+            &manager,
+            record_at(
+                "still-running",
+                None,
+                SubagentStatus::Running,
+                now - Duration::days(9),
+            ),
+        );
+        for n in 0..=MAX_FINISHED_RECORDS {
+            seed(
+                &manager,
+                record_at(
+                    &format!("done-{n:02}"),
+                    None,
+                    SubagentStatus::Completed,
+                    now - Duration::minutes((MAX_FINISHED_RECORDS - n) as i64),
+                ),
+            );
+        }
+        // The prune runs on insert: one more spawn trims the surplus.
+        seed(
+            &manager,
+            record_at("latest", None, SubagentStatus::Running, now),
+        );
+
+        let records = manager.list();
+        let finished = records
+            .iter()
+            .filter(|r| r.status != SubagentStatus::Running)
+            .count();
+        assert_eq!(finished, MAX_FINISHED_RECORDS);
+        assert!(records.iter().any(|r| r.task_id == "still-running"));
+        assert!(records.iter().any(|r| r.task_id == "latest"));
+        assert!(
+            !records.iter().any(|r| r.task_id == "done-00"),
+            "oldest finished is pruned"
+        );
+    }
+
+    #[test]
+    fn listing_covers_all_sessions_and_marks_the_current_one() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        let now = Utc::now();
+        seed(
+            &manager,
+            record_at("mine", Some("cli:me"), SubagentStatus::Running, now),
+        );
+        seed(
+            &manager,
+            record_at(
+                "theirs",
+                Some("web:other"),
+                SubagentStatus::Running,
+                now - Duration::minutes(1),
+            ),
+        );
+        seed(
+            &manager,
+            record_at(
+                "nokey",
+                None,
+                SubagentStatus::Completed,
+                now - Duration::minutes(2),
+            ),
+        );
+
+        let text = format_subagents_list_at(&manager.list(), Some("cli:me"), now);
+        let line_of = |id: &str| text.lines().find(|l| l.contains(id)).unwrap().to_string();
+        assert!(line_of("mine").starts_with("* "));
+        assert!(line_of("theirs").starts_with("  "));
+        assert!(line_of("theirs").contains("web:other"));
+        assert!(line_of("nokey").contains("session: —"));
+        assert!(text.contains("(* = this session)"));
+    }
+
+    #[test]
+    fn format_snapshot_shows_status_label_summary_and_times() {
+        let now = Utc::now();
+        let mut record = record_at(
+            "abc12345",
+            Some("cli:direct"),
+            SubagentStatus::Completed,
+            now - Duration::minutes(3),
+        );
+        record.finished_at = Some(now - Duration::minutes(1));
+        let text = format_subagents_list_at(&[record], None, now);
+        assert_eq!(
+            text,
+            "Spawn tasks (runs, this process):\n  abc12345 [COMPLETED] label-abc12345 — summary-abc12345 (session: cli:direct; spawned 3m ago, finished 1m ago)"
+        );
+    }
+
+    #[test]
+    fn multibyte_tasks_are_truncated_on_character_boundaries() {
+        let task = "日本語のタスク".repeat(10);
+        assert!(task.len() > 30);
+        let label = truncate_chars(&task, 30);
+        assert_eq!(label.chars().count(), 33);
+        assert!(label.ends_with("..."));
+        assert_eq!(truncate_chars("short", 30), "short");
+
+        let (manager, _tmp) = test_manager(ScriptedProvider::arc(vec![llm_text("ok")]));
+        Arc::clone(&manager).spawn(&task, None, None, None, None);
+        let record = manager.list().remove(0);
+        assert_eq!(record.label.chars().count(), 33);
+        assert_eq!(record.task_summary, task);
     }
 
     #[test]

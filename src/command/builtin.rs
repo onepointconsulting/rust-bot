@@ -1,16 +1,21 @@
 use crate::{
     PKG_VERSION,
     agent::{
+        acp::listing::{format_acp_agents, list_acp_rows},
         agent_loop::AgentLoop,
         context::BOOTSTRAP_FILES,
+        subagent::format_subagents_list,
         tools::mcp::{load_mcp_tools_from_config, mcp_presets_api},
     },
     bus::events::OutboundMessage,
-    command::{CommandContext, CommandHandler, CommandRouter, types::ChatCommand},
+    command::{
+        CommandContext, CommandHandler, CommandRouter,
+        types::{ChatCommand, SubagentsFilter},
+    },
     config::{
         loader::{load_config, resolve_config_env_vars, save_config},
         overlay::overlay_is_active,
-        schema::McpServerConfig,
+        schema::{Config, McpServerConfig},
     },
     security::workspace_access::WorkspaceAccessMode,
     session::goal_state::{self, GoalUpdateAction},
@@ -481,6 +486,39 @@ fn refuse_config_change_in_child(ctx: &CommandContext, in_child: bool) -> Option
     })
 }
 
+/// Validate `name`, load the config and preset catalog, and find the preset called
+/// `name` (case-insensitive). On failure returns the error text to send back.
+fn load_config_and_preset(name: &str) -> Result<(Config, mcp_presets_api::McpPreset), String> {
+    if !mcp_presets_api::MCP_PRESET_NAME_RE.is_match(name) {
+        return Err(format!("Error: invalid MCP preset name '{name}'."));
+    }
+    let config = load_config(None);
+    let presets = mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path)
+        .map_err(|e| format!("Error loading MCP presets: {e}"))?;
+    presets
+        .into_iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .map(|preset| (config, preset))
+        .ok_or_else(|| format!("Error: unknown MCP preset '{name}'."))
+}
+
+/// Show a preset's details and the fields/variables needed to get it working.
+fn handle_mcp_preset_info(ctx: &CommandContext, name: &str) -> OutboundMessage {
+    let name = name.trim();
+    if name.is_empty() {
+        return reply_as_text(ctx, "Usage: /mcp-preset info <name>");
+    }
+    let (config, preset) = match load_config_and_preset(name) {
+        Ok(loaded) => loaded,
+        Err(message) => return reply_as_text(ctx, message),
+    };
+    let configured = config.tools.mcp_servers.get(&preset.name);
+    reply_as_text(
+        ctx,
+        mcp_presets_api::format_preset_details(&preset, configured),
+    )
+}
+
 fn handle_mcp_preset_enable(ctx: &CommandContext, rest: &str) -> OutboundMessage {
     if let Some(refusal) = refuse_config_change_in_child(ctx, overlay_is_active()) {
         return refusal;
@@ -490,19 +528,9 @@ fn handle_mcp_preset_enable(ctx: &CommandContext, rest: &str) -> OutboundMessage
     if name.is_empty() {
         return reply_as_text(ctx, "Usage: /mcp-preset enable <name> [field=value ...]");
     }
-    if !mcp_presets_api::MCP_PRESET_NAME_RE.is_match(name) {
-        return reply_as_text(ctx, format!("Error: invalid MCP preset name '{name}'."));
-    }
-    let mut config = load_config(None);
-    let presets = match mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path) {
-        Ok(presets) => presets,
-        Err(e) => return reply_as_text(ctx, format!("Error loading MCP presets: {e}")),
-    };
-    let Some(preset) = presets
-        .into_iter()
-        .find(|p| p.name.eq_ignore_ascii_case(name))
-    else {
-        return reply_as_text(ctx, format!("Error: unknown MCP preset '{name}'."));
+    let (mut config, preset) = match load_config_and_preset(name) {
+        Ok(loaded) => loaded,
+        Err(message) => return reply_as_text(ctx, message),
     };
     let overrides = parse_field_overrides(field_args);
     let existing = config.tools.mcp_servers.get(&preset.name).cloned();
@@ -612,17 +640,18 @@ impl CommandHandler for CmdMcpPreset {
         };
         match sub {
             "list" => handle_mcp_preset_list(ctx),
+            "info" | "show" => handle_mcp_preset_info(ctx, rest),
             "enable" => handle_mcp_preset_enable(ctx, rest),
             "disable" => handle_mcp_preset_disable(ctx, rest),
             "test" => handle_mcp_preset_test(ctx, rest).await,
             "" => reply_as_text(
                 ctx,
-                "Usage: /mcp-preset <list|enable|disable|test> [name] [key=value ...]",
+                "Usage: /mcp-preset <list|info|enable|disable|test> [name] [key=value ...]",
             ),
             other => reply_as_text(
                 ctx,
                 format!(
-                    "Unknown /mcp-preset subcommand '{other}'. Use list, enable, disable, or test."
+                    "Unknown /mcp-preset subcommand '{other}'. Use list, info, enable, disable, or test."
                 ),
             ),
         }
@@ -1159,6 +1188,51 @@ impl CommandHandler for CmdListSessions {
     }
 }
 
+/// `/subagents [spawn|acp|all]`: the spawn tasks of every session in this
+/// process and the durable ACP child agents.
+struct CmdSubagents;
+
+impl CmdSubagents {
+    /// The "Spawn tasks" section; rows of the asking session are marked.
+    fn spawn_section(agent_loop: &AgentLoop, ctx: &CommandContext) -> String {
+        format_subagents_list(&agent_loop.subagents.list(), Some(ctx.key.as_str()))
+    }
+
+    /// The "Child agents" section, or a note when ACP is switched off here.
+    fn acp_section(agent_loop: &AgentLoop) -> String {
+        let Some(acp_tools) = agent_loop.acp_tools() else {
+            return "Child agents are unavailable: ACP is disabled.".to_string();
+        };
+        let manager = acp_tools.manager();
+        let rows = list_acp_rows(manager.store(), manager.index(), |name| {
+            manager.is_busy(name)
+        });
+        format_acp_agents(&rows)
+    }
+}
+
+#[async_trait]
+impl CommandHandler for CmdSubagents {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let filter = match SubagentsFilter::parse(&ctx.args) {
+            Ok(filter) => filter,
+            Err(usage) => return reply_as_text(ctx, usage),
+        };
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/subagents");
+        };
+        let sections = match filter {
+            SubagentsFilter::Spawn => vec![Self::spawn_section(agent_loop, ctx)],
+            SubagentsFilter::Acp => vec![Self::acp_section(agent_loop)],
+            SubagentsFilter::All => vec![
+                Self::spawn_section(agent_loop, ctx),
+                Self::acp_section(agent_loop),
+            ],
+        };
+        reply_as_text(ctx, sections.join("\n\n"))
+    }
+}
+
 struct CmdExamplePrompts;
 
 #[async_trait]
@@ -1212,13 +1286,14 @@ fn build_help_text() -> String {
         "/dream-restore — Revert memory to a previous state",
         "/help — Show available commands",
         "/mcp-list — List available MCP servers",
-        "/mcp-preset <list|enable|disable|test> [name] [key=value ...] — Manage MCP server presets (e.g. github, playwright); enable/disable require a restart to take effect",
+        "/mcp-preset <list|info|enable|disable|test> [name] [key=value ...] — Manage MCP server presets (e.g. github, playwright); info shows the fields a preset needs; enable/disable require a restart to take effect",
         "/tools — List available tools",
         "/workspace — Show the session's workspace scope, or switch it: /workspace <path> [restricted|full], /workspace default to clear",
         "/goal <task> — Start a sustained goal for this session; /goal to check status, /goal cancel to clear it",
         "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
         "/list-sessions — List available sessions in current workspace",
         "/example-prompts — List example prompts",
+        "/subagents [spawn|acp|all] — List spawn tasks (id, status, task, session, spawn time) and ACP child agents",
     ];
     lines.join("\n")
 }
@@ -1258,6 +1333,13 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(
         ChatCommand::ExamplePrompts.to_string(),
         Arc::new(CmdExamplePrompts),
+    );
+    // `exact` only matches the bare command; the trailing-space `prefix` carries
+    // the filter argument and keeps `/subagentsfoo` out of this handler.
+    router.exact(ChatCommand::Subagents.to_string(), Arc::new(CmdSubagents));
+    router.prefix(
+        format!("{} ", ChatCommand::Subagents),
+        Arc::new(CmdSubagents),
     );
 }
 
@@ -2242,6 +2324,38 @@ mod tests {
         );
     }
 
+    fn mcp_preset_test_context() -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: "/mcp-preset info".into(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "mcp-preset",
+            "/mcp-preset info",
+            "info",
+            None,
+        )
+    }
+
+    #[test]
+    fn mcp_preset_info_without_name_returns_usage() {
+        let out = handle_mcp_preset_info(&mcp_preset_test_context(), "  ");
+        assert!(out.content.contains("Usage: /mcp-preset info <name>"));
+    }
+
+    #[test]
+    fn mcp_preset_info_rejects_invalid_name() {
+        let out = handle_mcp_preset_info(&mcp_preset_test_context(), "bad name!");
+        assert!(out.content.contains("invalid MCP preset name"));
+    }
+
     #[test]
     fn parse_field_overrides_splits_key_value_pairs() {
         let overrides = parse_field_overrides("github_token=ghp_abc other_field=value2");
@@ -2316,5 +2430,141 @@ mod tests {
         expected.sort();
         actual.sort();
         assert_eq!(actual, expected);
+    }
+
+    // ── /subagents ───────────────────────────────────────────────────────────
+
+    fn subagents_ctx(
+        agent_loop: Option<Arc<crate::agent::agent_loop::AgentLoop>>,
+        args: &str,
+    ) -> CommandContext {
+        let raw = format!("/subagents {args}").trim().to_string();
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: raw.clone(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+            },
+            None,
+            "cli:direct",
+            raw,
+            args,
+            agent_loop,
+        )
+    }
+
+    fn subagents_test_loop(acp_enabled: bool) -> Arc<crate::agent::agent_loop::AgentLoop> {
+        let workspace = tempfile::tempdir().unwrap().keep();
+        let mut config = crate::config::schema::Config::default();
+        config.tools.acp.enabled = acp_enabled;
+        Arc::new(crate::agent::agent_loop::AgentLoop::new(
+            Arc::new(crate::bus::queue::MessageBus::new()),
+            Arc::new(ModelCmdTestProvider),
+            workspace,
+            config,
+            None,
+            None,
+            None,
+        ))
+    }
+
+    #[tokio::test]
+    async fn subagents_without_agent_loop_reports_no_agent() {
+        let out = CmdSubagents.handle(&subagents_ctx(None, "")).await;
+        assert_eq!(
+            out.content,
+            "No agent available to execute command: /subagents."
+        );
+    }
+
+    #[tokio::test]
+    async fn subagents_bad_token_replies_with_usage() {
+        let out = CmdSubagents.handle(&subagents_ctx(None, "garbage")).await;
+        assert_eq!(out.content, SubagentsFilter::USAGE);
+    }
+
+    #[tokio::test]
+    async fn subagents_filters_select_the_sections() {
+        let loop_ = subagents_test_loop(false);
+        Arc::clone(&loop_.subagents).spawn(
+            "list the open issues",
+            Some("issue-lister"),
+            Some("cli"),
+            Some("direct"),
+            Some("cli:direct"),
+        );
+
+        let all = CmdSubagents
+            .handle(&subagents_ctx(Some(loop_.clone()), ""))
+            .await
+            .content;
+        let spawn_at = all
+            .find("Spawn tasks (runs, this process):")
+            .expect("spawn section");
+        let acp_at = all
+            .find("Child agents are unavailable")
+            .expect("acp section");
+        assert!(spawn_at < acp_at, "spawn section comes first: {all}");
+        assert!(all.contains("issue-lister"));
+        assert!(all.contains("(* = this session)"));
+        let all_explicit = CmdSubagents
+            .handle(&subagents_ctx(Some(loop_.clone()), " ALL "))
+            .await
+            .content;
+        assert_eq!(all, all_explicit);
+
+        let spawn_only = CmdSubagents
+            .handle(&subagents_ctx(Some(loop_.clone()), "spawn"))
+            .await
+            .content;
+        assert!(spawn_only.contains("issue-lister"));
+        assert!(!spawn_only.contains("Child agents"));
+
+        let acp_only = CmdSubagents
+            .handle(&subagents_ctx(Some(loop_), "acp"))
+            .await
+            .content;
+        assert!(!acp_only.contains("Spawn tasks"));
+        assert!(!acp_only.contains("issue-lister"));
+    }
+
+    #[tokio::test]
+    async fn subagents_acp_section_reports_no_children_when_acp_is_enabled() {
+        let loop_ = subagents_test_loop(true);
+        let out = CmdSubagents
+            .handle(&subagents_ctx(Some(loop_), "acp"))
+            .await;
+        assert_eq!(out.content, "No child agents.");
+    }
+
+    #[tokio::test]
+    async fn subagents_routes_bare_and_argument_forms_to_the_handler() {
+        let mut router = CommandRouter::new();
+        register_builtin_commands(&mut router);
+
+        for text in ["/subagents", "/subagents acp", "/SUBAGENTS Spawn"] {
+            let mut ctx = subagents_ctx(None, "");
+            ctx.raw = text.to_string();
+            let out = router.dispatch(&mut ctx).await.expect(text);
+            assert!(out.content.contains("/subagents"), "{text}: {}", out.content);
+        }
+        let mut bad = subagents_ctx(None, "");
+        bad.raw = "/subagents nonsense".to_string();
+        let out = router.dispatch(&mut bad).await.unwrap();
+        assert_eq!(out.content, SubagentsFilter::USAGE);
+
+        let mut leak = subagents_ctx(None, "");
+        leak.raw = "/subagentsfoo".to_string();
+        assert!(router.dispatch(&mut leak).await.is_none());
+    }
+
+    #[test]
+    fn help_lists_subagents() {
+        assert!(build_help_text().contains("/subagents [spawn|acp|all]"));
     }
 }

@@ -3,10 +3,13 @@ use std::collections::HashMap;
 use std::fmt;
 use std::fs;
 use std::future::Future;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
+use crate::agent::acp::listing::{format_acp_agents, list_acp_rows};
+use crate::agent::acp::session_index::ChildSessionIndex;
+use crate::agent::acp::store::ChildAgentStore;
 use crate::agent::cron_context::with_cron_context_stack;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::tool_approval::ToolApprovalBroker;
@@ -141,6 +144,20 @@ pub enum Commands {
 
     /// Mint an EdDSA JWT using the private key path from the config file
     GenerateJwtToken(GenerateJwtTokenArgs),
+
+    /// List the ACP child agents stored in the workspace
+    Subagents(SubagentsArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct SubagentsArgs {
+    /// JSON configuration file path
+    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    pub config: PathBuf,
+
+    /// Workspace directory (overrides the config; the config file is then not read)
+    #[arg(short, long)]
+    pub workspace: Option<PathBuf>,
 }
 
 #[derive(Debug, Parser)]
@@ -431,7 +448,35 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::Onboard(args) => run_onboard(args),
         Commands::GenerateJwtKeypair(args) => run_generate_keypair(args),
         Commands::GenerateJwtToken(args) => run_generate_token(args),
+        Commands::Subagents(args) => run_subagents(args),
     }
+}
+
+/// Footnote of `rust-bot subagents`: what this process cannot see.
+const SUBAGENTS_CLI_FOOTNOTE: &str = "Spawn tasks and live running state are only visible via /subagents inside a running agent.";
+
+/// The report `rust-bot subagents` prints for `workspace`: the stored child
+/// agents (a pure disk read; this process has no view of another process's run
+/// locks, so no row is `running here`) followed by [`SUBAGENTS_CLI_FOOTNOTE`].
+fn subagents_report(workspace: &Path) -> String {
+    let rows = list_acp_rows(
+        &ChildAgentStore::new(workspace),
+        &ChildSessionIndex::new(workspace),
+        |_| false,
+    );
+    format!("{}\n\n{SUBAGENTS_CLI_FOOTNOTE}", format_acp_agents(&rows))
+}
+
+/// `rust-bot subagents`: list the ACP child agents of the configured workspace.
+fn run_subagents(args: SubagentsArgs) -> Result<(), CliError> {
+    let workspace = match args.workspace {
+        Some(workspace) => workspace,
+        None => try_load_runtime_config(args.config, None)
+            .map_err(CliError::Other)?
+            .workspace_path(),
+    };
+    println!("{}", subagents_report(&workspace));
+    Ok(())
 }
 
 pub(crate) fn path_for_config(path: PathBuf) -> PathBuf {
@@ -2335,6 +2380,87 @@ mod tests {
         utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel},
     };
     use serde_json::json;
+
+    #[test]
+    fn subagents_command_parses_with_and_without_flags() {
+        let bare = Cli::try_parse_from(["rust-bot", "subagents"]).unwrap();
+        let Commands::Subagents(args) = bare.command else {
+            panic!("expected the subagents command");
+        };
+        assert_eq!(args.workspace, None);
+
+        let with_workspace =
+            Cli::try_parse_from(["rust-bot", "subagents", "--workspace", "some/dir"]).unwrap();
+        let Commands::Subagents(args) = with_workspace.command else {
+            panic!("expected the subagents command");
+        };
+        assert_eq!(args.workspace, Some(PathBuf::from("some/dir")));
+    }
+
+    #[test]
+    fn subagents_report_for_an_empty_workspace_says_so_and_adds_the_footnote() {
+        let workspace = tempfile::tempdir().unwrap();
+        let report = subagents_report(workspace.path());
+        assert_eq!(
+            report,
+            format!("No child agents.\n\n{SUBAGENTS_CLI_FOOTNOTE}")
+        );
+        assert!(!workspace.path().join("acp").exists(), "read-only listing");
+    }
+
+    #[test]
+    fn subagents_report_lists_stored_agents_and_skips_a_damaged_one() {
+        let workspace = tempfile::tempdir().unwrap();
+        let agents_root = workspace.path().join("acp").join("agents");
+        let good = agents_root.join("docs");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(
+            good.join("agent.json"),
+            serde_json::json!({
+                "name": "docs",
+                "purpose": "writes the docs",
+                "preset": "rustbot",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "createdBy": "cli:direct",
+                "depth": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let damaged = agents_root.join("broken");
+        std::fs::create_dir_all(&damaged).unwrap();
+        std::fs::write(damaged.join("agent.json"), "{ not json").unwrap();
+
+        let report = subagents_report(workspace.path());
+        assert!(report.contains("docs [never run]"), "{report}");
+        assert!(report.contains("writes the docs"), "{report}");
+        assert!(!report.contains("broken"), "{report}");
+        assert!(report.ends_with(SUBAGENTS_CLI_FOOTNOTE));
+    }
+
+    #[test]
+    fn subagents_report_survives_a_corrupt_session_index() {
+        let workspace = tempfile::tempdir().unwrap();
+        let good = workspace.path().join("acp").join("agents").join("docs");
+        std::fs::create_dir_all(&good).unwrap();
+        std::fs::write(
+            good.join("agent.json"),
+            serde_json::json!({
+                "name": "docs",
+                "purpose": "p",
+                "preset": "rustbot",
+                "createdAt": "2026-01-01T00:00:00Z",
+                "createdBy": "cli:direct",
+                "depth": 1
+            })
+            .to_string(),
+        )
+        .unwrap();
+        std::fs::write(workspace.path().join("acp").join("sessions.json"), "garbage").unwrap();
+
+        let report = subagents_report(workspace.path());
+        assert!(report.contains("docs ["), "{report}");
+    }
 
     #[test]
     fn extract_images_resolves_captures_by_index_and_strips_sentinels() {

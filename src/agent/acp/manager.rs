@@ -260,6 +260,19 @@ impl AcpManager {
             .clone()
     }
 
+    /// Whether this process is running `agent` right now: its run lock is held
+    /// until the child's process has exited. A non-blocking snapshot, stale the
+    /// moment it returns; an agent never run here is not busy.
+    pub fn is_busy(&self, agent: &str) -> bool {
+        let lock = self
+            .locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(agent)
+            .cloned();
+        lock.is_some_and(|lock| lock.try_lock().is_err())
+    }
+
     /// Run one turn of `request.agent`.
     pub async fn run(&self, request: RunRequest) -> Result<RunResult, RunError> {
         let meta = self.load_agent(&request.agent)?;
@@ -452,6 +465,27 @@ fn kill_in_background(child: &RunningChild) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn is_busy_follows_the_run_lock_of_that_agent_only() {
+        let manager = AcpManager::new(AcpManagerSettings {
+            parent_workspace: PathBuf::from("unused"),
+            config_path: PathBuf::from("unused.json"),
+            inherited_overlays: Vec::new(),
+            depth: 0,
+            executable_override: None,
+            parent_env: HashMap::new(),
+            timings: ManagerTimings::default(),
+        });
+        assert!(!manager.is_busy("docs"), "never run here");
+
+        let guard = manager.lock_for("docs").lock_owned().await;
+        assert!(manager.is_busy("docs"));
+        assert!(!manager.is_busy("review"));
+
+        drop(guard);
+        assert!(!manager.is_busy("docs"), "free again after the run");
+    }
 
     #[test]
     fn the_shared_scope_uses_one_key_for_every_parent_session() {

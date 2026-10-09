@@ -595,12 +595,16 @@ mod tests {
 
         with_workspace_scope_stack(|| async {
             bind_workspace_scope(scope);
-            let denied = json!({"content": format!("file://{}", path_arg(&home.join("memory.bin")))});
-            let err = resolver.expand(&denied).expect_err("the denied subtree is off limits");
+            let denied =
+                json!({"content": format!("file://{}", path_arg(&home.join("memory.bin")))});
+            let err = resolver
+                .expand(&denied)
+                .expect_err("the denied subtree is off limits");
             assert!(matches!(err, FileRefError::Denied { .. }), "{err:?}");
             assert!(err.to_string().contains("off limits"), "{err}");
 
-            let allowed = json!({"content": format!("file://{}", path_arg(&project_path.join("ok.bin")))});
+            let allowed =
+                json!({"content": format!("file://{}", path_arg(&project_path.join("ok.bin")))});
             assert!(resolver.expand(&allowed).is_ok());
         })
         .await;

@@ -32,6 +32,7 @@ pub mod client;
 pub mod escalation;
 pub mod launch;
 pub mod link;
+pub mod listing;
 pub mod manager;
 pub mod mapping;
 pub mod permission;

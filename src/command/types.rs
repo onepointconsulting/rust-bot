@@ -51,6 +51,8 @@ pub enum ChatCommand {
     #[serde(rename = "list-sessions", alias = "listsessions")]
     ListSessions,
     ExamplePrompts,
+    #[serde(alias = "list-subagents")]
+    Subagents,
 }
 
 
@@ -78,6 +80,7 @@ impl std::str::FromStr for ChatCommand {
             "goal" => Ok(ChatCommand::Goal),
             "cleanup" => Ok(ChatCommand::Cleanup),
             "list-sessions" => Ok(ChatCommand::ListSessions),
+            "subagents" | "list-subagents" => Ok(ChatCommand::Subagents),
             _ => Err(()),
         }
     }
@@ -105,6 +108,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::Cleanup => write!(f, "/cleanup"),
             ChatCommand::ListSessions => write!(f, "/list-sessions"),
             ChatCommand::ExamplePrompts => write!(f, "/example-prompts"),
+            ChatCommand::Subagents => write!(f, "/subagents"),
             ChatCommand::ModelPresets => write!(f, "/model-presets"),
         }
     }
@@ -129,8 +133,86 @@ impl ChatCommand {
             | ChatCommand::McpPreset
             | ChatCommand::Workspace
             | ChatCommand::Mode
-            | ChatCommand::Goal => true,
+            | ChatCommand::Goal
+            | ChatCommand::Subagents => true,
             _ => false,
         }
+    }
+}
+
+/// Which sections `/subagents` shows.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentsFilter {
+    /// Spawn tasks only.
+    Spawn,
+    /// ACP child agents only.
+    Acp,
+    /// Both sections (the default).
+    All,
+}
+
+impl SubagentsFilter {
+    /// The usage line shown for an unknown argument.
+    pub const USAGE: &'static str = "Usage: /subagents [spawn|acp|all]";
+
+    /// Parse the text after `/subagents`: empty means [`SubagentsFilter::All`];
+    /// otherwise one token, trimmed and case-insensitive. Anything else is an
+    /// error carrying [`Self::USAGE`].
+    pub fn parse(args: &str) -> Result<Self, &'static str> {
+        match args.trim().to_lowercase().as_str() {
+            "" | "all" => Ok(SubagentsFilter::All),
+            "spawn" => Ok(SubagentsFilter::Spawn),
+            "acp" => Ok(SubagentsFilter::Acp),
+            _ => Err(Self::USAGE),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::str::FromStr;
+
+    #[test]
+    fn subagents_parses_with_its_alias_and_displays_canonically() {
+        assert_eq!(ChatCommand::from_str("subagents"), Ok(ChatCommand::Subagents));
+        assert_eq!(
+            ChatCommand::from_str("list-subagents"),
+            Ok(ChatCommand::Subagents)
+        );
+        assert_eq!(ChatCommand::Subagents.to_string(), "/subagents");
+    }
+
+    #[test]
+    fn subagents_accepts_args_and_has_no_lifecycle() {
+        assert!(ChatCommand::Subagents.accepts_args());
+        assert_eq!(ChatCommand::Subagents.lifecycle(), None);
+    }
+
+    #[test]
+    fn subagents_serde_name_and_alias() {
+        assert_eq!(
+            serde_json::to_string(&ChatCommand::Subagents).unwrap(),
+            "\"subagents\""
+        );
+        assert_eq!(
+            serde_json::from_str::<ChatCommand>("\"list-subagents\"").unwrap(),
+            ChatCommand::Subagents
+        );
+    }
+
+    #[test]
+    fn filter_defaults_to_all_and_ignores_case_and_whitespace() {
+        assert_eq!(SubagentsFilter::parse(""), Ok(SubagentsFilter::All));
+        assert_eq!(SubagentsFilter::parse("   "), Ok(SubagentsFilter::All));
+        assert_eq!(SubagentsFilter::parse("ALL"), Ok(SubagentsFilter::All));
+        assert_eq!(SubagentsFilter::parse(" Spawn "), Ok(SubagentsFilter::Spawn));
+        assert_eq!(SubagentsFilter::parse("acp"), Ok(SubagentsFilter::Acp));
+    }
+
+    #[test]
+    fn filter_rejects_unknown_tokens_with_usage() {
+        assert_eq!(SubagentsFilter::parse("garbage"), Err(SubagentsFilter::USAGE));
+        assert_eq!(SubagentsFilter::parse("acp spawn"), Err(SubagentsFilter::USAGE));
     }
 }

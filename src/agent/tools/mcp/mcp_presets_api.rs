@@ -573,6 +573,124 @@ pub fn status_for(preset: &McpPreset, cfg: Option<&McpServerConfig>) -> McpPrese
     McpPresetStatus::Configured
 }
 
+// ── details view ───────────────────────────────────────────────────────────────
+
+/// Whether the environment variable `name` is set to a non-empty value.
+fn env_var_is_set(name: &str) -> bool {
+    !name.is_empty() && std::env::var(name).map(|v| !v.is_empty()).unwrap_or(false)
+}
+
+/// Human-readable description of where a field's value ends up in the server config.
+fn describe_field_target(kind: &McpPresetFieldTargetKind, target_name: &str) -> String {
+    let kind_label = match kind {
+        McpPresetFieldTargetKind::Env => "environment variable of the server process",
+        McpPresetFieldTargetKind::UrlParam => "URL query parameter",
+        McpPresetFieldTargetKind::Arg => "command-line argument",
+        McpPresetFieldTargetKind::Header => "HTTP header",
+    };
+    format!("{kind_label} `{target_name}`")
+}
+
+/// Render the setup instructions for a single preset field. Secret values are never
+/// printed — only whether they are already available.
+fn format_field_details(field: &McpPresetField, cfg: Option<&McpServerConfig>) -> Vec<String> {
+    let requirement = if field.required {
+        "required"
+    } else {
+        "optional"
+    };
+    let sensitivity = if field.secret { ", secret" } else { "" };
+    let (kind, target_name) = &field.target;
+    let example_value = if field.placeholder.is_empty() {
+        "<value>"
+    } else {
+        field.placeholder.as_str()
+    };
+
+    let mut lines = vec![
+        format!(
+            "- {} [{requirement}{sensitivity}] (field: {})",
+            field.label, field.name
+        ),
+        format!("    set with:   {}={example_value}", field.name),
+        format!(
+            "    applied as: {}",
+            describe_field_target(kind, target_name)
+        ),
+    ];
+    if !field.env_var.is_empty() {
+        let env_state = if env_var_is_set(&field.env_var) {
+            "set"
+        } else {
+            "not set"
+        };
+        lines.push(format!(
+            "    or export:  {} (currently {env_state})",
+            field.env_var
+        ));
+    }
+    let configured = if field_configured(field, cfg) {
+        "ready"
+    } else if field.required {
+        "MISSING"
+    } else {
+        "not provided"
+    };
+    lines.push(format!("    status:     {configured}"));
+    lines
+}
+
+/// Render the full details of `preset` — what it is, what it needs, and how to supply
+/// each needed field — for `/mcp-preset info <name>`. `cfg` is the preset's currently
+/// configured server (if enabled), used to report which fields are already satisfied.
+pub fn format_preset_details(preset: &McpPreset, cfg: Option<&McpServerConfig>) -> String {
+    let mut lines = vec![format!("{} ({})", preset.display_name, preset.name)];
+    if !preset.category.is_empty() {
+        lines.push(format!("Category:  {}", preset.category));
+    }
+    lines.push(format!("Transport: {:?}", preset.transport));
+    lines.push(format!("Status:    {}", status_for(preset, cfg).as_str()));
+    if !preset.description.is_empty() {
+        lines.push(preset.description.clone());
+    }
+    if !preset.requires.is_empty() {
+        lines.push(format!("Requires:  {}", preset.requires));
+    }
+    if !preset.install_supported {
+        lines.push("This preset cannot be enabled yet (coming soon).".to_string());
+    }
+
+    lines.push(String::new());
+    if preset.fields.is_empty() {
+        lines.push("No configuration fields are needed.".to_string());
+    } else {
+        lines.push("Fields:".to_string());
+        for field in &preset.fields {
+            lines.extend(format_field_details(field, cfg));
+        }
+    }
+
+    if preset.install_supported && preset.server.is_some() {
+        let mut enable_command = format!("/mcp-preset enable {}", preset.name);
+        for field in preset.fields.iter().filter(|f| f.required) {
+            enable_command.push_str(&format!(" {}=<value>", field.name));
+        }
+        lines.push(String::new());
+        lines.push(format!("Enable with: {enable_command}"));
+        lines.push(
+            "Fields backed by an exported environment variable are picked up automatically; restart rust-bot after enabling."
+                .to_string(),
+        );
+    }
+    if !preset.note.is_empty() {
+        lines.push(format!("Note: {}", preset.note));
+    }
+    if !preset.docs_url.is_empty() {
+        lines.push(format!("Docs: {}", preset.docs_url));
+    }
+    lines.join("\n")
+}
+
 // ── message-attachment mentions (WebUI-facing, currently unused by any channel) ──
 
 /// Sanitize structured MCP preset mentions sent by a client. Currently a no-op stub —
@@ -997,5 +1115,100 @@ mod tests {
         let mut b = preset_with_fields(None, vec![]);
         b.name = a.name.clone();
         assert!(check_duplicate_names(vec![&a, &b].into_iter()).is_err());
+    }
+
+    // ── format_preset_details ─────────────────────────────────────────────────
+
+    #[test]
+    fn format_preset_details_lists_required_field_with_instructions() {
+        let mut token_field = field(
+            "token",
+            (McpPresetFieldTargetKind::Env, "TOKEN"),
+            true,
+            "RUST_BOT_TEST_DETAILS_UNSET_VAR",
+        );
+        token_field.placeholder = "ghp_...".to_string();
+        let preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![token_field]);
+
+        let details = format_preset_details(&preset, None);
+
+        assert!(details.contains("Test Preset (test-preset)"));
+        assert!(details.contains("token label [required, secret] (field: token)"));
+        assert!(details.contains("set with:   token=ghp_..."));
+        assert!(details.contains("environment variable of the server process `TOKEN`"));
+        assert!(
+            details.contains("or export:  RUST_BOT_TEST_DETAILS_UNSET_VAR (currently not set)")
+        );
+        assert!(details.contains("status:     MISSING"));
+        assert!(details.contains("Enable with: /mcp-preset enable test-preset token=<value>"));
+    }
+
+    #[test]
+    fn format_preset_details_reports_field_ready_when_configured_without_leaking_value() {
+        let preset = preset_with_fields(
+            Some(stdio_server("cmd", &[])),
+            vec![field(
+                "token",
+                (McpPresetFieldTargetKind::Env, "TOKEN"),
+                true,
+                "",
+            )],
+        );
+        let mut cfg = stdio_server("cmd", &[]);
+        cfg.env
+            .insert("TOKEN".to_string(), "super-secret-value".to_string());
+
+        let details = format_preset_details(&preset, Some(&cfg));
+
+        assert!(details.contains("status:     ready"));
+        assert!(!details.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn format_preset_details_marks_optional_field_and_omits_it_from_enable_command() {
+        let preset = preset_with_fields(
+            Some(stdio_server("cmd", &[])),
+            vec![field(
+                "extra",
+                (McpPresetFieldTargetKind::Header, "X-Extra"),
+                false,
+                "",
+            )],
+        );
+
+        let details = format_preset_details(&preset, None);
+
+        assert!(details.contains("[optional, secret]"));
+        assert!(details.contains("HTTP header `X-Extra`"));
+        assert!(details.contains("status:     not provided"));
+        assert!(details.contains("Enable with: /mcp-preset enable test-preset\n"));
+    }
+
+    #[test]
+    fn format_preset_details_without_fields_says_no_configuration_needed() {
+        let preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![]);
+        let details = format_preset_details(&preset, None);
+        assert!(details.contains("No configuration fields are needed."));
+    }
+
+    #[test]
+    fn format_preset_details_unsupported_preset_has_no_enable_instructions() {
+        let mut preset = preset_with_fields(None, vec![]);
+        preset.install_supported = false;
+        let details = format_preset_details(&preset, None);
+        assert!(details.contains("coming soon"));
+        assert!(!details.contains("Enable with:"));
+    }
+
+    #[test]
+    fn format_preset_details_includes_note_requires_and_docs() {
+        let mut preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![]);
+        preset.note = "Auth caveat".to_string();
+        preset.requires = "Docker".to_string();
+        preset.docs_url = "https://example.com/docs".to_string();
+        let details = format_preset_details(&preset, None);
+        assert!(details.contains("Requires:  Docker"));
+        assert!(details.contains("Note: Auth caveat"));
+        assert!(details.contains("Docs: https://example.com/docs"));
     }
 }
