@@ -292,6 +292,33 @@
           "placeholder": "sbp_..."
         }
       ]
+    },
+    {
+      "name": "strapi",
+      "displayName": "Strapi",
+      "category": "cms",
+      "description": "Inspect and manage content in a local Strapi server.",
+      "docsUrl": "https://docs.strapi.io/cms/features/strapi-mcp-server",
+      "transport": "streamableHttp",
+      "installSupported": true,
+      "requires": "Strapi 5.47+ running locally with MCP enabled, and an Admin token",
+      "note": "Enable it in Strapi with mcp: { enabled: true } in config/server.js, then create an Admin token. Connects to http://127.0.0.1:1337/mcp; for another host or port add a custom server in config.json. Tools are limited to the token's permissions.",
+      "server": {
+        "type": "streamableHttp",
+        "url": "http://127.0.0.1:1337/mcp",
+        "toolTimeout": 45
+      },
+      "fields": [
+        {
+          "name": "strapi_admin_token",
+          "label": "Strapi Admin token",
+          "target": ["header", "Authorization"],
+          "secret": true,
+          "required": true,
+          "envVar": "STRAPI_MCP_TOKEN",
+          "placeholder": "f4acb82..."
+        }
+      ]
     }
   ]
 }

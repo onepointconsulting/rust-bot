@@ -138,6 +138,67 @@ pub struct ToolSummary {
     pub description: String,
 }
 
+/// Setup state of one field a preset needs, as surfaced by the gateway's `mcp_presets`
+/// event. Never carries the field's value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpPresetFieldSummary {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub required: bool,
+    #[serde(default)]
+    pub secret: bool,
+    /// Whether the field already has a usable value.
+    #[serde(default)]
+    pub configured: bool,
+}
+
+/// One MCP server preset and whether it is enabled, as surfaced by the gateway's
+/// `mcp_presets` event.
+///
+/// Mirrors the backend's `McpPresetSummary` (`src/agent/tools/mcp/mcp_presets_api.rs`) — a
+/// plain re-declaration for the same reason as [`SkillSummary`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpPresetSummary {
+    pub name: String,
+    #[serde(default)]
+    pub display_name: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub category: String,
+    #[serde(default)]
+    pub transport: String,
+    #[serde(default)]
+    pub enabled: bool,
+    /// `not_installed` / `coming_soon` / `missing_credentials` / `missing_dependency` /
+    /// `configured`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default = "default_install_supported")]
+    pub install_supported: bool,
+    #[serde(default)]
+    pub requires: String,
+    #[serde(default)]
+    pub note: String,
+    #[serde(default)]
+    pub fields: Vec<McpPresetFieldSummary>,
+}
+
+fn default_install_supported() -> bool {
+    true
+}
+
+/// A configured MCP server that is not a catalog preset, as surfaced by the gateway's
+/// `mcp_presets` event. Only its name and transport kind are known to the browser.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpCustomServerSummary {
+    pub name: String,
+    #[serde(default)]
+    pub transport: String,
+}
+
 /// Current UTC time as RFC3339 (`Date.toISOString()`). Used to stamp live
 /// [`ChatEntry`]s in the browser; not called from host `#[test]`s, where
 /// `js_sys::Date` has no runtime.

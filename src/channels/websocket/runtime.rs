@@ -29,6 +29,9 @@ use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MOD
 use crate::agent::question_broker::{QuestionChoice, ResolveError};
 use crate::agent::skills::SkillsLoader;
 use crate::agent::tool_approval::ToolApprovalCall;
+use crate::agent::tools::mcp::mcp_presets_api::{
+    self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
+};
 use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
@@ -64,8 +67,10 @@ use crate::{
         queue::MessageBus,
     },
     channels::base::{BaseChannel, BaseChannelCommon},
+    config::loader::{load_config, save_config},
+    config::overlay::overlay_is_active,
     config::paths::get_media_dir,
-    config::schema::{ChannelsConfig, RESERVED_MODEL_PRESET_NAME},
+    config::schema::{ChannelsConfig, Config, RESERVED_MODEL_PRESET_NAME},
     security::attachment_ingress::store_inbound_attachments,
     security::jwt::{JwtValidationOpts, validate_jwt_token},
     security::workspace_requests::WorkspaceRequestHandler,
@@ -643,6 +648,12 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::ListTools => {
             handle_list_tools(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListMcpPresets => {
+            handle_list_mcp_presets(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetMcpPreset => {
+            handle_set_mcp_preset(envelope_dispatch_context).await;
         }
         EnvelopeType::SetModelPreset => {
             handle_envelope_set_model_preset(envelope_dispatch_context).await;
@@ -2517,6 +2528,360 @@ async fn handle_list_tools<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         serde_json::json!({"chat_id": cid, "tools": tools}),
     )
     .await;
+}
+
+/// Whether this connection presented a valid token at upgrade time. Anonymous
+/// (guest / JWT-disabled) connections are not authenticated, so features that expose
+/// server configuration are unavailable to them.
+fn connection_is_authenticated(auth: &AuthorizeResult) -> bool {
+    auth.sub.is_some()
+}
+
+/// Load the MCP preset catalog and describe it against `config`'s configured servers.
+fn mcp_presets_overview_for_config(config: &Config) -> Result<McpPresetsOverview, String> {
+    let presets = mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path)
+        .map_err(|e| format!("Error loading MCP presets: {e}"))?;
+    Ok(mcp_presets_api::summarize_presets(
+        &presets,
+        &config.tools.mcp_servers,
+    ))
+}
+
+/// Handle a `list_mcp_presets` envelope: reply with an `mcp_presets` event carrying
+/// every catalog preset with its enabled state, plus the configured MCP servers that are
+/// not presets. Authenticated connections only: an anonymous connection gets an
+/// `access_denied` error and the configuration is never read.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_list_mcp_presets<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = mcp_write_denial(
+        shared,
+        envelope_dispatch_context.remote_addr,
+        envelope_dispatch_context.auth,
+        overlay_is_active(),
+    )
+    .is_none();
+    match mcp_presets_overview_for_config(&load_config(None)) {
+        Ok(overview) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::McpPresets,
+                None,
+                serde_json::json!({
+                    "presets": overview.presets,
+                    "custom": overview.custom,
+                    "can_modify": can_modify,
+                }),
+            )
+            .await;
+        }
+        Err(detail) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                None,
+                serde_json::json!({"detail": detail}),
+            )
+            .await;
+        }
+    }
+}
+
+/// Serializes the load-modify-save cycles the WebUI makes on `config.json`, so two
+/// browser tabs changing presets at once cannot overwrite each other's change.
+static MCP_CONFIG_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Why this connection may not change the MCP configuration, as the `detail` code to
+/// send back, or `None` when it may.
+///
+/// Changing MCP servers means writing `config.json` (including credentials), and an MCP
+/// server is a program the bot will run, so it needs more than reading does: an
+/// authenticated connection that is also local (a loopback client, or the native app
+/// shell), on a process that owns its configuration (not a child agent running on its
+/// parent's file). Takes `overlay_active` as a parameter so it stays a pure function.
+fn mcp_write_denial(
+    shared: &WsShared,
+    remote_addr: SocketAddr,
+    auth: &AuthorizeResult,
+    overlay_active: bool,
+) -> Option<&'static str> {
+    if !connection_is_authenticated(auth) || !workspace_controls_available(shared, remote_addr) {
+        return Some("access_denied");
+    }
+    if overlay_active {
+        return Some("child_agent_config");
+    }
+    None
+}
+
+/// Why a requested MCP preset change was not applied. Messages name fields and presets
+/// only; they never contain a submitted value, because error events are logged in full.
+#[derive(Debug, PartialEq, Eq)]
+enum McpChangeError {
+    InvalidRequest,
+    InvalidName,
+    UnknownPreset,
+    NotInstallable,
+    /// Labels of the required fields that have no value yet.
+    MissingFields(Vec<String>),
+    /// A submitted value was rejected (unknown field, too long, control characters).
+    InvalidField(String),
+    InvalidPresetConfig,
+}
+
+impl McpChangeError {
+    /// Stable code the browser switches on.
+    fn detail(&self) -> &'static str {
+        match self {
+            Self::InvalidRequest => "invalid_request",
+            Self::InvalidName => "invalid_name",
+            Self::UnknownPreset => "unknown_preset",
+            Self::NotInstallable => "not_installable",
+            Self::MissingFields(_) => "missing_fields",
+            Self::InvalidField(_) => "invalid_field",
+            Self::InvalidPresetConfig => "invalid_preset",
+        }
+    }
+
+    /// Human-readable explanation, shown under the preset's row.
+    fn message(&self) -> String {
+        match self {
+            Self::InvalidRequest => "The request was malformed.".to_string(),
+            Self::InvalidName => "Invalid MCP preset name.".to_string(),
+            Self::UnknownPreset => "Unknown MCP preset.".to_string(),
+            Self::NotInstallable => "This preset cannot be enabled yet.".to_string(),
+            Self::MissingFields(labels) => {
+                format!("Missing required field(s): {}", labels.join(", "))
+            }
+            Self::InvalidField(reason) => reason.clone(),
+            Self::InvalidPresetConfig => {
+                "This preset has an invalid server definition.".to_string()
+            }
+        }
+    }
+
+    /// Labels of the fields to ask the user for (only for `MissingFields`).
+    fn fields(&self) -> Vec<String> {
+        match self {
+            Self::MissingFields(labels) => labels.clone(),
+            _ => Vec::new(),
+        }
+    }
+}
+
+/// Result of applying a preset change to an in-memory config.
+#[derive(Debug)]
+struct McpChangeOutcome {
+    /// The preset as it now stands.
+    preset: McpPresetSummary,
+    /// Whether the configuration actually changed (disabling an already-disabled preset
+    /// does not), i.e. whether a restart is needed.
+    changed: bool,
+}
+
+/// Enable or disable the preset called `name` in `config`, with `overrides` as the values
+/// for its fields. Pure: loading and saving the config is the caller's job, so a failure
+/// here leaves nothing half-written.
+fn apply_mcp_preset_change(
+    config: &mut Config,
+    presets: &[McpPreset],
+    name: &str,
+    enabled: bool,
+    overrides: &HashMap<String, String>,
+) -> Result<McpChangeOutcome, McpChangeError> {
+    if !mcp_presets_api::MCP_PRESET_NAME_RE.is_match(name) {
+        return Err(McpChangeError::InvalidName);
+    }
+    let preset = presets
+        .iter()
+        .find(|p| p.name.eq_ignore_ascii_case(name))
+        .ok_or(McpChangeError::UnknownPreset)?;
+    let changed = if enabled {
+        mcp_presets_api::validate_field_overrides(preset, overrides)
+            .map_err(|e| McpChangeError::InvalidField(e.to_string()))?;
+        mcp_presets_api::enable_preset(&mut config.tools.mcp_servers, preset, overrides).map_err(
+            |e| match e {
+                McpPresetError::MissingFields(_, labels) => McpChangeError::MissingFields(labels),
+                McpPresetError::NotInstallable(_) => McpChangeError::NotInstallable,
+                McpPresetError::InvalidUrl(..) => McpChangeError::InvalidPresetConfig,
+                McpPresetError::UnknownPreset(_) => McpChangeError::UnknownPreset,
+                McpPresetError::InvalidName(_) => McpChangeError::InvalidName,
+            },
+        )?;
+        true
+    } else {
+        mcp_presets_api::disable_preset(&mut config.tools.mcp_servers, &preset.name)
+    };
+    let summary =
+        mcp_presets_api::summarize_presets(std::slice::from_ref(preset), &config.tools.mcp_servers)
+            .presets
+            .remove(0);
+    Ok(McpChangeOutcome {
+        preset: summary,
+        changed,
+    })
+}
+
+/// Read the `fields` object of a `set_mcp_preset` envelope (`field name -> value`).
+/// A missing `fields` means no values; anything that is not an object of strings is
+/// rejected as a whole.
+fn parse_mcp_field_overrides(envelope: &Envelope) -> Option<HashMap<String, String>> {
+    let Some(fields) = envelope.get("fields") else {
+        return Some(HashMap::new());
+    };
+    fields
+        .as_object()?
+        .iter()
+        .map(|(name, value)| Some((name.clone(), value.as_str()?.to_string())))
+        .collect()
+}
+
+/// Tell the requester a `set_mcp_preset` was refused or failed.
+async fn send_mcp_preset_error(
+    shared: &WsShared,
+    connection_id: &str,
+    name: &str,
+    detail: &str,
+    message: &str,
+    fields: &[String],
+) {
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::McpPresetError,
+        None,
+        serde_json::json!({
+            "name": name,
+            "detail": detail,
+            "message": message,
+            "fields": fields,
+        }),
+    )
+    .await;
+}
+
+/// Handle a `set_mcp_preset` envelope `{name, enabled, fields?}`: enable or disable the
+/// preset in `config.json` and reply with `mcp_preset_set`, or with `mcp_preset_error`.
+/// The change only takes effect after a restart. Refused for anonymous, remote and child
+/// agent connections (see [`mcp_write_denial`]) before the request is even read.
+/// Submitted field values are written to the config and never logged or echoed.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_set_mcp_preset<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let envelope = envelope_dispatch_context.envelope;
+    let name = envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if let Some(denial) = mcp_write_denial(
+        shared,
+        envelope_dispatch_context.remote_addr,
+        envelope_dispatch_context.auth,
+        overlay_is_active(),
+    ) {
+        let message = if denial == "child_agent_config" {
+            "This agent runs on its parent's configuration and cannot change it."
+        } else {
+            "Changing MCP servers is only allowed from a signed-in browser on the gateway machine."
+        };
+        send_mcp_preset_error(shared, connection_id, &name, denial, message, &[]).await;
+        return;
+    }
+
+    let enabled = envelope.get("enabled").and_then(|v| v.as_bool());
+    let overrides = parse_mcp_field_overrides(envelope);
+    let (Some(enabled), Some(overrides)) = (enabled, overrides) else {
+        let error = McpChangeError::InvalidRequest;
+        send_mcp_preset_error(
+            shared,
+            connection_id,
+            &name,
+            error.detail(),
+            &error.message(),
+            &[],
+        )
+        .await;
+        return;
+    };
+
+    let result = {
+        // Held across load + save only; no `.await` while it is held.
+        let _write_guard = MCP_CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut config = load_config(None);
+        match mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path) {
+            Err(e) => Err(format!("Error loading MCP presets: {e}")),
+            Ok(presets) => {
+                match apply_mcp_preset_change(&mut config, &presets, &name, enabled, &overrides) {
+                    Err(error) => Ok(Err(error)),
+                    Ok(outcome) => {
+                        if outcome.changed {
+                            save_config(&config, None)
+                                .map(|()| Ok(outcome))
+                                .map_err(|e| format!("Error saving config: {e}"))
+                        } else {
+                            Ok(Ok(outcome))
+                        }
+                    }
+                }
+            }
+        }
+    };
+
+    match result {
+        Ok(Ok(outcome)) => {
+            if outcome.changed {
+                log::info!(
+                    "MCP preset '{}' {} from the WebUI (client '{client_id}')",
+                    outcome.preset.name,
+                    if enabled { "enabled" } else { "disabled" },
+                );
+            }
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::McpPresetSet,
+                None,
+                serde_json::json!({
+                    "preset": outcome.preset,
+                    "restart_required": outcome.changed,
+                }),
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            send_mcp_preset_error(
+                shared,
+                connection_id,
+                &name,
+                error.detail(),
+                &error.message(),
+                &error.fields(),
+            )
+            .await;
+        }
+        Err(message) => {
+            send_mcp_preset_error(shared, connection_id, &name, "config_error", &message, &[])
+                .await;
+        }
+    }
 }
 
 /// Guest session isolation: keep only entries whose `owner_client_id` field
@@ -7301,6 +7666,390 @@ mod tests {
             .collect();
 
         assert_eq!(names, vec!["shell", "web_search"]);
+    }
+
+    async fn dispatch_list_mcp_presets(
+        shared: &WsShared,
+        auth: &AuthorizeResult,
+    ) -> Option<serde_json::Value> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_mcp_presets"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth,
+        };
+        dispatch_envelope(ctx).await;
+        rx.try_recv()
+            .ok()
+            .map(|frame| serde_json::from_str(&frame.into_text().unwrap()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn list_mcp_presets_denies_anonymous_connections() {
+        let shared = test_shared("browser");
+
+        let body = dispatch_list_mcp_presets(&shared, &AuthorizeResult::UNAUTHENTICATED)
+            .await
+            .expect("expected an error frame");
+
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert!(body.get("presets").is_none());
+    }
+
+    #[test]
+    fn connection_is_authenticated_requires_a_validated_subject() {
+        assert!(!connection_is_authenticated(
+            &AuthorizeResult::UNAUTHENTICATED
+        ));
+        assert!(!connection_is_authenticated(&AuthorizeResult::new(
+            true,
+            Some("  ".into())
+        )));
+        assert!(connection_is_authenticated(&AuthorizeResult::new(
+            false,
+            Some("user-1".into())
+        )));
+    }
+
+    fn authenticated() -> AuthorizeResult {
+        AuthorizeResult::new(false, Some("user-1".to_string()))
+    }
+
+    #[test]
+    fn mcp_write_denial_allows_authenticated_local_clients() {
+        let shared = test_shared("browser");
+        assert_eq!(
+            mcp_write_denial(&shared, addr("127.0.0.1"), &authenticated(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_write_denial_refuses_anonymous_clients_even_when_local() {
+        let shared = test_shared("browser");
+        assert_eq!(
+            mcp_write_denial(
+                &shared,
+                addr("127.0.0.1"),
+                &AuthorizeResult::UNAUTHENTICATED,
+                false
+            ),
+            Some("access_denied")
+        );
+    }
+
+    #[test]
+    fn mcp_write_denial_refuses_remote_clients_on_the_browser_surface() {
+        let shared = test_shared("browser");
+        assert_eq!(
+            mcp_write_denial(&shared, addr("203.0.113.5"), &authenticated(), false),
+            Some("access_denied")
+        );
+    }
+
+    #[test]
+    fn mcp_write_denial_allows_the_native_surface_from_any_address() {
+        let shared = test_shared("native");
+        assert_eq!(
+            mcp_write_denial(&shared, addr("203.0.113.5"), &authenticated(), false),
+            None
+        );
+    }
+
+    #[test]
+    fn mcp_write_denial_refuses_child_agents() {
+        let shared = test_shared("browser");
+        assert_eq!(
+            mcp_write_denial(&shared, addr("127.0.0.1"), &authenticated(), true),
+            Some("child_agent_config")
+        );
+    }
+
+    /// A catalog of one preset needing a token, and one needing nothing. The token field
+    /// has no env-var fallback, so results do not depend on the machine's environment.
+    fn change_test_presets() -> Vec<McpPreset> {
+        serde_json::from_value(serde_json::json!([
+            {
+                "name": "needs-token", "displayName": "Needs Token", "transport": "stdio",
+                "server": {"type": "stdio", "command": "cmd"},
+                "fields": [{
+                    "name": "api_token", "label": "API token",
+                    "target": ["env", "API_TOKEN"], "required": true
+                }]
+            },
+            {
+                "name": "plain", "displayName": "Plain", "transport": "stdio",
+                "server": {"type": "stdio", "command": "cmd"}, "fields": []
+            },
+            {
+                "name": "soon", "displayName": "Soon", "transport": "stdio",
+                "installSupported": false, "fields": []
+            }
+        ]))
+        .unwrap()
+    }
+
+    fn no_values() -> HashMap<String, String> {
+        HashMap::new()
+    }
+
+    #[test]
+    fn apply_mcp_preset_change_enables_a_preset_without_fields() {
+        let mut config = Config::default();
+        let outcome = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "plain",
+            true,
+            &no_values(),
+        )
+        .unwrap();
+        assert!(outcome.changed);
+        assert!(outcome.preset.enabled);
+        assert!(config.tools.mcp_servers.contains_key("plain"));
+    }
+
+    #[test]
+    fn apply_mcp_preset_change_asks_for_missing_required_fields_and_changes_nothing() {
+        let mut config = Config::default();
+        let error = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "needs-token",
+            true,
+            &no_values(),
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            McpChangeError::MissingFields(vec!["API token".to_string()])
+        );
+        assert_eq!(error.detail(), "missing_fields");
+        assert_eq!(error.fields(), vec!["API token".to_string()]);
+        assert!(config.tools.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn apply_mcp_preset_change_stores_a_supplied_secret_but_never_reports_it() {
+        let mut config = Config::default();
+        let values = HashMap::from([("api_token".to_string(), "s3cret-value".to_string())]);
+        let outcome = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "needs-token",
+            true,
+            &values,
+        )
+        .unwrap();
+        assert_eq!(
+            config.tools.mcp_servers["needs-token"].env["API_TOKEN"],
+            "s3cret-value"
+        );
+        assert!(outcome.preset.fields[0].configured);
+        let summary_json = serde_json::to_string(&outcome.preset).unwrap();
+        assert!(!summary_json.contains("s3cret-value"));
+    }
+
+    #[test]
+    fn apply_mcp_preset_change_rejects_bad_values_without_echoing_them() {
+        let mut config = Config::default();
+        let values = HashMap::from([("api_token".to_string(), "line1\nline2".to_string())]);
+        let error = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "needs-token",
+            true,
+            &values,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail(), "invalid_field");
+        assert!(!error.message().contains("line1"));
+        assert!(config.tools.mcp_servers.is_empty());
+
+        let unknown = HashMap::from([("bogus".to_string(), "x".to_string())]);
+        let error = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "needs-token",
+            true,
+            &unknown,
+        )
+        .unwrap_err();
+        assert_eq!(error.detail(), "invalid_field");
+    }
+
+    #[test]
+    fn apply_mcp_preset_change_disables_and_is_idempotent() {
+        let mut config = Config::default();
+        apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "plain",
+            true,
+            &no_values(),
+        )
+        .unwrap();
+
+        let first = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "plain",
+            false,
+            &no_values(),
+        )
+        .unwrap();
+        assert!(first.changed);
+        assert!(!first.preset.enabled);
+        assert!(config.tools.mcp_servers.is_empty());
+
+        let second = apply_mcp_preset_change(
+            &mut config,
+            &change_test_presets(),
+            "plain",
+            false,
+            &no_values(),
+        )
+        .unwrap();
+        assert!(!second.changed);
+    }
+
+    #[test]
+    fn apply_mcp_preset_change_rejects_bad_names_unknown_and_unsupported_presets() {
+        let mut config = Config::default();
+        let presets = change_test_presets();
+        let detail = |name: &str, config: &mut Config| {
+            apply_mcp_preset_change(config, &presets, name, true, &no_values())
+                .unwrap_err()
+                .detail()
+        };
+        assert_eq!(detail("bad name!", &mut config), "invalid_name");
+        assert_eq!(detail("", &mut config), "invalid_name");
+        assert_eq!(detail("nope", &mut config), "unknown_preset");
+        assert_eq!(detail("soon", &mut config), "not_installable");
+        assert!(config.tools.mcp_servers.is_empty());
+    }
+
+    #[test]
+    fn parse_mcp_field_overrides_accepts_string_objects_only() {
+        let mut envelope: Envelope = HashMap::new();
+        assert_eq!(parse_mcp_field_overrides(&envelope), Some(HashMap::new()));
+
+        envelope.insert("fields".to_string(), serde_json::json!({"a": "1"}));
+        assert_eq!(
+            parse_mcp_field_overrides(&envelope),
+            Some(HashMap::from([("a".to_string(), "1".to_string())]))
+        );
+
+        envelope.insert("fields".to_string(), serde_json::json!({"a": 1}));
+        assert_eq!(parse_mcp_field_overrides(&envelope), None);
+
+        envelope.insert("fields".to_string(), serde_json::json!(["a"]));
+        assert_eq!(parse_mcp_field_overrides(&envelope), None);
+    }
+
+    async fn dispatch_set_mcp_preset(
+        shared: &WsShared,
+        auth: &AuthorizeResult,
+        remote: &str,
+    ) -> Option<serde_json::Value> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("set_mcp_preset"));
+        envelope.insert("name".to_string(), serde_json::json!("plain"));
+        envelope.insert("enabled".to_string(), serde_json::json!(true));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr(remote),
+            auth,
+        };
+        dispatch_envelope(ctx).await;
+        rx.try_recv()
+            .ok()
+            .map(|frame| serde_json::from_str(&frame.into_text().unwrap()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn set_mcp_preset_is_refused_for_anonymous_connections() {
+        let shared = test_shared("browser");
+        let body = dispatch_set_mcp_preset(&shared, &AuthorizeResult::UNAUTHENTICATED, "127.0.0.1")
+            .await
+            .expect("expected an error frame");
+        assert_eq!(body["event"], "mcp_preset_error");
+        assert_eq!(body["detail"], "access_denied");
+        assert_eq!(body["name"], "plain");
+    }
+
+    #[tokio::test]
+    async fn set_mcp_preset_is_refused_for_remote_connections() {
+        let shared = test_shared("browser");
+        let body = dispatch_set_mcp_preset(&shared, &authenticated(), "203.0.113.5")
+            .await
+            .expect("expected an error frame");
+        assert_eq!(body["event"], "mcp_preset_error");
+        assert_eq!(body["detail"], "access_denied");
+    }
+
+    #[test]
+    fn mcp_presets_overview_for_config_describes_catalog_and_custom_servers() {
+        let mut config = Config::default();
+        config.tools.mcp_presets_path = "/no/such/mcp_presets.json".to_string();
+        config.tools.mcp_servers.insert(
+            "my-custom-server".to_string(),
+            crate::config::schema::McpServerConfig::default(),
+        );
+        config.tools.mcp_servers.insert(
+            "playwright".to_string(),
+            crate::config::schema::McpServerConfig::default(),
+        );
+
+        let overview = mcp_presets_overview_for_config(&config).unwrap();
+
+        let playwright = overview
+            .presets
+            .iter()
+            .find(|p| p.name == "playwright")
+            .unwrap();
+        assert!(playwright.enabled);
+        let github = overview
+            .presets
+            .iter()
+            .find(|p| p.name == "github")
+            .unwrap();
+        assert!(!github.enabled);
+        assert_eq!(overview.custom.len(), 1);
+        assert_eq!(overview.custom[0].name, "my-custom-server");
+    }
+
+    #[test]
+    fn mcp_presets_overview_for_config_reports_catalog_load_errors() {
+        let dir = tempfile::tempdir().unwrap();
+        let bad = dir.path().join("bad.json");
+        std::fs::write(&bad, "not json").unwrap();
+        let mut config = Config::default();
+        config.tools.mcp_presets_path = bad.to_string_lossy().to_string();
+
+        let error = mcp_presets_overview_for_config(&config).unwrap_err();
+
+        assert!(error.starts_with("Error loading MCP presets"));
     }
 
     #[test]

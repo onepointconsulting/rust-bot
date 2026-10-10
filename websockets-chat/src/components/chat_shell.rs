@@ -1,12 +1,14 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsStrip};
 use chat_ui::models::{
-    ChatEntry, OutgoingMessage, SessionListItem, SessionSummaryPopup, SessionTokenUsage,
-    SkillSummary, ToolSummary, WorkspaceDialogState,
+    ChatEntry, McpCustomServerSummary, McpPresetSummary, OutgoingMessage, SessionListItem,
+    SessionSummaryPopup, SessionTokenUsage, SkillSummary, ToolSummary, WorkspaceDialogState,
 };
 use leptos::prelude::*;
 
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
-use crate::components::{AskQuestionCard, MessageList, ToolApprovalCard};
+use crate::components::{
+    AskQuestionCard, McpChangeRequest, McpPresetsPage, MessageList, ToolApprovalCard,
+};
 use crate::state::{ConnectionStatus, PendingApproval, PendingQuestion};
 
 /// Small dot + label in the header showing the gateway WebSocket's current
@@ -82,6 +84,20 @@ pub fn ChatShell(
     #[prop(into)] skills: Signal<Vec<SkillSummary>>,
     #[prop(into)] tools: Signal<Vec<ToolSummary>>,
     on_open_tools: impl Fn() + 'static + Send + Sync + Copy,
+    // The MCP list is for signed-in users only: when `false` the sidebar has no
+    // "MCPs" button. The gateway enforces the same rule independently.
+    #[prop(default = false)] show_mcps: bool,
+    #[prop(into)] mcp_view_open: Signal<bool>,
+    #[prop(into)] mcp_presets: Signal<Vec<McpPresetSummary>>,
+    #[prop(into)] mcp_custom: Signal<Vec<McpCustomServerSummary>>,
+    #[prop(into)] mcp_loaded: Signal<bool>,
+    #[prop(into)] mcp_can_modify: Signal<bool>,
+    #[prop(into)] mcp_busy: Signal<Option<String>>,
+    #[prop(into)] mcp_row_error: Signal<Option<(String, String)>>,
+    #[prop(into)] mcp_changed: Signal<Vec<String>>,
+    on_open_mcps: impl Fn() + 'static + Send + Sync + Copy,
+    on_refresh_mcps: impl Fn() + 'static + Send + Sync + Copy,
+    on_change_mcp: impl Fn(McpChangeRequest) + 'static + Send + Sync + Copy,
     #[prop(default = true)] show_logout: bool,
     #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
@@ -148,6 +164,8 @@ pub fn ChatShell(
                 on_clear=Callback::new(move |id| on_clear_session(id))
                 on_delete=Callback::new(move |id| on_delete_session(id))
                 on_new_chat=on_new_chat_callback
+                on_mcps=show_mcps.then_some(Callback::new(move |()| on_open_mcps()))
+                mcps_active=mcp_view_open
                 show_brand=true
                 collapse_hint=shortcut_label.to_string()
                 compact=compact
@@ -192,42 +210,65 @@ pub fn ChatShell(
                     </p>
                 </Show>
 
-                <MessageList
-                    entries=entries
-                    example_prompts=example_prompts
-                    token_streaming=token_streaming
-                    pending=pending
-                    active_session_id=active_session_id
-                    on_use_prompt=on_use_prompt
-                    on_fork_reply=on_fork_reply
-                />
-                <ToolApprovalCard
-                    approval=pending_approval
-                    on_toggle=Callback::new(move |id| on_toggle_approval_call(id))
-                    on_answer=Callback::new(move |ids| on_answer_approval(ids))
-                />
-                <AskQuestionCard
-                    question=pending_question
-                    on_select=Callback::new(move |id| on_select_question_option(id))
-                    on_free_text=Callback::new(move |text| on_answer_question_free_text(text))
-                    on_chat_about=Callback::new(move |()| on_chat_about_question())
-                />
-                <ChatInput
-                    pending=pending
-                    draft=draft
-                    on_send=on_send
-                    on_abort=Callback::new(move |()| on_abort_turn())
-                    model_presets=model_presets
-                    selected_model_preset=selected_model_preset
-                    on_select_model_preset=Callback::new(move |name| on_select_model_preset(name))
-                    selected_agent_mode=selected_agent_mode
-                    on_select_agent_mode=Callback::new(move |name| on_select_agent_mode(name))
-                    session_usage=session_usage
-                    skills=skills
-                    tools=tools
-                    on_open_tools=Callback::new(move |()| on_open_tools())
-                    focus_request=composer_focus_request
-                />
+                // Hidden (not unmounted) while the MCP list is showing, so the transcript
+                // keeps its scroll position and any half-typed draft.
+                <div class=move || {
+                    if mcp_view_open.get() {
+                        "hidden"
+                    } else {
+                        "flex min-h-0 flex-1 flex-col overflow-hidden"
+                    }
+                }>
+                    <MessageList
+                        entries=entries
+                        example_prompts=example_prompts
+                        token_streaming=token_streaming
+                        pending=pending
+                        active_session_id=active_session_id
+                        on_use_prompt=on_use_prompt
+                        on_fork_reply=on_fork_reply
+                    />
+                    <ToolApprovalCard
+                        approval=pending_approval
+                        on_toggle=Callback::new(move |id| on_toggle_approval_call(id))
+                        on_answer=Callback::new(move |ids| on_answer_approval(ids))
+                    />
+                    <AskQuestionCard
+                        question=pending_question
+                        on_select=Callback::new(move |id| on_select_question_option(id))
+                        on_free_text=Callback::new(move |text| on_answer_question_free_text(text))
+                        on_chat_about=Callback::new(move |()| on_chat_about_question())
+                    />
+                    <ChatInput
+                        pending=pending
+                        draft=draft
+                        on_send=on_send
+                        on_abort=Callback::new(move |()| on_abort_turn())
+                        model_presets=model_presets
+                        selected_model_preset=selected_model_preset
+                        on_select_model_preset=Callback::new(move |name| on_select_model_preset(name))
+                        selected_agent_mode=selected_agent_mode
+                        on_select_agent_mode=Callback::new(move |name| on_select_agent_mode(name))
+                        session_usage=session_usage
+                        skills=skills
+                        tools=tools
+                        on_open_tools=Callback::new(move |()| on_open_tools())
+                        focus_request=composer_focus_request
+                    />
+                </div>
+                <Show when=move || mcp_view_open.get()>
+                    <McpPresetsPage
+                        presets=mcp_presets
+                        custom=mcp_custom
+                        loaded=mcp_loaded
+                        can_modify=mcp_can_modify
+                        busy=mcp_busy
+                        row_error=mcp_row_error
+                        changed=mcp_changed
+                        on_refresh=Callback::new(move |()| on_refresh_mcps())
+                        on_change=Callback::new(move |request| on_change_mcp(request))
+                    />
+                </Show>
             </div>
         </div>
     }

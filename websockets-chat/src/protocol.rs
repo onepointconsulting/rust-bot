@@ -6,7 +6,7 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, `list_skills`, `list_directories`, `rename_chat`,
+//!   `attach`, `list_chats`, `list_skills`, `list_mcp_presets`, `set_mcp_preset`, `list_directories`, `rename_chat`,
 //!   `delete_chat`, `clear_session`, `get_session_summary`, `fork_chat`,
 //!   `set_workspace_scope`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
@@ -19,7 +19,8 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    ChatEntry, ImageAttachment, Role, SessionTokenUsage, SkillSummary, ToolEvent, ToolSummary,
+    ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary, Role, SessionTokenUsage,
+    SkillSummary, ToolEvent, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -90,6 +91,16 @@ pub struct ClientEnvelope {
     /// the question instead of answering it.
     #[serde(skip_serializing_if = "std::ops::Not::not")]
     pub chat_about: bool,
+    /// Set only by [`Self::set_mcp_preset`] — the preset to enable or disable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+    /// Set only by [`Self::set_mcp_preset`] — `true` to enable, `false` to disable.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub enabled: Option<bool>,
+    /// Set only by [`Self::set_mcp_preset`] when enabling with values — preset
+    /// field name to value (API keys, tokens). Secret: never logged or echoed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub fields: Option<HashMap<String, String>>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -123,6 +134,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -151,6 +165,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -178,6 +195,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -218,6 +238,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -243,6 +266,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -268,7 +294,40 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
+        }
+    }
+
+    /// Ask the gateway for the MCP server presets and custom MCP servers with
+    /// their enabled state. Authenticated connections only — an anonymous
+    /// connection is answered with an `access_denied` error. The reply is an
+    /// `mcp_presets` event (see [`ServerEvent::McpPresets`]).
+    pub fn list_mcp_presets() -> Self {
+        Self {
+            type_: "list_mcp_presets",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to enable (`enabled == true`) or disable the MCP preset `name`.
+    /// `fields` carries the values for the fields the preset needs (API keys, tokens);
+    /// it is omitted from the wire when empty. Refused by the gateway unless this
+    /// connection is signed in and local. The reply is an `mcp_preset_set` or an
+    /// `mcp_preset_error` event (see [`ServerEvent::McpPresetSet`]).
+    pub fn set_mcp_preset(
+        name: impl Into<String>,
+        enabled: bool,
+        fields: HashMap<String, String>,
+    ) -> Self {
+        Self {
+            type_: "set_mcp_preset",
+            name: Some(name.into()),
+            enabled: Some(enabled),
+            fields: (!fields.is_empty()).then_some(fields),
+            ..Self::list_skills()
         }
     }
 
@@ -295,6 +354,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -323,6 +385,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -351,6 +416,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -381,6 +449,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -409,6 +480,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -443,6 +517,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -471,6 +548,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -495,6 +575,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -522,6 +605,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -551,6 +637,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -582,6 +671,9 @@ impl ClientEnvelope {
             option_id: None,
             free_text: None,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -615,6 +707,9 @@ impl ClientEnvelope {
             option_id,
             free_text,
             chat_about: false,
+            name: None,
+            enabled: None,
+            fields: None,
             webui: true,
         }
     }
@@ -825,6 +920,31 @@ pub enum ServerEvent {
         chat_id: String,
         tools: Vec<ToolSummary>,
     },
+    /// Reply to a [`ClientEnvelope::list_mcp_presets`] envelope: every MCP
+    /// preset with its enabled state, plus the configured servers that are
+    /// not presets. Not scoped to any one `chat_id`.
+    McpPresets {
+        presets: Vec<McpPresetSummary>,
+        custom: Vec<McpCustomServerSummary>,
+        /// Whether this connection may change MCP settings (signed in and local).
+        /// The list is read-only otherwise.
+        can_modify: bool,
+    },
+    /// Reply to a successful [`ClientEnvelope::set_mcp_preset`]: the preset as it now
+    /// stands, and whether a restart is needed for the change to take effect.
+    McpPresetSet {
+        preset: McpPresetSummary,
+        restart_required: bool,
+    },
+    /// Reply to a refused or failed [`ClientEnvelope::set_mcp_preset`]. `detail` is a
+    /// stable code (`access_denied`, `child_agent_config`, `missing_fields`,
+    /// `invalid_field`, ...); `fields` lists the labels of missing required fields.
+    McpPresetError {
+        name: String,
+        detail: String,
+        message: String,
+        fields: Vec<String>,
+    },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
     /// Reply to a `delete_chat` envelope, fanned out to every connection
@@ -946,6 +1066,9 @@ impl ServerEvent {
             // `chat_id`.
             ServerEvent::ChatsList { .. }
             | ServerEvent::SkillsList { .. }
+            | ServerEvent::McpPresets { .. }
+            | ServerEvent::McpPresetSet { .. }
+            | ServerEvent::McpPresetError { .. }
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatDeleted { .. }
             | ServerEvent::SessionCleared { .. }
@@ -1239,6 +1362,33 @@ struct SkillsListWire {
 }
 
 #[derive(Deserialize)]
+struct McpPresetsWire {
+    presets: Vec<McpPresetSummary>,
+    #[serde(default)]
+    custom: Vec<McpCustomServerSummary>,
+    #[serde(default)]
+    can_modify: bool,
+}
+
+#[derive(Deserialize)]
+struct McpPresetSetWire {
+    preset: McpPresetSummary,
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
+struct McpPresetErrorWire {
+    #[serde(default)]
+    name: String,
+    detail: String,
+    #[serde(default)]
+    message: String,
+    #[serde(default)]
+    fields: Vec<String>,
+}
+
+#[derive(Deserialize)]
 struct ToolsListWire {
     chat_id: String,
     tools: Vec<ToolSummary>,
@@ -1446,6 +1596,23 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         }
         "skills" => {
             decode::<SkillsListWire>(&value).map(|w| ServerEvent::SkillsList { skills: w.skills })
+        }
+        "mcp_presets" => decode::<McpPresetsWire>(&value).map(|w| ServerEvent::McpPresets {
+            presets: w.presets,
+            custom: w.custom,
+            can_modify: w.can_modify,
+        }),
+        "mcp_preset_set" => decode::<McpPresetSetWire>(&value).map(|w| ServerEvent::McpPresetSet {
+            preset: w.preset,
+            restart_required: w.restart_required,
+        }),
+        "mcp_preset_error" => {
+            decode::<McpPresetErrorWire>(&value).map(|w| ServerEvent::McpPresetError {
+                name: w.name,
+                detail: w.detail,
+                message: w.message,
+                fields: w.fields,
+            })
         }
         "tools" => decode::<ToolsListWire>(&value).map(|w| ServerEvent::ToolsList {
             chat_id: w.chat_id,
@@ -2270,6 +2437,165 @@ mod tests {
                 "type": "list_skills",
                 "webui": true,
             })
+        );
+    }
+
+    #[test]
+    fn parses_mcp_presets() {
+        let raw = r#"{"event":"mcp_presets","presets":[
+            {"name":"github","display_name":"GitHub","description":"Repos","category":"code",
+             "transport":"stdio","enabled":true,"status":"missing_credentials",
+             "install_supported":true,"requires":"Docker","note":"",
+             "fields":[{"name":"github_token","label":"Token","required":true,
+                        "secret":true,"configured":false}]}
+        ],"custom":[{"name":"my-server","transport":"stdio"}]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        let ServerEvent::McpPresets {
+            presets,
+            custom,
+            can_modify,
+        } = event
+        else {
+            panic!("expected McpPresets");
+        };
+        assert!(!can_modify, "can_modify defaults to false when absent");
+        assert_eq!(presets.len(), 1);
+        assert_eq!(presets[0].display_name, "GitHub");
+        assert!(presets[0].enabled);
+        assert_eq!(presets[0].status, "missing_credentials");
+        assert_eq!(presets[0].fields[0].name, "github_token");
+        assert!(presets[0].fields[0].required && !presets[0].fields[0].configured);
+        assert_eq!(
+            custom,
+            vec![McpCustomServerSummary {
+                name: "my-server".to_string(),
+                transport: "stdio".to_string(),
+            }]
+        );
+    }
+
+    #[test]
+    fn parses_mcp_presets_with_defaults_for_missing_fields() {
+        let raw = r#"{"event":"mcp_presets","presets":[{"name":"minimal"}]}"#;
+        let ServerEvent::McpPresets {
+            presets, custom, ..
+        } = parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected McpPresets");
+        };
+        assert!(custom.is_empty());
+        assert!(!presets[0].enabled);
+        assert!(presets[0].install_supported);
+        assert!(presets[0].fields.is_empty());
+    }
+
+    #[test]
+    fn mcp_presets_has_no_scoping_chat_id() {
+        let event = ServerEvent::McpPresets {
+            presets: Vec::new(),
+            custom: Vec::new(),
+            can_modify: true,
+        };
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn parses_mcp_presets_can_modify_flag() {
+        let raw = r#"{"event":"mcp_presets","presets":[],"custom":[],"can_modify":true}"#;
+        let ServerEvent::McpPresets { can_modify, .. } =
+            parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected McpPresets");
+        };
+        assert!(can_modify);
+    }
+
+    #[test]
+    fn parses_mcp_preset_set() {
+        let raw = r#"{"event":"mcp_preset_set","restart_required":true,
+            "preset":{"name":"github","display_name":"GitHub","enabled":true,
+                      "status":"configured"}}"#;
+        let ServerEvent::McpPresetSet {
+            preset,
+            restart_required,
+        } = parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected McpPresetSet");
+        };
+        assert_eq!(preset.name, "github");
+        assert!(preset.enabled);
+        assert!(restart_required);
+    }
+
+    #[test]
+    fn parses_mcp_preset_error_with_missing_field_labels() {
+        let raw = r#"{"event":"mcp_preset_error","name":"github","detail":"missing_fields",
+            "message":"Missing required field(s): GitHub token","fields":["GitHub token"]}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::McpPresetError {
+                name: "github".to_string(),
+                detail: "missing_fields".to_string(),
+                message: "Missing required field(s): GitHub token".to_string(),
+                fields: vec!["GitHub token".to_string()],
+            }
+        );
+    }
+
+    #[test]
+    fn mcp_preset_replies_have_no_scoping_chat_id() {
+        let error = ServerEvent::McpPresetError {
+            name: "x".to_string(),
+            detail: "access_denied".to_string(),
+            message: String::new(),
+            fields: Vec::new(),
+        };
+        assert_eq!(error.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_set_mcp_preset_serializes_name_enabled_and_fields() {
+        let fields = HashMap::from([("github_token".to_string(), "ghp_x".to_string())]);
+        let value =
+            serde_json::to_value(ClientEnvelope::set_mcp_preset("github", true, fields)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_mcp_preset",
+                "name": "github",
+                "enabled": true,
+                "fields": {"github_token": "ghp_x"},
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_set_mcp_preset_omits_empty_fields() {
+        let value = serde_json::to_value(ClientEnvelope::set_mcp_preset(
+            "github",
+            false,
+            HashMap::new(),
+        ))
+        .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_mcp_preset",
+                "name": "github",
+                "enabled": false,
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn client_envelope_list_mcp_presets_serializes_expected_shape() {
+        let value = serde_json::to_value(ClientEnvelope::list_mcp_presets()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "list_mcp_presets", "webui": true})
         );
     }
 

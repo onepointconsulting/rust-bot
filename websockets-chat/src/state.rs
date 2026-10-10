@@ -14,7 +14,9 @@
 
 use std::collections::HashMap;
 
-use chat_ui::models::{ChatEntry, ImageAttachment, Role, SessionListItem, ToolEvent};
+use chat_ui::models::{
+    ChatEntry, ImageAttachment, McpPresetSummary, Role, SessionListItem, ToolEvent,
+};
 
 use crate::protocol::{QuestionChoice, ToolApprovalCall};
 
@@ -22,6 +24,22 @@ use crate::protocol::{QuestionChoice, ToolApprovalCall};
 /// `src/channels/websocket/webui/media.rs`) rather than a `data:` or
 /// arbitrary `http(s)://` reference — see [`authorize_media_attachments`].
 const GATEWAY_MEDIA_URL_PREFIX: &str = "/v1/media/";
+
+/// Swap in `updated` for the preset of the same name in `presets`. Does nothing when
+/// the list does not hold it (it was closed or refreshed in the meantime).
+pub fn replace_mcp_preset(presets: &mut [McpPresetSummary], updated: McpPresetSummary) {
+    if let Some(slot) = presets.iter_mut().find(|p| p.name == updated.name) {
+        *slot = updated;
+    }
+}
+
+/// Remember that `name` was changed and needs a restart to take effect. Each name is
+/// kept once, in the order first changed.
+pub fn note_mcp_restart_needed(changed: &mut Vec<String>, name: &str) {
+    if !changed.iter().any(|existing| existing == name) {
+        changed.push(name.to_string());
+    }
+}
 
 /// After deleting `deleted_id` from the sidebar list (most-recent first),
 /// the session that should become active: the row immediately after the
@@ -749,6 +767,47 @@ impl PendingQuestion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mcp_preset(name: &str, enabled: bool) -> McpPresetSummary {
+        McpPresetSummary {
+            name: name.to_string(),
+            display_name: name.to_string(),
+            description: String::new(),
+            category: String::new(),
+            transport: "stdio".to_string(),
+            enabled,
+            status: String::new(),
+            install_supported: true,
+            requires: String::new(),
+            note: String::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn replace_mcp_preset_swaps_only_the_matching_entry() {
+        let mut presets = vec![mcp_preset("a", false), mcp_preset("b", false)];
+        replace_mcp_preset(&mut presets, mcp_preset("b", true));
+        assert!(!presets[0].enabled);
+        assert!(presets[1].enabled);
+    }
+
+    #[test]
+    fn replace_mcp_preset_ignores_a_preset_the_list_does_not_hold() {
+        let mut presets = vec![mcp_preset("a", false)];
+        replace_mcp_preset(&mut presets, mcp_preset("zzz", true));
+        assert_eq!(presets.len(), 1);
+        assert!(!presets[0].enabled);
+    }
+
+    #[test]
+    fn note_mcp_restart_needed_keeps_each_name_once_in_order() {
+        let mut changed = Vec::new();
+        note_mcp_restart_needed(&mut changed, "github");
+        note_mcp_restart_needed(&mut changed, "exa");
+        note_mcp_restart_needed(&mut changed, "github");
+        assert_eq!(changed, vec!["github".to_string(), "exa".to_string()]);
+    }
 
     fn approval_call(id: &str) -> ToolApprovalCall {
         ToolApprovalCall {

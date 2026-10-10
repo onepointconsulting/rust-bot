@@ -400,7 +400,19 @@ fn format_mcp_list(servers: &[(String, String)]) -> String {
     lines.join("\n")
 }
 
-/// List connected MCP servers and their endpoints.
+/// Like [`format_mcp_list`], plus the servers that failed to connect and why.
+fn format_mcp_status(servers: &[(String, String)], failed: &[(String, String)]) -> String {
+    let mut content = format_mcp_list(servers);
+    if !failed.is_empty() {
+        content.push_str(&format!("\nFailed to connect ({}):", failed.len()));
+        for (name, error) in failed {
+            content.push_str(&format!("\n- {name} — {error}"));
+        }
+    }
+    content
+}
+
+/// List connected MCP servers and their endpoints, and any that failed to connect.
 #[async_trait]
 impl CommandHandler for CmdMcpList {
     async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
@@ -412,10 +424,11 @@ impl CommandHandler for CmdMcpList {
         }
         agent_loop.ensure_mcp_connected().await;
         let servers = agent_loop.connected_mcp_endpoints();
-        let content = if servers.is_empty() {
+        let failed = agent_loop.failed_mcp_servers();
+        let content = if servers.is_empty() && failed.is_empty() {
             "No MCP servers connected.".to_string()
         } else {
-            format_mcp_list(&servers)
+            format_mcp_status(&servers, &failed)
         };
         reply_as_text(ctx, content)
     }
@@ -533,16 +546,11 @@ fn handle_mcp_preset_enable(ctx: &CommandContext, rest: &str) -> OutboundMessage
         Err(message) => return reply_as_text(ctx, message),
     };
     let overrides = parse_field_overrides(field_args);
-    let existing = config.tools.mcp_servers.get(&preset.name).cloned();
-    let server_cfg =
-        match mcp_presets_api::materialize_preset_server(&preset, &overrides, existing.as_ref()) {
-            Ok(cfg) => cfg,
-            Err(e) => return reply_as_text(ctx, format!("Error: {e}")),
-        };
-    config
-        .tools
-        .mcp_servers
-        .insert(preset.name.clone(), server_cfg);
+    if let Err(e) =
+        mcp_presets_api::enable_preset(&mut config.tools.mcp_servers, &preset, &overrides)
+    {
+        return reply_as_text(ctx, format!("Error: {e}"));
+    }
     if let Err(e) = save_config(&config, None) {
         return reply_as_text(ctx, format!("Error saving config: {e}"));
     }
@@ -567,7 +575,7 @@ fn handle_mcp_preset_disable(ctx: &CommandContext, name: &str) -> OutboundMessag
         return reply_as_text(ctx, format!("Error: invalid MCP preset name '{name}'."));
     }
     let mut config = load_config(None);
-    if config.tools.mcp_servers.remove(name).is_none() {
+    if !mcp_presets_api::disable_preset(&mut config.tools.mcp_servers, name) {
         return reply_as_text(ctx, format!("'{name}' is not an enabled MCP server."));
     }
     if let Err(e) = save_config(&config, None) {
@@ -2255,6 +2263,37 @@ mod tests {
             content,
             "MCP servers (1 connected):\n- ems — https://ems.example.org/mcp"
         );
+    }
+
+    #[test]
+    fn format_mcp_status_without_failures_matches_the_plain_list() {
+        let servers = vec![("ems".to_string(), "https://ems.example.org/mcp".to_string())];
+        assert_eq!(format_mcp_status(&servers, &[]), format_mcp_list(&servers));
+    }
+
+    #[test]
+    fn format_mcp_status_lists_failed_servers_with_their_error() {
+        let servers = vec![(
+            "playwright".to_string(),
+            "npx -y @playwright/mcp".to_string(),
+        )];
+        let failed = vec![(
+            "firecrawl".to_string(),
+            "MCP handshake failed: connection closed".to_string(),
+        )];
+        let content = format_mcp_status(&servers, &failed);
+        assert_eq!(
+            content,
+            "MCP servers (1 connected):\n- playwright — npx -y @playwright/mcp\nFailed to connect (1):\n- firecrawl — MCP handshake failed: connection closed"
+        );
+    }
+
+    #[test]
+    fn format_mcp_status_with_only_failures_reports_zero_connected() {
+        let failed = vec![("firecrawl".to_string(), "boom".to_string())];
+        let content = format_mcp_status(&[], &failed);
+        assert!(content.starts_with("MCP servers (0 connected):"));
+        assert!(content.contains("- firecrawl — boom"));
     }
 
     #[test]

@@ -23,13 +23,13 @@ use uuid::Uuid;
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
-    now_rfc3339, ChatEntry, ImageAttachment, OutgoingMessage, Role, SessionListItem,
-    SessionSummaryPopup, SessionTokenUsage, SkillSummary, ToolSummary, WorkspaceDialogState,
-    WorkspaceDirectoryEntry,
+    now_rfc3339, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
+    OutgoingMessage, Role, SessionListItem, SessionSummaryPopup, SessionTokenUsage, SkillSummary,
+    ToolSummary, WorkspaceDialogState, WorkspaceDirectoryEntry,
 };
 
 use crate::api::{self, WsSender};
-use crate::components::ChatShell;
+use crate::components::{ChatShell, McpChangeRequest};
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, ConnectionStatus};
 use crate::storage_keys::CHAT_ID_STORAGE_KEY;
@@ -384,6 +384,27 @@ struct WsContext {
     /// re-requested each time the tools popup opens rather than once per
     /// connection. Empty until the first reply.
     tools: RwSignal<Vec<ToolSummary>>,
+    /// Whether the MCP list is showing instead of the chat. Always `false` on
+    /// page load and not persisted anywhere, so a reload never opens it.
+    mcp_view_open: RwSignal<bool>,
+    /// MCP presets from the gateway's `mcp_presets` event. Only filled while
+    /// the MCP list is open; cleared whenever it closes.
+    mcp_presets: RwSignal<Vec<McpPresetSummary>>,
+    /// Configured MCP servers that are not presets, from the same event.
+    mcp_custom: RwSignal<Vec<McpCustomServerSummary>>,
+    /// Whether the reply to the latest `list_mcp_presets` request has arrived
+    /// (drives the page's loading line).
+    mcp_loaded: RwSignal<bool>,
+    /// Whether the gateway lets this connection change MCP settings (signed in and
+    /// running on the gateway machine). The list is read-only when `false`.
+    mcp_can_modify: RwSignal<bool>,
+    /// The preset a change request is in flight for.
+    mcp_busy: RwSignal<Option<String>>,
+    /// The last failed change as `(preset name, message)`, shown under that row.
+    mcp_row_error: RwSignal<Option<(String, String)>>,
+    /// Presets changed since the page was loaded; they need a restart. Kept when the
+    /// list closes, since the restart is still pending.
+    mcp_changed: RwSignal<Vec<String>>,
     /// Sidebar Summary dialog: `None` when closed, `Some` with empty
     /// `text` while the `get_session_summary` reply is in flight.
     summary_popup: RwSignal<Option<SessionSummaryPopup>>,
@@ -701,6 +722,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
             ctx.token_streaming.set(streaming);
+            // A fresh connection starts on the chat, never on the MCP list.
+            close_mcp_view(ctx);
             // The chat list is connection-scoped, not chat-scoped — ask for
             // it on every `ready`, not only after `attached`. A refresh
             // always has a stored `chat_id`, so the previous "list only on
@@ -803,6 +826,11 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::Error {
             turn_id, detail, ..
         } => {
+            // The gateway refuses the MCP list to anonymous or expired sessions.
+            if detail == "access_denied" && ctx.mcp_view_open.get_untracked() {
+                close_mcp_view(ctx);
+                return;
+            }
             if turn_id.is_none() && ctx.workspace_popup.get_untracked().is_some() {
                 ctx.workspace_popup.update(|current| {
                     if let Some(state) = current {
@@ -932,6 +960,45 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::ToolsList { tools, .. } => {
             ctx.tools.set(tools);
+        }
+        ServerEvent::McpPresets {
+            presets,
+            custom,
+            can_modify,
+        } => {
+            // A reply that lands after the list was closed must not leave data behind.
+            if ctx.mcp_view_open.get_untracked() {
+                ctx.mcp_presets.set(presets);
+                ctx.mcp_custom.set(custom);
+                ctx.mcp_can_modify.set(can_modify);
+                ctx.mcp_loaded.set(true);
+            }
+        }
+        ServerEvent::McpPresetSet {
+            preset,
+            restart_required,
+        } => {
+            ctx.mcp_busy.set(None);
+            ctx.mcp_row_error.set(None);
+            if restart_required {
+                ctx.mcp_changed
+                    .update(|changed| state::note_mcp_restart_needed(changed, &preset.name));
+            }
+            ctx.mcp_presets
+                .update(|presets| state::replace_mcp_preset(presets, preset));
+        }
+        ServerEvent::McpPresetError {
+            name,
+            detail,
+            message,
+            ..
+        } => {
+            ctx.mcp_busy.set(None);
+            // The gateway no longer allows changes on this connection: go read-only.
+            if matches!(detail.as_str(), "access_denied" | "child_agent_config") {
+                ctx.mcp_can_modify.set(false);
+            }
+            ctx.mcp_row_error.set(Some((name, message)));
         }
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
@@ -1204,6 +1271,58 @@ fn request_skills_list(ctx: &WsContext) {
         protocol::ClientEnvelope::list_skills(),
         "Failed to encode the skills list request.",
     );
+}
+
+/// Ask the gateway for the MCP presets. Fire-and-forget; the reply fills
+/// `mcp_presets` / `mcp_custom` (see the `McpPresets` arm of the event handler).
+fn request_mcp_presets(ctx: &WsContext) {
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_mcp_presets(),
+        "Failed to encode the MCP list request.",
+    );
+}
+
+/// Show the MCP list in place of the chat and fetch it. Fetched here, on demand,
+/// and never on connect or page load.
+fn open_mcp_view(ctx: &WsContext) {
+    ctx.mcp_loaded.set(false);
+    ctx.mcp_view_open.set(true);
+    request_mcp_presets(ctx);
+}
+
+/// Ask the gateway to turn the preset `name` on or off. `fields` holds the values from the
+/// credentials form (API keys, tokens): they are sent once and not kept anywhere else.
+fn request_set_mcp_preset(
+    ctx: &WsContext,
+    name: String,
+    enabled: bool,
+    fields: HashMap<String, String>,
+) {
+    ctx.mcp_row_error.set(None);
+    ctx.mcp_busy.set(Some(name.clone()));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_mcp_preset(name, enabled, fields),
+        "Failed to encode the MCP change request.",
+    );
+}
+
+/// Re-fetch the MCP list while it is showing.
+fn refresh_mcp_view(ctx: &WsContext) {
+    ctx.mcp_loaded.set(false);
+    request_mcp_presets(ctx);
+}
+
+/// Hide the MCP list and drop its data.
+fn close_mcp_view(ctx: &WsContext) {
+    ctx.mcp_view_open.set(false);
+    ctx.mcp_loaded.set(false);
+    ctx.mcp_presets.set(Vec::new());
+    ctx.mcp_custom.set(Vec::new());
+    ctx.mcp_can_modify.set(false);
+    ctx.mcp_busy.set(None);
+    ctx.mcp_row_error.set(None);
 }
 
 /// Ask the gateway which tools the active chat's agent mode exposes.
@@ -1554,6 +1673,7 @@ fn reset_local_transcript(ctx: &WsContext) {
 /// transcript first so `should_drop_event` ignores leftover frames from the
 /// previous subscription until `attached` arrives with this chat's history.
 fn attach_to_session(ctx: &WsContext, selected_id: String) {
+    close_mcp_view(ctx);
     if ctx.chat_id.get_untracked().as_deref() == Some(selected_id.as_str()) {
         return;
     }
@@ -1665,6 +1785,7 @@ fn handle_session_cleared(ctx: &WsContext, chat_id: String) {
 /// brand-new chat. Used by the "New chat" header action — not by delete,
 /// which switches to a remaining session instead of minting a replacement.
 fn start_new_chat(ctx: &WsContext) {
+    close_mcp_view(ctx);
     reset_local_transcript(ctx);
     ctx.pending_attach.set(None);
 
@@ -1830,6 +1951,14 @@ pub fn App() -> impl IntoView {
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
     let skills = RwSignal::new(Vec::<SkillSummary>::new());
     let tools = RwSignal::new(Vec::<ToolSummary>::new());
+    let mcp_view_open = RwSignal::new(false);
+    let mcp_presets = RwSignal::new(Vec::<McpPresetSummary>::new());
+    let mcp_custom = RwSignal::new(Vec::<McpCustomServerSummary>::new());
+    let mcp_loaded = RwSignal::new(false);
+    let mcp_can_modify = RwSignal::new(false);
+    let mcp_busy = RwSignal::new(None::<String>);
+    let mcp_row_error = RwSignal::new(None::<(String, String)>);
+    let mcp_changed = RwSignal::new(Vec::<String>::new());
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
     let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
     let pending_approval = RwSignal::new(None::<state::PendingApproval>);
@@ -1861,6 +1990,14 @@ pub fn App() -> impl IntoView {
         session_usage,
         skills,
         tools,
+        mcp_view_open,
+        mcp_presets,
+        mcp_custom,
+        mcp_loaded,
+        mcp_can_modify,
+        mcp_busy,
+        mcp_row_error,
+        mcp_changed,
         summary_popup,
         workspace_popup,
         pending_approval,
@@ -1980,6 +2117,8 @@ pub fn App() -> impl IntoView {
         session_usage.set(None);
         skills.set(Vec::new());
         tools.set(Vec::new());
+        close_mcp_view(&ws_context);
+        mcp_changed.set(Vec::new());
         summary_popup.set(None);
         workspace_popup.set(None);
     };
@@ -2112,6 +2251,11 @@ pub fn App() -> impl IntoView {
     let on_select_model_preset = move |name: String| request_set_model_preset(&ws_context, name);
     let on_select_agent_mode = move |name: String| request_set_agent_mode(&ws_context, name);
     let on_open_tools = move || request_tools_list(&ws_context);
+    let on_open_mcps = move || open_mcp_view(&ws_context);
+    let on_refresh_mcps = move || refresh_mcp_view(&ws_context);
+    let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {
+        request_set_mcp_preset(&ws_context, name, enabled, fields);
+    };
 
     // A turn stays in flight across tool waits, even though those pauses
     // clear `streaming` on the current bubble so the next LLM round can
@@ -2203,6 +2347,18 @@ pub fn App() -> impl IntoView {
                     skills=Signal::derive(move || skills.get())
                     tools=Signal::derive(move || tools.get())
                     on_open_tools=on_open_tools
+                    show_mcps=token.get_untracked().is_some()
+                    mcp_view_open=Signal::derive(move || mcp_view_open.get())
+                    mcp_presets=Signal::derive(move || mcp_presets.get())
+                    mcp_custom=Signal::derive(move || mcp_custom.get())
+                    mcp_loaded=Signal::derive(move || mcp_loaded.get())
+                    mcp_can_modify=Signal::derive(move || mcp_can_modify.get())
+                    mcp_busy=Signal::derive(move || mcp_busy.get())
+                    mcp_row_error=Signal::derive(move || mcp_row_error.get())
+                    mcp_changed=Signal::derive(move || mcp_changed.get())
+                    on_open_mcps=on_open_mcps
+                    on_refresh_mcps=on_refresh_mcps
+                    on_change_mcp=on_change_mcp
                     show_logout=!embed_mode
                     show_minimize=!embed_mode
                 />

@@ -511,6 +511,77 @@ pub fn materialize_preset_server(
     Ok(cfg)
 }
 
+/// Enable `preset` in `servers` (the `config.tools.mcp_servers` map): materialize it with
+/// `overrides`, reusing any value already configured for it, and store it under the
+/// preset's name. Shared by the `/mcp-preset enable` command and the WebUI.
+pub fn enable_preset(
+    servers: &mut HashMap<String, McpServerConfig>,
+    preset: &McpPreset,
+    overrides: &HashMap<String, String>,
+) -> Result<(), McpPresetError> {
+    let existing = servers.get(&preset.name).cloned();
+    let server_cfg = materialize_preset_server(preset, overrides, existing.as_ref())?;
+    servers.insert(preset.name.clone(), server_cfg);
+    Ok(())
+}
+
+/// Remove the server called `name` from `servers`. Returns whether it was there.
+pub fn disable_preset(servers: &mut HashMap<String, McpServerConfig>, name: &str) -> bool {
+    servers.remove(name).is_some()
+}
+
+/// Longest value accepted for a preset field. Real API keys and tokens are far shorter.
+pub const MAX_FIELD_VALUE_LEN: usize = 4096;
+
+/// A caller-supplied field value that must not be stored. Never carries the value itself,
+/// so it is safe to log or send back.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum FieldValueError {
+    /// The preset has no field with this name.
+    UnknownField(String),
+    /// The value for this field exceeds [`MAX_FIELD_VALUE_LEN`].
+    TooLong(String),
+    /// The value for this field contains control characters (newlines would let a value
+    /// break out of an HTTP header or a command line).
+    ControlCharacters(String),
+}
+
+impl std::fmt::Display for FieldValueError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::UnknownField(name) => write!(f, "unknown field '{name}'"),
+            Self::TooLong(name) => write!(f, "the value for '{name}' is too long"),
+            Self::ControlCharacters(name) => {
+                write!(f, "the value for '{name}' contains control characters")
+            }
+        }
+    }
+}
+
+impl std::error::Error for FieldValueError {}
+
+/// Check caller-supplied field values (`field name -> value`) before they are written to
+/// the config: every name must be one of `preset`'s fields, and every value must be a
+/// reasonable single-line string.
+pub fn validate_field_overrides(
+    preset: &McpPreset,
+    overrides: &HashMap<String, String>,
+) -> Result<(), FieldValueError> {
+    let known: HashSet<&str> = preset.fields.iter().map(|f| f.name.as_str()).collect();
+    for (name, value) in overrides {
+        if !known.contains(name.as_str()) {
+            return Err(FieldValueError::UnknownField(name.clone()));
+        }
+        if value.len() > MAX_FIELD_VALUE_LEN {
+            return Err(FieldValueError::TooLong(name.clone()));
+        }
+        if value.chars().any(char::is_control) {
+            return Err(FieldValueError::ControlCharacters(name.clone()));
+        }
+    }
+    Ok(())
+}
+
 // ── status / validation ────────────────────────────────────────────────────────
 
 /// Readiness of a preset given its (possibly absent) configured `McpServerConfig`.
@@ -689,6 +760,135 @@ pub fn format_preset_details(preset: &McpPreset, cfg: Option<&McpServerConfig>) 
         lines.push(format!("Docs: {}", preset.docs_url));
     }
     lines.join("\n")
+}
+
+// ── overview (WebUI listing) ───────────────────────────────────────────────────
+
+/// Setup state of one preset field, as shown in the WebUI. Never carries the value.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpPresetFieldSummary {
+    pub name: String,
+    pub label: String,
+    pub required: bool,
+    pub secret: bool,
+    /// Whether the field already has a usable value (in config or via its env var).
+    pub configured: bool,
+}
+
+/// One catalog preset plus whether it is currently enabled, as shown in the WebUI.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpPresetSummary {
+    pub name: String,
+    pub display_name: String,
+    pub description: String,
+    pub category: String,
+    /// `stdio` / `streamableHttp` / `sse` / `oauth`.
+    pub transport: String,
+    /// Whether the preset has an entry in `config.tools.mcp_servers`.
+    pub enabled: bool,
+    /// Readiness string, identical to the one `/mcp-preset list` shows.
+    pub status: String,
+    pub install_supported: bool,
+    pub requires: String,
+    pub note: String,
+    pub fields: Vec<McpPresetFieldSummary>,
+}
+
+/// A configured MCP server that does not come from the preset catalog.
+///
+/// Only the transport kind is exposed: the command line, URL and headers of a custom
+/// server routinely embed credentials.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct McpCustomServerSummary {
+    pub name: String,
+    /// `stdio` / `streamableHttp` / `sse`, or `unknown` when neither command nor URL is set.
+    pub transport: String,
+}
+
+/// Everything the WebUI's MCP page needs: catalog presets and custom servers.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq, Default)]
+pub struct McpPresetsOverview {
+    pub presets: Vec<McpPresetSummary>,
+    pub custom: Vec<McpCustomServerSummary>,
+}
+
+impl McpPresetTransport {
+    /// Wire name, matching the catalog JSON.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Stdio => "stdio",
+            Self::StreamableHttp => "streamableHttp",
+            Self::Sse => "sse",
+            Self::Oauth => "oauth",
+        }
+    }
+}
+
+/// Transport kind of a configured server: the explicit setting, else inferred from
+/// whether it has a `command` (stdio) or a `url` (streamable HTTP).
+fn configured_transport_name(cfg: &McpServerConfig) -> &'static str {
+    use crate::config::schema::McpTransportType;
+    match &cfg.transport_type {
+        Some(McpTransportType::Stdio) => "stdio",
+        Some(McpTransportType::Sse) => "sse",
+        Some(McpTransportType::StreamableHttp) => "streamableHttp",
+        None if !cfg.command.is_empty() => "stdio",
+        None if !cfg.url.is_empty() => "streamableHttp",
+        None => "unknown",
+    }
+}
+
+/// Summarize one preset against its (possibly absent) configured server.
+fn summarize_preset(preset: &McpPreset, cfg: Option<&McpServerConfig>) -> McpPresetSummary {
+    McpPresetSummary {
+        name: preset.name.clone(),
+        display_name: preset.display_name.clone(),
+        description: preset.description.clone(),
+        category: preset.category.clone(),
+        transport: preset.transport.as_str().to_string(),
+        enabled: cfg.is_some(),
+        status: status_for(preset, cfg).as_str().to_string(),
+        install_supported: preset.install_supported,
+        requires: preset.requires.clone(),
+        note: preset.note.clone(),
+        fields: preset
+            .fields
+            .iter()
+            .map(|field| McpPresetFieldSummary {
+                name: field.name.clone(),
+                label: field.label.clone(),
+                required: field.required,
+                secret: field.secret,
+                configured: field_configured(field, cfg),
+            })
+            .collect(),
+    }
+}
+
+/// Build the WebUI overview: every catalog preset (in catalog order) with its enabled
+/// state, plus the configured servers that are not catalog presets (sorted by name).
+/// Pure — takes the already-loaded catalog and configured servers.
+pub fn summarize_presets(
+    presets: &[McpPreset],
+    configured: &HashMap<String, McpServerConfig>,
+) -> McpPresetsOverview {
+    let known: HashSet<&str> = presets.iter().map(|p| p.name.as_str()).collect();
+    let mut custom: Vec<McpCustomServerSummary> = configured
+        .iter()
+        .filter(|(name, _)| !known.contains(name.as_str()))
+        .map(|(name, cfg)| McpCustomServerSummary {
+            name: name.clone(),
+            transport: configured_transport_name(cfg).to_string(),
+        })
+        .collect();
+    custom.sort_by(|a, b| a.name.cmp(&b.name));
+    McpPresetsOverview {
+        presets: presets
+            .iter()
+            .map(|preset| summarize_preset(preset, configured.get(&preset.name)))
+            .collect(),
+        custom,
+    }
 }
 
 // ── message-attachment mentions (WebUI-facing, currently unused by any channel) ──
@@ -1115,6 +1315,169 @@ mod tests {
         let mut b = preset_with_fields(None, vec![]);
         b.name = a.name.clone();
         assert!(check_duplicate_names(vec![&a, &b].into_iter()).is_err());
+    }
+
+    // ── enable / disable / validate ───────────────────────────────────────────
+
+    fn token_field() -> McpPresetField {
+        field("token", (McpPresetFieldTargetKind::Env, "TOKEN"), true, "")
+    }
+
+    #[test]
+    fn enable_preset_stores_materialized_server_under_the_preset_name() {
+        let preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![token_field()]);
+        let mut servers = HashMap::new();
+        let overrides = HashMap::from([("token".to_string(), "abc".to_string())]);
+
+        enable_preset(&mut servers, &preset, &overrides).unwrap();
+
+        assert_eq!(servers["test-preset"].env["TOKEN"], "abc");
+    }
+
+    #[test]
+    fn enable_preset_reports_missing_required_fields_and_stores_nothing() {
+        let preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![token_field()]);
+        let mut servers = HashMap::new();
+
+        let error = enable_preset(&mut servers, &preset, &HashMap::new()).unwrap_err();
+
+        assert!(matches!(error, McpPresetError::MissingFields(..)));
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn enable_preset_keeps_the_existing_value_when_none_is_supplied() {
+        let preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![token_field()]);
+        let mut existing = stdio_server("cmd", &[]);
+        existing.env.insert("TOKEN".to_string(), "kept".to_string());
+        let mut servers = HashMap::from([("test-preset".to_string(), existing)]);
+
+        enable_preset(&mut servers, &preset, &HashMap::new()).unwrap();
+
+        assert_eq!(servers["test-preset"].env["TOKEN"], "kept");
+    }
+
+    #[test]
+    fn disable_preset_removes_the_server_and_reports_whether_it_existed() {
+        let mut servers = HashMap::from([("a".to_string(), stdio_server("cmd", &[]))]);
+        assert!(disable_preset(&mut servers, "a"));
+        assert!(!disable_preset(&mut servers, "a"));
+        assert!(servers.is_empty());
+    }
+
+    #[test]
+    fn validate_field_overrides_accepts_known_single_line_values() {
+        let preset = preset_with_fields(None, vec![token_field()]);
+        let overrides = HashMap::from([("token".to_string(), "ghp_abc123".to_string())]);
+        assert_eq!(validate_field_overrides(&preset, &overrides), Ok(()));
+    }
+
+    #[test]
+    fn validate_field_overrides_rejects_unknown_overlong_and_multiline_values() {
+        let preset = preset_with_fields(None, vec![token_field()]);
+        let unknown = HashMap::from([("nope".to_string(), "x".to_string())]);
+        assert_eq!(
+            validate_field_overrides(&preset, &unknown),
+            Err(FieldValueError::UnknownField("nope".to_string()))
+        );
+        let too_long = HashMap::from([("token".to_string(), "x".repeat(MAX_FIELD_VALUE_LEN + 1))]);
+        assert_eq!(
+            validate_field_overrides(&preset, &too_long),
+            Err(FieldValueError::TooLong("token".to_string()))
+        );
+        let multiline = HashMap::from([("token".to_string(), "a\r\nX-Evil: 1".to_string())]);
+        assert_eq!(
+            validate_field_overrides(&preset, &multiline),
+            Err(FieldValueError::ControlCharacters("token".to_string()))
+        );
+    }
+
+    #[test]
+    fn field_value_errors_never_contain_the_value() {
+        let error = FieldValueError::ControlCharacters("token".to_string());
+        assert_eq!(
+            error.to_string(),
+            "the value for 'token' contains control characters"
+        );
+    }
+
+    // ── summarize_presets ─────────────────────────────────────────────────────
+
+    #[test]
+    fn summarize_presets_marks_enabled_only_when_configured() {
+        let enabled = preset_with_fields(Some(stdio_server("cmd", &[])), vec![]);
+        let mut disabled = preset_with_fields(Some(stdio_server("cmd", &[])), vec![]);
+        disabled.name = "other-preset".to_string();
+        let mut configured = HashMap::new();
+        configured.insert(enabled.name.clone(), stdio_server("cmd", &[]));
+
+        let overview = summarize_presets(&[enabled, disabled], &configured);
+
+        assert_eq!(overview.presets.len(), 2);
+        assert!(overview.presets[0].enabled);
+        assert!(!overview.presets[1].enabled);
+        assert_eq!(overview.presets[1].status, "not_installed");
+    }
+
+    #[test]
+    fn summarize_presets_reports_field_state_without_values() {
+        let preset = preset_with_fields(
+            Some(stdio_server("cmd", &[])),
+            vec![field(
+                "token",
+                (McpPresetFieldTargetKind::Env, "TOKEN"),
+                true,
+                "",
+            )],
+        );
+        let mut cfg = stdio_server("cmd", &[]);
+        cfg.env
+            .insert("TOKEN".to_string(), "super-secret-value".to_string());
+        let mut configured = HashMap::new();
+        configured.insert(preset.name.clone(), cfg);
+
+        let overview = summarize_presets(&[preset], &configured);
+
+        let field_summary = &overview.presets[0].fields[0];
+        assert!(field_summary.configured);
+        assert!(field_summary.required && field_summary.secret);
+        let json = serde_json::to_string(&overview).unwrap();
+        assert!(!json.contains("super-secret-value"));
+    }
+
+    #[test]
+    fn summarize_presets_lists_non_preset_servers_as_custom_sorted() {
+        let preset = preset_with_fields(None, vec![]);
+        let mut configured = HashMap::new();
+        configured.insert(preset.name.clone(), stdio_server("cmd", &[]));
+        configured.insert("zeta".to_string(), stdio_server("cmd", &[]));
+        configured.insert(
+            "alpha".to_string(),
+            McpServerConfig {
+                url: "https://example.com/mcp?key=secret-key".to_string(),
+                ..McpServerConfig::default()
+            },
+        );
+
+        let overview = summarize_presets(&[preset], &configured);
+
+        let names: Vec<&str> = overview.custom.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+        assert_eq!(overview.custom[0].transport, "streamableHttp");
+        assert_eq!(overview.custom[1].transport, "stdio");
+        let json = serde_json::to_string(&overview).unwrap();
+        assert!(!json.contains("secret-key"));
+    }
+
+    #[test]
+    fn summarize_presets_serializes_snake_case_wire_names() {
+        let preset = preset_with_fields(None, vec![]);
+        let overview = summarize_presets(&[preset], &HashMap::new());
+        let value = serde_json::to_value(&overview).unwrap();
+        assert_eq!(value["presets"][0]["display_name"], "Test Preset");
+        assert_eq!(value["presets"][0]["install_supported"], true);
+        assert_eq!(value["presets"][0]["transport"], "stdio");
+        assert_eq!(value["custom"], serde_json::json!([]));
     }
 
     // ── format_preset_details ─────────────────────────────────────────────────

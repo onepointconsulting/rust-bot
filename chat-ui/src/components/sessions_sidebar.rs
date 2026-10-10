@@ -94,6 +94,36 @@ pub(crate) fn IconChatPlus() -> impl IntoView {
     }
 }
 
+/// Tailwind classes for the sidebar's "MCPs" button, highlighted while the MCP
+/// list is showing.
+fn mcps_button_class(active: bool) -> &'static str {
+    if active {
+        "flex w-full items-center gap-2 rounded-xl bg-slate-200 px-3 py-2 text-sm font-medium text-slate-900"
+    } else {
+        "flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100"
+    }
+}
+
+/// Puzzle piece, used by the sidebar's "MCPs" button.
+#[component]
+fn IconPuzzle() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <path d="M19.4 12.6V8a1 1 0 0 0-1-1h-4.6a2.5 2.5 0 1 0-5 0H4.2a1 1 0 0 0-1 1v4.6a2.5 2.5 0 1 1 0 5V21a1 1 0 0 0 1 1h4.6v-.8a2.5 2.5 0 1 1 5 0v.8h4.6a1 1 0 0 0 1-1v-4.6a2.5 2.5 0 1 0 0-5Z" />
+        </svg>
+    }
+}
+
 #[component]
 fn IconKebab() -> impl IntoView {
     view! {
@@ -719,6 +749,15 @@ pub fn SessionsSidebar(
     /// header carries its own "New chat" button.
     #[prop(optional)]
     on_new_chat: Option<Callback<()>>,
+    /// When set, an "MCPs" button is shown under "New chat" that fires this
+    /// callback (websockets-chat opens its MCP list). Omitted by `web-chat`
+    /// and for anonymous visitors.
+    #[prop(default = None)]
+    on_mcps: Option<Callback<()>>,
+    /// Whether the MCP list is currently showing, so the "MCPs" button can
+    /// render as selected.
+    #[prop(into, default = Signal::stored(false))]
+    mcps_active: Signal<bool>,
     /// When `true`, the header row shows the rust-bot logo + title instead of
     /// the "Chats" label.
     #[prop(default = false)]
@@ -940,6 +979,21 @@ pub fn SessionsSidebar(
                             >
                                 <IconChatPlus />
                                 "New chat"
+                            </button>
+                        </div>
+                    }
+                })}
+                {on_mcps.map(|on_mcps| {
+                    view! {
+                        <div class="px-2 pt-2">
+                            <button
+                                type="button"
+                                class=move || mcps_button_class(mcps_active.get())
+                                aria-pressed=move || mcps_active.get().to_string()
+                                on:click=move |_| on_mcps.run(())
+                            >
+                                <IconPuzzle />
+                                "MCPs"
                             </button>
                         </div>
                     }
@@ -1476,5 +1530,16 @@ mod collapse_tooltip_tests {
     #[test]
     fn tooltip_includes_shortcut_hint() {
         assert_eq!(collapse_tooltip(Some("Ctrl+B")), "Close sidebar Ctrl+B");
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::mcps_button_class;
+
+    #[test]
+    fn mcps_button_class_highlights_only_when_active() {
+        assert!(mcps_button_class(true).contains("bg-slate-200"));
+        assert!(!mcps_button_class(false).contains("bg-slate-200"));
     }
 }

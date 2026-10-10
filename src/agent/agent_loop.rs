@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
 use std::path::PathBuf;
@@ -33,7 +33,9 @@ use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::FsToolConfig;
 use crate::agent::tools::goal::UpdateGoalTool;
 use crate::agent::tools::mcp::mcp_file_ref::FileRefResolver;
-use crate::agent::tools::mcp::{LoadMcpToolsError, LoadedMcpTools, load_mcp_tools_with_file_refs};
+use crate::agent::tools::mcp::{
+    LoadedMcpTools, McpConnectBatch, connect_mcp_servers_independently,
+};
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
@@ -152,6 +154,40 @@ fn safe_strip_think(text: Option<&str>) -> Option<String> {
     text?;
     let text = strip_think(text.unwrap());
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// How long to wait before trying again to connect MCP servers that failed, so a broken
+/// server does not make every chat message wait for another failed attempt.
+const MCP_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Which MCP servers are up, which failed (and why), and when we last tried.
+#[derive(Default)]
+struct McpConnectionState {
+    /// Servers with a live session.
+    connected_names: HashSet<String>,
+    /// Servers whose last connection attempt failed, with the error text.
+    failures: BTreeMap<String, String>,
+    last_attempt: Option<Instant>,
+}
+
+/// The configured servers that still need connecting, sorted by name.
+fn pending_mcp_servers(
+    configured: &HashMap<String, McpServerConfig>,
+    connected: &HashSet<String>,
+) -> Vec<(String, McpServerConfig)> {
+    let mut pending: Vec<(String, McpServerConfig)> = configured
+        .iter()
+        .filter(|(name, _)| !connected.contains(*name))
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect();
+    pending.sort_by(|a, b| a.0.cmp(&b.0));
+    pending
+}
+
+/// Whether enough time has passed since `last_attempt` to try connecting again. Always
+/// true before the first attempt.
+fn mcp_retry_due(last_attempt: Option<Instant>, now: Instant, interval: Duration) -> bool {
+    last_attempt.is_none_or(|last| now.saturating_duration_since(last) >= interval)
 }
 
 fn mcp_server_endpoint(config: &McpServerConfig) -> String {
@@ -298,6 +334,8 @@ pub struct AgentLoop {
     /// Live MCP sessions. Holding these keeps the connections open; dropping
     /// them closes the connections (RAII equivalent of Python's AsyncExitStack).
     mcp_sessions: Mutex<Vec<LoadedMcpTools>>,
+    /// Per-server connection outcome. One failing server never affects the others.
+    mcp_state: Mutex<McpConnectionState>,
     _channels_config: Option<ChannelsConfig>,
     _timezone: Option<String>,
     pub start_time: SystemTime,
@@ -491,6 +529,7 @@ impl AgentLoop {
             mcp_connected: AtomicBool::new(false),
             mcp_connecting: AtomicBool::new(false),
             mcp_sessions: Mutex::new(Vec::new()),
+            mcp_state: Mutex::new(McpConnectionState::default()),
             active_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             next_task_id: AtomicU64::new(0),
             background_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
@@ -849,74 +888,87 @@ impl AgentLoop {
         tools.register(Box::new(UpdateGoalTool::new(session_manager)));
     }
 
-    /// Connect to configured MCP servers (one-time, lazy).
+    /// Connect to configured MCP servers (lazy, on the first message).
+    ///
+    /// Each server is connected on its own: the ones that come up get their tools
+    /// registered even if another server fails. Servers that failed are retried on a
+    /// later message, at most once per [`MCP_RETRY_INTERVAL`]; servers that are already
+    /// up are left alone.
     ///
     /// Takes `&self` (state is held in atomics / a mutex) so it can be called
     /// from a shared `Arc<Self>` in the run loop.
     pub async fn connect_mcp(&self) {
-        if self.mcp_connected.load(Ordering::Relaxed)
-            || self.mcp_connecting.load(Ordering::Relaxed)
-            || self.mcp_servers.is_empty()
-        {
+        if self.mcp_connected.load(Ordering::Relaxed) || self.mcp_servers.is_empty() {
             return;
         }
-        self.mcp_connecting.store(true, Ordering::Relaxed);
+        let pending = {
+            let state = self.mcp_state.lock().unwrap_or_else(|e| e.into_inner());
+            if !mcp_retry_due(state.last_attempt, Instant::now(), MCP_RETRY_INTERVAL) {
+                return;
+            }
+            pending_mcp_servers(&self.mcp_servers, &state.connected_names)
+        };
+        if self.mcp_connecting.swap(true, Ordering::Relaxed) {
+            return;
+        }
 
         // Rust uses RAII instead of an AsyncExitStack: each established session
-        // closes its connection when dropped. On success we keep the sessions
-        // alive by storing them on `self`; on failure they are dropped here,
-        // which is the equivalent of `await stack.aclose()`.
-        match Self::connect_mcp_servers(&self.mcp_servers, self.mcp_file_ref_resolver()).await {
-            Ok(mut sessions) => {
-                let mut mcp_tool_count = 0usize;
-                {
-                    let mut registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
-                    for session in &mut sessions {
-                        mcp_tool_count += session.tools.len();
-                        for tool in session.tools.drain(..) {
-                            if self.disabled_tools.contains(&tool.name()) {
-                                continue;
-                            }
-                            registry.register(tool);
-                        }
-                    }
-                }
-                *self.mcp_sessions.lock().unwrap_or_else(|e| e.into_inner()) = sessions;
-                self.mcp_connected.store(true, Ordering::Relaxed);
-                log::info!(
-                    "{} MCP server(s) connected successfully",
-                    self.mcp_servers.len()
-                );
-                log::info!("{mcp_tool_count} MCP tools registered");
-            }
-            Err(e) => {
-                log::error!("Failed to connect MCP servers (will retry next message): {e}");
-                // Drop any partially-established sessions (closes them).
-                self.mcp_sessions
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner())
-                    .clear();
-            }
-        }
+        // closes its connection when dropped, so the sessions are kept alive by
+        // storing them on `self`.
+        let batch = connect_mcp_servers_independently(pending, self.mcp_file_ref_resolver()).await;
+        self.record_mcp_batch(batch);
 
         // `finally`: always release the connecting flag.
         self.mcp_connecting.store(false, Ordering::Relaxed);
     }
 
-    /// Connect to every configured MCP server and load its tools.
-    ///
-    /// Returns the live sessions (each owns its connection plus the loaded tool
-    /// wrappers). Fails fast on the first server that cannot be reached; the
-    /// sessions established so far are dropped as the error unwinds.
-    async fn connect_mcp_servers(
-        servers: &HashMap<String, McpServerConfig>,
-        file_refs: Option<FileRefResolver>,
-    ) -> Result<Vec<LoadedMcpTools>, LoadMcpToolsError> {
-        let mut sessions = Vec::with_capacity(servers.len());
-        for (name, config) in servers {
-            sessions.push(load_mcp_tools_with_file_refs(config, name, file_refs.clone()).await?);
+    /// Register the tools of the servers that connected, remember the ones that did
+    /// not (and why), and update whether every configured server is up.
+    fn record_mcp_batch(&self, batch: McpConnectBatch) {
+        let McpConnectBatch { connected, failed } = batch;
+        let mut mcp_tool_count = 0usize;
+        let mut new_sessions = Vec::with_capacity(connected.len());
+        let mut connected_names = Vec::with_capacity(connected.len());
+        {
+            let mut registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+            for (name, mut session) in connected {
+                mcp_tool_count += session.tools.len();
+                for tool in session.tools.drain(..) {
+                    if self.disabled_tools.contains(&tool.name()) {
+                        continue;
+                    }
+                    registry.register(tool);
+                }
+                connected_names.push(name);
+                new_sessions.push(session);
+            }
         }
-        Ok(sessions)
+        self.mcp_sessions
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .extend(new_sessions);
+
+        let (connected_total, all_connected) = {
+            let mut state = self.mcp_state.lock().unwrap_or_else(|e| e.into_inner());
+            for name in connected_names {
+                state.failures.remove(&name);
+                state.connected_names.insert(name);
+            }
+            for (name, error) in failed {
+                log::error!(
+                    "Failed to connect MCP server '{name}' (will retry in {}s): {error}",
+                    MCP_RETRY_INTERVAL.as_secs()
+                );
+                state.failures.insert(name, error.to_string());
+            }
+            state.last_attempt = Some(Instant::now());
+            (state.connected_names.len(), state.failures.is_empty())
+        };
+        self.mcp_connected.store(all_connected, Ordering::Relaxed);
+        log::info!(
+            "{connected_total} of {} MCP server(s) connected; {mcp_tool_count} MCP tools registered",
+            self.mcp_servers.len()
+        );
     }
 
     /// Sandbox used when an MCP argument references a local file.
@@ -951,20 +1003,29 @@ impl AgentLoop {
         !self.mcp_servers.is_empty()
     }
 
-    /// Connected MCP servers as `(name, endpoint)` pairs, sorted by name.
-    ///
-    /// Returns an empty vec when not connected.
+    /// Connected MCP servers as `(name, endpoint)` pairs, sorted by name. Servers that
+    /// failed to connect are not included (see [`Self::failed_mcp_servers`]).
     pub fn connected_mcp_endpoints(&self) -> Vec<(String, String)> {
-        if !self.is_mcp_connected() {
-            return Vec::new();
-        }
+        let state = self.mcp_state.lock().unwrap_or_else(|e| e.into_inner());
         let mut servers: Vec<(String, String)> = self
             .mcp_servers
             .iter()
+            .filter(|(name, _)| state.connected_names.contains(*name))
             .map(|(name, config)| (name.clone(), mcp_server_endpoint(config)))
             .collect();
         servers.sort_by(|a, b| a.0.cmp(&b.0));
         servers
+    }
+
+    /// MCP servers whose last connection attempt failed, as `(name, error)` pairs sorted
+    /// by name.
+    pub fn failed_mcp_servers(&self) -> Vec<(String, String)> {
+        let state = self.mcp_state.lock().unwrap_or_else(|e| e.into_inner());
+        state
+            .failures
+            .iter()
+            .map(|(name, error)| (name.clone(), error.clone()))
+            .collect()
     }
 
     /// Shared message bus handle for publishing outbound messages.
@@ -2296,6 +2357,7 @@ impl AgentLoop {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clear();
+        *self.mcp_state.lock().unwrap_or_else(|e| e.into_inner()) = McpConnectionState::default();
         self.mcp_connected.store(false, Ordering::Relaxed);
     }
 
@@ -2383,6 +2445,52 @@ mod tests {
 
     use crate::providers::base::{GenerationSettings, LLMResponse};
     use serde_json::json;
+
+    fn mcp_servers(names: &[&str]) -> HashMap<String, McpServerConfig> {
+        names
+            .iter()
+            .map(|name| (name.to_string(), McpServerConfig::default()))
+            .collect()
+    }
+
+    #[test]
+    fn pending_mcp_servers_skips_connected_ones_and_sorts_by_name() {
+        let configured = mcp_servers(&["zeta", "alpha", "playwright"]);
+        let connected = HashSet::from(["playwright".to_string()]);
+
+        let pending = pending_mcp_servers(&configured, &connected);
+
+        let names: Vec<&str> = pending.iter().map(|(name, _)| name.as_str()).collect();
+        assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn pending_mcp_servers_is_empty_once_everything_is_connected() {
+        let configured = mcp_servers(&["a", "b"]);
+        let connected = HashSet::from(["a".to_string(), "b".to_string()]);
+        assert!(pending_mcp_servers(&configured, &connected).is_empty());
+    }
+
+    #[test]
+    fn mcp_retry_is_due_before_the_first_attempt() {
+        assert!(mcp_retry_due(None, Instant::now(), MCP_RETRY_INTERVAL));
+    }
+
+    #[test]
+    fn mcp_retry_waits_for_the_interval_after_an_attempt() {
+        let attempt = Instant::now();
+        let interval = Duration::from_secs(60);
+        assert!(!mcp_retry_due(
+            Some(attempt),
+            attempt + Duration::from_secs(59),
+            interval
+        ));
+        assert!(mcp_retry_due(
+            Some(attempt),
+            attempt + Duration::from_secs(60),
+            interval
+        ));
+    }
 
     /// Minimal provider placeholder until `AgentLoop` is fully wired.
     struct PlaceholderProvider {

@@ -54,6 +54,15 @@ pub enum EnvelopeType {
     /// skills only appear in the agent system prompt.
     ListSkills,
     ListTools,
+    /// List the MCP server presets (and any custom MCP servers) with their
+    /// enabled state, for the WebUI's MCP page. Rust-side addition with no
+    /// nanobot precedent. Authenticated connections only — see
+    /// `handle_list_mcp_presets`.
+    ListMcpPresets,
+    /// Enable or disable one MCP preset in `config.json`, optionally with the values
+    /// of the fields it needs (API keys, tokens). Rust-side addition with no nanobot
+    /// precedent. Local, authenticated connections only — see `mcp_write_denial`.
+    SetMcpPreset,
     /// Persist a new display title on an existing `websocket:{chat_id}`
     /// session. Rust-side addition with no nanobot precedent — the Python
     /// reference has no rename envelope; titles are LLM-generated only.
@@ -124,6 +133,8 @@ impl From<&str> for EnvelopeType {
             "list_chats" => Self::ListChats,
             "list_skills" => Self::ListSkills,
             "list_tools" => Self::ListTools,
+            "list_mcp_presets" => Self::ListMcpPresets,
+            "set_mcp_preset" => Self::SetMcpPreset,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
             "clear_session" => Self::ClearSession,
@@ -161,6 +172,14 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::ListTools`] — the tools visible to the chat's
     /// agent mode, as `{name, description}` entries.
     ToolsList,
+    /// Reply to [`EnvelopeType::ListMcpPresets`] — `{presets, custom}`.
+    McpPresets,
+    /// Reply to a successful [`EnvelopeType::SetMcpPreset`] — the preset's fresh summary
+    /// and whether a restart is needed for the change to take effect.
+    McpPresetSet,
+    /// Reply to a refused or failed [`EnvelopeType::SetMcpPreset`] — `{name, detail,
+    /// message, fields}`. Never carries a submitted field value.
+    McpPresetError,
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatRenamed,
@@ -222,6 +241,9 @@ impl WsOutboundEvent {
             Self::ChatsList => "chats",
             Self::SkillsList => "skills",
             Self::ToolsList => "tools",
+            Self::McpPresets => "mcp_presets",
+            Self::McpPresetSet => "mcp_preset_set",
+            Self::McpPresetError => "mcp_preset_error",
             Self::ChatRenamed => "chat_renamed",
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
@@ -604,6 +626,17 @@ mod tests {
         assert_eq!(EnvelopeType::from("message"), EnvelopeType::Message);
         assert_eq!(EnvelopeType::from("list_chats"), EnvelopeType::ListChats);
         assert_eq!(EnvelopeType::from("list_skills"), EnvelopeType::ListSkills);
+        assert_eq!(
+            EnvelopeType::from("list_mcp_presets"),
+            EnvelopeType::ListMcpPresets
+        );
+        assert_eq!(WsOutboundEvent::McpPresets.as_str(), "mcp_presets");
+        assert_eq!(
+            EnvelopeType::from("set_mcp_preset"),
+            EnvelopeType::SetMcpPreset
+        );
+        assert_eq!(WsOutboundEvent::McpPresetSet.as_str(), "mcp_preset_set");
+        assert_eq!(WsOutboundEvent::McpPresetError.as_str(), "mcp_preset_error");
         assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
         assert_eq!(EnvelopeType::from("delete_chat"), EnvelopeType::DeleteChat);
         assert_eq!(EnvelopeType::from("abort_turn"), EnvelopeType::AbortTurn);

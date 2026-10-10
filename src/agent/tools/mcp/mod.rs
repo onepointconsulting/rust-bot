@@ -336,8 +336,7 @@ pub async fn connect_mcp_server(config: &McpServerConfig) -> Result<McpClient, C
 
     match transport_type {
         McpTransportType::Stdio => connect_stdio(config).await,
-        McpTransportType::Sse => connect_http(config, true).await,
-        McpTransportType::StreamableHttp => connect_http(config, false).await,
+        McpTransportType::Sse | McpTransportType::StreamableHttp => connect_http(config).await,
     }
 }
 
@@ -368,10 +367,14 @@ async fn connect_stdio(config: &McpServerConfig) -> Result<McpClient, ConnectMcp
     })
 }
 
-async fn connect_http(
+/// Build the HTTP transport settings for `config`: URL, auth and custom headers.
+///
+/// Stateless servers are accepted. The MCP spec lets a server decline to hand out a
+/// session id, and some hosted servers do (Firecrawl's keyless endpoint, for one).
+/// Requiring one made the handshake fail with "Missing session id in HTTP response".
+fn http_transport_config(
     config: &McpServerConfig,
-    allow_stateless: bool,
-) -> Result<McpClient, ConnectMcpError> {
+) -> Result<StreamableHttpClientTransportConfig, ConnectMcpError> {
     let mut transport_config = StreamableHttpClientTransportConfig::with_uri(config.url.as_str())
         .reinit_on_expired_session(true);
 
@@ -395,8 +398,12 @@ async fn connect_http(
         transport_config = transport_config.custom_headers(custom_headers);
     }
 
-    transport_config.allow_stateless = allow_stateless;
+    transport_config.allow_stateless = true;
+    Ok(transport_config)
+}
 
+async fn connect_http(config: &McpServerConfig) -> Result<McpClient, ConnectMcpError> {
+    let transport_config = http_transport_config(config)?;
     let transport = StreamableHttpClientTransport::from_config(transport_config);
     let service = ().serve(transport).await.map_err(ConnectMcpError::Handshake)?;
     Ok(McpClient {
@@ -412,6 +419,39 @@ async fn connect_http(
 pub struct LoadedMcpTools {
     pub client: McpClient,
     pub tools: Vec<Box<dyn Tool>>,
+}
+
+/// Result of connecting a batch of MCP servers, each on its own: the ones that came up
+/// and the ones that did not, with why. One server failing never affects the others.
+pub struct McpConnectBatch {
+    pub connected: Vec<(String, LoadedMcpTools)>,
+    pub failed: Vec<(String, LoadMcpToolsError)>,
+}
+
+/// Connect every server in `servers` (`name, config`) concurrently, so a slow or broken
+/// server does not hold up or take down the rest. Both lists keep the input order.
+pub async fn connect_mcp_servers_independently(
+    servers: Vec<(String, McpServerConfig)>,
+    file_refs: Option<FileRefResolver>,
+) -> McpConnectBatch {
+    let attempts = servers.into_iter().map(|(name, config)| {
+        let file_refs = file_refs.clone();
+        async move {
+            let result = load_mcp_tools_with_file_refs(&config, &name, file_refs).await;
+            (name, result)
+        }
+    });
+    let mut batch = McpConnectBatch {
+        connected: Vec::new(),
+        failed: Vec::new(),
+    };
+    for (name, result) in futures::future::join_all(attempts).await {
+        match result {
+            Ok(loaded) => batch.connected.push((name, loaded)),
+            Err(error) => batch.failed.push((name, error)),
+        }
+    }
+    batch
 }
 
 /// Failure to connect or list tools when building [`LoadedMcpTools`].
@@ -671,6 +711,121 @@ fn mcp_cast_params(params: &serde_json::Value) -> serde_json::Value {
 mod tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn http_transport_config_accepts_stateless_servers() {
+        let config = McpServerConfig {
+            url: "https://mcp.example.com/v2/mcp".to_string(),
+            ..McpServerConfig::default()
+        };
+        let transport_config = http_transport_config(&config).unwrap();
+        assert!(
+            transport_config.allow_stateless,
+            "a server that hands out no session id must be accepted"
+        );
+    }
+
+    #[test]
+    fn http_transport_config_rejects_invalid_header_names() {
+        let mut config = McpServerConfig {
+            url: "https://mcp.example.com/mcp".to_string(),
+            ..McpServerConfig::default()
+        };
+        config
+            .headers
+            .insert("bad header name".to_string(), "x".to_string());
+        assert!(matches!(
+            http_transport_config(&config),
+            Err(ConnectMcpError::InvalidHeader(_))
+        ));
+    }
+
+    fn unreachable_stdio_server() -> McpServerConfig {
+        McpServerConfig {
+            command: "definitely-not-a-real-mcp-program-xyz".to_string(),
+            ..McpServerConfig::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_servers_independently_reports_every_failure_in_input_order() {
+        let batch = connect_mcp_servers_independently(
+            vec![
+                ("zeta".to_string(), unreachable_stdio_server()),
+                ("alpha".to_string(), unreachable_stdio_server()),
+            ],
+            None,
+        )
+        .await;
+
+        assert!(batch.connected.is_empty());
+        let failed_names: Vec<&str> = batch.failed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(failed_names, vec!["zeta", "alpha"]);
+    }
+
+    /// A minimal stdio MCP server (initialize + tools/list) written in Python, so the
+    /// mixed working/broken case can be tested without a real server. `None` when no
+    /// working Python is available, in which case the test is skipped.
+    fn fake_python_mcp_server(dir: &std::path::Path) -> Option<McpServerConfig> {
+        let python = ["python3", "python"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .args(["-c", "print(1)"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })?;
+        let script = dir.join("fake_mcp_server.py");
+        std::fs::write(
+            &script,
+            "import sys, json\n\
+             for line in sys.stdin:\n\
+             \x20   msg = json.loads(line)\n\
+             \x20   method = msg.get('method')\n\
+             \x20   if method == 'initialize':\n\
+             \x20       res = {'protocolVersion': msg['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fake', 'version': '1'}}\n\
+             \x20   elif method == 'tools/list':\n\
+             \x20       res = {'tools': [{'name': 'ping', 'description': 'p', 'inputSchema': {'type': 'object', 'properties': {}}}]}\n\
+             \x20   else:\n\
+             \x20       continue\n\
+             \x20   print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': res}), flush=True)\n",
+        )
+        .ok()?;
+        Some(McpServerConfig {
+            command: python.to_string(),
+            args: vec![script.to_string_lossy().to_string()],
+            ..McpServerConfig::default()
+        })
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_servers_independently_keeps_working_servers_when_another_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let Some(working) = fake_python_mcp_server(dir.path()) else {
+            eprintln!("skipped: no working python on PATH");
+            return;
+        };
+
+        let batch = connect_mcp_servers_independently(
+            vec![
+                ("broken".to_string(), unreachable_stdio_server()),
+                ("working".to_string(), working),
+            ],
+            None,
+        )
+        .await;
+
+        let connected_names: Vec<&str> = batch.connected.iter().map(|(n, _)| n.as_str()).collect();
+        let failed_names: Vec<&str> = batch.failed.iter().map(|(n, _)| n.as_str()).collect();
+        assert_eq!(connected_names, vec!["working"]);
+        assert_eq!(failed_names, vec!["broken"]);
+        assert_eq!(batch.connected[0].1.tools.len(), 1);
+        assert_eq!(batch.connected[0].1.tools[0].name(), "mcp_working_ping");
+    }
+
+    #[tokio::test]
+    async fn connect_mcp_servers_independently_with_no_servers_is_empty() {
+        let batch = connect_mcp_servers_independently(Vec::new(), None).await;
+        assert!(batch.connected.is_empty() && batch.failed.is_empty());
+    }
 
     #[test]
     fn resolve_stdio_command_keeps_unknown_command_as_written() {

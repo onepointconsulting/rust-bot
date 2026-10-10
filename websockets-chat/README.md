@@ -142,6 +142,48 @@ editing code:
 http://127.0.0.1:8902/?wsBase=ws://127.0.0.1:18790
 ```
 
+## MCP list
+
+Signed-in users get an **MCPs** button in the sidebar. It opens a list of the MCP
+server presets (GitHub, Playwright, ...) with a switch showing whether each one is
+turned on, plus a "Custom" section for MCP servers in `config.json` that are not
+presets. Presets that need attention show a badge (`Needs credentials`,
+`Missing dependency`, `Coming soon`).
+
+- The list is never shown on page load, and is only requested when the button is
+  clicked (`list_mcp_presets` envelope, `mcp_presets` event).
+- Anonymous connections (no valid JWT) do not get the button, and the gateway answers
+  a hand-sent `list_mcp_presets` with an `access_denied` error. If JWT is disabled
+  entirely, the feature is unavailable.
+- Credential values and custom-server command lines or URLs are never sent to the
+  browser.
+
+### Turning presets on and off
+
+When the browser runs on the gateway machine (a loopback connection, or the native app
+shell) and is signed in, the switches work (`set_mcp_preset` envelope):
+
+- Turning a preset off removes it from `config.json`.
+- Turning a preset on enables it. A preset that still needs credentials (an API key,
+  a token) first opens an inline form for the missing values. They are sent over the
+  WebSocket and stored in `config.json` on the gateway machine, which is fine for a
+  local setup. Fields that already have a value, or an exported environment variable,
+  are not asked for. An enabled preset that lacks credentials has a "Set credentials"
+  link.
+- **Changes need a restart.** Changed presets are marked "Restart to apply", and a banner
+  lists them until you reload the page.
+- When the browser runs on another machine, the whole page is **read-only**: the
+  gateway reports `can_modify: false` and refuses `set_mcp_preset` itself, so hiding the
+  switches is not the only protection. It is also read-only inside a child agent, which
+  runs on its parent's configuration.
+- Submitted values are checked (known field, at most 4096 characters, no control
+  characters), are never logged, and are never echoed back in a reply.
+- Custom servers are listed but cannot be changed here.
+
+The "local" test is the connection's source address, so a reverse proxy running on the
+gateway machine makes remote visitors look local. Do not put the gateway behind one
+unless the proxy itself restricts access.
+
 ## Build for production
 
 ```bash
