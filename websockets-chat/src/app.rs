@@ -23,15 +23,16 @@ use uuid::Uuid;
 use chat_ui::api::login;
 use chat_ui::components::LoginForm;
 use chat_ui::models::{
-    now_rfc3339, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
-    OutgoingMessage, Role, SessionListItem, SessionSummaryPopup, SessionTokenUsage, SkillSummary,
-    ToolSummary, WorkspaceDialogState, WorkspaceDirectoryEntry,
+    now_rfc3339, AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary,
+    McpPresetSummary, OutgoingMessage, Role, SessionListItem, SessionSummaryPopup,
+    SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolSummary, WorkspaceDialogState,
+    WorkspaceDirectoryEntry,
 };
 
 use crate::api::{self, WsSender};
 use crate::components::{ChatShell, McpChangeRequest};
 use crate::protocol::{self, ServerEvent};
-use crate::state::{self, ConnectionStatus};
+use crate::state::{self, startup_view, ConnectionStatus, MainView, StartupView};
 use crate::storage_keys::CHAT_ID_STORAGE_KEY;
 use crate::storage_keys::CHAT_OPEN_STORAGE_KEY;
 use crate::storage_keys::EXPANDED_STORAGE_KEY;
@@ -384,9 +385,9 @@ struct WsContext {
     /// re-requested each time the tools popup opens rather than once per
     /// connection. Empty until the first reply.
     tools: RwSignal<Vec<ToolSummary>>,
-    /// Whether the MCP list is showing instead of the chat. Always `false` on
-    /// page load and not persisted anywhere, so a reload never opens it.
-    mcp_view_open: RwSignal<bool>,
+    /// What fills the main area: the chat or one of the list pages. Always the
+    /// chat on page load and not persisted anywhere, so a reload never opens a page.
+    main_view: RwSignal<MainView>,
     /// MCP presets from the gateway's `mcp_presets` event. Only filled while
     /// the MCP list is open; cleared whenever it closes.
     mcp_presets: RwSignal<Vec<McpPresetSummary>>,
@@ -405,6 +406,15 @@ struct WsContext {
     /// Presets changed since the page was loaded; they need a restart. Kept when the
     /// list closes, since the restart is still pending.
     mcp_changed: RwSignal<Vec<String>>,
+    /// Durable ACP child agents from the gateway's `subagents` event. Only filled
+    /// while the sub-agents page is open; cleared whenever it closes.
+    subagent_agents: RwSignal<Vec<AcpAgentSummary>>,
+    /// Spawn tasks from the same event (the ones from the user's own chats).
+    spawn_tasks: RwSignal<Vec<SpawnTaskSummary>>,
+    /// Whether the gateway has child agents (ACP) switched on.
+    subagents_acp_enabled: RwSignal<bool>,
+    /// Whether the reply to the latest `list_subagents` request has arrived.
+    subagents_loaded: RwSignal<bool>,
     /// Sidebar Summary dialog: `None` when closed, `Some` with empty
     /// `text` while the `get_session_summary` reply is in flight.
     summary_popup: RwSignal<Option<SessionSummaryPopup>>,
@@ -722,8 +732,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
             ctx.token_streaming.set(streaming);
-            // A fresh connection starts on the chat, never on the MCP list.
-            close_mcp_view(ctx);
+            // A fresh connection starts on the chat, never on a list page.
+            close_main_view(ctx);
             // The chat list is connection-scoped, not chat-scoped — ask for
             // it on every `ready`, not only after `attached`. A refresh
             // always has a stored `chat_id`, so the previous "list only on
@@ -826,9 +836,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::Error {
             turn_id, detail, ..
         } => {
-            // The gateway refuses the MCP list to anonymous or expired sessions.
-            if detail == "access_denied" && ctx.mcp_view_open.get_untracked() {
-                close_mcp_view(ctx);
+            // The gateway refuses the list pages to anonymous or expired sessions.
+            if detail == "access_denied" && !ctx.main_view.get_untracked().is_chat() {
+                close_main_view(ctx);
                 return;
             }
             if turn_id.is_none() && ctx.workspace_popup.get_untracked().is_some() {
@@ -967,11 +977,24 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             can_modify,
         } => {
             // A reply that lands after the list was closed must not leave data behind.
-            if ctx.mcp_view_open.get_untracked() {
+            if ctx.main_view.get_untracked() == MainView::Mcps {
                 ctx.mcp_presets.set(presets);
                 ctx.mcp_custom.set(custom);
                 ctx.mcp_can_modify.set(can_modify);
                 ctx.mcp_loaded.set(true);
+            }
+        }
+        ServerEvent::Subagents {
+            acp_enabled,
+            agents,
+            tasks,
+        } => {
+            // A reply that lands after the page was closed must not leave data behind.
+            if ctx.main_view.get_untracked() == MainView::Subagents {
+                ctx.subagents_acp_enabled.set(acp_enabled);
+                ctx.subagent_agents.set(agents);
+                ctx.spawn_tasks.set(tasks);
+                ctx.subagents_loaded.set(true);
             }
         }
         ServerEvent::McpPresetSet {
@@ -1060,8 +1083,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             options,
             ..
         } => {
-            ctx.pending_question
-                .set(Some(state::PendingQuestion::new(request_id, question, options)));
+            ctx.pending_question.set(Some(state::PendingQuestion::new(
+                request_id, question, options,
+            )));
         }
         ServerEvent::QuestionResolved { request_id, .. } => {
             if ctx
@@ -1286,9 +1310,35 @@ fn request_mcp_presets(ctx: &WsContext) {
 /// Show the MCP list in place of the chat and fetch it. Fetched here, on demand,
 /// and never on connect or page load.
 fn open_mcp_view(ctx: &WsContext) {
+    clear_subagents_data(ctx);
     ctx.mcp_loaded.set(false);
-    ctx.mcp_view_open.set(true);
+    ctx.main_view.set(MainView::Mcps);
     request_mcp_presets(ctx);
+}
+
+/// Ask the gateway for the child agents and spawn tasks. Fire-and-forget; the reply
+/// fills the sub-agents signals (see the `Subagents` arm of the event handler).
+fn request_subagents(ctx: &WsContext) {
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_subagents(),
+        "Failed to encode the sub-agents request.",
+    );
+}
+
+/// Show the sub-agents list in place of the chat and fetch it. Fetched here, on demand,
+/// and never on connect or page load.
+fn open_subagents_view(ctx: &WsContext) {
+    clear_mcp_data(ctx);
+    ctx.subagents_loaded.set(false);
+    ctx.main_view.set(MainView::Subagents);
+    request_subagents(ctx);
+}
+
+/// Re-fetch the sub-agents list while it is showing.
+fn refresh_subagents_view(ctx: &WsContext) {
+    ctx.subagents_loaded.set(false);
+    request_subagents(ctx);
 }
 
 /// Ask the gateway to turn the preset `name` on or off. `fields` holds the values from the
@@ -1314,15 +1364,30 @@ fn refresh_mcp_view(ctx: &WsContext) {
     request_mcp_presets(ctx);
 }
 
-/// Hide the MCP list and drop its data.
-fn close_mcp_view(ctx: &WsContext) {
-    ctx.mcp_view_open.set(false);
+/// Drop everything the MCP page holds. The list of changed presets stays: a restart is
+/// still pending after the page closes.
+fn clear_mcp_data(ctx: &WsContext) {
     ctx.mcp_loaded.set(false);
     ctx.mcp_presets.set(Vec::new());
     ctx.mcp_custom.set(Vec::new());
     ctx.mcp_can_modify.set(false);
     ctx.mcp_busy.set(None);
     ctx.mcp_row_error.set(None);
+}
+
+/// Drop everything the sub-agents page holds.
+fn clear_subagents_data(ctx: &WsContext) {
+    ctx.subagents_loaded.set(false);
+    ctx.subagent_agents.set(Vec::new());
+    ctx.spawn_tasks.set(Vec::new());
+    ctx.subagents_acp_enabled.set(false);
+}
+
+/// Go back to the chat and drop the data of whichever list page was open.
+fn close_main_view(ctx: &WsContext) {
+    ctx.main_view.set(MainView::Chat);
+    clear_mcp_data(ctx);
+    clear_subagents_data(ctx);
 }
 
 /// Ask the gateway which tools the active chat's agent mode exposes.
@@ -1673,7 +1738,7 @@ fn reset_local_transcript(ctx: &WsContext) {
 /// transcript first so `should_drop_event` ignores leftover frames from the
 /// previous subscription until `attached` arrives with this chat's history.
 fn attach_to_session(ctx: &WsContext, selected_id: String) {
-    close_mcp_view(ctx);
+    close_main_view(ctx);
     if ctx.chat_id.get_untracked().as_deref() == Some(selected_id.as_str()) {
         return;
     }
@@ -1785,7 +1850,7 @@ fn handle_session_cleared(ctx: &WsContext, chat_id: String) {
 /// brand-new chat. Used by the "New chat" header action — not by delete,
 /// which switches to a remaining session instead of minting a replacement.
 fn start_new_chat(ctx: &WsContext) {
-    close_mcp_view(ctx);
+    close_main_view(ctx);
     reset_local_transcript(ctx);
     ctx.pending_attach.set(None);
 
@@ -1871,6 +1936,23 @@ fn ChatLauncher(on_open: impl Fn() + 'static + Copy) -> impl IntoView {
     }
 }
 
+/// Full-widget loading indicator shown while the gateway's login policy
+/// (`GET /v1/auth/config`) is being fetched, so the user sees progress
+/// rather than an empty panel.
+#[component]
+fn ChatLoading() -> impl IntoView {
+    view! {
+        <div
+            role="status"
+            aria-live="polite"
+            class="flex min-h-screen flex-col items-center justify-center gap-3 text-slate-600"
+        >
+            <div class="h-8 w-8 animate-spin rounded-full border-4 border-slate-200 border-t-slate-900"></div>
+            <div>"Connecting…"</div>
+        </div>
+    }
+}
+
 #[component]
 pub fn App() -> impl IntoView {
     let hash_token = consume_hash_token();
@@ -1951,7 +2033,11 @@ pub fn App() -> impl IntoView {
     let session_usage = RwSignal::new(None::<SessionTokenUsage>);
     let skills = RwSignal::new(Vec::<SkillSummary>::new());
     let tools = RwSignal::new(Vec::<ToolSummary>::new());
-    let mcp_view_open = RwSignal::new(false);
+    let main_view = RwSignal::new(MainView::Chat);
+    let subagent_agents = RwSignal::new(Vec::<AcpAgentSummary>::new());
+    let spawn_tasks = RwSignal::new(Vec::<SpawnTaskSummary>::new());
+    let subagents_acp_enabled = RwSignal::new(false);
+    let subagents_loaded = RwSignal::new(false);
     let mcp_presets = RwSignal::new(Vec::<McpPresetSummary>::new());
     let mcp_custom = RwSignal::new(Vec::<McpCustomServerSummary>::new());
     let mcp_loaded = RwSignal::new(false);
@@ -1990,7 +2076,7 @@ pub fn App() -> impl IntoView {
         session_usage,
         skills,
         tools,
-        mcp_view_open,
+        main_view,
         mcp_presets,
         mcp_custom,
         mcp_loaded,
@@ -1998,6 +2084,10 @@ pub fn App() -> impl IntoView {
         mcp_busy,
         mcp_row_error,
         mcp_changed,
+        subagent_agents,
+        spawn_tasks,
+        subagents_acp_enabled,
+        subagents_loaded,
         summary_popup,
         workspace_popup,
         pending_approval,
@@ -2080,7 +2170,7 @@ pub fn App() -> impl IntoView {
         if require_login.get_untracked() == Some(false) {
             // Guest-capable instance: there is no account to sign out of,
             // and tearing down the guest connection here would strand the
-            // user on a screen `show_login`'s gate below will never show
+            // user on a screen `current_view`'s gate below will never show
             // for this instance. Treat "Sign out" as "close the chat"
             // instead — the connection stays up in the background.
             chat_open.set(false);
@@ -2117,7 +2207,7 @@ pub fn App() -> impl IntoView {
         session_usage.set(None);
         skills.set(Vec::new());
         tools.set(Vec::new());
-        close_mcp_view(&ws_context);
+        close_main_view(&ws_context);
         mcp_changed.set(Vec::new());
         summary_popup.set(None);
         workspace_popup.set(None);
@@ -2253,6 +2343,8 @@ pub fn App() -> impl IntoView {
     let on_open_tools = move || request_tools_list(&ws_context);
     let on_open_mcps = move || open_mcp_view(&ws_context);
     let on_refresh_mcps = move || refresh_mcp_view(&ws_context);
+    let on_open_subagents = move || open_subagents_view(&ws_context);
+    let on_refresh_subagents = move || refresh_subagents_view(&ws_context);
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {
         request_set_mcp_preset(&ws_context, name, enabled, fields);
     };
@@ -2264,14 +2356,12 @@ pub fn App() -> impl IntoView {
     // between rounds.
     let pending = Signal::derive(move || active_turn_id.get().is_some());
 
-    // Show `LoginForm` unless the user already has a session, or this
-    // gateway is known to allow guest use. While the auth-config fetch is
-    // still in flight (`require_login` is `None`), this defaults to
-    // requiring login — the same fail-closed default `do_logout`/the fetch's
-    // own error handler use — so a guest-capable instance shows `LoginForm`
-    // only briefly, if at all, rather than a guest-only instance ever
-    // skipping it by mistake.
-    let show_login = move || token.get().is_none() && require_login.get() != Some(false);
+    // Which screen to show: chat for a session or guest-capable gateway,
+    // `LoginForm` when login is required, and a loading indicator while the
+    // auth-config fetch is still in flight (`require_login` is `None`). A
+    // failed fetch resolves to `Some(true)` — the same fail-closed default
+    // `do_logout` uses — so the loading state never outlives the request.
+    let current_view = move || startup_view(token.get().is_some(), require_login.get());
 
     view! {
         <Show
@@ -2279,15 +2369,20 @@ pub fn App() -> impl IntoView {
             fallback=move || view! { <ChatLauncher on_open=open_chat /> }
         >
             <Show
-                when=move || !show_login()
+                when=move || current_view() == StartupView::Chat
                 fallback=move || {
                     view! {
-                        <LoginForm
-                            error=Signal::derive(move || login_error.get())
-                            pending=Signal::derive(move || login_pending.get())
-                            on_submit=do_login
-                            on_minimize=close_chat
-                        />
+                        <Show
+                            when=move || current_view() == StartupView::Login
+                            fallback=|| view! { <ChatLoading /> }
+                        >
+                            <LoginForm
+                                error=Signal::derive(move || login_error.get())
+                                pending=Signal::derive(move || login_pending.get())
+                                on_submit=do_login
+                                on_minimize=close_chat
+                            />
+                        </Show>
                     }
                 }
             >
@@ -2348,7 +2443,14 @@ pub fn App() -> impl IntoView {
                     tools=Signal::derive(move || tools.get())
                     on_open_tools=on_open_tools
                     show_mcps=token.get_untracked().is_some()
-                    mcp_view_open=Signal::derive(move || mcp_view_open.get())
+                    main_view=Signal::derive(move || main_view.get())
+                    show_subagents=token.get_untracked().is_some()
+                    subagent_agents=Signal::derive(move || subagent_agents.get())
+                    spawn_tasks=Signal::derive(move || spawn_tasks.get())
+                    subagents_acp_enabled=Signal::derive(move || subagents_acp_enabled.get())
+                    subagents_loaded=Signal::derive(move || subagents_loaded.get())
+                    on_open_subagents=on_open_subagents
+                    on_refresh_subagents=on_refresh_subagents
                     mcp_presets=Signal::derive(move || mcp_presets.get())
                     mcp_custom=Signal::derive(move || mcp_custom.get())
                     mcp_loaded=Signal::derive(move || mcp_loaded.get())

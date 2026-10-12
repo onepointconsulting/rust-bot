@@ -118,7 +118,9 @@ fn confine_outbound_media_with_limit(
 
     let mut confined = Vec::new();
     for path in paths {
-        if let Some(saved) = confine_one(path, &dest_dir, &canonical_root, max_file_bytes) { confined.push(saved) }
+        if let Some(saved) = confine_one(path, &dest_dir, &canonical_root, max_file_bytes) {
+            confined.push(saved)
+        }
     }
     confined
 }
@@ -594,6 +596,8 @@ mod tests {
             runtime_resolver: crate::agent::model_runtime::ModelRuntimeResolver::for_tests(),
             default_agent_mode: crate::agent::modes::AgentMode::Standard,
             tool_registry: None,
+            acp_manager: None,
+            subagents: None,
         }
     }
 

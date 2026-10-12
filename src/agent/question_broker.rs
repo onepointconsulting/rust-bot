@@ -147,8 +147,11 @@ mod tests {
     #[tokio::test]
     async fn resolve_delivers_matching_option_id() {
         let broker = QuestionBroker::new();
-        let (request_id, rx) =
-            broker.register("chat-1", "Which?".to_string(), vec![choice("0"), choice("1")]);
+        let (request_id, rx) = broker.register(
+            "chat-1",
+            "Which?".to_string(),
+            vec![choice("0"), choice("1")],
+        );
         broker
             .resolve("chat-1", &request_id, Some("1".to_string()), None, false)
             .unwrap();
@@ -180,7 +183,9 @@ mod tests {
     async fn resolve_with_no_answer_delivers_empty_answer() {
         let broker = QuestionBroker::new();
         let (request_id, rx) = broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
-        broker.resolve("chat-1", &request_id, None, None, false).unwrap();
+        broker
+            .resolve("chat-1", &request_id, None, None, false)
+            .unwrap();
         assert_eq!(rx.await.unwrap(), QuestionAnswer::default());
     }
 
@@ -188,7 +193,9 @@ mod tests {
     async fn resolve_delivers_chat_about() {
         let broker = QuestionBroker::new();
         let (request_id, rx) = broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
-        broker.resolve("chat-1", &request_id, None, None, true).unwrap();
+        broker
+            .resolve("chat-1", &request_id, None, None, true)
+            .unwrap();
         assert!(rx.await.unwrap().chat_about);
     }
 
@@ -204,8 +211,7 @@ mod tests {
     #[test]
     fn resolve_rejects_other_chat_and_keeps_request() {
         let broker = QuestionBroker::new();
-        let (request_id, _rx) =
-            broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
+        let (request_id, _rx) = broker.register("chat-1", "Which?".to_string(), vec![choice("0")]);
         assert_eq!(
             broker.resolve("chat-2", &request_id, Some("0".to_string()), None, false),
             Err(ResolveError::ChatMismatch)

@@ -25,6 +25,27 @@ use crate::protocol::{QuestionChoice, ToolApprovalCall};
 /// arbitrary `http(s)://` reference — see [`authorize_media_attachments`].
 const GATEWAY_MEDIA_URL_PREFIX: &str = "/v1/media/";
 
+/// What fills the main area next to the sidebar: the chat, or one of the list pages.
+/// One value instead of a flag per page, so two pages can never be open at once.
+/// Never persisted: every page load starts on [`MainView::Chat`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MainView {
+    /// The conversation (the default).
+    #[default]
+    Chat,
+    /// The MCP server list.
+    Mcps,
+    /// The child agents and spawn tasks list.
+    Subagents,
+}
+
+impl MainView {
+    /// Whether the chat itself is showing.
+    pub fn is_chat(self) -> bool {
+        self == MainView::Chat
+    }
+}
+
 /// Swap in `updated` for the preset of the same name in `presets`. Does nothing when
 /// the list does not hold it (it was closed or refreshed in the meantime).
 pub fn replace_mcp_preset(presets: &mut [McpPresetSummary], updated: McpPresetSummary) {
@@ -541,6 +562,31 @@ impl ConnectionStatus {
     }
 }
 
+/// Which top-level screen the open chat widget shows on startup.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StartupView {
+    /// No session yet and the gateway's login policy (`GET /v1/auth/config`)
+    /// is still unknown — show a loading indicator instead of a blank page
+    /// or a login form that might be replaced a moment later.
+    Loading,
+    /// Login is required and the user has no session.
+    Login,
+    /// The user has a session, or the gateway allows guest use.
+    Chat,
+}
+
+/// Decides the [`StartupView`] from whether a session token exists and the
+/// gateway's `requireLogin` policy (`None` while the fetch is in flight).
+/// A failed fetch is recorded by `app.rs` as `Some(true)` (fail closed), so
+/// `Loading` never lasts past the request.
+pub fn startup_view(has_token: bool, require_login: Option<bool>) -> StartupView {
+    match (has_token, require_login) {
+        (true, _) | (false, Some(false)) => StartupView::Chat,
+        (false, Some(true)) => StartupView::Login,
+        (false, None) => StartupView::Loading,
+    }
+}
+
 /// Maximum automatic reconnect attempts before giving up and surfacing a
 /// manual "Retry" affordance, per the 0-indexed `attempt` convention shared
 /// with [`compute_backoff_delay_ms`].
@@ -740,7 +786,10 @@ impl PendingApproval {
     }
 
     pub fn all_ids(&self) -> Vec<String> {
-        self.calls.iter().map(|entry| entry.call.id.clone()).collect()
+        self.calls
+            .iter()
+            .map(|entry| entry.call.id.clone())
+            .collect()
     }
 }
 
@@ -782,6 +831,18 @@ mod tests {
             note: String::new(),
             fields: Vec::new(),
         }
+    }
+
+    #[test]
+    fn main_view_starts_on_the_chat() {
+        assert_eq!(MainView::default(), MainView::Chat);
+        assert!(MainView::default().is_chat());
+    }
+
+    #[test]
+    fn main_view_list_pages_are_not_the_chat() {
+        assert!(!MainView::Mcps.is_chat());
+        assert!(!MainView::Subagents.is_chat());
     }
 
     #[test]
@@ -857,7 +918,10 @@ mod tests {
         );
         assert_eq!(pending.request_id, "req-1");
         assert_eq!(pending.question, "Which one?");
-        assert_eq!(pending.options, vec![question_choice("0"), question_choice("1")]);
+        assert_eq!(
+            pending.options,
+            vec![question_choice("0"), question_choice("1")]
+        );
     }
 
     use chat_ui::models::{ImageAttachment, Role};
@@ -1747,6 +1811,16 @@ mod tests {
             ConnectionStatus::Disconnected.dot_modifier_class(),
             "connection-dot--disconnected"
         );
+    }
+
+    #[test]
+    fn startup_view_covers_token_and_policy_combinations() {
+        assert_eq!(startup_view(true, None), StartupView::Chat);
+        assert_eq!(startup_view(true, Some(true)), StartupView::Chat);
+        assert_eq!(startup_view(true, Some(false)), StartupView::Chat);
+        assert_eq!(startup_view(false, Some(false)), StartupView::Chat);
+        assert_eq!(startup_view(false, Some(true)), StartupView::Login);
+        assert_eq!(startup_view(false, None), StartupView::Loading);
     }
 
     #[test]

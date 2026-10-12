@@ -23,11 +23,16 @@ use regex::Regex;
 use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
 use uuid::Uuid;
 
+use crate::agent::acp::listing::{AcpAgentSummary, list_acp_rows, summarize_acp_rows};
+use crate::agent::acp::manager::AcpManager;
 use crate::agent::agent_loop::AgentLoop;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::question_broker::{QuestionChoice, ResolveError};
 use crate::agent::skills::SkillsLoader;
+use crate::agent::subagent::{
+    SpawnTaskSummary, SubagentManager, SubagentRecord, summarize_spawn_records,
+};
 use crate::agent::tool_approval::ToolApprovalCall;
 use crate::agent::tools::mcp::mcp_presets_api::{
     self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
@@ -654,6 +659,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SetMcpPreset => {
             handle_set_mcp_preset(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListSubagents => {
+            handle_list_subagents(envelope_dispatch_context).await;
         }
         EnvelopeType::SetModelPreset => {
             handle_envelope_set_model_preset(envelope_dispatch_context).await;
@@ -2444,20 +2452,7 @@ async fn handle_envelope_list_chats<'a>(envelope_dispatch_context: EnvelopeDispa
     let connection_id = envelope_dispatch_context.connection_id;
     let client_id = envelope_dispatch_context.client_id;
 
-    let sessions = {
-        // Scoped so the (synchronous) `MutexGuard` is dropped before
-        // `send_event`'s `.await` below — same discipline as every other
-        // `session_manager` use in this file.
-        let session_manager = shared
-            .session_manager
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        session_manager.list_sessions()
-    };
-    let mut chats = list_websocket_chats(sessions);
-    if !shared.require_auth {
-        chats = scope_chats_to_owner(chats, client_id);
-    }
+    let mut chats = visible_websocket_chats(shared, client_id);
     strip_owner_client_id(&mut chats);
     send_event(
         shared,
@@ -2545,6 +2540,123 @@ fn mcp_presets_overview_for_config(config: &Config) -> Result<McpPresetsOverview
         &presets,
         &config.tools.mcp_servers,
     ))
+}
+
+/// The `websocket:*` chats `client_id` may see, with their internal `owner_client_id`
+/// still attached. When the gateway requires auth, every authenticated connection sees
+/// every chat; otherwise a connection sees only the chats it owns (guest isolation,
+/// failing closed for chats with no owner). `list_chats` and the sub-agent listing both
+/// use this, so they always agree on what "your chats" means.
+fn visible_websocket_chats(shared: &WsShared, client_id: &str) -> Vec<serde_json::Value> {
+    let sessions = {
+        // Scoped so the (synchronous) `MutexGuard` is dropped before any `.await`
+        // — same discipline as every other `session_manager` use in this file.
+        let session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.list_sessions()
+    };
+    let chats = list_websocket_chats(sessions);
+    if shared.require_auth {
+        chats
+    } else {
+        scope_chats_to_owner(chats, client_id)
+    }
+}
+
+/// Keep only the spawn tasks that belong to one of `visible_chats` (entries as returned
+/// by [`visible_websocket_chats`]). A task from any other session — the CLI, another
+/// channel, a chat this connection may not see — or with no session at all is dropped:
+/// a task summary can hold private text from someone else's chat.
+fn scope_spawn_records_to_chats(
+    records: Vec<SubagentRecord>,
+    visible_chats: &[serde_json::Value],
+) -> Vec<SubagentRecord> {
+    let visible_session_keys: HashSet<String> = visible_chats
+        .iter()
+        .filter_map(|chat| chat.get("chat_id")?.as_str())
+        .map(get_session_id)
+        .collect();
+    records
+        .into_iter()
+        .filter(|record| {
+            record
+                .session_key
+                .as_ref()
+                .is_some_and(|key| visible_session_keys.contains(key))
+        })
+        .collect()
+}
+
+/// The `subagents` event payload: the ACP section (`enabled` is false when ACP is off
+/// here) and the spawn-task section.
+fn subagents_payload(
+    acp: Option<Vec<AcpAgentSummary>>,
+    tasks: Vec<SpawnTaskSummary>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "acp": {"enabled": acp.is_some(), "agents": acp.unwrap_or_default()},
+        "spawn": {"tasks": tasks},
+    })
+}
+
+/// Read the durable child agents and which of them this process is running. The
+/// session index is read under a lock file, so the work runs off the async threads.
+async fn load_acp_agents(manager: Arc<AcpManager>) -> Vec<AcpAgentSummary> {
+    tokio::task::spawn_blocking(move || {
+        let rows = list_acp_rows(manager.store(), manager.index(), |name| {
+            manager.is_busy(name)
+        });
+        summarize_acp_rows(&rows, chrono::Utc::now())
+    })
+    .await
+    .unwrap_or_else(|e| {
+        log::error!("reading the child agents failed: {e}");
+        Vec::new()
+    })
+}
+
+/// Handle a `list_subagents` envelope: reply with a `subagents` event carrying the
+/// durable ACP child agents and the spawn tasks of this process, as `/subagents` shows
+/// them. Authenticated connections only: an anonymous connection gets `access_denied`
+/// and nothing is read. Spawn tasks are limited to the chats this connection may see
+/// (see [`scope_spawn_records_to_chats`]); child agents are process-wide definitions,
+/// so every authenticated connection sees all of them. "Running here" only reflects
+/// runs started by this gateway process. Rust-side addition with no nanobot precedent.
+async fn handle_list_subagents<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let acp = match &shared.acp_manager {
+        Some(manager) => Some(load_acp_agents(Arc::clone(manager)).await),
+        None => None,
+    };
+    let records = shared
+        .subagents
+        .as_ref()
+        .map(|subagents| subagents.list())
+        .unwrap_or_default();
+    let records =
+        scope_spawn_records_to_chats(records, &visible_websocket_chats(shared, client_id));
+    let tasks = summarize_spawn_records(&records, chrono::Utc::now());
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Subagents,
+        None,
+        subagents_payload(acp, tasks),
+    )
+    .await;
 }
 
 /// Handle a `list_mcp_presets` envelope: reply with an `mcp_presets` event carrying
@@ -4141,6 +4253,11 @@ pub struct WebSocketChannel {
     /// Same `Arc` as `AgentLoop::tools`, cloned into every [`WsShared`]
     /// snapshot — see [`Self::shared`]. `None` until set by the gateway.
     pub(crate) tool_registry: Option<Arc<StdMutex<ToolRegistry>>>,
+    /// Same `Arc` as the agent loop's ACP manager, cloned into every [`WsShared`]
+    /// snapshot. `None` when ACP is disabled or not wired in.
+    pub(crate) acp_manager: Option<Arc<AcpManager>>,
+    /// Same `Arc` as `AgentLoop::subagents`, cloned into every [`WsShared`] snapshot.
+    pub(crate) subagents: Option<Arc<SubagentManager>>,
     /// Filesystem root [`serve_media`] confines keys to. Captured at
     /// construction (`get_media_dir(None)`) so tests can point it at a
     /// tempdir the same way they override `gateway_services`.
@@ -4184,6 +4301,8 @@ impl WebSocketChannel {
             runtime_resolver,
             default_agent_mode: AgentMode::Standard,
             tool_registry: None,
+            acp_manager: None,
+            subagents: None,
             media_root: get_media_dir(None),
         }
     }
@@ -4299,6 +4418,8 @@ impl WebSocketChannel {
             runtime_resolver: Arc::clone(&self.runtime_resolver),
             default_agent_mode: self.default_agent_mode,
             tool_registry: self.tool_registry.clone(),
+            acp_manager: self.acp_manager.clone(),
+            subagents: self.subagents.clone(),
         }
     }
 
@@ -5170,6 +5291,8 @@ mod tests {
             runtime_resolver: ModelRuntimeResolver::for_tests(),
             default_agent_mode: AgentMode::Standard,
             tool_registry: None,
+            acp_manager: None,
+            subagents: None,
         }
     }
 
@@ -8006,6 +8129,173 @@ mod tests {
             .expect("expected an error frame");
         assert_eq!(body["event"], "mcp_preset_error");
         assert_eq!(body["detail"], "access_denied");
+    }
+
+    fn spawn_record(task_id: &str, session_key: Option<&str>) -> SubagentRecord {
+        SubagentRecord {
+            task_id: task_id.to_string(),
+            label: format!("label-{task_id}"),
+            task_summary: format!("summary-{task_id}"),
+            session_key: session_key.map(str::to_string),
+            channel: "websocket".to_string(),
+            chat_id: "x".to_string(),
+            spawned_at: chrono::Utc::now(),
+            finished_at: None,
+            status: crate::agent::subagent::SubagentStatus::Running,
+        }
+    }
+
+    fn chat_entry(chat_id: &str) -> serde_json::Value {
+        serde_json::json!({"chat_id": chat_id})
+    }
+
+    #[test]
+    fn scope_spawn_records_to_chats_keeps_only_tasks_of_visible_chats() {
+        let records = vec![
+            spawn_record("mine", Some("websocket:chat-a")),
+            spawn_record("theirs", Some("websocket:chat-b")),
+            spawn_record("from-cli", Some("cli:direct")),
+            spawn_record("no-session", None),
+        ];
+
+        let kept = scope_spawn_records_to_chats(records, &[chat_entry("chat-a")]);
+
+        let ids: Vec<&str> = kept.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["mine"]);
+    }
+
+    #[test]
+    fn scope_spawn_records_to_chats_keeps_the_given_order() {
+        let records = vec![
+            spawn_record("first", Some("websocket:chat-a")),
+            spawn_record("second", Some("websocket:chat-a")),
+        ];
+        let kept = scope_spawn_records_to_chats(records, &[chat_entry("chat-a")]);
+        let ids: Vec<&str> = kept.iter().map(|r| r.task_id.as_str()).collect();
+        assert_eq!(ids, vec!["first", "second"]);
+    }
+
+    #[test]
+    fn scope_spawn_records_to_chats_with_no_visible_chats_keeps_nothing() {
+        let records = vec![spawn_record("t", Some("websocket:chat-a"))];
+        assert!(scope_spawn_records_to_chats(records, &[]).is_empty());
+    }
+
+    fn visible_chat_ids(chats: &[serde_json::Value]) -> Vec<String> {
+        let mut ids: Vec<String> = chats
+            .iter()
+            .filter_map(|chat| chat["chat_id"].as_str().map(str::to_string))
+            .collect();
+        ids.sort();
+        ids
+    }
+
+    #[test]
+    fn visible_websocket_chats_scopes_to_the_owner_when_auth_is_not_required() {
+        let mut shared = test_shared("browser");
+        shared.require_auth = false;
+        let mine = Uuid::new_v4().to_string();
+        let theirs = Uuid::new_v4().to_string();
+        let unowned = Uuid::new_v4().to_string();
+        save_session_with_owner(&shared, &mine, Some("client-1"));
+        save_session_with_owner(&shared, &theirs, Some("client-2"));
+        save_session_with_owner(&shared, &unowned, None);
+
+        let chats = visible_websocket_chats(&shared, "client-1");
+
+        assert_eq!(visible_chat_ids(&chats), vec![mine]);
+    }
+
+    #[test]
+    fn visible_websocket_chats_shows_every_chat_when_auth_is_required() {
+        let shared = test_shared("browser");
+        assert!(shared.require_auth);
+        let a = Uuid::new_v4().to_string();
+        let b = Uuid::new_v4().to_string();
+        save_session_with_owner(&shared, &a, Some("client-1"));
+        save_session_with_owner(&shared, &b, Some("client-2"));
+
+        let chats = visible_websocket_chats(&shared, "client-1");
+
+        let mut expected = vec![a, b];
+        expected.sort();
+        assert_eq!(visible_chat_ids(&chats), expected);
+    }
+
+    #[test]
+    fn subagents_payload_marks_acp_enabled_only_when_listed() {
+        let off = subagents_payload(None, Vec::new());
+        assert_eq!(off["acp"]["enabled"], false);
+        assert_eq!(off["acp"]["agents"], serde_json::json!([]));
+        assert_eq!(off["spawn"]["tasks"], serde_json::json!([]));
+
+        let on = subagents_payload(Some(Vec::new()), Vec::new());
+        assert_eq!(on["acp"]["enabled"], true);
+    }
+
+    #[test]
+    fn subagents_payload_carries_the_spawn_tasks() {
+        let tasks = summarize_spawn_records(
+            &[spawn_record("t1", Some("websocket:chat-a"))],
+            chrono::Utc::now(),
+        );
+        let payload = subagents_payload(None, tasks);
+        assert_eq!(payload["spawn"]["tasks"][0]["task_id"], "t1");
+        assert_eq!(payload["spawn"]["tasks"][0]["status"], "running");
+        assert_eq!(
+            payload["spawn"]["tasks"][0]["session_key"],
+            "websocket:chat-a"
+        );
+    }
+
+    async fn dispatch_list_subagents(
+        shared: &WsShared,
+        auth: &AuthorizeResult,
+    ) -> Option<serde_json::Value> {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("list_subagents"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("203.0.113.5"),
+            auth,
+        };
+        dispatch_envelope(ctx).await;
+        rx.try_recv()
+            .ok()
+            .map(|frame| serde_json::from_str(&frame.into_text().unwrap()).unwrap())
+    }
+
+    #[tokio::test]
+    async fn list_subagents_denies_anonymous_connections() {
+        let shared = test_shared("browser");
+        let body = dispatch_list_subagents(&shared, &AuthorizeResult::UNAUTHENTICATED)
+            .await
+            .expect("expected an error frame");
+        assert_eq!(body["event"], "error");
+        assert_eq!(body["detail"], "access_denied");
+        assert!(body.get("acp").is_none());
+    }
+
+    #[tokio::test]
+    async fn list_subagents_works_for_authenticated_remote_connections_and_reports_acp_off() {
+        // Reading is allowed from anywhere once signed in (unlike changing MCP settings).
+        let shared = test_shared("browser");
+        let body = dispatch_list_subagents(&shared, &authenticated())
+            .await
+            .expect("expected a subagents frame");
+        assert_eq!(body["event"], "subagents");
+        assert_eq!(body["acp"]["enabled"], false);
+        assert_eq!(body["acp"]["agents"], serde_json::json!([]));
+        assert_eq!(body["spawn"]["tasks"], serde_json::json!([]));
     }
 
     #[test]

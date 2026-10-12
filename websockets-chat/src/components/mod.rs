@@ -1,8 +1,10 @@
 mod ask_question;
 mod chat_shell;
+mod list_page;
 mod mcp_presets_page;
 mod message_list;
 mod reasoning_panel;
+mod subagents_page;
 mod tool_activity;
 mod tool_approval;
 
@@ -11,5 +13,6 @@ pub use chat_shell::ChatShell;
 pub use mcp_presets_page::{McpChangeRequest, McpPresetsPage};
 pub use message_list::MessageList;
 pub use reasoning_panel::ReasoningPanel;
+pub use subagents_page::SubagentsPage;
 pub use tool_activity::ToolActivity;
 pub use tool_approval::ToolApprovalCard;

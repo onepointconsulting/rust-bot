@@ -389,6 +389,9 @@ mod tests {
     fn deny_path_can_be_repeated() {
         let args =
             AcpArgs::try_parse_from(["acp", "--deny-path", "/a", "--deny-path", "/b"]).unwrap();
-        assert_eq!(args.deny_path, vec![PathBuf::from("/a"), PathBuf::from("/b")]);
+        assert_eq!(
+            args.deny_path,
+            vec![PathBuf::from("/a"), PathBuf::from("/b")]
+        );
     }
 }

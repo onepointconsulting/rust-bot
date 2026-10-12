@@ -37,7 +37,6 @@ pub struct ProviderConfig {
     pub extra_headers: Option<HashMap<String, String>>,
 }
 
-
 // ── ChannelsConfig ────────────────────────────────────────────────────────────
 
 fn default_send_progress() -> bool {
@@ -570,7 +569,6 @@ pub struct ProvidersConfig {
     #[garde(dive)]
     pub groq: ProviderConfig,
 }
-
 
 impl ProvidersConfig {
     /// Return the [`ProviderConfig`] for the given provider name (e.g. `"openai"`).
@@ -1617,10 +1615,7 @@ pub struct AcpConfig {
     pub allow_dynamic_agents: bool,
 
     /// Seconds one child turn may take before it is cancelled.
-    #[serde(
-        alias = "default_timeout_secs",
-        default = "default_acp_timeout_secs"
-    )]
+    #[serde(alias = "default_timeout_secs", default = "default_acp_timeout_secs")]
     #[garde(range(min = 1))]
     pub default_timeout_secs: u64,
 
@@ -1872,15 +1867,18 @@ impl Config {
         let (p, name) = self.match_provider(model);
 
         if let Some(p) = p
-            && p.api_base.is_some() {
-                return p.api_base.clone();
-            }
+            && p.api_base.is_some()
+        {
+            return p.api_base.clone();
+        }
 
         if let Some(name) = name
             && let Some(spec) = crate::providers::registry::find_by_name(&name)
-                && (spec.is_gateway || spec.is_local) && spec.default_api_base.is_some() {
-                    return spec.default_api_base;
-                }
+            && (spec.is_gateway || spec.is_local)
+            && spec.default_api_base.is_some()
+        {
+            return spec.default_api_base;
+        }
 
         None
     }
@@ -1934,21 +1932,25 @@ pub fn validate_model_presets(config: &Config) -> Result<(), String> {
     }
 
     if let Some(selected) = &config.agents.model_preset
-        && selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
-            return Err(format!(
-                "agents.modelPreset references unknown preset '{selected}'; known presets: {:?}",
-                config.model_presets.keys().collect::<Vec<_>>()
-            ));
-        }
+        && selected != RESERVED_MODEL_PRESET_NAME
+        && !config.model_presets.contains_key(selected)
+    {
+        return Err(format!(
+            "agents.modelPreset references unknown preset '{selected}'; known presets: {:?}",
+            config.model_presets.keys().collect::<Vec<_>>()
+        ));
+    }
 
     if let Some(selected) = &config.agents.dream.dream_model_preset
-        && selected != RESERVED_MODEL_PRESET_NAME && !config.model_presets.contains_key(selected) {
-            return Err(format!(
-                "agents.dream.dreamModelPreset references unknown preset '{selected}'; \
+        && selected != RESERVED_MODEL_PRESET_NAME
+        && !config.model_presets.contains_key(selected)
+    {
+        return Err(format!(
+            "agents.dream.dreamModelPreset references unknown preset '{selected}'; \
                  known presets: {:?}",
-                config.model_presets.keys().collect::<Vec<_>>()
-            ));
-        }
+            config.model_presets.keys().collect::<Vec<_>>()
+        ));
+    }
 
     Ok(())
 }

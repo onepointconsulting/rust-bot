@@ -46,7 +46,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     // The token is persisted to token_cache.json (next to the client secret file)
     // so you only log in once.
     let token_cache_path = token_cache_path_for(Path::new(secret_path));
-    println!("Token cache will be written to {}", token_cache_path.display());
+    println!(
+        "Token cache will be written to {}",
+        token_cache_path.display()
+    );
     let auth = InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
         .persist_tokens_to_disk(token_cache_path)
         .build()

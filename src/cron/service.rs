@@ -127,9 +127,10 @@ pub fn validate_schedule_for_add(schedule: &CronSchedule) -> Result<(), String> 
 
     if schedule.kind == CronScheduleKind::Cron
         && let Some(tz) = schedule.tz.as_deref()
-            && let Some(msg) = validate_timezone(tz) {
-                return Err(msg.trim_start_matches("Error: ").to_string());
-            }
+        && let Some(msg) = validate_timezone(tz)
+    {
+        return Err(msg.trim_start_matches("Error: ").to_string());
+    }
 
     Ok(())
 }

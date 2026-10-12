@@ -223,7 +223,11 @@ impl PickerState {
             let selected = i == self.cursor;
             let prefix = row_prefix(i + 1, number_width, selected);
             for (j, part) in wrap(&choice.label, body_width).into_iter().enumerate() {
-                let head = if j == 0 { prefix.clone() } else { " ".repeat(indent) };
+                let head = if j == 0 {
+                    prefix.clone()
+                } else {
+                    " ".repeat(indent)
+                };
                 let text = if selected {
                     part.cyan().bold().to_string()
                 } else {
@@ -257,7 +261,11 @@ impl PickerState {
             parts
         };
         for (j, part) in field.into_iter().enumerate() {
-            let head = if j == 0 { prefix.clone() } else { " ".repeat(indent) };
+            let head = if j == 0 {
+                prefix.clone()
+            } else {
+                " ".repeat(indent)
+            };
             lines.push(format!("{head}{part}"));
         }
 

@@ -6,6 +6,7 @@ use std::{
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::{
     agent::{
@@ -91,6 +92,43 @@ fn truncate_chars(text: &str, max_chars: usize) -> String {
     } else {
         text.to_string()
     }
+}
+
+/// One spawn task as sent to the WebUI: the same facts [`format_subagents_list`] prints,
+/// with the times both raw (RFC 3339) and as relative text ("5m ago").
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct SpawnTaskSummary {
+    pub task_id: String,
+    pub label: String,
+    pub task_summary: String,
+    /// [`SubagentStatus::as_str`]: `running`, `completed`, `partial`, `failed`, `cancelled`.
+    pub status: String,
+    pub session_key: Option<String>,
+    pub spawned_at: String,
+    pub spawned_ago: String,
+    pub finished_at: Option<String>,
+    pub finished_ago: Option<String>,
+}
+
+/// Convert `records` to their WebUI form, in the given order, with times relative to `now`.
+pub fn summarize_spawn_records(
+    records: &[SubagentRecord],
+    now: DateTime<Utc>,
+) -> Vec<SpawnTaskSummary> {
+    records
+        .iter()
+        .map(|record| SpawnTaskSummary {
+            task_id: record.task_id.clone(),
+            label: record.label.clone(),
+            task_summary: record.task_summary.clone(),
+            status: record.status.as_str().to_string(),
+            session_key: record.session_key.clone(),
+            spawned_at: record.spawned_at.to_rfc3339(),
+            spawned_ago: format_relative_time(now, record.spawned_at),
+            finished_at: record.finished_at.map(|at| at.to_rfc3339()),
+            finished_ago: record.finished_at.map(|at| format_relative_time(now, at)),
+        })
+        .collect()
 }
 
 /// Render `records` as the "Spawn tasks" section of `/subagents`. Rows of
@@ -1380,7 +1418,7 @@ mod tests {
 
     use super::{
         MAX_FINISHED_RECORDS, SubagentRecord, SubagentStatus, format_subagents_list,
-        format_subagents_list_at, truncate_chars,
+        format_subagents_list_at, summarize_spawn_records, truncate_chars,
     };
     use chrono::{DateTime, Duration, Utc};
 
@@ -1412,6 +1450,41 @@ mod tests {
             finished_at: None,
             status,
         }
+    }
+
+    #[test]
+    fn summarize_spawn_records_carries_the_listing_facts_with_relative_times() {
+        let now: DateTime<Utc> = "2026-10-10T10:00:00+00:00".parse().unwrap();
+        let spawned = now - chrono::Duration::minutes(5);
+        let mut finished = record_at(
+            "t2",
+            Some("websocket:abc"),
+            SubagentStatus::Completed,
+            spawned,
+        );
+        finished.finished_at = Some(now - chrono::Duration::minutes(2));
+        let running = record_at("t1", None, SubagentStatus::Running, spawned);
+
+        let summaries = summarize_spawn_records(&[running, finished], now);
+
+        assert_eq!(summaries.len(), 2);
+        assert_eq!(summaries[0].task_id, "t1");
+        assert_eq!(summaries[0].status, "running");
+        assert_eq!(summaries[0].session_key, None);
+        assert_eq!(summaries[0].spawned_ago, "5m ago");
+        assert_eq!(summaries[0].finished_at, None);
+        assert_eq!(summaries[0].finished_ago, None);
+        assert_eq!(summaries[1].task_id, "t2");
+        assert_eq!(summaries[1].status, "completed");
+        assert_eq!(summaries[1].session_key.as_deref(), Some("websocket:abc"));
+        assert_eq!(summaries[1].label, "label-t2");
+        assert_eq!(summaries[1].task_summary, "summary-t2");
+        assert_eq!(summaries[1].finished_ago.as_deref(), Some("2m ago"));
+    }
+
+    #[test]
+    fn summarize_spawn_records_of_nothing_is_empty() {
+        assert!(summarize_spawn_records(&[], Utc::now()).is_empty());
     }
 
     /// Insert a record as `spawn()` does, then move it to `status` the way a

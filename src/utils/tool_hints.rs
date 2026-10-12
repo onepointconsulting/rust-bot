@@ -193,16 +193,18 @@ fn extract_arg(tc: &ToolCallRequest, key_args: &[&str]) -> Option<String> {
         if let Some(val) = val_option
             && val.is_string()
             && let Some(val_str) = val.as_str()
-                && !val_str.is_empty() {
-                    return Some(val_str.to_string());
-                }
+            && !val_str.is_empty()
+        {
+            return Some(val_str.to_string());
+        }
     }
     for val in args.values() {
         if val.is_string()
             && let Some(val_str) = val.as_str()
-                && !val_str.is_empty() {
-                    return Some(val_str.to_string());
-                }
+            && !val_str.is_empty()
+        {
+            return Some(val_str.to_string());
+        }
     }
     None
 }
@@ -216,9 +218,10 @@ fn get_args(tc: &ToolCallRequest) -> &HashMap<String, serde_json::Value> {
 fn first_string_arg(args: &HashMap<String, serde_json::Value>) -> Option<&str> {
     for val in args.values() {
         if let Some(s) = val.as_str()
-            && !s.is_empty() {
-                return Some(s);
-            }
+            && !s.is_empty()
+        {
+            return Some(s);
+        }
     }
     None
 }

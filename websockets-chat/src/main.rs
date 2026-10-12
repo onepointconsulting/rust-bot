@@ -24,5 +24,9 @@ fn main() {
         .expect("missing #rust-bot-chat")
         .unchecked_into::<HtmlElement>();
 
+    // Remove the static "Loading chat…" placeholder from index.html; `mount_to`
+    // appends rather than replaces, so it would otherwise stay visible.
+    el.set_inner_html("");
+
     mount_to(el, App).forget();
 }

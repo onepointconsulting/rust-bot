@@ -28,9 +28,7 @@ pub fn current_depth() -> u32 {
 
 /// The depth a [`DEPTH_ENV_VAR`] value stands for; anything unusable is `0`.
 fn depth_from(value: Option<&str>) -> u32 {
-    value
-        .and_then(|text| text.trim().parse().ok())
-        .unwrap_or(0)
+    value.and_then(|text| text.trim().parse().ok()).unwrap_or(0)
 }
 
 /// rust-bot's own settings plus `PATH`, which every child needs.

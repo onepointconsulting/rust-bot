@@ -79,14 +79,15 @@ pub fn should_show_cli_restart_notice(notice: RestartNotice, session_id: &str) -
 pub fn format_restart_completed_message(started_at_raw: &str) -> String {
     let mut elapsed_suffix = String::new();
     if !started_at_raw.is_empty()
-        && let Ok(started_at) = started_at_raw.parse::<f64>() {
-            let now = SystemTime::now()
-                .duration_since(UNIX_EPOCH)
-                .map(|d| d.as_secs_f64())
-                .unwrap_or(0.0);
-            let elapsed_s = (now - started_at).max(0.0);
-            elapsed_suffix = format!(" in {elapsed_s:.1}s");
-        }
+        && let Ok(started_at) = started_at_raw.parse::<f64>()
+    {
+        let now = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .map(|d| d.as_secs_f64())
+            .unwrap_or(0.0);
+        let elapsed_s = (now - started_at).max(0.0);
+        elapsed_suffix = format!(" in {elapsed_s:.1}s");
+    }
     format!("Restart completed{elapsed_suffix}.")
 }
 

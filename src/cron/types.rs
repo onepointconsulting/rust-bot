@@ -123,7 +123,6 @@ pub struct CronJobState {
     pub run_history: Vec<CronRunRecord>,
 }
 
-
 /// A scheduled job.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]

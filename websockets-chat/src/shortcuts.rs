@@ -11,7 +11,13 @@
 /// AltGr on Windows and can swallow typed characters on some keyboard
 /// layouts. `key` is `KeyboardEvent.key`, compared case-insensitively
 /// (Caps Lock reports `"B"`).
-pub fn is_sidebar_toggle_shortcut(ctrl: bool, meta: bool, alt: bool, shift: bool, key: &str) -> bool {
+pub fn is_sidebar_toggle_shortcut(
+    ctrl: bool,
+    meta: bool,
+    alt: bool,
+    shift: bool,
+    key: &str,
+) -> bool {
     (ctrl || meta) && !alt && !shift && key.eq_ignore_ascii_case("b")
 }
 
@@ -28,7 +34,10 @@ pub fn label_for_platform(platform: &str) -> &'static str {
 
 /// The shortcut label for the current browser (see [`label_for_platform`]).
 pub fn sidebar_shortcut_label() -> &'static str {
-    let platform = leptos::prelude::window().navigator().platform().unwrap_or_default();
+    let platform = leptos::prelude::window()
+        .navigator()
+        .platform()
+        .unwrap_or_default();
     label_for_platform(&platform)
 }
 

@@ -199,6 +199,64 @@ pub struct McpCustomServerSummary {
     pub transport: String,
 }
 
+/// One durable ACP child agent, as surfaced by the gateway's `subagents` event.
+///
+/// Mirrors the backend's `AcpAgentSummary` (`src/agent/acp/listing.rs`) — a plain
+/// re-declaration for the same reason as [`SkillSummary`]. The `*_ago` fields are
+/// relative text ("2d ago") computed by the gateway when it answered.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct AcpAgentSummary {
+    pub name: String,
+    #[serde(default)]
+    pub purpose: String,
+    #[serde(default)]
+    pub preset: String,
+    #[serde(default)]
+    pub depth: u32,
+    #[serde(default)]
+    pub cwd: Option<String>,
+    /// `running_here` / `idle` / `never_run` / `unknown`.
+    #[serde(default)]
+    pub state: String,
+    #[serde(default)]
+    pub state_label: String,
+    #[serde(default)]
+    pub created_at: String,
+    #[serde(default)]
+    pub created_ago: String,
+    #[serde(default)]
+    pub created_by: String,
+    #[serde(default)]
+    pub last_used: Option<String>,
+    #[serde(default)]
+    pub last_used_ago: Option<String>,
+}
+
+/// One spawn task of the gateway process, as surfaced by the `subagents` event.
+///
+/// Mirrors the backend's `SpawnTaskSummary` (`src/agent/subagent.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SpawnTaskSummary {
+    pub task_id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub task_summary: String,
+    /// `running` / `completed` / `partial` / `failed` / `cancelled`.
+    #[serde(default)]
+    pub status: String,
+    #[serde(default)]
+    pub session_key: Option<String>,
+    #[serde(default)]
+    pub spawned_at: String,
+    #[serde(default)]
+    pub spawned_ago: String,
+    #[serde(default)]
+    pub finished_at: Option<String>,
+    #[serde(default)]
+    pub finished_ago: Option<String>,
+}
+
 /// Current UTC time as RFC3339 (`Date.toISOString()`). Used to stamp live
 /// [`ChatEntry`]s in the browser; not called from host `#[test]`s, where
 /// `js_sys::Date` has no runtime.

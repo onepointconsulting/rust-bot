@@ -1,15 +1,16 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsStrip};
 use chat_ui::models::{
-    ChatEntry, McpCustomServerSummary, McpPresetSummary, OutgoingMessage, SessionListItem,
-    SessionSummaryPopup, SessionTokenUsage, SkillSummary, ToolSummary, WorkspaceDialogState,
+    AcpAgentSummary, ChatEntry, McpCustomServerSummary, McpPresetSummary, OutgoingMessage,
+    SessionListItem, SessionSummaryPopup, SessionTokenUsage, SkillSummary, SpawnTaskSummary,
+    ToolSummary, WorkspaceDialogState,
 };
 use leptos::prelude::*;
 
-use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
 use crate::components::{
-    AskQuestionCard, McpChangeRequest, McpPresetsPage, MessageList, ToolApprovalCard,
+    AskQuestionCard, McpChangeRequest, McpPresetsPage, MessageList, SubagentsPage, ToolApprovalCard,
 };
-use crate::state::{ConnectionStatus, PendingApproval, PendingQuestion};
+use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
+use crate::state::{ConnectionStatus, MainView, PendingApproval, PendingQuestion};
 
 /// Small dot + label in the header showing the gateway WebSocket's current
 /// lifecycle state (see [`ConnectionStatus`] for what drives it).
@@ -87,7 +88,15 @@ pub fn ChatShell(
     // The MCP list is for signed-in users only: when `false` the sidebar has no
     // "MCPs" button. The gateway enforces the same rule independently.
     #[prop(default = false)] show_mcps: bool,
-    #[prop(into)] mcp_view_open: Signal<bool>,
+    // The sub-agents list, like the MCP list, is for signed-in users only.
+    #[prop(default = false)] show_subagents: bool,
+    #[prop(into)] main_view: Signal<MainView>,
+    #[prop(into)] subagent_agents: Signal<Vec<AcpAgentSummary>>,
+    #[prop(into)] spawn_tasks: Signal<Vec<SpawnTaskSummary>>,
+    #[prop(into)] subagents_acp_enabled: Signal<bool>,
+    #[prop(into)] subagents_loaded: Signal<bool>,
+    on_open_subagents: impl Fn() + 'static + Send + Sync + Copy,
+    on_refresh_subagents: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(into)] mcp_presets: Signal<Vec<McpPresetSummary>>,
     #[prop(into)] mcp_custom: Signal<Vec<McpCustomServerSummary>>,
     #[prop(into)] mcp_loaded: Signal<bool>,
@@ -165,7 +174,10 @@ pub fn ChatShell(
                 on_delete=Callback::new(move |id| on_delete_session(id))
                 on_new_chat=on_new_chat_callback
                 on_mcps=show_mcps.then_some(Callback::new(move |()| on_open_mcps()))
-                mcps_active=mcp_view_open
+                mcps_active=Signal::derive(move || main_view.get() == MainView::Mcps)
+                on_subagents=show_subagents
+                    .then_some(Callback::new(move |()| on_open_subagents()))
+                subagents_active=Signal::derive(move || main_view.get() == MainView::Subagents)
                 show_brand=true
                 collapse_hint=shortcut_label.to_string()
                 compact=compact
@@ -213,7 +225,7 @@ pub fn ChatShell(
                 // Hidden (not unmounted) while the MCP list is showing, so the transcript
                 // keeps its scroll position and any half-typed draft.
                 <div class=move || {
-                    if mcp_view_open.get() {
+                    if !main_view.get().is_chat() {
                         "hidden"
                     } else {
                         "flex min-h-0 flex-1 flex-col overflow-hidden"
@@ -256,7 +268,18 @@ pub fn ChatShell(
                         focus_request=composer_focus_request
                     />
                 </div>
-                <Show when=move || mcp_view_open.get()>
+                <Show when=move || main_view.get() == MainView::Subagents>
+                    <SubagentsPage
+                        agents=subagent_agents
+                        tasks=spawn_tasks
+                        acp_enabled=subagents_acp_enabled
+                        loaded=subagents_loaded
+                        sessions=sessions
+                        active_chat_id=active_session_id
+                        on_refresh=Callback::new(move |()| on_refresh_subagents())
+                    />
+                </Show>
+                <Show when=move || main_view.get() == MainView::Mcps>
                     <McpPresetsPage
                         presets=mcp_presets
                         custom=mcp_custom

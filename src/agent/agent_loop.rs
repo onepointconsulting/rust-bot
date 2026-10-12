@@ -18,9 +18,7 @@ use tokio::task::JoinHandle;
 use crate::agent::autocompact::Autocompact;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
-use crate::agent::hook::{
-    AgentHook, AgentHookContext, LoopHookChain, ToolHookDecision,
-};
+use crate::agent::hook::{AgentHook, AgentHookContext, LoopHookChain, ToolHookDecision};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::model_runtime::{
@@ -29,6 +27,8 @@ use crate::agent::model_runtime::{
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
+use crate::agent::tool_progress::with_tool_progress;
+use crate::agent::tools::acp::{AcpToolsContext, register_acp_tools};
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::filesystem::FsToolConfig;
 use crate::agent::tools::goal::UpdateGoalTool;
@@ -40,8 +40,6 @@ use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
-use crate::agent::tool_progress::with_tool_progress;
-use crate::agent::tools::acp::{AcpToolsContext, register_acp_tools};
 use crate::agent::workspace_context::{
     bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
 };
@@ -221,9 +219,10 @@ impl AgentHook for LoopHook {
         };
 
         if !incremental.is_empty()
-            && let Some(on_stream) = &self.on_stream {
-                on_stream(incremental).await;
-            }
+            && let Some(on_stream) = &self.on_stream
+        {
+            on_stream(incremental).await;
+        }
     }
 
     async fn on_stream_end(&self, _ctx: &mut AgentHookContext, resuming: bool) {
@@ -457,11 +456,8 @@ impl AgentLoop {
         );
         tools.register(Box::new(SpawnTool::new(subagents.clone())));
         // The acp_* tools exist only when enabled and not already at maxDepth.
-        let acp_tools = AcpToolsContext::for_process(
-            &tools_cfg.acp,
-            workspace.clone(),
-            restrict_to_workspace,
-        );
+        let acp_tools =
+            AcpToolsContext::for_process(&tools_cfg.acp, workspace.clone(), restrict_to_workspace);
         if let Some(acp_tools) = &acp_tools {
             register_acp_tools(&mut tools, acp_tools);
         }
@@ -499,7 +495,6 @@ impl AgentLoop {
 
         let dream_cfg = agents_cfg.dream.clone();
 
-        
         Self {
             bus: bus.clone(),
             _channels_config: channels_config,
@@ -1235,18 +1230,19 @@ impl AgentLoop {
             log::warn!("Message circuit breaker tripped");
         }
         if let Some(session_key) = session_key
-            && result.usage != LLMUsage::new() {
-                let mut manager = self
-                    .session_manager
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
-                let session = manager.get_or_create_session(&session_key);
-                session.update_usage(result.usage);
-                let snapshot = session.clone();
-                if let Err(e) = manager.save(snapshot) {
-                    log::error!("Failed to save session token usage for {session_key}: {e}");
-                }
+            && result.usage != LLMUsage::new()
+        {
+            let mut manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let session = manager.get_or_create_session(&session_key);
+            session.update_usage(result.usage);
+            let snapshot = session.clone();
+            if let Err(e) = manager.save(snapshot) {
+                log::error!("Failed to save session token usage for {session_key}: {e}");
             }
+        }
         result
     }
 
@@ -1351,9 +1347,10 @@ impl AgentLoop {
                 // System messages may run consolidation, which calls the `?Send`
                 // LLM provider — handled on the run-loop task, not via `spawn`.
                 if let Some(response) = Arc::clone(self).process_system_message(msg).await
-                    && let Err(error) = self.bus.publish_outbound(response) {
-                        log::error!("Failed to publish outbound message: {error}");
-                    }
+                    && let Err(error) = self.bus.publish_outbound(response)
+                {
+                    log::error!("Failed to publish outbound message: {error}");
+                }
             } else {
                 // Everything else is dispatched as its own task so the loop stays
                 // responsive (and the task is cancellable via /stop).
@@ -1983,10 +1980,9 @@ impl AgentLoop {
             let restored = self.restore_runtime_checkpoint(session);
             // End the `&mut session` borrow before re-borrowing the manager to save.
             let snapshot = session.clone();
-            if restored
-                && let Err(e) = session_manager.save(snapshot.clone()) {
-                    log::error!("Failed to save restored session: {e}");
-                }
+            if restored && let Err(e) = session_manager.save(snapshot.clone()) {
+                log::error!("Failed to save restored session: {e}");
+            }
             snapshot
         };
 
@@ -2004,10 +2000,11 @@ impl AgentLoop {
         // `run()`'s bus loop before it ever reaches `dispatch()`. Callers that skip the
         // bus (API, CLI `process_direct`) still need them to be recognized here.
         if self.commands.is_priority(raw)
-            && let Some(result) = self.commands.dispatch_priority(&ctx).await {
-                self.persist_command_turn(&key, &msg.content, raw, &result);
-                return Some(result);
-            }
+            && let Some(result) = self.commands.dispatch_priority(&ctx).await
+        {
+            self.persist_command_turn(&key, &msg.content, raw, &result);
+            return Some(result);
+        }
         if let Some(result) = self.commands.dispatch(&mut ctx).await {
             self.persist_command_turn(&key, &msg.content, raw, &result);
             return Some(result);
@@ -2166,15 +2163,15 @@ impl AgentLoop {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .get("message")
-                && let Some(message_tool) =
-                    (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
-                    && *message_tool
-                        .sent_in_turn
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                    {
-                        return None;
-                    }
+            && let Some(message_tool) =
+                (message_tool.as_ref() as &dyn std::any::Any).downcast_ref::<MessageTool>()
+            && *message_tool
+                .sent_in_turn
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+        {
+            return None;
+        }
         let limit: usize = 120;
         let preview = if final_content.len() > limit {
             format!(

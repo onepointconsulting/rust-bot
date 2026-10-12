@@ -99,11 +99,11 @@ fn strip_host_port(host: &str) -> &str {
     }
     if let Some((name, port)) = host.rsplit_once(':')
         && host.matches(':').count() == 1
-            && !name.is_empty()
-            && port.chars().all(|c| c.is_ascii_digit())
-        {
-            return name;
-        }
+        && !name.is_empty()
+        && port.chars().all(|c| c.is_ascii_digit())
+    {
+        return name;
+    }
     host
 }
 
@@ -168,16 +168,17 @@ pub fn current_time_str(timezone: Option<&str>) -> String {
     };
 
     if let Some(tz_name) = timezone
-        && let Ok(tz) = tz_name.parse::<chrono_tz::Tz>() {
-            let now = chrono::Utc::now().with_timezone(&tz);
-            let offset = now.format("%z").to_string();
-            return format!(
-                "{} ({}, UTC{})",
-                now.format("%Y-%m-%d %H:%M (%A)"),
-                tz_name,
-                fmt_offset(offset)
-            );
-        }
+        && let Ok(tz) = tz_name.parse::<chrono_tz::Tz>()
+    {
+        let now = chrono::Utc::now().with_timezone(&tz);
+        let offset = now.format("%z").to_string();
+        return format!(
+            "{} ({}, UTC{})",
+            now.format("%Y-%m-%d %H:%M (%A)"),
+            tz_name,
+            fmt_offset(offset)
+        );
+    }
 
     let now = chrono::Local::now();
     let offset = now.format("%z").to_string();
@@ -257,20 +258,22 @@ pub fn find_legal_message_start(messages: &[Value]) -> usize {
         } else if role == "tool" {
             let tid = msg.get("tool_call_id").and_then(|v| v.as_str());
             if let Some(tid) = tid
-                && !declared.contains(tid) {
-                    start = i + 1;
-                    declared.clear();
-                    for prev in &messages[start..=i] {
-                        if prev.get("role").and_then(|v| v.as_str()) == Some("assistant")
-                            && let Some(tcs) = prev.get("tool_calls").and_then(|v| v.as_array()) {
-                                for tc in tcs {
-                                    if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
-                                        declared.insert(id.to_string());
-                                    }
-                                }
+                && !declared.contains(tid)
+            {
+                start = i + 1;
+                declared.clear();
+                for prev in &messages[start..=i] {
+                    if prev.get("role").and_then(|v| v.as_str()) == Some("assistant")
+                        && let Some(tcs) = prev.get("tool_calls").and_then(|v| v.as_array())
+                    {
+                        for tc in tcs {
+                            if let Some(id) = tc.get("id").and_then(|v| v.as_str()) {
+                                declared.insert(id.to_string());
                             }
+                        }
                     }
                 }
+            }
         }
     }
     start
@@ -515,9 +518,10 @@ pub fn estimate_message_tokens(message: &Value) -> usize {
             for block in blocks {
                 if block.get("type").and_then(|v| v.as_str()) == Some("text") {
                     if let Some(t) = block.get("text").and_then(|v| v.as_str())
-                        && !t.is_empty() {
-                            parts.push(t.to_string());
-                        }
+                        && !t.is_empty()
+                    {
+                        parts.push(t.to_string());
+                    }
                 } else {
                     parts.push(block.to_string());
                 }
@@ -529,17 +533,19 @@ pub fn estimate_message_tokens(message: &Value) -> usize {
 
     for key in &["name", "tool_call_id"] {
         if let Some(v) = message.get(*key).and_then(|v| v.as_str())
-            && !v.is_empty() {
-                parts.push(v.to_string());
-            }
+            && !v.is_empty()
+        {
+            parts.push(v.to_string());
+        }
     }
     if let Some(tc) = message.get("tool_calls") {
         parts.push(tc.to_string());
     }
     if let Some(Value::String(rc)) = message.get("reasoning_content")
-        && !rc.is_empty() {
-            parts.push(rc.clone());
-        }
+        && !rc.is_empty()
+    {
+        parts.push(rc.clone());
+    }
 
     let payload = parts.join("\n");
     if payload.is_empty() {
@@ -580,9 +586,10 @@ pub fn estimate_prompt_tokens(messages: &[Value], tools: Option<&[Value]>) -> us
                 for block in blocks {
                     if block.get("type").and_then(|v| v.as_str()) == Some("text")
                         && let Some(t) = block.get("text").and_then(|v| v.as_str())
-                            && !t.is_empty() {
-                                parts.push(t.to_string());
-                            }
+                        && !t.is_empty()
+                    {
+                        parts.push(t.to_string());
+                    }
                 }
             }
             _ => {}
@@ -591,14 +598,16 @@ pub fn estimate_prompt_tokens(messages: &[Value], tools: Option<&[Value]>) -> us
             parts.push(tc.to_string());
         }
         if let Some(Value::String(rc)) = msg.get("reasoning_content")
-            && !rc.is_empty() {
-                parts.push(rc.clone());
-            }
+            && !rc.is_empty()
+        {
+            parts.push(rc.clone());
+        }
         for key in &["name", "tool_call_id"] {
             if let Some(v) = msg.get(*key).and_then(|v| v.as_str())
-                && !v.is_empty() {
-                    parts.push(v.to_string());
-                }
+                && !v.is_empty()
+            {
+                parts.push(v.to_string());
+            }
         }
     }
 
@@ -703,10 +712,9 @@ fn write_dest_if_missing(
         Some(text) => fs::write(dest, text).is_ok(),
         None => std::fs::File::create(dest).is_ok(),
     };
-    if write_ok
-        && let Ok(rel) = dest.strip_prefix(workspace) {
-            added.push(rel.to_string_lossy().into_owned());
-        }
+    if write_ok && let Ok(rel) = dest.strip_prefix(workspace) {
+        added.push(rel.to_string_lossy().into_owned());
+    }
 }
 
 /// Read a bootstrap template's content, preferring the on-disk `templates_root` and
@@ -717,9 +725,10 @@ fn write_dest_if_missing(
 /// that on both Unix and Windows.
 fn read_bootstrap_file(templates_root: Option<&Path>, rel_name: &str) -> Option<String> {
     if let Some(root) = templates_root
-        && let Ok(content) = fs::read_to_string(root.join(rel_name)) {
-            return Some(content);
-        }
+        && let Ok(content) = fs::read_to_string(root.join(rel_name))
+    {
+        return Some(content);
+    }
     embedded_templates::get(rel_name)
 }
 

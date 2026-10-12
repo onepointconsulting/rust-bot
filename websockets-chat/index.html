@@ -18,8 +18,46 @@
     <!-- Plain (non-Tailwind) shared stylesheet from chat-ui; see the comment
          in style/input.css for why this can't be an @import instead. -->
     <link data-trunk rel="css" href="../chat-ui/style/shared.css" />
+    <!-- Shown while the WASM bundle downloads and compiles; main.rs clears
+         #rust-bot-chat before mounting, which removes this placeholder.
+         Inline (not Tailwind) so it paints before any stylesheet/WASM loads. -->
+    <style>
+      .app-boot {
+        display: flex;
+        flex-direction: column;
+        align-items: center;
+        justify-content: center;
+        gap: 0.75rem;
+        min-height: 100vh;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        color: #475569;
+      }
+      .app-boot__spinner {
+        height: 2rem;
+        width: 2rem;
+        border: 3px solid #e2e8f0;
+        border-top-color: #0f172a;
+        border-radius: 9999px;
+        animation: app-boot-spin 0.9s linear infinite;
+      }
+      @keyframes app-boot-spin {
+        to {
+          transform: rotate(360deg);
+        }
+      }
+      @media (prefers-reduced-motion: reduce) {
+        .app-boot__spinner {
+          animation-duration: 3s;
+        }
+      }
+    </style>
   </head>
   <body class="min-h-full bg-transparent">
-    <div id="rust-bot-chat"></div>
+    <div id="rust-bot-chat">
+      <div class="app-boot" role="status" aria-live="polite">
+        <div class="app-boot__spinner" aria-hidden="true"></div>
+        <div>Loading chat&hellip;</div>
+      </div>
+    </div>
   </body>
 </html>

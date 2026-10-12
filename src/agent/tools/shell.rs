@@ -343,27 +343,29 @@ impl ShellTool {
         if let Some(deny) = &self.deny_patterns {
             for pattern in deny {
                 if let Ok(re) = Regex::new(pattern)
-                    && re.is_match(&lower) {
-                        return Some(
-                            "Error: Command blocked by safety guard (dangerous pattern detected)"
-                                .to_string(),
-                        );
-                    }
+                    && re.is_match(&lower)
+                {
+                    return Some(
+                        "Error: Command blocked by safety guard (dangerous pattern detected)"
+                            .to_string(),
+                    );
+                }
             }
         }
 
         // ── 2. Allow patterns ─────────────────────────────────────────────────
         if let Some(allow) = &self.allow_patterns
-            && !allow.is_empty() {
-                let permitted = allow
-                    .iter()
-                    .any(|p| Regex::new(p).map(|re| re.is_match(&lower)).unwrap_or(false));
-                if !permitted {
-                    return Some(
-                        "Error: Command blocked by safety guard (not in allowlist)".to_string(),
-                    );
-                }
+            && !allow.is_empty()
+        {
+            let permitted = allow
+                .iter()
+                .any(|p| Regex::new(p).map(|re| re.is_match(&lower)).unwrap_or(false));
+            if !permitted {
+                return Some(
+                    "Error: Command blocked by safety guard (not in allowlist)".to_string(),
+                );
             }
+        }
 
         // ── 3. Workspace restriction ──────────────────────────────────────────
         if restrict_to_workspace {

@@ -2590,7 +2590,11 @@ mod tests {
             let mut ctx = subagents_ctx(None, "");
             ctx.raw = text.to_string();
             let out = router.dispatch(&mut ctx).await.expect(text);
-            assert!(out.content.contains("/subagents"), "{text}: {}", out.content);
+            assert!(
+                out.content.contains("/subagents"),
+                "{text}: {}",
+                out.content
+            );
         }
         let mut bad = subagents_ctx(None, "");
         bad.raw = "/subagents nonsense".to_string();

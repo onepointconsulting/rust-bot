@@ -689,7 +689,10 @@ mod tests {
             .with_denied_roots(vec![denied.clone()]);
 
         assert_eq!(resolver.default().denied_roots, vec![denied.clone()]);
-        assert_eq!(resolver.for_session(None).denied_roots, vec![denied.clone()]);
+        assert_eq!(
+            resolver.for_session(None).denied_roots,
+            vec![denied.clone()]
+        );
         let mut metadata = HashMap::new();
         metadata.insert(
             WORKSPACE_SCOPE_METADATA_KEY.to_string(),

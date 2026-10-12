@@ -32,11 +32,11 @@ fn extract_nullable_branch(options: Value) -> Option<(Value, bool)> {
         }
         if let Some(type_value) = option.get("type")
             && let Some(type_str) = type_value.as_str()
-                && type_str == "null"
-            {
-                saw_null = true;
-                continue;
-            }
+            && type_str == "null"
+        {
+            saw_null = true;
+            continue;
+        }
         non_null.push(option.clone());
     }
     if saw_null && non_null.len() == 1 {
@@ -178,58 +178,62 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
 
     // Expand nullable type arrays: ["string","null"] → type:"string", nullable:true
     if let Some(raw_type) = normalized.get("type").cloned()
-        && let Some(type_arr) = raw_type.as_array() {
-            let non_null: Vec<&Value> = type_arr
-                .iter()
-                .filter(|t| t.as_str() != Some("null"))
-                .collect();
-            let saw_null = type_arr.iter().any(|t| t.as_str() == Some("null"));
-            if saw_null && non_null.len() == 1 {
-                normalized.insert("type".to_string(), non_null[0].clone());
-                normalized.insert("nullable".to_string(), Value::Bool(true));
-            }
+        && let Some(type_arr) = raw_type.as_array()
+    {
+        let non_null: Vec<&Value> = type_arr
+            .iter()
+            .filter(|t| t.as_str() != Some("null"))
+            .collect();
+        let saw_null = type_arr.iter().any(|t| t.as_str() == Some("null"));
+        if saw_null && non_null.len() == 1 {
+            normalized.insert("type".to_string(), non_null[0].clone());
+            normalized.insert("nullable".to_string(), Value::Bool(true));
         }
+    }
 
     // Flatten nullable oneOf/anyOf unions
     'outer: for key in ["oneOf", "anyOf"] {
         if let Some(options) = normalized.get(key).cloned()
-            && let Some((branch, _)) = extract_nullable_branch(options) {
-                normalized.remove(key);
-                if let Some(branch_obj) = branch.as_object() {
-                    for (k, v) in branch_obj {
-                        normalized.insert(k.clone(), v.clone());
-                    }
+            && let Some((branch, _)) = extract_nullable_branch(options)
+        {
+            normalized.remove(key);
+            if let Some(branch_obj) = branch.as_object() {
+                for (k, v) in branch_obj {
+                    normalized.insert(k.clone(), v.clone());
                 }
-                normalized.insert("nullable".to_string(), Value::Bool(true));
-                break 'outer;
             }
+            normalized.insert("nullable".to_string(), Value::Bool(true));
+            break 'outer;
+        }
     }
 
     // Recursively normalize each property schema
     if let Some(props) = normalized.get("properties").cloned()
-        && let Some(props_obj) = props.as_object() {
-            let new_props: Map<String, Value> = props_obj
-                .iter()
-                .map(|(name, prop)| {
-                    let v = if prop.is_object() {
-                        normalize_schema_for_openai_inner(prop)
-                    } else {
-                        prop.clone()
-                    };
-                    (name.clone(), v)
-                })
-                .collect();
-            normalized.insert("properties".to_string(), Value::Object(new_props));
-        }
+        && let Some(props_obj) = props.as_object()
+    {
+        let new_props: Map<String, Value> = props_obj
+            .iter()
+            .map(|(name, prop)| {
+                let v = if prop.is_object() {
+                    normalize_schema_for_openai_inner(prop)
+                } else {
+                    prop.clone()
+                };
+                (name.clone(), v)
+            })
+            .collect();
+        normalized.insert("properties".to_string(), Value::Object(new_props));
+    }
 
     // Recursively normalize items schema
     if let Some(items) = normalized.get("items").cloned()
-        && items.is_object() {
-            normalized.insert(
-                "items".to_string(),
-                normalize_schema_for_openai_inner(&items),
-            );
-        }
+        && items.is_object()
+    {
+        normalized.insert(
+            "items".to_string(),
+            normalize_schema_for_openai_inner(&items),
+        );
+    }
 
     // Recursively normalize composition / additionalProperties schemas
     for key in ["anyOf", "oneOf", "allOf"] {
@@ -248,12 +252,13 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
         }
     }
     if let Some(additional) = normalized.get("additionalProperties").cloned()
-        && additional.is_object() {
-            normalized.insert(
-                "additionalProperties".to_string(),
-                normalize_schema_for_openai_inner(&additional),
-            );
-        }
+        && additional.is_object()
+    {
+        normalized.insert(
+            "additionalProperties".to_string(),
+            normalize_schema_for_openai_inner(&additional),
+        );
+    }
 
     // Non-object schemas are returned without the extra defaults
     if normalized.get("type").and_then(|t| t.as_str()) != Some("object") {

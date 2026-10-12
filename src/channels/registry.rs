@@ -135,7 +135,9 @@ mod tests {
             test_session_manager(),
             test_workspace_request_handler(),
         );
-        let message = channels.keys().map(|k| k.to_string())
+        let message = channels
+            .keys()
+            .map(|k| k.to_string())
             .collect::<Vec<String>>()
             .join(", ");
         let err = format!("expected 'email' in {}", message);

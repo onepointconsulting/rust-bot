@@ -8,15 +8,17 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::agent::acp::listing::{format_acp_agents, list_acp_rows};
+use crate::agent::acp::manager::AcpManager;
 use crate::agent::acp::session_index::ChildSessionIndex;
 use crate::agent::acp::store::ChildAgentStore;
 use crate::agent::cron_context::with_cron_context_stack;
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::subagent::SubagentManager;
 use crate::agent::tool_approval::ToolApprovalBroker;
 use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
-use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::question::{QUESTION_TOOL_NAME, QuestionTool};
+use crate::agent::tools::registry::ToolRegistry;
 use crate::api::login::{
     AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
 };
@@ -453,7 +455,8 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
 }
 
 /// Footnote of `rust-bot subagents`: what this process cannot see.
-const SUBAGENTS_CLI_FOOTNOTE: &str = "Spawn tasks and live running state are only visible via /subagents inside a running agent.";
+const SUBAGENTS_CLI_FOOTNOTE: &str =
+    "Spawn tasks and live running state are only visible via /subagents inside a running agent.";
 
 /// The report `rust-bot subagents` prints for `workspace`: the stored child
 /// agents (a pure disk read; this process has no view of another process's run
@@ -737,13 +740,14 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     let agent_loop = init_agent_loop(&config, workspace, hooks);
 
     if let Some(restart_notice) = consume_restart_notice_from_env()
-        && should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str()) {
-            print_agent_response(
-                &format_restart_completed_message(&restart_notice.started_at_raw),
-                false,
-                None,
-            );
-        }
+        && should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str())
+    {
+        print_agent_response(
+            &format_restart_completed_message(&restart_notice.started_at_raw),
+            false,
+            None,
+        );
+    }
 
     let agent_loop = Arc::new(agent_loop);
     // Subagent completions publish system-channel messages to the inbound bus.
@@ -1019,6 +1023,8 @@ fn resolve_websocket_channel(
     workspace_request_handler: WorkspaceRequestHandler,
     runtime_resolver: Arc<ModelRuntimeResolver>,
     tool_registry: Arc<StdMutex<ToolRegistry>>,
+    acp_manager: Option<Arc<AcpManager>>,
+    subagents: Option<Arc<SubagentManager>>,
 ) -> Option<Arc<WebSocketChannel>> {
     let raw = config.channels.extra.get(CHANNEL_NAME)?.clone();
     let cfg: WebSocketConfig = serde_json::from_value(raw)
@@ -1037,6 +1043,8 @@ fn resolve_websocket_channel(
     );
     channel.default_agent_mode = config.agents.mode;
     channel.tool_registry = Some(tool_registry);
+    channel.acp_manager = acp_manager;
+    channel.subagents = subagents;
     Some(Arc::new(channel))
 }
 
@@ -1248,11 +1256,11 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                         .await;
                     if let Some(token) = cron_token
                         && let Some(tool) = cron_tool.as_ref()
-                            && let Some(cron_tool) =
-                                (tool.as_ref() as &dyn std::any::Any).downcast_ref::<CronTool>()
-                            {
-                                cron_tool.reset_cron_context(token);
-                            }
+                        && let Some(cron_tool) =
+                            (tool.as_ref() as &dyn std::any::Any).downcast_ref::<CronTool>()
+                    {
+                        cron_tool.reset_cron_context(token);
+                    }
 
                     // If the message tool already delivered the reply, we're done.
                     let already_sent = {
@@ -1329,6 +1337,10 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
         agent_loop.workspace_request_handler(),
         Arc::clone(&agent_loop.runtime_resolver),
         Arc::clone(&agent_loop.tools),
+        agent_loop
+            .acp_tools()
+            .map(|acp_tools| Arc::clone(acp_tools.manager())),
+        Some(Arc::clone(&agent_loop.subagents)),
     );
     // Give the WebSocket channel's `delete_chat` handler something to abort
     // in-flight work through. Must happen before `ws_channel.router()` is
@@ -2456,7 +2468,11 @@ mod tests {
             .to_string(),
         )
         .unwrap();
-        std::fs::write(workspace.path().join("acp").join("sessions.json"), "garbage").unwrap();
+        std::fs::write(
+            workspace.path().join("acp").join("sessions.json"),
+            "garbage",
+        )
+        .unwrap();
 
         let report = subagents_report(workspace.path());
         assert!(report.contains("docs ["), "{report}");
@@ -2618,6 +2634,8 @@ mod tests {
             test_workspace_request_handler(),
             test_runtime_resolver(),
             test_tool_registry(),
+            None,
+            None,
         );
 
         assert!(
@@ -2642,6 +2660,8 @@ mod tests {
             test_workspace_request_handler(),
             test_runtime_resolver(),
             test_tool_registry(),
+            None,
+            None,
         );
 
         assert!(resolved.is_none());
@@ -2662,6 +2682,8 @@ mod tests {
             test_workspace_request_handler(),
             test_runtime_resolver(),
             test_tool_registry(),
+            None,
+            None,
         );
 
         assert!(resolved.is_some());
@@ -2682,6 +2704,8 @@ mod tests {
             test_workspace_request_handler(),
             test_runtime_resolver(),
             test_tool_registry(),
+            None,
+            None,
         );
 
         assert!(resolved.is_none());

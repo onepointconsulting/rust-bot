@@ -309,10 +309,11 @@ impl Autocompact {
                 meta.get(SessionManager::LAST_ACTIVE_KEY)
                     .and_then(|v| v.as_str()),
             )
-                && let Ok(dt) = DateTime::parse_from_rfc3339(last_active_str) {
-                    let formatted = Self::format_summary(text, dt.with_timezone(&Utc));
-                    return (session, Some(formatted));
-                }
+            && let Ok(dt) = DateTime::parse_from_rfc3339(last_active_str)
+        {
+            let formatted = Self::format_summary(text, dt.with_timezone(&Utc));
+            return (session, Some(formatted));
+        }
 
         (session, None)
     }

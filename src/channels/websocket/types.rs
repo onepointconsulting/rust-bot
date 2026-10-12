@@ -14,7 +14,9 @@ use garde::{Report, Validate};
 use serde::{Deserialize, Deserializer, Serialize};
 use tokio::sync::Mutex as AsyncMutex;
 
+use crate::agent::acp::manager::AcpManager;
 use crate::agent::model_runtime::ModelRuntimeResolver;
+use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::{
     bus::queue::MessageBus,
@@ -63,6 +65,10 @@ pub enum EnvelopeType {
     /// of the fields it needs (API keys, tokens). Rust-side addition with no nanobot
     /// precedent. Local, authenticated connections only — see `mcp_write_denial`.
     SetMcpPreset,
+    /// List the durable ACP child agents and the spawn tasks of this process, as
+    /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
+    /// connections only; spawn tasks are limited to the chats the connection may see.
+    ListSubagents,
     /// Persist a new display title on an existing `websocket:{chat_id}`
     /// session. Rust-side addition with no nanobot precedent — the Python
     /// reference has no rename envelope; titles are LLM-generated only.
@@ -135,6 +141,7 @@ impl From<&str> for EnvelopeType {
             "list_tools" => Self::ListTools,
             "list_mcp_presets" => Self::ListMcpPresets,
             "set_mcp_preset" => Self::SetMcpPreset,
+            "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
             "clear_session" => Self::ClearSession,
@@ -180,6 +187,8 @@ pub enum WsOutboundEvent {
     /// Reply to a refused or failed [`EnvelopeType::SetMcpPreset`] — `{name, detail,
     /// message, fields}`. Never carries a submitted field value.
     McpPresetError,
+    /// Reply to [`EnvelopeType::ListSubagents`] — `{acp: {enabled, agents}, spawn: {tasks}}`.
+    Subagents,
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatRenamed,
@@ -244,6 +253,7 @@ impl WsOutboundEvent {
             Self::McpPresets => "mcp_presets",
             Self::McpPresetSet => "mcp_preset_set",
             Self::McpPresetError => "mcp_preset_error",
+            Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
@@ -452,6 +462,13 @@ pub struct WsShared {
     /// registry (including MCP tools registered after startup). `None` when
     /// no agent loop was wired in (tests, channel-only setups).
     pub tool_registry: Option<Arc<StdMutex<ToolRegistry>>>,
+    /// Same `Arc` as the agent loop's ACP manager, so `list_subagents` reads the
+    /// durable child agents and sees which of them this process is running. `None`
+    /// when ACP is disabled (or no agent loop was wired in).
+    pub acp_manager: Option<Arc<AcpManager>>,
+    /// Same `Arc` as `AgentLoop::subagents`, so `list_subagents` sees the spawn
+    /// tasks of this process. `None` when no agent loop was wired in.
+    pub subagents: Option<Arc<SubagentManager>>,
 }
 
 /// Upgrade-time JWT outcome for one WebSocket connection. Produced by
@@ -637,6 +654,11 @@ mod tests {
         );
         assert_eq!(WsOutboundEvent::McpPresetSet.as_str(), "mcp_preset_set");
         assert_eq!(WsOutboundEvent::McpPresetError.as_str(), "mcp_preset_error");
+        assert_eq!(
+            EnvelopeType::from("list_subagents"),
+            EnvelopeType::ListSubagents
+        );
+        assert_eq!(WsOutboundEvent::Subagents.as_str(), "subagents");
         assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
         assert_eq!(EnvelopeType::from("delete_chat"), EnvelopeType::DeleteChat);
         assert_eq!(EnvelopeType::from("abort_turn"), EnvelopeType::AbortTurn);

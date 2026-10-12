@@ -186,9 +186,10 @@ impl ContextBuilder {
         }
 
         if parts.is_empty()
-            && let Some(fallback) = mode.fallback_system_prompt() {
-                return fallback.to_string();
-            }
+            && let Some(fallback) = mode.fallback_system_prompt()
+        {
+            return fallback.to_string();
+        }
 
         parts.join("\n\n---\n\n")
     }
@@ -232,8 +233,7 @@ impl ContextBuilder {
         id_context.insert("runtime", &runtime);
         id_context.insert("platform_policy", platform_policy.as_str());
         id_context.insert("channel", &channel.unwrap_or("cli"));
-        render_template("agent/identity.md", &id_context, true)
-            .unwrap_or_else(|_| "".to_string())
+        render_template("agent/identity.md", &id_context, true).unwrap_or_else(|_| "".to_string())
     }
 
     /// Build untrusted runtime metadata block for injection before the user message.
@@ -248,10 +248,12 @@ impl ContextBuilder {
         let mut lines = vec![format!("Current Time: {}", current_time_str(timezone))];
         if let Some(channel) = channel_option
             && let Some(chat_id) = chat_id_option
-            && !channel.is_empty() && !chat_id.is_empty() {
-                lines.push(format!("Channel: {}", channel));
-                lines.push(format!("Chat ID: {}", chat_id));
-            }
+            && !channel.is_empty()
+            && !chat_id.is_empty()
+        {
+            lines.push(format!("Channel: {}", channel));
+            lines.push(format!("Chat ID: {}", chat_id));
+        }
         format!("{RUNTIME_CONTEXT_TAG}\n{}", lines.join("\n"))
     }
 
@@ -414,13 +416,14 @@ impl MessageBuilder for ContextBuilder {
         let mut runtime_ctx =
             ContextBuilder::build_runtime_context(channel, chat_id, self.timezone.as_deref());
         if mode.include_goal_runtime()
-            && let Some(metadata) = session_metadata {
-                let goal_lines = crate::session::goal_state::goal_state_runtime_lines(metadata);
-                if !goal_lines.is_empty() {
-                    runtime_ctx.push('\n');
-                    runtime_ctx.push_str(&goal_lines.join("\n"));
-                }
+            && let Some(metadata) = session_metadata
+        {
+            let goal_lines = crate::session::goal_state::goal_state_runtime_lines(metadata);
+            if !goal_lines.is_empty() {
+                runtime_ctx.push('\n');
+                runtime_ctx.push_str(&goal_lines.join("\n"));
             }
+        }
         let user_content = self.build_user_content(current_message, media);
 
         // Merge runtime context block and user content into a single value so

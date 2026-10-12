@@ -565,22 +565,23 @@ pub trait LLMProvider: Send + Sync {
             }
 
             if let Some(content_str) = content.and_then(|v| v.as_str())
-                && content_str.is_empty() {
-                    // Clone whole msg, replace "content"
-                    let mut clean = msg.clone();
-                    let is_assistant = get_str(msg, "role") == Some("assistant");
-                    let has_tool_calls = msg
-                        .get("tool_calls")
-                        .map(|tc| !tc.is_null())
-                        .unwrap_or(false);
-                    if is_assistant && has_tool_calls {
-                        clean["content"] = serde_json::Value::Null;
-                    } else {
-                        clean["content"] = serde_json::Value::String("(empty)".to_string());
-                    }
-                    result.push(clean);
-                    continue;
+                && content_str.is_empty()
+            {
+                // Clone whole msg, replace "content"
+                let mut clean = msg.clone();
+                let is_assistant = get_str(msg, "role") == Some("assistant");
+                let has_tool_calls = msg
+                    .get("tool_calls")
+                    .map(|tc| !tc.is_null())
+                    .unwrap_or(false);
+                if is_assistant && has_tool_calls {
+                    clean["content"] = serde_json::Value::Null;
+                } else {
+                    clean["content"] = serde_json::Value::String("(empty)".to_string());
                 }
+                result.push(clean);
+                continue;
+            }
 
             if let Some(content_arr) = content.and_then(|v| v.as_array()) {
                 let mut new_items = Vec::new();
@@ -718,9 +719,10 @@ pub trait LLMProvider: Send + Sync {
         let mut ordered_unique = Vec::new();
         for idx in [last_builtin_idx, Some(tail_idx)] {
             if let Some(idx) = idx
-                && !ordered_unique.contains(&idx) {
-                    ordered_unique.push(idx);
-                }
+                && !ordered_unique.contains(&idx)
+            {
+                ordered_unique.push(idx);
+            }
         }
         Some(ordered_unique)
     }
@@ -929,9 +931,10 @@ pub trait LLMProvider: Send + Sync {
                 .await;
 
             if let Some(on_delta) = on_content_delta
-                && let Some(ref content) = response.content {
-                    on_delta(content.clone()).await;
-                }
+                && let Some(ref content) = response.content
+            {
+                on_delta(content.clone()).await;
+            }
 
             response
         }
@@ -1384,7 +1387,7 @@ mod tests {
                 on_delta("Hello, ".to_string()).await;
                 on_delta("world!".to_string()).await;
             }
-            
+
             LLMResponse {
                 content: Some("Hello, world!".to_string()),
                 finish_reason: "stop".to_string(),
@@ -1557,9 +1560,9 @@ mod tests {
     #[test]
     fn test_sanitize_request_messages() {
         let allowed_keys = ["role", "content", "tool_calls", "tool_call_id", "name"]
-                .iter()
-                .map(|s| s.to_string())
-                .collect::<HashSet<String>>();
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<HashSet<String>>();
         let messages = vec![
             serde_json::json!({
                 "role": "user",

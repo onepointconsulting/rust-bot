@@ -9,6 +9,7 @@
 //! [`AcpManager::is_busy`]: crate::agent::acp::manager::AcpManager::is_busy
 
 use chrono::{DateTime, Utc};
+use serde::Serialize;
 
 use crate::agent::acp::session_index::{ChildSessionIndex, SessionEntry};
 use crate::agent::acp::store::{AgentSummary, ChildAgentStore};
@@ -41,6 +42,16 @@ impl AcpAgentState {
             AcpAgentState::Unknown => "unknown",
         }
     }
+
+    /// Stable machine-readable code, for the WebUI to switch on.
+    pub fn code(&self) -> &'static str {
+        match self {
+            AcpAgentState::RunningHere => "running_here",
+            AcpAgentState::Idle => "idle",
+            AcpAgentState::NeverRun => "never_run",
+            AcpAgentState::Unknown => "unknown",
+        }
+    }
 }
 
 /// One child agent as listed.
@@ -58,6 +69,51 @@ pub struct AcpAgentRow {
     /// The ACP session id of that most recent use.
     pub child_session: Option<String>,
     pub state: AcpAgentState,
+}
+
+/// One child agent as sent to the WebUI: the same facts [`format_acp_agents`] prints,
+/// with the times both raw and as relative text ("2d ago") so the browser needs no
+/// formatter of its own. The ACP session id is internal and not included.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct AcpAgentSummary {
+    pub name: String,
+    /// The full purpose (the terminal listing cuts it short).
+    pub purpose: String,
+    pub preset: String,
+    pub depth: u32,
+    pub cwd: Option<String>,
+    /// [`AcpAgentState::code`].
+    pub state: String,
+    /// [`AcpAgentState::as_str`].
+    pub state_label: String,
+    pub created_at: String,
+    pub created_ago: String,
+    pub created_by: String,
+    pub last_used: Option<String>,
+    pub last_used_ago: Option<String>,
+}
+
+/// Convert listing rows to their WebUI form, with times relative to `now`.
+pub fn summarize_acp_rows(rows: &[AcpAgentRow], now: DateTime<Utc>) -> Vec<AcpAgentSummary> {
+    rows.iter()
+        .map(|row| AcpAgentSummary {
+            name: row.name.clone(),
+            purpose: row.purpose.clone(),
+            preset: row.preset.clone(),
+            depth: row.depth,
+            cwd: row.cwd.clone(),
+            state: row.state.code().to_string(),
+            state_label: row.state.as_str().to_string(),
+            created_at: row.created_at.clone(),
+            created_ago: format_relative_rfc3339(now, &row.created_at),
+            created_by: row.created_by.clone(),
+            last_used: row.last_used.clone(),
+            last_used_ago: row
+                .last_used
+                .as_deref()
+                .map(|stamp| format_relative_rfc3339(now, stamp)),
+        })
+        .collect()
 }
 
 /// The most recently used entry among `entries` (an agent has one per parent session).
@@ -183,6 +239,79 @@ fn truncate_purpose(purpose: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn row_for_summary(state: AcpAgentState, last_used: Option<&str>) -> AcpAgentRow {
+        AcpAgentRow {
+            name: "planner".to_string(),
+            purpose: "x".repeat(150),
+            preset: "rustbot".to_string(),
+            created_at: "2026-10-08T10:00:00+00:00".to_string(),
+            created_by: "cli:direct".to_string(),
+            depth: 1,
+            cwd: Some("C:/work".to_string()),
+            last_used: last_used.map(str::to_string),
+            child_session: Some("internal-session-id".to_string()),
+            state,
+        }
+    }
+
+    #[test]
+    fn summarize_acp_rows_carries_the_listing_facts_with_relative_times() {
+        let now: DateTime<Utc> = "2026-10-10T10:00:00+00:00".parse().unwrap();
+        let rows = vec![row_for_summary(
+            AcpAgentState::Idle,
+            Some("2026-10-09T10:00:00+00:00"),
+        )];
+
+        let summaries = summarize_acp_rows(&rows, now);
+
+        assert_eq!(summaries.len(), 1);
+        let summary = &summaries[0];
+        assert_eq!(summary.name, "planner");
+        assert_eq!(summary.preset, "rustbot");
+        assert_eq!(summary.depth, 1);
+        assert_eq!(summary.cwd.as_deref(), Some("C:/work"));
+        assert_eq!(summary.created_by, "cli:direct");
+        assert_eq!(summary.created_ago, "2d ago");
+        assert_eq!(summary.last_used_ago.as_deref(), Some("1d ago"));
+        assert_eq!(summary.state, "idle");
+        assert_eq!(summary.state_label, "idle");
+    }
+
+    #[test]
+    fn summarize_acp_rows_keeps_the_full_purpose() {
+        let rows = vec![row_for_summary(AcpAgentState::Idle, None)];
+        let summaries = summarize_acp_rows(&rows, Utc::now());
+        assert_eq!(summaries[0].purpose.chars().count(), 150);
+    }
+
+    #[test]
+    fn summarize_acp_rows_never_used_has_no_last_used() {
+        let rows = vec![row_for_summary(AcpAgentState::NeverRun, None)];
+        let summaries = summarize_acp_rows(&rows, Utc::now());
+        assert_eq!(summaries[0].last_used, None);
+        assert_eq!(summaries[0].last_used_ago, None);
+        assert_eq!(summaries[0].state, "never_run");
+        assert_eq!(summaries[0].state_label, "never run");
+    }
+
+    #[test]
+    fn summarize_acp_rows_does_not_expose_the_internal_session_id() {
+        let rows = vec![row_for_summary(
+            AcpAgentState::Idle,
+            Some("2026-10-09T10:00:00+00:00"),
+        )];
+        let json = serde_json::to_string(&summarize_acp_rows(&rows, Utc::now())).unwrap();
+        assert!(!json.contains("internal-session-id"));
+    }
+
+    #[test]
+    fn acp_state_codes_are_stable_snake_case() {
+        assert_eq!(AcpAgentState::RunningHere.code(), "running_here");
+        assert_eq!(AcpAgentState::Idle.code(), "idle");
+        assert_eq!(AcpAgentState::NeverRun.code(), "never_run");
+        assert_eq!(AcpAgentState::Unknown.code(), "unknown");
+    }
     use crate::agent::acp::store::{AgentMeta, Overrides};
     use chrono::Duration;
 

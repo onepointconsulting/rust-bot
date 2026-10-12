@@ -44,7 +44,7 @@ async fn simple_test_chat_system(system_message: &str, user_message: &str) -> LL
             "content": user_message
         }),
     ];
-    
+
     provider
         .chat(messages, None, None, 100, Some(0.5), None, None)
         .await
@@ -56,7 +56,7 @@ async fn simple_test_chat(message: &str) -> LLMResponse {
         "role": "user",
         "content": message
     })];
-    
+
     provider
         .chat(messages, None, None, 1000, Some(0.5), None, None)
         .await
@@ -93,7 +93,7 @@ async fn simple_test_safe_chat(message: &str) -> LLMResponse {
         "role": "user",
         "content": message
     })];
-    
+
     provider
         .safe_chat(
             messages,

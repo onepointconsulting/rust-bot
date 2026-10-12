@@ -142,7 +142,11 @@ pub fn AskQuestionCard(
         if typing.get_untracked() {
             return;
         }
-        let outcome = card_key_outcome(&ev.key(), highlight.get_untracked(), option_count_untracked());
+        let outcome = card_key_outcome(
+            &ev.key(),
+            highlight.get_untracked(),
+            option_count_untracked(),
+        );
         match outcome {
             Some(KeyOutcome::Move(row)) => {
                 ev.prevent_default();
@@ -315,12 +319,18 @@ mod tests {
     #[test]
     fn arrows_wrap_across_all_rows() {
         assert_eq!(card_key_outcome("ArrowUp", 0, 2), Some(KeyOutcome::Move(3)));
-        assert_eq!(card_key_outcome("ArrowDown", 3, 2), Some(KeyOutcome::Move(0)));
+        assert_eq!(
+            card_key_outcome("ArrowDown", 3, 2),
+            Some(KeyOutcome::Move(0))
+        );
     }
 
     #[test]
     fn enter_activates_highlighted_row() {
-        assert_eq!(card_key_outcome("Enter", 1, 2), Some(KeyOutcome::Activate(1)));
+        assert_eq!(
+            card_key_outcome("Enter", 1, 2),
+            Some(KeyOutcome::Activate(1))
+        );
     }
 
     #[test]

@@ -16,6 +16,8 @@ use std::collections::HashMap;
 use chat_ui::models::{McpCustomServerSummary, McpPresetFieldSummary, McpPresetSummary};
 use leptos::prelude::*;
 
+use super::list_page::{ListPageShell, SectionHeading, Tile};
+
 /// Tooltip on the switches when this connection may not change MCP settings.
 const READ_ONLY_HINT: &str =
     "Read-only: MCP servers can only be changed from a signed-in browser on the gateway machine.";
@@ -55,16 +57,6 @@ pub fn status_badge_label(status: &str) -> Option<&'static str> {
         "coming_soon" => Some("Coming soon"),
         _ => None,
     }
-}
-
-/// Uppercase first character of `title`, shown in the placeholder tile that stands in
-/// for an icon. `?` for an empty title.
-pub fn tile_initial(title: &str) -> String {
-    title
-        .chars()
-        .next()
-        .map(|c| c.to_uppercase().to_string())
-        .unwrap_or_else(|| "?".to_string())
 }
 
 /// Human-readable transport name for the small label under a custom server's name.
@@ -199,16 +191,6 @@ fn ToggleSwitch(
                 <span class=switch_knob_class(on)></span>
             </button>
         </span>
-    }
-}
-
-/// Placeholder tile standing in for an icon: the name's first letter.
-#[component]
-fn Tile(title: String) -> impl IntoView {
-    view! {
-        <div class="flex h-12 w-12 shrink-0 items-center justify-center rounded-xl border border-slate-200 bg-slate-100 text-lg font-semibold text-slate-500">
-            {tile_initial(&title)}
-        </div>
     }
 }
 
@@ -418,18 +400,6 @@ fn CustomRow(server: McpCustomServerSummary) -> impl IntoView {
     }
 }
 
-/// Section heading with a count, e.g. "Presets 13".
-#[component]
-fn SectionHeading(title: &'static str, count: usize, detail: Option<String>) -> impl IntoView {
-    view! {
-        <div class="flex items-baseline gap-2 pt-6 pb-1">
-            <h2 class="text-sm font-semibold text-slate-700">{title}</h2>
-            <span class="text-xs text-slate-400">{count}</span>
-            {detail.map(|text| view! { <span class="text-xs text-slate-400">{text}</span> })}
-        </div>
-    }
-}
-
 /// The MCP list page.
 ///
 /// `loaded` is false while the first reply is in flight (shows a loading line).
@@ -449,31 +419,20 @@ pub fn McpPresetsPage(
     on_refresh: Callback<()>,
     on_change: Callback<McpChangeRequest>,
 ) -> impl IntoView {
+    let subtitle = Signal::derive(move || {
+        if can_modify.get() {
+            "Turn MCP servers on or off. Changes need a restart."
+        } else {
+            "Read-only: MCP servers can only be changed from a signed-in browser on the gateway machine."
+        }
+    });
     view! {
-        <div class="flex-1 overflow-y-auto bg-white">
-            <div class="mx-auto w-full max-w-3xl px-6 py-6">
-                <div class="flex items-start justify-between gap-4">
-                    <div>
-                        <h1 class="text-xl font-semibold text-slate-900">"MCPs"</h1>
-                        <p class="text-sm text-slate-500">
-                            {move || {
-                                if can_modify.get() {
-                                    "Turn MCP servers on or off. Changes need a restart."
-                                } else {
-                                    "Read-only: MCP servers can only be changed from a signed-in browser on the gateway machine."
-                                }
-                            }}
-                        </p>
-                    </div>
-                    <button
-                        type="button"
-                        class="rounded-full px-3 py-1.5 text-sm text-slate-600 hover:bg-slate-100"
-                        aria-label="Refresh MCP list"
-                        on:click=move |_| on_refresh.run(())
-                    >
-                        "Refresh"
-                    </button>
-                </div>
+        <ListPageShell
+            title="MCPs"
+            subtitle=subtitle
+            refresh_label="Refresh MCP list"
+            on_refresh=on_refresh
+        >
                 {move || {
                     restart_banner_text(&changed.get())
                         .map(|text| {
@@ -532,8 +491,7 @@ pub fn McpPresetsPage(
                         }
                     }}
                 </Show>
-            </div>
-        </div>
+        </ListPageShell>
     }
 }
 
@@ -623,13 +581,6 @@ mod tests {
         assert_eq!(status_badge_label("configured"), None);
         assert_eq!(status_badge_label("not_installed"), None);
         assert_eq!(status_badge_label("something-new"), None);
-    }
-
-    #[test]
-    fn tile_initial_uppercases_first_character() {
-        assert_eq!(tile_initial("github"), "G");
-        assert_eq!(tile_initial("Étoile"), "É");
-        assert_eq!(tile_initial(""), "?");
     }
 
     #[test]

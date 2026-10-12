@@ -552,9 +552,10 @@ impl GmailEmailsTool {
 
     fn extract_body_by_mime(payload: &serde_json::Value, target_mime: &str) -> Option<String> {
         if payload["mimeType"].as_str() == Some(target_mime)
-            && let Some(data) = payload["body"]["data"].as_str() {
-                return Self::decode_gmail_body_data(data);
-            }
+            && let Some(data) = payload["body"]["data"].as_str()
+        {
+            return Self::decode_gmail_body_data(data);
+        }
         if let Some(parts) = payload["parts"].as_array() {
             for part in parts {
                 if let Some(text) = Self::extract_body_by_mime(part, target_mime) {
@@ -579,9 +580,10 @@ impl GmailEmailsTool {
         let disposition = Self::extract_header(part, "Content-Disposition", "");
         if !disposition.is_empty()
             && let Some(name) = parse_filename_from_disposition(&disposition)
-                && !name.is_empty() {
-                    return Some(name);
-                }
+            && !name.is_empty()
+        {
+            return Some(name);
+        }
         None
     }
 
@@ -648,9 +650,10 @@ impl GmailEmailsTool {
             for mime in ["text/plain", "text/html"] {
                 for part in parts {
                     if part["mimeType"].as_str() == Some(mime)
-                        && let Some(text) = GmailEmailsTool::extract_body(part) {
-                            return Some(text);
-                        }
+                        && let Some(text) = GmailEmailsTool::extract_body(part)
+                    {
+                        return Some(text);
+                    }
                 }
             }
             // Fallback: any nested part

@@ -298,9 +298,7 @@ impl SkillsLoader {
         }
         let matched_option = STRIP_SKILL_FRONTMATTER.captures(content);
         match matched_option {
-            Some(captures) => {
-                content[captures.get(0).unwrap().end()..].trim().to_string()
-            }
+            Some(captures) => content[captures.get(0).unwrap().end()..].trim().to_string(),
             None => content.to_string(),
         }
     }
@@ -393,9 +391,10 @@ impl SkillsLoader {
         if let Some(bins) = required_bins.as_array() {
             for bin in bins {
                 if let Some(command_name) = bin.as_str()
-                    && which::which(command_name).is_err() {
-                        missing.push(format!("CLI: {}", command_name));
-                    }
+                    && which::which(command_name).is_err()
+                {
+                    missing.push(format!("CLI: {}", command_name));
+                }
             }
         }
 
@@ -406,9 +405,9 @@ impl SkillsLoader {
                     && std::env::var(env_name)
                         .map(|v| v.is_empty())
                         .unwrap_or(true)
-                    {
-                        missing.push(format!("ENV: {}", env_name));
-                    }
+                {
+                    missing.push(format!("ENV: {}", env_name));
+                }
             }
         }
 
@@ -439,8 +438,7 @@ impl SkillsLoader {
                             continue;
                         }
                         let (key, value) = line.split_once(':').unwrap();
-                        metadata
-                            .insert(key.trim().to_string(), strip_surrounding_quotes(value));
+                        metadata.insert(key.trim().to_string(), strip_surrounding_quotes(value));
                     }
                 }
                 Some(serde_json::json!(metadata))

@@ -739,8 +739,7 @@ impl WebUiTranscriptRecorder {
     }
 
     fn segment_file_path(&self, session_key: &str, segment_id: &str) -> PathBuf {
-        self
-            .webui_transcript_segments_dir(session_key)
+        self.webui_transcript_segments_dir(session_key)
             .join(format!("{segment_id}.jsonl"))
     }
 
@@ -1244,9 +1243,10 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
             if let Some(timestamp) = row.get("timestamp").and_then(Value::as_str) {
                 entry["timestamp"] = serde_json::json!(timestamp);
             } else if let Some(ms) = valid_created_at_ms(row.get("created_at_ms"))
-                && let Some(dt) = chrono::DateTime::from_timestamp_millis(ms) {
-                    entry["timestamp"] = serde_json::json!(dt.to_rfc3339());
-                }
+                && let Some(dt) = chrono::DateTime::from_timestamp_millis(ms)
+            {
+                entry["timestamp"] = serde_json::json!(dt.to_rfc3339());
+            }
             // Prefer the folded `reasoning_end` text (how the WebUI transcript
             // actually stores a completed trace). Fall back to a
             // `reasoning_content`/`reasoning` field on the answer row itself,

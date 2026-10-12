@@ -184,6 +184,36 @@ The "local" test is the connection's source address, so a reverse proxy running 
 gateway machine makes remote visitors look local. Do not put the gateway behind one
 unless the proxy itself restricts access.
 
+## Sub-agents list
+
+Signed-in users also get a **Sub-agents** button under "MCPs". It opens the same two
+sections `/subagents` prints in the terminal, read-only:
+
+- **Child agents (ACP):** the durable child agent definitions, each with its state
+  (`running here`, `idle`, `never run`, `unknown`), preset, depth, the full purpose, its
+  working folder, who created it and when, and when it was last used. When child agents
+  are switched off on the gateway the page says so.
+- **Spawn tasks:** the tasks spawned by this gateway process, each with its label, status
+  (`running`, `completed`, `partial`, `failed`, `cancelled`), a summary, the chat it came
+  from (shown by the chat's title, with a "this chat" tag for the one you have open), and
+  when it was spawned and finished.
+
+Like the MCP list, the page is never shown on page load, is only requested when the button
+is clicked (`list_subagents` envelope, `subagents` event), and is refused to anonymous
+connections on the gateway as well as hidden in the UI.
+
+Things to know:
+
+- "Running here" only reflects runs started by the gateway process itself, not runs from
+  other processes.
+- Spawn tasks are limited to **your own chats**: the same chats the sidebar lists for you.
+  Tasks started from the CLI or another channel do not appear, because a task summary can
+  contain private text from someone else's conversation. Child agents are process-wide
+  definitions, so every signed-in user sees all of them.
+- Spawn tasks live in memory only, so the list is empty again after a restart.
+- Times such as "2d ago" are worked out by the gateway when it answers; use Refresh to
+  update them.
+
 ## Build for production
 
 ```bash

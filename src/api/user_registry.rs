@@ -143,9 +143,10 @@ impl JsonUserRegistry {
 
     fn save(&self) -> Result<(), UserRegistryError> {
         if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty() {
-                fs::create_dir_all(parent)?;
-            }
+            && !parent.as_os_str().is_empty()
+        {
+            fs::create_dir_all(parent)?;
+        }
         let contents = serde_json::to_string_pretty(&self.users)?;
         fs::write(&self.path, contents)?;
         Ok(())

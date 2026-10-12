@@ -8,7 +8,9 @@ use serde_json::Value;
 
 use crate::agent::question_broker::{QuestionAnswer, QuestionBroker, QuestionChoice};
 use crate::agent::tools::base::Tool;
-use crate::bus::outbound_events::{OutboundEvent, QuestionRequestEvent, outbound_message_for_event};
+use crate::bus::outbound_events::{
+    OutboundEvent, QuestionRequestEvent, outbound_message_for_event,
+};
 use crate::bus::queue::MessageBus;
 use crate::channels::websocket::CHANNEL_NAME as WEBSOCKET_CHANNEL;
 use crate::cli::pause_for_prompt;
@@ -96,11 +98,17 @@ impl QuestionTool {
     }
 
     fn channel(&self) -> String {
-        self.channel.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.channel
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn chat_id(&self) -> String {
-        self.chat_id.lock().unwrap_or_else(|e| e.into_inner()).clone()
+        self.chat_id
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
     }
 
     fn bus(&self) -> Option<Arc<MessageBus>> {
@@ -242,7 +250,9 @@ fn parse_options(params: &Value) -> Result<(String, Vec<QuestionOption>), String
         .get("options")
         .and_then(Value::as_array)
         .filter(|arr| !arr.is_empty())
-        .ok_or_else(|| "missing required parameter 'options' (must be a non-empty array)".to_string())?;
+        .ok_or_else(|| {
+            "missing required parameter 'options' (must be a non-empty array)".to_string()
+        })?;
 
     let mut options = Vec::with_capacity(raw_options.len());
     for (i, raw) in raw_options.iter().enumerate() {
@@ -503,10 +513,7 @@ mod tests {
             label: "A".to_string(),
             description: Some("first".to_string()),
         };
-        assert_eq!(
-            format_answer(Some(&opt), None),
-            "User selected: A (first)"
-        );
+        assert_eq!(format_answer(Some(&opt), None), "User selected: A (first)");
     }
 
     #[test]
@@ -624,10 +631,7 @@ mod tests {
                 "options": [{"label": "A"}],
             }))
             .await;
-        assert_eq!(
-            result,
-            "Error: no chat to ask a clarifying question in"
-        );
+        assert_eq!(result, "Error: no chat to ask a clarifying question in");
     }
 
     #[tokio::test]
@@ -683,7 +687,9 @@ mod tests {
             }
             tokio::task::yield_now().await;
         };
-        broker.resolve("chat-1", &request_id, None, None, true).unwrap();
+        broker
+            .resolve("chat-1", &request_id, None, None, true)
+            .unwrap();
 
         assert_eq!(run.await.unwrap(), CHAT_ABOUT_ANSWER);
     }
@@ -710,14 +716,23 @@ mod tests {
             panic!("expected QuestionRequest event");
         };
         assert_eq!(event.question, "Which one?");
-        assert_eq!(event.options, vec![QuestionChoice {
-            id: "0".to_string(),
-            label: "A".to_string(),
-            description: None,
-        }]);
+        assert_eq!(
+            event.options,
+            vec![QuestionChoice {
+                id: "0".to_string(),
+                label: "A".to_string(),
+                description: None,
+            }]
+        );
 
         broker
-            .resolve("chat-1", &event.request_id, None, Some("free text".to_string()), false)
+            .resolve(
+                "chat-1",
+                &event.request_id,
+                None,
+                Some("free text".to_string()),
+                false,
+            )
             .unwrap();
         assert_eq!(run.await.unwrap(), "User answered: free text");
     }

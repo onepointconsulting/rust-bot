@@ -67,17 +67,18 @@ impl StreamAccumulator {
             let delta = choice.get("delta").unwrap_or(&empty);
 
             if let Some(content_val) = delta.get("content")
-                && let Some(text) = OpenAICompatProvider::extract_text_content(content_val) {
-                    let normalized =
-                        OpenAICompatProvider::non_overlapping_suffix(&self.content, text.as_str());
-                    if !normalized.is_empty() {
-                        self.content.push_str(normalized);
-                        match &mut deltas.content {
-                            Some(existing) => existing.push_str(normalized),
-                            None => deltas.content = Some(normalized.to_string()),
-                        }
+                && let Some(text) = OpenAICompatProvider::extract_text_content(content_val)
+            {
+                let normalized =
+                    OpenAICompatProvider::non_overlapping_suffix(&self.content, text.as_str());
+                if !normalized.is_empty() {
+                    self.content.push_str(normalized);
+                    match &mut deltas.content {
+                        Some(existing) => existing.push_str(normalized),
+                        None => deltas.content = Some(normalized.to_string()),
                     }
                 }
+            }
 
             let reasoning_val = delta
                 .get("reasoning_content")
@@ -85,13 +86,13 @@ impl StreamAccumulator {
             if let Some(reasoning_val) = reasoning_val
                 && let Some(text) = OpenAICompatProvider::extract_text_content(reasoning_val)
                     .filter(|s| !s.is_empty())
-                {
-                    self.reasoning.push_str(&text);
-                    match &mut deltas.reasoning {
-                        Some(existing) => existing.push_str(&text),
-                        None => deltas.reasoning = Some(text),
-                    }
+            {
+                self.reasoning.push_str(&text);
+                match &mut deltas.reasoning {
+                    Some(existing) => existing.push_str(&text),
+                    None => deltas.reasoning = Some(text),
                 }
+            }
 
             if let Some(tcs) = delta.get("tool_calls").and_then(|v| v.as_array()) {
                 for tc in tcs {
@@ -128,9 +129,10 @@ impl StreamAccumulator {
             }
 
             if let Some(obj) = choice.as_object()
-                && let Some(reason) = OpenAICompatProvider::json_finish_reason(obj) {
-                    self.finish_reason = reason;
-                }
+                && let Some(reason) = OpenAICompatProvider::json_finish_reason(obj)
+            {
+                self.finish_reason = reason;
+            }
         }
         Ok(deltas)
     }
@@ -217,13 +219,14 @@ where
             match event {
                 Ok(SseData::Done) => {
                     if !acc.reasoning.is_empty()
-                        && let Some(progress) = progress {
-                            progress(
-                                String::new(),
-                                crate::bus::outbound_events::ProgressKind::ReasoningEnd,
-                            )
-                            .await;
-                        }
+                        && let Some(progress) = progress
+                    {
+                        progress(
+                            String::new(),
+                            crate::bus::outbound_events::ProgressKind::ReasoningEnd,
+                        )
+                        .await;
+                    }
                     return acc.into_response();
                 }
                 Ok(SseData::Json(chunk)) => match acc.apply_chunk(&chunk) {
@@ -287,13 +290,14 @@ where
                     }
                 }
                 if !acc.reasoning.is_empty()
-                    && let Some(progress) = progress {
-                        progress(
-                            String::new(),
-                            crate::bus::outbound_events::ProgressKind::ReasoningEnd,
-                        )
-                        .await;
-                    }
+                    && let Some(progress) = progress
+                {
+                    progress(
+                        String::new(),
+                        crate::bus::outbound_events::ProgressKind::ReasoningEnd,
+                    )
+                    .await;
+                }
                 return acc.into_response();
             }
             Ok(Some(Ok(chunk))) => buffer.extend_from_slice(chunk.as_ref()),

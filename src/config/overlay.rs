@@ -60,7 +60,10 @@ pub fn overlay_is_active() -> bool {
 /// The overlays this process runs on, outermost first (empty in a root process).
 /// A child's own children must inherit through all of them, not just the config file.
 pub fn active_overlay_chain() -> Vec<PathBuf> {
-    OVERLAY_CHAIN.lock().unwrap_or_else(|e| e.into_inner()).clone()
+    OVERLAY_CHAIN
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
 }
 
 /// Why an overlay was refused.
@@ -422,8 +425,7 @@ fn check_not_wider(parent: &Config, merged: &Config) -> Result<(), OverlayError>
     if merged.tools.acp.allow_dynamic_agents && !parent.tools.acp.allow_dynamic_agents {
         return Err(widens(
             "tools.acp.allowDynamicAgents",
-            "the parent does not allow dynamic agents (null resets it to the default)"
-                .to_string(),
+            "the parent does not allow dynamic agents (null resets it to the default)".to_string(),
         ));
     }
     if merged.tools.acp.max_depth > parent.tools.acp.max_depth {
@@ -912,15 +914,15 @@ mod tests {
     #[test]
     fn a_grandchild_inherits_every_restriction_of_the_child_above_it() {
         // The grandchild's own overlay says nothing about any of this.
-        let effective = effective_config_chain(
-            &acp_parent(),
-            &[read_only_child_overlay(), json!({})],
-        )
-        .unwrap();
+        let effective =
+            effective_config_chain(&acp_parent(), &[read_only_child_overlay(), json!({})]).unwrap();
 
         assert!(!effective.tools.exec.enable);
         assert!(effective.tools.restrict_to_workspace);
-        assert_eq!(effective.tools.disabled_tools, vec!["write_file", "edit_file"]);
+        assert_eq!(
+            effective.tools.disabled_tools,
+            vec!["write_file", "edit_file"]
+        );
         assert_eq!(effective.tools.acp.max_depth, 1);
     }
 
@@ -956,7 +958,10 @@ mod tests {
 
         assert!(!effective.tools.exec.enable);
         assert!(effective.tools.restrict_to_workspace);
-        assert_eq!(effective.tools.disabled_tools, vec!["write_file", "edit_file"]);
+        assert_eq!(
+            effective.tools.disabled_tools,
+            vec!["write_file", "edit_file"]
+        );
         assert_eq!(effective.tools.acp.max_depth, 1);
     }
 

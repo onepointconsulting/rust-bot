@@ -470,13 +470,15 @@ impl CronServiceInner {
     }
 
     fn reload_store_if_needed(&mut self) {
-        if self.store.is_some() && self.store_path.exists()
+        if self.store.is_some()
+            && self.store_path.exists()
             && let Ok(meta) = std::fs::metadata(&self.store_path)
-                && let Ok(mtime) = meta.modified()
-                    && self.last_mtime != Some(mtime) {
-                        log::info!("Cron: jobs.json modified externally, reloading");
-                        self.store = None;
-                    }
+            && let Ok(mtime) = meta.modified()
+            && self.last_mtime != Some(mtime)
+        {
+            log::info!("Cron: jobs.json modified externally, reloading");
+            self.store = None;
+        }
 
         if self.store.is_some() {
             return;
@@ -488,9 +490,10 @@ impl CronServiceInner {
                     Ok(store) => {
                         self.store = Some(store);
                         if let Ok(meta) = std::fs::metadata(&self.store_path)
-                            && let Ok(mtime) = meta.modified() {
-                                self.last_mtime = Some(mtime);
-                            }
+                            && let Ok(mtime) = meta.modified()
+                        {
+                            self.last_mtime = Some(mtime);
+                        }
                     }
                     Err(e) => {
                         log::warn!("Failed to load cron store: {e}");
@@ -513,10 +516,11 @@ impl CronServiceInner {
         };
 
         if let Some(parent) = self.store_path.parent()
-            && let Err(e) = std::fs::create_dir_all(parent) {
-                log::warn!("Failed to create cron store directory: {e}");
-                return;
-            }
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            log::warn!("Failed to create cron store directory: {e}");
+            return;
+        }
 
         let json = match serde_json::to_string_pretty(store) {
             Ok(j) => j,
@@ -532,9 +536,10 @@ impl CronServiceInner {
         }
 
         if let Ok(meta) = std::fs::metadata(&self.store_path)
-            && let Ok(mtime) = meta.modified() {
-                self.last_mtime = Some(mtime);
-            }
+            && let Ok(mtime) = meta.modified()
+        {
+            self.last_mtime = Some(mtime);
+        }
     }
 }
 

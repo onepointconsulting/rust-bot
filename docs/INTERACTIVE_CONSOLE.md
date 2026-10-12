@@ -162,6 +162,7 @@ launchers documented under [Command line](COMMAND_LINE.md).
 | `/cleanup`         | Remove stray files from the workspace                                           |
 | `/list-sessions`   | List available sessions in the current workspace                                |
 | `/example-prompts` | List example prompts                                                            |
+| `/subagents`       | List spawn tasks and ACP child agents: `/subagents [spawn\|acp\|all]`            |
 
 
 
@@ -177,6 +178,7 @@ additions.
 
 ```bash
 /mcp-preset list
+/mcp-preset info github
 /mcp-preset enable github github_token=ghp_xxx
 /mcp-preset test github
 /mcp-preset disable github
@@ -185,6 +187,12 @@ additions.
 - `list` — shows every preset with its status (`configured`,
 `missing_credentials`, `missing_dependency`, `not_installed`), plus any
 custom (non-preset) MCP servers already in `config.json`.
+- `info <name>` (alias `show`) — shows a preset's description, transport,
+status, and every field it needs: whether it is required or secret, the
+`field=value` key to pass to `enable`, where the value ends up (env var,
+header, URL parameter, argument), the environment variable that can supply it
+automatically (and whether it is currently set), and whether the field is
+already satisfied. Secret values are never printed.
 - `enable <name> [field=value ...]` — materializes the preset into a full
 MCP server config and writes it into `config.json`. Any field a preset needs
 (an API key, a token) can be supplied inline as `field=value`; if omitted, an

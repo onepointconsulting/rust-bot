@@ -29,8 +29,8 @@ mod support;
 
 use support::{
     Fixture, ScriptedProvider, SharedProvider, fixture, fixture_with, long_running_command,
-    running_process_count, text_reply, tool_call_reply, wait_until, write_project_file,
-    long_running_process_name,
+    long_running_process_name, running_process_count, text_reply, tool_call_reply, wait_until,
+    write_project_file,
 };
 
 // ── test client ─────────────────────────────────────────────────────────────
@@ -856,7 +856,11 @@ async fn loading_rejects_a_relative_or_missing_project_folder() {
 
 /// A project with a file of its own and a rust-bot home inside it holding a secret.
 fn put_a_home_in_the_project(project: &Path) -> PathBuf {
-    write_project_file(project, "main.rs", "fn main() { /* needle in the code */ }\n");
+    write_project_file(
+        project,
+        "main.rs",
+        "fn main() { /* needle in the code */ }\n",
+    );
     let home = project.join(".rust-bot").join("workspace");
     std::fs::create_dir_all(home.join("memory")).unwrap();
     std::fs::create_dir_all(home.join("sessions")).unwrap();
@@ -875,9 +879,21 @@ async fn a_denied_home_inside_the_project_is_off_limits_to_every_file_tool() {
     // exactly as a parent computes it and passes it with `--deny-path`.
     let fixture = support::fixture_denying(
         vec![
-            tool_call_reply("r1", "read_file", json!({"path": ".rust-bot/workspace/memory/MEMORY.md"})),
-            tool_call_reply("g1", "grep", json!({"pattern": "needle", "output_mode": "content"})),
-            tool_call_reply("l1", "list_dir", json!({"path": ".rust-bot", "recursive": true})),
+            tool_call_reply(
+                "r1",
+                "read_file",
+                json!({"path": ".rust-bot/workspace/memory/MEMORY.md"}),
+            ),
+            tool_call_reply(
+                "g1",
+                "grep",
+                json!({"pattern": "needle", "output_mode": "content"}),
+            ),
+            tool_call_reply(
+                "l1",
+                "list_dir",
+                json!({"path": ".rust-bot", "recursive": true}),
+            ),
             tool_call_reply("m1", "glob", json!({"pattern": "**/*.md"})),
             tool_call_reply("ok", "read_file", json!({"path": "main.rs"})),
             text_reply("done"),
@@ -887,19 +903,27 @@ async fn a_denied_home_inside_the_project_is_off_limits_to_every_file_tool() {
     );
     let log = Arc::new(ClientLog::default());
 
-    run_client(&fixture.runtime, Permission::Allow, &log, async |connection| {
-        initialize(&connection).await?;
-        let session = new_session(&connection, fixture.project.path()).await?;
-        prompt(&connection, &session, "poke around").await?;
-        Ok(())
-    })
+    run_client(
+        &fixture.runtime,
+        Permission::Allow,
+        &log,
+        async |connection| {
+            initialize(&connection).await?;
+            let session = new_session(&connection, fixture.project.path()).await?;
+            prompt(&connection, &session, "poke around").await?;
+            Ok(())
+        },
+    )
     .await;
 
     let seen = fixture.provider.everything_seen();
     // The code outside the home is readable and found by grep ...
     assert!(seen.contains("needle in the code"), "{seen}");
     // ... the home's memory never reaches the model through any tool.
-    assert!(!seen.contains("secret memory"), "a file tool leaked the denied home: {seen}");
+    assert!(
+        !seen.contains("secret memory"),
+        "a file tool leaked the denied home: {seen}"
+    );
     // The direct read says why it was refused.
     assert!(seen.contains("off limits"), "{seen}");
 }
@@ -910,7 +934,11 @@ async fn without_a_denied_root_the_same_home_is_readable() {
     // the test above honest.
     let fixture = support::fixture_denying(
         vec![
-            tool_call_reply("r1", "read_file", json!({"path": ".rust-bot/workspace/memory/MEMORY.md"})),
+            tool_call_reply(
+                "r1",
+                "read_file",
+                json!({"path": ".rust-bot/workspace/memory/MEMORY.md"}),
+            ),
             text_reply("done"),
         ],
         |_| {},
@@ -921,12 +949,17 @@ async fn without_a_denied_root_the_same_home_is_readable() {
     );
     let log = Arc::new(ClientLog::default());
 
-    run_client(&fixture.runtime, Permission::Allow, &log, async |connection| {
-        initialize(&connection).await?;
-        let session = new_session(&connection, fixture.project.path()).await?;
-        prompt(&connection, &session, "read the memory").await?;
-        Ok(())
-    })
+    run_client(
+        &fixture.runtime,
+        Permission::Allow,
+        &log,
+        async |connection| {
+            initialize(&connection).await?;
+            let session = new_session(&connection, fixture.project.path()).await?;
+            prompt(&connection, &session, "read the memory").await?;
+            Ok(())
+        },
+    )
     .await;
 
     assert!(fixture.provider.everything_seen().contains("secret memory"));

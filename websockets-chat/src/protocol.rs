@@ -6,7 +6,7 @@
 //! side of the connection.
 //!
 //! * Outbound: [`ClientEnvelope`], currently `message`, `new_chat`,
-//!   `attach`, `list_chats`, `list_skills`, `list_mcp_presets`, `set_mcp_preset`, `list_directories`, `rename_chat`,
+//!   `attach`, `list_chats`, `list_skills`, `list_mcp_presets`, `set_mcp_preset`, `list_subagents`, `list_directories`, `rename_chat`,
 //!   `delete_chat`, `clear_session`, `get_session_summary`, `fork_chat`,
 //!   `set_workspace_scope`, and `abort_turn`.
 //! * Inbound: [`ServerEvent`], one variant per `event` value the gateway can
@@ -19,8 +19,8 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary, Role, SessionTokenUsage,
-    SkillSummary, ToolEvent, ToolSummary,
+    AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary, Role,
+    SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolEvent, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -327,6 +327,17 @@ impl ClientEnvelope {
             name: Some(name.into()),
             enabled: Some(enabled),
             fields: (!fields.is_empty()).then_some(fields),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway for the durable ACP child agents and the spawn tasks of the
+    /// gateway process, as `/subagents` lists them. Authenticated connections only — an
+    /// anonymous connection is answered with an `access_denied` error. The reply is a
+    /// `subagents` event (see [`ServerEvent::Subagents`]).
+    pub fn list_subagents() -> Self {
+        Self {
+            type_: "list_subagents",
             ..Self::list_skills()
         }
     }
@@ -930,6 +941,14 @@ pub enum ServerEvent {
         /// The list is read-only otherwise.
         can_modify: bool,
     },
+    /// Reply to a [`ClientEnvelope::list_subagents`] envelope: the durable ACP child
+    /// agents (`acp_enabled` is false when ACP is switched off on the gateway) and the
+    /// spawn tasks the connection may see. Not scoped to any one `chat_id`.
+    Subagents {
+        acp_enabled: bool,
+        agents: Vec<AcpAgentSummary>,
+        tasks: Vec<SpawnTaskSummary>,
+    },
     /// Reply to a successful [`ClientEnvelope::set_mcp_preset`]: the preset as it now
     /// stands, and whether a restart is needed for the change to take effect.
     McpPresetSet {
@@ -1068,6 +1087,7 @@ impl ServerEvent {
             | ServerEvent::SkillsList { .. }
             | ServerEvent::McpPresets { .. }
             | ServerEvent::McpPresetSet { .. }
+            | ServerEvent::Subagents { .. }
             | ServerEvent::McpPresetError { .. }
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatDeleted { .. }
@@ -1371,6 +1391,28 @@ struct McpPresetsWire {
 }
 
 #[derive(Deserialize)]
+struct SubagentsWire {
+    #[serde(default)]
+    acp: SubagentsAcpWire,
+    #[serde(default)]
+    spawn: SubagentsSpawnWire,
+}
+
+#[derive(Deserialize, Default)]
+struct SubagentsAcpWire {
+    #[serde(default)]
+    enabled: bool,
+    #[serde(default)]
+    agents: Vec<AcpAgentSummary>,
+}
+
+#[derive(Deserialize, Default)]
+struct SubagentsSpawnWire {
+    #[serde(default)]
+    tasks: Vec<SpawnTaskSummary>,
+}
+
+#[derive(Deserialize)]
 struct McpPresetSetWire {
     preset: McpPresetSummary,
     #[serde(default)]
@@ -1602,6 +1644,11 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             custom: w.custom,
             can_modify: w.can_modify,
         }),
+        "subagents" => decode::<SubagentsWire>(&value).map(|w| ServerEvent::Subagents {
+            acp_enabled: w.acp.enabled,
+            agents: w.acp.agents,
+            tasks: w.spawn.tasks,
+        }),
         "mcp_preset_set" => decode::<McpPresetSetWire>(&value).map(|w| ServerEvent::McpPresetSet {
             preset: w.preset,
             restart_required: w.restart_required,
@@ -1671,20 +1718,20 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             })
         }
         "tool_approval_resolved" => {
-            decode::<ToolApprovalResolvedWire>(&value).map(|w| {
-                ServerEvent::ToolApprovalResolved {
-                    chat_id: w.chat_id,
-                    request_id: w.request_id,
-                }
+            decode::<ToolApprovalResolvedWire>(&value).map(|w| ServerEvent::ToolApprovalResolved {
+                chat_id: w.chat_id,
+                request_id: w.request_id,
             })
         }
-        "question_request" => decode::<QuestionRequestWire>(&value).map(|w| ServerEvent::QuestionRequest {
-            chat_id: w.chat_id,
-            turn_id: w.turn_id,
-            request_id: w.request_id,
-            question: w.question,
-            options: w.options,
-        }),
+        "question_request" => {
+            decode::<QuestionRequestWire>(&value).map(|w| ServerEvent::QuestionRequest {
+                chat_id: w.chat_id,
+                turn_id: w.turn_id,
+                request_id: w.request_id,
+                question: w.question,
+                options: w.options,
+            })
+        }
         "question_resolved" => {
             decode::<QuestionResolvedWire>(&value).map(|w| ServerEvent::QuestionResolved {
                 chat_id: w.chat_id,
@@ -2508,6 +2555,90 @@ mod tests {
             panic!("expected McpPresets");
         };
         assert!(can_modify);
+    }
+
+    #[test]
+    fn parses_subagents_with_both_sections() {
+        let raw = r#"{"event":"subagents",
+            "acp":{"enabled":true,"agents":[{
+                "name":"planner","purpose":"Plans things","preset":"rustbot","depth":1,
+                "cwd":"C:/work","state":"idle","state_label":"idle",
+                "created_at":"2026-10-08T10:00:00+00:00","created_ago":"2d ago",
+                "created_by":"cli:direct","last_used":"2026-10-09T10:00:00+00:00",
+                "last_used_ago":"1d ago"}]},
+            "spawn":{"tasks":[{
+                "task_id":"t1","label":"research","task_summary":"Find things",
+                "status":"running","session_key":"websocket:abc",
+                "spawned_at":"2026-10-10T09:55:00+00:00","spawned_ago":"5m ago",
+                "finished_at":null,"finished_ago":null}]}}"#;
+        let ServerEvent::Subagents {
+            acp_enabled,
+            agents,
+            tasks,
+        } = parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected Subagents");
+        };
+        assert!(acp_enabled);
+        assert_eq!(agents.len(), 1);
+        assert_eq!(agents[0].name, "planner");
+        assert_eq!(agents[0].depth, 1);
+        assert_eq!(agents[0].cwd.as_deref(), Some("C:/work"));
+        assert_eq!(agents[0].last_used_ago.as_deref(), Some("1d ago"));
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].task_id, "t1");
+        assert_eq!(tasks[0].status, "running");
+        assert_eq!(tasks[0].session_key.as_deref(), Some("websocket:abc"));
+        assert_eq!(tasks[0].finished_at, None);
+    }
+
+    #[test]
+    fn parses_subagents_with_acp_off_and_no_tasks() {
+        let raw =
+            r#"{"event":"subagents","acp":{"enabled":false,"agents":[]},"spawn":{"tasks":[]}}"#;
+        let ServerEvent::Subagents {
+            acp_enabled,
+            agents,
+            tasks,
+        } = parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected Subagents");
+        };
+        assert!(!acp_enabled);
+        assert!(agents.is_empty() && tasks.is_empty());
+    }
+
+    #[test]
+    fn parses_subagents_when_sections_are_missing() {
+        let ServerEvent::Subagents {
+            acp_enabled,
+            agents,
+            tasks,
+        } = parse_server_event(r#"{"event":"subagents"}"#).expect("should parse")
+        else {
+            panic!("expected Subagents");
+        };
+        assert!(!acp_enabled);
+        assert!(agents.is_empty() && tasks.is_empty());
+    }
+
+    #[test]
+    fn subagents_has_no_scoping_chat_id() {
+        let event = ServerEvent::Subagents {
+            acp_enabled: true,
+            agents: Vec::new(),
+            tasks: Vec::new(),
+        };
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_list_subagents_serializes_expected_shape() {
+        let value = serde_json::to_value(ClientEnvelope::list_subagents()).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({"type": "list_subagents", "webui": true})
+        );
     }
 
     #[test]

@@ -51,9 +51,10 @@ pub fn ensure_nonempty_tool_result(tool_name: &str, content: Value) -> Value {
                 return Value::String(empty_tool_result_message(tool_name));
             }
             if let Some(text) = stringify_text_blocks(blocks)
-                && text.trim().is_empty() {
-                    return Value::String(empty_tool_result_message(tool_name));
-                }
+                && text.trim().is_empty()
+            {
+                return Value::String(empty_tool_result_message(tool_name));
+            }
             content
         }
 

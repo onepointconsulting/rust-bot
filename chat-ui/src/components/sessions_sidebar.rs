@@ -94,13 +94,60 @@ pub(crate) fn IconChatPlus() -> impl IntoView {
     }
 }
 
-/// Tailwind classes for the sidebar's "MCPs" button, highlighted while the MCP
-/// list is showing.
-fn mcps_button_class(active: bool) -> &'static str {
+/// Tailwind classes for a sidebar page button ("MCPs", "Sub-agents"), highlighted while
+/// its page is showing.
+fn nav_button_class(active: bool) -> &'static str {
     if active {
         "flex w-full items-center gap-2 rounded-xl bg-slate-200 px-3 py-2 text-sm font-medium text-slate-900"
     } else {
         "flex w-full items-center gap-2 rounded-xl px-3 py-2 text-sm font-medium text-slate-600 hover:bg-slate-100"
+    }
+}
+
+/// A full-width sidebar button that opens a list page, highlighted while that page is
+/// showing. The icon is passed as the children.
+#[component]
+fn SidebarNavButton(
+    label: &'static str,
+    #[prop(into)] active: Signal<bool>,
+    on_click: Callback<()>,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        <div class="px-2 pt-2">
+            <button
+                type="button"
+                class=move || nav_button_class(active.get())
+                aria-pressed=move || active.get().to_string()
+                on:click=move |_| on_click.run(())
+            >
+                {children()}
+                {label}
+            </button>
+        </div>
+    }
+}
+
+/// Two linked nodes, used by the sidebar's "Sub-agents" button.
+#[component]
+fn IconAgents() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <circle cx="12" cy="5" r="2.5" />
+            <circle cx="5" cy="19" r="2.5" />
+            <circle cx="19" cy="19" r="2.5" />
+            <path d="M12 7.5v4M12 11.5 6.2 16.8M12 11.5l5.8 5.3" />
+        </svg>
     }
 }
 
@@ -758,6 +805,14 @@ pub fn SessionsSidebar(
     /// render as selected.
     #[prop(into, default = Signal::stored(false))]
     mcps_active: Signal<bool>,
+    /// When set, a "Sub-agents" button is shown under "MCPs" that fires this callback
+    /// (websockets-chat opens its child agents and spawn tasks list). Omitted by
+    /// `web-chat` and for anonymous visitors.
+    #[prop(default = None)]
+    on_subagents: Option<Callback<()>>,
+    /// Whether the sub-agents list is currently showing.
+    #[prop(into, default = Signal::stored(false))]
+    subagents_active: Signal<bool>,
     /// When `true`, the header row shows the rust-bot logo + title instead of
     /// the "Chats" label.
     #[prop(default = false)]
@@ -985,17 +1040,20 @@ pub fn SessionsSidebar(
                 })}
                 {on_mcps.map(|on_mcps| {
                     view! {
-                        <div class="px-2 pt-2">
-                            <button
-                                type="button"
-                                class=move || mcps_button_class(mcps_active.get())
-                                aria-pressed=move || mcps_active.get().to_string()
-                                on:click=move |_| on_mcps.run(())
-                            >
-                                <IconPuzzle />
-                                "MCPs"
-                            </button>
-                        </div>
+                        <SidebarNavButton label="MCPs" active=mcps_active on_click=on_mcps>
+                            <IconPuzzle />
+                        </SidebarNavButton>
+                    }
+                })}
+                {on_subagents.map(|on_subagents| {
+                    view! {
+                        <SidebarNavButton
+                            label="Sub-agents"
+                            active=subagents_active
+                            on_click=on_subagents
+                        >
+                            <IconAgents />
+                        </SidebarNavButton>
                     }
                 })}
                 <div class="flex-1 overflow-y-auto px-2 py-2">
@@ -1535,11 +1593,11 @@ mod collapse_tooltip_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::mcps_button_class;
+    use super::nav_button_class;
 
     #[test]
-    fn mcps_button_class_highlights_only_when_active() {
-        assert!(mcps_button_class(true).contains("bg-slate-200"));
-        assert!(!mcps_button_class(false).contains("bg-slate-200"));
+    fn nav_button_class_highlights_only_when_active() {
+        assert!(nav_button_class(true).contains("bg-slate-200"));
+        assert!(!nav_button_class(false).contains("bg-slate-200"));
     }
 }

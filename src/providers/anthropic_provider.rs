@@ -260,9 +260,9 @@ impl AnthropicProvider {
                 if cur_c.is_array()
                     && let (Some(prev_arr), Some(cur_arr)) =
                         (prev_c.as_array_mut(), cur_c.as_array())
-                    {
-                        prev_arr.extend(cur_arr.iter().cloned());
-                    }
+                {
+                    prev_arr.extend(cur_arr.iter().cloned());
+                }
                 last["content"] = prev_c;
             } else {
                 merged.push(msg);
@@ -321,9 +321,10 @@ impl AnthropicProvider {
         match content {
             Some(v) if v.is_string() => {
                 if let Some(text) = v.as_str()
-                    && !text.is_empty() {
-                        blocks.push(json!({ "type": "text", "text": text }));
-                    }
+                    && !text.is_empty()
+                {
+                    blocks.push(json!({ "type": "text", "text": text }));
+                }
             }
             Some(v) if v.is_array() => {
                 for item in v.as_array().unwrap() {
@@ -606,9 +607,9 @@ impl AnthropicProvider {
                 .get("error")
                 .and_then(|error| error.get("message"))
                 .and_then(|message| message.as_str())
-            {
-                return format!("Anthropic API error ({status}): {message}");
-            }
+        {
+            return format!("Anthropic API error ({status}): {message}");
+        }
 
         let trimmed = body.trim();
         if trimmed.is_empty() {

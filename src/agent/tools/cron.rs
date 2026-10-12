@@ -101,9 +101,10 @@ impl CronTool {
         }
 
         if let Some(tz_name) = tz
-            && let Some(err) = Self::validate_timezone(tz_name) {
-                return err;
-            }
+            && let Some(err) = Self::validate_timezone(tz_name)
+        {
+            return err;
+        }
 
         let mut delete_after = false;
         let schedule = if let Some(secs) = every_seconds {

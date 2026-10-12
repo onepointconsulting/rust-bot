@@ -407,19 +407,20 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
         )
         .expect("duckduckgo base url failed");
         if let Ok(response) = self.client.get(url).send().await
-            && let Ok(body) = response.text().await {
-                let json = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
-                let related_topics = json
-                    .get("RelatedTopics")
-                    .and_then(Value::as_array)
-                    .cloned()
-                    .unwrap_or_default();
-                return flatten_ddg_topics(&related_topics)
-                    .iter()
-                    .take(count)
-                    .map(ddg_topic_to_result)
-                    .collect();
-            }
+            && let Ok(body) = response.text().await
+        {
+            let json = serde_json::from_str(&body).unwrap_or(serde_json::json!({}));
+            let related_topics = json
+                .get("RelatedTopics")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            return flatten_ddg_topics(&related_topics)
+                .iter()
+                .take(count)
+                .map(ddg_topic_to_result)
+                .collect();
+        }
         vec![]
     }
 
@@ -572,9 +573,11 @@ Count defaults to 5 (max 10). Use web_fetch to read a specific page in full."
             .map_err(|e| format!("Exa MCP response read failed: {e}"))?;
         if status.as_u16() == 429 {
             log::warn!("Exa free tier rate limit reached (429)");
-            return Err("Exa free tier rate limit reached (429). Configure provider \"exa\" \
+            return Err(
+                "Exa free tier rate limit reached (429). Configure provider \"exa\" \
 with EXA_API_KEY for unthrottled search."
-                .to_string());
+                    .to_string(),
+            );
         }
         if !status.is_success() {
             log::warn!("Exa MCP search failed with status {status}");
@@ -991,7 +994,10 @@ mod tests {
 
     #[test]
     fn parse_exa_mcp_rpc_reads_plain_json_body() {
-        assert_eq!(parse_exa_mcp_rpc(&mcp_rpc_json("payload")).unwrap(), "payload");
+        assert_eq!(
+            parse_exa_mcp_rpc(&mcp_rpc_json("payload")).unwrap(),
+            "payload"
+        );
     }
 
     #[test]

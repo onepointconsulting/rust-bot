@@ -8,10 +8,18 @@ use std::path::{Component, Path, PathBuf};
 #[derive(Debug)]
 pub enum ResolvePathError {
     HomeDirUnavailable,
-    NotUnderAllowedDir { path: PathBuf, allowed: PathBuf },
-    NotUnderAnyAllowedDir { path: PathBuf },
+    NotUnderAllowedDir {
+        path: PathBuf,
+        allowed: PathBuf,
+    },
+    NotUnderAnyAllowedDir {
+        path: PathBuf,
+    },
     /// The path lies inside a subtree the scope denies (another rust-bot's home).
-    InDeniedRoot { path: PathBuf, denied: PathBuf },
+    InDeniedRoot {
+        path: PathBuf,
+        denied: PathBuf,
+    },
 }
 
 impl ResolvePathError {
@@ -196,9 +204,10 @@ fn _resolve_path(
     }
 
     if !p.is_absolute()
-        && let Some(ref ws) = workspace {
-            p = ws.join(&p);
-        }
+        && let Some(ref ws) = workspace
+    {
+        p = ws.join(&p);
+    }
     // Soft-resolve so non-existent targets still collapse `..` before the
     // allowed-dir check (strict canonicalize alone is not enough).
     let resolved = soft_resolve(&p);
@@ -631,9 +640,10 @@ For large files, write an initial chunk with this tool, then append further sect
         };
 
         if let Some(parent) = fp.parent()
-            && let Err(e) = std::fs::create_dir_all(parent) {
-                return format!("Error writing file: {}", e);
-            }
+            && let Err(e) = std::fs::create_dir_all(parent)
+        {
+            return format!("Error writing file: {}", e);
+        }
 
         match std::fs::write(&fp, content.as_bytes()) {
             Ok(_) => format!(
@@ -1267,7 +1277,6 @@ mod tests {
         assert!(result.split("\n").count() <= limit);
     }
 
-
     // --- denied subtrees (a child working on a repo that holds a rust-bot home) ---
 
     /// A project folder with a file of its own and a rust-bot home inside it.
@@ -1276,7 +1285,11 @@ mod tests {
         fs::write(project.path().join("main.rs"), "fn main() {}\n").unwrap();
         let home = project.path().join(".rust-bot").join("workspace");
         fs::create_dir_all(home.join("memory")).unwrap();
-        fs::write(home.join("memory").join("MEMORY.md"), "the parent's secrets\n").unwrap();
+        fs::write(
+            home.join("memory").join("MEMORY.md"),
+            "the parent's secrets\n",
+        )
+        .unwrap();
         let project_path = project.path().canonicalize().unwrap();
         let home = home.canonicalize().unwrap();
         (project, project_path, home)
@@ -1309,11 +1322,22 @@ mod tests {
             let error = fs_config
                 .resolve(".rust-bot/workspace/memory/MEMORY.md")
                 .unwrap_err();
-            assert!(matches!(error, ResolvePathError::InDeniedRoot { .. }), "{error:?}");
-            assert!(error.describe().contains("off limits"), "{}", error.describe());
+            assert!(
+                matches!(error, ResolvePathError::InDeniedRoot { .. }),
+                "{error:?}"
+            );
+            assert!(
+                error.describe().contains("off limits"),
+                "{}",
+                error.describe()
+            );
             // The denied folder itself, and a `..` detour into it, are refused too.
             assert!(fs_config.resolve(".rust-bot/workspace").is_err());
-            assert!(fs_config.resolve("src/../.rust-bot/workspace/memory").is_err());
+            assert!(
+                fs_config
+                    .resolve("src/../.rust-bot/workspace/memory")
+                    .is_err()
+            );
         })
         .await;
     }
@@ -1339,7 +1363,10 @@ mod tests {
                 .execute(&serde_json::json!({"path": ".rust-bot/workspace/memory/MEMORY.md"}))
                 .await;
             assert!(!denied.contains("the parent's secrets"), "{denied}");
-            assert!(denied.contains("off limits") || denied.contains("InDeniedRoot"), "{denied}");
+            assert!(
+                denied.contains("off limits") || denied.contains("InDeniedRoot"),
+                "{denied}"
+            );
 
             let allowed = tool.execute(&serde_json::json!({"path": "main.rs"})).await;
             assert!(allowed.contains("fn main"), "{allowed}");
@@ -1353,7 +1380,9 @@ mod tests {
         let tool = ListDirTool::new(Some(project.clone()), Some(project.clone()), None);
 
         with_denied_scope(&project, &home, || async {
-            let flat = tool.execute(&serde_json::json!({"path": ".rust-bot"})).await;
+            let flat = tool
+                .execute(&serde_json::json!({"path": ".rust-bot"}))
+                .await;
             assert!(!flat.contains("workspace"), "{flat}");
             let recursive = tool
                 .execute(&serde_json::json!({"path": ".", "recursive": true}))

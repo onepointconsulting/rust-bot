@@ -113,9 +113,7 @@ fn pagination_note(limit: Option<usize>, offset: usize, truncated: bool) -> Opti
 
 fn matches_type(name: &str, file_type: Option<&str>) -> bool {
     match file_type {
-        None => {
-            true
-        }
+        None => true,
         Some(file_type) => {
             let lowered = file_type.trim().to_lowercase();
             if lowered.is_empty() {
@@ -763,11 +761,10 @@ impl Tool for GrepTool {
                 blocks.push(block);
             }
 
-            if output_mode == "count" && file_had_match
-                && !matching_files.contains(&display_path) {
-                    matching_files.push(display_path.clone());
-                    file_mtimes.insert(display_path.clone(), mtime);
-                }
+            if output_mode == "count" && file_had_match && !matching_files.contains(&display_path) {
+                matching_files.push(display_path.clone());
+                file_mtimes.insert(display_path.clone(), mtime);
+            }
             if matches!(output_mode, "count" | "files_with_matches") && file_had_match {
                 continue;
             }
@@ -1625,7 +1622,11 @@ mod tests {
         fs::write(project.path().join("main.rs"), "needle in the project\n").unwrap();
         let home = project.path().join(".rust-bot").join("workspace");
         fs::create_dir_all(home.join("memory")).unwrap();
-        fs::write(home.join("memory").join("MEMORY.md"), "needle in the secret\n").unwrap();
+        fs::write(
+            home.join("memory").join("MEMORY.md"),
+            "needle in the secret\n",
+        )
+        .unwrap();
         let root = project.path().canonicalize().unwrap();
         let home = home.canonicalize().unwrap();
         (project, root, home)
@@ -1678,9 +1679,13 @@ mod tests {
         let tool = GlobTool::new(Some(project.clone()), Some(project.clone()), None);
 
         with_denied_scope(&project, &home, || async {
-            let result = tool.execute(&serde_json::json!({"pattern": "**/*.md"})).await;
+            let result = tool
+                .execute(&serde_json::json!({"pattern": "**/*.md"}))
+                .await;
             assert!(!result.contains("MEMORY.md"), "{result}");
-            let result = tool.execute(&serde_json::json!({"pattern": "**/*.rs"})).await;
+            let result = tool
+                .execute(&serde_json::json!({"pattern": "**/*.rs"}))
+                .await;
             assert!(result.contains("main.rs"), "{result}");
         })
         .await;

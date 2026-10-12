@@ -513,10 +513,9 @@ impl EmailChannel {
                     }
                 }
             }
-            if mark_seen
-                && let Err(e) = session.uid_store(uid, "+FLAGS (\\Seen)").await {
-                    log::warn!("Email channel: Failed to mark message uid={uid} as seen: {e}");
-                }
+            if mark_seen && let Err(e) = session.uid_store(uid, "+FLAGS (\\Seen)").await {
+                log::warn!("Email channel: Failed to mark message uid={uid} as seen: {e}");
+            }
         }
 
         Ok(())
@@ -965,9 +964,7 @@ impl BaseChannel for EmailChannel {
 
         if !msg.metadata.is_empty() {
             let subject_option = msg.metadata.get("subject");
-            if subject_option.map(|v| v.is_string())
-                .unwrap_or(false)
-            {
+            if subject_option.map(|v| v.is_string()).unwrap_or(false) {
                 let override_subject = subject_option.and_then(|v| v.as_str()).unwrap_or("");
                 if !override_subject.is_empty() {
                     subject = override_subject.to_string();
@@ -1020,11 +1017,12 @@ impl BaseChannel for EmailChannel {
             .unwrap()
             .get(&to_addr)
             .cloned()
-            && !in_reply_to.trim().is_empty() {
-                builder = builder
-                    .in_reply_to(in_reply_to.clone())
-                    .references(in_reply_to);
-            }
+            && !in_reply_to.trim().is_empty()
+        {
+            builder = builder
+                .in_reply_to(in_reply_to.clone())
+                .references(in_reply_to);
+        }
 
         let email_msg = Self::build_email_message(msg, builder)?;
 

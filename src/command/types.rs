@@ -55,7 +55,6 @@ pub enum ChatCommand {
     Subagents,
 }
 
-
 impl std::str::FromStr for ChatCommand {
     type Err = ();
 
@@ -175,7 +174,10 @@ mod tests {
 
     #[test]
     fn subagents_parses_with_its_alias_and_displays_canonically() {
-        assert_eq!(ChatCommand::from_str("subagents"), Ok(ChatCommand::Subagents));
+        assert_eq!(
+            ChatCommand::from_str("subagents"),
+            Ok(ChatCommand::Subagents)
+        );
         assert_eq!(
             ChatCommand::from_str("list-subagents"),
             Ok(ChatCommand::Subagents)
@@ -206,13 +208,22 @@ mod tests {
         assert_eq!(SubagentsFilter::parse(""), Ok(SubagentsFilter::All));
         assert_eq!(SubagentsFilter::parse("   "), Ok(SubagentsFilter::All));
         assert_eq!(SubagentsFilter::parse("ALL"), Ok(SubagentsFilter::All));
-        assert_eq!(SubagentsFilter::parse(" Spawn "), Ok(SubagentsFilter::Spawn));
+        assert_eq!(
+            SubagentsFilter::parse(" Spawn "),
+            Ok(SubagentsFilter::Spawn)
+        );
         assert_eq!(SubagentsFilter::parse("acp"), Ok(SubagentsFilter::Acp));
     }
 
     #[test]
     fn filter_rejects_unknown_tokens_with_usage() {
-        assert_eq!(SubagentsFilter::parse("garbage"), Err(SubagentsFilter::USAGE));
-        assert_eq!(SubagentsFilter::parse("acp spawn"), Err(SubagentsFilter::USAGE));
+        assert_eq!(
+            SubagentsFilter::parse("garbage"),
+            Err(SubagentsFilter::USAGE)
+        );
+        assert_eq!(
+            SubagentsFilter::parse("acp spawn"),
+            Err(SubagentsFilter::USAGE)
+        );
     }
 }
