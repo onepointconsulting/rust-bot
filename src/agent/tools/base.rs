@@ -87,6 +87,21 @@ pub trait Tool: std::any::Any + Send + Sync {
         self.read_only() && !self.exclusive()
     }
 
+    /// Whether crash recovery may re-execute an interrupted call of this tool
+    /// with identical arguments.
+    ///
+    /// Contract: running the call twice must not produce a user-visible
+    /// duplicate effect **and** must not depend on state the first, interrupted
+    /// run may have changed. `read_only() == true` is necessary but not
+    /// sufficient (a read of a file the interrupted turn was still writing is
+    /// not replay safe). MCP and ACP tools are opaque and must stay `false`.
+    ///
+    /// Defaults to `false`: an interrupted call of a non-replay-safe tool is
+    /// never repeated, the model receives a synthetic "interrupted" result.
+    fn replay_safe(&self) -> bool {
+        false
+    }
+
     /// Update routing context for tools that send messages or spawn subagents.
     fn set_tool_context(&self, channel: &str, chat_id: &str, message_id: Option<&str>) {
         let _ = (channel, chat_id, message_id);

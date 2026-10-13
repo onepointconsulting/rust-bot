@@ -12,6 +12,7 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 - [Interactive console](#interactive-console) (including chat commands; see [docs/INTERACTIVE_CONSOLE.md](docs/INTERACTIVE_CONSOLE.md))
 - [Gmail support](#gmail-support) (see [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md))
 - [Configuration](#configuration)
+- [Durability](#durability) (crash recovery; see [docs/DURABILITY.md](docs/DURABILITY.md))
 - [Project layout](#project-layout)
 
 ---
@@ -141,7 +142,15 @@ The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TO
 
 ---
 
+## Durability
 
+The agent survives a process kill mid-turn: interrupted turns are resumed
+(gateway), tools that are not safe to repeat are never re-run, queued messages
+are not lost and redelivered messages do not start a second turn. See
+[docs/DURABILITY.md](docs/DURABILITY.md) for the guarantees, the recovery policy
+and the `durability` config keys.
+
+---
 
 ## Project layout
 

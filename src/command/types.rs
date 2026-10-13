@@ -124,18 +124,18 @@ impl ChatCommand {
     }
 
     pub const fn accepts_args(self) -> bool {
-        match self {
+        matches!(
+            self,
             ChatCommand::Model
-            | ChatCommand::ModelPreset
-            | ChatCommand::DreamLog
-            | ChatCommand::DreamRestore
-            | ChatCommand::McpPreset
-            | ChatCommand::Workspace
-            | ChatCommand::Mode
-            | ChatCommand::Goal
-            | ChatCommand::Subagents => true,
-            _ => false,
-        }
+                | ChatCommand::ModelPreset
+                | ChatCommand::DreamLog
+                | ChatCommand::DreamRestore
+                | ChatCommand::McpPreset
+                | ChatCommand::Workspace
+                | ChatCommand::Mode
+                | ChatCommand::Goal
+                | ChatCommand::Subagents
+        )
     }
 }
 

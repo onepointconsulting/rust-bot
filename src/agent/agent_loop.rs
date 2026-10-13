@@ -1,14 +1,14 @@
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
-use chrono::Utc;
+use chrono::{DateTime, Utc};
 use futures::FutureExt;
 use tera::Value;
 use tokio::sync::Mutex as AsyncMutex;
@@ -16,8 +16,10 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::agent::autocompact::Autocompact;
+use crate::agent::checkpoint_payload;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
+use crate::agent::crash_points::crash_point;
 use crate::agent::hook::{AgentHook, AgentHookContext, LoopHookChain, ToolHookDecision};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
@@ -25,8 +27,11 @@ use crate::agent::model_runtime::{
     ModelRuntime, ModelRuntimeResolver, SESSION_MODEL_PRESET_METADATA_KEY,
 };
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
+use crate::agent::recovery::{self, ToolRecovery, UnfinishedTurn};
+use crate::agent::resume::{self, ResumeAction, ResumePolicy};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
+use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
 use crate::agent::tool_progress::with_tool_progress;
 use crate::agent::tools::acp::{AcpToolsContext, register_acp_tools};
 use crate::agent::tools::cron::CronTool;
@@ -40,6 +45,7 @@ use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::turn_journal::TurnJournal;
 use crate::agent::workspace_context::{
     bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
 };
@@ -53,7 +59,7 @@ use crate::command::CommandContext;
 use crate::command::types::ChatCommand;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
-    ChannelsConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig,
+    ChannelsConfig, Config, DocxToolConfig, DurabilityConfig, ExecToolConfig, GmailToolConfig,
     ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, QuestionToolConfig,
     RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
 };
@@ -66,6 +72,10 @@ use crate::security::workspace_access::{
 };
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::goal_state;
+use crate::session::inbox::{self, InboxLedger, LedgerGuard, RedriveAction};
+use crate::session::journal::{
+    JournalRecord, JournalStore, RunJournal, ToolCallStatus, TurnOutcome,
+};
 use crate::session::keys::{COMMAND_KEY, RUNTIME_CHECKPOINT_KEY};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
@@ -300,6 +310,9 @@ impl AgentHook for LoopHook {
 /// 4. Executes tool calls
 /// 5. Sends responses back
 ///
+/// Join handles of in-flight tasks, keyed by their unique task id.
+type TaskJoinHandles = HashMap<u64, JoinHandle<()>>;
+
 pub struct AgentLoop {
     pub config: Config,
     bus: Arc<MessageBus>,
@@ -348,13 +361,18 @@ pub struct AgentLoop {
     acp_tools: Option<Arc<AcpToolsContext>>,
     /// In-flight per-session tasks, keyed by session then by a unique task id so
     /// each task can remove itself on completion (the `add_done_callback` analog).
-    pub active_tasks: Arc<AsyncMutex<HashMap<String, HashMap<u64, JoinHandle<()>>>>>,
+    pub active_tasks: Arc<AsyncMutex<HashMap<String, TaskJoinHandles>>>,
     /// Monotonic source of task ids for `active_tasks`.
     next_task_id: AtomicU64,
-    background_tasks: Arc<AsyncMutex<HashMap<u64, JoinHandle<()>>>>,
+    background_tasks: Arc<AsyncMutex<TaskJoinHandles>>,
     /// Monotonic source of task ids for `background_tasks`.
     next_background_task_id: AtomicU64,
     session_locks: Arc<AsyncMutex<HashMap<String, Arc<AsyncMutex<()>>>>>,
+    /// Crash-recovery settings (`durability` in the config).
+    durability: DurabilityConfig,
+    /// When this process started (Unix millis). Journal records older than
+    /// this belong to a previous process and are what recovery acts on.
+    process_started_ms: AtomicI64,
     _max: usize,
     running: AtomicBool,
     concurrency_gate: Option<Arc<Semaphore>>,
@@ -365,6 +383,17 @@ pub struct AgentLoop {
     /// nanobot's `_idle_compact_check_interval_s` (`loop.py:1099-1104`).
     idle_compact_check_interval: Duration,
     commands: CommandRouter,
+}
+
+/// Counts of what one startup resume pass did.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq)]
+pub struct ResumeSummary {
+    /// Turns handed to the resume driver.
+    pub resumed: usize,
+    /// Turns closed because they ran out of resume attempts (or were superseded).
+    pub abandoned: usize,
+    /// Turns left alone because they were too old.
+    pub stale: usize,
 }
 
 impl AgentLoop {
@@ -417,6 +446,12 @@ impl AgentLoop {
                 &agents_cfg,
             )))
         });
+        // Record every published inbound message durably and drop redeliveries.
+        let journal_store = session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .journal_store();
+        bus.set_inbound_guard(Arc::new(LedgerGuard::new(journal_store)));
         let runtime_resolver =
             Arc::new(ModelRuntimeResolver::new(config.clone(), provider.clone()));
         let subagents = Arc::new(
@@ -530,6 +565,8 @@ impl AgentLoop {
             background_tasks: Arc::new(AsyncMutex::new(HashMap::new())),
             next_background_task_id: AtomicU64::new(0),
             session_locks: Arc::new(AsyncMutex::new(HashMap::new())),
+            durability: config.durability.clone(),
+            process_started_ms: AtomicI64::new(Utc::now().timestamp_millis()),
             _max: max,
             concurrency_gate,
             consolidator,
@@ -750,7 +787,7 @@ impl AgentLoop {
         session_key: &str,
         project_path: &std::path::Path,
         access_mode: WorkspaceAccessMode,
-        workspace: &PathBuf,
+        workspace: &Path,
         restrict_to_workspace: bool,
     ) -> Result<WorkspaceScope, WorkspaceScopeError> {
         let scope = validate_workspace_scope_payload(
@@ -820,6 +857,7 @@ impl AgentLoop {
     }
 
     /// Register the default set of tools.
+    #[allow(clippy::too_many_arguments)]
     fn register_default_tools(
         tools: &mut ToolRegistry,
         restrict_to_workspace: bool,
@@ -833,7 +871,7 @@ impl AgentLoop {
         bus: Arc<MessageBus>,
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
-        workspace: &PathBuf,
+        workspace: &Path,
         session_manager: Arc<Mutex<SessionManager>>,
     ) {
         log::info!("Registering default tools");
@@ -844,7 +882,7 @@ impl AgentLoop {
             log::debug!("Registering exec tool");
             tools.register(Box::new(ShellTool::new(
                 exec_config.timeout as u64,
-                Some(workspace.clone()),
+                Some(workspace.to_path_buf()),
                 None,
                 None,
                 restrict_to_workspace,
@@ -863,7 +901,7 @@ impl AgentLoop {
         );
         register_conversion_tools(
             docx_config,
-            &FsToolConfig::new(Some(workspace.clone()), allowed_dir, Some(extra_read)),
+            &FsToolConfig::new(Some(workspace.to_path_buf()), allowed_dir, Some(extra_read)),
             tools,
         );
         register_image_generation_tools(image_generation_config, workspace, tools);
@@ -1080,6 +1118,11 @@ impl AgentLoop {
             cancelled += 1;
         }
         let sub_cancelled = self.subagents.cancel_by_session(&session_key).await;
+        // A stopped request must not be re-driven after a restart.
+        let ledger = InboxLedger::for_session(&self.journal_store(), &session_key);
+        for entry in ledger.pending() {
+            ledger.mark_entry_done(&entry, None);
+        }
         let total = cancelled + sub_cancelled;
         self.publish_turn_end(msg, None);
         total
@@ -1119,6 +1162,7 @@ impl AgentLoop {
     /// `on_stream_end(resuming)` is called when a streaming session finishes:
     /// `resuming = true` means tool calls follow (spinner should restart),
     /// `resuming = false` means this is the final response.
+    #[allow(clippy::too_many_arguments)]
     async fn run_agent_loop(
         self: &Arc<Self>,
         initial_messages: Vec<Value>,
@@ -1129,6 +1173,8 @@ impl AgentLoop {
         channel: &str,
         chat_id: &str,
         message_id: Option<&str>,
+        attempt: u32,
+        request_id: Option<String>,
     ) -> AgentRunResult {
         // The same progress callback, for tools that report while they block.
         let tool_progress = on_progress.clone();
@@ -1183,6 +1229,19 @@ impl AgentLoop {
         let workspace_scope_token = bind_workspace_scope(scope);
 
         let runner = AgentRunner::new(runtime.provider.clone());
+        let turn_journal = session_key.as_deref().map(|key| {
+            self.begin_turn_journal(
+                key,
+                &initial_messages,
+                channel,
+                chat_id,
+                attempt,
+                request_id.clone(),
+            )
+        });
+        // Aborting the turn (`/stop`) drops this future, which closes the turn as cancelled.
+        let turn_guard = turn_journal.as_ref().map(TurnJournal::guard);
+        let turn_journal_handle = turn_journal.clone();
         let result = with_tool_progress(
             tool_progress,
             runner.run(AgentRunSpec {
@@ -1210,9 +1269,27 @@ impl AgentLoop {
                 max_iterations_message: None,
                 max_tokens: Some(runtime.max_tokens as usize),
                 reasoning_effort: runtime.reasoning_effort.clone(),
+                journal: turn_journal,
             }),
         )
         .await;
+        crash_point("after_final_before_turn_end");
+        if let Some(turn_guard) = turn_guard {
+            turn_guard.finish(Self::turn_outcome(&result));
+            if let Some(journal) = &turn_journal_handle {
+                if let Err(e) = recovery::prune_journal(journal.journal()) {
+                    log::warn!("Failed to compact run journal: {e}");
+                }
+                let ledger_ttl = Duration::from_secs(self.durability.ledger_ttl_days * 86_400);
+                if let Err(e) = InboxLedger::new(Arc::clone(journal.journal())).compact(
+                    Utc::now(),
+                    ledger_ttl,
+                    self.durability.ledger_max_entries,
+                ) {
+                    log::warn!("Failed to compact inbox ledger: {e}");
+                }
+            }
+        }
         reset_workspace_scope(workspace_scope_token);
         *self.last_usage.lock().unwrap_or_else(|e| e.into_inner()) = result.usage;
         if result.stop_reason == "max_iterations" {
@@ -1244,6 +1321,397 @@ impl AgentLoop {
             }
         }
         result
+    }
+
+    /// Open the run journal of `session_key` and record the start of a new turn.
+    ///
+    /// The turn's user message goes into the journal because the session file
+    /// only receives it once the turn has finished.
+    fn begin_turn_journal(
+        &self,
+        session_key: &str,
+        initial_messages: &[Value],
+        channel: &str,
+        chat_id: &str,
+        attempt: u32,
+        request_id: Option<String>,
+    ) -> TurnJournal {
+        let turn = TurnJournal::new(
+            RunJournal::new(self.journal_store(), session_key),
+            uuid::Uuid::new_v4().to_string(),
+        );
+        let user_message = initial_messages
+            .iter()
+            .rev()
+            .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .cloned();
+        turn.append(
+            JournalRecord::TurnStart {
+                turn_id: turn.turn_id().to_string(),
+                session_key: session_key.to_string(),
+                request_id,
+                user_message,
+                attempt,
+                channel: Some(channel.to_string()),
+                chat_id: Some(chat_id.to_string()),
+            },
+            true,
+        );
+        crash_point("after_turn_start");
+        turn
+    }
+
+    /// Terminal journal outcome of a finished run.
+    fn turn_outcome(result: &AgentRunResult) -> TurnOutcome {
+        if result.stop_reason == "error" {
+            TurnOutcome::Failed
+        } else {
+            TurnOutcome::Completed
+        }
+    }
+
+    // ── crash recovery: resuming interrupted turns ────────────────────────────
+
+    /// Start of this process; recovery only touches records from before it.
+    fn process_start(&self) -> DateTime<Utc> {
+        DateTime::from_timestamp_millis(self.process_started_ms.load(Ordering::Relaxed))
+            .unwrap_or_else(Utc::now)
+    }
+
+    /// Turns that a previous run left unfinished, for the one-line notice of
+    /// the modes that do not auto-resume (interactive and one-shot `agent`).
+    pub fn unfinished_turn_count(&self) -> usize {
+        resume::count_unfinished_turns(self.journal_store().as_ref())
+    }
+
+    /// Where the shared session manager keeps the run journals.
+    fn journal_store(&self) -> Arc<dyn JournalStore> {
+        self.session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .journal_store()
+    }
+
+    /// Resume the turns that a crash left unfinished (gateway startup).
+    ///
+    /// Plans with [`resume::plan_resumes`] (cancelled, stale and out-of-attempts
+    /// turns are not resumed), then drives each resumable turn: replay-safe tool
+    /// calls are re-executed once, the rest are reported to the model as
+    /// interrupted, and the model is asked to continue. Resumes of different
+    /// sessions run in parallel up to `durability.maxConcurrentResumes`.
+    /// Resumed turns are not registered in `active_tasks`, so `/stop` cannot
+    /// abort them.
+    pub async fn resume_interrupted_turns(self: &Arc<Self>) -> ResumeSummary {
+        let journals = self.journal_store();
+        let policy = ResumePolicy::from_config(&self.durability);
+        let actions =
+            resume::plan_resumes(journals.as_ref(), Utc::now(), self.process_start(), &policy);
+        let mut summary = ResumeSummary::default();
+        let gate = Arc::new(Semaphore::new(
+            self.durability.max_concurrent_resumes.max(1),
+        ));
+        let mut tasks = Vec::new();
+        for action in actions {
+            match action {
+                ResumeAction::Abandon { turn } => {
+                    log::warn!(
+                        "abandoning turn={} session={} after {} resume attempt(s)",
+                        turn.turn_id,
+                        turn.session_key,
+                        turn.attempts
+                    );
+                    let journal = RunJournal::new(Arc::clone(&journals), &turn.session_key);
+                    TurnJournal::new(journal, turn.turn_id).record_turn_end(TurnOutcome::Abandoned);
+                    summary.abandoned += 1;
+                }
+                ResumeAction::Stale { turn } => {
+                    log::warn!(
+                        "not resuming stale turn={} session={} (started {})",
+                        turn.turn_id,
+                        turn.session_key,
+                        turn.started_at
+                    );
+                    summary.stale += 1;
+                }
+                ResumeAction::Resume { turn, attempt } => {
+                    summary.resumed += 1;
+                    let this = Arc::clone(self);
+                    let gate = Arc::clone(&gate);
+                    tasks.push(tokio::spawn(async move {
+                        let _permit = gate.acquire_owned().await.ok();
+                        this.resume_turn(turn, attempt).await;
+                    }));
+                }
+            }
+        }
+        for task in tasks {
+            let _ = task.await;
+        }
+        summary
+    }
+
+    /// Where the reply of `turn` goes: the journaled route, else the session key.
+    fn resume_route(turn: &UnfinishedTurn) -> Option<(String, String)> {
+        match (&turn.channel, &turn.chat_id) {
+            (Some(channel), Some(chat_id)) => Some((channel.clone(), chat_id.clone())),
+            _ => turn
+                .session_key
+                .split_once(':')
+                .map(|(channel, chat_id)| (channel.to_string(), chat_id.to_string())),
+        }
+    }
+
+    /// Resume one interrupted turn as attempt number `attempt`.
+    async fn resume_turn(self: Arc<Self>, turn: UnfinishedTurn, attempt: u32) {
+        // Tools read the ambient workspace scope, which every turn entry point establishes.
+        with_workspace_scope_stack(move || self.resume_turn_inner(turn, attempt)).await
+    }
+
+    async fn resume_turn_inner(self: Arc<Self>, turn: UnfinishedTurn, attempt: u32) {
+        let key = turn.session_key.clone();
+        let Some((channel, chat_id)) = Self::resume_route(&turn) else {
+            log::error!(
+                "turn {} of session {key} has no route; abandoning",
+                turn.turn_id
+            );
+            let journal = RunJournal::new(self.journal_store(), &key);
+            TurnJournal::new(journal, turn.turn_id).record_turn_end(TurnOutcome::Abandoned);
+            return;
+        };
+        // Same per-session serialization as `dispatch`.
+        let lock = {
+            let mut locks = self.session_locks.lock().await;
+            locks
+                .entry(key.clone())
+                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+                .clone()
+        };
+        let _guard = lock.lock().await;
+        log::warn!(
+            "resume turn={} attempt={attempt} session={key}",
+            turn.turn_id
+        );
+
+        self.replay_interrupted_calls(&key, &turn.turn_id, &channel, &chat_id)
+            .await;
+
+        // Merge the interrupted turn into the transcript (journal-first).
+        let mut session = {
+            let mut manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let journals = manager.journal_store();
+            let session = manager.get_or_create_session(&key);
+            let restored = self.restore_runtime_checkpoint(session, &journals);
+            let snapshot = session.clone();
+            if restored && let Err(e) = manager.save(snapshot.clone()) {
+                log::error!("Failed to save restored session: {e}");
+            }
+            snapshot
+        };
+        let history = session.get_history(Some(0));
+
+        // A turn that died after its final answer only lacks the delivery.
+        if let Some(answer) = Self::final_answer_of(&history) {
+            log::warn!(
+                "resume turn={}: answer already complete, delivering it",
+                turn.turn_id
+            );
+            self.close_resumed_request(&turn, &answer);
+            self.publish_resumed_reply(&channel, &chat_id, answer);
+            return;
+        }
+
+        self.set_tool_context(&channel, &chat_id, None);
+        // The system prompt only: the transcript already holds the turn so far.
+        let mut initial_messages = self.context.build_messages(
+            &[],
+            "",
+            None,
+            None,
+            Some(&channel),
+            Some(&chat_id),
+            Some(&session.metadata),
+            None,
+            DEFAULT_CURRENT_ROLE,
+            None,
+        );
+        initial_messages.truncate(1);
+        initial_messages.extend(history.iter().cloned());
+
+        let result = self
+            .run_agent_loop(
+                initial_messages,
+                None,
+                None,
+                None,
+                Some(session.clone()),
+                &channel,
+                &chat_id,
+                None,
+                attempt,
+                turn.request_id.clone(),
+            )
+            .await;
+        self.persist_finished_turn(
+            &mut session,
+            &result.messages,
+            1 + history.len() as u32,
+            result.usage,
+            "resuming turn",
+        );
+        let answer = result
+            .final_content
+            .filter(|content| !content.trim().is_empty())
+            .unwrap_or_else(|| EMPTY_FINAL_RESPONSE_MESSAGE.to_string());
+        self.close_resumed_request(&turn, &answer);
+        self.publish_resumed_reply(&channel, &chat_id, answer);
+    }
+
+    /// Mark the inbound request behind a resumed turn as answered in the ledger.
+    fn close_resumed_request(&self, turn: &UnfinishedTurn, answer: &str) {
+        let Some(request_id) = &turn.request_id else {
+            return;
+        };
+        let ledger = InboxLedger::for_session(&self.journal_store(), &turn.session_key);
+        if let Some(entry) = ledger
+            .entries()
+            .into_iter()
+            .find(|entry| &entry.request_id == request_id)
+        {
+            ledger.mark_entry_done(&entry, Some(answer.to_string()));
+        }
+    }
+
+    /// Re-drive inbound messages that were accepted before a crash but never
+    /// answered, and close ledger entries whose turn already ended.
+    ///
+    /// Runs after interrupted turns were resumed, so per session the resumed
+    /// turn goes first and queued messages follow in ledger order. Returns how
+    /// many messages were fed back to the agent.
+    pub fn redrive_pending_inbound(&self) -> usize {
+        let mut redriven = 0;
+        let cutoff = self.process_start();
+        for scan in self.journal_store().scan_all() {
+            let entries = scan.entries;
+            for action in inbox::plan_redrive(&entries) {
+                // Entries touched by this process are live, not left over from a crash.
+                if !resume::started_before_cutoff(action.entry().updated_at.as_str(), cutoff) {
+                    continue;
+                }
+                match action {
+                    RedriveAction::Keep(_) => {}
+                    RedriveAction::Close(entry) => {
+                        InboxLedger::for_session(&self.journal_store(), &entry.session_key)
+                            .mark_entry_done(&entry, None);
+                    }
+                    RedriveAction::Redrive(entry) => {
+                        let message = entry
+                            .message
+                            .clone()
+                            .and_then(|value| serde_json::from_value::<InboundMessage>(value).ok());
+                        let Some(message) = message else {
+                            log::error!("unreadable stored message for {}", entry.request_id);
+                            continue;
+                        };
+                        log::warn!("re-driving queued request {}", entry.request_id);
+                        if self.bus.republish_inbound(message).is_ok() {
+                            redriven += 1;
+                        }
+                    }
+                }
+            }
+        }
+        redriven
+    }
+
+    /// The text of the last message when it is a finished assistant answer.
+    fn final_answer_of(history: &[Value]) -> Option<String> {
+        let last = history.last()?;
+        let is_assistant = last.get("role").and_then(Value::as_str) == Some("assistant");
+        let wants_tools = last
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty());
+        let text = last.get("content").and_then(Value::as_str)?;
+        (is_assistant && !wants_tools && !text.trim().is_empty()).then(|| text.to_string())
+    }
+
+    /// Send the reply of a resumed turn to its chat.
+    fn publish_resumed_reply(&self, channel: &str, chat_id: &str, content: String) {
+        let outbound = OutboundMessage {
+            channel: channel.to_string(),
+            chat_id: chat_id.to_string(),
+            content,
+            reply_to: None,
+            media: vec![],
+            metadata: HashMap::new(),
+            event: None,
+        };
+        if let Err(e) = self.bus.publish_outbound(outbound) {
+            log::error!("Failed to publish resumed reply to {channel}:{chat_id}: {e}");
+        }
+    }
+
+    /// Re-execute the interrupted calls of `turn_id` that are replay safe and not
+    /// yet replayed, journaling each with the original arguments. The recorded
+    /// result is what the restored transcript then shows the model. Calls that
+    /// are not replay safe are never executed here.
+    async fn replay_interrupted_calls(
+        &self,
+        session_key: &str,
+        turn_id: &str,
+        channel: &str,
+        chat_id: &str,
+    ) {
+        let journal = RunJournal::new(self.journal_store(), session_key);
+        let states = recovery::tool_call_states(&journal.scan().entries);
+        let turn = TurnJournal::new(journal, turn_id);
+        let scope = {
+            let mut manager = self
+                .session_manager
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let metadata = manager.get_or_create_session(session_key).metadata.clone();
+            self.workspace_scopes.for_session(Some(&metadata))
+        };
+        let scope_token = bind_workspace_scope(scope);
+        for state in states.iter().filter(|state| state.turn_id == turn_id) {
+            let ToolRecovery::Replay { args } =
+                recovery::decide_tool_recovery(state, state.was_replayed())
+            else {
+                continue;
+            };
+            let tool = self
+                .tools
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .get(&state.tool_name);
+            // The registry is authoritative: a tool that no longer declares itself safe stays unrun.
+            let Some(tool) = tool.filter(|tool| tool.replay_safe()) else {
+                continue;
+            };
+            log::warn!(
+                "replaying interrupted call turn={turn_id} call={} tool={}",
+                state.call_id,
+                state.tool_name
+            );
+            self.set_tool_context(channel, chat_id, None);
+            let in_flight = turn.begin_tool_call(&state.call_id, &state.tool_name, &args, true);
+            let identity = ToolCallIdentity {
+                turn_id: turn_id.to_string(),
+                call_id: state.call_id.clone(),
+            };
+            let result = with_tool_call(identity, tool.execute(&args)).await;
+            let status = if result.starts_with("Error") {
+                ToolCallStatus::Error
+            } else {
+                ToolCallStatus::Done
+            };
+            in_flight.finish(status, result);
+        }
+        reset_workspace_scope(scope_token);
     }
 
     /// Persist the latest in-flight turn state into session metadata.
@@ -1304,6 +1772,19 @@ impl AgentLoop {
         self.running.store(true, Ordering::Relaxed);
         self.connect_mcp().await;
         log::info!("Agent loop started");
+        if self.durability.auto_resume {
+            let this = Arc::clone(self);
+            tokio::spawn(async move {
+                let summary = this.resume_interrupted_turns().await;
+                let redriven = this.redrive_pending_inbound();
+                log::info!(
+                    "journal: {} resumed, {} abandoned, {} stale unfinished turn(s); {redriven} queued message(s) re-driven",
+                    summary.resumed,
+                    summary.abandoned,
+                    summary.stale
+                );
+            });
+        }
         // Local to this call: `_check_expired_sessions_if_due`'s throttle gate
         // (`loop.py`'s `_next_idle_compact_check_at`) only needs to live for
         // one `run()` invocation, so a plain local avoids adding shared
@@ -1506,6 +1987,8 @@ impl AgentLoop {
         // cancellation path — `CmdStop` publishes `TurnEnd` itself because this
         // future never reaches the match below.
         let started_at = Instant::now();
+        let ledger = InboxLedger::for_session(&self.journal_store(), &session_key);
+        ledger.mark_processing(&msg);
         let processed = AssertUnwindSafe(Arc::clone(&self).process_message(
             msg.clone(),
             &session_key,
@@ -1518,11 +2001,14 @@ impl AgentLoop {
 
         match processed {
             Ok(Some(response)) => {
+                let reply = response.content.clone();
                 if let Err(e) = self.bus.publish_outbound(response) {
                     log::error!("Failed to publish outbound message: {e}");
                 }
+                ledger.mark_done(&msg, &reply, None);
             }
             Ok(None) if msg.channel == "cli" => {
+                ledger.mark_done(&msg, "", None);
                 let _ = self.bus.publish_outbound(OutboundMessage {
                     channel: msg.channel.clone(),
                     chat_id: msg.chat_id.clone(),
@@ -1533,8 +2019,9 @@ impl AgentLoop {
                     event: None,
                 });
             }
-            Ok(None) => {}
+            Ok(None) => ledger.mark_done(&msg, "", None),
             Err(panic) => {
+                ledger.mark_done(&msg, "Sorry, I encountered an error.", None);
                 log::error!(
                     "Error processing message for session {session_key}: {}",
                     panic
@@ -1618,8 +2105,9 @@ impl AgentLoop {
                 .session_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let journals = manager.journal_store();
             let session = manager.get_or_create_session(&key);
-            if self.restore_runtime_checkpoint(session) {
+            if self.restore_runtime_checkpoint(session, &journals) {
                 let restored = session.clone();
                 if let Err(e) = manager.save(restored) {
                     log::error!("Failed to save restored session: {e}");
@@ -1679,6 +2167,8 @@ impl AgentLoop {
                 channel,
                 chat_id,
                 msg.metadata.get("message_id").and_then(Value::as_str),
+                0,
+                None,
             )
             .await;
         let final_content = agent_run_result.final_content;
@@ -1976,8 +2466,9 @@ impl AgentLoop {
                 .session_manager
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
+            let journals = session_manager.journal_store();
             let session = session_manager.get_or_create_session(&key);
-            let restored = self.restore_runtime_checkpoint(session);
+            let restored = self.restore_runtime_checkpoint(session, &journals);
             // End the `&mut session` borrow before re-borrowing the manager to save.
             let snapshot = session.clone();
             if restored && let Err(e) = session_manager.save(snapshot.clone()) {
@@ -2130,6 +2621,8 @@ impl AgentLoop {
                 msg.channel.as_str(),
                 msg.chat_id.as_str(),
                 msg.metadata.get("message_id").and_then(Value::as_str),
+                0,
+                msg.request_id.clone(),
             )
             .await;
         let mut final_content = result.final_content.unwrap_or_default();
@@ -2224,7 +2717,59 @@ impl AgentLoop {
     /// only the portion not already present (suffix/prefix overlap detection
     /// keeps re-materialization idempotent). Returns whether anything was
     /// restored.
-    fn restore_runtime_checkpoint(&self, session: &mut Session) -> bool {
+    /// Merge the unfinished part of an interrupted turn into `session`.
+    ///
+    /// The run journal in `journals` is the source of truth; the
+    /// `RUNTIME_CHECKPOINT_KEY` metadata checkpoint is only read as a fallback for
+    /// sessions written before the journal existed. Returns whether the session
+    /// changed. Never executes a tool: calls that were cut off get their journaled
+    /// outcome or an "interrupted" result.
+    fn restore_runtime_checkpoint(
+        &self,
+        session: &mut Session,
+        journals: &Arc<dyn JournalStore>,
+    ) -> bool {
+        let from_journal = self.restore_from_journal(session, journals);
+        if from_journal {
+            // The journal wins: a leftover metadata checkpoint must not restore it twice.
+            self.clear_runtime_checkpoint(session);
+            return true;
+        }
+        self.restore_from_metadata_checkpoint(session)
+    }
+
+    /// Journal half of [`Self::restore_runtime_checkpoint`].
+    fn restore_from_journal(
+        &self,
+        session: &mut Session,
+        journals: &Arc<dyn JournalStore>,
+    ) -> bool {
+        let journal = RunJournal::new(Arc::clone(journals), &session.key);
+        let entries = journal.scan().entries;
+        let mut restored_any = false;
+        for turn_id in recovery::turns_to_restore(&entries) {
+            let turn_messages = recovery::turn_messages_for_restore(&entries, &turn_id);
+            log::warn!(
+                "restoring interrupted turn {turn_id} of session {}: {} message(s)",
+                session.key,
+                turn_messages.len()
+            );
+            if !turn_messages.is_empty() {
+                // `save_turn` skips the leading history; here there is none.
+                let framed: Vec<Value> =
+                    std::iter::once(Value::Null).chain(turn_messages).collect();
+                self.save_turn(session, &framed, 1);
+                restored_any = true;
+            }
+            if let Err(e) = journal.append(JournalRecord::TurnRestored { turn_id }) {
+                log::error!("Failed to mark turn restored in journal: {e}");
+            }
+        }
+        restored_any
+    }
+
+    /// Metadata-checkpoint half of [`Self::restore_runtime_checkpoint`] (pre-journal sessions).
+    fn restore_from_metadata_checkpoint(&self, session: &mut Session) -> bool {
         let Some(checkpoint) = session
             .metadata
             .get(RUNTIME_CHECKPOINT_KEY)
@@ -2233,62 +2778,9 @@ impl AgentLoop {
             return false;
         };
 
-        let mut restored_messages: Vec<Value> = Vec::new();
-
-        if let Some(assistant) = checkpoint
-            .get("assistant_message")
-            .and_then(Value::as_object)
-        {
-            let mut restored = assistant.clone();
-            restored
-                .entry("timestamp")
-                .or_insert_with(|| Value::String(Utc::now().to_rfc3339()));
-            restored_messages.push(Value::Object(restored));
-        }
-
-        if let Some(results) = checkpoint
-            .get("completed_tool_results")
-            .and_then(Value::as_array)
-        {
-            for message in results {
-                if let Some(obj) = message.as_object() {
-                    let mut restored = obj.clone();
-                    restored
-                        .entry("timestamp")
-                        .or_insert_with(|| Value::String(Utc::now().to_rfc3339()));
-                    restored_messages.push(Value::Object(restored));
-                }
-            }
-        }
-
-        if let Some(pending) = checkpoint
-            .get("pending_tool_calls")
-            .and_then(Value::as_array)
-        {
-            for tool_call in pending {
-                let Some(tool_call) = tool_call.as_object() else {
-                    continue;
-                };
-                let tool_id = tool_call.get("id").cloned().unwrap_or(Value::Null);
-                let name = tool_call
-                    .get("function")
-                    .and_then(Value::as_object)
-                    .and_then(|f| f.get("name"))
-                    .and_then(Value::as_str)
-                    .unwrap_or("tool")
-                    .to_string();
-                let mut obj = serde_json::Map::new();
-                obj.insert("role".into(), Value::String("tool".into()));
-                obj.insert("tool_call_id".into(), tool_id);
-                obj.insert("name".into(), Value::String(name));
-                obj.insert(
-                    "content".into(),
-                    Value::String("Error: Task interrupted before this tool finished.".into()),
-                );
-                obj.insert("timestamp".into(), Value::String(Utc::now().to_rfc3339()));
-                restored_messages.push(Value::Object(obj));
-            }
-        }
+        let mut restored_messages = checkpoint_payload::materialize(checkpoint, |_| {
+            checkpoint_payload::INTERRUPTED_RESULT.to_string()
+        });
 
         // Find the longest history suffix that already matches the restored
         // prefix; only the non-overlapping tail is appended.
@@ -2363,6 +2855,7 @@ impl AgentLoop {
         log::info!("Agent loop stopping ... shutting down");
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub async fn process_direct(
         self: Arc<Self>,
         content: &str,
@@ -2393,6 +2886,7 @@ impl AgentLoop {
             media,
             timestamp: Utc::now(),
             session_key_override: None,
+            request_id: None,
             metadata: HashMap::new(),
         };
         self.process_message(msg, session_key, on_progress, on_stream, on_stream_end)
@@ -2781,6 +3275,1067 @@ mod tests {
         ))
     }
 
+    // ── journal-backed restore ────────────────────────────────────────────────
+
+    fn make_loop_in(workspace: &Path) -> (Arc<AgentLoop>, Arc<dyn JournalStore>) {
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(PlaceholderProvider {
+            settings: GenerationSettings::new(),
+        });
+        let loop_ = Arc::new(AgentLoop::new(
+            Arc::new(MessageBus::new()),
+            provider,
+            workspace.to_path_buf(),
+            Config::default(),
+            None,
+            None,
+            None,
+        ));
+        let journals = loop_.journal_store();
+        (loop_, journals)
+    }
+
+    fn two_call_turn() -> Vec<Value> {
+        let call = |id: &str| json!({"id": id, "type": "function", "function": {"name": "t", "arguments": "{}"}});
+        vec![
+            json!({"role": "user", "content": "do two things"}),
+            json!({"role": "assistant", "content": null, "tool_calls": [call("a"), call("b")]}),
+        ]
+    }
+
+    /// Journal of a turn that died with call `a` finished and call `b` in flight.
+    fn write_crashed_turn(
+        journals: &Arc<dyn JournalStore>,
+        key: &str,
+        outcome: Option<TurnOutcome>,
+    ) {
+        use crate::session::journal::{StepKind, ToolCallStatus};
+        let journal = RunJournal::new(Arc::clone(journals), key);
+        let turn = two_call_turn();
+        journal
+            .append(JournalRecord::TurnStart {
+                turn_id: "t1".into(),
+                session_key: key.into(),
+                request_id: None,
+                user_message: Some(turn[0].clone()),
+                attempt: 0,
+                channel: None,
+                chat_id: None,
+            })
+            .unwrap();
+        journal
+            .append(JournalRecord::StepCheckpoint {
+                turn_id: "t1".into(),
+                step: StepKind::PreTool,
+                payload: checkpoint_payload::build("awaiting_tools", &turn),
+            })
+            .unwrap();
+        let tool = |call_id: &str, status, result: Option<&str>| JournalRecord::ToolIntent {
+            turn_id: "t1".into(),
+            call_id: call_id.into(),
+            tool_name: "t".into(),
+            args: json!({}),
+            replay_safe: false,
+            status,
+            result: result.map(str::to_string),
+        };
+        journal
+            .append(tool("a", ToolCallStatus::Intent, None))
+            .unwrap();
+        journal
+            .append(tool("a", ToolCallStatus::Done, Some("A-result")))
+            .unwrap();
+        journal
+            .append(tool("b", ToolCallStatus::Intent, None))
+            .unwrap();
+        if let Some(outcome) = outcome {
+            journal
+                .append(JournalRecord::TurnEnd {
+                    turn_id: "t1".into(),
+                    outcome,
+                })
+                .unwrap();
+        }
+    }
+
+    fn roles_and_contents(session: &Session) -> Vec<(String, String)> {
+        session
+            .messages
+            .iter()
+            .map(|m| {
+                (
+                    m["role"].as_str().unwrap_or_default().to_string(),
+                    m["content"].as_str().unwrap_or_default().to_string(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn restore_rebuilds_the_unfinished_turn_from_the_journal_including_the_user_message() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loop_, journals) = make_loop_in(dir.path());
+        write_crashed_turn(&journals, "t:1", None);
+        let mut session = Session::new("t:1".to_string());
+
+        assert!(loop_.restore_runtime_checkpoint(&mut session, &journals));
+
+        assert_eq!(
+            roles_and_contents(&session),
+            [
+                ("user".to_string(), "do two things".to_string()),
+                ("assistant".to_string(), String::new()),
+                ("tool".to_string(), "A-result".to_string()),
+                (
+                    "tool".to_string(),
+                    checkpoint_payload::INTERRUPTED_RESULT.to_string()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn restore_runs_once_per_turn_even_when_called_again() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loop_, journals) = make_loop_in(dir.path());
+        write_crashed_turn(&journals, "t:1", None);
+        let mut session = Session::new("t:1".to_string());
+
+        assert!(loop_.restore_runtime_checkpoint(&mut session, &journals));
+        let after_first = session.messages.len();
+        assert!(!loop_.restore_runtime_checkpoint(&mut session, &journals));
+        assert_eq!(session.messages.len(), after_first);
+    }
+
+    #[test]
+    fn restore_merges_a_stopped_turn_but_not_a_completed_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loop_, journals) = make_loop_in(dir.path());
+        write_crashed_turn(&journals, "stopped:1", Some(TurnOutcome::Cancelled));
+        write_crashed_turn(&journals, "done:1", Some(TurnOutcome::Completed));
+
+        let mut stopped = Session::new("stopped:1".to_string());
+        let mut done = Session::new("done:1".to_string());
+        assert!(loop_.restore_runtime_checkpoint(&mut stopped, &journals));
+        assert!(!loop_.restore_runtime_checkpoint(&mut done, &journals));
+        assert!(done.messages.is_empty());
+    }
+
+    #[test]
+    fn journal_wins_over_a_leftover_metadata_checkpoint_and_nothing_is_duplicated() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loop_, journals) = make_loop_in(dir.path());
+        write_crashed_turn(&journals, "t:1", None);
+        let mut session = Session::new("t:1".to_string());
+        session.metadata.insert(
+            RUNTIME_CHECKPOINT_KEY.to_string(),
+            checkpoint_payload::build("awaiting_tools", &two_call_turn()),
+        );
+
+        assert!(loop_.restore_runtime_checkpoint(&mut session, &journals));
+
+        assert_eq!(session.messages.len(), 4);
+        assert!(!session.metadata.contains_key(RUNTIME_CHECKPOINT_KEY));
+    }
+
+    #[test]
+    fn pre_journal_sessions_still_restore_from_the_metadata_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loop_, journals) = make_loop_in(dir.path());
+        let call =
+            json!({"id": "b", "type": "function", "function": {"name": "t", "arguments": "{}"}});
+        let mut session = Session::new("old:1".to_string());
+        session.metadata.insert(
+            RUNTIME_CHECKPOINT_KEY.to_string(),
+            json!({
+                "assistant_message": {"role": "assistant", "content": null, "tool_calls": [call.clone()]},
+                "completed_tool_results": [],
+                "pending_tool_calls": [call],
+            }),
+        );
+
+        assert!(loop_.restore_runtime_checkpoint(&mut session, &journals));
+
+        assert_eq!(session.messages.len(), 2);
+        assert_eq!(
+            session.messages[1]["content"],
+            checkpoint_payload::INTERRUPTED_RESULT
+        );
+        assert!(!session.metadata.contains_key(RUNTIME_CHECKPOINT_KEY));
+    }
+
+    #[test]
+    fn restore_with_neither_journal_nor_checkpoint_changes_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let (loop_, journals) = make_loop_in(dir.path());
+        let mut session = Session::new("fresh:1".to_string());
+        assert!(!loop_.restore_runtime_checkpoint(&mut session, &journals));
+        assert!(session.messages.is_empty());
+    }
+
+    // ── resuming interrupted turns ────────────────────────────────────────────
+
+    /// Provider that answers with a fixed text and records every request it receives.
+    struct RecordingProvider {
+        settings: GenerationSettings,
+        reply: String,
+        /// Responses handed out first, in order; `reply` is the fallback.
+        script: Mutex<Vec<LLMResponse>>,
+        requests: Arc<Mutex<Vec<Vec<Value>>>>,
+    }
+
+    impl RecordingProvider {
+        fn respond(&self, messages: Vec<Value>) -> LLMResponse {
+            self.requests.lock().unwrap().push(messages);
+            {
+                let mut script = self.script.lock().unwrap();
+                if !script.is_empty() {
+                    return script.remove(0);
+                }
+            }
+            LLMResponse {
+                content: Some(self.reply.clone()),
+                finish_reason: "stop".into(),
+                ..LLMResponse::new()
+            }
+        }
+    }
+
+    #[async_trait]
+    impl LLMProviderDyn for RecordingProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            String::new()
+        }
+        async fn chat(
+            &self,
+            messages: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.respond(messages)
+        }
+        async fn safe_chat(
+            &self,
+            messages: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.respond(messages)
+        }
+        async fn chat_with_retry(
+            &self,
+            messages: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.respond(messages)
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            messages: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+            _: Option<crate::providers::base::BoxedStreamCallback>,
+            _: Option<crate::providers::base::BoxedProgressCallback>,
+        ) -> LLMResponse {
+            self.respond(messages)
+        }
+    }
+
+    struct ResumeFixture {
+        _dir: tempfile::TempDir,
+        loop_: Arc<AgentLoop>,
+        journals: Arc<dyn JournalStore>,
+        requests: Arc<Mutex<Vec<Vec<Value>>>>,
+        note_path: PathBuf,
+    }
+
+    fn resume_fixture(config: Config) -> ResumeFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(RecordingProvider {
+            settings: GenerationSettings::new(),
+            reply: "all done".into(),
+            script: Mutex::new(Vec::new()),
+            requests: requests.clone(),
+        });
+        let loop_ = Arc::new(AgentLoop::new(
+            Arc::new(MessageBus::new()),
+            provider,
+            dir.path().to_path_buf(),
+            config,
+            None,
+            None,
+            None,
+        ));
+        let journals = loop_.journal_store();
+        let note_path = dir.path().join("note.txt");
+        std::fs::write(&note_path, "note body").unwrap();
+        ResumeFixture {
+            _dir: dir,
+            loop_,
+            journals,
+            requests,
+            note_path,
+        }
+    }
+
+    impl ResumeFixture {
+        /// Pretend the process restarted: everything journaled so far is from a previous run.
+        fn simulate_restart(&self) {
+            let later = Utc::now() + chrono::Duration::hours(1);
+            self.loop_
+                .process_started_ms
+                .store(later.timestamp_millis(), Ordering::Relaxed);
+        }
+    }
+
+    /// Journal of a turn that died with a safe `read_file` call and an unsafe
+    /// `exec` call both in flight.
+    fn write_turn_killed_mid_tools(fixture: &ResumeFixture, key: &str, attempt: u32) {
+        use crate::session::journal::StepKind;
+        let call = |id: &str, name: &str| json!({"id": id, "type": "function", "function": {"name": name, "arguments": "{}"}});
+        let turn = vec![
+            json!({"role": "user", "content": "read the note and run it"}),
+            json!({"role": "assistant", "content": null,
+                   "tool_calls": [call("c-read", "read_file"), call("c-exec", "exec")]}),
+        ];
+        fixture.simulate_restart();
+        let journal = RunJournal::new(Arc::clone(&fixture.journals), key);
+        let (channel, chat_id) = key.split_once(':').unwrap();
+        journal
+            .append(JournalRecord::TurnStart {
+                turn_id: "killed".into(),
+                session_key: key.into(),
+                request_id: None,
+                user_message: Some(turn[0].clone()),
+                attempt,
+                channel: Some(channel.into()),
+                chat_id: Some(chat_id.into()),
+            })
+            .unwrap();
+        journal
+            .append(JournalRecord::StepCheckpoint {
+                turn_id: "killed".into(),
+                step: StepKind::PreTool,
+                payload: checkpoint_payload::build("awaiting_tools", &turn),
+            })
+            .unwrap();
+        let intent =
+            |call_id: &str, tool: &str, args: Value, replay_safe: bool| JournalRecord::ToolIntent {
+                turn_id: "killed".into(),
+                call_id: call_id.into(),
+                tool_name: tool.into(),
+                args,
+                replay_safe,
+                status: ToolCallStatus::Intent,
+                result: None,
+            };
+        journal
+            .append(intent(
+                "c-read",
+                "read_file",
+                json!({"path": fixture.note_path.to_string_lossy()}),
+                true,
+            ))
+            .unwrap();
+        journal
+            .append(intent(
+                "c-exec",
+                "exec",
+                json!({"command": "echo hi"}),
+                false,
+            ))
+            .unwrap();
+    }
+
+    async fn next_reply(loop_: &AgentLoop) -> OutboundMessage {
+        tokio::time::timeout(Duration::from_secs(5), loop_.bus.consume_outbound())
+            .await
+            .expect("a resumed reply within 5s")
+            .expect("bus open")
+    }
+
+    #[tokio::test]
+    async fn resume_replays_safe_calls_interrupts_unsafe_ones_and_answers_once() {
+        let fixture = resume_fixture(Config::default());
+        write_turn_killed_mid_tools(&fixture, "chan:chat1", 0);
+
+        let summary = fixture.loop_.resume_interrupted_turns().await;
+
+        assert_eq!(
+            summary,
+            ResumeSummary {
+                resumed: 1,
+                ..Default::default()
+            }
+        );
+        let reply = next_reply(&fixture.loop_).await;
+        assert_eq!(
+            (reply.channel.as_str(), reply.chat_id.as_str()),
+            ("chan", "chat1")
+        );
+        assert_eq!(reply.content, "all done");
+
+        // One model request, carrying the user prompt, the safe call's re-run
+        // result and the interrupted marker for the unsafe call.
+        let requests = fixture.requests.lock().unwrap();
+        assert_eq!(requests.len(), 1);
+        let sent = &requests[0];
+        let tool_content = |id: &str| {
+            sent.iter()
+                .find(|m| m["tool_call_id"] == id)
+                .and_then(|m| m["content"].as_str())
+                .unwrap_or_default()
+                .to_string()
+        };
+        assert!(tool_content("c-read").contains("note body"), "{sent:?}");
+        assert_eq!(
+            tool_content("c-exec"),
+            checkpoint_payload::INTERRUPTED_RESULT
+        );
+        assert!(sent.iter().any(|m| {
+            m["role"] == "user"
+                && m["content"]
+                    .as_str()
+                    .is_some_and(|c| c.contains("read the note"))
+        }));
+    }
+
+    #[tokio::test]
+    async fn resume_persists_the_whole_turn_and_does_not_run_twice() {
+        let fixture = resume_fixture(Config::default());
+        write_turn_killed_mid_tools(&fixture, "chan:chat1", 0);
+
+        fixture.loop_.resume_interrupted_turns().await;
+        let again = fixture.loop_.resume_interrupted_turns().await;
+
+        assert_eq!(again, ResumeSummary::default());
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+        let session = fixture
+            .loop_
+            .session_manager
+            .lock()
+            .unwrap()
+            .get_or_create_session("chan:chat1")
+            .clone();
+        let roles: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "tool", "assistant"]);
+        assert_eq!(session.messages[4]["content"], "all done");
+    }
+
+    #[tokio::test]
+    async fn resume_skips_turns_that_were_stopped() {
+        let fixture = resume_fixture(Config::default());
+        write_turn_killed_mid_tools(&fixture, "chan:chat1", 0);
+        RunJournal::new(Arc::clone(&fixture.journals), "chan:chat1")
+            .append(JournalRecord::TurnEnd {
+                turn_id: "killed".into(),
+                outcome: TurnOutcome::Cancelled,
+            })
+            .unwrap();
+
+        let summary = fixture.loop_.resume_interrupted_turns().await;
+
+        assert_eq!(summary, ResumeSummary::default());
+        assert!(fixture.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn resume_honors_the_kill_switch() {
+        let mut config = Config::default();
+        config.durability.auto_resume = false;
+        let fixture = resume_fixture(config);
+        write_turn_killed_mid_tools(&fixture, "chan:chat1", 0);
+
+        let summary = fixture.loop_.resume_interrupted_turns().await;
+
+        assert_eq!(summary, ResumeSummary::default());
+        assert!(fixture.requests.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn a_poison_turn_is_abandoned_after_the_attempt_limit_and_never_calls_the_model() {
+        let fixture = resume_fixture(Config::default());
+        write_turn_killed_mid_tools(&fixture, "chan:chat1", 2);
+
+        let summary = fixture.loop_.resume_interrupted_turns().await;
+
+        assert_eq!(
+            summary,
+            ResumeSummary {
+                abandoned: 1,
+                ..Default::default()
+            }
+        );
+        assert!(fixture.requests.lock().unwrap().is_empty());
+        // The partial work is still merged when the session is next used.
+        let mut session = Session::new("chan:chat1".to_string());
+        assert!(
+            fixture
+                .loop_
+                .restore_runtime_checkpoint(&mut session, &fixture.journals)
+        );
+    }
+
+    #[tokio::test]
+    async fn a_turn_that_died_after_its_answer_only_redelivers_it() {
+        use crate::session::journal::StepKind;
+        let fixture = resume_fixture(Config::default());
+        fixture.simulate_restart();
+        let journal = RunJournal::new(Arc::clone(&fixture.journals), "chan:chat1");
+        let turn = vec![
+            json!({"role": "user", "content": "hi"}),
+            json!({"role": "assistant", "content": "the answer"}),
+        ];
+        journal
+            .append(JournalRecord::TurnStart {
+                turn_id: "t".into(),
+                session_key: "chan:chat1".into(),
+                request_id: None,
+                user_message: Some(turn[0].clone()),
+                attempt: 0,
+                channel: Some("chan".into()),
+                chat_id: Some("chat1".into()),
+            })
+            .unwrap();
+        journal
+            .append(JournalRecord::StepCheckpoint {
+                turn_id: "t".into(),
+                step: StepKind::Final,
+                payload: checkpoint_payload::build("final_response", &turn),
+            })
+            .unwrap();
+
+        fixture.loop_.resume_interrupted_turns().await;
+
+        assert_eq!(next_reply(&fixture.loop_).await.content, "the answer");
+        assert!(fixture.requests.lock().unwrap().is_empty());
+    }
+
+    // ── inbox ledger through the running loop ─────────────────────────────────
+
+    fn inbound_with_request_id(content: &str, request_id: &str) -> InboundMessage {
+        InboundMessage {
+            channel: "chan".into(),
+            sender_id: "user".into(),
+            chat_id: "chat1".into(),
+            content: content.into(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: HashMap::new(),
+            session_key_override: None,
+            request_id: Some(request_id.into()),
+        }
+    }
+
+    /// Next outbound message that satisfies `wanted`, skipping progress/turn events.
+    async fn next_outbound_where(
+        loop_: &AgentLoop,
+        wanted: impl Fn(&OutboundMessage) -> bool,
+    ) -> OutboundMessage {
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                let outbound = loop_.bus.consume_outbound().await.expect("bus open");
+                if wanted(&outbound) {
+                    return outbound;
+                }
+            }
+        })
+        .await
+        .expect("the expected outbound message within 5s")
+    }
+
+    /// Roles of the persisted transcript of `key`.
+    fn transcript_roles(fixture: &ResumeFixture, key: &str) -> Vec<String> {
+        let mut manager = fixture
+            .loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        manager
+            .get_or_create_session(key)
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or_default().to_string())
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn a_redelivered_request_runs_one_turn_and_gets_the_original_reply() {
+        let fixture = resume_fixture(Config::default());
+        let running = tokio::spawn({
+            let loop_ = fixture.loop_.clone();
+            async move { loop_.run().await }
+        });
+        let msg = inbound_with_request_id("hello", "chan:chat1:m1");
+
+        fixture.loop_.bus.publish_inbound(msg.clone()).unwrap();
+        let first = next_outbound_where(&fixture.loop_, |o| o.content == "all done").await;
+        assert!(!first.metadata.contains_key("_redelivered"));
+
+        // The ledger reaches Done after the reply is published; wait for it.
+        let ledger = InboxLedger::for_session(&fixture.journals, "chan:chat1");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ledger.pending().is_empty() || ledger.entries().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ledger entry closed");
+
+        fixture.loop_.bus.publish_inbound(msg).unwrap();
+        let replayed =
+            next_outbound_where(&fixture.loop_, |o| o.metadata.contains_key("_redelivered")).await;
+        assert_eq!(replayed.content, "all done");
+        assert_eq!(
+            transcript_roles(&fixture, "chan:chat1"),
+            ["user", "assistant"],
+            "exactly one model turn"
+        );
+
+        fixture.loop_.stop();
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn a_message_queued_before_a_crash_is_redriven_exactly_once() {
+        let fixture = resume_fixture(Config::default());
+        // The previous process accepted the message, then died before consuming it.
+        let msg = inbound_with_request_id("queued before the crash", "chan:chat1:m9");
+        let ledger = InboxLedger::for_session(&fixture.journals, "chan:chat1");
+        assert_eq!(ledger.admit(&msg), crate::session::inbox::Admission::New);
+        fixture.simulate_restart();
+
+        // `run()` resumes interrupted turns and then re-drives queued messages itself.
+        let running = tokio::spawn({
+            let loop_ = fixture.loop_.clone();
+            async move { loop_.run().await }
+        });
+        let reply = next_outbound_where(&fixture.loop_, |o| o.content == "all done").await;
+        assert_eq!(reply.chat_id, "chat1");
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !ledger.pending().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("ledger entry closed");
+
+        assert_eq!(fixture.loop_.redrive_pending_inbound(), 0);
+        assert_eq!(
+            transcript_roles(&fixture, "chan:chat1"),
+            ["user", "assistant"],
+            "exactly one model turn"
+        );
+        fixture.loop_.stop();
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn a_stopped_request_is_not_redriven_after_a_restart() {
+        let fixture = resume_fixture(Config::default());
+        let msg = inbound_with_request_id("long job", "chan:chat1:m3");
+        let ledger = InboxLedger::for_session(&fixture.journals, "chan:chat1");
+        ledger.admit(&msg);
+        ledger.mark_processing(&msg);
+        fixture.simulate_restart();
+
+        fixture.loop_.abort_session(&msg).await;
+
+        assert!(ledger.pending().is_empty());
+        assert_eq!(fixture.loop_.redrive_pending_inbound(), 0);
+    }
+
+    // ── crash sweep: kill at every boundary, restart, assert the invariants ───
+
+    /// Tool that counts how often it really ran; `safe` decides `replay_safe()`.
+    struct CountingProbe {
+        name: &'static str,
+        safe: bool,
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::agent::tools::base::Tool for CountingProbe {
+        fn name(&self) -> String {
+            self.name.to_string()
+        }
+        fn description(&self) -> String {
+            "counts executions".into()
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn replay_safe(&self) -> bool {
+            self.safe
+        }
+        async fn execute(&self, _: &Value) -> String {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            format!("{} ran", self.name)
+        }
+    }
+
+    fn tool_call_response(calls: &[(&str, &str)]) -> LLMResponse {
+        LLMResponse {
+            tool_calls: calls
+                .iter()
+                .map(|(id, name)| crate::providers::base::ToolCallRequest {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments: HashMap::new(),
+                    extra_content: None,
+                    provider_specific_fields: None,
+                    function_provider_specific_fields: None,
+                })
+                .collect(),
+            finish_reason: "tool_calls".into(),
+            ..LLMResponse::new()
+        }
+    }
+
+    fn text_response(text: &str) -> LLMResponse {
+        LLMResponse {
+            content: Some(text.to_string()),
+            finish_reason: "stop".into(),
+            ..LLMResponse::new()
+        }
+    }
+
+    /// One "process": an agent loop over `workspace` with a scripted model and
+    /// the two counting tools (a replay-safe one and an unsafe one).
+    struct CrashProcess {
+        loop_: Arc<AgentLoop>,
+        safe_runs: Arc<std::sync::atomic::AtomicUsize>,
+        unsafe_runs: Arc<std::sync::atomic::AtomicUsize>,
+        model_requests: Arc<Mutex<Vec<Vec<Value>>>>,
+    }
+
+    fn start_process(
+        workspace: &Path,
+        script: Vec<LLMResponse>,
+        safe_runs: Arc<std::sync::atomic::AtomicUsize>,
+        unsafe_runs: Arc<std::sync::atomic::AtomicUsize>,
+    ) -> CrashProcess {
+        let model_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(RecordingProvider {
+            settings: GenerationSettings::new(),
+            reply: "final".into(),
+            script: Mutex::new(script),
+            requests: model_requests.clone(),
+        });
+        let loop_ = Arc::new(AgentLoop::new(
+            Arc::new(MessageBus::new()),
+            provider,
+            workspace.to_path_buf(),
+            Config::default(),
+            None,
+            None,
+            None,
+        ));
+        {
+            let mut registry = loop_.tools.lock().unwrap();
+            registry.register(Box::new(CountingProbe {
+                name: "safe_probe",
+                safe: true,
+                runs: safe_runs.clone(),
+            }));
+            registry.register(Box::new(CountingProbe {
+                name: "unsafe_probe",
+                safe: false,
+                runs: unsafe_runs.clone(),
+            }));
+        }
+        CrashProcess {
+            loop_,
+            safe_runs,
+            unsafe_runs,
+            model_requests,
+        }
+    }
+
+    fn assistant_tool_call_ids(messages: &[Value]) -> Vec<String> {
+        messages
+            .iter()
+            .filter_map(|m| m["tool_calls"].as_array())
+            .flatten()
+            .filter_map(|call| call["id"].as_str().map(str::to_string))
+            .collect()
+    }
+
+    /// Kill the turn at `point` (the `nth` time it is reached), restart, and
+    /// check what recovery guarantees.
+    async fn crash_then_recover(point: &'static str, nth: usize) {
+        use futures::FutureExt;
+        use std::sync::atomic::AtomicUsize;
+        let workspace = tempfile::tempdir().unwrap();
+        let safe_runs = Arc::new(AtomicUsize::new(0));
+        let unsafe_runs = Arc::new(AtomicUsize::new(0));
+
+        // ── process 1: runs until the crash point ─────────────────────────────
+        let first = start_process(
+            workspace.path(),
+            vec![
+                tool_call_response(&[("c-safe", "safe_probe"), ("c-unsafe", "unsafe_probe")]),
+                text_response("final"),
+            ],
+            safe_runs.clone(),
+            unsafe_runs.clone(),
+        );
+        crate::agent::crash_points::arm(point, nth);
+        let crashed = AssertUnwindSafe(Arc::clone(&first.loop_).process_direct(
+            "run both probes",
+            Some("chan:chat1"),
+            Some("chan"),
+            Some("chat1"),
+            None,
+            None,
+            None,
+            None,
+        ))
+        .catch_unwind()
+        .await
+        .is_err();
+        crate::agent::crash_points::disarm();
+        assert!(crashed, "{point}#{nth}: the crash point was never reached");
+        let (safe_at_crash, unsafe_at_crash) = (
+            safe_runs.load(Ordering::SeqCst),
+            unsafe_runs.load(Ordering::SeqCst),
+        );
+        drop(first);
+
+        // ── process 2: restarts over the same workspace ───────────────────────
+        let second = start_process(
+            workspace.path(),
+            vec![text_response("final")],
+            safe_runs.clone(),
+            unsafe_runs.clone(),
+        );
+        // Anything journaled so far belongs to the dead process.
+        second.loop_.process_started_ms.store(
+            (Utc::now() + chrono::Duration::hours(1)).timestamp_millis(),
+            Ordering::Relaxed,
+        );
+        second.loop_.resume_interrupted_turns().await;
+
+        let transcript = second
+            .loop_
+            .session_manager
+            .lock()
+            .unwrap()
+            .get_or_create_session("chan:chat1")
+            .messages
+            .clone();
+        let label = format!("{point}#{nth}");
+
+        // One user prompt, one final answer, nothing lost or duplicated.
+        let count = |role: &str| transcript.iter().filter(|m| m["role"] == role).count();
+        assert_eq!(count("user"), 1, "{label}: user prompt exactly once");
+        assert_eq!(
+            transcript
+                .iter()
+                .filter(|m| m["role"] == "assistant" && m["content"] == "final")
+                .count(),
+            1,
+            "{label}: exactly one final answer: {transcript:?}"
+        );
+        // Every requested tool call has a result.
+        let results: Vec<&str> = transcript
+            .iter()
+            .filter_map(|m| m["tool_call_id"].as_str())
+            .collect();
+        for id in assistant_tool_call_ids(&transcript) {
+            assert!(
+                results.contains(&id.as_str()),
+                "{label}: {id} has no result"
+            );
+        }
+        // Replay budget: safe tools at most once more, unsafe tools never again.
+        assert!(
+            second.safe_runs.load(Ordering::SeqCst) <= safe_at_crash + 1,
+            "{label}: safe tool re-run more than once"
+        );
+        assert_eq!(
+            second.unsafe_runs.load(Ordering::SeqCst),
+            unsafe_at_crash,
+            "{label}: an unsafe tool was executed again by recovery"
+        );
+        // The answer was delivered exactly once.
+        let mut delivered = 0;
+        while let Ok(Some(out)) = tokio::time::timeout(
+            Duration::from_millis(100),
+            second.loop_.bus.consume_outbound(),
+        )
+        .await
+        {
+            if out.content == "final" {
+                delivered += 1;
+            }
+        }
+        assert_eq!(delivered, 1, "{label}: reply delivered once");
+
+        // Recovering again changes nothing.
+        let again = second.loop_.resume_interrupted_turns().await;
+        assert_eq!(again, ResumeSummary::default(), "{label}: second pass");
+        assert_eq!(
+            second
+                .loop_
+                .session_manager
+                .lock()
+                .unwrap()
+                .get_or_create_session("chan:chat1")
+                .messages
+                .len(),
+            transcript.len(),
+            "{label}: second pass changed the transcript"
+        );
+        let _ = second.model_requests;
+    }
+
+    #[tokio::test]
+    async fn crash_after_turn_start() {
+        crash_then_recover("after_turn_start", 0).await;
+    }
+
+    #[tokio::test]
+    async fn crash_before_the_model_request() {
+        crash_then_recover("before_model", 0).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_the_safe_tools_intent() {
+        crash_then_recover("after_intent", 0).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_the_unsafe_tools_intent() {
+        crash_then_recover("after_intent", 1).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_the_safe_tool_ran_before_its_terminal_record() {
+        crash_then_recover("before_terminal", 0).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_the_unsafe_tool_ran_before_its_terminal_record() {
+        crash_then_recover("before_terminal", 1).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_all_tools_finished_before_the_checkpoint() {
+        crash_then_recover("after_tools_before_checkpoint", 0).await;
+    }
+
+    #[tokio::test]
+    async fn crash_after_the_final_answer_before_the_turn_end_record() {
+        crash_then_recover("after_final_before_turn_end", 0).await;
+    }
+
+    #[tokio::test]
+    async fn a_normal_turn_leaves_only_the_transcript_and_an_empty_journal() {
+        let fixture = resume_fixture(Config::default());
+
+        let reply = Arc::clone(&fixture.loop_)
+            .process_direct(
+                "hello",
+                Some("chan:chat1"),
+                Some("chan"),
+                Some("chat1"),
+                None,
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("a reply");
+
+        assert_eq!(reply.content, "all done");
+        let mut manager = fixture.loop_.session_manager.lock().unwrap();
+        let session = manager.get_or_create_session("chan:chat1").clone();
+        let roles: Vec<&str> = session
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap())
+            .collect();
+        assert_eq!(roles, ["user", "assistant"]);
+        // No per-step metadata checkpoint any more, and nothing left to recover.
+        assert!(!session.metadata.contains_key(RUNTIME_CHECKPOINT_KEY));
+        let journal = RunJournal::new(Arc::clone(&fixture.journals), "chan:chat1");
+        assert!(journal.scan().entries.is_empty());
+    }
+
+    /// Names of every registered tool that declares `replay_safe() == true`.
+    fn replay_safe_tool_names(loop_: &AgentLoop) -> Vec<String> {
+        let registry = loop_.tools.lock().unwrap_or_else(|e| e.into_inner());
+        let mut names: Vec<String> = registry
+            .tool_names()
+            .into_iter()
+            .filter(|name| registry.get(name).is_some_and(|tool| tool.replay_safe()))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[test]
+    fn only_the_reviewed_read_only_tools_are_replay_safe() {
+        // Any new opt-in must be a deliberate edit of this list.
+        let loop_ = make_save_turn_loop(1000);
+        assert_eq!(
+            replay_safe_tool_names(&loop_),
+            ["glob", "grep", "list_dir", "read_file", "spawn"]
+        );
+    }
+
+    #[test]
+    fn side_effecting_tools_are_not_replay_safe() {
+        let loop_ = make_save_turn_loop(1000);
+        let registry = loop_.tools.lock().unwrap_or_else(|e| e.into_inner());
+        for name in ["message", "exec", "write_file", "edit_file"] {
+            if let Some(tool) = registry.get(name) {
+                assert!(!tool.replay_safe(), "{name} must not be replay safe");
+            }
+        }
+        assert!(registry.get("message").is_some());
+    }
+
     fn saved_content(msg: &Value) -> Option<&str> {
         msg.get("content").and_then(Value::as_str)
     }
@@ -3027,7 +4582,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session("test:workspace_scope_relative");
-        assert!(session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).is_none());
+        assert!(!session.metadata.contains_key(WORKSPACE_SCOPE_METADATA_KEY));
     }
 
     #[test]
@@ -3062,7 +4617,7 @@ mod tests {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
         let session = manager.get_or_create_session("test:workspace_scope_clear");
-        assert!(session.metadata.get(WORKSPACE_SCOPE_METADATA_KEY).is_none());
+        assert!(!session.metadata.contains_key(WORKSPACE_SCOPE_METADATA_KEY));
     }
 
     #[test]
@@ -3109,10 +4664,9 @@ mod tests {
             assert_eq!(mode, AgentMode::Standard);
             let session = manager.get_or_create_session(key);
             assert!(
-                session
+                !session
                     .metadata
-                    .get(SESSION_AGENT_MODE_METADATA_KEY)
-                    .is_none()
+                    .contains_key(SESSION_AGENT_MODE_METADATA_KEY)
             );
         }
     }
@@ -3130,10 +4684,9 @@ mod tests {
         assert!(err.contains("Unknown agent mode"));
         let session = manager.get_or_create_session("test:agent_mode_bad");
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_AGENT_MODE_METADATA_KEY)
-                .is_none()
+                .contains_key(SESSION_AGENT_MODE_METADATA_KEY)
         );
     }
 }

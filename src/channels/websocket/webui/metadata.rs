@@ -1,4 +1,4 @@
-/// Shared WebUI metadata keys
+//! Shared WebUI metadata keys
 
 pub const WEBUI_TURN_METADATA_KEY: &str = "webui_turn_id";
 pub const WEBUI_SYSTEM_COMMAND_TURN_PREFIX: &str = "webui-system:";

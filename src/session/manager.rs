@@ -3,7 +3,7 @@ use std::{
     fs::{self, File},
     io::{BufRead, BufReader, Write},
     path::{Path, PathBuf},
-    sync::{LazyLock, Mutex},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use chrono::{DateTime, Duration, NaiveDateTime, TimeZone, Utc};
@@ -20,7 +20,7 @@ use crate::{
     session::{
         GOAL_STATE_KEY, SESSION_TITLE_METADATA_KEY, SESSION_TOKEN_USAGE_KEY,
         SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, history_visibility::is_hidden_history_message,
-        keys::COMMAND_KEY,
+        journal::JournalStore, journal_file::FileJournalStore, keys::COMMAND_KEY,
     },
     utils::fs::write_atomic,
     utils::helpers::{
@@ -101,6 +101,13 @@ pub trait SessionStore: Send + Sync {
 
     /// Remove the archive of `key`. Idempotent.
     fn delete_archive(&self, key: &str) -> std::io::Result<()>;
+
+    /// Where this store keeps the durability run journals.
+    ///
+    /// The journal is part of what a store persists for a session: a store
+    /// backed by a database keeps its journals there too, so one backend holds
+    /// everything. [`Self::delete_session`] must remove the session's journal.
+    fn journal_store(&self) -> Arc<dyn JournalStore>;
 }
 
 /// [`SessionStore`] that keeps one JSONL file per session: a metadata line
@@ -108,6 +115,7 @@ pub trait SessionStore: Send + Sync {
 pub struct JSONLSessionStore {
     sessions_dir: PathBuf,
     legacy_sessions_dir: PathBuf,
+    journals: Arc<FileJournalStore>,
 }
 
 impl JSONLSessionStore {
@@ -116,6 +124,7 @@ impl JSONLSessionStore {
     /// and [`SessionStore::delete_session`] so old files are not left behind.
     pub fn new(sessions_dir: PathBuf, legacy_sessions_dir: PathBuf) -> Self {
         Self {
+            journals: FileJournalStore::shared(sessions_dir.clone()),
             sessions_dir,
             legacy_sessions_dir,
         }
@@ -406,7 +415,8 @@ impl SessionStore for JSONLSessionStore {
         for candidate in [self.session_path(key), self.legacy_session_path(key)] {
             remove_file_if_present(&candidate)?;
         }
-        self.delete_archive(key)
+        self.delete_archive(key)?;
+        self.journals.delete(key)
     }
 
     /// Appends one JSON line per message to the archive file, creating it on first use.
@@ -450,6 +460,10 @@ impl SessionStore for JSONLSessionStore {
 
     fn delete_archive(&self, key: &str) -> std::io::Result<()> {
         remove_file_if_present(&self.archive_path(key))
+    }
+
+    fn journal_store(&self) -> Arc<dyn JournalStore> {
+        self.journals.clone()
     }
 
     /// Reads only the first (metadata) line of every `*.jsonl` file.
@@ -1075,8 +1089,14 @@ impl SessionManager {
     /// which would leave the archived history behind.
     pub fn reset_session(&mut self, mut session: Session) -> std::io::Result<()> {
         self.store.delete_archive(&session.key)?;
+        self.store.journal_store().delete(&session.key)?;
         session.clear();
         self.save(session)
+    }
+
+    /// Where the run journals of this manager's sessions are kept.
+    pub fn journal_store(&self) -> Arc<dyn JournalStore> {
+        self.store.journal_store()
     }
 
     pub fn invalidate(&mut self, key: &str) -> Option<Session> {
@@ -1180,6 +1200,11 @@ impl SessionManager {
         new_session.metadata = metadata;
         new_session.last_consolidated = last_consolidated;
 
+        // A fork starts with a clean run journal, never a stale one of the same key.
+        self.store
+            .journal_store()
+            .delete(target_key)
+            .map_err(ForkSessionError::Io)?;
         self.save(new_session.clone())
             .map_err(ForkSessionError::Io)?;
         Ok(new_session)
@@ -1575,7 +1600,7 @@ mod tests {
         assert_eq!(usage.input_cost, Some(0.01));
         assert_eq!(usage.output_cost, Some(0.02));
         assert_eq!(usage.total_cost(), Some(0.03));
-        assert!(session.metadata.get(SESSION_TOKEN_USAGE_KEY).is_some());
+        assert!(session.metadata.contains_key(SESSION_TOKEN_USAGE_KEY));
     }
 
     #[test]
@@ -1828,7 +1853,7 @@ mod tests {
         );
         session.add_message("user", "x", Map::new());
         session.clear();
-        assert!(session.metadata.get(GOAL_STATE_KEY).is_none());
+        assert!(!session.metadata.contains_key(GOAL_STATE_KEY));
     }
 
     #[test]
@@ -1842,7 +1867,7 @@ mod tests {
         session.add_message("user", "x", Map::new());
         session.clear();
         assert!(session.usage().is_none());
-        assert!(session.metadata.get(SESSION_TOKEN_USAGE_KEY).is_none());
+        assert!(!session.metadata.contains_key(SESSION_TOKEN_USAGE_KEY));
     }
 
     #[test]
@@ -1855,10 +1880,9 @@ mod tests {
         session.add_message("user", "x", Map::new());
         session.clear();
         assert!(
-            session
+            !session
                 .metadata
-                .get(SessionManager::LAST_SUMMARY_KEY)
-                .is_none()
+                .contains_key(SessionManager::LAST_SUMMARY_KEY)
         );
     }
 
@@ -2023,9 +2047,11 @@ mod tests {
     #[test]
     fn from_agents_config_copies_eviction_settings() {
         let dir = tempfile::tempdir().unwrap();
-        let mut agents = crate::config::schema::AgentsConfig::default();
-        agents.session_eviction_threshold_hours = 12;
-        agents.session_eviction_cron_interval_hours = 3;
+        let agents = crate::config::schema::AgentsConfig {
+            session_eviction_threshold_hours: 12,
+            session_eviction_cron_interval_hours: 3,
+            ..Default::default()
+        };
         let mgr = SessionManager::from_agents_config(dir.path().join("ws"), &agents);
         assert_eq!(mgr.session_eviction_threshold_hours(), 12);
         assert_eq!(mgr.session_eviction_cron_interval_hours(), 3);
@@ -3084,6 +3110,59 @@ mod tests {
         assert_eq!(mgr.list_sessions().len(), 1);
     }
 
+    fn write_journal_for(mgr: &SessionManager, key: &str) {
+        use crate::session::journal::{JournalRecord, RunJournal, TurnOutcome};
+        RunJournal::new(mgr.journal_store(), key)
+            .append(JournalRecord::TurnEnd {
+                turn_id: "t".to_string(),
+                outcome: TurnOutcome::Completed,
+            })
+            .unwrap();
+    }
+
+    fn journal_exists(mgr: &SessionManager, key: &str) -> bool {
+        !mgr.journal_store().scan(key).entries.is_empty()
+    }
+
+    #[test]
+    fn journal_is_not_listed_as_a_session() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 0);
+        write_journal_for(&mgr, "src");
+
+        assert_eq!(mgr.list_sessions().len(), 1);
+    }
+
+    #[test]
+    fn delete_and_reset_session_remove_the_journal() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 0);
+        write_journal_for(&mgr, "src");
+        let session = mgr.get_session_internal("src").unwrap();
+        mgr.reset_session(session).unwrap();
+        assert!(!journal_exists(&mgr, "src"));
+
+        write_journal_for(&mgr, "src");
+        mgr.delete_session("src").unwrap();
+        assert!(!journal_exists(&mgr, "src"));
+    }
+
+    #[test]
+    fn fork_starts_without_a_journal_and_drops_a_stale_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        save_two_turn_session(&mut mgr, "src", 0);
+        write_journal_for(&mgr, "src");
+        write_journal_for(&mgr, "dst");
+
+        mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
+
+        assert!(journal_exists(&mgr, "src"), "the source keeps its journal");
+        assert!(!journal_exists(&mgr, "dst"));
+    }
+
     #[test]
     fn reset_session_wipes_messages_and_archive() {
         let dir = tempfile::tempdir().unwrap();
@@ -3248,6 +3327,7 @@ mod tests {
     struct InMemorySessionStore {
         sessions: Mutex<HashMap<String, Session>>,
         archives: Mutex<HashMap<String, Vec<Value>>>,
+        journals: Arc<crate::session::journal::InMemoryJournalStore>,
     }
 
     impl SessionStore for InMemorySessionStore {
@@ -3266,7 +3346,11 @@ mod tests {
         }
         fn delete_session(&self, key: &str) -> std::io::Result<()> {
             self.sessions.lock().unwrap().remove(key);
+            self.journals.delete(key)?;
             self.delete_archive(key)
+        }
+        fn journal_store(&self) -> Arc<dyn JournalStore> {
+            self.journals.clone()
         }
         fn append_archive(&self, key: &str, messages: &[Value]) -> std::io::Result<()> {
             self.archives

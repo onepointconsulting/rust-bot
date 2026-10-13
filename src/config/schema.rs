@@ -1735,6 +1735,10 @@ pub struct Config {
     #[serde(alias = "model_presets")]
     #[garde(dive)]
     pub model_presets: HashMap<String, ModelPresetConfig>,
+
+    /// Crash recovery: run journal, auto-resume of interrupted turns.
+    #[garde(dive)]
+    pub durability: DurabilityConfig,
 }
 
 impl Config {
@@ -1896,6 +1900,86 @@ impl Default for Config {
             subagent: SubagentConfig::default(),
             example_prompts: default_example_prompts(),
             model_presets: HashMap::new(),
+            durability: DurabilityConfig::default(),
+        }
+    }
+}
+
+// ── DurabilityConfig ────────────────────────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_resume_max_age_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_max_resume_attempts() -> u32 {
+    2
+}
+
+fn default_max_concurrent_resumes() -> usize {
+    4
+}
+
+fn default_ledger_ttl_days() -> u64 {
+    14
+}
+
+fn default_ledger_max_entries() -> usize {
+    1000
+}
+
+/// Crash-recovery settings (`durability` in the config file).
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DurabilityConfig {
+    /// Resume turns that a crash interrupted when the gateway or API starts.
+    /// Default: `true`. When `false` an interrupted turn is only merged into
+    /// the session transcript on the session's next message.
+    #[serde(default = "default_true")]
+    #[garde(skip)]
+    pub auto_resume: bool,
+
+    /// Turns older than this many seconds are not resumed (stale tool calls
+    /// would act on outdated state). Default: 86400 (24 h).
+    #[serde(default = "default_resume_max_age_secs")]
+    #[garde(skip)]
+    pub resume_max_age_secs: u64,
+
+    /// How often one turn may be resumed before it is abandoned, which stops a
+    /// turn that kills the process from crash-looping. Default: 2.
+    #[serde(default = "default_max_resume_attempts")]
+    #[garde(skip)]
+    pub max_resume_attempts: u32,
+
+    /// Interrupted turns resumed in parallel at startup. Default: 4.
+    #[serde(default = "default_max_concurrent_resumes")]
+    #[garde(skip)]
+    pub max_concurrent_resumes: usize,
+
+    /// How long the inbox ledger remembers an answered request id, in days.
+    /// A redelivery after that is processed again. Default: 14.
+    #[serde(default = "default_ledger_ttl_days")]
+    #[garde(skip)]
+    pub ledger_ttl_days: u64,
+
+    /// Most answered request ids the ledger keeps per session. Default: 1000.
+    #[serde(default = "default_ledger_max_entries")]
+    #[garde(skip)]
+    pub ledger_max_entries: usize,
+}
+
+impl Default for DurabilityConfig {
+    fn default() -> Self {
+        Self {
+            auto_resume: default_true(),
+            resume_max_age_secs: default_resume_max_age_secs(),
+            max_resume_attempts: default_max_resume_attempts(),
+            max_concurrent_resumes: default_max_concurrent_resumes(),
+            ledger_ttl_days: default_ledger_ttl_days(),
+            ledger_max_entries: default_ledger_max_entries(),
         }
     }
 }
@@ -1973,8 +2057,8 @@ pub struct AgentDefaults {
     pub dream: DreamConfig,
 }
 
-impl AgentDefaults {
-    pub fn default() -> Self {
+impl Default for AgentDefaults {
+    fn default() -> Self {
         Self {
             workspace: default_agent_workspace(),
             model: default_agent_model(),
@@ -1995,6 +2079,23 @@ impl AgentDefaults {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn durability_defaults_apply_when_the_section_or_its_keys_are_absent() {
+        let absent: Config = serde_json::from_str("{}").unwrap();
+        let partial: Config =
+            serde_json::from_str(r#"{"durability": {"maxResumeAttempts": 5}}"#).unwrap();
+
+        for durability in [&absent.durability, &partial.durability] {
+            assert!(durability.auto_resume);
+            assert_eq!(durability.resume_max_age_secs, 86_400);
+            assert_eq!(durability.max_concurrent_resumes, 4);
+            assert_eq!(durability.ledger_ttl_days, 14);
+            assert_eq!(durability.ledger_max_entries, 1000);
+        }
+        assert_eq!(absent.durability.max_resume_attempts, 2);
+        assert_eq!(partial.durability.max_resume_attempts, 5);
+    }
+
     use super::*;
 
     #[test]

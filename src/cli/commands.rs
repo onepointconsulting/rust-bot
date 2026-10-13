@@ -739,6 +739,17 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
         .map(|hook| vec![hook as Arc<dyn AgentHook>]);
     let agent_loop = init_agent_loop(&config, workspace, hooks);
 
+    // This mode does not resume on its own (a different invocation than the
+    // interrupted one); the interrupted work joins its session's transcript on
+    // that session's next message.
+    let unfinished_turns = agent_loop.unfinished_turn_count();
+    if unfinished_turns > 0 {
+        eprintln!(
+            "note: {unfinished_turns} turn(s) from a previous run were interrupted; \
+             they are added to their session the next time it is used (the gateway resumes them automatically)."
+        );
+    }
+
     if let Some(restart_notice) = consume_restart_notice_from_env()
         && should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str())
     {
@@ -1016,6 +1027,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
 /// Not routed through `discover_all`/`BUILTIN_CHANNELS`: that function
 /// returns type-erased `Box<dyn BaseChannel>`, but `run_gateway` needs the
 /// *concrete* `WebSocketChannel` to call its inherent `.router()` method.
+#[allow(clippy::too_many_arguments)]
 fn resolve_websocket_channel(
     config: &Config,
     bus: Arc<MessageBus>,
@@ -1756,7 +1768,7 @@ fn render_api_startup_message(
     host: &str,
     port: u16,
     model_name: &str,
-    workspace: &PathBuf,
+    workspace: &Path,
     session_id: &str,
     timeout: &u64,
     web_root: Option<&std::path::Path>,
@@ -1866,6 +1878,7 @@ fn with_question_tool<F: FnOnce(&QuestionTool) -> R, R>(agent_loop: &AgentLoop, 
         .map(f)
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn message_session(
     message: &str,
     media: Vec<String>,
@@ -2625,7 +2638,7 @@ mod tests {
     #[test]
     fn resolve_websocket_channel_is_none_when_key_absent() {
         let config = Config::default();
-        assert!(config.channels.extra.get(CHANNEL_NAME).is_none());
+        assert!(!config.channels.extra.contains_key(CHANNEL_NAME));
 
         let resolved = resolve_websocket_channel(
             &config,

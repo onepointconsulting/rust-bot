@@ -413,6 +413,9 @@ fn configure_chat_channels(config: &mut Config, config_path: PathBuf) -> Result<
     Ok(config.clone())
 }
 
+// Field-by-field fill is intentional: prompts run in order and `?` exits early,
+// so a single struct-literal initializer does not fit this flow.
+#[allow(clippy::field_reassign_with_default)]
 fn configure_mail_channel(config: &mut Config) -> Result<Config, CliError> {
     let mut email = EmailConfig::default();
 

@@ -28,7 +28,7 @@ pub type HeartbeatExecuteCallback =
 pub type HeartbeatNotifyCallback =
     Arc<dyn Fn(&str) -> Pin<Box<dyn Future<Output = Result<(), String>> + Send>> + Send + Sync>;
 
-const HEARTBEAT_TOOL: LazyLock<Vec<serde_json::Value>> = LazyLock::new(|| {
+static HEARTBEAT_TOOL: LazyLock<Vec<serde_json::Value>> = LazyLock::new(|| {
     vec![serde_json::json!({
         "type": "function",
         "function": {
@@ -81,6 +81,7 @@ pub struct HeartbeatService {
 }
 
 impl HeartbeatService {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         workspace: PathBuf,
         provider: Arc<dyn LLMProviderDyn>,

@@ -669,10 +669,9 @@ mod tests {
         handler.persist_scope(&mut sessions, "chat-1", &scope, "");
         let session = sessions.get_or_create_session("websocket:chat-1");
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY)
-                .is_none()
+                .contains_key(SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY)
         );
     }
 }

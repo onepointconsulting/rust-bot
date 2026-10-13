@@ -23,6 +23,7 @@ use crate::{
     session::manager::SessionManager,
 };
 
+#[allow(clippy::too_many_arguments)]
 pub async fn handle_message(
     sender_id: &str,
     chat_id: &str,
@@ -48,6 +49,7 @@ pub async fn handle_message(
     if supports_streaming {
         meta.insert("_wants_stream".to_string(), serde_json::json!(true));
     }
+    let request_id = InboundMessage::request_id_from_metadata(channel_name, chat_id, &meta);
     let message = InboundMessage {
         channel: channel_name.to_string(),
         sender_id: sender_id.to_string(),
@@ -57,6 +59,7 @@ pub async fn handle_message(
         media: media.unwrap_or_default(),
         metadata: meta,
         session_key_override: session_key,
+        request_id,
     };
     if let Err(e) = bus.publish_inbound(message) {
         let msg = format!("Failed to publish inbound message to bus: {}", e);
@@ -69,6 +72,7 @@ pub async fn handle_message(
 /// Abstract base class for chat channel implementations.
 /// Each channel (Telegram, Discord, etc.) should implement this interface
 /// to integrate with the nanobot message bus.
+#[allow(clippy::too_many_arguments)]
 #[async_trait]
 pub trait BaseChannel: std::any::Any + Send + Sync {
     /// Channel name

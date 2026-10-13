@@ -280,6 +280,7 @@ fn normalize_schema_for_openai_inner(schema: &Value) -> Value {
 
 /// Error returned by [`connect_mcp_server`].
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum ConnectMcpError {
     /// No transport type could be determined from the config.
     UnknownTransport,
@@ -377,6 +378,7 @@ async fn connect_stdio(config: &McpServerConfig) -> Result<McpClient, ConnectMcp
 /// Stateless servers are accepted. The MCP spec lets a server decline to hand out a
 /// session id, and some hosted servers do (Firecrawl's keyless endpoint, for one).
 /// Requiring one made the handshake fail with "Missing session id in HTTP response".
+#[allow(clippy::result_large_err)]
 fn http_transport_config(
     config: &McpServerConfig,
 ) -> Result<StreamableHttpClientTransportConfig, ConnectMcpError> {
@@ -461,6 +463,7 @@ pub async fn connect_mcp_servers_independently(
 
 /// Failure to connect or list tools when building [`LoadedMcpTools`].
 #[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
 pub enum LoadMcpToolsError {
     Connect(ConnectMcpError),
     ListTools(ServiceError),

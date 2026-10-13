@@ -275,6 +275,10 @@ impl GlobTool {
 
 #[async_trait]
 impl Tool for GlobTool {
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "glob".to_string()
     }
@@ -465,6 +469,10 @@ impl GrepTool {
 
 #[async_trait]
 impl Tool for GrepTool {
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "grep".to_string()
     }
@@ -828,9 +836,10 @@ impl Tool for GrepTool {
             } else {
                 notes.push(format!("(pagination: offset={offset})"));
             }
-        } else if matches!(output_mode, "count" | "files_with_matches") && offset > 0 {
-            notes.push(format!("(pagination: offset={offset})"));
-        } else if output_mode == "content" && offset > 0 && !blocks.is_empty() {
+        } else if offset > 0
+            && (matches!(output_mode, "count" | "files_with_matches")
+                || (output_mode == "content" && !blocks.is_empty()))
+        {
             notes.push(format!("(pagination: offset={offset})"));
         }
         if skipped_binary > 0 {

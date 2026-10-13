@@ -398,7 +398,7 @@ pub struct GmailEmailsTool {
     common: GmailToolCommon,
 }
 
-fn show_error_and_exit(path: &PathBuf) {
+fn show_error_and_exit(path: &Path) {
     let error_message = format!(
         "ERROR: {} not found. Make sure this path exists.",
         path.display()

@@ -76,6 +76,7 @@ impl CronTool {
     }
 
     /// Add a scheduled job (Python `_add_job`).
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_job(
         &self,
         name: Option<&str>,

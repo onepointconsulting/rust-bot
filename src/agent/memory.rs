@@ -629,7 +629,7 @@ impl MemoryStore {
         }
     }
 
-    fn write_safe(content: &str, path: &PathBuf) {
+    fn write_safe(content: &str, path: &Path) {
         // Atomic: a kill mid-write must not leave MEMORY.md, SOUL.md or USER.md truncated.
         if let Err(e) = write_atomic(path, content.as_bytes()) {
             log::error!("Failed to write file: {} due to {}", path.display(), e);

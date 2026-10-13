@@ -448,6 +448,7 @@ impl AnthropicProvider {
         }))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_args(
         &self,
         messages: &[serde_json::Value],

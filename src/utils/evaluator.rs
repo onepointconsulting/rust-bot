@@ -1,3 +1,8 @@
+//! Post-run evaluation for background tasks (heartbeat & cron).
+//!
+//! After the agent executes a background task, this module makes a lightweight
+//! LLM call to decide whether the result warrants notifying the user.
+
 use std::sync::{Arc, LazyLock};
 
 use tera::Context;
@@ -5,12 +10,7 @@ use tera::Context;
 use crate::providers::base::LLMProviderDyn;
 use crate::utils::prompt_templates::render_template;
 
-/// Post-run evaluation for background tasks (heartbeat & cron).
-///
-/// After the agent executes a background task, this module makes a lightweight
-/// LLM call to decide whether the result warrants notifying the user.
-
-const EVALUATE_TOOL: LazyLock<Vec<serde_json::Value>> = LazyLock::new(|| {
+static EVALUATE_TOOL: LazyLock<Vec<serde_json::Value>> = LazyLock::new(|| {
     vec![serde_json::json!({
         "type": "function",
         "function": {

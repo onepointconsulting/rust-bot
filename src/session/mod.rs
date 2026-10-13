@@ -1,6 +1,9 @@
 pub mod automation_turns;
 pub mod goal_state;
 pub mod history_visibility;
+pub mod inbox;
+pub mod journal;
+pub mod journal_file;
 pub mod keys;
 pub mod manager;
 pub mod websocket_turns;

@@ -42,12 +42,14 @@ static BDKIM_MATCH: LazyLock<Regex> =
 type ImapTlsStream = TlsStream<TcpStream>;
 
 /// Unauthenticated IMAP client over plain TCP or implicit TLS.
+#[allow(clippy::large_enum_variant)]
 enum ImapClient {
     Plain(Client<TcpStream>),
     Tls(Client<ImapTlsStream>),
 }
 
 /// Authenticated IMAP session over plain TCP or implicit TLS.
+#[allow(clippy::large_enum_variant)]
 enum ImapSession {
     Plain(Session<TcpStream>),
     Tls(Session<ImapTlsStream>),
@@ -186,14 +188,13 @@ impl ImapSession {
 }
 
 /// Email channel.
-
+///
 /// Inbound:
-///- Poll IMAP mailbox for unread messages.
-///- Convert each message into an inbound event.
-
+/// - Poll IMAP mailbox for unread messages.
+/// - Convert each message into an inbound event.
+///
 /// Outbound:
-///- Send responses via SMTP back to the sender address.
-///- Send responses via SMTP back to the sender address.
+/// - Send responses via SMTP back to the sender address.
 pub struct EmailChannel {
     base: BaseChannelCommon,
     channels_config: ChannelsConfig,
@@ -335,6 +336,7 @@ impl EmailChannel {
         result.map(|_| messages.clone())
     }
 
+    #[allow(clippy::too_many_arguments)]
     async fn fetch_messages_once_with_session(
         &self,
         session: &mut ImapSession,

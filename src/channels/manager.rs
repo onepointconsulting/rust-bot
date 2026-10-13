@@ -407,18 +407,18 @@ impl ChannelManager {
             }
 
             let metadata = msg.metadata.clone();
-            if metadata.get("_progress").is_some() {
-                if metadata.get("_tool_hint").is_some() && !overrides.send_tool_hints {
+            if metadata.contains_key("_progress") {
+                if metadata.contains_key("_tool_hint") && !overrides.send_tool_hints {
                     continue;
                 }
-                if metadata.get("_tool_hint").is_none() && !overrides.send_progress {
+                if !metadata.contains_key("_tool_hint") && !overrides.send_progress {
                     continue;
                 }
             }
 
             // Coalesce consecutive _stream_delta messages for the same (channel, chat_id)
             // to reduce API calls and improve streaming latency
-            if metadata.get("_stream_delta").is_some() && metadata.get("_stream_end").is_none() {
+            if metadata.contains_key("_stream_delta") && !metadata.contains_key("_stream_end") {
                 let (message, extra_pending) = Self::coalesce_stream_deltas(&bus, &msg);
                 pending.extend(extra_pending);
                 msg = message;
@@ -449,10 +449,10 @@ impl ChannelManager {
             };
             let same_target = (next_msg.channel.clone(), next_msg.chat_id.clone()) == target_key;
             let metadata = next_msg.metadata.clone();
-            let is_delta = metadata.get("_stream_delta").is_some();
-            let is_end = metadata.get("_stream_end").is_some();
+            let is_delta = metadata.contains_key("_stream_delta");
+            let is_end = metadata.contains_key("_stream_end");
 
-            if same_target && is_delta && final_metadata.get("_stream_end").is_none() {
+            if same_target && is_delta && !final_metadata.contains_key("_stream_end") {
                 // Accumulate content
                 combined_content.push_str(&next_msg.content);
                 // If we see _stream_end, remember it and stop coalescing this stream
@@ -573,8 +573,7 @@ impl ChannelManager {
                 ProgressKind::Plain | ProgressKind::ToolHint => {}
             }
         }
-        if msg.metadata.get("_stream_delta").is_some() || msg.metadata.get("_stream_end").is_some()
-        {
+        if msg.metadata.contains_key("_stream_delta") || msg.metadata.contains_key("_stream_end") {
             channel
                 .send_delta(
                     msg.chat_id.as_str(),
@@ -582,7 +581,7 @@ impl ChannelManager {
                     Some(msg.metadata.clone()),
                 )
                 .await
-        } else if msg.metadata.get("_streamed").is_none() || !channel.implements_send_delta() {
+        } else if !msg.metadata.contains_key("_streamed") || !channel.implements_send_delta() {
             channel.send(msg).await
         } else {
             Ok(())
@@ -852,7 +851,7 @@ mod tests {
         let (merged, pending) = ChannelManager::coalesce_stream_deltas(&bus, &first);
 
         assert_eq!(merged.content, "Hello world!");
-        assert!(merged.metadata.get("_stream_delta").is_some());
+        assert!(merged.metadata.contains_key("_stream_delta"));
         assert!(pending.is_empty());
     }
 
@@ -911,9 +910,9 @@ mod tests {
         let (merged, pending) = ChannelManager::coalesce_stream_deltas(&bus, &first);
 
         assert_eq!(merged.content, "Hello");
-        assert!(merged.metadata.get("_stream_end").is_none());
+        assert!(!merged.metadata.contains_key("_stream_end"));
         assert_eq!(pending.len(), 1);
-        assert!(pending[0].metadata.get("_stream_end").is_some());
+        assert!(pending[0].metadata.contains_key("_stream_end"));
     }
 
     /// Minimal channel double for exercising `send_once` branching without a

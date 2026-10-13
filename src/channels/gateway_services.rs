@@ -39,6 +39,7 @@ impl SessionWorkCanceller {
             media: Vec::new(),
             metadata: std::collections::HashMap::new(),
             session_key_override: None,
+            request_id: None,
         };
         self.agent_loop.abort_session(&msg).await;
     }

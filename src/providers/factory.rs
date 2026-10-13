@@ -17,22 +17,20 @@ use crate::providers::base::{LLMProvider, LLMProviderDyn};
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
 use crate::providers::registry::find_by_name;
 
+/// Resolved provider selection: provider name, api key, api base, extra headers.
+pub type AutoProviderSelection = (
+    String,
+    Option<String>,
+    Option<String>,
+    Option<HashMap<String, String>>,
+);
+
 /// Resolve `"auto"` to a concrete provider name + credentials by picking the
 /// first configured provider (by API key presence) in this fixed order:
 /// openai, openrouter, custom, anthropic. Mirrors the CLI's own
 /// `get_auto_provider` selection order exactly — do not reorder without
 /// updating both.
-pub fn try_auto_provider_selection(
-    config: &Config,
-) -> Result<
-    (
-        String,
-        Option<String>,
-        Option<String>,
-        Option<HashMap<String, String>>,
-    ),
-    String,
-> {
+pub fn try_auto_provider_selection(config: &Config) -> Result<AutoProviderSelection, String> {
     if !config.providers.openai.api_key.is_empty() {
         return Ok((
             "openai".to_string(),

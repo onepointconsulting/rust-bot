@@ -1370,6 +1370,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "stop",
@@ -1409,6 +1410,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "dream",
@@ -1528,6 +1530,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "model",
@@ -1663,6 +1666,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "model-cmd-session",
@@ -1745,6 +1749,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "mode-cmd-session",
@@ -1826,6 +1831,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "workspace-cmd-session",
@@ -1922,6 +1928,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "goal-cmd-session",
@@ -2007,6 +2014,7 @@ mod tests {
                     media: vec![],
                     metadata: Default::default(),
                     session_key_override: None,
+                    request_id: None,
                 },
                 None,
                 session_key,
@@ -2062,10 +2070,9 @@ mod tests {
             Some(&serde_json::json!("keep-me"))
         );
         assert!(
-            session
+            !session
                 .metadata
-                .get(crate::session::SESSION_TOKEN_USAGE_KEY)
-                .is_none()
+                .contains_key(crate::session::SESSION_TOKEN_USAGE_KEY)
         );
     }
 
@@ -2084,6 +2091,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             session_key,
@@ -2323,6 +2331,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "mcp-list",
@@ -2349,6 +2358,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "mcp-preset",
@@ -2374,6 +2384,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "mcp-preset",
@@ -2488,6 +2499,7 @@ mod tests {
                 media: vec![],
                 metadata: Default::default(),
                 session_key_override: None,
+                request_id: None,
             },
             None,
             "cli:direct",

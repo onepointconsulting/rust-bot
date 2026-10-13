@@ -4,17 +4,22 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
+use crate::agent::checkpoint_payload;
 use crate::agent::circuit_breaker::{
     CIRCUIT_BREAKER_STOP_REASON, CIRCUIT_BREAKER_USER_MESSAGE, CircuitDecision,
     DEFAULT_N_IDENTICAL_MESSAGES, MessageCircuitBreaker, is_tripped_error, tripped_error_message,
 };
+use crate::agent::crash_points::crash_point;
 use crate::agent::hook::{AgentHook, AgentHookContext, HOOK_ABORT_STOP_REASON, ToolHookDecision};
+use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
 use crate::agent::tools::registry::ToolRegistry;
+use crate::agent::turn_journal::TurnJournal;
 use crate::bus::outbound_events::ProgressKind;
 use crate::providers::base::{
     BoxedProgressCallback, BoxedStreamCallback, LLMProviderDyn, LLMResponse, LLMUsage,
     ToolCallRequest, is_unsupported_image_input_error,
 };
+use crate::session::journal::{JournalRecord, StepKind, ToolCallStatus};
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
     find_legal_message_start, maybe_persist_tool_result, truncate_text,
@@ -72,6 +77,9 @@ pub struct AgentRunSpec {
     pub provider_retry_mode: String,
     pub progress_callback: Option<Arc<dyn Fn(Value) + Send + Sync>>,
     pub checkpoint_callback: Option<Arc<dyn Fn(Value) + Send + Sync>>,
+    /// Write-ahead journal of this turn; `None` (subagents, memory runs, tests)
+    /// disables journaling entirely.
+    pub journal: Option<TurnJournal>,
 }
 
 impl Default for AgentRunSpec {
@@ -99,6 +107,7 @@ impl Default for AgentRunSpec {
             provider_retry_mode: "standard".to_string(),
             progress_callback: None,
             checkpoint_callback: None,
+            journal: None,
         }
     }
 }
@@ -178,8 +187,7 @@ impl AgentRunner {
         }
 
         let mut updated = messages.to_vec();
-        let mut offset = 0usize;
-        for (assistant_idx, call_id, name) in missing {
+        for (offset, (assistant_idx, call_id, name)) in missing.into_iter().enumerate() {
             let mut insert_at = assistant_idx + 1 + offset;
             while insert_at < updated.len()
                 && updated[insert_at].get("role").and_then(Value::as_str) == Some("tool")
@@ -195,7 +203,6 @@ impl AgentRunner {
                     "content": BACKFILL_CONTENT,
                 }),
             );
-            offset += 1;
         }
         updated
     }
@@ -610,7 +617,7 @@ impl AgentRunner {
                     tools_opt,
                     Some(spec.model.clone()),
                     spec.max_tokens,
-                    spec.temperature.map(|t| t),
+                    spec.temperature,
                     spec.reasoning_effort.clone(),
                     None,
                     Some(callback),
@@ -625,7 +632,7 @@ impl AgentRunner {
                 tools_opt,
                 Some(spec.model.clone()),
                 spec.max_tokens,
-                spec.temperature.map(|t| t),
+                spec.temperature,
                 spec.reasoning_effort.clone(),
                 None,
             )
@@ -640,6 +647,45 @@ impl AgentRunner {
         if let Some(ref callback) = spec.checkpoint_callback {
             callback(payload);
         }
+    }
+
+    /// Index of the turn's first message (the latest user message) in `messages`.
+    ///
+    /// Everything before it is session history that is already persisted.
+    fn turn_start_index(messages: &[Value]) -> usize {
+        messages
+            .iter()
+            .rposition(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+            .unwrap_or(0)
+    }
+
+    /// Persist a step checkpoint holding the turn's messages so far.
+    ///
+    /// With a journal the snapshot is one small append and the session file is
+    /// not rewritten. Without one, or when the journal cannot be written, the
+    /// older session-metadata callback gets the same payload instead.
+    fn emit_step_checkpoint(
+        spec: &AgentRunSpec,
+        step: StepKind,
+        kind: &str,
+        messages: &[Value],
+        turn_start: usize,
+    ) {
+        let payload = checkpoint_payload::build(kind, &messages[turn_start.min(messages.len())..]);
+        if let Some(journal) = &spec.journal {
+            let written = journal.append(
+                JournalRecord::StepCheckpoint {
+                    turn_id: journal.turn_id().to_string(),
+                    step,
+                    payload: payload.clone(),
+                },
+                false,
+            );
+            if written {
+                return;
+            }
+        }
+        Self::emit_checkpoint(spec, payload);
     }
 
     /// Execute all tool calls and return their results, telemetry events, and
@@ -783,6 +829,7 @@ impl AgentRunner {
         let mut events = Vec::with_capacity(tool_calls.len());
         for tc in tool_calls {
             if denied.contains(&tc.id) {
+                Self::journal_blocked_call(spec, tc, &reason);
                 let (result, event) = Self::hook_block_result(&tc.name, &reason);
                 results.push(result);
                 events.push(event);
@@ -796,6 +843,23 @@ impl AgentRunner {
             }
         }
         (results, events, fatal_error)
+    }
+
+    /// Tool result as stored in the journal, capped like the transcript copy.
+    fn journaled_result(spec: &AgentRunSpec, result: &str) -> String {
+        if spec.max_tool_result_chars == 0 {
+            return result.to_string();
+        }
+        truncate_text(result, spec.max_tool_result_chars)
+    }
+
+    /// Journal a tool call that a hook denied (no-op without a journal).
+    fn journal_blocked_call(spec: &AgentRunSpec, tool_call: &ToolCallRequest, reason: &str) {
+        let Some(journal) = &spec.journal else {
+            return;
+        };
+        let args = Value::Object(tool_call.arguments.clone().into_iter().collect());
+        journal.record_blocked_call(&tool_call.id, &tool_call.name, &args, reason);
     }
 
     fn tool_call_denied(decision: &ToolHookDecision, tool_call_id: &str) -> bool {
@@ -866,8 +930,8 @@ impl AgentRunner {
     ///   - `result`      — string fed back to the LLM as the tool result.
     ///   - `event`       — telemetry map (`"name"`, `"status"`, `"detail"`).
     ///   - `fatal_error` — `Some(msg)` when the message circuit breaker trips
-    ///                     (always abort), or when `spec.fail_on_tool_error` is
-    ///                     set and an error occurred; the agent loop should abort.
+    ///     (always abort), or when `spec.fail_on_tool_error` is
+    ///     set and an error occurred; the agent loop should abort.
     async fn run_tool(
         spec: &AgentRunSpec,
         tool_call: &ToolCallRequest,
@@ -987,10 +1051,37 @@ impl AgentRunner {
         // Python's `await tool.execute(**params)` maps to the sync call below.
         // Unlike Python, Rust tools do not raise exceptions; a tool that wants
         // to signal failure returns a string starting with "Error".
-        let result = tool
-            .expect("prepare_call returned no tool and no error")
-            .execute(&cast_params)
-            .await;
+        let tool = tool.expect("prepare_call returned no tool and no error");
+        // Write-ahead: the intent is on disk before the tool starts, so a crash
+        // during `execute` leaves an intent without a terminal record.
+        let in_flight = spec.journal.as_ref().map(|journal| {
+            journal.begin_tool_call(
+                &tool_call.id,
+                &tool_call.name,
+                &cast_params,
+                tool.replay_safe(),
+            )
+        });
+        crash_point("after_intent");
+        let result = match &spec.journal {
+            Some(journal) => {
+                let identity = ToolCallIdentity {
+                    turn_id: journal.turn_id().to_string(),
+                    call_id: tool_call.id.clone(),
+                };
+                with_tool_call(identity, tool.execute(&cast_params)).await
+            }
+            None => tool.execute(&cast_params).await,
+        };
+        crash_point("before_terminal");
+        if let Some(in_flight) = in_flight {
+            let status = if result.starts_with("Error") {
+                ToolCallStatus::Error
+            } else {
+                ToolCallStatus::Done
+            };
+            in_flight.finish(status, Self::journaled_result(spec, &result));
+        }
 
         // ── 5. Treat "Error…" result strings as soft errors ──────────────────
         if result.starts_with("Error") {
@@ -1133,6 +1224,7 @@ impl AgentRunner {
         let hook: Arc<dyn AgentHook> = spec.hook.clone().unwrap_or_else(|| Arc::new(NoopHook));
 
         let mut messages = spec.initial_messages.clone();
+        let turn_start = Self::turn_start_index(&messages);
         let mut usage = LLMUsage::new();
         let mut all_tool_events: Vec<HashMap<String, String>> = Vec::new();
         let mut tools_used: Vec<String> = Vec::new();
@@ -1159,6 +1251,16 @@ impl AgentRunner {
             let budgeted = self.apply_tool_result_budget(&spec, &compacted);
             let messages_for_model = self.snip_history(&spec, budgeted);
 
+            if iteration == 0 {
+                // Later model requests are covered by the `tools_completed` checkpoint.
+                Self::emit_step_checkpoint(
+                    &spec,
+                    StepKind::PreModel,
+                    checkpoint_payload::TYPE_PRE_MODEL,
+                    &messages,
+                    turn_start,
+                );
+            }
             let mut ctx = AgentHookContext::new(iteration, messages.clone());
             ctx.channel = spec.channel.clone();
             ctx.chat_id = spec.chat_id.clone();
@@ -1173,6 +1275,7 @@ impl AgentRunner {
                     .collect::<Vec<String>>()
                     .join("\n")
             );
+            crash_point("before_model");
             // ── LLM call ──────────────────────────────────────────────────────
             let response = self
                 .request_model(
@@ -1243,7 +1346,13 @@ impl AgentRunner {
                         .collect::<String>()
                 );
                 messages.push(assistant_msg);
-                Self::emit_checkpoint(&spec, serde_json::json!({"type": "awaiting_tools"}));
+                Self::emit_step_checkpoint(
+                    &spec,
+                    StepKind::PreTool,
+                    checkpoint_payload::TYPE_AWAITING_TOOLS,
+                    &messages,
+                    turn_start,
+                );
 
                 ctx.tool_calls = response.tool_calls.clone();
                 let decision = hook.before_execute_tools(&mut ctx).await;
@@ -1252,6 +1361,7 @@ impl AgentRunner {
                     log::warn!("Tool execution aborted by hook: {reason}");
                     let mut abort_events = Vec::with_capacity(response.tool_calls.len());
                     for tc in &response.tool_calls {
+                        Self::journal_blocked_call(&spec, tc, reason);
                         let (result, event) = Self::hook_block_result(&tc.name, reason);
                         let normalized = self.normalize_tool_result(
                             &spec,
@@ -1358,7 +1468,14 @@ impl AgentRunner {
                     break 'outer;
                 }
 
-                Self::emit_checkpoint(&spec, serde_json::json!({"type": "tools_completed"}));
+                crash_point("after_tools_before_checkpoint");
+                Self::emit_step_checkpoint(
+                    &spec,
+                    StepKind::PreModel,
+                    checkpoint_payload::TYPE_TOOLS_COMPLETED,
+                    &messages,
+                    turn_start,
+                );
                 empty_retries = 0;
                 length_recoveries = 0;
                 hook.after_iteration(&mut ctx).await;
@@ -1469,7 +1586,13 @@ impl AgentRunner {
                 normal_thinking,
             );
             messages.push(assistant_msg);
-            Self::emit_checkpoint(&spec, serde_json::json!({"type": "final_response"}));
+            Self::emit_step_checkpoint(
+                &spec,
+                StepKind::Final,
+                checkpoint_payload::TYPE_FINAL,
+                &messages,
+                turn_start,
+            );
             ctx.final_content = final_content.clone();
             hook.after_iteration(&mut ctx).await;
             final_result_content = final_content;
@@ -1536,7 +1659,7 @@ mod tests {
     }
 
     impl StubProvider {
-        fn new() -> Arc<dyn LLMProviderDyn> {
+        fn new_boxed() -> Arc<dyn LLMProviderDyn> {
             Arc::new(Self {
                 settings: GenerationSettings::new(),
             })
@@ -1626,7 +1749,7 @@ mod tests {
     }
 
     fn make_runner() -> AgentRunner {
-        AgentRunner::new(StubProvider::new())
+        AgentRunner::new(StubProvider::new_boxed())
     }
 
     struct FixedResponseProvider {
@@ -1635,7 +1758,7 @@ mod tests {
     }
 
     impl FixedResponseProvider {
-        fn new(response: LLMResponse) -> Arc<dyn LLMProviderDyn> {
+        fn new_boxed(response: LLMResponse) -> Arc<dyn LLMProviderDyn> {
             Arc::new(Self {
                 settings: GenerationSettings::new(),
                 response,
@@ -1903,15 +2026,12 @@ mod tests {
         assert_eq!(result.len(), total);
 
         // First 2 are stale and large — must be collapsed.
-        for i in 0..2 {
-            assert_eq!(
-                result[i]["content"],
-                "[read_file result omitted from context]"
-            );
+        for item in result.iter().take(2) {
+            assert_eq!(item["content"], "[read_file result omitted from context]");
         }
         // Remaining MICROCOMPACT_KEEP_RECENT are untouched.
-        for i in 2..total {
-            assert_eq!(result[i]["content"], large_content.as_str());
+        for item in result.iter().skip(2) {
+            assert_eq!(item["content"], large_content.as_str());
         }
     }
 
@@ -1988,8 +2108,8 @@ mod tests {
         // previous-turn tools occupy indices 1..=previous_count.
         assert_eq!(result[1]["content"], omitted);
         assert_eq!(result[2]["content"], omitted);
-        for i in 3..=previous_count {
-            assert_eq!(result[i]["content"], large_content.as_str());
+        for item in &result[3..=previous_count] {
+            assert_eq!(item["content"], large_content.as_str());
         }
         // Last user message onward is untouched.
         let current_turn_start = previous_count + 2; // assistant after old tools, then user
@@ -2841,7 +2961,7 @@ mod tests {
 
     #[tokio::test]
     async fn run_surfaces_unsupported_image_input_as_error() {
-        let runner = AgentRunner::new(FixedResponseProvider::new(vision_error_response()));
+        let runner = AgentRunner::new(FixedResponseProvider::new_boxed(vision_error_response()));
         let result = runner
             .run(AgentRunSpec {
                 initial_messages: vec![serde_json::json!({
@@ -2867,7 +2987,7 @@ mod tests {
     #[tokio::test]
     async fn run_streams_unsupported_image_input_error_to_hook() {
         let hook = RecordingHook::streaming();
-        let runner = AgentRunner::new(FixedResponseProvider::new(vision_error_response()));
+        let runner = AgentRunner::new(FixedResponseProvider::new_boxed(vision_error_response()));
         let result = runner
             .run(AgentRunSpec {
                 initial_messages: vec![serde_json::json!({
@@ -2892,7 +3012,7 @@ mod tests {
     }
 
     impl ScriptedProvider {
-        fn new(responses: Vec<LLMResponse>) -> Arc<dyn LLMProviderDyn> {
+        fn new_boxed(responses: Vec<LLMResponse>) -> Arc<dyn LLMProviderDyn> {
             Arc::new(Self {
                 settings: GenerationSettings::new(),
                 responses: Mutex::new(responses),
@@ -3054,7 +3174,7 @@ mod tests {
             name: "echo".into(),
             hits: Arc::clone(&hits),
         }));
-        let runner = AgentRunner::new(ScriptedProvider::new(vec![
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![
             tool_call_llm_response(vec![tc("echo")]),
             text_llm_response("recovered"),
         ]));
@@ -3113,7 +3233,7 @@ mod tests {
             name: "tool_b".into(),
             hits: Arc::clone(&hits_b),
         }));
-        let runner = AgentRunner::new(ScriptedProvider::new(vec![
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![
             tool_call_llm_response(vec![tc("tool_a"), tc("tool_b")]),
             text_llm_response("done"),
         ]));
@@ -3166,9 +3286,9 @@ mod tests {
             name: "echo".into(),
             hits: Arc::clone(&hits),
         }));
-        let runner = AgentRunner::new(ScriptedProvider::new(vec![tool_call_llm_response(vec![
-            tc("echo"),
-        ])]));
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![tool_call_llm_response(
+            vec![tc("echo")],
+        )]));
         let result = runner
             .run(AgentRunSpec {
                 initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
@@ -3210,5 +3330,286 @@ mod tests {
             result.messages.last().and_then(|m| m["role"].as_str()),
             Some("assistant")
         );
+    }
+
+    // ── tool-intent journal (WAL) ─────────────────────────────────────────────
+
+    use crate::session::journal::{JournalRecord, RunJournal};
+    use crate::session::journal_file::FileJournalStore;
+
+    /// Tool that reports what the journal held at the moment `execute` ran.
+    struct JournalProbeTool {
+        journal: Arc<RunJournal>,
+        seen_at_execute: Arc<Mutex<Vec<ToolCallStatus>>>,
+        reply: &'static str,
+        replay_safe: bool,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::tools::base::Tool for JournalProbeTool {
+        fn name(&self) -> String {
+            "probe".into()
+        }
+        fn description(&self) -> String {
+            "probe".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({"type":"object","properties":{"path":{"type":"string"}}})
+        }
+        fn replay_safe(&self) -> bool {
+            self.replay_safe
+        }
+        async fn execute(&self, _: &serde_json::Value) -> String {
+            *self.seen_at_execute.lock().unwrap() = tool_statuses(&self.journal);
+            self.reply.into()
+        }
+    }
+
+    fn tool_statuses(journal: &RunJournal) -> Vec<ToolCallStatus> {
+        journal
+            .scan()
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry.record {
+                JournalRecord::ToolIntent { status, .. } => Some(status),
+                _ => None,
+            })
+            .collect()
+    }
+
+    struct JournalFixture {
+        _dir: tempfile::TempDir,
+        journal: Arc<RunJournal>,
+        seen_at_execute: Arc<Mutex<Vec<ToolCallStatus>>>,
+        spec: AgentRunSpec,
+    }
+
+    fn journal_fixture(reply: &'static str, replay_safe: bool) -> JournalFixture {
+        let dir = tempfile::tempdir().unwrap();
+        let journal = RunJournal::new(FileJournalStore::shared(dir.path().to_path_buf()), "k");
+        let seen_at_execute = Arc::new(Mutex::new(Vec::new()));
+        let tool = JournalProbeTool {
+            journal: journal.clone(),
+            seen_at_execute: seen_at_execute.clone(),
+            reply,
+            replay_safe,
+        };
+        let spec = AgentRunSpec {
+            tools: registry_with(vec![Box::new(tool)]),
+            journal: Some(TurnJournal::new(journal.clone(), "turn-1")),
+            ..Default::default()
+        };
+        JournalFixture {
+            _dir: dir,
+            journal,
+            seen_at_execute,
+            spec,
+        }
+    }
+
+    async fn run_probe(spec: &AgentRunSpec) -> String {
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let breaker = Arc::new(Mutex::new(MessageCircuitBreaker::new(
+            DEFAULT_N_IDENTICAL_MESSAGES,
+        )));
+        let mut call = tc("probe");
+        call.id = "call-1".into();
+        call.arguments
+            .insert("path".into(), Value::String("a.txt".into()));
+        AgentRunner::run_tool(spec, &call, counts, breaker).await.0
+    }
+
+    #[tokio::test]
+    async fn runner_journal_intent_precedes_execute_and_done_follows() {
+        let fixture = journal_fixture("fine", true);
+        run_probe(&fixture.spec).await;
+
+        assert_eq!(
+            *fixture.seen_at_execute.lock().unwrap(),
+            [ToolCallStatus::Intent],
+            "intent must be on disk before execute runs"
+        );
+        assert_eq!(
+            tool_statuses(&fixture.journal),
+            [ToolCallStatus::Intent, ToolCallStatus::Done]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_journal_records_args_replay_flag_and_result() {
+        let fixture = journal_fixture("fine", true);
+        run_probe(&fixture.spec).await;
+
+        let entries = fixture.journal.scan().entries;
+        let JournalRecord::ToolIntent {
+            turn_id,
+            call_id,
+            tool_name,
+            args,
+            replay_safe,
+            result,
+            ..
+        } = &entries[1].record
+        else {
+            panic!("expected a tool record");
+        };
+        assert_eq!(
+            (turn_id.as_str(), call_id.as_str(), tool_name.as_str()),
+            ("turn-1", "call-1", "probe")
+        );
+        assert_eq!(args["path"], "a.txt");
+        assert!(replay_safe);
+        assert_eq!(result.as_deref(), Some("fine"));
+    }
+
+    #[tokio::test]
+    async fn runner_journal_error_result_is_journaled_as_error() {
+        let fixture = journal_fixture("Error: boom", false);
+        run_probe(&fixture.spec).await;
+        assert_eq!(
+            tool_statuses(&fixture.journal),
+            [ToolCallStatus::Intent, ToolCallStatus::Error]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_journal_is_untouched_without_a_journal() {
+        let mut fixture = journal_fixture("fine", true);
+        fixture.spec.journal = None;
+        assert_eq!(run_probe(&fixture.spec).await, "fine");
+        assert!(fixture.journal.scan().entries.is_empty());
+    }
+
+    #[tokio::test]
+    async fn runner_journal_aborted_call_is_marked_cancelled() {
+        struct Hang;
+        #[async_trait::async_trait]
+        impl crate::agent::tools::base::Tool for Hang {
+            fn name(&self) -> String {
+                "probe".into()
+            }
+            fn description(&self) -> String {
+                "hangs".into()
+            }
+            fn parameters(&self) -> serde_json::Value {
+                serde_json::json!({"type":"object","properties":{}})
+            }
+            async fn execute(&self, _: &serde_json::Value) -> String {
+                std::future::pending().await
+            }
+        }
+        let mut fixture = journal_fixture("unused", false);
+        fixture.spec.tools = registry_with(vec![Box::new(Hang)]);
+        let spec = Arc::new(fixture.spec);
+
+        let task_spec = spec.clone();
+        let task = tokio::spawn(async move { run_probe(&task_spec).await });
+        while tool_statuses(&fixture.journal).is_empty() {
+            tokio::task::yield_now().await;
+        }
+        task.abort();
+        let _ = task.await;
+
+        assert_eq!(
+            tool_statuses(&fixture.journal),
+            [ToolCallStatus::Intent, ToolCallStatus::Cancelled]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_journal_hook_denied_call_is_journaled_blocked_and_never_executed() {
+        let fixture = journal_fixture("fine", true);
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let breaker = Arc::new(Mutex::new(MessageCircuitBreaker::new(
+            DEFAULT_N_IDENTICAL_MESSAGES,
+        )));
+        let decision = ToolHookDecision::Deny {
+            reason: "nope".into(),
+        };
+
+        let (results, _events, _fatal) = AgentRunner::execute_tools_honoring_decision(
+            &fixture.spec,
+            &[tc("probe")],
+            &decision,
+            counts,
+            breaker,
+        )
+        .await;
+
+        assert_eq!(tool_statuses(&fixture.journal), [ToolCallStatus::Blocked]);
+        assert!(fixture.seen_at_execute.lock().unwrap().is_empty());
+        assert!(results[0].contains("nope"));
+    }
+
+    // ── step checkpoints ──────────────────────────────────────────────────────
+
+    fn checkpoint_types(journal: &RunJournal) -> Vec<(StepKind, String, usize)> {
+        journal
+            .scan()
+            .entries
+            .into_iter()
+            .filter_map(|entry| match entry.record {
+                JournalRecord::StepCheckpoint { step, payload, .. } => Some((
+                    step,
+                    payload["type"].as_str().unwrap_or_default().to_string(),
+                    payload["turn_messages"].as_array().map_or(0, Vec::len),
+                )),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn runner_journal_writes_a_step_checkpoint_per_step_with_turn_local_messages() {
+        let fixture = journal_fixture("fine", true);
+        let mut spec = fixture.spec;
+        let mut call = tc("probe");
+        call.id = "call-1".into();
+        spec.initial_messages = vec![
+            serde_json::json!({"role": "system", "content": "sys"}),
+            serde_json::json!({"role": "user", "content": "older question"}),
+            serde_json::json!({"role": "assistant", "content": "older answer"}),
+            serde_json::json!({"role": "user", "content": "go"}),
+        ];
+        spec.model = "test".into();
+        spec.max_iterations = 4;
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![
+            tool_call_llm_response(vec![call]),
+            text_llm_response("done"),
+        ]));
+
+        runner.run(spec).await;
+
+        // user | user,assistant | user,assistant,tool | user,assistant,tool,assistant
+        assert_eq!(
+            checkpoint_types(&fixture.journal),
+            [
+                (StepKind::PreModel, "pre_model".to_string(), 1),
+                (StepKind::PreTool, "awaiting_tools".to_string(), 2),
+                (StepKind::PreModel, "tools_completed".to_string(), 3),
+                (StepKind::Final, "final_response".to_string(), 4),
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_without_a_journal_still_feeds_the_metadata_callback() {
+        let seen = Arc::new(Mutex::new(Vec::<String>::new()));
+        let sink = seen.clone();
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![text_llm_response("done")]));
+        runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                model: "test".into(),
+                max_iterations: 2,
+                checkpoint_callback: Some(Arc::new(move |payload: Value| {
+                    sink.lock()
+                        .unwrap()
+                        .push(payload["type"].as_str().unwrap_or_default().to_string());
+                })),
+                ..Default::default()
+            })
+            .await;
+        assert_eq!(*seen.lock().unwrap(), ["pre_model", "final_response"]);
     }
 }

@@ -443,7 +443,7 @@ mod tests {
         let delivered = tool.take_delivered_outbound().expect("owner outbound");
         assert_eq!(delivered.content, "hello");
         assert!(tool.take_delivered_outbound().is_none());
-        assert!(sent[0].metadata.get(WEBUI_METADATA_KEY).is_none());
+        assert!(!sent[0].metadata.contains_key(WEBUI_METADATA_KEY));
     }
 
     #[tokio::test]
@@ -478,8 +478,8 @@ mod tests {
         tool.execute(&serde_json::json!({ "content": "hi" })).await;
 
         let sent = captured.lock().unwrap();
-        assert!(sent[0].metadata.get(WEBUI_METADATA_KEY).is_none());
-        assert!(sent[0].metadata.get(WEBUI_TURN_ID_KEY).is_none());
+        assert!(!sent[0].metadata.contains_key(WEBUI_METADATA_KEY));
+        assert!(!sent[0].metadata.contains_key(WEBUI_TURN_ID_KEY));
     }
 
     #[tokio::test]
@@ -501,8 +501,8 @@ mod tests {
         .await;
 
         let sent = captured.lock().unwrap();
-        assert!(sent[0].metadata.get(WEBUI_METADATA_KEY).is_none());
-        assert!(sent[0].metadata.get(WEBUI_TURN_ID_KEY).is_none());
+        assert!(!sent[0].metadata.contains_key(WEBUI_METADATA_KEY));
+        assert!(!sent[0].metadata.contains_key(WEBUI_TURN_ID_KEY));
     }
 
     #[test]
@@ -549,7 +549,7 @@ mod tests {
         assert_eq!(sent[0].channel, "telegram");
         assert_eq!(sent[0].chat_id, "other-chat");
         // Cross-chat send must not carry the owner's message_id.
-        assert!(sent[0].metadata.get("message_id").is_none());
+        assert!(!sent[0].metadata.contains_key("message_id"));
         // Not going back to the owner ⇒ sent_in_turn stays false.
         assert!(!*tool.sent_in_turn.lock().unwrap());
         assert!(tool.take_delivered_outbound().is_none());

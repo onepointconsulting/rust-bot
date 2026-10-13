@@ -120,6 +120,7 @@ impl CronService {
     }
 
     /// Add a new job.
+    #[allow(clippy::too_many_arguments)]
     pub async fn add_job(
         self: &Arc<Self>,
         name: impl Into<String>,
@@ -144,7 +145,6 @@ impl CronService {
                 deliver,
                 channel,
                 to,
-                ..Default::default()
             },
             state: CronJobState {
                 next_run_at_ms: compute_next_run(&schedule, now),

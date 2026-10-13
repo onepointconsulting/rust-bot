@@ -5,6 +5,9 @@ use crate::providers::{
 };
 use std::collections::HashMap;
 
+/// A JSON object (serde_json map). Aliased to keep function signatures readable.
+pub type JsonMap = serde_json::Map<String, serde_json::Value>;
+
 fn maybe_mapping(value: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
     value.as_object()
 }
@@ -160,11 +163,7 @@ impl OpenAICompatProvider {
     /// (extra_content, provider_specific_fields, fn_provider_specific_fields)
     pub fn extract_tc_extras(
         tc: &serde_json::Value,
-    ) -> (
-        Option<serde_json::Map<String, serde_json::Value>>,
-        Option<serde_json::Map<String, serde_json::Value>>,
-        Option<serde_json::Map<String, serde_json::Value>>,
-    ) {
+    ) -> (Option<JsonMap>, Option<JsonMap>, Option<JsonMap>) {
         // Helper: get value by key
         fn get<'a>(obj: &'a serde_json::Value, key: &str) -> Option<&'a serde_json::Value> {
             if let Some(map) = obj.as_object() {
@@ -533,6 +532,7 @@ impl OpenAICompatProvider {
         Some(serde_json::Value::Object(out))
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn build_request(
         &self,
         messages: &[serde_json::Value],
@@ -930,8 +930,8 @@ impl OpenAICompatProvider {
         if existing.is_empty() || incoming.is_empty() {
             return incoming;
         }
-        if incoming.starts_with(existing) {
-            return &incoming[existing.len()..];
+        if let Some(rest) = incoming.strip_prefix(existing) {
+            return rest;
         }
         if existing.ends_with(incoming) {
             return "";
@@ -1328,20 +1328,14 @@ mod tests {
             args.get("content").and_then(serde_json::Value::as_str),
             Some("hi")
         );
-        assert!(
-            args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY)
-                .is_none()
-        );
+        assert!(!args.contains_key(OpenAICompatProvider::ARG_PARSE_ERROR_KEY));
     }
 
     #[test]
     fn test_parse_tool_arguments_malformed_json_adds_markers() {
         let malformed = r#"{"path":"a.txt","content":"hi""#;
         let args = OpenAICompatProvider::parse_tool_arguments(malformed);
-        assert!(
-            args.get(OpenAICompatProvider::ARG_PARSE_ERROR_KEY)
-                .is_some()
-        );
+        assert!(args.contains_key(OpenAICompatProvider::ARG_PARSE_ERROR_KEY));
         assert_eq!(
             args.get(OpenAICompatProvider::ARG_PARSE_RAW_KEY)
                 .and_then(serde_json::Value::as_str),

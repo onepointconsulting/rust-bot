@@ -2,7 +2,7 @@ use regex::Regex;
 use std::sync::LazyLock;
 use std::{
     collections::{HashMap, HashSet},
-    path::PathBuf,
+    path::{Path, PathBuf},
 };
 
 use serde::Serialize;
@@ -63,9 +63,9 @@ pub struct SkillsLoader {
 }
 
 impl SkillsLoader {
-    pub fn new(workspace: &PathBuf, builtin_skills_dir: Option<PathBuf>) -> Self {
+    pub fn new(workspace: &Path, builtin_skills_dir: Option<PathBuf>) -> Self {
         Self {
-            _workspace: workspace.clone(),
+            _workspace: workspace.to_path_buf(),
             workspace_skills: workspace.join("skills"),
             builtin_skills: builtin_skills_dir.unwrap_or(BUILTIN_SKILLS_DIR.clone()),
         }
@@ -73,7 +73,7 @@ impl SkillsLoader {
 
     fn skill_entries_from_dir(
         &self,
-        base: &PathBuf,
+        base: &Path,
         source: &str,
         skip_names_option: Option<&HashSet<String>>,
     ) -> Vec<serde_json::Value> {
@@ -469,7 +469,7 @@ mod tests {
     #[test]
     fn skill_entries_empty_directory_is_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let entries = loader().skill_entries_from_dir(&dir.path().to_path_buf(), "ws", None);
+        let entries = loader().skill_entries_from_dir(dir.path(), "ws", None);
         assert!(entries.is_empty());
     }
 
@@ -483,8 +483,7 @@ mod tests {
         fs::write(alpha.join("SKILL.md"), b"# Alpha").unwrap();
         fs::write(beta.join("SKILL.md"), b"# Beta").unwrap();
 
-        let mut entries =
-            loader().skill_entries_from_dir(&dir.path().to_path_buf(), "builtin", None);
+        let mut entries = loader().skill_entries_from_dir(dir.path(), "builtin", None);
         entries.sort_by(|a, b| a["name"].as_str().unwrap().cmp(b["name"].as_str().unwrap()));
 
         assert_eq!(entries.len(), 2);
@@ -510,7 +509,7 @@ mod tests {
         fs::create_dir(&ok).unwrap();
         fs::write(ok.join("SKILL.md"), b"#").unwrap();
 
-        let entries = loader().skill_entries_from_dir(&dir.path().to_path_buf(), "ws", None);
+        let entries = loader().skill_entries_from_dir(dir.path(), "ws", None);
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["name"], "ok");
     }
@@ -526,7 +525,7 @@ mod tests {
         let mut skip = HashSet::new();
         skip.insert("drop".to_string());
 
-        let entries = loader().skill_entries_from_dir(&dir.path().to_path_buf(), "ws", Some(&skip));
+        let entries = loader().skill_entries_from_dir(dir.path(), "ws", Some(&skip));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0]["name"], "keep");
     }
@@ -539,14 +538,14 @@ mod tests {
         fs::create_dir(outer.join("inner")).unwrap();
         fs::write(outer.join("inner").join("SKILL.md"), b"#").unwrap();
 
-        let entries = loader().skill_entries_from_dir(&dir.path().to_path_buf(), "ws", None);
+        let entries = loader().skill_entries_from_dir(dir.path(), "ws", None);
         assert!(entries.is_empty());
     }
 
     #[test]
     fn load_skill_returns_none_when_not_found() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(dir.path().to_path_buf()));
+        let loader = SkillsLoader::new(dir.path(), Some(dir.path().to_path_buf()));
         assert!(loader.load_skill("nonexistent").is_none());
     }
 
@@ -557,7 +556,7 @@ mod tests {
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("SKILL.md"), b"workspace content").unwrap();
 
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(
             loader.load_skill("my-skill").as_deref(),
             Some("workspace content")
@@ -572,10 +571,7 @@ mod tests {
         fs::create_dir_all(&skill_dir).unwrap();
         fs::write(skill_dir.join("SKILL.md"), b"builtin content").unwrap();
 
-        let loader = SkillsLoader::new(
-            &workspace.path().to_path_buf(),
-            Some(builtins.path().to_path_buf()),
-        );
+        let loader = SkillsLoader::new(workspace.path(), Some(builtins.path().to_path_buf()));
         assert_eq!(
             loader.load_skill("core-skill").as_deref(),
             Some("builtin content")
@@ -596,10 +592,7 @@ mod tests {
             fs::write(skill_dir.join("SKILL.md"), content.as_bytes()).unwrap();
         }
 
-        let loader = SkillsLoader::new(
-            &workspace.path().to_path_buf(),
-            Some(builtins.path().to_path_buf()),
-        );
+        let loader = SkillsLoader::new(workspace.path(), Some(builtins.path().to_path_buf()));
         assert_eq!(
             loader.load_skill("shared-skill").as_deref(),
             Some("workspace version")
@@ -612,7 +605,7 @@ mod tests {
         // Directory exists but has no SKILL.md inside it.
         fs::create_dir_all(dir.path().join("skills").join("incomplete-skill")).unwrap();
 
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert!(loader.load_skill("incomplete-skill").is_none());
     }
 
@@ -629,10 +622,7 @@ mod tests {
     fn list_skills_empty_workspace_and_builtin_dirs() {
         let workspace = tempfile::tempdir().expect("tempdir");
         let builtins = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(
-            &workspace.path().to_path_buf(),
-            Some(builtins.path().to_path_buf()),
-        );
+        let loader = SkillsLoader::new(workspace.path(), Some(builtins.path().to_path_buf()));
         assert!(loader.list_skills(false).is_empty());
         assert!(loader.list_skills(true).is_empty());
     }
@@ -643,7 +633,7 @@ mod tests {
         write_skill(workspace.path(), "gamma", "---\nt: 1\n---\n");
         write_skill(workspace.path(), "delta", "---\nt: 2\n---\n");
         let missing = workspace.path().join("_no_builtin_dir_");
-        let loader = SkillsLoader::new(&workspace.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(workspace.path(), Some(missing));
 
         let mut list = loader.list_skills(false);
         list.sort_by(|a, b| a["name"].as_str().unwrap().cmp(b["name"].as_str().unwrap()));
@@ -663,10 +653,7 @@ mod tests {
         write_skill_under_base(builtins.path(), "overlap", "# bi overlap — skipped");
         write_skill_under_base(builtins.path(), "bi-only", "# bi");
 
-        let loader = SkillsLoader::new(
-            &workspace.path().to_path_buf(),
-            Some(builtins.path().to_path_buf()),
-        );
+        let loader = SkillsLoader::new(workspace.path(), Some(builtins.path().to_path_buf()));
         let mut list = loader.list_skills(false);
         list.sort_by(|a, b| a["name"].as_str().unwrap().cmp(b["name"].as_str().unwrap()));
         assert_eq!(list.len(), 3);
@@ -688,7 +675,7 @@ mod tests {
         write_skill(workspace.path(), "bad-req", &bad_front);
         write_skill(workspace.path(), "plain", "# no frontmatter");
 
-        let loader = SkillsLoader::new(&workspace.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(workspace.path(), Some(missing));
         let filtered = loader.list_skills(true);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["name"], "plain");
@@ -705,7 +692,7 @@ mod tests {
         let body = format!("---\nmetadata: '{}'\n---\n#", ok_json);
         write_skill(workspace.path(), "ok-meta", &body);
 
-        let loader = SkillsLoader::new(&workspace.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(workspace.path(), Some(missing));
         let filtered = loader.list_skills(true);
         assert_eq!(filtered.len(), 1);
         assert_eq!(filtered[0]["name"], "ok-meta");
@@ -724,7 +711,7 @@ mod tests {
         );
         write_skill(workspace.path(), "no-desc", "# no frontmatter");
 
-        let loader = SkillsLoader::new(&workspace.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(workspace.path(), Some(missing));
         let mut summaries = loader.list_skill_summaries();
         summaries.sort_by(|a, b| a.name.cmp(&b.name));
 
@@ -823,7 +810,7 @@ mod tests {
     #[test]
     fn get_skill_metadata_returns_none_when_skill_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert!(loader.get_skill_metadata("nonexistent").is_none());
     }
 
@@ -831,7 +818,7 @@ mod tests {
     fn get_skill_metadata_returns_none_when_no_frontmatter_marker() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "plain", "# Just markdown\nno frontmatter here");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert!(loader.get_skill_metadata("plain").is_none());
     }
 
@@ -839,7 +826,7 @@ mod tests {
     fn get_skill_metadata_returns_none_when_frontmatter_unclosed() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "unclosed", "---\nkey: value\n# no closing ---");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert!(loader.get_skill_metadata("unclosed").is_none());
     }
 
@@ -847,7 +834,7 @@ mod tests {
     fn get_skill_metadata_parses_simple_key_value() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "simple", "---\ntitle: My Skill\n---\n# Body");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let meta = loader.get_skill_metadata("simple").expect("Some");
         assert_eq!(meta["title"], "My Skill");
     }
@@ -860,7 +847,7 @@ mod tests {
             "quoted",
             "---\ntitle: \"Quoted Title\"\nauthor: 'Alice'\n---\n",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let meta = loader.get_skill_metadata("quoted").expect("Some");
         assert_eq!(meta["title"], "Quoted Title");
         assert_eq!(meta["author"], "Alice");
@@ -874,7 +861,7 @@ mod tests {
             "nocokon",
             "---\ntitle: Real\njust a line\n---\n",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let meta = loader.get_skill_metadata("nocokon").expect("Some");
         assert_eq!(meta["title"], "Real");
         assert!(!meta.as_object().unwrap().contains_key("just a line"));
@@ -888,7 +875,7 @@ mod tests {
             "url-skill",
             "---\nurl: https://example.com\n---\n",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let meta = loader.get_skill_metadata("url-skill").expect("Some");
         assert_eq!(meta["url"], "https://example.com");
     }
@@ -901,7 +888,7 @@ mod tests {
             "multi",
             "---\ntitle: A\nauthor: B\nversion: 1\n---\n# Body",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let meta = loader.get_skill_metadata("multi").expect("Some");
         assert_eq!(meta["title"], "A");
         assert_eq!(meta["author"], "B");
@@ -913,7 +900,7 @@ mod tests {
     #[test]
     fn get_skill_meta_returns_empty_when_skill_missing() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_meta("nonexistent"), serde_json::json!({}));
     }
 
@@ -921,7 +908,7 @@ mod tests {
     fn get_skill_meta_returns_empty_when_no_frontmatter() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "plain", "# Just markdown");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_meta("plain"), serde_json::json!({}));
     }
 
@@ -929,7 +916,7 @@ mod tests {
     fn get_skill_meta_returns_empty_when_no_metadata_key_in_frontmatter() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "no-meta", "---\ntitle: My Skill\n---\n# Body");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         // "metadata" key absent → parse_rustbot_metadata("") → {}
         assert_eq!(loader.get_skill_meta("no-meta"), serde_json::json!({}));
     }
@@ -940,7 +927,7 @@ mod tests {
         let json = r#"{"rust-bot": {"requires": {"bins": ["git"]}}}"#;
         let content = format!("---\nmetadata: '{}'\n---\n# Body", json);
         write_skill(dir.path(), "with-meta", &content);
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(
             loader.get_skill_meta("with-meta"),
             serde_json::json!({"requires": {"bins": ["git"]}})
@@ -955,7 +942,7 @@ mod tests {
             "bad-json",
             "---\nmetadata: not-json\n---\n# Body",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_meta("bad-json"), serde_json::json!({}));
     }
 
@@ -965,7 +952,7 @@ mod tests {
         let json = r#"{"other": {"x": 1}}"#;
         let content = format!("---\nmetadata: '{}'\n---\n# Body", json);
         write_skill(dir.path(), "unknown-key", &content);
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_meta("unknown-key"), serde_json::json!({}));
     }
 
@@ -1077,7 +1064,7 @@ metadata:
     #[test]
     fn load_skills_for_context_empty_returns_empty() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.load_skills_for_context(&[] as &[&str]), "");
     }
 
@@ -1088,7 +1075,7 @@ metadata:
         let skill_md = format!("---\ntitle: t\n---\n{body}");
         write_skill(dir.path(), "alpha", &skill_md);
 
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let out = loader.load_skills_for_context(&["alpha"]);
         assert_eq!(out, format!("### Skill: alpha\n\n{body}"));
     }
@@ -1099,7 +1086,7 @@ metadata:
         write_skill(dir.path(), "a", "# A");
         write_skill(dir.path(), "b", "# B");
 
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let out = loader.load_skills_for_context(&["a", "b"]);
         assert_eq!(out, "### Skill: a\n\n# A\n\n---\n\n### Skill: b\n\n# B");
     }
@@ -1109,7 +1096,7 @@ metadata:
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "only", "# X");
 
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         let out = loader.load_skills_for_context(&["missing", "only", "also-missing"]);
         assert_eq!(out, "### Skill: only\n\n# X");
     }
@@ -1117,7 +1104,7 @@ metadata:
     #[test]
     fn get_skill_description_missing_skill_returns_name() {
         let dir = tempfile::tempdir().expect("tempdir");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_description("nope"), "nope");
     }
 
@@ -1125,7 +1112,7 @@ metadata:
     fn get_skill_description_no_frontmatter_returns_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "plain", "# Just markdown");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_description("plain"), "plain");
     }
 
@@ -1137,7 +1124,7 @@ metadata:
             "with-desc",
             "---\ndescription: Does useful things\ntitle: t\n---\n# Body",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(
             loader.get_skill_description("with-desc"),
             "Does useful things"
@@ -1152,7 +1139,7 @@ metadata:
             "empty-desc",
             "---\ndescription: \"\"\ntitle: t\n---\n# Body",
         );
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_description("empty-desc"), "empty-desc");
     }
 
@@ -1160,7 +1147,7 @@ metadata:
     fn get_skill_description_missing_key_falls_back_to_name() {
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "no-desc", "---\ntitle: only title\n---\n# Body");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), None);
+        let loader = SkillsLoader::new(dir.path(), None);
         assert_eq!(loader.get_skill_description("no-desc"), "no-desc");
     }
 
@@ -1233,7 +1220,7 @@ metadata:
             "---\ndescription: Does alpha things\n---\n# Alpha",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
 
         let summary = loader.build_skills_summary();
         assert!(
@@ -1259,7 +1246,7 @@ metadata:
             "---\ndescription: Free skill\n---\n# Free",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
 
         let summary = loader.build_skills_summary();
         assert!(summary.contains(r#"<skill available="true">"#));
@@ -1273,7 +1260,7 @@ metadata:
         let content = format!("---\nmetadata: '{}'\n---\n# Needs it", json);
         write_skill(dir.path(), "needs-bin", &content);
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
 
         let summary = loader.build_skills_summary();
         assert!(summary.contains(r#"<skill available="false">"#));
@@ -1290,7 +1277,7 @@ metadata:
             "---\ndescription: A & <B>\n---\n# XML",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
 
         let summary = loader.build_skills_summary();
         assert!(summary.contains("A &amp; &lt;B&gt;"));
@@ -1301,7 +1288,7 @@ metadata:
         let dir = tempfile::tempdir().expect("tempdir");
         write_skill(dir.path(), "ok", "---\ndescription: OK\n---\n# OK");
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
 
         let summary = loader.build_skills_summary();
         assert!(
@@ -1316,7 +1303,7 @@ metadata:
     fn get_always_skills_empty_when_no_skills() {
         let dir = tempfile::tempdir().expect("tempdir");
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         assert!(loader.get_always_skills().is_empty());
     }
 
@@ -1329,7 +1316,7 @@ metadata:
             "---\ndescription: Normal\n---\n# Normal",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         assert!(loader.get_always_skills().is_empty());
     }
 
@@ -1342,7 +1329,7 @@ metadata:
             "---\ndescription: Eager\nalways: true\n---\n# Eager",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         assert_eq!(loader.get_always_skills(), vec!["eager"]);
     }
 
@@ -1356,7 +1343,7 @@ metadata:
             "---\ndescription: Meta Eager\nmetadata: {\"rust-bot\":{\"always\":true}}\n---\n# Meta Eager",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         assert_eq!(loader.get_always_skills(), vec!["meta-eager"]);
     }
 
@@ -1369,7 +1356,7 @@ metadata:
             "---\ndescription: Lazy\nalways: false\n---\n# Lazy",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         assert!(loader.get_always_skills().is_empty());
     }
 
@@ -1382,7 +1369,7 @@ metadata:
             "---\ndescription: Empty\nalways: \n---\n# Empty",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         assert!(loader.get_always_skills().is_empty());
     }
 
@@ -1400,7 +1387,7 @@ metadata:
             "---\ndescription: Always\nalways: true\n---\n# Always",
         );
         let missing = dir.path().join("_no_builtins_");
-        let loader = SkillsLoader::new(&dir.path().to_path_buf(), Some(missing));
+        let loader = SkillsLoader::new(dir.path(), Some(missing));
         let result = loader.get_always_skills();
         assert_eq!(result, vec!["always-one"]);
     }

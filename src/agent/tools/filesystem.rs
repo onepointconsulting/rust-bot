@@ -469,6 +469,10 @@ impl EditFileTool {
 
 #[async_trait]
 impl Tool for ReadFileTool {
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "read_file".to_string()
     }
@@ -782,6 +786,10 @@ impl Tool for EditFileTool {
 
 #[async_trait]
 impl Tool for ListDirTool {
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     fn name(&self) -> String {
         "list_dir".to_string()
     }

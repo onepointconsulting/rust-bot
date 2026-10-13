@@ -128,7 +128,7 @@ fn completion_message_check(result: &AgentRunResult) {
         );
         println!("final_message: {:?}", final_message);
     } else {
-        assert!(false, "No final message found");
+        panic!("No final message found");
     }
 }
 

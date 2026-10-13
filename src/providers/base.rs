@@ -214,9 +214,8 @@ pub struct LLMResponse {
     pub thinking_blocks: Option<Vec<HashMap<String, serde_json::Value>>>,
 }
 
-impl LLMResponse {
-    /// Construct a new LLMResponse with defaults.
-    pub fn new() -> Self {
+impl Default for LLMResponse {
+    fn default() -> Self {
         Self {
             content: None,
             tool_calls: Vec::new(),
@@ -225,6 +224,13 @@ impl LLMResponse {
             reasoning_content: None,
             thinking_blocks: None,
         }
+    }
+}
+
+impl LLMResponse {
+    /// Construct a new LLMResponse with defaults.
+    pub fn new() -> Self {
+        Self::default()
     }
 
     /// Check if response contains tool calls.
@@ -323,6 +329,7 @@ pub type BoxedProgressCallback =
 /// the core `&self` accessors and the three non-generic async call methods.
 /// A blanket impl covers any `T: LLMProvider + Send + Sync` automatically,
 /// so callers store `Arc<dyn LLMProviderDyn>` and construct it from any concrete provider.
+#[allow(clippy::too_many_arguments)]
 #[async_trait::async_trait]
 pub trait LLMProviderDyn: Send + Sync {
     fn api_key(&self) -> Option<String>;
@@ -744,6 +751,7 @@ pub trait LLMProvider: Send + Sync {
     /// # Errors
     /// Should be implemented by the LLMProvider for actual backend.
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn chat(
         &self,
         messages: Vec<serde_json::Value>,
@@ -834,6 +842,7 @@ pub trait LLMProvider: Send + Sync {
         if found { Some(result) } else { None }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn safe_chat(
         &self,
         messages: Vec<serde_json::Value>,
@@ -901,6 +910,7 @@ pub trait LLMProvider: Send + Sync {
     /// # Notes
     /// This dummy implementation can be overridden by providers supporting real streaming.
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn chat_stream<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
@@ -941,6 +951,7 @@ pub trait LLMProvider: Send + Sync {
     }
 
     #[allow(unused_variables)]
+    #[allow(clippy::too_many_arguments)]
     fn safe_chat_stream<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,
@@ -999,6 +1010,7 @@ pub trait LLMProvider: Send + Sync {
     /// `max_tokens` and `reasoning_effort` default to `self.generation` when
     /// not explicitly passed. `temperature` is sent only when `Some`; `None`
     /// omits the parameter, which many models reject.
+    #[allow(clippy::too_many_arguments)]
     fn chat_with_retry(
         &self,
         messages: Vec<serde_json::Value>,
@@ -1016,6 +1028,7 @@ pub trait LLMProvider: Send + Sync {
             let reasoning_effort = reasoning_effort.or_else(|| gs.reasoning_effort.clone());
 
             // Helper closure for calling self.chat and handling .await
+            #[allow(clippy::too_many_arguments)]
             async fn call_safe_chat<T: LLMProvider + ?Sized>(
                 provider: &T,
                 messages: Vec<serde_json::Value>,
@@ -1116,6 +1129,7 @@ pub trait LLMProvider: Send + Sync {
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn safe_chat_stream_with_retry<F, Fut>(
         &self,
         messages: Vec<serde_json::Value>,

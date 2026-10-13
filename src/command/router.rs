@@ -150,7 +150,7 @@ impl CommandRouter {
     /// Registers a prefix handler; entries are kept longest-prefix-first.
     pub fn prefix(&mut self, prefix: impl Into<String>, handler: Arc<dyn CommandHandler>) {
         self.prefix.push((prefix.into(), handler));
-        self.prefix.sort_by(|a, b| b.0.len().cmp(&a.0.len()));
+        self.prefix.sort_by_key(|(p, _)| std::cmp::Reverse(p.len()));
     }
 
     pub fn intercept(&mut self, handler: Arc<dyn CommandHandler>) {
@@ -267,6 +267,7 @@ mod tests {
             media: vec![],
             metadata: Default::default(),
             session_key_override: None,
+            request_id: None,
         }
     }
 

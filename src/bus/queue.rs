@@ -106,6 +106,11 @@ impl<T> AsyncQueue<T> {
         self.count.load(Ordering::Relaxed)
     }
 
+    /// True when the queue holds no pending messages.
+    pub fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
     /// Returns a sender handle that can be cloned and shared to push messages from elsewhere.
     pub fn sender(&self) -> TrackedSender<T> {
         self.tx.clone()
@@ -121,12 +126,41 @@ impl<T> AsyncQueue<T> {
     }
 }
 
+/// What a [`InboundGuard`] decided about a message that is about to be published.
+#[derive(Debug)]
+#[allow(clippy::large_enum_variant)]
+pub enum InboundAdmission {
+    /// Enqueue the message normally.
+    Accept,
+    /// Drop it silently (a duplicate whose first delivery is still being handled).
+    Drop,
+    /// Drop it and send this reply instead (a duplicate of an answered request).
+    Reply(OutboundMessage),
+}
+
+/// Hook that sees every inbound message before it enters the queue.
+///
+/// The inbox ledger implements it to record submissions durably and to drop
+/// redeliveries, so a message that is acknowledged to the channel is never lost
+/// to a crash between publish and processing.
+pub trait InboundGuard: Send + Sync {
+    /// Decide what to do with `msg`. May record it durably.
+    fn admit(&self, msg: &InboundMessage) -> InboundAdmission;
+}
+
 /// Async message bus that decouples chat channels from the agent core.
 /// Channels push messages to the inbound queue, and the agent processes
 /// them and pushes responses to the outbound queue.
 pub struct MessageBus {
     pub inbound: AsyncQueue<InboundMessage>,
     pub outbound: AsyncQueue<OutboundMessage>,
+    guard: std::sync::RwLock<Option<Arc<dyn InboundGuard>>>,
+}
+
+impl Default for MessageBus {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl MessageBus {
@@ -144,7 +178,16 @@ impl MessageBus {
             TrackedSender::new(outbound_tx, Arc::clone(&outbound_count)),
             TrackedReceiver::new(outbound_rx, outbound_count),
         );
-        Self { inbound, outbound }
+        Self {
+            inbound,
+            outbound,
+            guard: std::sync::RwLock::new(None),
+        }
+    }
+
+    /// Install the guard that screens every message passed to [`Self::publish_inbound`].
+    pub fn set_inbound_guard(&self, guard: Arc<dyn InboundGuard>) {
+        *self.guard.write().unwrap_or_else(|e| e.into_inner()) = Some(guard);
     }
 
     /// Number of pending inbound messages.
@@ -158,7 +201,31 @@ impl MessageBus {
     }
 
     /// Publish a message from a channel to the agent.
+    ///
+    /// With an [`InboundGuard`] installed the message may be dropped (a
+    /// duplicate) or answered with a stored reply instead of being enqueued;
+    /// both count as success for the caller.
+    #[allow(clippy::result_large_err)]
     pub fn publish_inbound(
+        &self,
+        msg: InboundMessage,
+    ) -> Result<(), mpsc::error::SendError<InboundMessage>> {
+        let guard = self.guard.read().unwrap_or_else(|e| e.into_inner()).clone();
+        match guard.map_or(InboundAdmission::Accept, |guard| guard.admit(&msg)) {
+            InboundAdmission::Accept => self.inbound.send(msg),
+            InboundAdmission::Drop => Ok(()),
+            InboundAdmission::Reply(reply) => {
+                if let Err(e) = self.publish_outbound(reply) {
+                    log::error!("Failed to publish stored reply for a redelivered message: {e}");
+                }
+                Ok(())
+            }
+        }
+    }
+
+    /// Enqueue a message that is already recorded (startup re-drive), skipping the guard.
+    #[allow(clippy::result_large_err)]
+    pub fn republish_inbound(
         &self,
         msg: InboundMessage,
     ) -> Result<(), mpsc::error::SendError<InboundMessage>> {
@@ -171,6 +238,7 @@ impl MessageBus {
     }
 
     /// Publish a response from the agent to channels.
+    #[allow(clippy::result_large_err)]
     pub fn publish_outbound(
         &self,
         msg: OutboundMessage,
@@ -207,6 +275,7 @@ mod tests {
                 media: vec![],
                 metadata: HashMap::new(),
                 session_key_override: None,
+                request_id: None,
             };
             bus.publish_inbound(inbound).unwrap();
 
@@ -253,5 +322,74 @@ mod tests {
             let received = bus.consume_outbound().await.unwrap();
             assert_eq!(received.content, "put_nowait works");
         });
+    }
+
+    struct ScriptedGuard(std::sync::Mutex<Vec<&'static str>>);
+
+    impl InboundGuard for ScriptedGuard {
+        fn admit(&self, msg: &InboundMessage) -> InboundAdmission {
+            match self.0.lock().unwrap().remove(0) {
+                "accept" => InboundAdmission::Accept,
+                "drop" => InboundAdmission::Drop,
+                _ => InboundAdmission::Reply(OutboundMessage {
+                    channel: msg.channel.clone(),
+                    chat_id: msg.chat_id.clone(),
+                    content: "stored reply".into(),
+                    reply_to: None,
+                    media: vec![],
+                    metadata: HashMap::new(),
+                    event: None,
+                }),
+            }
+        }
+    }
+
+    fn inbound(content: &str) -> InboundMessage {
+        InboundMessage {
+            channel: "c".into(),
+            sender_id: "u".into(),
+            chat_id: "x".into(),
+            content: content.into(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: HashMap::new(),
+            session_key_override: None,
+            request_id: Some("r".into()),
+        }
+    }
+
+    #[tokio::test]
+    async fn guard_decides_between_enqueue_drop_and_stored_reply() {
+        let bus = MessageBus::new();
+        bus.set_inbound_guard(Arc::new(ScriptedGuard(std::sync::Mutex::new(vec![
+            "accept", "drop", "reply",
+        ]))));
+
+        bus.publish_inbound(inbound("first")).unwrap();
+        bus.publish_inbound(inbound("dropped")).unwrap();
+        bus.publish_inbound(inbound("answered")).unwrap();
+
+        assert_eq!(bus.inbound_size(), 1);
+        assert_eq!(bus.consume_inbound().await.unwrap().content, "first");
+        assert_eq!(
+            bus.consume_outbound().await.unwrap().content,
+            "stored reply"
+        );
+        assert_eq!(bus.outbound_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn republish_skips_the_guard() {
+        let bus = MessageBus::new();
+        bus.set_inbound_guard(Arc::new(ScriptedGuard(std::sync::Mutex::new(vec!["drop"]))));
+        bus.republish_inbound(inbound("again")).unwrap();
+        assert_eq!(bus.consume_inbound().await.unwrap().content, "again");
+    }
+
+    #[tokio::test]
+    async fn without_a_guard_everything_is_enqueued() {
+        let bus = MessageBus::new();
+        bus.publish_inbound(inbound("a")).unwrap();
+        assert_eq!(bus.inbound_size(), 1);
     }
 }

@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use crate::{
@@ -26,12 +26,12 @@ use crate::{
 
 /// Workspace restriction and builtin-skills read path used by filesystem tools.
 pub fn filesystem_tool_scope(
-    workspace: &PathBuf,
+    workspace: &Path,
     restrict_to_workspace: bool,
     exec_sandbox: &str,
 ) -> (Option<PathBuf>, Vec<PathBuf>) {
     let allowed_dir = if restrict_to_workspace || !exec_sandbox.is_empty() {
-        Some(workspace.clone())
+        Some(workspace.to_path_buf())
     } else {
         None
     };
@@ -45,11 +45,11 @@ pub fn filesystem_tool_scope(
 
 pub fn register_filesystem_tools(
     tools: &mut ToolRegistry,
-    workspace: &PathBuf,
+    workspace: &Path,
     allowed_dir: Option<PathBuf>,
     extra_read: Vec<PathBuf>,
 ) {
-    let workspace = Some(workspace.clone());
+    let workspace = Some(workspace.to_path_buf());
     tools.register(Box::new(ReadFileTool::new(
         workspace.clone(),
         allowed_dir.clone(),
@@ -97,7 +97,7 @@ pub fn register_web_tools(web_config: &WebToolsConfig, tools: &mut ToolRegistry)
 
 pub fn register_gmail_tools(
     gmail_config: &GmailToolConfig,
-    workspace: &PathBuf,
+    workspace: &Path,
     tools: &mut ToolRegistry,
 ) {
     log::info!("Gmail config: {:?}", gmail_config);
@@ -107,14 +107,14 @@ pub fn register_gmail_tools(
         tools.register(Box::new(GmailEmailSendTool::new(gmail_config.clone())));
         tools.register(Box::new(GmailEmailDownloadTool::new(
             gmail_config.clone(),
-            workspace.clone(),
+            workspace.to_path_buf(),
         )));
     }
 }
 
 pub fn register_ocr_tools(
     ocr_config: &OcrToolConfig,
-    workspace: &PathBuf,
+    workspace: &Path,
     allowed_dir: Option<PathBuf>,
     extra_read: Vec<PathBuf>,
     tools: &mut ToolRegistry,
@@ -125,7 +125,7 @@ pub fn register_ocr_tools(
     log::debug!("Registering OCR tool");
     let tool = OcrTool::new(
         ocr_config.clone(),
-        workspace.clone(),
+        workspace.to_path_buf(),
         allowed_dir,
         extra_read,
     );
@@ -147,14 +147,14 @@ pub fn register_conversion_tools(
 
 pub fn register_image_generation_tools(
     image_generation_config: &ImageGenerationToolConfig,
-    workspace: &PathBuf,
+    workspace: &Path,
     tools: &mut ToolRegistry,
 ) {
     if !image_generation_config.enable {
         return;
     }
     log::debug!("Registering image generation tool");
-    let tool = ImageGenerationTool::new(image_generation_config.clone(), workspace.clone());
+    let tool = ImageGenerationTool::new(image_generation_config.clone(), workspace.to_path_buf());
     tools.register(Box::new(tool));
 }
 

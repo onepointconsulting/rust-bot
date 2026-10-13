@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::LazyLock;
 
 use async_trait::async_trait;
@@ -55,7 +55,7 @@ impl DocxConversionTool {
         }
     }
 
-    fn ensure_output_parent(path: &PathBuf) -> Result<(), String> {
+    fn ensure_output_parent(path: &Path) -> Result<(), String> {
         let Some(parent) = path.parent() else {
             return Ok(());
         };

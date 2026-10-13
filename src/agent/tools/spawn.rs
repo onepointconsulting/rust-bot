@@ -3,7 +3,11 @@ use std::sync::{Arc, Mutex};
 use async_trait::async_trait;
 use serde_json::Value;
 
-use crate::agent::{subagent::SubagentManager, tools::base::Tool};
+use crate::agent::{
+    subagent::SubagentManager,
+    tool_call_context::{current_tool_call, deterministic_task_id},
+    tools::base::Tool,
+};
 
 /// Tool to spawn a subagent for background task execution.
 pub struct SpawnTool {
@@ -50,6 +54,12 @@ impl Tool for SpawnTool {
         self.set_context(channel, chat_id);
     }
 
+    /// Replaying a call reuses its deterministic task id, which finds the
+    /// existing subagent instead of starting another one.
+    fn replay_safe(&self) -> bool {
+        true
+    }
+
     fn parameters(&self) -> Value {
         serde_json::json!({
             "type": "object",
@@ -78,7 +88,11 @@ impl Tool for SpawnTool {
         let origin_chat_id = self.origin_chat_id.lock().unwrap().clone();
         let session_key = self.session_key.lock().unwrap().clone();
 
-        Arc::clone(&self.manager).spawn(
+        // Under journaling the call identity makes the task id deterministic, so
+        // replaying this call after a crash cannot start a second subagent.
+        let task_id = current_tool_call().map(|identity| deterministic_task_id(&identity));
+        Arc::clone(&self.manager).spawn_with_task_id(
+            task_id,
             task,
             label,
             Some(origin_channel.as_str()),
@@ -91,6 +105,7 @@ impl Tool for SpawnTool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
     use crate::{
         agent::tools::base::Tool,
         bus::queue::MessageBus,
@@ -256,5 +271,65 @@ mod tests {
 
         assert!(result.contains("worker-1"));
         assert!(result.contains("started"));
+    }
+
+    fn spawn_tool_with_manager() -> (SpawnTool, Arc<SubagentManager>, TempDir) {
+        let tmp = TempDir::new().unwrap();
+        let manager = Arc::new(SubagentManager::new_simple(
+            Arc::new(TestProvider {
+                settings: GenerationSettings::new(),
+            }),
+            tmp.path().to_path_buf(),
+            Arc::new(MessageBus::new()),
+            4096,
+        ));
+        let tool = SpawnTool::new(Arc::clone(&manager));
+        (tool, manager, tmp)
+    }
+
+    fn call_identity(turn: &str, call: &str) -> ToolCallIdentity {
+        ToolCallIdentity {
+            turn_id: turn.into(),
+            call_id: call.into(),
+        }
+    }
+
+    #[tokio::test]
+    async fn replaying_the_same_call_never_starts_a_second_subagent() {
+        let (tool, manager, _tmp) = spawn_tool_with_manager();
+        let params = serde_json::json!({"task": "summarise logs", "label": "worker"});
+
+        let first = with_tool_call(call_identity("turn-1", "call-1"), tool.execute(&params)).await;
+        let replay = with_tool_call(call_identity("turn-1", "call-1"), tool.execute(&params)).await;
+
+        assert!(first.contains("started"), "{first}");
+        assert!(replay.contains("already"), "{replay}");
+        assert_eq!(manager.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn different_calls_get_different_subagents() {
+        let (tool, manager, _tmp) = spawn_tool_with_manager();
+        let params = serde_json::json!({"task": "summarise logs"});
+
+        with_tool_call(call_identity("turn-1", "call-1"), tool.execute(&params)).await;
+        with_tool_call(call_identity("turn-1", "call-2"), tool.execute(&params)).await;
+
+        assert_eq!(manager.list().len(), 2);
+    }
+
+    #[tokio::test]
+    async fn without_a_call_identity_every_spawn_is_new() {
+        let (tool, manager, _tmp) = spawn_tool_with_manager();
+        let params = serde_json::json!({"task": "summarise logs"});
+        tool.execute(&params).await;
+        tool.execute(&params).await;
+        assert_eq!(manager.list().len(), 2);
+    }
+
+    #[test]
+    fn spawn_declares_itself_replay_safe() {
+        let (tool, _manager, _tmp) = spawn_tool_with_manager();
+        assert!(tool.replay_safe());
     }
 }

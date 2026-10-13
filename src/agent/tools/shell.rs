@@ -248,12 +248,6 @@ impl ShellTool {
         )
     }
 
-    /// Extract all absolute path references from a shell command string.
-    ///
-    /// Three classes are detected, mirroring the Python implementation:
-    ///   - Windows drive-rooted paths  (`C:\…`)
-    ///   - POSIX absolute paths        (`/absolute/path`)
-    ///   - Home-directory shortcuts    (`~/…` or bare `~`)
     /// Build a minimal environment for subprocess execution.
     ///
     /// On Unix, only `HOME`, `LANG`, and `TERM` are forwarded; `bash -l`
@@ -438,6 +432,12 @@ impl ShellTool {
         }
     }
 
+    /// Extract all absolute path references from a shell command string.
+    ///
+    /// Three classes are detected, mirroring the Python implementation:
+    ///   - Windows drive-rooted paths  (`C:\…`)
+    ///   - POSIX absolute paths        (`/absolute/path`)
+    ///   - Home-directory shortcuts    (`~/…` or bare `~`)
     fn extract_absolute_paths(command: &str) -> Vec<String> {
         // Windows: C:\  or  C:\path\to\file  (* allows bare drive root)
         let win_re = Regex::new(r#"[A-Za-z]:\\[^\s"'|><;]*"#).unwrap();
@@ -650,17 +650,17 @@ mod tests {
     fn test_build_env() {
         let env = ShellTool::build_env();
         if IS_WINDOWS {
-            assert!(env.get("SYSTEMROOT").is_some());
-            assert!(env.get("COMSPEC").is_some());
-            assert!(env.get("USERPROFILE").is_some());
-            assert!(env.get("HOMEDRIVE").is_some());
-            assert!(env.get("HOMEPATH").is_some());
-            assert!(env.get("TEMP").is_some());
-            assert!(env.get("TMP").is_some());
+            assert!(env.contains_key("SYSTEMROOT"));
+            assert!(env.contains_key("COMSPEC"));
+            assert!(env.contains_key("USERPROFILE"));
+            assert!(env.contains_key("HOMEDRIVE"));
+            assert!(env.contains_key("HOMEPATH"));
+            assert!(env.contains_key("TEMP"));
+            assert!(env.contains_key("TMP"));
         } else {
-            assert!(env.get("HOME").is_some());
-            assert!(env.get("LANG").is_some());
-            assert!(env.get("TERM").is_some());
+            assert!(env.contains_key("HOME"));
+            assert!(env.contains_key("LANG"));
+            assert!(env.contains_key("TERM"));
         }
     }
 
@@ -701,12 +701,8 @@ mod tests {
     async fn test_execute_echo() {
         let tool = ShellTool::new(10, None, None, None, false, None, None);
 
-        // Use a platform-appropriate echo command.
-        let command = if IS_WINDOWS {
-            "echo hello"
-        } else {
-            "echo hello"
-        };
+        // `echo` behaves the same on Windows cmd and POSIX shells.
+        let command = "echo hello";
         let result = tool.execute_command(command, None, None).await;
         println!("result: {result}");
 

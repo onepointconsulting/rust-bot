@@ -233,6 +233,7 @@ pub struct SubagentManager {
 }
 
 impl SubagentManager {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         runtime_resolver: Arc<ModelRuntimeResolver>,
         sessions: Arc<Mutex<SessionManager>>,
@@ -314,9 +315,40 @@ impl SubagentManager {
         origin_chat_id_option: Option<&str>,
         session_key: Option<&str>,
     ) -> String {
+        self.spawn_with_task_id(
+            None,
+            task,
+            label,
+            original_channel_option,
+            origin_chat_id_option,
+            session_key,
+        )
+    }
+
+    /// Like [`Self::spawn`], with a caller-chosen task id that makes the call idempotent.
+    ///
+    /// When a record with `task_id` already exists (a replay of the same tool
+    /// call) nothing is started: the reply says whether that subagent is still
+    /// running or how it ended. After a process crash the old subagent thread
+    /// is gone and its in-memory record with it, so a replay respawns once.
+    pub fn spawn_with_task_id(
+        self: Arc<Self>,
+        task_id: Option<String>,
+        task: &str,
+        label: Option<&str>,
+        original_channel_option: Option<&str>,
+        origin_chat_id_option: Option<&str>,
+        session_key: Option<&str>,
+    ) -> String {
+        if let Some(existing) = task_id
+            .as_deref()
+            .and_then(|id| self.existing_task_reply(id))
+        {
+            return existing;
+        }
         let original_channel = original_channel_option.unwrap_or("cli");
         let origin_chat_id = origin_chat_id_option.unwrap_or("direct");
-        let task_id = uuid::Uuid::new_v4().to_string()[..8].to_string();
+        let task_id = task_id.unwrap_or_else(|| uuid::Uuid::new_v4().to_string()[..8].to_string());
         let display_label = label
             .map(str::to_string)
             .unwrap_or_else(|| truncate_chars(task, DERIVED_LABEL_MAX_CHARS));
@@ -394,6 +426,23 @@ impl SubagentManager {
         format!(
             "Subagent [{display_label_owned}] started (id: {task_id}). I'll notify you when it completes."
         )
+    }
+
+    /// Reply for a spawn whose task id is already known, or `None` for a new task.
+    fn existing_task_reply(&self, task_id: &str) -> Option<String> {
+        let tasks = self.tasks.lock().unwrap();
+        let record = tasks.get(task_id)?;
+        Some(match record.status {
+            SubagentStatus::Running => format!(
+                "Subagent [{}] is already running (id: {task_id}). I'll notify you when it completes.",
+                record.label
+            ),
+            status => format!(
+                "Subagent [{}] already ran and ended as {} (id: {task_id}).",
+                record.label,
+                status.as_str()
+            ),
+        })
     }
 
     /// Store a freshly spawned record, then drop the oldest finished records
@@ -706,6 +755,7 @@ impl SubagentManager {
                 media: vec![],
                 metadata: HashMap::new(),
                 session_key_override: Some(format!("{origin_channel}:{origin_chat_id}")),
+                request_id: None,
             };
             let result = self.bus.publish_inbound(msg);
             if let Err(e) = result {
@@ -1544,6 +1594,50 @@ mod tests {
         let finished = finished.expect("sub-agent run should finish");
         assert_eq!(finished.status, SubagentStatus::Completed);
         assert!(finished.finished_at.is_some());
+    }
+
+    #[tokio::test]
+    async fn spawning_twice_with_one_task_id_starts_a_single_subagent() {
+        let (manager, _tmp) = test_manager(ScriptedProvider::arc(vec![llm_text("ok")]));
+        let spawn = |manager: &Arc<SubagentManager>| {
+            Arc::clone(manager).spawn_with_task_id(
+                Some("deadbeef".to_string()),
+                "do the thing",
+                Some("thing"),
+                None,
+                None,
+                None,
+            )
+        };
+
+        let first = spawn(&manager);
+        let second = spawn(&manager);
+
+        assert!(first.contains("started (id: deadbeef)"), "{first}");
+        assert!(second.contains("deadbeef"), "{second}");
+        assert!(
+            second.contains("already"),
+            "the replay must say it reused the subagent: {second}"
+        );
+        assert_eq!(manager.list().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn a_replay_after_the_subagent_finished_reports_how_it_ended() {
+        let (manager, _tmp) = test_manager(ScriptedProvider::arc(vec![llm_text("ok")]));
+        let id = Some("cafef00d".to_string());
+        Arc::clone(&manager).spawn_with_task_id(id.clone(), "task", None, None, None, None);
+        for _ in 0..200 {
+            if manager.list()[0].status != SubagentStatus::Running {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        }
+
+        let replay = Arc::clone(&manager).spawn_with_task_id(id, "task", None, None, None, None);
+
+        assert!(replay.contains("already ran and ended as"), "{replay}");
+        assert_eq!(manager.list().len(), 1);
     }
 
     #[test]

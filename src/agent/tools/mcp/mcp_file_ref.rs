@@ -397,6 +397,7 @@ mod tests {
     use super::*;
     use serde_json::json;
     use std::io::Write;
+    use std::path::Path;
 
     /// Resolver with no sandbox, for tests that use absolute temp paths.
     fn open_resolver() -> FileRefResolver {
@@ -414,7 +415,7 @@ mod tests {
         path
     }
 
-    fn path_arg(path: &PathBuf) -> String {
+    fn path_arg(path: &Path) -> String {
         path.to_string_lossy().replace('\\', "/")
     }
 
@@ -591,7 +592,7 @@ mod tests {
             vec![],
         );
         let scope = build_workspace_scope(&project_path, WorkspaceAccessMode::Restricted, None)
-            .with_denied_roots(&[home.clone()]);
+            .with_denied_roots(std::slice::from_ref(&home));
 
         with_workspace_scope_stack(|| async {
             bind_workspace_scope(scope);

@@ -629,6 +629,7 @@ pub fn estimate_prompt_tokens(messages: &[Value], tools: Option<&[Value]>) -> us
 // ── status ────────────────────────────────────────────────────────────────────
 
 /// Build a human-readable runtime status snapshot.
+#[allow(clippy::too_many_arguments)]
 pub fn build_status_content(
     version: &str,
     model: &str,
@@ -649,11 +650,9 @@ pub fn build_status_content(
     let last_in = last_usage.prompt_tokens().unwrap_or(0);
     let last_out = last_usage.output_tokens.unwrap_or(0);
     let cached = last_usage.cache_read_input_tokens.unwrap_or(0);
-    let ctx_pct = if context_window_tokens > 0 {
-        context_tokens_estimate * 100 / context_window_tokens
-    } else {
-        0
-    };
+    let ctx_pct = (context_tokens_estimate * 100)
+        .checked_div(context_window_tokens)
+        .unwrap_or(0);
     let ctx_used_str = if context_tokens_estimate >= 1000 {
         format!("{}k", context_tokens_estimate / 1000)
     } else {

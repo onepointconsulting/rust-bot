@@ -136,6 +136,3 @@ strip = true        # drop symbols from the final binary
 # with abort fails with: "the linked panic runtime `panic_unwind` is not
 # compiled with this crate's panic strategy `abort`".
 
-[toolchain]
-channel = "stable"
-targets = ["wasm32-unknown-unknown"]

@@ -3,6 +3,13 @@
 //!
 //! One broker instance is shared process-wide, so every pending request is
 //! keyed by a generated `request_id` and pinned to the `chat_id` that asked.
+//!
+//! The broker is in memory only, and crash recovery (`agent::recovery`,
+//! `agent::resume`) deliberately never touches it: a tool call that a crash
+//! interrupted is either re-executed because it is `replay_safe()` (read-only
+//! or idempotent, so it needs no approval) or is never executed again and the
+//! model gets a synthesized "interrupted" result. Approvals are therefore not
+//! re-requested after a restart. Durable approvals are out of scope.
 use std::collections::HashMap;
 use std::sync::Mutex as StdMutex;
 

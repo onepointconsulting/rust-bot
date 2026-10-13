@@ -4048,10 +4048,9 @@ async fn handle_envelope_clear_session<'a>(envelope_dispatch_context: EnvelopeDi
             .session_manager
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        match session_manager.get_session_internal(&get_session_id(cid)) {
-            Some(session) => Some(session_manager.reset_session(session)),
-            None => None,
-        }
+        session_manager
+            .get_session_internal(&get_session_id(cid))
+            .map(|session| session_manager.reset_session(session))
     };
     match save_result {
         None => {
@@ -8785,10 +8784,9 @@ mod tests {
                 .expect("session must still exist")
         };
         assert!(
-            session
+            !session
                 .metadata
-                .get(crate::session::SESSION_TITLE_METADATA_KEY)
-                .is_none(),
+                .contains_key(crate::session::SESSION_TITLE_METADATA_KEY),
             "a rejected rename must not persist a title: {:?}",
             session.metadata
         );
@@ -9250,10 +9248,9 @@ mod tests {
                 .expect("cleared session must still exist");
             assert!(session.messages.is_empty(), "messages must be wiped");
             assert!(
-                session
+                !session
                     .metadata
-                    .get(crate::session::GOAL_STATE_KEY)
-                    .is_none()
+                    .contains_key(crate::session::GOAL_STATE_KEY)
             );
             assert!(session.usage().is_none());
             assert_eq!(
@@ -10456,10 +10453,9 @@ mod tests {
                 .expect("session must still exist")
         };
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_MODEL_PRESET_METADATA_KEY)
-                .is_none(),
+                .contains_key(SESSION_MODEL_PRESET_METADATA_KEY),
             "default must remove the session override, not store the string"
         );
     }
@@ -10506,10 +10502,9 @@ mod tests {
                 .expect("session must still exist")
         };
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_MODEL_PRESET_METADATA_KEY)
-                .is_none()
+                .contains_key(SESSION_MODEL_PRESET_METADATA_KEY)
         );
     }
 
@@ -10622,10 +10617,9 @@ mod tests {
                 .expect("session must still exist")
         };
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_MODEL_PRESET_METADATA_KEY)
-                .is_none()
+                .contains_key(SESSION_MODEL_PRESET_METADATA_KEY)
         );
     }
 
@@ -10757,10 +10751,9 @@ mod tests {
                 .expect("session must still exist")
         };
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_AGENT_MODE_METADATA_KEY)
-                .is_none()
+                .contains_key(SESSION_AGENT_MODE_METADATA_KEY)
         );
     }
 
@@ -10804,10 +10797,9 @@ mod tests {
                 .expect("session must still exist")
         };
         assert!(
-            session
+            !session
                 .metadata
-                .get(SESSION_AGENT_MODE_METADATA_KEY)
-                .is_none()
+                .contains_key(SESSION_AGENT_MODE_METADATA_KEY)
         );
     }
 
