@@ -1,0 +1,9 @@
+# Pinned so that clippy and rustfmt give the same results for everyone: both
+# add lints and formatting rules in most releases, so a floating "stable" turns
+# a clean tree into warnings after a `rustup update`. Bump deliberately, then
+# fix what the new release reports. The wasm target is needed by the browser
+# frontends (`web-chat`, `chat-ui`, `websockets-chat`).
+[toolchain]
+channel = "1.97.1"
+components = ["clippy", "rustfmt"]
+targets = ["wasm32-unknown-unknown"]
