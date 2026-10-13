@@ -19,6 +19,26 @@ use crate::utils::helpers::safe_filename;
 pub const DEFAULT_MAX_BYTES: usize = 10 * 1024 * 1024;
 pub const MAX_FILE_SIZE: usize = DEFAULT_MAX_BYTES;
 
+/// Maximum number of characters kept from a caller-supplied filename stem.
+const MAX_STEM_CHARS: usize = 80;
+
+/// Most filesystems (ext4, etc.) limit a single file name to 255 *bytes*,
+/// not characters, so multi-byte stems need a byte cap as well.
+const MAX_FILENAME_BYTES: usize = 255;
+
+/// Truncate `text` to at most `max_bytes` bytes without splitting a UTF-8
+/// character.
+fn truncate_to_byte_budget(text: &str, max_bytes: usize) -> &str {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    &text[..end]
+}
+
 /// Mirrors nanobot's `re.compile(..., re.DOTALL)` — `(?s)` makes `.` match
 /// newlines too, so a data URL with an embedded newline in its payload still
 /// matches in one pass, same as Python. (One narrow divergence, not chased
@@ -159,7 +179,7 @@ pub fn save_base64_data_url(
             .and_then(|s| s.to_str())
             .unwrap_or("")
             .chars()
-            .take(80)
+            .take(MAX_STEM_CHARS)
             .collect::<String>()
     };
 
@@ -167,6 +187,10 @@ pub fn save_base64_data_url(
     // (unlike `stem` above).
     let uuid_hex = Uuid::new_v4().simple().to_string();
     let short_id = &uuid_hex[..12];
+    // Reserve room for `<short_id>_` and the extension so the final name
+    // stays within the filesystem's byte limit.
+    let stem_byte_budget = MAX_FILENAME_BYTES.saturating_sub(short_id.len() + 1 + ext.len());
+    let stem = truncate_to_byte_budget(&stem, stem_byte_budget);
     let saved_name = if stem.is_empty() {
         format!("{short_id}{ext}")
     } else {
@@ -238,9 +262,19 @@ mod tests {
         .unwrap()
         .unwrap();
 
-        let stem = Path::new(&saved).file_stem().unwrap().to_str().unwrap();
-        // "<12-hex>_" prefix + up to 80 "你" chars.
-        assert_eq!(stem.chars().filter(|&c| c == '你').count(), 80);
+        let name = Path::new(&saved).file_name().unwrap().to_str().unwrap();
+        // Truncated below the 100 requested, and the whole name fits the
+        // 255-byte filesystem limit (80 * 3 bytes + prefix + ext would not).
+        let kept = name.chars().filter(|&c| c == '你').count();
+        assert!(kept > 0 && kept < 100, "kept {kept} chars");
+        assert!(name.len() <= MAX_FILENAME_BYTES, "name is {} bytes", name.len());
+    }
+
+    #[test]
+    fn truncate_to_byte_budget_respects_char_boundaries() {
+        assert_eq!(truncate_to_byte_budget("abc", 10), "abc");
+        assert_eq!(truncate_to_byte_budget("你好", 4), "你");
+        assert_eq!(truncate_to_byte_budget("你好", 2), "");
     }
 
     #[test]

@@ -1012,7 +1012,7 @@ mod tests {
     fn default_asset_has_no_duplicate_names() {
         let presets = load_default_presets().unwrap();
         assert!(check_duplicate_names(presets.iter()).is_ok());
-        assert_eq!(presets.len(), 13);
+        assert_eq!(presets.len(), 14);
     }
 
     // ── resolve_field_value precedence ──────────────────────────────────────
