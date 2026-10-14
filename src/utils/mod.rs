@@ -9,6 +9,7 @@ pub mod fs;
 pub mod gitstore;
 pub mod helpers;
 pub mod logo;
+pub mod malloc_tuning;
 pub mod media_decode;
 pub mod path;
 pub mod process;

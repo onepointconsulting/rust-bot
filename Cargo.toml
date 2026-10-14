@@ -5,7 +5,7 @@ resolver = "2"
 
 [package]
 name = "rust-bot"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2024"
 license = "MIT"
 default-run = "rust-bot"
@@ -31,6 +31,7 @@ git2 = "0.20"
 tera = "1"
 regex = "1"
 base64 = "0.22"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 chrono-tz = "0.9"
 croner = "2"
 async-trait = "0.1"

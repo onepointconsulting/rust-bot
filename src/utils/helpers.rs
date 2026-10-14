@@ -1,4 +1,5 @@
 /// Utility functions for rust-bot.
+use std::borrow::Cow;
 use std::fs;
 use std::net::IpAddr;
 use std::path::{Path, PathBuf};
@@ -135,13 +136,78 @@ pub fn detect_image_mime(data: &[u8]) -> Option<&'static str> {
     None
 }
 
-/// Build native image content blocks plus a short text label.
+/// Longest image edge (pixels) sent to a model. Vision models downscale
+/// anything larger themselves, so extra resolution only costs memory,
+/// bandwidth and tokens.
+pub const MAX_IMAGE_LONG_EDGE_PX: u32 = 1568;
+
+/// JPEG quality used when an oversized JPEG is re-encoded.
+const RESIZED_JPEG_QUALITY: u8 = 85;
+
+/// Shrink a PNG/JPEG whose longest edge exceeds `max_long_edge_px`, keeping
+/// its format and aspect ratio.
+///
+/// Returns the input untouched (no decode, no re-encode) when the image is
+/// already small enough, is not PNG/JPEG, or cannot be decoded — callers
+/// never lose an image because of resizing. Only the header is read to
+/// check dimensions, so the common small-image case allocates nothing.
+pub fn downscale_image_if_oversized(raw: &[u8], max_long_edge_px: u32) -> Cow<'_, [u8]> {
+    let format = match detect_image_mime(raw) {
+        Some("image/png") => image::ImageFormat::Png,
+        Some("image/jpeg") => image::ImageFormat::Jpeg,
+        _ => return Cow::Borrowed(raw),
+    };
+    let is_oversized = image::ImageReader::with_format(std::io::Cursor::new(raw), format)
+        .into_dimensions()
+        .is_ok_and(|(width, height)| width.max(height) > max_long_edge_px);
+    if !is_oversized {
+        return Cow::Borrowed(raw);
+    }
+    let Ok(decoded) = image::load_from_memory_with_format(raw, format) else {
+        return Cow::Borrowed(raw);
+    };
+    let resized = decoded.resize(
+        max_long_edge_px,
+        max_long_edge_px,
+        image::imageops::FilterType::Triangle,
+    );
+    drop(decoded);
+    let mut encoded = Vec::new();
+    let encode_result = match format {
+        image::ImageFormat::Jpeg => {
+            let encoder = image::codecs::jpeg::JpegEncoder::new_with_quality(
+                &mut encoded,
+                RESIZED_JPEG_QUALITY,
+            );
+            resized.to_rgb8().write_with_encoder(encoder)
+        }
+        _ => resized.write_to(&mut std::io::Cursor::new(&mut encoded), format),
+    };
+    match encode_result {
+        // Keep the original if re-encoding somehow did not shrink it.
+        Ok(()) if encoded.len() < raw.len() => Cow::Owned(encoded),
+        _ => Cow::Borrowed(raw),
+    }
+}
+
+/// Encode `raw` as a `data:<mime>;base64,<payload>` URL using a single,
+/// exactly pre-sized allocation (no intermediate base64 `String`).
+pub fn encode_image_data_url(mime: &str, raw: &[u8]) -> String {
+    let prefix = format!("data:{mime};base64,");
+    let mut url = String::with_capacity(prefix.len() + raw.len().div_ceil(3) * 4);
+    url.push_str(&prefix);
+    BASE64.encode_string(raw, &mut url);
+    url
+}
+
+/// Build native image content blocks plus a short text label. Oversized
+/// PNG/JPEG images are downscaled to [`MAX_IMAGE_LONG_EDGE_PX`] first.
 pub fn build_image_content_blocks(raw: &[u8], mime: &str, path: &str, label: &str) -> Vec<Value> {
-    let b64 = BASE64.encode(raw);
+    let raw = downscale_image_if_oversized(raw, MAX_IMAGE_LONG_EDGE_PX);
     vec![
         json!({
             "type": "image_url",
-            "image_url": { "url": format!("data:{};base64,{}", mime, b64) },
+            "image_url": { "url": encode_image_data_url(mime, &raw) },
             "_meta": { "path": path },
         }),
         json!({ "type": "text", "text": label }),
@@ -949,6 +1015,69 @@ mod tests {
     #[test]
     fn test_detect_unknown() {
         assert_eq!(detect_image_mime(b"\x00\x01\x02"), None);
+    }
+
+    // ── downscale_image_if_oversized / encode_image_data_url ──────────────────
+
+    /// Encode a flat-colour `width`×`height` image in `format`.
+    fn encoded_test_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let canvas = image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height));
+        let mut bytes = Vec::new();
+        canvas
+            .write_to(&mut std::io::Cursor::new(&mut bytes), format)
+            .unwrap();
+        bytes
+    }
+
+    fn dimensions_of(bytes: &[u8]) -> (u32, u32) {
+        image::load_from_memory(bytes).unwrap().into_rgb8().dimensions()
+    }
+
+    #[test]
+    fn test_downscale_shrinks_oversized_png_keeping_aspect_ratio() {
+        let raw = encoded_test_image(400, 200, image::ImageFormat::Png);
+        let result = downscale_image_if_oversized(&raw, 100);
+        assert!(matches!(result, Cow::Owned(_)), "expected a re-encoded copy");
+        assert_eq!(dimensions_of(&result), (100, 50));
+        assert_eq!(detect_image_mime(&result), Some("image/png"));
+    }
+
+    #[test]
+    fn test_downscale_shrinks_oversized_jpeg_and_stays_jpeg() {
+        let raw = encoded_test_image(300, 600, image::ImageFormat::Jpeg);
+        let result = downscale_image_if_oversized(&raw, 200);
+        assert_eq!(dimensions_of(&result), (100, 200));
+        assert_eq!(detect_image_mime(&result), Some("image/jpeg"));
+    }
+
+    #[test]
+    fn test_downscale_leaves_small_image_untouched() {
+        let raw = encoded_test_image(50, 40, image::ImageFormat::Png);
+        let result = downscale_image_if_oversized(&raw, 100);
+        assert!(matches!(result, Cow::Borrowed(_)));
+        assert_eq!(&*result, raw.as_slice());
+    }
+
+    #[test]
+    fn test_downscale_passes_through_undecodable_and_unsupported_data() {
+        let fake_png = b"\x89PNG\r\n\x1a\nnot really a png";
+        assert!(matches!(
+            downscale_image_if_oversized(fake_png, 1),
+            Cow::Borrowed(_)
+        ));
+        let gif = b"GIF89a-whatever";
+        assert!(matches!(
+            downscale_image_if_oversized(gif, 1),
+            Cow::Borrowed(_)
+        ));
+    }
+
+    #[test]
+    fn test_encode_image_data_url_matches_base64_and_is_exactly_sized() {
+        let raw = [0u8, 1, 2, 3, 4];
+        let url = encode_image_data_url("image/png", &raw);
+        assert_eq!(url, format!("data:image/png;base64,{}", BASE64.encode(raw)));
+        assert_eq!(url.len(), url.capacity());
     }
 
     // ── build_image_content_blocks ────────────────────────────────────────────

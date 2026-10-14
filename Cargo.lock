@@ -3118,6 +3118,8 @@ dependencies = [
  "num-traits",
  "png 0.18.1",
  "tiff",
+ "zune-core",
+ "zune-jpeg",
 ]
 
 [[package]]
@@ -5564,7 +5566,7 @@ dependencies = [
 
 [[package]]
 name = "rust-bot"
-version = "0.3.2"
+version = "0.3.3"
 dependencies = [
  "adk-anthropic",
  "agent-client-protocol",
@@ -5597,6 +5599,7 @@ dependencies = [
  "html-escape",
  "html2md",
  "http",
+ "image",
  "indicatif",
  "inquire",
  "ipnet",

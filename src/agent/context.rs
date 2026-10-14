@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
-use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
 use tera::Context;
 
 use crate::{
@@ -13,7 +12,10 @@ use crate::{
     },
     runtime_context::RUNTIME_CONTEXT_TAG,
     utils::{
-        helpers::{build_assistant_message, current_time_str, detect_image_mime},
+        helpers::{
+            MAX_IMAGE_LONG_EDGE_PX, build_assistant_message, current_time_str, detect_image_mime,
+            downscale_image_if_oversized, encode_image_data_url,
+        },
         prompt_templates::render_template,
     },
 };
@@ -299,10 +301,10 @@ impl ContextBuilder {
                 Some(m) if m.starts_with("image/") => m,
                 _ => continue,
             };
-            let b64 = BASE64.encode(&raw);
+            let raw = downscale_image_if_oversized(&raw, MAX_IMAGE_LONG_EDGE_PX);
             images.push(serde_json::json!({
                 "type": "image_url",
-                "image_url": { "url": format!("data:{mime};base64,{b64}") },
+                "image_url": { "url": encode_image_data_url(mime, &raw) },
                 "_meta": { "path": path_str },
             }));
         }
