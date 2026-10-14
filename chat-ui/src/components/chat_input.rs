@@ -386,7 +386,7 @@ fn SessionUsageChip(usage: Signal<Option<SessionTokenUsage>>) -> impl IntoView {
                     ></div>
                     <div
                         role="menu"
-                        class="absolute bottom-full left-0 z-20 mb-1 w-56 overflow-hidden rounded-xl bg-white py-2 shadow-lg ring-1 ring-slate-200"
+                        class="absolute bottom-full right-0 z-20 mb-1 w-56 max-w-[calc(100vw-1rem)] overflow-hidden sm:left-0 sm:right-auto rounded-xl bg-white py-2 shadow-lg ring-1 ring-slate-200"
                     >
                         <p class="px-3 pb-1 text-xs font-semibold uppercase tracking-wide text-slate-400">
                             "Session usage"
