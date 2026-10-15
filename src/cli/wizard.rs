@@ -291,15 +291,23 @@ pub fn configure_extra_headers(
     Ok(config.clone())
 }
 
-pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
-    let expanded = PathBuf::from(expand_tilde_path(&config_path.to_string_lossy()).as_ref());
-    let config_path = if expanded.is_absolute() {
+/// Expand a leading `~` and make the path absolute relative to the current directory.
+///
+/// Persisting absolute paths keeps a config created by `onboard` valid when `rust-bot`
+/// is later started from a different directory.
+pub(crate) fn expand_and_absolutize(path: &std::path::Path) -> PathBuf {
+    let expanded = PathBuf::from(expand_tilde_path(&path.to_string_lossy()).as_ref());
+    if expanded.is_absolute() {
         expanded
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(expanded)
-    };
+    }
+}
+
+pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
+    let config_path = expand_and_absolutize(&config_path);
     set_config_path(config_path.clone());
 
     let dim = Style::new().dimmed();
@@ -313,8 +321,9 @@ pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
 }
 
 pub fn apply_workspace_override(mut config: Config, workspace: PathBuf) -> Config {
-    let expanded = PathBuf::from(expand_tilde_path(&workspace.to_string_lossy()).as_ref());
-    config.agents.workspace = expanded.to_string_lossy().into_owned();
+    config.agents.workspace = expand_and_absolutize(&workspace)
+        .to_string_lossy()
+        .into_owned();
     config
 }
 
@@ -1640,4 +1649,30 @@ fn configure_subagent(config: &mut Config) -> Result<(), CliError> {
         )
         .prompt()?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn expand_and_absolutize_keeps_absolute_paths() {
+        let absolute = std::env::temp_dir().join("rust-bot-abs");
+        assert_eq!(expand_and_absolutize(&absolute), absolute);
+    }
+
+    #[test]
+    fn expand_and_absolutize_anchors_relative_paths_to_current_dir() {
+        let resolved = expand_and_absolutize(std::path::Path::new("./.rust-bot/workspace"));
+        assert!(resolved.is_absolute());
+        assert!(
+            resolved.ends_with(".rust-bot/workspace") || resolved.ends_with(r".rust-bot\workspace")
+        );
+    }
+
+    #[test]
+    fn workspace_override_is_stored_as_absolute_path() {
+        let config = apply_workspace_override(Config::default(), PathBuf::from("./ws"));
+        assert!(std::path::Path::new(&config.agents.workspace).is_absolute());
+    }
 }

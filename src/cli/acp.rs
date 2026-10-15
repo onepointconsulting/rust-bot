@@ -32,7 +32,7 @@ use crate::agent::acp::workspace_lock::{DEFAULT_POLL_INTERVAL, WorkspaceLock, ac
 use crate::agent::agent_loop::AgentLoop;
 use crate::agent::hook::AgentHook;
 use crate::cli::commands::{
-    CliError, DEFAULT_CONFIG_PATH, eprint_error, init_agent_loop_with_provider,
+    CliError, default_config_path, eprint_error, init_agent_loop_with_provider,
     try_create_provider, try_load_runtime_config,
 };
 use crate::config::loader::set_config_path;
@@ -54,7 +54,7 @@ pub const DEFAULT_LOCK_WAIT_SECS: u64 = 30;
 #[derive(Debug, Parser)]
 pub struct AcpArgs {
     /// JSON configuration file path. Use an absolute path when a client launches rust-bot.
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Workspace directory (overrides the config)
@@ -378,7 +378,7 @@ mod tests {
     #[test]
     fn acp_args_default_to_the_standard_config_path() {
         let args = AcpArgs::try_parse_from(["acp"]).unwrap();
-        assert_eq!(args.config, PathBuf::from(DEFAULT_CONFIG_PATH));
+        assert_eq!(args.config, default_config_path());
         assert!(!args.logs);
         assert!(args.workspace.is_none());
         assert_eq!(args.lock_wait_secs, DEFAULT_LOCK_WAIT_SECS);
