@@ -108,6 +108,34 @@ use crate::utils::restart::{
 /// Default `--config` path when the flag is omitted.
 pub const DEFAULT_CONFIG_PATH: &str = "./.rust-bot/config.json";
 
+/// Per-user config location (`~/.rust-bot/config.json`) written by the one-line installer.
+const HOME_CONFIG_RELATIVE_PATH: &str = ".rust-bot/config.json";
+
+/// Pick the config path used when `--config` is omitted.
+///
+/// A project-local config (`local_config`) always wins. Otherwise the per-user config
+/// under `home_dir` is used when it exists, so a globally installed `rust-bot` works from
+/// any directory. With neither present the local path is returned, which lets
+/// `rust-bot onboard` create it in the current directory.
+pub(crate) fn select_default_config_path(
+    local_config: &std::path::Path,
+    home_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    let home_config = home_dir.map(|home| home.join(HOME_CONFIG_RELATIVE_PATH));
+    match home_config {
+        Some(home_config) if !local_config.exists() && home_config.exists() => home_config,
+        _ => local_config.to_path_buf(),
+    }
+}
+
+/// Default `--config` value for every subcommand; see [`select_default_config_path`].
+pub fn default_config_path() -> PathBuf {
+    select_default_config_path(
+        std::path::Path::new(DEFAULT_CONFIG_PATH),
+        home::home_dir().as_deref(),
+    )
+}
+
 #[derive(Debug, Parser)]
 #[command(
     name = "rust-bot",
@@ -154,7 +182,7 @@ pub enum Commands {
 #[derive(Debug, Parser)]
 pub struct SubagentsArgs {
     /// JSON configuration file path
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Workspace directory (overrides the config; the config file is then not read)
@@ -177,7 +205,7 @@ pub struct AgentArgs {
     pub workspace: Option<PathBuf>,
 
     /// JSON configuration file path
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Render assistant output as Markdown
@@ -223,7 +251,7 @@ pub struct ApiArgs {
     pub web_root: Option<PathBuf>,
 
     /// JSON configuration file path (workspace is taken from `agents.workspace`)
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 }
 
@@ -238,7 +266,7 @@ pub struct GatewayArgs {
     pub verbose: bool,
 
     /// JSON configuration file path
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Bind address for the combined login + WebSocket gateway server.
@@ -269,7 +297,7 @@ pub struct OnboardArgs {
     pub workspace: PathBuf,
 
     /// JSON configuration file path
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Use interactive setup wizard
@@ -288,14 +316,14 @@ pub struct LoginArgs {
     pub force: bool,
 
     /// JSON configuration file path
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 }
 
 #[derive(Debug, Parser)]
 pub struct GenerateJwtKeypairArgs {
     /// Path to the rust-bot JSON configuration file
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Directory where private_key.pem and public_key.pem are written
@@ -310,7 +338,7 @@ pub struct GenerateJwtKeypairArgs {
 #[derive(Debug, Parser)]
 pub struct GenerateJwtTokenArgs {
     /// Path to the rust-bot JSON configuration file
-    #[arg(short, long, default_value = DEFAULT_CONFIG_PATH)]
+    #[arg(short, long, default_value_os_t = default_config_path())]
     pub config: PathBuf,
 
     /// Override issuer (defaults to api.jwt.iss from config)
@@ -2405,6 +2433,53 @@ mod tests {
         utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel},
     };
     use serde_json::json;
+
+    /// Creates `<root>/.rust-bot/config.json` and returns its path.
+    fn write_config_under(root: &std::path::Path) -> PathBuf {
+        let config_path = root.join(HOME_CONFIG_RELATIVE_PATH);
+        std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
+        std::fs::write(&config_path, "{}").unwrap();
+        config_path
+    }
+
+    #[test]
+    fn default_config_prefers_local_over_home() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let local_config = write_config_under(local_dir.path());
+        write_config_under(home_dir.path());
+        assert_eq!(
+            select_default_config_path(&local_config, Some(home_dir.path())),
+            local_config
+        );
+    }
+
+    #[test]
+    fn default_config_falls_back_to_home_when_local_missing() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let home_config = write_config_under(home_dir.path());
+        let missing_local = local_dir.path().join(HOME_CONFIG_RELATIVE_PATH);
+        assert_eq!(
+            select_default_config_path(&missing_local, Some(home_dir.path())),
+            home_config
+        );
+    }
+
+    #[test]
+    fn default_config_keeps_local_when_nothing_exists() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let missing_local = local_dir.path().join(HOME_CONFIG_RELATIVE_PATH);
+        assert_eq!(
+            select_default_config_path(&missing_local, Some(home_dir.path())),
+            missing_local
+        );
+        assert_eq!(
+            select_default_config_path(&missing_local, None),
+            missing_local
+        );
+    }
 
     #[test]
     fn subagents_command_parses_with_and_without_flags() {

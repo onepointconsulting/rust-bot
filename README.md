@@ -80,6 +80,24 @@ Windows:
 
 ## Quick start
 
+### One-line install
+
+Installs the latest release for your user, puts `rust-bot` on your `PATH` and starts `rust-bot onboard`. Config and workspace are created under `~/.rust-bot/`, and `rust-bot` finds them from any directory.
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.ps1 | iex
+```
+
+Set `RUST_BOT_VERSION` (for example `0.3.3`) to pin a version.
+
+### Manual install
+
 Pre-built packages are on [GitHub Releases](https://github.com/onepointconsulting/rust-bot/releases). Linux example:
 
 ```bash
