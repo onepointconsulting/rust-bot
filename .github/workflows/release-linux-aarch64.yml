@@ -64,6 +64,16 @@ jobs:
       - name: Install Trunk
         run: cargo install trunk --locked
 
+      - name: Install Zig (glibc-pinning linker for cargo-zigbuild)
+        uses: mlugg/setup-zig@v2
+        with:
+          version: 0.16.0
+
+      - name: Install cargo-zigbuild
+        uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-zigbuild@0.22.3
+
       - name: Install wasm-opt (Binaryen)
         run: |
           ver=version_132
@@ -83,8 +93,20 @@ jobs:
         working-directory: websockets-chat
         run: trunk build --release
 
-      - name: Build release binaries
-        run: cargo build --release --bin rust-bot --bin gmail-auth --target aarch64-unknown-linux-gnu
+      - name: Build release binaries (glibc 2.17 floor via zig)
+        run: cargo zigbuild --release --bin rust-bot --bin gmail-auth --target aarch64-unknown-linux-gnu.2.17
+
+      - name: Verify glibc symbol ceiling (must stay <= 2.17)
+        run: |
+          for bin in rust-bot gmail-auth; do
+            path="target/aarch64-unknown-linux-gnu/release/$bin"
+            max=$(objdump -T "$path" | grep -o 'GLIBC_[0-9][0-9.]*' | sort -Vu | tail -n 1)
+            echo "$bin requires at most ${max:-none}"
+            if [ -n "$max" ] && [ "$(printf '%s\n%s\n' "$max" "GLIBC_2.17" | sort -Vu | tail -n 1)" != "GLIBC_2.17" ]; then
+              echo "error: $bin requires $max (> GLIBC_2.17); older distros will not run it" >&2
+              exit 1
+            fi
+          done
 
       - name: Assemble package
         id: package
@@ -115,6 +137,9 @@ jobs:
           name: Rust Bot ${{ steps.version.outputs.tag }}
           body: |
             Automated release for Rust Bot ${{ steps.version.outputs.tag }}.
+
+            Linux binaries target glibc 2.17+ (CentOS/RHEL 7, Amazon Linux 2,
+            Ubuntu 16.04, Debian 9 or newer).
 
             Platform packages:
             - rust-bot-${{ steps.version.outputs.version }}-windows-x86_64.zip

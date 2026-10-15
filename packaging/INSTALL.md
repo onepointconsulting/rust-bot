@@ -5,6 +5,9 @@ for Gmail OAuth, the `web` (REST API) UI assets, an optional `websockets/`
 copy of the gateway UI (already compiled into `rust-bot`), and two sample
 configurations. The recommended first run is `rust-bot onboard`.
 
+Linux binaries are built against glibc 2.17 and run on CentOS/RHEL 7+,
+Amazon Linux 2, Ubuntu 16.04+, Debian 9+, and anything newer.
+
 ## 1. Unpack
 
 Extract the archive:
