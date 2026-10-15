@@ -4,13 +4,19 @@
 #   curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.sh | sh
 #
 # Downloads the latest GitHub release, installs it under ~/.local/share/rust-bot,
-# links `rust-bot` into ~/.local/bin and runs `rust-bot onboard` from $HOME so the
+# links `rust-bot` into ~/.local/bin (/usr/local/bin for root) and runs `rust-bot onboard` from $HOME so the
 # config lands in ~/.rust-bot/. Set RUST_BOT_VERSION (e.g. 0.3.3) to pin a version.
 set -eu
 
 REPO="onepointconsulting/rust-bot"
 INSTALL_DIR="${RUST_BOT_INSTALL_DIR:-$HOME/.local/share/rust-bot}"
-BIN_DIR="${RUST_BOT_BIN_DIR:-$HOME/.local/bin}"
+# root installs into /usr/local/bin, which is already on every shell's PATH.
+if [ "$(id -u)" -eq 0 ]; then
+    DEFAULT_BIN_DIR="/usr/local/bin"
+else
+    DEFAULT_BIN_DIR="$HOME/.local/bin"
+fi
+BIN_DIR="${RUST_BOT_BIN_DIR:-$DEFAULT_BIN_DIR}"
 
 # Prints an error message and aborts.
 fail() {
@@ -57,19 +63,28 @@ install_release() {
     ln -sf "$INSTALL_DIR/rust-bot" "$BIN_DIR/rust-bot"
 }
 
-# Warns when $BIN_DIR is not on PATH.
-check_path() {
+# Ensures $BIN_DIR is on PATH: makes it available to this script and, if it is missing,
+# persists it in the user's shell profile (a piped script cannot change the parent shell).
+ensure_on_path() {
     case ":$PATH:" in
-        *":$BIN_DIR:"*) ;;
-        *) echo "Add $BIN_DIR to your PATH, e.g.: export PATH=\"$BIN_DIR:\$PATH\"" ;;
+        *":$BIN_DIR:"*) return ;;
     esac
+    export PATH="$BIN_DIR:$PATH"
+    case "${SHELL:-}" in
+        */zsh) profile="$HOME/.zshrc" ;;
+        */bash) profile="$HOME/.bashrc" ;;
+        *) profile="$HOME/.profile" ;;
+    esac
+    path_line="export PATH=\"$BIN_DIR:\$PATH\""
+    grep -qsF "$path_line" "$profile" || echo "$path_line" >> "$profile"
+    echo "Added $BIN_DIR to PATH in $profile. Open a new terminal or run: $path_line"
 }
 
 command -v curl >/dev/null 2>&1 || fail "curl is required"
 version="$(resolve_version)"
 [ -n "$version" ] || fail "could not determine the latest version"
 install_release "$version" "$(detect_platform)"
-check_path
+ensure_on_path
 
 echo "Installed rust-bot $version. Starting onboarding..."
 cd "$HOME"

@@ -297,13 +297,18 @@ pub fn configure_extra_headers(
 /// is later started from a different directory.
 pub(crate) fn expand_and_absolutize(path: &std::path::Path) -> PathBuf {
     let expanded = PathBuf::from(expand_tilde_path(&path.to_string_lossy()).as_ref());
-    if expanded.is_absolute() {
+    let absolute = if expanded.is_absolute() {
         expanded
     } else {
         std::env::current_dir()
             .unwrap_or_else(|_| PathBuf::from("."))
             .join(expanded)
-    }
+    };
+    // Drop `.` segments so `/root/./.rust-bot` is shown and stored as `/root/.rust-bot`.
+    absolute
+        .components()
+        .filter(|component| *component != std::path::Component::CurDir)
+        .collect()
 }
 
 pub fn resolve_onboard_config_path(config_path: PathBuf) -> PathBuf {
@@ -1667,6 +1672,16 @@ mod tests {
         assert!(resolved.is_absolute());
         assert!(
             resolved.ends_with(".rust-bot/workspace") || resolved.ends_with(r".rust-bot\workspace")
+        );
+    }
+
+    #[test]
+    fn expand_and_absolutize_removes_current_dir_segments() {
+        let resolved = expand_and_absolutize(std::path::Path::new("./.rust-bot/config.json"));
+        assert!(
+            !resolved
+                .components()
+                .any(|component| component == std::path::Component::CurDir)
         );
     }
 

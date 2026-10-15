@@ -89,15 +89,28 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     Ok(())
 }
 
-/// Binary name used in onboarding "next steps" examples.
+/// File name of the binary inside a release archive.
+const LOCAL_BIN_FILE: &str = if cfg!(windows) {
+    "rust-bot.exe"
+} else {
+    "rust-bot"
+};
+
+/// Binary invocation used in onboarding "next steps" examples.
 ///
-/// Linux/macOS archives are run from the extract directory (`./rust-bot`).
-/// Windows archives use `.\rust-bot.exe`.
+/// When the binary sits in the current directory (an unpacked archive) it is run as
+/// `./rust-bot` (Windows: `.\rust-bot.exe`). Otherwise it was installed globally by the
+/// one-line installer and is invoked by name from `PATH`.
 fn cli_bin() -> &'static str {
-    if cfg!(windows) {
-        r".\rust-bot.exe"
-    } else {
-        "./rust-bot"
+    cli_bin_name(Path::new(LOCAL_BIN_FILE).is_file())
+}
+
+/// Pure variant of [`cli_bin`]: `local_binary_present` tells whether the binary is in the cwd.
+fn cli_bin_name(local_binary_present: bool) -> &'static str {
+    match (local_binary_present, cfg!(windows)) {
+        (true, true) => r".\rust-bot.exe",
+        (true, false) => "./rust-bot",
+        (false, _) => "rust-bot",
     }
 }
 
@@ -235,9 +248,14 @@ mod tests {
     #[test]
     fn cli_bin_uses_platform_invocation() {
         #[cfg(windows)]
-        assert_eq!(cli_bin(), r".\rust-bot.exe");
+        assert_eq!(cli_bin_name(true), r".\rust-bot.exe");
         #[cfg(not(windows))]
-        assert_eq!(cli_bin(), "./rust-bot");
+        assert_eq!(cli_bin_name(true), "./rust-bot");
+    }
+
+    #[test]
+    fn cli_bin_uses_bare_name_when_installed_globally() {
+        assert_eq!(cli_bin_name(false), "rust-bot");
     }
 
     #[test]
@@ -253,10 +271,7 @@ mod tests {
                 "expected {bin:?} in next-steps line: {line}"
             );
         }
-        #[cfg(not(windows))]
-        assert!(commands[0].starts_with("  2. a) One message chat: ./rust-bot agent"));
-        #[cfg(windows)]
-        assert!(commands[0].starts_with(r"  2. a) One message chat: .\rust-bot.exe agent"));
+        assert!(commands[0].starts_with(&format!("  2. a) One message chat: {bin} agent")));
     }
 
     #[test]
