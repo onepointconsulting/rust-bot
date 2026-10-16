@@ -22,6 +22,8 @@ use crate::models::SessionListItem;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum SessionGroup {
+    /// User-pinned sessions, listed above every date bucket.
+    Pinned,
     Today,
     Yesterday,
     Last7Days,
@@ -32,6 +34,7 @@ pub enum SessionGroup {
 impl SessionGroup {
     pub fn label(&self) -> &'static str {
         match self {
+            SessionGroup::Pinned => "Pinned",
             SessionGroup::Today => "Today",
             SessionGroup::Yesterday => "Yesterday",
             SessionGroup::Last7Days => "Last 7 Days",
@@ -42,7 +45,8 @@ impl SessionGroup {
 }
 
 /// Fixed display order for the sidebar's group sections.
-const GROUP_ORDER: [SessionGroup; 5] = [
+const GROUP_ORDER: [SessionGroup; 6] = [
+    SessionGroup::Pinned,
     SessionGroup::Today,
     SessionGroup::Yesterday,
     SessionGroup::Last7Days,
@@ -79,8 +83,9 @@ fn parse_ms_or(timestamp: &str, fallback_ms: i64) -> i64 {
         .unwrap_or(fallback_ms)
 }
 
-/// Group `sessions` into the sidebar's fixed date buckets, preserving input
-/// order within each bucket. Empty buckets are omitted. `now_ms` is Unix
+/// Group `sessions` into the sidebar's fixed buckets: pinned sessions first,
+/// then the date buckets, preserving input order within each bucket. A
+/// pinned session appears only in `Pinned`, whatever its `updated_at`. Empty buckets are omitted. `now_ms` is Unix
 /// milliseconds for "now" — see the module doc comment for why it's an
 /// argument rather than read internally.
 pub fn group_sessions(
@@ -88,12 +93,15 @@ pub fn group_sessions(
     now_ms: i64,
 ) -> Vec<(SessionGroup, Vec<SessionListItem>)> {
     let today_index = utc_day_index(now_ms);
-    let mut buckets: [Vec<SessionListItem>; 5] = Default::default();
+    let mut buckets: [Vec<SessionListItem>; 6] = Default::default();
 
     for session in sessions {
-        let updated_ms = parse_ms_or(&session.updated_at, now_ms);
-        let days_ago = today_index - utc_day_index(updated_ms);
-        let bucket = bucket_for_days_ago(days_ago);
+        let bucket = if session.pinned {
+            SessionGroup::Pinned
+        } else {
+            let updated_ms = parse_ms_or(&session.updated_at, now_ms);
+            bucket_for_days_ago(today_index - utc_day_index(updated_ms))
+        };
         let slot = GROUP_ORDER
             .iter()
             .position(|group| *group == bucket)
@@ -126,6 +134,7 @@ mod tests {
             created_at: updated_at.to_string(),
             updated_at: updated_at.to_string(),
             has_summary: false,
+            pinned: false,
         }
     }
 
@@ -210,7 +219,21 @@ mod tests {
     }
 
     #[test]
+    fn pinned_sessions_go_first_regardless_of_age() {
+        let mut old_pinned = item("old-pinned", "2023-01-01T00:00:00Z");
+        old_pinned.pinned = true;
+        let sessions = vec![item("today", "2024-06-15T08:00:00Z"), old_pinned.clone()];
+
+        let grouped = group_sessions(&sessions, now_ms());
+
+        assert_eq!(grouped.len(), 2);
+        assert_eq!(grouped[0], (SessionGroup::Pinned, vec![old_pinned]));
+        assert_eq!(grouped[1].0, SessionGroup::Today);
+    }
+
+    #[test]
     fn group_labels() {
+        assert_eq!(SessionGroup::Pinned.label(), "Pinned");
         assert_eq!(SessionGroup::Today.label(), "Today");
         assert_eq!(SessionGroup::Yesterday.label(), "Yesterday");
         assert_eq!(SessionGroup::Last7Days.label(), "Last 7 Days");

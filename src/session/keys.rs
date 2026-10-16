@@ -46,6 +46,10 @@ pub const SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY: &str = "websocket_owner_client_
 /// Session display title (LLM-generated or user-renamed).
 pub const SESSION_TITLE_METADATA_KEY: &str = "title";
 
+/// Whether the user pinned the session to the top of the chat list (`true`
+/// when pinned; absent or `false` otherwise).
+pub const SESSION_PINNED_METADATA_KEY: &str = "pinned";
+
 /// Hidden history marker.
 pub const HIDDEN_HISTORY_KEY: &str = "_hidden_history";
 

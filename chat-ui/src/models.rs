@@ -361,6 +361,10 @@ pub struct SessionListItem {
     /// sidebar kebab uses this to hide "Summary" until one exists.
     #[serde(default)]
     pub has_summary: bool,
+    /// Whether the user pinned this session. Pinned sessions are listed in
+    /// their own "Pinned" group on top, with a pin icon on the row.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// Content for the sessions-sidebar Summary dialog.

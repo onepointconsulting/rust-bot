@@ -323,6 +323,7 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             has_summary: false,
+            pinned: false,
         }
     }
 

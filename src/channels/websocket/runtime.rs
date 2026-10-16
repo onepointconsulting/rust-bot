@@ -626,6 +626,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::RenameChat => {
             handle_envelope_rename_chat(envelope_dispatch_context).await;
         }
+        EnvelopeType::PinChat => {
+            handle_envelope_pin_chat(envelope_dispatch_context).await;
+        }
         EnvelopeType::DeleteChat => {
             handle_envelope_delete_chat(envelope_dispatch_context).await;
         }
@@ -1547,19 +1550,17 @@ async fn check_owner_allows_access(
     allowed
 }
 
-/// Handle a `rename_chat` envelope: persist a new display `title` on an
-/// existing `websocket:{chat_id}` session and ack with `chat_renamed`.
-/// Existence of a session file *is* required — unlike `attach`, renaming
-/// a chat that was never persisted would create a title-only ghost session.
-/// Rust-side protocol addition with no nanobot precedent — see
-/// [`EnvelopeType::RenameChat`].
-async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+/// Shared gate for envelopes that mutate one existing chat's metadata
+/// (`rename_chat`, `pin_chat`): a valid `chat_id`, an allow-listed sender,
+/// and a session the sender may act on. Each failed check has already sent
+/// its `error` reply when this returns `None`; on success returns the
+/// `chat_id` plus the rejection fields later errors should be scoped with.
+async fn authorize_chat_metadata_mutation<'a>(
+    envelope_dispatch_context: &EnvelopeDispatchContext<'a>,
+) -> Option<(&'a str, serde_json::Map<String, serde_json::Value>)> {
     let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
 
-    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
-        return;
-    };
-
+    let cid = require_valid_chat_id(envelope_dispatch_context).await?;
     let rejection_fields = create_rejection_fields(cid);
 
     if !sender_allowed(&shared.channels_config, client_id) {
@@ -1571,7 +1572,7 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
             serde_json::json!({"detail": "access_denied"}),
         )
         .await;
-        return;
+        return None;
     }
 
     if !check_owner_allows_access(
@@ -1583,8 +1584,89 @@ async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDisp
     )
     .await
     {
+        return None;
+    }
+    Some((cid, rejection_fields))
+}
+
+/// Handle a `pin_chat` envelope: persist the boolean `pinned` flag on an
+/// existing `websocket:{chat_id}` session and ack with `chat_pinned`.
+/// Rust-side protocol addition — see [`EnvelopeType::PinChat`].
+async fn handle_envelope_pin_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _) = envelope_dispatch_context.connection_fields();
+
+    let Some((cid, rejection_fields)) =
+        authorize_chat_metadata_mutation(&envelope_dispatch_context).await
+    else {
+        return;
+    };
+
+    let Some(pinned) = envelope_dispatch_context
+        .envelope
+        .get("pinned")
+        .and_then(|v| v.as_bool())
+    else {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "missing pinned"}),
+        )
+        .await;
+        return;
+    };
+
+    let pin_result = {
+        let mut session_manager = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        session_manager.set_session_pinned(&get_session_id(cid), pinned)
+    };
+    if let Err(e) = pin_result {
+        let detail = match e {
+            RenameSessionError::NotFound => "session_not_found",
+            RenameSessionError::Save(e) => {
+                log::error!("Failed to pin session {cid}: {e}");
+                "pin_failed"
+            }
+        };
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": detail}),
+        )
+        .await;
         return;
     }
+
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ChatPinned,
+        None,
+        serde_json::json!({"chat_id": cid, "pinned": pinned}),
+    )
+    .await;
+}
+
+/// Handle a `rename_chat` envelope: persist a new display `title` on an
+/// existing `websocket:{chat_id}` session and ack with `chat_renamed`.
+/// Existence of a session file *is* required — unlike `attach`, renaming
+/// a chat that was never persisted would create a title-only ghost session.
+/// Rust-side protocol addition with no nanobot precedent — see
+/// [`EnvelopeType::RenameChat`].
+async fn handle_envelope_rename_chat<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _) = envelope_dispatch_context.connection_fields();
+
+    let Some((cid, rejection_fields)) =
+        authorize_chat_metadata_mutation(&envelope_dispatch_context).await
+    else {
+        return;
+    };
 
     let title = envelope_dispatch_context
         .envelope
@@ -8701,6 +8783,81 @@ mod tests {
                 .get(crate::session::SESSION_TITLE_METADATA_KEY),
             Some(&serde_json::json!("Fix the login bug"))
         );
+    }
+
+    // --- handle_envelope_pin_chat ---
+
+    async fn dispatch_pin(shared: &WsShared, pinned: Option<serde_json::Value>) {
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!("pin_chat"));
+        envelope.insert("chat_id".to_string(), serde_json::json!("chat-1"));
+        if let Some(pinned) = pinned {
+            envelope.insert("pinned".to_string(), pinned);
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("handle_envelope_pin_chat must not hang");
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_pin_chat_persists_flag_and_sends_chat_pinned() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save(Session::new("websocket:chat-1".to_string()))
+            .unwrap();
+
+        dispatch_pin(&shared, Some(serde_json::json!(true))).await;
+
+        let body = recv_json(&mut rx);
+        assert_eq!(body["event"], "chat_pinned");
+        assert_eq!(body["chat_id"], "chat-1");
+        assert_eq!(body["pinned"], true);
+        let session = shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_session_internal("websocket:chat-1")
+            .expect("session must still exist");
+        assert_eq!(
+            session
+                .metadata
+                .get(crate::session::SESSION_PINNED_METADATA_KEY),
+            Some(&serde_json::json!(true))
+        );
+    }
+
+    #[tokio::test]
+    async fn handle_envelope_pin_chat_rejects_missing_flag_and_unknown_session() {
+        let shared = test_shared("browser");
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        dispatch_pin(&shared, None).await;
+        assert_eq!(recv_json(&mut rx)["detail"], "missing pinned");
+
+        dispatch_pin(&shared, Some(serde_json::json!(true))).await;
+        assert_eq!(recv_json(&mut rx)["detail"], "session_not_found");
     }
 
     #[tokio::test]

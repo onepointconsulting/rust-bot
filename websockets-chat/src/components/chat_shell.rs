@@ -53,6 +53,7 @@ pub fn ChatShell(
     on_toggle_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_close_sidebar: impl Fn() + 'static + Send + Sync + Copy,
     on_select_session: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_pin_session: impl Fn(String, bool) + 'static + Send + Sync + Copy,
     on_rename_session: impl Fn(String, String) + 'static + Send + Sync + Copy,
     #[prop(default = false)] show_workspace: bool,
     #[prop(into)] workspace_popup: Signal<Option<WorkspaceDialogState>>,
@@ -159,6 +160,7 @@ pub fn ChatShell(
                 open=sidebar_open
                 on_close=on_close_sidebar
                 on_select=on_select_session
+                on_pin=Callback::new(move |(id, pinned)| on_pin_session(id, pinned))
                 on_rename=Callback::new(move |(id, title)| on_rename_session(id, title))
                 on_workspace=show_workspace.then_some(Callback::new(move |id| on_workspace_session(id)))
                 workspace_popup=workspace_popup

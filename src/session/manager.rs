@@ -18,7 +18,8 @@ use crate::{
     providers::base::{LLMResponse, LLMUsage},
     runtime_context::RUNTIME_CONTEXT_HISTORY_META,
     session::{
-        GOAL_STATE_KEY, SESSION_TITLE_METADATA_KEY, SESSION_TOKEN_USAGE_KEY,
+        GOAL_STATE_KEY, SESSION_PINNED_METADATA_KEY, SESSION_TITLE_METADATA_KEY,
+        SESSION_TOKEN_USAGE_KEY,
         SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, history_visibility::is_hidden_history_message,
         journal::JournalStore, journal_file::FileJournalStore, keys::COMMAND_KEY,
     },
@@ -502,6 +503,7 @@ impl SessionStore for JSONLSessionStore {
                         "title": listed_session_title(&metadata),
                         "owner_client_id": listed_session_owner_client_id(&metadata),
                         "has_summary": listed_session_has_summary(&metadata),
+                        "pinned": listed_session_is_pinned(&metadata),
                     }));
                 }
             }
@@ -1406,6 +1408,32 @@ impl SessionManager {
         })
     }
 
+    /// Pin or unpin an existing session. Does not create a session — missing
+    /// keys return [`RenameSessionError::NotFound`] (the shared "mutate an
+    /// existing session's metadata" error). Unlike a rename this leaves
+    /// `updated_at` alone, so pinning never reorders the date groups.
+    pub fn set_session_pinned(
+        &mut self,
+        session_key: &str,
+        pinned: bool,
+    ) -> Result<(), RenameSessionError> {
+        log::info!("Setting pinned={pinned} on session {session_key}");
+        let Some(mut session) = self.get_session_internal(session_key) else {
+            return Err(RenameSessionError::NotFound);
+        };
+        if pinned {
+            session
+                .metadata
+                .insert(SESSION_PINNED_METADATA_KEY.to_string(), json!(true));
+        } else {
+            session.metadata.remove(SESSION_PINNED_METADATA_KEY);
+        }
+        self.save(session).map_err(|e| {
+            log::error!("Failed to save pinned flag for {session_key}: {e}");
+            RenameSessionError::Save(e)
+        })
+    }
+
     fn persist_generated_title(&mut self, session_key: &str, title: String) -> Option<String> {
         let session = self.get_or_create_session(session_key);
         if let Some(existing) = session
@@ -1503,6 +1531,16 @@ fn listed_session_has_summary(metadata_line: &Value) -> bool {
         .and_then(|obj| obj.get("text"))
         .and_then(Value::as_str)
         .is_some_and(|s| !s.is_empty())
+}
+
+/// Whether the JSONL metadata line marks the session as pinned
+/// (`metadata.pinned` is the boolean `true`).
+fn listed_session_is_pinned(metadata_line: &Value) -> bool {
+    metadata_line
+        .get("metadata")
+        .and_then(|m| m.get(SESSION_PINNED_METADATA_KEY))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
 }
 
 /// Title stored on the JSONL metadata line (`metadata.title`), if any.
@@ -2560,6 +2598,37 @@ mod tests {
         let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
         assert!(matches!(
             mgr.rename_session("missing", "Nope"),
+            Err(RenameSessionError::NotFound)
+        ));
+        assert!(mgr.list_sessions().is_empty());
+    }
+
+    #[test]
+    fn set_session_pinned_persists_flag_without_touching_updated_at() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        mgr.save(Session::new("chat".to_string())).unwrap();
+        mgr.cache.clear();
+        let updated_before = mgr.list_sessions()[0]["updated_at"].clone();
+        assert_eq!(mgr.list_sessions()[0]["pinned"], json!(false));
+
+        mgr.set_session_pinned("chat", true).unwrap();
+        mgr.cache.clear();
+        let listed = mgr.list_sessions();
+        assert_eq!(listed[0]["pinned"], json!(true));
+        assert_eq!(listed[0]["updated_at"], updated_before);
+
+        mgr.set_session_pinned("chat", false).unwrap();
+        mgr.cache.clear();
+        assert_eq!(mgr.list_sessions()[0]["pinned"], json!(false));
+    }
+
+    #[test]
+    fn set_session_pinned_errors_when_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        assert!(matches!(
+            mgr.set_session_pinned("missing", true),
             Err(RenameSessionError::NotFound)
         ));
         assert!(mgr.list_sessions().is_empty());

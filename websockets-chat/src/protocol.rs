@@ -97,6 +97,9 @@ pub struct ClientEnvelope {
     /// Set only by [`Self::set_mcp_preset`] — `true` to enable, `false` to disable.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub enabled: Option<bool>,
+    /// Set only by [`Self::pin_chat`] — `true` to pin the chat, `false` to unpin it.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub pinned: Option<bool>,
     /// Set only by [`Self::set_mcp_preset`] when enabling with values — preset
     /// field name to value (API keys, tokens). Secret: never logged or echoed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -136,6 +139,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -167,6 +171,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -197,6 +202,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -240,6 +246,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -268,6 +275,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -296,6 +304,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -326,6 +335,7 @@ impl ClientEnvelope {
             type_: "set_mcp_preset",
             name: Some(name.into()),
             enabled: Some(enabled),
+            pinned: None,
             fields: (!fields.is_empty()).then_some(fields),
             ..Self::list_skills()
         }
@@ -367,8 +377,24 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
+        }
+    }
+
+    /// Pin (`true`) or unpin (`false`) an existing `chat_id` so the chat list
+    /// shows it on top.
+    ///
+    /// The reply is a `chat_pinned` event carrying that `chat_id` and the
+    /// stored `pinned` flag. Rejections come back as `error` (`missing pinned`,
+    /// `session_not_found`, `access_denied`, `pin_failed`).
+    pub fn pin_chat(chat_id: impl Into<String>, pinned: bool) -> Self {
+        Self {
+            type_: "pin_chat",
+            title: None,
+            pinned: Some(pinned),
+            ..Self::rename_chat(chat_id, "")
         }
     }
 
@@ -398,6 +424,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -429,6 +456,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -462,6 +490,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -493,6 +522,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -530,6 +560,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -561,6 +592,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -588,6 +620,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -618,6 +651,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -650,6 +684,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -684,6 +719,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -720,6 +756,7 @@ impl ClientEnvelope {
             chat_about: false,
             name: None,
             enabled: None,
+            pinned: None,
             fields: None,
             webui: true,
         }
@@ -774,6 +811,10 @@ pub struct ChatSummary {
     /// omit the field; treat that as no summary.
     #[serde(default)]
     pub has_summary: bool,
+    /// Whether the user pinned this chat. Older gateways omit the field;
+    /// treat that as unpinned.
+    #[serde(default)]
+    pub pinned: bool,
 }
 
 /// One child directory inside a `directories` event.
@@ -966,6 +1007,8 @@ pub enum ServerEvent {
     },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
+    /// Reply to a `pin_chat` envelope: `chat_id` is now pinned or unpinned.
+    ChatPinned { chat_id: String, pinned: bool },
     /// Reply to a `delete_chat` envelope, fanned out to every connection
     /// that was subscribed to `chat_id` — not just the requester.
     ChatDeleted { chat_id: String },
@@ -1090,6 +1133,7 @@ impl ServerEvent {
             | ServerEvent::Subagents { .. }
             | ServerEvent::McpPresetError { .. }
             | ServerEvent::ChatRenamed { .. }
+            | ServerEvent::ChatPinned { .. }
             | ServerEvent::ChatDeleted { .. }
             | ServerEvent::SessionCleared { .. }
             | ServerEvent::SessionSummary { .. }
@@ -1443,6 +1487,12 @@ struct ChatRenamedWire {
 }
 
 #[derive(Deserialize)]
+struct ChatPinnedWire {
+    chat_id: String,
+    pinned: bool,
+}
+
+#[derive(Deserialize)]
 struct ChatDeletedWire {
     chat_id: String,
 }
@@ -1668,6 +1718,10 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "chat_renamed" => decode::<ChatRenamedWire>(&value).map(|w| ServerEvent::ChatRenamed {
             chat_id: w.chat_id,
             title: w.title,
+        }),
+        "chat_pinned" => decode::<ChatPinnedWire>(&value).map(|w| ServerEvent::ChatPinned {
+            chat_id: w.chat_id,
+            pinned: w.pinned,
         }),
         "chat_deleted" => decode::<ChatDeletedWire>(&value)
             .map(|w| ServerEvent::ChatDeleted { chat_id: w.chat_id }),
@@ -2411,6 +2465,7 @@ mod tests {
                         created_at: "2024-01-01T00:00:00Z".to_string(),
                         updated_at: "2024-01-02T00:00:00Z".to_string(),
                         has_summary: false,
+                        pinned: false,
                     },
                     ChatSummary {
                         chat_id: "chat-2".to_string(),
@@ -2418,6 +2473,7 @@ mod tests {
                         created_at: "2024-01-03T00:00:00Z".to_string(),
                         updated_at: "2024-01-03T00:00:00Z".to_string(),
                         has_summary: false,
+                        pinned: false,
                     },
                 ],
             }
@@ -2821,6 +2877,35 @@ mod tests {
     }
 
     #[test]
+    fn client_envelope_pin_chat_serializes_expected_shape() {
+        let value = serde_json::to_value(ClientEnvelope::pin_chat("chat-1", true))
+            .expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "pin_chat",
+                "chat_id": "chat-1",
+                "pinned": true,
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_chat_pinned() {
+        let raw = r#"{"event":"chat_pinned","chat_id":"chat-1","pinned":true}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ChatPinned {
+                chat_id: "chat-1".to_string(),
+                pinned: true,
+            }
+        );
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
     fn client_envelope_delete_chat_serializes_expected_shape() {
         let envelope = ClientEnvelope::delete_chat("chat-1");
         let value = serde_json::to_value(&envelope).expect("should serialize");
@@ -2916,6 +3001,7 @@ mod tests {
                     created_at: String::new(),
                     updated_at: String::new(),
                     has_summary: true,
+                    pinned: false,
                 }],
             }
         );

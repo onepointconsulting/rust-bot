@@ -76,6 +76,18 @@ pub fn next_session_id_after(sessions: &[SessionListItem], deleted_id: &str) -> 
         .map(|session| session.id.clone())
 }
 
+/// Mark `chat_id` as pinned or unpinned in the sidebar list. Returns whether
+/// a row with that id exists; unknown ids leave the list untouched.
+pub fn set_session_pinned(sessions: &mut [SessionListItem], chat_id: &str, pinned: bool) -> bool {
+    match sessions.iter_mut().find(|session| session.id == chat_id) {
+        Some(session) => {
+            session.pinned = pinned;
+            true
+        }
+        None => false,
+    }
+}
+
 /// Whether the in-transcript Fork control should render next to this entry.
 ///
 /// Shown on every completed assistant reply, not just the last one; hidden
@@ -1842,7 +1854,19 @@ mod tests {
             created_at: String::new(),
             updated_at: String::new(),
             has_summary: false,
+            pinned: false,
         }
+    }
+
+    #[test]
+    fn set_session_pinned_updates_only_the_matching_row() {
+        let mut sessions = vec![session_item("a"), session_item("b")];
+        assert!(set_session_pinned(&mut sessions, "b", true));
+        assert!(!sessions[0].pinned);
+        assert!(sessions[1].pinned);
+        assert!(set_session_pinned(&mut sessions, "b", false));
+        assert!(!sessions[1].pinned);
+        assert!(!set_session_pinned(&mut sessions, "missing", true));
     }
 
     #[test]

@@ -1,9 +1,10 @@
 //! Cursor-style sessions sidebar shared by `web-chat` and `websockets-chat`.
 //!
 //! Rows highlight the active session; clicking one invokes `on_select`.
-//! When `on_rename`, `on_workspace`, `on_summary`, `on_fork`, `on_clear`,
+//! When `on_pin`, `on_rename`, `on_workspace`, `on_summary`, `on_fork`, `on_clear`,
 //! and/or `on_delete` is provided (websockets-chat), each row also has a
-//! kebab that opens a menu with "Rename", "Workspace" (localhost only),
+//! kebab that opens a menu with "Pin session"/"Unpin session" (pinned rows are
+//! listed in a "Pinned" group on top and show a pin icon), "Rename", "Workspace" (localhost only),
 //! "Summary" (only when that row has a persisted summary), "Fork session",
 //! "Clear session", and/or a red "Delete" item.
 //! Delete and clear each open their own confirmation dialog before actually
@@ -34,6 +35,7 @@ use std::collections::HashSet;
 
 use leptos::html::Input;
 use leptos::prelude::*;
+use wasm_bindgen::JsCast;
 
 use crate::components::brand::BrandLogo;
 use crate::models::{SessionListItem, SessionSummaryPopup, WorkspaceDialogState};
@@ -42,6 +44,17 @@ use crate::session_groups::{group_sessions, SessionGroup};
 /// Rows beyond this count in a single group are collapsed behind a
 /// "··· More" toggle, mirroring Cursor's own history list.
 const COLLAPSE_THRESHOLD: usize = 8;
+
+/// Width of the kebab menu (`w-40`), needed to right-align it to the kebab.
+const MENU_WIDTH_PX: f64 = 160.0;
+
+/// Height of one menu item (`py-2` + `text-sm` line) and of one divider
+/// (`my-1` + 1px rule), used to estimate the menu height before it renders.
+const MENU_ITEM_HEIGHT_PX: f64 = 36.0;
+const MENU_DIVIDER_HEIGHT_PX: f64 = 9.0;
+
+/// Minimum gap kept between the menu and the viewport edge.
+const MENU_EDGE_GAP_PX: f64 = 8.0;
 
 const MENU_ITEM: &str = "flex w-full items-center gap-2.5 px-3 py-2 text-left text-sm font-medium text-slate-700 hover:bg-slate-50";
 
@@ -188,6 +201,28 @@ fn IconKebab() -> impl IntoView {
             <circle cx="12" cy="5" r="1" fill="currentColor" />
             <circle cx="12" cy="12" r="1" fill="currentColor" />
             <circle cx="12" cy="19" r="1" fill="currentColor" />
+        </svg>
+    }
+}
+
+/// Pin glyph. `filled` renders the solid variant used as the "this row is
+/// pinned" marker; the outline variant is the menu item's icon.
+#[component]
+fn IconPin(#[prop(default = false)] filled: bool) -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill=if filled { "currentColor" } else { "none" }
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=if filled { "h-3.5 w-3.5" } else { icon_class() }
+            aria-hidden="true"
+        >
+            <path d="M12 17v5" />
+            <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
         </svg>
     }
 }
@@ -350,6 +385,70 @@ fn collapse_tooltip(hint: Option<&str>) -> String {
     }
 }
 
+/// Estimated rendered height of a kebab menu with `item_count` items
+/// separated by dividers (plus the `py-1` padding).
+fn estimated_menu_height(item_count: usize) -> f64 {
+    let count = item_count as f64;
+    count * MENU_ITEM_HEIGHT_PX + (count - 1.0).max(0.0) * MENU_DIVIDER_HEIGHT_PX + 8.0
+}
+
+/// Inline `position: fixed` style for a kebab menu anchored to the button
+/// spanning `anchor_top..anchor_bottom` and ending at `anchor_right`.
+///
+/// The menu opens below the button when it fits there, otherwise above it,
+/// otherwise on whichever side has more room — in that last case its
+/// `max-height` shrinks it so it scrolls internally rather than leaving the
+/// viewport.
+fn menu_placement_style(
+    anchor_top: f64,
+    anchor_bottom: f64,
+    anchor_right: f64,
+    viewport_height: f64,
+    menu_height: f64,
+) -> String {
+    let space_below = viewport_height - anchor_bottom - MENU_EDGE_GAP_PX;
+    let space_above = anchor_top - MENU_EDGE_GAP_PX;
+    let left = (anchor_right + 4.0 - MENU_WIDTH_PX).max(MENU_EDGE_GAP_PX);
+    let open_below = space_below >= menu_height || space_below >= space_above;
+    if open_below {
+        format!(
+            "left:{left}px;top:{}px;max-height:{}px",
+            anchor_bottom + 2.0,
+            space_below.max(0.0)
+        )
+    } else {
+        format!(
+            "left:{left}px;bottom:{}px;max-height:{}px",
+            viewport_height - anchor_top + 2.0,
+            space_above.max(0.0)
+        )
+    }
+}
+
+/// Placement style for the menu opened from `kebab` (the clicked button), or
+/// an empty style when the browser geometry is unavailable.
+fn menu_style_for_button(kebab: &web_sys::Element, menu_height: f64) -> String {
+    let viewport_height = web_sys::window()
+        .and_then(|window| window.inner_height().ok())
+        .and_then(|height| height.as_f64());
+    let Some(viewport_height) = viewport_height else {
+        return String::new();
+    };
+    let rect = kebab.get_bounding_client_rect();
+    menu_placement_style(
+        rect.top(),
+        rect.bottom(),
+        rect.right(),
+        viewport_height,
+        menu_height,
+    )
+}
+
+/// Label of the kebab menu's pin item for a row that is currently `pinned`.
+fn pin_menu_label(pinned: bool) -> &'static str {
+    if pinned { "Unpin session" } else { "Pin session" }
+}
+
 /// Header button (left of the title, same at every breakpoint) that opens
 /// the sidebar once it's collapsed. Renders nothing while the sidebar is
 /// already open — closing it is done from the collapse icon inside the
@@ -389,9 +488,11 @@ fn SessionRow(
     display_title: String,
     raw_title: String,
     has_summary: bool,
+    pinned: bool,
     #[prop(into)] active_id: Signal<Option<String>>,
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
+    on_open_pin: Option<Callback<(String, bool)>>,
     on_open_rename: Option<Callback<(String, String)>>,
     on_open_workspace: Option<Callback<String>>,
     on_open_summary: Option<Callback<String>>,
@@ -407,15 +508,34 @@ fn SessionRow(
     let id_for_kebab_active = id.clone();
     let id_for_expanded = id.clone();
     let id_for_toggle = id.clone();
+    let menu_style = RwSignal::new(String::new());
     let display_title_for_menu = display_title.clone();
+    let show_pin = on_open_pin.is_some();
     let show_rename = on_open_rename.is_some();
     let show_workspace = on_open_workspace.is_some();
     let show_summary = on_open_summary.is_some() && has_summary;
     let show_fork = on_open_fork.is_some();
     let show_clear = on_open_clear.is_some();
     let show_delete = on_open_delete.is_some();
-    let show_menu =
-        show_rename || show_workspace || show_summary || show_fork || show_clear || show_delete;
+    let show_menu = show_pin
+        || show_rename
+        || show_workspace
+        || show_summary
+        || show_fork
+        || show_clear
+        || show_delete;
+    let menu_item_count = [
+        show_pin,
+        show_rename,
+        show_workspace,
+        show_summary,
+        show_fork,
+        show_clear,
+        show_delete,
+    ]
+    .into_iter()
+    .filter(|shown| *shown)
+    .count();
 
     view! {
         <li class="group relative">
@@ -447,6 +567,18 @@ fn SessionRow(
                 >
                     {display_title}
                 </button>
+                {pinned.then(|| {
+                    view! {
+                        <span
+                            class="mr-1 flex shrink-0 items-center text-slate-400"
+                            title="Pinned"
+                            role="img"
+                            aria-label="Pinned"
+                        >
+                            <IconPin filled=true />
+                        </span>
+                    }
+                })}
                 {show_menu.then(|| {
                     view! {
                         <button
@@ -473,6 +605,18 @@ fn SessionRow(
                             }
                             on:click=move |ev| {
                                 ev.stop_propagation();
+                                if let Some(kebab) = ev
+                                    .current_target()
+                                    .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+                                {
+                                    menu_style
+                                        .set(
+                                            menu_style_for_button(
+                                                &kebab,
+                                                estimated_menu_height(menu_item_count),
+                                            ),
+                                        );
+                                }
                                 open_menu_id.update(|current| {
                                     if current.as_deref() == Some(id_for_toggle.as_str()) {
                                         *current = None;
@@ -489,6 +633,7 @@ fn SessionRow(
             </div>
             {show_menu.then(|| {
                 let id_for_menu_visible = id.clone();
+                let id_for_pin = id.clone();
                 let id_for_rename = id.clone();
                 let id_for_workspace = id.clone();
                 let id_for_summary = id.clone();
@@ -511,8 +656,35 @@ fn SessionRow(
                         ></div>
                         <div
                             role="menu"
-                            class="absolute right-1 z-30 mt-0.5 w-40 overflow-hidden rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
+                            class="fixed z-30 w-40 overflow-y-auto rounded-xl bg-white py-1 shadow-lg ring-1 ring-slate-200"
+                            style=move || menu_style.get()
                         >
+                            {show_pin.then(|| {
+                                view! {
+                                    <button
+                                        type="button"
+                                        role="menuitem"
+                                        class=MENU_ITEM
+                                        on:click=move |_| {
+                                            open_menu_id.set(None);
+                                            if let Some(on_open_pin) = on_open_pin {
+                                                on_open_pin.run((id_for_pin.clone(), !pinned));
+                                            }
+                                        }
+                                    >
+                                        <IconPin />
+                                        {pin_menu_label(pinned)}
+                                    </button>
+                                }
+                            })}
+                            {(show_pin
+                                && (show_rename
+                                    || show_workspace
+                                    || show_summary
+                                    || show_fork
+                                    || show_clear
+                                    || show_delete))
+                                .then(|| view! { <div class="my-1 h-px bg-slate-100"></div> })}
                             {show_rename.then(|| {
                                 view! {
                                     <button
@@ -666,6 +838,7 @@ fn SessionGroupSection(
     on_expand: impl Fn() + 'static + Send + Sync + Copy,
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
     open_menu_id: RwSignal<Option<String>>,
+    on_open_pin: Option<Callback<(String, bool)>>,
     on_open_rename: Option<Callback<(String, String)>>,
     on_open_workspace: Option<Callback<String>>,
     on_open_summary: Option<Callback<String>>,
@@ -696,9 +869,11 @@ fn SessionGroupSection(
                     display_title=display_title
                     raw_title=item.title
                     has_summary=item.has_summary
+                    pinned=item.pinned
                     active_id=active_id
                     on_select=on_select
                     open_menu_id=open_menu_id
+                    on_open_pin=on_open_pin
                     on_open_rename=on_open_rename
                     on_open_workspace=on_open_workspace
                     on_open_summary=on_open_summary
@@ -748,6 +923,11 @@ pub fn SessionsSidebar(
     #[prop(into)] open: Signal<bool>,
     on_close: impl Fn() + 'static + Send + Sync + Copy,
     on_select: impl Fn(String) + 'static + Send + Sync + Copy,
+    /// When set, each row's kebab gets a "Pin session"/"Unpin session" item
+    /// that fires immediately with `(chat_id, pinned)` — the *new* state.
+    /// Omitted by `web-chat`, which has no pin API.
+    #[prop(optional)]
+    on_pin: Option<Callback<(String, bool)>>,
     /// When set, each row shows a kebab → Rename → dialog. Omitted by
     /// `web-chat`, which has no rename API yet.
     #[prop(optional)]
@@ -837,6 +1017,14 @@ pub fn SessionsSidebar(
     let rename_input = NodeRef::<Input>::new();
     let delete_id = RwSignal::new(None::<String>);
     let clear_id = RwSignal::new(None::<String>);
+
+    let open_pin = Callback::new(move |(id, pinned): (String, bool)| {
+        open_menu_id.set(None);
+        if let Some(on_pin) = on_pin {
+            on_pin.run((id, pinned));
+        }
+    });
+    let on_open_pin = on_pin.map(|_| open_pin);
 
     let open_rename = Callback::new(move |(id, title): (String, String)| {
         open_menu_id.set(None);
@@ -979,6 +1167,7 @@ pub fn SessionsSidebar(
                             }
                             on_select=on_select
                             open_menu_id=open_menu_id
+                            on_open_pin=on_open_pin
                             on_open_rename=on_open_rename
                             on_open_workspace=on_open_workspace
                             on_open_summary=on_open_summary
@@ -1593,7 +1782,48 @@ mod collapse_tooltip_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::nav_button_class;
+    use super::{estimated_menu_height, menu_placement_style, nav_button_class, pin_menu_label};
+
+    #[test]
+    fn menu_opens_below_when_it_fits() {
+        let style = menu_placement_style(100.0, 130.0, 250.0, 800.0, 200.0);
+        assert!(style.contains("top:132px"), "{style}");
+        assert!(!style.contains("bottom:"), "{style}");
+    }
+
+    #[test]
+    fn menu_flips_above_near_the_bottom_of_the_viewport() {
+        let style = menu_placement_style(700.0, 730.0, 250.0, 760.0, 200.0);
+        assert!(style.contains("bottom:62px"), "{style}");
+        assert!(!style.contains("top:"), "{style}");
+    }
+
+    #[test]
+    fn menu_uses_the_larger_side_and_caps_height_when_neither_fits() {
+        let style = menu_placement_style(300.0, 330.0, 250.0, 600.0, 500.0);
+        // 262px below vs 292px above: above wins, height capped to what is there.
+        assert!(style.contains("bottom:302px"), "{style}");
+        assert!(style.contains("max-height:292px"), "{style}");
+    }
+
+    #[test]
+    fn menu_stays_inside_the_left_edge() {
+        let style = menu_placement_style(100.0, 130.0, 50.0, 800.0, 100.0);
+        assert!(style.starts_with("left:8px"), "{style}");
+    }
+
+    #[test]
+    fn estimated_menu_height_counts_items_and_dividers() {
+        assert_eq!(estimated_menu_height(0), 8.0);
+        assert_eq!(estimated_menu_height(1), 44.0);
+        assert_eq!(estimated_menu_height(3), 3.0 * 36.0 + 2.0 * 9.0 + 8.0);
+    }
+
+    #[test]
+    fn pin_menu_label_reflects_current_state() {
+        assert_eq!(pin_menu_label(false), "Pin session");
+        assert_eq!(pin_menu_label(true), "Unpin session");
+    }
 
     #[test]
     fn nav_button_class_highlights_only_when_active() {

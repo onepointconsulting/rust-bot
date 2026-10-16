@@ -867,7 +867,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             if matches!(
                 detail.as_str(),
-                "session_not_found" | "missing title" | "rename_failed" | "delete_failed"
+                "session_not_found" | "missing title" | "rename_failed" | "pin_failed" | "delete_failed"
             ) {
                 request_chat_list(ctx);
             }
@@ -961,6 +961,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                     created_at: chat.created_at,
                     updated_at: chat.updated_at,
                     has_summary: chat.has_summary,
+                    pinned: chat.pinned,
                 })
                 .collect();
             ctx.sessions.set(items);
@@ -1025,6 +1026,10 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         }
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
+        }
+        ServerEvent::ChatPinned { chat_id, pinned } => {
+            ctx.sessions
+                .update(|sessions| _ = state::set_session_pinned(sessions, &chat_id, pinned));
         }
         ServerEvent::ChatDeleted { chat_id } => {
             handle_chat_deleted(ctx, chat_id);
@@ -1419,6 +1424,19 @@ fn request_rename(ctx: &WsContext, chat_id: String, title: String) {
         *ctx,
         protocol::ClientEnvelope::rename_chat(chat_id, title),
         "Failed to encode the rename request.",
+    );
+}
+
+/// Pin or unpin `chat_id`: the sidebar updates optimistically, and a failed
+/// request (`session_not_found`, `pin_failed`) triggers a list refresh that
+/// restores the stored state.
+fn request_pin(ctx: &WsContext, chat_id: String, pinned: bool) {
+    ctx.sessions
+        .update(|sessions| _ = state::set_session_pinned(sessions, &chat_id, pinned));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::pin_chat(chat_id, pinned),
+        "Failed to encode the pin request.",
     );
 }
 
@@ -2272,6 +2290,9 @@ pub fn App() -> impl IntoView {
         sidebar_open.set(false);
         let _ = BrowserLocalStorage::set(SIDEBAR_OPEN_STORAGE_KEY, &sidebar_open.get());
     };
+    let on_pin_session = move |id: String, pinned: bool| {
+        request_pin(&ws_context, id, pinned);
+    };
     let on_rename_session = move |id: String, title: String| {
         request_rename(&ws_context, id, title);
     };
@@ -2410,6 +2431,7 @@ pub fn App() -> impl IntoView {
                     on_toggle_sidebar=toggle_sidebar
                     on_close_sidebar=close_sidebar
                     on_select_session=on_select_session
+                    on_pin_session=on_pin_session
                     on_rename_session=on_rename_session
                     show_workspace=show_workspace
                     workspace_popup=Signal::derive(move || workspace_popup.get())

@@ -73,6 +73,10 @@ pub enum EnvelopeType {
     /// session. Rust-side addition with no nanobot precedent — the Python
     /// reference has no rename envelope; titles are LLM-generated only.
     RenameChat,
+    /// Pin or unpin an existing `websocket:{chat_id}` session (`pinned: bool`)
+    /// so the chat list shows it on top. Rust-side addition with no nanobot
+    /// precedent.
+    PinChat,
     /// Delete an existing `websocket:{chat_id}` session.
     /// Rust-side addition with no nanobot precedent — the Python reference has no delete envelope.
     DeleteChat,
@@ -129,6 +133,7 @@ impl From<&str> for EnvelopeType {
             "new_chat" => Self::NewChat,
             "fork_chat" => Self::ForkChat,
             "rename_chat" => Self::RenameChat,
+            "pin_chat" => Self::PinChat,
             "delete_chat" => Self::DeleteChat,
             "abort_turn" => Self::AbortTurn,
             "attach" => Self::Attach,
@@ -192,6 +197,8 @@ pub enum WsOutboundEvent {
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
     /// wire-name precedent to mirror (see that variant's doc comment).
     ChatRenamed,
+    /// Reply to [`EnvelopeType::PinChat`] — `{chat_id, pinned}`. Rust-side addition.
+    ChatPinned,
     /// Fan-out for [`EnvelopeType::DeleteChat`], sent to every connection
     /// that was subscribed to the deleted chat (not just the requester).
     /// Rust-side addition, no nanobot wire-name precedent to mirror (see
@@ -255,6 +262,7 @@ impl WsOutboundEvent {
             Self::McpPresetError => "mcp_preset_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
+            Self::ChatPinned => "chat_pinned",
             Self::ChatDeleted => "chat_deleted",
             Self::TurnAborted => "turn_aborted",
             Self::ModelPresetSet => "model_preset_set",
@@ -660,6 +668,8 @@ mod tests {
         );
         assert_eq!(WsOutboundEvent::Subagents.as_str(), "subagents");
         assert_eq!(EnvelopeType::from("rename_chat"), EnvelopeType::RenameChat);
+        assert_eq!(EnvelopeType::from("pin_chat"), EnvelopeType::PinChat);
+        assert_eq!(WsOutboundEvent::ChatPinned.as_str(), "chat_pinned");
         assert_eq!(EnvelopeType::from("delete_chat"), EnvelopeType::DeleteChat);
         assert_eq!(EnvelopeType::from("abort_turn"), EnvelopeType::AbortTurn);
         assert_eq!(
