@@ -19,9 +19,9 @@ use crate::{
     runtime_context::RUNTIME_CONTEXT_HISTORY_META,
     session::{
         GOAL_STATE_KEY, SESSION_PINNED_METADATA_KEY, SESSION_TITLE_METADATA_KEY,
-        SESSION_TOKEN_USAGE_KEY,
-        SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY, history_visibility::is_hidden_history_message,
-        journal::JournalStore, journal_file::FileJournalStore, keys::COMMAND_KEY,
+        SESSION_TOKEN_USAGE_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY,
+        history_visibility::is_hidden_history_message, journal::JournalStore,
+        journal_file::FileJournalStore, keys::COMMAND_KEY,
     },
     utils::fs::write_atomic,
     utils::helpers::{

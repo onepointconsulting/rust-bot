@@ -83,6 +83,26 @@ fn parse_ms_or(timestamp: &str, fallback_ms: i64) -> i64 {
         .unwrap_or(fallback_ms)
 }
 
+/// Title the sidebar shows for `session` (an untitled chat reads "New chat").
+pub fn display_title(session: &SessionListItem) -> &str {
+    if session.title.trim().is_empty() {
+        "New chat"
+    } else {
+        &session.title
+    }
+}
+
+/// Sessions whose displayed title contains `query`, case-insensitively,
+/// preserving input order. A blank `query` matches everything.
+pub fn filter_sessions_by_title(sessions: &[SessionListItem], query: &str) -> Vec<SessionListItem> {
+    let needle = query.trim().to_lowercase();
+    sessions
+        .iter()
+        .filter(|session| display_title(session).to_lowercase().contains(&needle))
+        .cloned()
+        .collect()
+}
+
 /// Group `sessions` into the sidebar's fixed buckets: pinned sessions first,
 /// then the date buckets, preserving input order within each bucket. A
 /// pinned session appears only in `Pinned`, whatever its `updated_at`. Empty buckets are omitted. `now_ms` is Unix
@@ -229,6 +249,37 @@ mod tests {
         assert_eq!(grouped.len(), 2);
         assert_eq!(grouped[0], (SessionGroup::Pinned, vec![old_pinned]));
         assert_eq!(grouped[1].0, SessionGroup::Today);
+    }
+
+    #[test]
+    fn filter_matches_title_substring_case_insensitively() {
+        let sessions = vec![
+            item("a", "2024-06-15T08:00:00Z"),
+            SessionListItem {
+                title: "Add Chess game".to_string(),
+                ..item("b", "2024-06-15T07:00:00Z")
+            },
+        ];
+        let ids = |query: &str| {
+            filter_sessions_by_title(&sessions, query)
+                .into_iter()
+                .map(|session| session.id)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(ids("CHESS"), vec!["b"]);
+        assert_eq!(ids("  ch "), vec!["a", "b"]);
+        assert_eq!(ids(""), vec!["a", "b"]);
+        assert!(ids("zzz").is_empty());
+    }
+
+    #[test]
+    fn filter_matches_the_new_chat_placeholder_for_untitled_sessions() {
+        let untitled = SessionListItem {
+            title: "  ".to_string(),
+            ..item("u", "2024-06-15T08:00:00Z")
+        };
+        assert_eq!(display_title(&untitled), "New chat");
+        assert_eq!(filter_sessions_by_title(&[untitled], "new").len(), 1);
     }
 
     #[test]

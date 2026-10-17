@@ -39,7 +39,7 @@ use wasm_bindgen::JsCast;
 
 use crate::components::brand::BrandLogo;
 use crate::models::{SessionListItem, SessionSummaryPopup, WorkspaceDialogState};
-use crate::session_groups::{group_sessions, SessionGroup};
+use crate::session_groups::{display_title, filter_sessions_by_title, group_sessions, SessionGroup};
 
 /// Rows beyond this count in a single group are collapsed behind a
 /// "··· More" toggle, mirroring Cursor's own history list.
@@ -105,6 +105,19 @@ pub(crate) fn IconChatPlus() -> impl IntoView {
             <line x1="8.5" x2="15.5" y1="11.5" y2="11.5" />
         </svg>
     }
+}
+
+/// Narrowest width (px) the docked sidebar can be dragged to.
+const SIDEBAR_MIN_WIDTH_PX: f64 = 160.0;
+/// Widest width (px) the docked sidebar can be dragged to.
+const SIDEBAR_MAX_WIDTH_PX: f64 = 480.0;
+
+/// Width (px) the sidebar should have after a drag: the width it had when
+/// the drag started, shifted by how far the pointer has moved horizontally,
+/// and kept within [`SIDEBAR_MIN_WIDTH_PX`]..=[`SIDEBAR_MAX_WIDTH_PX`].
+fn dragged_sidebar_width(start_width: f64, start_pointer_x: f64, current_pointer_x: f64) -> f64 {
+    (start_width + current_pointer_x - start_pointer_x)
+        .clamp(SIDEBAR_MIN_WIDTH_PX, SIDEBAR_MAX_WIDTH_PX)
 }
 
 /// Tailwind classes for a sidebar page button ("MCPs", "Sub-agents"), highlighted while
@@ -223,6 +236,27 @@ fn IconPin(#[prop(default = false)] filled: bool) -> impl IntoView {
         >
             <path d="M12 17v5" />
             <path d="M9 10.76a2 2 0 0 1-1.11 1.79l-1.78.9A2 2 0 0 0 5 15.24V16a1 1 0 0 0 1 1h12a1 1 0 0 0 1-1v-.76a2 2 0 0 0-1.11-1.79l-1.78-.9A2 2 0 0 1 15 10.76V7a1 1 0 0 1 1-1 2 2 0 0 0 0-4H8a2 2 0 0 0 0 4 1 1 0 0 1 1 1z" />
+        </svg>
+    }
+}
+
+/// Magnifying glass, used by the sidebar's search toggle and search field.
+#[component]
+fn IconSearch() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <circle cx="11" cy="11" r="8" />
+            <path d="m21 21-4.3-4.3" />
         </svg>
     }
 }
@@ -858,11 +892,7 @@ fn SessionGroupSection(
         .into_iter()
         .take(visible_count)
         .map(|item| {
-            let display_title = if item.title.trim().is_empty() {
-                "New chat".to_string()
-            } else {
-                item.title.clone()
-            };
+            let display_title = display_title(&item).to_string();
             view! {
                 <SessionRow
                     id=item.id
@@ -1012,6 +1042,48 @@ pub fn SessionsSidebar(
     // change instead of resetting to collapsed on the very next refresh.
     let expanded_groups = RwSignal::new(HashSet::<SessionGroup>::new());
     let open_menu_id = RwSignal::new(None::<String>);
+    // Title search: the field is hidden until the magnifier is clicked, and
+    // closing it clears the query so the full list returns.
+    let search_open = RwSignal::new(false);
+    let search_query = RwSignal::new(String::new());
+    let toggle_search = move || {
+        if search_open.get_untracked() {
+            search_open.set(false);
+            search_query.set(String::new());
+        } else {
+            search_open.set(true);
+        }
+    };
+    // Drag-to-resize: `None` keeps the default (compact/regular) width class
+    // until the user first drags; `resize_drag` holds the pointer x and the
+    // sidebar width at the moment the current drag started.
+    let sidebar_width_px = RwSignal::new(None::<f64>);
+    let resize_drag = RwSignal::new(None::<(f64, f64)>);
+    let start_resize = move |ev: web_sys::PointerEvent| {
+        let Some(handle) = ev
+            .current_target()
+            .and_then(|target| target.dyn_into::<web_sys::Element>().ok())
+        else {
+            return;
+        };
+        let Some(sidebar) = handle.parent_element() else {
+            return;
+        };
+        ev.prevent_default();
+        let _ = handle.set_pointer_capture(ev.pointer_id());
+        let start_width = sidebar.get_bounding_client_rect().width();
+        resize_drag.set(Some((f64::from(ev.client_x()), start_width)));
+    };
+    let continue_resize = move |ev: web_sys::PointerEvent| {
+        if let Some((start_pointer_x, start_width)) = resize_drag.get_untracked() {
+            sidebar_width_px.set(Some(dragged_sidebar_width(
+                start_width,
+                start_pointer_x,
+                f64::from(ev.client_x()),
+            )));
+        }
+    };
+    let end_resize = move |_: web_sys::PointerEvent| resize_drag.set(None);
     let rename_id = RwSignal::new(None::<String>);
     let rename_draft = RwSignal::new(String::new());
     let rename_input = NodeRef::<Input>::new();
@@ -1149,8 +1221,18 @@ pub fn SessionsSidebar(
     let collapse_title = StoredValue::new(collapse_tooltip(collapse_hint.as_deref()));
 
     let body = move || {
+        let search_input = NodeRef::<Input>::new();
+        Effect::new(move |_| {
+            if !search_open.get() {
+                return;
+            }
+            if let Some(el) = search_input.get() {
+                let _ = el.focus();
+            }
+        });
         let group_sections = move || {
-            group_sessions(&sessions.get(), js_sys::Date::now() as i64)
+            let visible = filter_sessions_by_title(&sessions.get(), &search_query.get());
+            group_sessions(&visible, js_sys::Date::now() as i64)
                 .into_iter()
                 .map(|(group, items)| {
                     let is_expanded = expanded_groups.get().contains(&group);
@@ -1201,17 +1283,19 @@ pub fn SessionsSidebar(
                         }
                         .into_any()
                     }}
-                    <button
-                        type="button"
-                        aria-label="Collapse chats panel"
-                        title=collapse_title.get_value()
-                        class="flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
-                        on:click=move |_| {
-                            on_close()
-                        }
-                    >
-                        <IconSidebarPanel />
-                    </button>
+                    <div class="flex shrink-0 items-center gap-1">
+                        <button
+                            type="button"
+                            aria-label="Collapse chats panel"
+                            title=collapse_title.get_value()
+                            class="flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                            on:click=move |_| {
+                                on_close()
+                            }
+                        >
+                            <IconSidebarPanel />
+                        </button>
+                    </div>
                 </div>
                 {on_new_chat.map(|on_new_chat| {
                     view! {
@@ -1245,11 +1329,71 @@ pub fn SessionsSidebar(
                         </SidebarNavButton>
                     }
                 })}
+                <div class="flex justify-end px-2 pt-2">
+                    <button
+                        type="button"
+                        aria-label="Search chats"
+                        title="Search"
+                        aria-pressed=move || search_open.get().to_string()
+                        class=move || {
+                            if search_open.get() {
+                                "flex h-7 w-7 items-center justify-center rounded-full bg-slate-100 text-slate-700"
+                            } else {
+                                "flex h-7 w-7 items-center justify-center rounded-full text-slate-500 hover:bg-slate-100 hover:text-slate-700"
+                            }
+                        }
+                        on:click=move |_| toggle_search()
+                    >
+                        <IconSearch />
+                    </button>
+                </div>
+                {move || {
+                    search_open
+                        .get()
+                        .then(|| {
+                            view! {
+                                <div class="px-2 pt-3">
+                                    <div class="flex items-center gap-2 rounded-xl border border-slate-200 bg-white px-3 py-1.5 text-slate-400 focus-within:border-orange-500">
+                                        <IconSearch />
+                                        <input
+                                            node_ref=search_input
+                                            type="text"
+                                            placeholder="Search session names"
+                                            aria-label="Search session names"
+                                            class="min-w-0 flex-1 bg-transparent text-sm text-slate-900 outline-none placeholder:text-slate-400"
+                                            prop:value=move || search_query.get()
+                                            on:input=move |ev| search_query.set(event_target_value(&ev))
+                                            on:keydown=move |ev| {
+                                                if ev.key() == "Escape" {
+                                                    toggle_search();
+                                                }
+                                            }
+                                        />
+                                        <button
+                                            type="button"
+                                            aria-label="Close search"
+                                            class="flex h-6 w-6 shrink-0 items-center justify-center rounded-md text-slate-500 hover:bg-slate-100 hover:text-slate-800"
+                                            on:click=move |_| toggle_search()
+                                        >
+                                            <IconClose />
+                                        </button>
+                                    </div>
+                                </div>
+                            }
+                        })
+                }}
                 <div class="flex-1 overflow-y-auto px-2 py-2">
                     {move || {
                         if sessions.get().is_empty() {
                             view! {
                                 <p class="px-2 py-4 text-xs text-slate-400">"No chats yet"</p>
+                            }
+                            .into_any()
+                        } else if filter_sessions_by_title(&sessions.get(), &search_query.get())
+                            .is_empty()
+                        {
+                            view! {
+                                <p class="px-2 py-4 text-xs text-slate-400">"No matching chats"</p>
                             }
                             .into_any()
                         } else {
@@ -1264,13 +1408,35 @@ pub fn SessionsSidebar(
     view! {
         <>
             <Show when=move || open.get()>
-                <aside class=move || {
-                    if compact.get() {
-                        "hidden shrink-0 border-r border-slate-200 bg-white sm:flex sm:w-48 sm:flex-col"
-                    } else {
-                        "hidden shrink-0 border-r border-slate-200 bg-white sm:flex sm:w-64 sm:flex-col"
+                <aside
+                    class=move || {
+                        let base = "relative hidden shrink-0 border-r border-slate-200 bg-white sm:flex sm:flex-col";
+                        match (sidebar_width_px.get(), compact.get()) {
+                            (Some(_), _) => base.to_string(),
+                            (None, true) => format!("{base} sm:w-48"),
+                            (None, false) => format!("{base} sm:w-64"),
+                        }
                     }
-                }>
+                    style=move || {
+                        sidebar_width_px.get().map(|width| format!("width:{width}px"))
+                    }
+                >
+                    <div
+                        role="separator"
+                        aria-orientation="vertical"
+                        aria-label="Resize chats panel"
+                        class=move || {
+                            if resize_drag.get().is_some() {
+                                "absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize touch-none select-none bg-orange-400/60"
+                            } else {
+                                "absolute inset-y-0 -right-1 z-20 w-2 cursor-col-resize touch-none select-none hover:bg-orange-400/40"
+                            }
+                        }
+                        on:pointerdown=start_resize
+                        on:pointermove=continue_resize
+                        on:pointerup=end_resize
+                        on:pointercancel=end_resize
+                    ></div>
                     {body()}
                 </aside>
             </Show>
@@ -1782,7 +1948,19 @@ mod collapse_tooltip_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{estimated_menu_height, menu_placement_style, nav_button_class, pin_menu_label};
+    use super::{dragged_sidebar_width, estimated_menu_height, menu_placement_style, nav_button_class, pin_menu_label};
+
+    #[test]
+    fn dragging_right_widens_and_left_narrows_the_sidebar() {
+        assert_eq!(dragged_sidebar_width(256.0, 256.0, 300.0), 300.0);
+        assert_eq!(dragged_sidebar_width(256.0, 256.0, 200.0), 200.0);
+    }
+
+    #[test]
+    fn dragged_width_is_clamped_to_min_and_max() {
+        assert_eq!(dragged_sidebar_width(256.0, 256.0, 0.0), 160.0);
+        assert_eq!(dragged_sidebar_width(256.0, 256.0, 2000.0), 480.0);
+    }
 
     #[test]
     fn menu_opens_below_when_it_fits() {

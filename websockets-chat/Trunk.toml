@@ -18,3 +18,10 @@ open = false
 # defaults to allow-any-origin.
 [[proxy]]
 backend = "http://127.0.0.1:18790/v1/"
+
+# WebSocket: without `?wsBase=`, the page builds its WS URL from its own
+# origin (`ws://127.0.0.1:8902/ws`), which Trunk would otherwise answer
+# itself and fail. Proxy it to the gateway so plain `trunk serve` works.
+[[proxy]]
+backend = "ws://127.0.0.1:18790/ws"
+ws = true
