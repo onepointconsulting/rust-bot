@@ -267,7 +267,11 @@ mod tests {
         // 255-byte filesystem limit (80 * 3 bytes + prefix + ext would not).
         let kept = name.chars().filter(|&c| c == '你').count();
         assert!(kept > 0 && kept < 100, "kept {kept} chars");
-        assert!(name.len() <= MAX_FILENAME_BYTES, "name is {} bytes", name.len());
+        assert!(
+            name.len() <= MAX_FILENAME_BYTES,
+            "name is {} bytes",
+            name.len()
+        );
     }
 
     #[test]

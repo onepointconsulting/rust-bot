@@ -41,6 +41,7 @@ use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
+use crate::channels::websocket::config_file;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     AuthorizeResult, ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType,
@@ -72,7 +73,7 @@ use crate::{
         queue::MessageBus,
     },
     channels::base::{BaseChannel, BaseChannelCommon},
-    config::loader::{load_config, save_config},
+    config::loader::{get_config_path, load_config, save_config},
     config::overlay::overlay_is_active,
     config::paths::get_media_dir,
     config::schema::{ChannelsConfig, Config, RESERVED_MODEL_PRESET_NAME},
@@ -662,6 +663,12 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SetMcpPreset => {
             handle_set_mcp_preset(envelope_dispatch_context).await;
+        }
+        EnvelopeType::GetConfigFile => {
+            handle_get_config_file(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SaveConfigFile => {
+            handle_save_config_file(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -2965,6 +2972,131 @@ async fn send_mcp_preset_error(
         }),
     )
     .await;
+}
+
+/// Tell the requester a config file read or save was refused or failed. `message` must
+/// never contain any of the file's content: error events are logged in full.
+async fn send_config_file_error(
+    shared: &WsShared,
+    connection_id: &str,
+    detail: &str,
+    message: &str,
+) {
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ConfigFileError,
+        None,
+        serde_json::json!({"detail": detail, "message": message}),
+    )
+    .await;
+}
+
+/// Why this connection may not read or write `config.json`, as `(detail, message)`, or
+/// `None` when it may. The file holds credentials and the bot runs what it describes, so
+/// both directions need the same rights as changing MCP servers (see [`mcp_write_denial`]).
+fn config_file_denial(
+    shared: &WsShared,
+    envelope_dispatch_context: &EnvelopeDispatchContext<'_>,
+) -> Option<(&'static str, &'static str)> {
+    let detail = mcp_write_denial(
+        shared,
+        envelope_dispatch_context.remote_addr,
+        envelope_dispatch_context.auth,
+        overlay_is_active(),
+    )?;
+    let message = if detail == "child_agent_config" {
+        "This agent runs on its parent's configuration and cannot change it."
+    } else {
+        "The configuration file can only be opened from a signed-in browser on the gateway machine."
+    };
+    Some((detail, message))
+}
+
+/// Handle a `get_config_file` envelope: reply with a `config_file` event carrying the
+/// raw text of `config.json` and its path, or with `config_file_error`.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_get_config_file<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if let Some((detail, message)) = config_file_denial(shared, &envelope_dispatch_context) {
+        send_config_file_error(shared, connection_id, detail, message).await;
+        return;
+    }
+    let path = get_config_path();
+    match config_file::read_config_text(&path) {
+        Ok(content) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::ConfigFile,
+                None,
+                serde_json::json!({
+                    "path": path.display().to_string(),
+                    "content": content,
+                }),
+            )
+            .await;
+        }
+        Err(e) => {
+            let message = format!("Could not read the configuration file: {e}");
+            send_config_file_error(shared, connection_id, "read_failed", &message).await;
+        }
+    }
+}
+
+/// Handle a `save_config_file` envelope `{content}`: validate the text and replace
+/// `config.json` with it, replying `config_file_saved` (a restart is needed) or
+/// `config_file_error`. An invalid configuration is never written.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_save_config_file<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    if let Some((detail, message)) = config_file_denial(shared, &envelope_dispatch_context) {
+        send_config_file_error(shared, connection_id, detail, message).await;
+        return;
+    }
+    let Some(content) = envelope_dispatch_context
+        .envelope
+        .get("content")
+        .and_then(|v| v.as_str())
+    else {
+        send_config_file_error(
+            shared,
+            connection_id,
+            "invalid_request",
+            "The request was malformed.",
+        )
+        .await;
+        return;
+    };
+    let result = {
+        // Shares the lock with the MCP preset changes: both rewrite the whole file.
+        let _write_guard = MCP_CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        config_file::save_config_text(&get_config_path(), content)
+    };
+    match result {
+        Ok(backup) => {
+            match backup {
+                Some(backup) => log::info!(
+                    "config.json saved from the WebUI (client '{client_id}'); previous version kept as '{}'",
+                    backup.display()
+                ),
+                None => log::info!("config.json saved from the WebUI (client '{client_id}')"),
+            }
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::ConfigFileSaved,
+                None,
+                serde_json::json!({"restart_required": true}),
+            )
+            .await;
+        }
+        Err(message) => {
+            send_config_file_error(shared, connection_id, "invalid_config", &message).await;
+        }
+    }
 }
 
 /// Handle a `set_mcp_preset` envelope `{name, enabled, fields?}`: enable or disable the
@@ -7909,6 +8041,51 @@ mod tests {
         assert_eq!(body["event"], "error");
         assert_eq!(body["detail"], "access_denied");
         assert!(body.get("presets").is_none());
+    }
+
+    async fn dispatch_config_file_envelope(
+        shared: &WsShared,
+        auth: &AuthorizeResult,
+        envelope_type: &str,
+    ) -> serde_json::Value {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!(envelope_type));
+        envelope.insert("content".to_string(), serde_json::json!("{}"));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth,
+        };
+        dispatch_envelope(ctx).await;
+        let frame = rx.try_recv().expect("expected a reply frame");
+        serde_json::from_str(&frame.into_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn config_file_requests_are_denied_to_anonymous_connections() {
+        let shared = test_shared("browser");
+
+        for envelope_type in ["get_config_file", "save_config_file"] {
+            let body = dispatch_config_file_envelope(
+                &shared,
+                &AuthorizeResult::UNAUTHENTICATED,
+                envelope_type,
+            )
+            .await;
+
+            assert_eq!(body["event"], "config_file_error", "{envelope_type}");
+            assert_eq!(body["detail"], "access_denied", "{envelope_type}");
+            assert!(body.get("content").is_none(), "{envelope_type}");
+        }
     }
 
     #[test]

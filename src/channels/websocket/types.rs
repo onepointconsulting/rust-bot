@@ -65,6 +65,14 @@ pub enum EnvelopeType {
     /// of the fields it needs (API keys, tokens). Rust-side addition with no nanobot
     /// precedent. Local, authenticated connections only — see `mcp_write_denial`.
     SetMcpPreset,
+    /// Read the raw text of `config.json` for the WebUI's Settings dialog. Rust-side
+    /// addition with no nanobot precedent. Local, authenticated connections only — the
+    /// file holds credentials; see `mcp_write_denial`.
+    GetConfigFile,
+    /// Replace `config.json` with the `content` the Settings dialog sends, after
+    /// validating it. Rust-side addition with no nanobot precedent. Same access rules as
+    /// [`Self::GetConfigFile`].
+    SaveConfigFile,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -146,6 +154,8 @@ impl From<&str> for EnvelopeType {
             "list_tools" => Self::ListTools,
             "list_mcp_presets" => Self::ListMcpPresets,
             "set_mcp_preset" => Self::SetMcpPreset,
+            "get_config_file" => Self::GetConfigFile,
+            "save_config_file" => Self::SaveConfigFile,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -192,6 +202,14 @@ pub enum WsOutboundEvent {
     /// Reply to a refused or failed [`EnvelopeType::SetMcpPreset`] — `{name, detail,
     /// message, fields}`. Never carries a submitted field value.
     McpPresetError,
+    /// Reply to [`EnvelopeType::GetConfigFile`] — `{path, content}`.
+    ConfigFile,
+    /// Reply to a successful [`EnvelopeType::SaveConfigFile`] — a restart is needed for
+    /// the new configuration to take effect.
+    ConfigFileSaved,
+    /// Reply to a refused or failed config file read or save — `{detail, message}`.
+    /// Never carries any of the file's content.
+    ConfigFileError,
     /// Reply to [`EnvelopeType::ListSubagents`] — `{acp: {enabled, agents}, spawn: {tasks}}`.
     Subagents,
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
@@ -260,6 +278,9 @@ impl WsOutboundEvent {
             Self::McpPresets => "mcp_presets",
             Self::McpPresetSet => "mcp_preset_set",
             Self::McpPresetError => "mcp_preset_error",
+            Self::ConfigFile => "config_file",
+            Self::ConfigFileSaved => "config_file_saved",
+            Self::ConfigFileError => "config_file_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
             Self::ChatPinned => "chat_pinned",
@@ -662,6 +683,23 @@ mod tests {
         );
         assert_eq!(WsOutboundEvent::McpPresetSet.as_str(), "mcp_preset_set");
         assert_eq!(WsOutboundEvent::McpPresetError.as_str(), "mcp_preset_error");
+        assert_eq!(
+            EnvelopeType::from("get_config_file"),
+            EnvelopeType::GetConfigFile
+        );
+        assert_eq!(
+            EnvelopeType::from("save_config_file"),
+            EnvelopeType::SaveConfigFile
+        );
+        assert_eq!(WsOutboundEvent::ConfigFile.as_str(), "config_file");
+        assert_eq!(
+            WsOutboundEvent::ConfigFileSaved.as_str(),
+            "config_file_saved"
+        );
+        assert_eq!(
+            WsOutboundEvent::ConfigFileError.as_str(),
+            "config_file_error"
+        );
         assert_eq!(
             EnvelopeType::from("list_subagents"),
             EnvelopeType::ListSubagents

@@ -321,6 +321,28 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway for the raw text of its `config.json`. Refused unless this
+    /// connection is signed in and local. The reply is a `config_file` or a
+    /// `config_file_error` event (see [`ServerEvent::ConfigFile`]).
+    pub fn get_config_file() -> Self {
+        Self {
+            type_: "get_config_file",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to replace its `config.json` with `content`. The gateway
+    /// validates the text first and refuses anything the bot could not start with.
+    /// The reply is a `config_file_saved` or a `config_file_error` event (see
+    /// [`ServerEvent::ConfigFileSaved`]).
+    pub fn save_config_file(content: impl Into<String>) -> Self {
+        Self {
+            type_: "save_config_file",
+            content: Some(content.into()),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway to enable (`enabled == true`) or disable the MCP preset `name`.
     /// `fields` carries the values for the fields the preset needs (API keys, tokens);
     /// it is omitted from the wire when empty. Refused by the gateway unless this
@@ -1005,6 +1027,16 @@ pub enum ServerEvent {
         message: String,
         fields: Vec<String>,
     },
+    /// Reply to a [`ClientEnvelope::get_config_file`] envelope: the raw text of the
+    /// gateway's `config.json` and where it lives. Not scoped to any one `chat_id`.
+    ConfigFile { path: String, content: String },
+    /// Reply to a successful [`ClientEnvelope::save_config_file`]: the file was
+    /// replaced, but the running bot only picks the change up after a restart.
+    ConfigFileSaved { restart_required: bool },
+    /// Reply to a refused or failed config file read or save. `detail` is a stable
+    /// code (`access_denied`, `child_agent_config`, `invalid_config`, ...); `message`
+    /// is the explanation to show.
+    ConfigFileError { detail: String, message: String },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
     /// Reply to a `pin_chat` envelope: `chat_id` is now pinned or unpinned.
@@ -1132,6 +1164,9 @@ impl ServerEvent {
             | ServerEvent::McpPresetSet { .. }
             | ServerEvent::Subagents { .. }
             | ServerEvent::McpPresetError { .. }
+            | ServerEvent::ConfigFile { .. }
+            | ServerEvent::ConfigFileSaved { .. }
+            | ServerEvent::ConfigFileError { .. }
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatPinned { .. }
             | ServerEvent::ChatDeleted { .. }
@@ -1475,6 +1510,26 @@ struct McpPresetErrorWire {
 }
 
 #[derive(Deserialize)]
+struct ConfigFileWire {
+    #[serde(default)]
+    path: String,
+    content: String,
+}
+
+#[derive(Deserialize)]
+struct ConfigFileSavedWire {
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
+struct ConfigFileErrorWire {
+    detail: String,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
 struct ToolsListWire {
     chat_id: String,
     tools: Vec<ToolSummary>,
@@ -1709,6 +1764,21 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 detail: w.detail,
                 message: w.message,
                 fields: w.fields,
+            })
+        }
+        "config_file" => decode::<ConfigFileWire>(&value).map(|w| ServerEvent::ConfigFile {
+            path: w.path,
+            content: w.content,
+        }),
+        "config_file_saved" => {
+            decode::<ConfigFileSavedWire>(&value).map(|w| ServerEvent::ConfigFileSaved {
+                restart_required: w.restart_required,
+            })
+        }
+        "config_file_error" => {
+            decode::<ConfigFileErrorWire>(&value).map(|w| ServerEvent::ConfigFileError {
+                detail: w.detail,
+                message: w.message,
             })
         }
         "tools" => decode::<ToolsListWire>(&value).map(|w| ServerEvent::ToolsList {
@@ -2727,6 +2797,64 @@ mod tests {
                 message: "Missing required field(s): GitHub token".to_string(),
                 fields: vec!["GitHub token".to_string()],
             }
+        );
+    }
+
+    #[test]
+    fn parses_config_file() {
+        let raw =
+            r#"{"event":"config_file","path":"/home/u/.rust-bot/config.json","content":"{}"}"#;
+        assert_eq!(
+            parse_server_event(raw).expect("should parse"),
+            ServerEvent::ConfigFile {
+                path: "/home/u/.rust-bot/config.json".to_string(),
+                content: "{}".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_config_file_saved() {
+        let raw = r#"{"event":"config_file_saved","restart_required":true}"#;
+        assert_eq!(
+            parse_server_event(raw).expect("should parse"),
+            ServerEvent::ConfigFileSaved {
+                restart_required: true
+            }
+        );
+    }
+
+    #[test]
+    fn parses_config_file_error() {
+        let raw = r#"{"event":"config_file_error","detail":"invalid_config","message":"Invalid JSON: eof"}"#;
+        assert_eq!(
+            parse_server_event(raw).expect("should parse"),
+            ServerEvent::ConfigFileError {
+                detail: "invalid_config".to_string(),
+                message: "Invalid JSON: eof".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn config_file_replies_have_no_scoping_chat_id() {
+        let saved = ServerEvent::ConfigFileSaved {
+            restart_required: true,
+        };
+        assert_eq!(saved.chat_id(), None);
+    }
+
+    #[test]
+    fn client_envelope_config_file_requests_serialize() {
+        let get = serde_json::to_value(ClientEnvelope::get_config_file()).unwrap();
+        assert_eq!(
+            get,
+            serde_json::json!({"type": "get_config_file", "webui": true})
+        );
+        let save = serde_json::to_value(ClientEnvelope::save_config_file("{}")).unwrap();
+        assert_eq!(
+            save,
+            serde_json::json!({"type": "save_config_file", "content": "{}", "webui": true})
         );
     }
 

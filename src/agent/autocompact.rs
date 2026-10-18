@@ -157,7 +157,7 @@ impl Autocompact {
                     log::info!("Auto-compact: session {session_key} is not expired");
                 }
                 if !has_compactable_idle_tail {
-                    log::info!(
+                    log::debug!(
                         "Auto-compact: session {session_key} does not have a compactable idle tail"
                     );
                 }

@@ -39,7 +39,9 @@ use wasm_bindgen::JsCast;
 
 use crate::components::brand::BrandLogo;
 use crate::models::{SessionListItem, SessionSummaryPopup, WorkspaceDialogState};
-use crate::session_groups::{display_title, filter_sessions_by_title, group_sessions, SessionGroup};
+use crate::session_groups::{
+    display_title, filter_sessions_by_title, group_sessions, SessionGroup,
+};
 
 /// Rows beyond this count in a single group are collapsed behind a
 /// "··· More" toggle, mirroring Cursor's own history list.
@@ -173,6 +175,27 @@ fn IconAgents() -> impl IntoView {
             <circle cx="5" cy="19" r="2.5" />
             <circle cx="19" cy="19" r="2.5" />
             <path d="M12 7.5v4M12 11.5 6.2 16.8M12 11.5l5.8 5.3" />
+        </svg>
+    }
+}
+
+/// Gear, used by the sidebar's "Settings" button.
+#[component]
+fn IconSettings() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="2"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class=icon_class()
+            aria-hidden="true"
+        >
+            <circle cx="12" cy="12" r="3" />
+            <path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 1 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 1 1-4 0v-.09a1.65 1.65 0 0 0-1-1.51 1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 1 1-2.83-2.83l.06-.06a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H3a2 2 0 1 1 0-4h.09a1.65 1.65 0 0 0 1.51-1 1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 1 1 2.83-2.83l.06.06a1.65 1.65 0 0 0 1.82.33h0a1.65 1.65 0 0 0 1-1.51V3a2 2 0 1 1 4 0v.09a1.65 1.65 0 0 0 1 1.51h0a1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 1 1 2.83 2.83l-.06.06a1.65 1.65 0 0 0-.33 1.82v0a1.65 1.65 0 0 0 1.51 1H21a2 2 0 1 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1Z" />
         </svg>
     }
 }
@@ -480,7 +503,11 @@ fn menu_style_for_button(kebab: &web_sys::Element, menu_height: f64) -> String {
 
 /// Label of the kebab menu's pin item for a row that is currently `pinned`.
 fn pin_menu_label(pinned: bool) -> &'static str {
-    if pinned { "Unpin session" } else { "Pin session" }
+    if pinned {
+        "Unpin session"
+    } else {
+        "Pin session"
+    }
 }
 
 /// Header button (left of the title, same at every breakpoint) that opens
@@ -1023,6 +1050,11 @@ pub fn SessionsSidebar(
     /// Whether the sub-agents list is currently showing.
     #[prop(into, default = Signal::stored(false))]
     subagents_active: Signal<bool>,
+    /// When set, a "Settings" button is pinned to the bottom of the sidebar and fires
+    /// this callback (websockets-chat opens its Settings dialog). Omitted by
+    /// `web-chat` and for anonymous visitors.
+    #[prop(default = None)]
+    on_settings: Option<Callback<()>>,
     /// When `true`, the header row shows the rust-bot logo + title instead of
     /// the "Chats" label.
     #[prop(default = false)]
@@ -1401,6 +1433,19 @@ pub fn SessionsSidebar(
                         }
                     }}
                 </div>
+                {on_settings.map(|on_settings| {
+                    view! {
+                        <div class="border-t border-slate-200 pb-2">
+                            <SidebarNavButton
+                                label="Settings"
+                                active=Signal::stored(false)
+                                on_click=on_settings
+                            >
+                                <IconSettings />
+                            </SidebarNavButton>
+                        </div>
+                    }
+                })}
             </div>
         }
     };
@@ -1948,7 +1993,10 @@ mod collapse_tooltip_tests {
 
 #[cfg(test)]
 mod tests {
-    use super::{dragged_sidebar_width, estimated_menu_height, menu_placement_style, nav_button_class, pin_menu_label};
+    use super::{
+        dragged_sidebar_width, estimated_menu_height, menu_placement_style, nav_button_class,
+        pin_menu_label,
+    };
 
     #[test]
     fn dragging_right_widens_and_left_narrows_the_sidebar() {

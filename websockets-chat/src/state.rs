@@ -39,6 +39,38 @@ pub enum MainView {
     Subagents,
 }
 
+/// What the Settings dialog's configuration file editor is showing.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub enum ConfigFileView {
+    /// No editor: the dialog shows its intro line.
+    #[default]
+    Closed,
+    /// The file was requested and has not arrived yet.
+    Loading,
+    /// The gateway's `config.json`: where it lives and its raw text.
+    Loaded { path: String, content: String },
+}
+
+impl ConfigFileView {
+    /// The view after the gateway delivered the file: only a pending request turns
+    /// into the editor, so a reply that lands after the editor was closed is dropped.
+    pub fn after_file_arrived(&self, path: String, content: String) -> Self {
+        match self {
+            Self::Loading => Self::Loaded { path, content },
+            other => other.clone(),
+        }
+    }
+
+    /// The view after the gateway refused or failed a request: a pending load is
+    /// abandoned, an open editor stays so the user keeps their edits.
+    pub fn after_failure(&self) -> Self {
+        match self {
+            Self::Loading => Self::Closed,
+            other => other.clone(),
+        }
+    }
+}
+
 impl MainView {
     /// Whether the chat itself is showing.
     pub fn is_chat(self) -> bool {
@@ -1949,5 +1981,46 @@ mod tests {
             url,
             "ws://127.0.0.1:18790/ws?client_id=client-1&token=secret"
         );
+    }
+}
+
+#[cfg(test)]
+mod config_file_view_tests {
+    use super::ConfigFileView;
+
+    fn loaded(content: &str) -> ConfigFileView {
+        ConfigFileView::Loaded {
+            path: "p".to_string(),
+            content: content.to_string(),
+        }
+    }
+
+    #[test]
+    fn a_pending_load_becomes_the_editor_when_the_file_arrives() {
+        assert_eq!(
+            ConfigFileView::Loading.after_file_arrived("p".into(), "{}".into()),
+            loaded("{}")
+        );
+    }
+
+    #[test]
+    fn a_file_arriving_after_the_editor_was_closed_is_dropped() {
+        assert_eq!(
+            ConfigFileView::Closed.after_file_arrived("p".into(), "{}".into()),
+            ConfigFileView::Closed
+        );
+    }
+
+    #[test]
+    fn a_failure_abandons_a_pending_load() {
+        assert_eq!(
+            ConfigFileView::Loading.after_failure(),
+            ConfigFileView::Closed
+        );
+    }
+
+    #[test]
+    fn a_failure_keeps_an_open_editor_and_its_text() {
+        assert_eq!(loaded("{}").after_failure(), loaded("{}"));
     }
 }

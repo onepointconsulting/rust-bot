@@ -32,7 +32,7 @@ use chat_ui::models::{
 use crate::api::{self, WsSender};
 use crate::components::{ChatShell, McpChangeRequest};
 use crate::protocol::{self, ServerEvent};
-use crate::state::{self, startup_view, ConnectionStatus, MainView, StartupView};
+use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
 use crate::storage_keys::CHAT_ID_STORAGE_KEY;
 use crate::storage_keys::CHAT_OPEN_STORAGE_KEY;
 use crate::storage_keys::EXPANDED_STORAGE_KEY;
@@ -406,6 +406,17 @@ struct WsContext {
     /// Presets changed since the page was loaded; they need a restart. Kept when the
     /// list closes, since the restart is still pending.
     mcp_changed: RwSignal<Vec<String>>,
+    /// Whether the Settings dialog is open.
+    settings_open: RwSignal<bool>,
+    /// What the dialog's configuration file editor shows. Only filled while the
+    /// editor is open; the file's text is never kept once it closes.
+    config_file: RwSignal<ConfigFileView>,
+    /// Whether a save of the configuration file is in flight.
+    config_saving: RwSignal<bool>,
+    /// The last failed configuration file request, shown in the dialog.
+    config_error: RwSignal<Option<String>>,
+    /// Whether the "restart the rust-bot process" notice is showing.
+    config_saved_notice: RwSignal<bool>,
     /// Durable ACP child agents from the gateway's `subagents` event. Only filled
     /// while the sub-agents page is open; cleared whenever it closes.
     subagent_agents: RwSignal<Vec<AcpAgentSummary>>,
@@ -867,7 +878,11 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             if matches!(
                 detail.as_str(),
-                "session_not_found" | "missing title" | "rename_failed" | "pin_failed" | "delete_failed"
+                "session_not_found"
+                    | "missing title"
+                    | "rename_failed"
+                    | "pin_failed"
+                    | "delete_failed"
             ) {
                 request_chat_list(ctx);
             }
@@ -1023,6 +1038,20 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 ctx.mcp_can_modify.set(false);
             }
             ctx.mcp_row_error.set(Some((name, message)));
+        }
+        ServerEvent::ConfigFile { path, content } => {
+            ctx.config_file
+                .update(|view| *view = view.after_file_arrived(path, content));
+        }
+        ServerEvent::ConfigFileSaved { .. } => {
+            ctx.config_saving.set(false);
+            close_settings(ctx);
+            ctx.config_saved_notice.set(true);
+        }
+        ServerEvent::ConfigFileError { message, .. } => {
+            ctx.config_saving.set(false);
+            ctx.config_file.update(|view| *view = view.after_failure());
+            ctx.config_error.set(Some(message));
         }
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
@@ -1386,6 +1415,50 @@ fn clear_subagents_data(ctx: &WsContext) {
     ctx.subagent_agents.set(Vec::new());
     ctx.spawn_tasks.set(Vec::new());
     ctx.subagents_acp_enabled.set(false);
+}
+
+/// Open the Settings dialog, on its intro (no configuration editor yet).
+fn open_settings(ctx: &WsContext) {
+    ctx.config_error.set(None);
+    ctx.config_file.set(ConfigFileView::Closed);
+    ctx.settings_open.set(true);
+}
+
+/// Close the Settings dialog and drop the configuration text it held.
+fn close_settings(ctx: &WsContext) {
+    ctx.settings_open.set(false);
+    close_config_file(ctx);
+}
+
+/// Ask the gateway for `config.json` and show the editor once it arrives (see the
+/// `ConfigFile` arm of the event handler). Fetched on demand, never on connect.
+fn open_config_file(ctx: &WsContext) {
+    ctx.config_error.set(None);
+    ctx.config_file.set(ConfigFileView::Loading);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::get_config_file(),
+        "Failed to encode the configuration request.",
+    );
+}
+
+/// Leave the configuration editor and drop its text, discarding unsaved edits.
+fn close_config_file(ctx: &WsContext) {
+    ctx.config_file.set(ConfigFileView::Closed);
+    ctx.config_saving.set(false);
+    ctx.config_error.set(None);
+}
+
+/// Send the edited configuration text to the gateway, which validates it before
+/// writing. The reply is `config_file_saved` or `config_file_error`.
+fn request_save_config_file(ctx: &WsContext, content: String) {
+    ctx.config_error.set(None);
+    ctx.config_saving.set(true);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::save_config_file(content),
+        "Failed to encode the configuration save request.",
+    );
 }
 
 /// Go back to the chat and drop the data of whichever list page was open.
@@ -2063,6 +2136,11 @@ pub fn App() -> impl IntoView {
     let mcp_busy = RwSignal::new(None::<String>);
     let mcp_row_error = RwSignal::new(None::<(String, String)>);
     let mcp_changed = RwSignal::new(Vec::<String>::new());
+    let settings_open = RwSignal::new(false);
+    let config_file = RwSignal::new(ConfigFileView::Closed);
+    let config_saving = RwSignal::new(false);
+    let config_error = RwSignal::new(None::<String>);
+    let config_saved_notice = RwSignal::new(false);
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
     let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
     let pending_approval = RwSignal::new(None::<state::PendingApproval>);
@@ -2102,6 +2180,11 @@ pub fn App() -> impl IntoView {
         mcp_busy,
         mcp_row_error,
         mcp_changed,
+        settings_open,
+        config_file,
+        config_saving,
+        config_error,
+        config_saved_notice,
         subagent_agents,
         spawn_tasks,
         subagents_acp_enabled,
@@ -2227,6 +2310,8 @@ pub fn App() -> impl IntoView {
         tools.set(Vec::new());
         close_main_view(&ws_context);
         mcp_changed.set(Vec::new());
+        close_settings(&ws_context);
+        config_saved_notice.set(false);
         summary_popup.set(None);
         workspace_popup.set(None);
     };
@@ -2366,6 +2451,12 @@ pub fn App() -> impl IntoView {
     let on_refresh_mcps = move || refresh_mcp_view(&ws_context);
     let on_open_subagents = move || open_subagents_view(&ws_context);
     let on_refresh_subagents = move || refresh_subagents_view(&ws_context);
+    let on_open_settings = move || open_settings(&ws_context);
+    let on_close_settings = move || close_settings(&ws_context);
+    let on_open_config_file = move || open_config_file(&ws_context);
+    let on_close_config_file = move || close_config_file(&ws_context);
+    let on_save_config_file = move |content: String| request_save_config_file(&ws_context, content);
+    let on_close_config_saved_notice = move || config_saved_notice.set(false);
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {
         request_set_mcp_preset(&ws_context, name, enabled, fields);
     };
@@ -2483,6 +2574,18 @@ pub fn App() -> impl IntoView {
                     on_open_mcps=on_open_mcps
                     on_refresh_mcps=on_refresh_mcps
                     on_change_mcp=on_change_mcp
+                    show_settings=token.get_untracked().is_some()
+                    settings_open=Signal::derive(move || settings_open.get())
+                    config_file=Signal::derive(move || config_file.get())
+                    config_saving=Signal::derive(move || config_saving.get())
+                    config_error=Signal::derive(move || config_error.get())
+                    config_saved_notice=Signal::derive(move || config_saved_notice.get())
+                    on_open_settings=on_open_settings
+                    on_close_settings=on_close_settings
+                    on_open_config_file=on_open_config_file
+                    on_close_config_file=on_close_config_file
+                    on_save_config_file=on_save_config_file
+                    on_close_config_saved_notice=on_close_config_saved_notice
                     show_logout=!embed_mode
                     show_minimize=!embed_mode
                 />

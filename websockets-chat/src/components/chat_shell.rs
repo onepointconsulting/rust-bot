@@ -7,10 +7,11 @@ use chat_ui::models::{
 use leptos::prelude::*;
 
 use crate::components::{
-    AskQuestionCard, McpChangeRequest, McpPresetsPage, MessageList, SubagentsPage, ToolApprovalCard,
+    AskQuestionCard, ConfigSavedNotice, McpChangeRequest, McpPresetsPage, MessageList,
+    SettingsDialog, SubagentsPage, ToolApprovalCard,
 };
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
-use crate::state::{ConnectionStatus, MainView, PendingApproval, PendingQuestion};
+use crate::state::{ConfigFileView, ConnectionStatus, MainView, PendingApproval, PendingQuestion};
 
 /// Small dot + label in the header showing the gateway WebSocket's current
 /// lifecycle state (see [`ConnectionStatus`] for what drives it).
@@ -108,6 +109,21 @@ pub fn ChatShell(
     on_open_mcps: impl Fn() + 'static + Send + Sync + Copy,
     on_refresh_mcps: impl Fn() + 'static + Send + Sync + Copy,
     on_change_mcp: impl Fn(McpChangeRequest) + 'static + Send + Sync + Copy,
+    // The Settings dialog, like the MCP list, is for signed-in users only: when `false`
+    // the sidebar has no "Settings" button. The gateway enforces the same rule
+    // independently.
+    #[prop(default = false)] show_settings: bool,
+    #[prop(into)] settings_open: Signal<bool>,
+    #[prop(into)] config_file: Signal<ConfigFileView>,
+    #[prop(into)] config_saving: Signal<bool>,
+    #[prop(into)] config_error: Signal<Option<String>>,
+    #[prop(into)] config_saved_notice: Signal<bool>,
+    on_open_settings: impl Fn() + 'static + Send + Sync + Copy,
+    on_close_settings: impl Fn() + 'static + Send + Sync + Copy,
+    on_open_config_file: impl Fn() + 'static + Send + Sync + Copy,
+    on_close_config_file: impl Fn() + 'static + Send + Sync + Copy,
+    on_save_config_file: impl Fn(String) + 'static + Send + Sync + Copy,
+    on_close_config_saved_notice: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(default = true)] show_logout: bool,
     #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
@@ -180,6 +196,7 @@ pub fn ChatShell(
                 on_subagents=show_subagents
                     .then_some(Callback::new(move |()| on_open_subagents()))
                 subagents_active=Signal::derive(move || main_view.get() == MainView::Subagents)
+                on_settings=show_settings.then_some(Callback::new(move |()| on_open_settings()))
                 show_brand=true
                 collapse_hint=shortcut_label.to_string()
                 compact=compact
@@ -295,6 +312,20 @@ pub fn ChatShell(
                     />
                 </Show>
             </div>
+            <SettingsDialog
+                open=settings_open
+                config_file=config_file
+                saving=config_saving
+                error=config_error
+                on_close=Callback::new(move |()| on_close_settings())
+                on_open_config_file=Callback::new(move |()| on_open_config_file())
+                on_close_config_file=Callback::new(move |()| on_close_config_file())
+                on_save_config_file=Callback::new(move |text| on_save_config_file(text))
+            />
+            <ConfigSavedNotice
+                open=config_saved_notice
+                on_close=Callback::new(move |()| on_close_config_saved_notice())
+            />
         </div>
     }
 }

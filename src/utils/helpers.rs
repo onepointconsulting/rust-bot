@@ -1030,14 +1030,20 @@ mod tests {
     }
 
     fn dimensions_of(bytes: &[u8]) -> (u32, u32) {
-        image::load_from_memory(bytes).unwrap().into_rgb8().dimensions()
+        image::load_from_memory(bytes)
+            .unwrap()
+            .into_rgb8()
+            .dimensions()
     }
 
     #[test]
     fn test_downscale_shrinks_oversized_png_keeping_aspect_ratio() {
         let raw = encoded_test_image(400, 200, image::ImageFormat::Png);
         let result = downscale_image_if_oversized(&raw, 100);
-        assert!(matches!(result, Cow::Owned(_)), "expected a re-encoded copy");
+        assert!(
+            matches!(result, Cow::Owned(_)),
+            "expected a re-encoded copy"
+        );
         assert_eq!(dimensions_of(&result), (100, 50));
         assert_eq!(detect_image_mime(&result), Some("image/png"));
     }
