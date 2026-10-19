@@ -1,6 +1,7 @@
 pub mod acp;
 pub mod agent_loop;
 pub mod autocompact;
+pub mod background_activity;
 pub mod checkpoint_payload;
 pub mod circuit_breaker;
 pub mod context;

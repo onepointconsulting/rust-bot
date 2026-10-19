@@ -1,5 +1,8 @@
 use crate::providers::{
-    base::{GenerationSettings, LLMProvider, LLMResponse, LLMUsage, ToolCallRequest},
+    base::{
+        GenerationSettings, LLMProvider, LLMResponse, LLMUsage, ToolCallRequest,
+        describe_error_chain,
+    },
     cache_control::apply_cache_control,
     registry::ProviderSpec,
 };
@@ -10,6 +13,23 @@ pub type JsonMap = serde_json::Map<String, serde_json::Value>;
 
 fn maybe_mapping(value: &serde_json::Value) -> Option<&serde_json::Map<String, serde_json::Value>> {
     value.as_object()
+}
+
+/// How much of a response body an error message quotes.
+const BODY_PREVIEW_MAX_CHARS: usize = 300;
+
+/// The start of `body` on one line, for an error message: whitespace runs
+/// collapsed, cut at [`BODY_PREVIEW_MAX_CHARS`], `(empty)` for a blank body.
+fn body_preview(body: &str) -> String {
+    let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
+    if one_line.is_empty() {
+        return "(empty)".to_string();
+    }
+    let mut preview: String = one_line.chars().take(BODY_PREVIEW_MAX_CHARS).collect();
+    if one_line.chars().count() > BODY_PREVIEW_MAX_CHARS {
+        preview.push('…');
+    }
+    preview
 }
 
 pub struct OpenAICompatProvider {
@@ -612,24 +632,49 @@ impl OpenAICompatProvider {
 
     /// POST the request as raw JSON. The body is parsed as a `Value` so
     /// unknown gateway fields do not have to match a fixed response schema.
+    ///
+    /// Every failure is described in full (what failed, where, and the
+    /// underlying cause), because the text ends up in front of the user.
     async fn chat_raw(&self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
+        let url = &self.chat_completions_url;
         let resp = self
             .http_client
-            .post(&self.chat_completions_url)
+            .post(url)
             .header("Content-Type", "application/json")
             .json(request)
             .send()
             .await
-            .map_err(|e| e.to_string())?;
+            .map_err(|e| format!("request to {url} failed: {}", describe_error_chain(&e)))?;
 
         let status = resp.status();
-        let json: serde_json::Value = resp.json().await.map_err(|e| e.to_string())?;
+        // The body is read as text first: decoding it straight to JSON would turn
+        // a gateway's non-JSON error page into an opaque "error decoding response body".
+        let body = resp.text().await.map_err(|e| {
+            format!(
+                "failed to read the response body (HTTP {status}) from {url}: {}",
+                describe_error_chain(&e)
+            )
+        })?;
+        Self::parse_chat_response_body(status, &body, url)
+    }
 
+    /// Turn a finished chat-completions response into its JSON, or into an error
+    /// that names the HTTP status, the endpoint and what the body looked like.
+    fn parse_chat_response_body(
+        status: reqwest::StatusCode,
+        body: &str,
+        url: &str,
+    ) -> Result<serde_json::Value, String> {
         if !status.is_success() {
-            return Err(format!("HTTP {status}: {json}"));
+            let message = Self::extract_api_error_message(body);
+            return Err(format!("HTTP {status}: {}", body_preview(&message)));
         }
-
-        Ok(json)
+        serde_json::from_str(body).map_err(|e| {
+            format!(
+                "invalid JSON response (HTTP {status}) from {url}: {e}; body starts: {}",
+                body_preview(body)
+            )
+        })
     }
 
     fn json_u32(value: &serde_json::Value, key: &str) -> Option<u32> {
@@ -1159,7 +1204,11 @@ impl LLMProvider for OpenAICompatProvider {
             Ok(response) => response,
             Err(e) => {
                 return LLMResponse {
-                    content: Some(e.to_string()),
+                    content: Some(format!(
+                        "request to {} failed: {}",
+                        self.chat_completions_url,
+                        describe_error_chain(&e)
+                    )),
                     finish_reason: "error".to_string(),
                     tool_calls: Vec::new(),
                     usage: LLMUsage::new(),
@@ -1767,6 +1816,196 @@ mod tests {
         assert_eq!(response.reasoning_content.as_deref(), Some("think"));
         assert_eq!(response.usage.input_tokens, Some(12));
         assert_eq!(response.usage.output_tokens, Some(3));
+    }
+
+    // ── chat_raw / response-body errors ──────────────────────────────────────
+
+    const TEST_URL: &str = "https://example.com/v1/chat/completions";
+
+    #[test]
+    fn body_preview_collapses_whitespace_and_marks_blank_bodies() {
+        assert_eq!(body_preview("a \n  b\t c"), "a b c");
+        assert_eq!(body_preview("  \n "), "(empty)");
+        assert_eq!(body_preview(""), "(empty)");
+    }
+
+    #[test]
+    fn body_preview_cuts_long_bodies() {
+        let long = "x".repeat(BODY_PREVIEW_MAX_CHARS + 50);
+        let preview = body_preview(&long);
+        assert_eq!(preview.chars().count(), BODY_PREVIEW_MAX_CHARS + 1);
+        assert!(preview.ends_with('…'));
+        let exact = "y".repeat(BODY_PREVIEW_MAX_CHARS);
+        assert_eq!(body_preview(&exact), exact);
+    }
+
+    #[test]
+    fn a_json_success_body_is_parsed() {
+        let value = OpenAICompatProvider::parse_chat_response_body(
+            reqwest::StatusCode::OK,
+            r#"{"choices":[]}"#,
+            TEST_URL,
+        )
+        .unwrap();
+        assert_eq!(value, serde_json::json!({"choices": []}));
+    }
+
+    #[test]
+    fn a_success_status_with_a_truncated_body_names_the_cause_and_the_body() {
+        let error = OpenAICompatProvider::parse_chat_response_body(
+            reqwest::StatusCode::OK,
+            r#"{"choices":[{"message":"#,
+            TEST_URL,
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "invalid JSON response (HTTP 200 OK) from {TEST_URL}"
+            )),
+            "{error}"
+        );
+        assert!(error.contains("EOF while parsing"), "{error}");
+        assert!(
+            error.contains(r#"body starts: {"choices":[{"message":"#),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_empty_success_body_is_reported_as_empty() {
+        let error =
+            OpenAICompatProvider::parse_chat_response_body(reqwest::StatusCode::OK, "", TEST_URL)
+                .unwrap_err();
+        assert!(error.contains("body starts: (empty)"), "{error}");
+    }
+
+    #[test]
+    fn a_non_json_error_page_reports_the_status_instead_of_a_decode_error() {
+        let error = OpenAICompatProvider::parse_chat_response_body(
+            reqwest::StatusCode::BAD_GATEWAY,
+            "<html>\n<body>Bad   gateway</body>\n</html>",
+            TEST_URL,
+        )
+        .unwrap_err();
+        assert_eq!(
+            error,
+            "HTTP 502 Bad Gateway: <html> <body>Bad gateway</body> </html>"
+        );
+    }
+
+    #[test]
+    fn a_json_error_body_reports_the_api_message() {
+        let error = OpenAICompatProvider::parse_chat_response_body(
+            reqwest::StatusCode::TOO_MANY_REQUESTS,
+            r#"{"error":{"message":"Rate limit reached","code":429}}"#,
+            TEST_URL,
+        )
+        .unwrap_err();
+        assert_eq!(error, "HTTP 429 Too Many Requests: Rate limit reached");
+    }
+
+    #[test]
+    fn body_errors_are_classified_as_transient_so_they_are_retried() {
+        let truncated =
+            OpenAICompatProvider::parse_chat_response_body(reqwest::StatusCode::OK, "{", TEST_URL)
+                .unwrap_err();
+        assert!(OpenAICompatProvider::is_transient_error(Some(&truncated)));
+        assert!(OpenAICompatProvider::is_transient_error(Some(
+            "failed to read the response body (HTTP 200 OK) from https://example.com: reset"
+        )));
+    }
+
+    /// Serve `raw_response` once on a local port and return the base URL.
+    async fn serve_once(raw_response: &'static [u8]) -> String {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = vec![0u8; 8192];
+            let _ = socket.read(&mut request).await;
+            socket.write_all(raw_response).await.unwrap();
+            // Dropping the socket closes the connection, cutting a short body off.
+        });
+        format!("http://{address}/v1")
+    }
+
+    fn provider_at(api_base: String) -> OpenAICompatProvider {
+        OpenAICompatProvider::new(
+            Some("test-key".to_string()),
+            Some(api_base),
+            Some("gpt-test".to_string()),
+            None,
+            None,
+        )
+    }
+
+    #[tokio::test]
+    async fn chat_raw_reports_a_body_cut_off_by_the_server() {
+        let base = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: 500\r\n\r\n{\"choices\":[",
+        )
+        .await;
+        let error = provider_at(base)
+            .chat_raw(&serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with(
+                "failed to read the response body (HTTP 200 OK) from http://127.0.0.1:"
+            ),
+            "{error}"
+        );
+        // The cause is spelled out, not just "error decoding response body".
+        assert!(error.matches(": ").count() >= 2, "{error}");
+    }
+
+    #[tokio::test]
+    async fn chat_raw_reports_a_gateway_error_page_with_its_status() {
+        let base = serve_once(
+            b"HTTP/1.1 502 Bad Gateway\r\nContent-Type: text/html\r\nContent-Length: 21\r\nConnection: close\r\n\r\n<html>bad gateway</h>",
+        )
+        .await;
+        let error = provider_at(base)
+            .chat_raw(&serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert_eq!(error, "HTTP 502 Bad Gateway: <html>bad gateway</h>");
+    }
+
+    #[tokio::test]
+    async fn chat_raw_reports_html_served_with_a_success_status() {
+        let base = serve_once(
+            b"HTTP/1.1 200 OK\r\nContent-Type: text/html\r\nContent-Length: 15\r\nConnection: close\r\n\r\n<html>login</h>",
+        )
+        .await;
+        let error = provider_at(base)
+            .chat_raw(&serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with("invalid JSON response (HTTP 200 OK) from "),
+            "{error}"
+        );
+        assert!(error.contains("body starts: <html>login</h>"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn chat_raw_says_where_a_failed_request_was_going() {
+        // Nothing listens here: bind a port, then free it.
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        drop(listener);
+        let error = provider_at(format!("http://{address}/v1"))
+            .chat_raw(&serde_json::json!({}))
+            .await
+            .unwrap_err();
+        assert!(
+            error.starts_with(&format!(
+                "request to http://{address}/v1/chat/completions failed: "
+            )),
+            "{error}"
+        );
     }
 
     fn test_provider() -> OpenAICompatProvider {

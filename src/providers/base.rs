@@ -281,6 +281,9 @@ const TRANSIENT_ERROR_MARKERS: &[&str] = &[
     "connection",
     "server error",
     "temporarily unavailable",
+    // A response cut off mid-body or not valid JSON: a gateway hiccup, not a bad request.
+    "failed to read the response body",
+    "invalid json response",
 ];
 
 /// Markers that the selected model cannot accept image / vision input.
@@ -297,6 +300,25 @@ const UNSUPPORTED_IMAGE_INPUT_MARKERS: &[&str] = &[
     "vision is not supported",
     "support image input",
 ];
+
+/// `error` followed by each of its sources, joined by `": "`.
+///
+/// Some errors (notably `reqwest`'s "error decoding response body") only say
+/// what went wrong in their *source*; `to_string()` alone drops it. A source
+/// whose text the previous message already contains is skipped.
+pub fn describe_error_chain(error: &dyn std::error::Error) -> String {
+    let mut description = error.to_string();
+    let mut source = error.source();
+    while let Some(cause) = source {
+        let cause_text = cause.to_string();
+        if !description.contains(&cause_text) {
+            description.push_str(": ");
+            description.push_str(&cause_text);
+        }
+        source = cause.source();
+    }
+    description
+}
 
 /// True when `content` is an LLM error saying the model cannot take images.
 pub fn is_unsupported_image_input_error(content: Option<&str>) -> bool {
@@ -1591,6 +1613,65 @@ mod tests {
         ];
         let res = TestLLMProvider::sanitize_request_messages(&messages, &allowed_keys);
         assert_eq!(res.len(), 2);
+    }
+
+    #[derive(Debug)]
+    struct ChainLink {
+        message: &'static str,
+        cause: Option<Box<ChainLink>>,
+    }
+
+    impl fmt::Display for ChainLink {
+        fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+            f.write_str(self.message)
+        }
+    }
+
+    impl std::error::Error for ChainLink {
+        fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+            self.cause
+                .as_deref()
+                .map(|cause| cause as &(dyn std::error::Error + 'static))
+        }
+    }
+
+    #[test]
+    fn describe_error_chain_of_an_error_without_a_source_is_its_message() {
+        let error = ChainLink {
+            message: "boom",
+            cause: None,
+        };
+        assert_eq!(describe_error_chain(&error), "boom");
+    }
+
+    #[test]
+    fn describe_error_chain_appends_every_source() {
+        let error = ChainLink {
+            message: "error decoding response body",
+            cause: Some(Box::new(ChainLink {
+                message: "error reading a body from connection",
+                cause: Some(Box::new(ChainLink {
+                    message: "connection reset by peer",
+                    cause: None,
+                })),
+            })),
+        };
+        assert_eq!(
+            describe_error_chain(&error),
+            "error decoding response body: error reading a body from connection: connection reset by peer"
+        );
+    }
+
+    #[test]
+    fn describe_error_chain_skips_a_source_the_message_already_contains() {
+        let error = ChainLink {
+            message: "request failed: timed out",
+            cause: Some(Box::new(ChainLink {
+                message: "timed out",
+                cause: None,
+            })),
+        };
+        assert_eq!(describe_error_chain(&error), "request failed: timed out");
     }
 
     #[test]

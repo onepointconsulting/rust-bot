@@ -1,4 +1,5 @@
 pub mod acp;
+mod background_banner;
 mod cancel;
 pub mod commands;
 mod confirm_tools;

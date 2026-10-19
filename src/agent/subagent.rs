@@ -10,6 +10,7 @@ use serde::Serialize;
 
 use crate::{
     agent::{
+        background_activity::{ActivityGuard, ActivityKind, BackgroundActivity},
         context::ContextBuilder,
         hook::{AgentHook, AgentHookContext, ToolHookDecision},
         model_runtime::ModelRuntimeResolver,
@@ -44,12 +45,18 @@ const TASK_SUMMARY_MAX_CHARS: usize = 80;
 /// How many finished records are kept; running ones are never pruned.
 const MAX_FINISHED_RECORDS: usize = 50;
 
+/// How many model/tool rounds a sub-agent may use before it is stopped.
+const SUB_AGENT_MAX_ITERATIONS: usize = 30;
+/// The `stop_reason` of a run that used up its iterations without finishing.
+const MAX_ITERATIONS_STOP_REASON: &str = "max_iterations";
+
 /// Where a spawned sub-agent is in its life. Terminal states never change.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SubagentStatus {
     Running,
     Completed,
-    /// Stopped by a tool error; the announcement carries the partial progress.
+    /// Stopped by a tool error or by the iteration limit; the announcement
+    /// carries the partial progress.
     Partial,
     Failed,
     Cancelled,
@@ -230,6 +237,17 @@ pub struct SubagentManager {
     session_tasks: Arc<Mutex<HashMap<String, HashSet<String>>>>,
     /// One record per spawned sub-agent, kept after it finishes (bounded).
     tasks: Arc<Mutex<HashMap<String, SubagentRecord>>>,
+    /// Per-session count of running sub-agents, for the "waiting for background
+    /// agents" banner of the channels.
+    activity: Arc<BackgroundActivity>,
+    /// One guard per running task of a session, keyed by task id. It lives here,
+    /// not in the task's thread, so that [`Self::set_status`] ends the entry the
+    /// moment the task leaves `Running` (a cancel clears the banner at once, even
+    /// while the thread is still winding down).
+    activity_guards: Mutex<HashMap<String, ActivityGuard>>,
+    /// One cancel signal per running task, keyed by task id. Notifying it ends the
+    /// task's run at its next await point (see [`Self::cancel_by_session`]).
+    cancel_signals: Mutex<HashMap<String, Arc<tokio::sync::Notify>>>,
 }
 
 impl SubagentManager {
@@ -267,7 +285,16 @@ impl SubagentManager {
             running_tasks: Arc::new(Mutex::new(HashMap::new())),
             session_tasks: Arc::new(Mutex::new(HashMap::new())),
             tasks: Arc::new(Mutex::new(HashMap::new())),
+            activity: BackgroundActivity::new(),
+            activity_guards: Mutex::new(HashMap::new()),
+            cancel_signals: Mutex::new(HashMap::new()),
         }
+    }
+
+    /// The per-session tracker of running sub-agents, for channels that show
+    /// what is running in the background.
+    pub fn activity(&self) -> Arc<BackgroundActivity> {
+        Arc::clone(&self.activity)
     }
 
     /// Tools (by name) that subagents must not get, mirroring `tools.disabledTools`.
@@ -375,38 +402,61 @@ impl SubagentManager {
             finished_at: None,
             status: SubagentStatus::Running,
         });
+        // Registered before the thread starts: the thread's `set_status` must
+        // find the guard, or a fast task would leave its entry counted forever.
+        if let Some(session_key) = session_key {
+            self.register_activity(&task_id, session_key);
+        }
+        // Also before the thread starts, so a cancel right after the spawn finds it.
+        let cancel_signal = self.register_cancel_signal(&task_id);
 
         // LLMProviderDyn uses `?Send` futures; run on a dedicated thread with a
         // single-threaded runtime instead of `tokio::spawn`.
         let handle = std::thread::spawn(move || {
-            tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .expect("subagent runtime")
-                .block_on(async move {
-                    log::info!("Running subagent task: {}", task_id_bg);
-                    manager
-                        .run_subagent(
-                            &task_id_bg,
-                            &task_owned,
-                            &display_label,
-                            &origin,
-                            session_key_owned.as_deref(),
-                        )
-                        .await;
-                    log::info!("Completed: {}", task_id_bg);
-                    // Safety net for a run that ended without reporting a status;
-                    // a no-op whenever one was already recorded (first writer wins).
-                    manager.set_status(&task_id_bg, SubagentStatus::Failed);
-                    running_tasks.lock().unwrap().remove(&task_id_bg);
-                    log::info!("Removed from running tasks: {}", task_id_bg);
-                    if let Some(session_key) = session_key_owned
-                        && let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key)
-                    {
-                        tasks.remove(&task_id_bg);
-                        log::info!("Removed from tasks: {}", task_id_bg);
-                    }
-                });
+            // A panic must not skip the bookkeeping below, or the task would stay
+            // `Running` (and counted in the banner) forever.
+            let run_outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("subagent runtime")
+                    .block_on(async {
+                        log::info!("Running subagent task: {}", task_id_bg);
+                        // A cancel drops the run at its next await point instead of
+                        // letting it work on (and announce) after it was stopped.
+                        tokio::select! {
+                            _ = manager.run_subagent(
+                                &task_id_bg,
+                                &task_owned,
+                                &display_label,
+                                &origin,
+                                session_key_owned.as_deref(),
+                            ) => log::info!("Completed: {}", task_id_bg),
+                            _ = cancel_signal.notified() => {
+                                log::info!("Cancelled: {}", task_id_bg);
+                            }
+                        }
+                    });
+            }));
+            if run_outcome.is_err() {
+                log::error!("Subagent [{task_id_bg}] panicked");
+            }
+            // Safety net for a run that ended without reporting a status (or
+            // panicked); a no-op whenever one was already recorded (first writer wins).
+            manager.set_status(&task_id_bg, SubagentStatus::Failed);
+            manager
+                .cancel_signals
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(&task_id_bg);
+            running_tasks.lock().unwrap().remove(&task_id_bg);
+            log::info!("Removed from running tasks: {}", task_id_bg);
+            if let Some(session_key) = session_key_owned
+                && let Some(tasks) = session_tasks.lock().unwrap().get_mut(&session_key)
+            {
+                tasks.remove(&task_id_bg);
+                log::info!("Removed from tasks: {}", task_id_bg);
+            }
         });
 
         self.running_tasks
@@ -426,6 +476,40 @@ impl SubagentManager {
         format!(
             "Subagent [{display_label_owned}] started (id: {task_id}). I'll notify you when it completes."
         )
+    }
+
+    /// Count `task_id` as running in `session_key` until [`Self::set_status`]
+    /// moves it out of `Running`.
+    fn register_activity(&self, task_id: &str, session_key: &str) {
+        let guard = self.activity.begin(session_key, ActivityKind::Spawn);
+        self.activity_guards
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.to_string(), guard);
+    }
+
+    /// Create and store the cancel signal of `task_id`.
+    fn register_cancel_signal(&self, task_id: &str) -> Arc<tokio::sync::Notify> {
+        let signal = Arc::new(tokio::sync::Notify::new());
+        self.cancel_signals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(task_id.to_string(), Arc::clone(&signal));
+        signal
+    }
+
+    /// Tell the run of `task_id` to stop at its next await point. A signal sent
+    /// before the run starts waiting is kept, so it is never lost.
+    fn signal_cancel(&self, task_id: &str) {
+        let signal = self
+            .cancel_signals
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(task_id)
+            .cloned();
+        if let Some(signal) = signal {
+            signal.notify_one();
+        }
     }
 
     /// Reply for a spawn whose task id is already known, or `None` for a new task.
@@ -468,13 +552,29 @@ impl SubagentManager {
     /// Move a record out of [`SubagentStatus::Running`]. One-shot: the first
     /// terminal status wins, later calls (and unknown ids) are ignored. This is
     /// what keeps a cancelled task `Cancelled` when it still finishes later.
+    ///
+    /// Also ends the task's banner entry, so every terminal path (completion,
+    /// failure, cancel, the thread's safety net) clears it.
     fn set_status(&self, task_id: &str, status: SubagentStatus) {
-        let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(record) = tasks.get_mut(task_id)
-            && record.status == SubagentStatus::Running
-        {
-            record.status = status;
-            record.finished_at = Some(Utc::now());
+        let moved_out_of_running = {
+            let mut tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+            match tasks.get_mut(task_id) {
+                Some(record) if record.status == SubagentStatus::Running => {
+                    record.status = status;
+                    record.finished_at = Some(Utc::now());
+                    true
+                }
+                _ => false,
+            }
+        };
+        if moved_out_of_running {
+            // Dropped after the `tasks` lock is released: it announces the change.
+            let guard = self
+                .activity_guards
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .remove(task_id);
+            drop(guard);
         }
     }
 
@@ -607,12 +707,12 @@ impl SubagentManager {
                 initial_messages: messages,
                 tools,
                 model: runtime.model.clone(),
-                max_iterations: 15,
+                max_iterations: SUB_AGENT_MAX_ITERATIONS,
                 max_tool_result_chars: self.max_tool_result_chars,
                 hook: Some(Arc::new(SubagentHook::new(task_id.to_string()))),
-                max_iterations_message: Some(
-                    "Task completed but no final response was generated.".to_string(),
-                ),
+                // The iteration limit is reported by `run_subagent_inner`, which also
+                // lists what was done; the runner's own wording would claim success.
+                max_iterations_message: None,
                 error_message: None,
                 fail_on_tool_error: self.subagent_config.fail_on_tool_error,
                 ..Default::default()
@@ -635,6 +735,16 @@ impl SubagentManager {
                 .await;
             return Ok(());
         }
+        if result.stop_reason == MAX_ITERATIONS_STOP_REASON {
+            log::warn!(
+                "Subagent [{task_id}] stopped at its limit of {SUB_AGENT_MAX_ITERATIONS} iterations"
+            );
+            self.set_status(task_id, SubagentStatus::Partial);
+            let report = SubagentManager::format_iteration_limit_report(&result);
+            self.announce_result(task_id, label, task, &report, origin, "partial")
+                .await;
+            return Ok(());
+        }
         let final_result = result
             .final_content
             .unwrap_or("Task completed but no final response was generated.".to_string());
@@ -643,6 +753,46 @@ impl SubagentManager {
         self.announce_result(task_id, label, task, &final_result, origin, "ok")
             .await;
         Ok(())
+    }
+
+    /// The "Completed steps:" block for the last few successful tool calls, or
+    /// nothing when there were none.
+    fn completed_steps_lines(completed: &[&HashMap<String, String>]) -> Vec<String> {
+        if completed.is_empty() {
+            return Vec::new();
+        }
+        let mut lines = vec!["Completed steps:".to_string()];
+        let start = completed.len().saturating_sub(3);
+        for event in completed[start..].iter() {
+            lines.push(format!(
+                "- {}: {}",
+                event.get("name").unwrap_or(&"".to_string()),
+                event.get("detail").unwrap_or(&"".to_string())
+            ));
+        }
+        lines
+    }
+
+    /// What the main agent is told when a sub-agent used up its iterations: that
+    /// the task is unfinished, and the last steps that did succeed.
+    fn format_iteration_limit_report(result: &AgentRunResult) -> String {
+        let completed = result
+            .tool_events
+            .iter()
+            .filter(|e| e.get("status").unwrap_or(&"".to_string()) == "ok")
+            .collect::<Vec<_>>();
+        let mut lines = vec![format!(
+            "The task is NOT finished: it was stopped after {SUB_AGENT_MAX_ITERATIONS} steps without a final answer, so any output is incomplete."
+        )];
+        let steps = Self::completed_steps_lines(&completed);
+        if !steps.is_empty() {
+            lines.push(String::new());
+            lines.extend(steps);
+        }
+        lines.join(
+            "
+",
+        )
     }
 
     fn format_partial_progress(result: AgentRunResult) -> String {
@@ -656,18 +806,7 @@ impl SubagentManager {
             .iter()
             .rev()
             .find(|e| e.get("status").unwrap_or(&"".to_string()) == "error");
-        let mut lines = Vec::new();
-        if !completed.is_empty() {
-            lines.push("Completed steps:".to_string());
-            let start = completed.len().saturating_sub(3);
-            for event in completed[start..].iter() {
-                lines.push(format!(
-                    "- {}: {}",
-                    event.get("name").unwrap_or(&"".to_string()),
-                    event.get("detail").unwrap_or(&"".to_string())
-                ));
-            }
-        }
+        let mut lines = Self::completed_steps_lines(&completed);
         if let Some(failure) = failure {
             if !lines.is_empty() {
                 lines.push("".to_string());
@@ -722,10 +861,10 @@ impl SubagentManager {
         origin: &HashMap<String, String>,
         status: &str,
     ) {
-        let status_text = if status == "ok" {
-            "completed successfully"
-        } else {
-            "failed"
+        let status_text = match status {
+            "ok" => "completed successfully",
+            "partial" => "stopped before it finished",
+            _ => "failed",
         };
         let mut ctx = Context::new();
         ctx.insert("label", label);
@@ -793,10 +932,12 @@ impl SubagentManager {
                 }
             }
         }
-        // Before waiting: the task keeps running until it ends, but a result it
-        // reports afterwards must not overwrite `Cancelled`.
+        // Before waiting: the status stays `Cancelled` whatever the run reports
+        // afterwards, and the signal ends the run at its next await point, so the
+        // wait below is short instead of lasting until the run would have finished.
         for task_id in &cancelled_ids {
             self.set_status(task_id, SubagentStatus::Cancelled);
+            self.signal_cancel(task_id);
         }
 
         let count = handles.len() as u32;
@@ -804,7 +945,7 @@ impl SubagentManager {
             return count;
         }
 
-        // std::thread::JoinHandle has no cancel(); wait for each thread to finish.
+        // std::thread::JoinHandle has no cancel(); wait for each (signalled) thread to end.
         tokio::task::spawn_blocking(move || {
             for handle in handles {
                 let _ = handle.join();
@@ -1467,8 +1608,8 @@ mod tests {
     // ── spawn-task records, list(), format_subagents_list ────────────────────
 
     use super::{
-        MAX_FINISHED_RECORDS, SubagentRecord, SubagentStatus, format_subagents_list,
-        format_subagents_list_at, summarize_spawn_records, truncate_chars,
+        MAX_FINISHED_RECORDS, SUB_AGENT_MAX_ITERATIONS, SubagentRecord, SubagentStatus,
+        format_subagents_list, format_subagents_list_at, summarize_spawn_records, truncate_chars,
     };
     use chrono::{DateTime, Duration, Utc};
 
@@ -1719,6 +1860,545 @@ mod tests {
         // The run still ends later and reports success: it must not overwrite.
         manager.set_status("task-1", SubagentStatus::Completed);
         assert_eq!(manager.list()[0].status, SubagentStatus::Cancelled);
+    }
+
+    // ── background activity (the "waiting for background agents" count) ───────
+
+    use crate::agent::background_activity::ActivityChange;
+
+    /// A provider whose every request panics, to prove a crashed sub-agent
+    /// thread still clears its banner entry.
+    struct PanickingProvider {
+        settings: GenerationSettings,
+    }
+
+    #[async_trait]
+    impl LLMProviderDyn for PanickingProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            "panicking-model".to_string()
+        }
+        async fn chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            panic!("provider blew up");
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            panic!("provider blew up");
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            panic!("provider blew up");
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<crate::providers::base::BoxedStreamCallback>,
+            _: Option<crate::providers::base::BoxedProgressCallback>,
+        ) -> LLMResponse {
+            panic!("provider blew up");
+        }
+    }
+
+    /// The next change announced for `session_key`, failing the test after a timeout.
+    async fn next_change_for(
+        changes: &mut tokio::sync::broadcast::Receiver<ActivityChange>,
+        session_key: &str,
+    ) -> ActivityChange {
+        tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            loop {
+                let change = changes.recv().await.expect("tracker alive");
+                if change.session_key == session_key {
+                    return change;
+                }
+            }
+        })
+        .await
+        .expect("an activity change within the timeout")
+    }
+
+    /// Spawn a task for `session_key` and return the changes announced until it ends.
+    async fn spawn_and_collect_changes(
+        provider: Arc<dyn LLMProviderDyn>,
+        session_key: &str,
+    ) -> (Arc<SubagentManager>, Vec<ActivityChange>, TempDir) {
+        let (manager, tmp) = test_manager(provider);
+        let mut changes = manager.activity().subscribe();
+        Arc::clone(&manager).spawn(
+            "do it",
+            Some("job"),
+            Some("cli"),
+            Some("direct"),
+            Some(session_key),
+        );
+        let started = next_change_for(&mut changes, session_key).await;
+        let ended = next_change_for(&mut changes, session_key).await;
+        (manager, vec![started, ended], tmp)
+    }
+
+    #[tokio::test]
+    async fn spawn_counts_the_task_until_it_completes() {
+        let (manager, changes, _tmp) =
+            spawn_and_collect_changes(ScriptedProvider::arc(vec![llm_text("fine")]), "cli:direct")
+                .await;
+        assert_eq!(changes[0].snapshot.spawn_count, 1);
+        assert!(changes[1].snapshot.is_idle());
+        assert!(manager.activity().snapshot("cli:direct").is_idle());
+    }
+
+    #[tokio::test]
+    async fn a_failed_task_stops_being_counted() {
+        let (manager, changes, _tmp) =
+            spawn_and_collect_changes(ScriptedProvider::arc(vec![llm_error("boom")]), "cli:direct")
+                .await;
+        assert_eq!(changes[0].snapshot.spawn_count, 1);
+        assert!(changes[1].snapshot.is_idle());
+        assert!(manager.activity().snapshot("cli:direct").is_idle());
+    }
+
+    #[tokio::test]
+    async fn a_panicking_task_is_marked_failed_and_stops_being_counted() {
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(PanickingProvider {
+            settings: GenerationSettings::new(),
+        });
+        let (manager, changes, _tmp) = spawn_and_collect_changes(provider, "cli:direct").await;
+        assert_eq!(changes[0].snapshot.spawn_count, 1);
+        assert!(changes[1].snapshot.is_idle());
+        // The thread's cleanup runs right after the announced change.
+        for _ in 0..200 {
+            if manager.running_tasks.lock().unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        assert!(manager.running_tasks.lock().unwrap().is_empty());
+        assert_eq!(manager.list()[0].status, SubagentStatus::Failed);
+    }
+
+    #[test]
+    fn a_task_without_a_session_is_not_counted() {
+        let (manager, _tmp) = test_manager(ScriptedProvider::arc(vec![llm_text("fine")]));
+        let mut changes = manager.activity().subscribe();
+        Arc::clone(&manager).spawn("do it", Some("job"), None, None, None);
+        for _ in 0..200 {
+            if manager.list()[0].status != SubagentStatus::Running {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_millis(25));
+        }
+        assert!(changes.try_recv().is_err());
+    }
+
+    /// Insert a running record and count it, as `spawn` does for a task with a session.
+    fn seed_counted(manager: &SubagentManager, task_id: &str, session_key: &str) {
+        seed(
+            manager,
+            record_at(
+                task_id,
+                Some(session_key),
+                SubagentStatus::Running,
+                Utc::now(),
+            ),
+        );
+        manager.register_activity(task_id, session_key);
+    }
+
+    #[test]
+    fn every_terminal_status_uncounts_the_task() {
+        for status in [
+            SubagentStatus::Completed,
+            SubagentStatus::Failed,
+            SubagentStatus::Partial,
+            SubagentStatus::Cancelled,
+        ] {
+            let (manager, _tmp) = test_manager(TestProvider::arc());
+            seed_counted(&manager, "task-1", "cli:direct");
+            assert_eq!(manager.activity().snapshot("cli:direct").spawn_count, 1);
+            manager.set_status("task-1", status);
+            assert!(
+                manager.activity().snapshot("cli:direct").is_idle(),
+                "{status:?} must clear the count"
+            );
+        }
+    }
+
+    #[test]
+    fn a_late_result_after_cancel_does_not_uncount_twice() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        seed_counted(&manager, "task-1", "cli:direct");
+        seed_counted(&manager, "task-2", "cli:direct");
+        manager.set_status("task-1", SubagentStatus::Cancelled);
+        manager.set_status("task-1", SubagentStatus::Completed);
+        assert_eq!(manager.activity().snapshot("cli:direct").spawn_count, 1);
+    }
+
+    #[tokio::test]
+    async fn cancel_by_session_clears_that_sessions_count_only() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        seed_counted(&manager, "task-1", "cli:a");
+        seed_counted(&manager, "task-2", "cli:b");
+        for (task_id, session_key) in [("task-1", "cli:a"), ("task-2", "cli:b")] {
+            let handle = std::thread::spawn(|| {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            });
+            manager
+                .running_tasks
+                .lock()
+                .unwrap()
+                .insert(task_id.to_string(), handle);
+            manager
+                .session_tasks
+                .lock()
+                .unwrap()
+                .entry(session_key.to_string())
+                .or_default()
+                .insert(task_id.to_string());
+        }
+
+        assert_eq!(manager.cancel_by_session("cli:a").await, 1);
+
+        assert!(manager.activity().snapshot("cli:a").is_idle());
+        assert_eq!(manager.activity().snapshot("cli:b").spawn_count, 1);
+    }
+
+    #[test]
+    fn replaying_a_known_task_id_does_not_count_it_again() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        seed_counted(&manager, "task-1", "cli:direct");
+        let reply = Arc::clone(&manager).spawn_with_task_id(
+            Some("task-1".to_string()),
+            "do it",
+            Some("job"),
+            Some("cli"),
+            Some("direct"),
+            Some("cli:direct"),
+        );
+        assert!(reply.contains("already running"));
+        assert_eq!(manager.activity().snapshot("cli:direct").spawn_count, 1);
+    }
+
+    // ── iteration limit and cancel signal ────────────────────────────────────
+
+    fn llm_read_file(path: &str) -> LLMResponse {
+        LLMResponse {
+            tool_calls: vec![ToolCallRequest {
+                id: "call_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: HashMap::from([("path".to_string(), serde_json::json!(path))]),
+                extra_content: None,
+                provider_specific_fields: None,
+                function_provider_specific_fields: None,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            ..LLMResponse::new()
+        }
+    }
+
+    #[test]
+    fn iteration_limit_report_says_the_task_is_unfinished() {
+        let result = AgentRunResult::default();
+        let report = SubagentManager::format_iteration_limit_report(&result);
+        assert!(report.contains("NOT finished"), "{report}");
+        assert!(
+            report.contains(&format!("{SUB_AGENT_MAX_ITERATIONS} steps")),
+            "{report}"
+        );
+        assert!(!report.contains("Completed steps"), "{report}");
+    }
+
+    #[test]
+    fn iteration_limit_report_lists_the_last_three_successful_steps() {
+        let result = AgentRunResult {
+            tool_events: vec![
+                tool_event("ok", "read_file", "step one"),
+                tool_event("ok", "read_file", "step two"),
+                tool_event("error", "shell", "broke"),
+                tool_event("ok", "read_file", "step three"),
+                tool_event("ok", "write_file", "step four"),
+            ],
+            ..AgentRunResult::default()
+        };
+        let report = SubagentManager::format_iteration_limit_report(&result);
+        assert!(report.contains("Completed steps:"), "{report}");
+        assert!(!report.contains("step one"), "{report}");
+        assert!(report.contains("- read_file: step two"), "{report}");
+        assert!(report.contains("- read_file: step three"), "{report}");
+        assert!(report.contains("- write_file: step four"), "{report}");
+        assert!(!report.contains("broke"), "{report}");
+    }
+
+    #[tokio::test]
+    async fn a_run_that_uses_up_its_iterations_is_partial_and_announced_as_unfinished() {
+        let tmp = TempDir::new().unwrap();
+        std::fs::write(tmp.path().join("note.txt"), "hello").unwrap();
+        let responses = (0..SUB_AGENT_MAX_ITERATIONS)
+            .map(|_| llm_read_file("note.txt"))
+            .collect();
+        let bus = Arc::new(MessageBus::new());
+        let manager = SubagentManager::new_simple(
+            ScriptedProvider::arc(responses),
+            tmp.path().to_path_buf(),
+            bus.clone(),
+            4096,
+        );
+        seed(
+            &manager,
+            record_at("task-1", None, SubagentStatus::Running, Utc::now()),
+        );
+
+        let outcome = manager
+            .run_subagent_inner(
+                "task-1",
+                "read forever",
+                "reader",
+                &origin("cli", "direct"),
+                None,
+            )
+            .await;
+
+        assert!(outcome.is_ok());
+        assert_eq!(manager.list()[0].status, SubagentStatus::Partial);
+        let announcement = bus.consume_inbound().await.expect("an announcement");
+        assert!(
+            announcement.content.contains("stopped before it finished"),
+            "{}",
+            announcement.content
+        );
+        assert!(announcement.content.contains("NOT finished"));
+        assert!(announcement.content.contains("Completed steps:"));
+        assert!(!announcement.content.contains("completed successfully"));
+    }
+
+    /// A provider whose requests never return, standing in for a long model call.
+    struct HangingProvider {
+        settings: GenerationSettings,
+        requested: Arc<std::sync::atomic::AtomicBool>,
+    }
+
+    impl HangingProvider {
+        async fn hang(&self) -> LLMResponse {
+            self.requested
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl LLMProviderDyn for HangingProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            "hanging-model".to_string()
+        }
+        async fn chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<serde_json::Value>,
+            _: Option<Vec<serde_json::Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<serde_json::Value>,
+            _: Option<crate::providers::base::BoxedStreamCallback>,
+            _: Option<crate::providers::base::BoxedProgressCallback>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+    }
+
+    /// A manager whose sub-agents hang in their first model request, with the
+    /// flag that turns true once that request has started.
+    fn hanging_manager() -> (
+        Arc<SubagentManager>,
+        Arc<std::sync::atomic::AtomicBool>,
+        Arc<MessageBus>,
+        TempDir,
+    ) {
+        let tmp = TempDir::new().unwrap();
+        let requested = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(HangingProvider {
+            settings: GenerationSettings::new(),
+            requested: Arc::clone(&requested),
+        });
+        let bus = Arc::new(MessageBus::new());
+        let manager = Arc::new(SubagentManager::new_simple(
+            provider,
+            tmp.path().to_path_buf(),
+            bus.clone(),
+            4096,
+        ));
+        (manager, requested, bus, tmp)
+    }
+
+    /// Wait until the hanging provider has been asked for a model response.
+    async fn wait_for_model_request(requested: &std::sync::atomic::AtomicBool) {
+        for _ in 0..400 {
+            if requested.load(std::sync::atomic::Ordering::SeqCst) {
+                return;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+        }
+        panic!("the sub-agent never asked the model");
+    }
+
+    /// Cancel `session_key`'s tasks, failing the test if that takes long: a wait
+    /// until the hanging run ends by itself would never return.
+    async fn cancel_within_timeout(manager: &SubagentManager, session_key: &str) -> u32 {
+        tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            manager.cancel_by_session(session_key),
+        )
+        .await
+        .expect("cancel must not wait for the run to finish by itself")
+    }
+
+    fn spawn_hanging_task(manager: &Arc<SubagentManager>, label: &str, session_key: &str) {
+        Arc::clone(manager).spawn(
+            "hang",
+            Some(label),
+            Some("cli"),
+            Some("direct"),
+            Some(session_key),
+        );
+    }
+
+    #[tokio::test]
+    async fn cancel_stops_a_run_that_is_waiting_on_the_model() {
+        let (manager, requested, bus, _tmp) = hanging_manager();
+        spawn_hanging_task(&manager, "job", "cli:a");
+        wait_for_model_request(&requested).await;
+
+        assert_eq!(cancel_within_timeout(&manager, "cli:a").await, 1);
+
+        assert_eq!(manager.list()[0].status, SubagentStatus::Cancelled);
+        assert!(manager.activity().snapshot("cli:a").is_idle());
+        assert!(manager.running_tasks.lock().unwrap().is_empty());
+        assert_eq!(bus.inbound_size(), 0, "a cancelled run must not announce");
+    }
+
+    #[tokio::test]
+    async fn cancel_right_after_spawn_is_not_lost() {
+        let (manager, _requested, bus, _tmp) = hanging_manager();
+        spawn_hanging_task(&manager, "job", "cli:a");
+
+        assert_eq!(cancel_within_timeout(&manager, "cli:a").await, 1);
+
+        assert_eq!(manager.list()[0].status, SubagentStatus::Cancelled);
+        assert_eq!(bus.inbound_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn cancel_leaves_other_sessions_tasks_running() {
+        let (manager, requested, _bus, _tmp) = hanging_manager();
+        spawn_hanging_task(&manager, "a", "cli:a");
+        spawn_hanging_task(&manager, "b", "cli:b");
+        wait_for_model_request(&requested).await;
+
+        assert_eq!(cancel_within_timeout(&manager, "cli:a").await, 1);
+
+        assert!(manager.activity().snapshot("cli:a").is_idle());
+        assert_eq!(manager.activity().snapshot("cli:b").spawn_count, 1);
+        // Clean up the other task so its thread does not outlive the test.
+        assert_eq!(cancel_within_timeout(&manager, "cli:b").await, 1);
     }
 
     #[test]

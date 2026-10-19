@@ -5,6 +5,7 @@ use std::fs;
 use std::future::Future;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use crate::agent::acp::listing::{format_acp_agents, list_acp_rows};
@@ -37,6 +38,9 @@ use crate::channels::websocket::CHANNEL_NAME;
 use crate::channels::websocket::runtime::WebSocketChannel;
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::channels::whatsapp::{WhatsAppChannel, WhatsAppConfig};
+use crate::cli::background_banner::{
+    keep_spinner_banner_updated, print_current_banner, spawn_prompt_notices,
+};
 use crate::cli::cancel::wait_for_escape_cancel;
 use crate::cli::confirm_tools::WebsocketsAskHook;
 use crate::cli::onboard::run_onboard;
@@ -66,9 +70,9 @@ use axum::routing::{get, post};
 use clap::{Parser, Subcommand};
 use futures::lock::Mutex;
 use reedline::{
-    EditCommand, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Prompt, PromptEditMode,
-    PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent, Signal,
-    default_emacs_keybindings,
+    EditCommand, ExternalPrinter, FileBackedHistory, KeyCode, KeyModifiers, Keybindings, Prompt,
+    PromptEditMode, PromptHistorySearch, PromptHistorySearchStatus, Reedline, ReedlineEvent,
+    Signal, default_emacs_keybindings,
 };
 use serde_json::Value;
 use termimad::MadSkin;
@@ -1924,6 +1928,10 @@ async fn message_session(
     }
     let renderer: Arc<Mutex<StreamRenderer>> =
         Arc::new(Mutex::new(StreamRenderer::new(markdown, true)));
+    // Shows "Waiting for N background agents" on the spinner line while any run;
+    // stops with this turn on every return path.
+    let _spinner_banner_updates =
+        keep_spinner_banner_updated(&agent_loop.subagents.activity(), Arc::clone(&renderer));
     if let Some(hook) = &confirm_hook {
         hook.set_renderer(Arc::clone(&renderer));
     }
@@ -2116,11 +2124,28 @@ async fn interactive_session(
     print_previous_messages(&agent_loop, session_id, markdown);
     let text_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
     let image_captures: Arc<StdMutex<Vec<String>>> = Arc::new(StdMutex::new(Vec::new()));
-    let mut line_editor = init_prompt_session(text_captures.clone());
+    // Background-agent notices at the prompt go through reedline's external
+    // printer, the only safe way to print while it owns the terminal.
+    let notice_printer = ExternalPrinter::<String>::default();
+    let mut line_editor =
+        init_prompt_session(text_captures.clone()).with_external_printer(notice_printer.clone());
+    let prompt_active = Arc::new(AtomicBool::new(false));
+    let activity = agent_loop.subagents.activity();
+    let _prompt_notices =
+        spawn_prompt_notices(&activity, notice_printer, Arc::clone(&prompt_active));
+    // Agents started during the last turn are still running when the prompt
+    // returns; say so once, before it is drawn.
+    let mut announce_running_agents = true;
     let prompt = CliPrompt;
     loop {
-        let sig = tokio::task::block_in_place(|| line_editor.read_line(&prompt))
-            .map_err(|e| CliError::Readline(e.into()))?;
+        if announce_running_agents {
+            print_current_banner(&activity);
+            announce_running_agents = false;
+        }
+        prompt_active.store(true, Ordering::Relaxed);
+        let read_result = tokio::task::block_in_place(|| line_editor.read_line(&prompt));
+        prompt_active.store(false, Ordering::Relaxed);
+        let sig = read_result.map_err(|e| CliError::Readline(e.into()))?;
         match sig {
             Signal::HostCommand(cmd) if cmd == TEXT_PASTE_COMMAND => {
                 let captured = try_get_clipboard_text().unwrap_or_default();
@@ -2185,6 +2210,7 @@ async fn interactive_session(
                     Arc::clone(&herdr),
                 )
                 .await;
+                announce_running_agents = true;
                 for media_path in media {
                     if let Err(err) = fs::remove_file(&media_path) {
                         log::debug!(

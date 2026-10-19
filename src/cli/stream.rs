@@ -16,16 +16,35 @@ pub struct ThinkingSpinner {
     active: bool,
 }
 
+/// The text appended to the spinner line for the background-agents `banner`:
+/// empty without one, otherwise ` · <banner>`.
+fn spinner_banner_suffix(banner: Option<&str>) -> String {
+    banner.map(|text| format!(" · {text}")).unwrap_or_default()
+}
+
 impl ThinkingSpinner {
     pub fn start() -> Self {
+        Self::start_with_banner(None)
+    }
+
+    /// Start the spinner, showing the background-agents `banner` after the
+    /// "thinking" text when there is one.
+    pub fn start_with_banner(banner: Option<&str>) -> Self {
         let bar = ProgressBar::new_spinner();
         bar.set_style(
-            ProgressStyle::with_template("{spinner:.dim} rust-bot is thinking...")
+            ProgressStyle::with_template("{spinner:.dim} rust-bot is thinking...{msg}")
                 .unwrap()
                 .tick_strings(&["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]),
         );
+        bar.set_message(spinner_banner_suffix(banner));
         bar.enable_steady_tick(Duration::from_millis(80));
         Self { bar, active: true }
+    }
+
+    /// Show, change or (with `None`) remove the background-agents banner on the
+    /// running spinner line.
+    pub fn set_banner(&self, banner: Option<&str>) {
+        self.bar.set_message(spinner_banner_suffix(banner));
     }
 
     pub fn stop(&mut self) {
@@ -69,6 +88,9 @@ pub struct StreamRenderer {
     pub header_printed: bool,
     is_tty: bool,
     reasoning_started: bool,
+    /// The background-agents banner shown on the spinner line, kept here so a
+    /// spinner that is stopped and restarted between rounds shows it again.
+    background_banner: Option<String>,
 }
 
 impl StreamRenderer {
@@ -91,9 +113,24 @@ impl StreamRenderer {
             header_printed: false,
             is_tty: io::stdout().is_terminal(),
             reasoning_started: false,
+            background_banner: None,
         };
         renderer.start_spinner();
         renderer
+    }
+
+    /// The background-agents banner currently set, if any.
+    pub fn background_banner(&self) -> Option<&str> {
+        self.background_banner.as_deref()
+    }
+
+    /// Show, change or (with `None`) remove the background-agents banner on the
+    /// spinner line, now and whenever the spinner is restarted.
+    pub fn set_background_banner(&mut self, banner: Option<String>) {
+        if let Some(spinner) = &self.spinner {
+            spinner.set_banner(banner.as_deref());
+        }
+        self.background_banner = banner;
     }
 
     #[cfg_attr(not(test), allow(dead_code))]
@@ -107,7 +144,9 @@ impl StreamRenderer {
 
     fn start_spinner(&mut self) {
         if self.show_spinner && self.spinner.is_none() {
-            self.spinner = Some(ThinkingSpinner::start());
+            self.spinner = Some(ThinkingSpinner::start_with_banner(
+                self.background_banner.as_deref(),
+            ));
         }
     }
 
@@ -305,6 +344,40 @@ mod tests {
             renderer.spinner.as_ref().is_some_and(|s| s.is_active()),
             "spinner should restart while the agent continues after a tool-call round"
         );
+    }
+
+    #[test]
+    fn spinner_banner_suffix_is_empty_without_a_banner() {
+        assert_eq!(spinner_banner_suffix(None), "");
+    }
+
+    #[test]
+    fn spinner_banner_suffix_separates_the_banner_from_the_thinking_text() {
+        assert_eq!(
+            spinner_banner_suffix(Some("Waiting for 1 background agent to finish")),
+            " · Waiting for 1 background agent to finish"
+        );
+    }
+
+    #[test]
+    fn background_banner_survives_a_spinner_restart() {
+        let mut renderer = StreamRenderer::new(false, true);
+        renderer.set_background_banner(Some("Waiting for 2 background agents to finish".into()));
+        renderer.stop_for_input();
+        renderer.resume_after_input();
+        assert_eq!(
+            renderer.background_banner.as_deref(),
+            Some("Waiting for 2 background agents to finish")
+        );
+        assert!(renderer.spinner.as_ref().is_some_and(|s| s.is_active()));
+    }
+
+    #[test]
+    fn clearing_the_background_banner_forgets_it() {
+        let mut renderer = StreamRenderer::new(false, true);
+        renderer.set_background_banner(Some("Waiting for 1 background agent to finish".into()));
+        renderer.set_background_banner(None);
+        assert_eq!(renderer.background_banner, None);
     }
 
     #[test]

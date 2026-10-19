@@ -50,7 +50,7 @@ clap = { version = "4", features = ["derive"] }
 anstyle = "1"
 termimad = "0.34.1"
 indicatif = "0.18.4"
-reedline = "0.48.0"
+reedline = { version = "0.48.0", features = ["external_printer"] }
 arboard = { version = "3", default-features = false, features = ["image-data"] }
 png = "0.17"
 crossterm = "0.29"

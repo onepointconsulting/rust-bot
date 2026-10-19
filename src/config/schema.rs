@@ -2168,7 +2168,7 @@ mod tests {
     fn test_dream_deserialize_camel_case() {
         let interval_h = 4;
         let max_batch_size = 25;
-        let max_iterations = 15;
+        let max_iterations = 30;
         let json = format!(
             "{{\"intervalH\": {interval_h}, \"maxBatchSize\": {max_batch_size}, \"maxIterations\": {max_iterations}}}"
         );
