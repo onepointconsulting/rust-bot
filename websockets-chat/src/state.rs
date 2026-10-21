@@ -649,14 +649,47 @@ pub fn background_agents_after(current: usize, reported: Option<usize>) -> usize
     reported.unwrap_or(current)
 }
 
-/// The status line for `running` background agents, or `None` when there are
-/// none. Worded like the gateway CLI's own banner.
-pub fn background_agents_banner(running: usize) -> Option<String> {
-    match running {
+/// Whether the agent is working on a sub-agent's result after a `goal_status`
+/// frame: what it reports, or `current` unchanged when it reports nothing.
+pub fn working_on_results_after(current: bool, reported: Option<bool>) -> bool {
+    reported.unwrap_or(current)
+}
+
+/// The status line for `running` background agents and for the main agent
+/// `working` on their results, or `None` when there is neither. Worded like the
+/// gateway CLI's own banner.
+pub fn background_banner(running: usize, working: bool) -> Option<String> {
+    let waiting = match running {
         0 => None,
         1 => Some("Waiting for 1 background agent to finish".to_string()),
         count => Some(format!("Waiting for {count} background agents to finish")),
+    };
+    match (waiting, working) {
+        (Some(waiting), true) => Some(format!("{waiting} · working on the results so far")),
+        (Some(waiting), false) => Some(waiting),
+        (None, true) => Some("Working on the background agents' results".to_string()),
+        (None, false) => None,
     }
+}
+
+/// The longest hint shown under the banner, in characters.
+const BACKGROUND_HINT_MAX_CHARS: usize = 140;
+
+/// The line to show under the banner for a progress `message` of the agent's
+/// background work: the first non-blank line of a `tool_hint` or `progress`
+/// message, cut to [`BACKGROUND_HINT_MAX_CHARS`]. `None` for other kinds and
+/// for blank text.
+pub fn background_hint_from(kind: &str, text: &str) -> Option<String> {
+    if kind != "tool_hint" && kind != "progress" {
+        return None;
+    }
+    let line = text.lines().map(str::trim).find(|line| !line.is_empty())?;
+    if line.chars().count() <= BACKGROUND_HINT_MAX_CHARS {
+        return Some(line.to_string());
+    }
+    let mut cut: String = line.chars().take(BACKGROUND_HINT_MAX_CHARS).collect();
+    cut.push('…');
+    Some(cut)
 }
 
 /// Percent-encode a string for safe inclusion in a URL query value.
@@ -892,20 +925,70 @@ mod tests {
     }
 
     #[test]
-    fn background_agents_banner_is_hidden_at_zero() {
-        assert_eq!(background_agents_banner(0), None);
+    fn a_reported_working_state_replaces_the_current_one() {
+        assert!(working_on_results_after(false, Some(true)));
+        assert!(!working_on_results_after(true, Some(false)));
     }
 
     #[test]
-    fn background_agents_banner_uses_singular_and_plural() {
+    fn a_frame_without_a_working_state_leaves_the_current_one() {
+        assert!(working_on_results_after(true, None));
+        assert!(!working_on_results_after(false, None));
+    }
+
+    #[test]
+    fn background_banner_is_hidden_when_nothing_happens() {
+        assert_eq!(background_banner(0, false), None);
+    }
+
+    #[test]
+    fn background_banner_uses_singular_and_plural() {
         assert_eq!(
-            background_agents_banner(1).as_deref(),
+            background_banner(1, false).as_deref(),
             Some("Waiting for 1 background agent to finish")
         );
         assert_eq!(
-            background_agents_banner(4).as_deref(),
+            background_banner(4, false).as_deref(),
             Some("Waiting for 4 background agents to finish")
         );
+    }
+
+    #[test]
+    fn background_banner_says_when_the_agent_works_on_results() {
+        assert_eq!(
+            background_banner(0, true).as_deref(),
+            Some("Working on the background agents' results")
+        );
+        assert_eq!(
+            background_banner(2, true).as_deref(),
+            Some("Waiting for 2 background agents to finish · working on the results so far")
+        );
+    }
+
+    #[test]
+    fn background_hint_takes_the_first_line_of_a_tool_hint_or_progress_note() {
+        assert_eq!(
+            background_hint_from("tool_hint", "\n  write_file(report.html)\nmore").as_deref(),
+            Some("write_file(report.html)")
+        );
+        assert_eq!(
+            background_hint_from("progress", "Verifying the report").as_deref(),
+            Some("Verifying the report")
+        );
+    }
+
+    #[test]
+    fn background_hint_ignores_other_kinds_and_blank_text() {
+        assert_eq!(background_hint_from("status", "something"), None);
+        assert_eq!(background_hint_from("tool_hint", "  \n "), None);
+    }
+
+    #[test]
+    fn background_hint_is_cut_to_a_readable_length() {
+        let long = "x".repeat(BACKGROUND_HINT_MAX_CHARS + 30);
+        let hint = background_hint_from("tool_hint", &long).unwrap();
+        assert_eq!(hint.chars().count(), BACKGROUND_HINT_MAX_CHARS + 1);
+        assert!(hint.ends_with('…'));
     }
 
     fn mcp_preset(name: &str, enabled: bool) -> McpPresetSummary {

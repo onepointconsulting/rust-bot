@@ -139,7 +139,7 @@ mod tests {
     fn spawn_snapshot(spawn_count: usize) -> ActivitySnapshot {
         ActivitySnapshot {
             spawn_count,
-            acp_agents: Vec::new(),
+            ..ActivitySnapshot::default()
         }
     }
 

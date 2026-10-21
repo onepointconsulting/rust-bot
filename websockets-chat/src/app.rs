@@ -430,6 +430,12 @@ struct WsContext {
     /// `background_agents` field of `goal_status` frames. Reset on attach (the
     /// gateway re-sends a non-zero count right after) and on disconnect.
     background_agents: RwSignal<usize>,
+    /// Whether the agent is working on a finished sub-agent's result, from the
+    /// `working_on_results` field of `goal_status` frames. Reset like
+    /// `background_agents`.
+    working_on_results: RwSignal<bool>,
+    /// The latest tool call or note of that work, shown under the banner.
+    background_hint: RwSignal<Option<String>>,
     /// Sidebar Summary dialog: `None` when closed, `Some` with empty
     /// `text` while the `get_session_summary` reply is in flight.
     summary_popup: RwSignal<Option<SessionSummaryPopup>>,
@@ -548,6 +554,32 @@ fn append_finished_assistant_entry(
         });
     });
     persist_entries(&ctx.entries.get_untracked());
+}
+
+/// Handle a `message` event of the agent's work on a finished sub-agent's
+/// result. It has no turn of its own on this client, and the user may have a
+/// turn pending that it must neither answer nor decorate: a final message becomes
+/// its own finished entry, and a tool call or note becomes the banner's hint.
+fn handle_background_message(
+    ctx: &WsContext,
+    text: String,
+    kind: Option<String>,
+    media: Vec<String>,
+) {
+    match kind {
+        None => {
+            let attachments =
+                state::media_urls_to_attachments(media, ctx.token.get_untracked().as_deref());
+            append_finished_assistant_entry(ctx, text, attachments);
+            ctx.background_hint.set(None);
+            request_chat_list(ctx);
+        }
+        Some(kind) => {
+            if let Some(hint) = state::background_hint_from(&kind, &text) {
+                ctx.background_hint.set(Some(hint));
+            }
+        }
+    }
 }
 
 /// Handle a `message` event, branching on whether `kind` is present (a live
@@ -803,13 +835,26 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             started_at,
             turn_id,
             background_agents,
+            working_on_results,
         } => {
             log::info!(
-                "goal status: chat_id={chat_id} status={status} started_at={started_at:?} turn_id={turn_id:?} background_agents={background_agents:?}"
+                "goal status: chat_id={chat_id} status={status} started_at={started_at:?} turn_id={turn_id:?} background_agents={background_agents:?} working_on_results={working_on_results:?}"
             );
             ctx.background_agents.update(|running| {
                 *running = state::background_agents_after(*running, background_agents);
             });
+            ctx.working_on_results.update(|working| {
+                *working = state::working_on_results_after(*working, working_on_results);
+            });
+            if state::background_banner(
+                ctx.background_agents.get_untracked(),
+                ctx.working_on_results.get_untracked(),
+            )
+            .is_none()
+            {
+                // Nothing is going on any more: a leftover hint would be stale.
+                ctx.background_hint.set(None);
+            }
         }
         ServerEvent::Message {
             text,
@@ -817,9 +862,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             kind,
             tool_events,
             media,
+            background,
             ..
         } => {
-            handle_message_event(ctx, text, reply_to, kind, tool_events, media);
+            if background {
+                handle_background_message(ctx, text, kind, media);
+            } else {
+                handle_message_event(ctx, text, reply_to, kind, tool_events, media);
+            }
         }
         ServerEvent::Delta { text, .. } => {
             if let Some(turn_id) = ctx.active_turn_id.get_untracked() {
@@ -928,6 +978,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.chat_error.set(None);
             // The gateway re-sends a non-zero count right after `attached`.
             ctx.background_agents.set(0);
+            ctx.working_on_results.set(false);
+            ctx.background_hint.set(None);
             ctx.turn_index.set(HashMap::new());
             ctx.active_turn_id.set(None);
             // A still-open request is re-sent right after `attached`.
@@ -1231,6 +1283,8 @@ fn handle_connection_closed(ctx: WsContext, generation_at_open: u64) {
     // Nothing reports changes while offline; the re-attach after a reconnect
     // brings back the real count.
     ctx.background_agents.set(0);
+    ctx.working_on_results.set(false);
+    ctx.background_hint.set(None);
     let should_reconnect =
         ctx.token.get_untracked().is_some() || ctx.require_login.get_untracked() == Some(false);
     if should_reconnect {
@@ -2143,6 +2197,8 @@ pub fn App() -> impl IntoView {
     let subagents_acp_enabled = RwSignal::new(false);
     let subagents_loaded = RwSignal::new(false);
     let background_agents = RwSignal::new(0usize);
+    let working_on_results = RwSignal::new(false);
+    let background_hint = RwSignal::new(None::<String>);
     let mcp_presets = RwSignal::new(Vec::<McpPresetSummary>::new());
     let mcp_custom = RwSignal::new(Vec::<McpCustomServerSummary>::new());
     let mcp_loaded = RwSignal::new(false);
@@ -2204,6 +2260,8 @@ pub fn App() -> impl IntoView {
         subagents_acp_enabled,
         subagents_loaded,
         background_agents,
+        working_on_results,
+        background_hint,
         summary_popup,
         workspace_popup,
         pending_approval,
@@ -2555,6 +2613,8 @@ pub fn App() -> impl IntoView {
                     on_clear_session=on_clear_session
                     on_abort_turn=on_abort_turn
                     background_agents=Signal::derive(move || background_agents.get())
+                    working_on_results=Signal::derive(move || working_on_results.get())
+                    background_hint=Signal::derive(move || background_hint.get())
                     pending_approval=Signal::derive(move || pending_approval.get())
                     on_toggle_approval_call=on_toggle_approval_call
                     on_answer_approval=on_answer_approval

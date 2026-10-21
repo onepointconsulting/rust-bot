@@ -171,3 +171,14 @@ Spawn tasks and ACP children are different mechanisms, so this gets its own mile
 ## Out of scope
 
 Config flag, per-agent names/progress in the banner, a sidebar indicator, bridging child-process activity into the parent, persisting activity across restarts (sub-agents are in-memory and die with the process).
+
+---
+
+## Follow-up (2026-10-21): the main agent no longer goes quiet after the last sub-agent
+
+Found in `rust-bot-ems` logs: after the last sub-agent ended, the main agent spent 10 minutes on its follow-up turn (writing the report) while a user message waited unread, because system-message turns ran inline on the agent loop and showed no progress.
+
+- **Loop unblocked:** system messages are spawned as per-session tasks like user messages (`dispatch_system`, shared `acquire_turn_slot`), registered in `active_tasks`, so `/stop` and Stop work during a follow-up. Turns of one session still serialize on the session lock, so a user message waits for the running follow-up, but is no longer unreadable.
+- **Visible work:** new `ActivityKind::FollowUp` (held for the length of `process_system_message`) feeds the banner text ("Working on the background agents' results", or "Waiting for … · working on the results so far"); `goal_status` gained `working_on_results`. For WebUI chats the follow-up turn also publishes its tool calls and notes (never the reasoning stream) as progress; the client shows the latest as a hint under the banner, with a Stop button.
+- **Replies of a follow-up** are flagged `from_background` on the wire so the client shows them as their own entries instead of attaching them to a turn the user has pending.
+- Not done: letting a user message interrupt a follow-up (the earlier "option C").

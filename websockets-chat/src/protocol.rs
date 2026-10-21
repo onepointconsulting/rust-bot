@@ -935,6 +935,9 @@ pub enum ServerEvent {
         started_at: Option<f64>,
         turn_id: Option<String>,
         background_agents: Option<usize>,
+        /// Whether the agent is busy with a finished sub-agent's result; `None`
+        /// when the frame carries no such information (not the same as `false`).
+        working_on_results: Option<bool>,
     },
     /// A complete chat message. When `kind` is `Some("progress")` or
     /// `Some("tool_hint")` this is a live-progress update (often carrying
@@ -950,6 +953,9 @@ pub enum ServerEvent {
         latency_ms: Option<u64>,
         kind: Option<String>,
         tool_events: Option<Vec<ToolEvent>>,
+        /// The message belongs to the agent's work on a finished sub-agent's
+        /// result, not to the turn the user may have pending.
+        background: bool,
     },
     /// One streamed text chunk for an in-progress turn.
     Delta {
@@ -1395,6 +1401,8 @@ struct GoalStatusWire {
     turn_id: Option<String>,
     #[serde(default)]
     background_agents: Option<usize>,
+    #[serde(default)]
+    working_on_results: Option<bool>,
 }
 
 #[derive(Deserialize)]
@@ -1411,6 +1419,8 @@ struct MessageWire {
     kind: Option<String>,
     #[serde(default)]
     tool_events: Option<Vec<ToolEvent>>,
+    #[serde(default)]
+    from_background: bool,
 }
 
 #[derive(Deserialize)]
@@ -1707,6 +1717,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             started_at: w.started_at,
             turn_id: w.turn_id,
             background_agents: w.background_agents,
+            working_on_results: w.working_on_results,
         }),
         "message" => decode::<MessageWire>(&value).map(|w| ServerEvent::Message {
             chat_id: w.chat_id,
@@ -1716,6 +1727,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             latency_ms: w.latency_ms,
             kind: w.kind,
             tool_events: w.tool_events,
+            background: w.from_background,
         }),
         "delta" => decode::<DeltaWire>(&value).map(|w| ServerEvent::Delta {
             chat_id: w.chat_id,
@@ -2350,6 +2362,7 @@ mod tests {
                 started_at: Some(123.4),
                 turn_id: Some("turn-1".to_string()),
                 background_agents: None,
+                working_on_results: None,
             }
         );
     }
@@ -2366,6 +2379,7 @@ mod tests {
                 started_at: None,
                 turn_id: None,
                 background_agents: None,
+                working_on_results: None,
             }
         );
     }
@@ -2383,6 +2397,7 @@ mod tests {
                 started_at: None,
                 turn_id: None,
                 background_agents: Some(2),
+                working_on_results: None,
             }
         );
     }
@@ -2409,6 +2424,52 @@ mod tests {
     }
 
     #[test]
+    fn parses_working_on_results_as_true_false_or_missing() {
+        let parse = |raw: &str| {
+            let ServerEvent::GoalStatus {
+                working_on_results, ..
+            } = parse_server_event(raw).expect("should parse")
+            else {
+                panic!("expected GoalStatus");
+            };
+            working_on_results
+        };
+        let base = r#"{"event":"goal_status","chat_id":"c","status":"idle""#;
+        assert_eq!(
+            parse(&format!(r#"{base},"working_on_results":true}}"#)),
+            Some(true)
+        );
+        assert_eq!(
+            parse(&format!(r#"{base},"working_on_results":false}}"#)),
+            Some(false)
+        );
+        assert_eq!(parse(&format!("{base}}}")), None);
+    }
+
+    #[test]
+    fn parses_a_message_from_background_work() {
+        let raw =
+            r#"{"event":"message","chat_id":"chat-1","text":"agent done","from_background":true}"#;
+        let ServerEvent::Message { background, .. } =
+            parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected Message");
+        };
+        assert!(background);
+    }
+
+    #[test]
+    fn a_message_without_the_background_flag_is_not_from_background() {
+        let raw = r#"{"event":"message","chat_id":"chat-1","text":"hi"}"#;
+        let ServerEvent::Message { background, .. } =
+            parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected Message");
+        };
+        assert!(!background);
+    }
+
+    #[test]
     fn parses_plain_final_message() {
         let raw = r#"{"event":"message","chat_id":"chat-1","text":"hello there"}"#;
         let event = parse_server_event(raw).expect("should parse");
@@ -2422,6 +2483,7 @@ mod tests {
                 latency_ms: None,
                 kind: None,
                 tool_events: None,
+                background: false,
             }
         );
     }
@@ -2440,6 +2502,7 @@ mod tests {
                 latency_ms: None,
                 kind: None,
                 tool_events: None,
+                background: false,
             }
         );
     }
@@ -2470,6 +2533,7 @@ mod tests {
                     status: "running".to_string(),
                     detail: Some("querying docs".to_string()),
                 }]),
+                background: false,
             }
         );
     }

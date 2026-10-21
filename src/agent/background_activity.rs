@@ -20,6 +20,11 @@ const CHANGE_CHANNEL_CAPACITY: usize = 64;
 /// external agent is being called.
 pub const ACP_LABEL_PREFIX: &str = "acp::";
 
+/// Banner text while the main agent works on results and no agent is running.
+pub const WORKING_ON_RESULTS_TEXT: &str = "Working on the background agents' results";
+/// The same, as the tail of a banner that also says agents are still running.
+const WORKING_ON_RESULTS_SUFFIX: &str = "working on the results so far";
+
 /// What kind of background work an entry stands for.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ActivityKind {
@@ -27,6 +32,8 @@ pub enum ActivityKind {
     Spawn,
     /// A run of the named ACP child agent.
     Acp { agent: String },
+    /// The main agent working on the result of a finished background agent.
+    FollowUp,
 }
 
 /// What is running in one session at one moment.
@@ -36,20 +43,37 @@ pub struct ActivitySnapshot {
     pub spawn_count: usize,
     /// Names of the ACP child agents currently running, oldest first.
     pub acp_agents: Vec<String>,
+    /// Number of turns the main agent is running on a background agent's result.
+    pub follow_up_runs: usize,
 }
 
 impl ActivitySnapshot {
     /// True when nothing is running.
     pub fn is_idle(&self) -> bool {
-        self.spawn_count == 0 && self.acp_agents.is_empty()
+        self.spawn_count == 0 && self.acp_agents.is_empty() && self.follow_up_runs == 0
     }
 
     /// The banner text for this snapshot, or `None` when nothing is running.
     ///
     /// Spawned sub-agents are a plain count; ACP agents are listed by name with
     /// the [`ACP_LABEL_PREFIX`], e.g. `Waiting for 2 background agents, acp::reviewer to finish`.
+    /// While the main agent works on a result the text says so, so a quiet
+    /// stretch after the last agent ended does not look like nothing is happening.
     pub fn banner(&self) -> Option<String> {
         if self.is_idle() {
+            return None;
+        }
+        let waiting = self.waiting_text();
+        match (waiting, self.follow_up_runs > 0) {
+            (Some(waiting), true) => Some(format!("{waiting} · {WORKING_ON_RESULTS_SUFFIX}")),
+            (Some(waiting), false) => Some(waiting),
+            (None, _) => Some(WORKING_ON_RESULTS_TEXT.to_string()),
+        }
+    }
+
+    /// The "Waiting for … to finish" part, or `None` when no agent is running.
+    fn waiting_text(&self) -> Option<String> {
+        if self.spawn_count == 0 && self.acp_agents.is_empty() {
             return None;
         }
         let mut parts: Vec<String> = Vec::new();
@@ -178,6 +202,7 @@ fn snapshot_of(entries: &[ActivityEntry]) -> ActivitySnapshot {
         match &entry.kind {
             ActivityKind::Spawn => snapshot.spawn_count += 1,
             ActivityKind::Acp { agent } => snapshot.acp_agents.push(agent.clone()),
+            ActivityKind::FollowUp => snapshot.follow_up_runs += 1,
         }
     }
     snapshot
@@ -283,6 +308,51 @@ mod tests {
     }
 
     #[test]
+    fn follow_up_runs_are_counted_apart_from_agents() {
+        let tracker = BackgroundActivity::new();
+        let _follow_up = tracker.begin("s", ActivityKind::FollowUp);
+        let _spawn = tracker.begin("s", ActivityKind::Spawn);
+        let snapshot = tracker.snapshot("s");
+        assert_eq!(snapshot.follow_up_runs, 1);
+        assert_eq!(snapshot.spawn_count, 1);
+    }
+
+    #[test]
+    fn a_follow_up_alone_is_not_idle_and_has_its_own_banner() {
+        let snapshot = ActivitySnapshot {
+            follow_up_runs: 1,
+            ..ActivitySnapshot::default()
+        };
+        assert!(!snapshot.is_idle());
+        assert_eq!(snapshot.banner().as_deref(), Some(WORKING_ON_RESULTS_TEXT));
+    }
+
+    #[test]
+    fn a_follow_up_with_agents_still_running_says_both() {
+        let snapshot = ActivitySnapshot {
+            spawn_count: 1,
+            follow_up_runs: 1,
+            ..ActivitySnapshot::default()
+        };
+        assert_eq!(
+            snapshot.banner().as_deref(),
+            Some("Waiting for 1 background agent to finish · working on the results so far")
+        );
+    }
+
+    #[test]
+    fn ending_the_follow_up_leaves_the_agents_banner() {
+        let tracker = BackgroundActivity::new();
+        let _spawn = tracker.begin("s", ActivityKind::Spawn);
+        let follow_up = tracker.begin("s", ActivityKind::FollowUp);
+        drop(follow_up);
+        assert_eq!(
+            tracker.snapshot("s").banner().as_deref(),
+            Some("Waiting for 1 background agent to finish")
+        );
+    }
+
+    #[test]
     fn banner_is_none_when_idle() {
         assert_eq!(ActivitySnapshot::default().banner(), None);
     }
@@ -292,6 +362,7 @@ mod tests {
         let one = ActivitySnapshot {
             spawn_count: 1,
             acp_agents: vec![],
+            ..ActivitySnapshot::default()
         };
         assert_eq!(
             one.banner().as_deref(),
@@ -300,6 +371,7 @@ mod tests {
         let many = ActivitySnapshot {
             spawn_count: 3,
             acp_agents: vec![],
+            ..ActivitySnapshot::default()
         };
         assert_eq!(
             many.banner().as_deref(),
@@ -312,6 +384,7 @@ mod tests {
         let only_acp = ActivitySnapshot {
             spawn_count: 0,
             acp_agents: vec!["reviewer".to_string()],
+            ..ActivitySnapshot::default()
         };
         assert_eq!(
             only_acp.banner().as_deref(),
@@ -320,6 +393,7 @@ mod tests {
         let mixed = ActivitySnapshot {
             spawn_count: 2,
             acp_agents: vec!["reviewer".to_string(), "coder".to_string()],
+            ..ActivitySnapshot::default()
         };
         assert_eq!(
             mixed.banner().as_deref(),

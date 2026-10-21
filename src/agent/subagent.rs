@@ -46,7 +46,7 @@ const TASK_SUMMARY_MAX_CHARS: usize = 80;
 const MAX_FINISHED_RECORDS: usize = 50;
 
 /// How many model/tool rounds a sub-agent may use before it is stopped.
-const SUB_AGENT_MAX_ITERATIONS: usize = 30;
+const SUB_AGENT_MAX_ITERATIONS: usize = 50;
 /// The `stop_reason` of a run that used up its iterations without finishing.
 const MAX_ITERATIONS_STOP_REASON: &str = "max_iterations";
 

@@ -12,8 +12,7 @@ use crate::components::{
 };
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
 use crate::state::{
-    background_agents_banner, ConfigFileView, ConnectionStatus, MainView, PendingApproval,
-    PendingQuestion,
+    background_banner, ConfigFileView, ConnectionStatus, MainView, PendingApproval, PendingQuestion,
 };
 
 /// Small dot + label in the header showing the gateway WebSocket's current
@@ -28,18 +27,36 @@ fn ConnectionBadge(#[prop(into)] status: Signal<ConnectionStatus>) -> impl IntoV
     }
 }
 
-/// The "Waiting for N background agents to finish" line above the composer.
-/// Rendered only while at least one background sub-agent runs in the chat.
+/// The status line above the composer while background sub-agents run or the
+/// agent works on their results: what is going on, the latest tool call of that
+/// work, and a Stop button (the same abort as `/stop`).
 #[component]
-fn BackgroundAgentsBanner(#[prop(into)] running: Signal<usize>) -> impl IntoView {
+fn BackgroundWorkBanner(
+    #[prop(into)] running: Signal<usize>,
+    #[prop(into)] working: Signal<bool>,
+    #[prop(into)] hint: Signal<Option<String>>,
+    #[prop(into)] on_stop: Callback<()>,
+) -> impl IntoView {
     view! {
-        <Show when=move || running.get() != 0>
-            <p
-                class="border-t border-slate-100 bg-slate-50 px-4 py-1.5 text-xs text-slate-500"
+        <Show when=move || background_banner(running.get(), working.get()).is_some()>
+            <div
+                class="flex items-center justify-between gap-3 border-t border-slate-100 bg-slate-50 px-4 py-1.5 text-xs text-slate-500"
                 role="status"
             >
-                {move || background_agents_banner(running.get()).unwrap_or_default()}
-            </p>
+                <div class="min-w-0">
+                    <p>{move || background_banner(running.get(), working.get()).unwrap_or_default()}</p>
+                    <Show when=move || hint.get().is_some()>
+                        <p class="truncate text-slate-400">{move || hint.get().unwrap_or_default()}</p>
+                    </Show>
+                </div>
+                <button
+                    type="button"
+                    class="shrink-0 rounded-full border border-slate-300 px-2.5 py-0.5 text-slate-600 hover:bg-slate-100"
+                    on:click=move |_| on_stop.run(())
+                >
+                    "Stop"
+                </button>
+            </div>
         </Show>
     }
 }
@@ -91,6 +108,8 @@ pub fn ChatShell(
     on_clear_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(into)] background_agents: Signal<usize>,
+    #[prop(into)] working_on_results: Signal<bool>,
+    #[prop(into)] background_hint: Signal<Option<String>>,
     #[prop(into)] pending_approval: Signal<Option<PendingApproval>>,
     on_toggle_approval_call: impl Fn(String) + 'static + Send + Sync + Copy,
     on_answer_approval: impl Fn(Vec<String>) + 'static + Send + Sync + Copy,
@@ -279,7 +298,12 @@ pub fn ChatShell(
                         on_use_prompt=on_use_prompt
                         on_fork_reply=on_fork_reply
                     />
-                    <BackgroundAgentsBanner running=background_agents />
+                    <BackgroundWorkBanner
+                        running=background_agents
+                        working=working_on_results
+                        hint=background_hint
+                        on_stop=Callback::new(move |()| on_abort_turn())
+                    />
                     <ToolApprovalCard
                         approval=pending_approval
                         on_toggle=Callback::new(move |id| on_toggle_approval_call(id))

@@ -16,6 +16,7 @@ use tokio::sync::Semaphore;
 use tokio::task::JoinHandle;
 
 use crate::agent::autocompact::Autocompact;
+use crate::agent::background_activity::ActivityKind;
 use crate::agent::checkpoint_payload;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
@@ -55,6 +56,7 @@ use crate::bus::outbound_events::{
     StreamedResponseEvent, TurnEndEvent, outbound_message_for_event,
 };
 use crate::bus::queue::MessageBus;
+use crate::channels::websocket::webui::metadata::WEBUI_SYSTEM_TURN_PREFIX;
 use crate::command::CommandContext;
 use crate::command::types::ChatCommand;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
@@ -168,14 +170,32 @@ fn safe_strip_think(text: Option<&str>) -> Option<String> {
 /// server does not make every chat message wait for another failed attempt.
 const MCP_RETRY_INTERVAL: Duration = Duration::from_secs(60);
 
+/// A session's turn in progress: the per-session lock and the global
+/// concurrency permit. Dropping it lets the next turn start.
+struct TurnSlot {
+    _session_guard: tokio::sync::OwnedMutexGuard<()>,
+    _permit: Option<tokio::sync::OwnedSemaphorePermit>,
+}
+
 /// Outbound metadata flag that makes the websocket channel record a delivery
 /// in the chat's WebUI transcript (the same key `MessageTool` copies).
 const WEBUI_METADATA_KEY: &str = "webui";
 /// Outbound metadata key naming the WebUI turn a recorded row belongs to.
 const WEBUI_TURN_ID_METADATA_KEY: &str = "webui_turn_id";
-/// Prefix of the turn id given to a reply to a system message (a sub-agent's
-/// result), which has no user turn of its own.
-const SYSTEM_TURN_ID_PREFIX: &str = "system-";
+
+/// Split a system message's `chat_id` (`channel:chat_id`) into its parts. An id
+/// with no channel belongs to the CLI.
+fn split_system_chat_id(chat_id: &str) -> (&str, &str) {
+    chat_id.split_once(':').unwrap_or(("cli", chat_id))
+}
+
+/// Whether `kind` belongs to the model's reasoning stream.
+fn is_reasoning_progress(kind: ProgressKind) -> bool {
+    matches!(
+        kind,
+        ProgressKind::Reasoning | ProgressKind::ReasoningDelta | ProgressKind::ReasoningEnd
+    )
+}
 
 /// The WebUI markers for a turn run for a system message (e.g. a sub-agent's
 /// result) on `session`: `webui` and a fresh turn id when the session is a
@@ -196,7 +216,7 @@ fn webui_system_turn_metadata(channel: &str, session: &Session) -> HashMap<Strin
         (
             WEBUI_TURN_ID_METADATA_KEY.to_string(),
             Value::String(format!(
-                "{SYSTEM_TURN_ID_PREFIX}{}",
+                "{WEBUI_SYSTEM_TURN_PREFIX}{}",
                 uuid::Uuid::new_v4().simple()
             )),
         ),
@@ -1514,14 +1534,7 @@ impl AgentLoop {
             return;
         };
         // Same per-session serialization as `dispatch`.
-        let lock = {
-            let mut locks = self.session_locks.lock().await;
-            locks
-                .entry(key.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
-        let _guard = lock.lock().await;
+        let _guard = self.session_lock(&key).await.lock_owned().await;
         log::warn!(
             "resume turn={} attempt={attempt} session={key}",
             turn.turn_id
@@ -1859,18 +1872,13 @@ impl AgentLoop {
                         log::error!("Failed to publish outbound message: {error}");
                     }
                 }
-            } else if msg.channel.eq_ignore_ascii_case("system") {
-                // System messages may run consolidation, which calls the `?Send`
-                // LLM provider — handled on the run-loop task, not via `spawn`.
-                if let Some(response) = Arc::clone(self).process_system_message(msg).await
-                    && let Err(error) = self.bus.publish_outbound(response)
-                {
-                    log::error!("Failed to publish outbound message: {error}");
-                }
             } else {
-                // Everything else is dispatched as its own task so the loop stays
-                // responsive (and the task is cancellable via /stop).
+                // Everything else (user messages and system messages such as a
+                // sub-agent's result) is dispatched as its own task so the loop
+                // stays responsive and the task is cancellable via /stop. A long
+                // follow-up turn must not hold up the next message, or `/stop`.
                 let this = Arc::clone(self);
+                let is_system = msg.channel.eq_ignore_ascii_case("system");
                 let key = msg.session_key();
                 let task_id = self.next_task_id.fetch_add(1, Ordering::Relaxed);
                 let active_tasks = Arc::clone(&self.active_tasks);
@@ -1880,7 +1888,11 @@ impl AgentLoop {
                 // cleanup can't run (and no-op) before the handle is registered.
                 let mut map = self.active_tasks.lock().await;
                 let handle = tokio::spawn(async move {
-                    this.dispatch(msg).await;
+                    if is_system {
+                        this.dispatch_system(msg).await;
+                    } else {
+                        this.dispatch(msg).await;
+                    }
                     // `add_done_callback` analog: drop our own entry when finished.
                     let mut map = active_tasks.lock().await;
                     if let Some(slot) = map.get_mut(&cleanup_key) {
@@ -1895,21 +1907,23 @@ impl AgentLoop {
         }
     }
 
-    /// Process a message: per-session serial, cross-session concurrent.
-    async fn dispatch(self: Arc<Self>, msg: InboundMessage) {
-        let session_key = msg.session_key();
-
+    /// The per-session lock, created on first use. Held for the length of a turn
+    /// so a session never runs two at once.
+    async fn session_lock(&self, session_key: &str) -> Arc<AsyncMutex<()>> {
         // setdefault: get-or-create the per-session lock, then release the map.
-        let lock = {
-            let mut locks = self.session_locks.lock().await;
-            locks
-                .entry(session_key.clone())
-                .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-                .clone()
-        };
+        let mut locks = self.session_locks.lock().await;
+        locks
+            .entry(session_key.to_string())
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone()
+    }
+
+    /// Wait for this session's turn, then for a place under the global
+    /// concurrency cap. Held (dropped) for the length of the turn.
+    async fn acquire_turn_slot(&self, session_key: &str) -> TurnSlot {
         // `async with lock, gate:` — serialize this session, then cap global concurrency.
-        let _guard = lock.lock().await;
-        let _permit = match &self.concurrency_gate {
+        let session_guard = self.session_lock(session_key).await.lock_owned().await;
+        let permit = match &self.concurrency_gate {
             Some(gate) => Some(
                 Arc::clone(gate)
                     .acquire_owned()
@@ -1918,6 +1932,43 @@ impl AgentLoop {
             ),
             None => None,
         };
+        TurnSlot {
+            _session_guard: session_guard,
+            _permit: permit,
+        }
+    }
+
+    /// Run the turn for a system message (a sub-agent's result) and publish the
+    /// reply. Serialized with the session's other turns, like [`Self::dispatch`],
+    /// but on its own task: aborting that task (`/stop`) ends the turn.
+    async fn dispatch_system(self: Arc<Self>, msg: InboundMessage) {
+        let session_key = msg.session_key();
+        let _slot = self.acquire_turn_slot(&session_key).await;
+        let processed = AssertUnwindSafe(Arc::clone(&self).process_system_message(msg))
+            .catch_unwind()
+            .await;
+        match processed {
+            Ok(Some(response)) => {
+                if let Err(error) = self.bus.publish_outbound(response) {
+                    log::error!("Failed to publish outbound message: {error}");
+                }
+            }
+            Ok(None) => {}
+            Err(panic) => log::error!(
+                "Error processing system message for session {session_key}: {}",
+                panic
+                    .downcast_ref::<&str>()
+                    .copied()
+                    .unwrap_or("(non-string panic)")
+            ),
+        }
+    }
+
+    /// Process a message: per-session serial, cross-session concurrent.
+    async fn dispatch(self: Arc<Self>, msg: InboundMessage) {
+        let session_key = msg.session_key();
+
+        let _slot = self.acquire_turn_slot(&session_key).await;
 
         let mut on_stream: Option<StreamCallback> = None;
         let mut on_stream_end: Option<StreamEndCallback> = None;
@@ -2107,6 +2158,83 @@ impl AgentLoop {
         .await;
     }
 
+    /// A progress callback that publishes each progress item (tool hints, narration,
+    /// reasoning) to the bus as an outbound message for `channel`/`chat_id`, with
+    /// `base_meta` as its metadata.
+    fn bus_progress_callback(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        base_meta: HashMap<String, Value>,
+    ) -> ProgressCallback {
+        let bus = Arc::clone(&self.bus);
+        let channel = channel.to_string();
+        let chat_id = chat_id.to_string();
+        let reasoning_stream_id = {
+            let now_ns = SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            format!("{chat_id}:reasoning:{now_ns}")
+        };
+        Arc::new(move |content: String, kind: ProgressKind| {
+            let bus = Arc::clone(&bus);
+            let channel = channel.clone();
+            let chat_id = chat_id.clone();
+            let mut meta = base_meta.clone();
+            let reasoning_stream_id = reasoning_stream_id.clone();
+            Box::pin(async move {
+                let is_reasoning = is_reasoning_progress(kind);
+                if is_reasoning {
+                    meta.insert(
+                        "_stream_id".into(),
+                        Value::String(reasoning_stream_id.clone()),
+                    );
+                } else {
+                    meta.insert("_progress".into(), Value::Bool(true));
+                    meta.insert(
+                        "_tool_hint".into(),
+                        Value::Bool(kind == ProgressKind::ToolHint),
+                    );
+                }
+                if let Err(e) = bus.publish_outbound(OutboundMessage {
+                    channel,
+                    chat_id,
+                    content,
+                    reply_to: None,
+                    media: vec![],
+                    metadata: meta,
+                    event: Some(OutboundEvent::Progress(ProgressEvent {
+                        kind,
+                        stream_id: is_reasoning.then_some(reasoning_stream_id),
+                        ..ProgressEvent::default()
+                    })),
+                }) {
+                    log::error!("Failed to publish progress message: {e}");
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        })
+    }
+
+    /// The progress callback of a system-message turn: [`Self::bus_progress_callback`]
+    /// without the reasoning stream, which a WebUI chat has no turn to show on.
+    fn system_turn_progress(
+        &self,
+        channel: &str,
+        chat_id: &str,
+        base_meta: HashMap<String, Value>,
+    ) -> ProgressCallback {
+        let publish = self.bus_progress_callback(channel, chat_id, base_meta);
+        Arc::new(move |content: String, kind: ProgressKind| {
+            let publish = Arc::clone(&publish);
+            Box::pin(async move {
+                if !is_reasoning_progress(kind) {
+                    publish(content, kind).await;
+                }
+            }) as Pin<Box<dyn Future<Output = ()> + Send>>
+        })
+    }
+
     /// Handle system-channel messages (checkpoint restore + consolidation).
     ///
     /// Kept separate from [`Self::process_message`] so spawned `dispatch`
@@ -2118,6 +2246,13 @@ impl AgentLoop {
         self: Arc<Self>,
         msg: InboundMessage,
     ) -> Option<OutboundMessage> {
+        // Counted while the turn runs, so channels can say the agent is busy with
+        // a result instead of looking idle. Dropped on every exit, `/stop` included.
+        let (channel, chat_id) = split_system_chat_id(&msg.chat_id);
+        let _working = self
+            .subagents
+            .activity()
+            .begin(&format!("{channel}:{chat_id}"), ActivityKind::FollowUp);
         with_workspace_scope_stack(move || self.process_system_message_inner(msg)).await
     }
 
@@ -2125,11 +2260,7 @@ impl AgentLoop {
         self: Arc<Self>,
         msg: InboundMessage,
     ) -> Option<OutboundMessage> {
-        let (channel, chat_id) = if let Some((channel, chat_id)) = msg.chat_id.split_once(':') {
-            (channel, chat_id)
-        } else {
-            ("cli", msg.chat_id.as_str())
-        };
+        let (channel, chat_id) = split_system_chat_id(&msg.chat_id);
         log::info!("Processing system message from {}", msg.sender_id);
         let key = format!("{channel}:{chat_id}");
 
@@ -2177,6 +2308,9 @@ impl AgentLoop {
         let mut turn_metadata = msg.metadata.clone();
         turn_metadata.extend(webui_turn_metadata.clone());
         self.apply_message_tool_inbound_metadata(&turn_metadata);
+        // Show the turn's tool calls to a WebUI chat while it runs.
+        let on_progress = (!webui_turn_metadata.is_empty())
+            .then(|| self.system_turn_progress(channel, chat_id, turn_metadata.clone()));
         // Pick up any idle-compaction summary produced since this session was
         // last used, refreshing `snapshot` again if a background archive is
         // still in flight (or the session still looks idle-expired).
@@ -2202,7 +2336,7 @@ impl AgentLoop {
         let agent_run_result = self
             .run_agent_loop(
                 messages,
-                None,
+                on_progress,
                 None,
                 None,
                 Some(snapshot.clone()),
@@ -2597,61 +2731,8 @@ impl AgentLoop {
             pending_summary.as_deref(),
         );
 
-        let bus_progress: ProgressCallback = {
-            let bus = Arc::clone(&self.bus);
-            let channel = msg.channel.clone();
-            let chat_id = msg.chat_id.clone();
-            let base_meta = msg.metadata.clone();
-            let reasoning_stream_id = {
-                let now_ns = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .map(|d| d.as_nanos())
-                    .unwrap_or(0);
-                format!("{}:reasoning:{now_ns}", msg.chat_id)
-            };
-            Arc::new(move |content: String, kind: ProgressKind| {
-                let bus = Arc::clone(&bus);
-                let channel = channel.clone();
-                let chat_id = chat_id.clone();
-                let mut meta = base_meta.clone();
-                let reasoning_stream_id = reasoning_stream_id.clone();
-                Box::pin(async move {
-                    let is_reasoning = matches!(
-                        kind,
-                        ProgressKind::Reasoning
-                            | ProgressKind::ReasoningDelta
-                            | ProgressKind::ReasoningEnd
-                    );
-                    if is_reasoning {
-                        meta.insert(
-                            "_stream_id".into(),
-                            Value::String(reasoning_stream_id.clone()),
-                        );
-                    } else {
-                        meta.insert("_progress".into(), Value::Bool(true));
-                        meta.insert(
-                            "_tool_hint".into(),
-                            Value::Bool(kind == ProgressKind::ToolHint),
-                        );
-                    }
-                    if let Err(e) = bus.publish_outbound(OutboundMessage {
-                        channel,
-                        chat_id,
-                        content,
-                        reply_to: None,
-                        media: vec![],
-                        metadata: meta,
-                        event: Some(OutboundEvent::Progress(ProgressEvent {
-                            kind,
-                            stream_id: is_reasoning.then_some(reasoning_stream_id),
-                            ..ProgressEvent::default()
-                        })),
-                    }) {
-                        log::error!("Failed to publish progress message: {e}");
-                    }
-                }) as Pin<Box<dyn Future<Output = ()> + Send>>
-            })
-        };
+        let bus_progress =
+            self.bus_progress_callback(&msg.channel, &msg.chat_id, msg.metadata.clone());
 
         let result = self
             .run_agent_loop(
@@ -4755,8 +4836,8 @@ mod tests {
             .get("webui_turn_id")
             .and_then(Value::as_str)
             .expect("a turn id");
-        assert!(turn_id.starts_with(SYSTEM_TURN_ID_PREFIX), "{turn_id}");
-        assert!(turn_id.len() > SYSTEM_TURN_ID_PREFIX.len());
+        assert!(turn_id.starts_with(WEBUI_SYSTEM_TURN_PREFIX), "{turn_id}");
+        assert!(turn_id.len() > WEBUI_SYSTEM_TURN_PREFIX.len());
     }
 
     #[test]
@@ -4831,7 +4912,7 @@ mod tests {
                 .metadata
                 .get("webui_turn_id")
                 .and_then(Value::as_str)
-                .is_some_and(|id| id.starts_with(SYSTEM_TURN_ID_PREFIX))
+                .is_some_and(|id| id.starts_with(WEBUI_SYSTEM_TURN_PREFIX))
         );
     }
 
@@ -4845,5 +4926,321 @@ mod tests {
             .expect("a reply");
 
         assert!(reply.metadata.is_empty());
+    }
+
+    // ── system-message turns run as tasks and show their work ─────────────────
+
+    /// A provider whose requests never return, standing in for a long model call;
+    /// `requested` turns true once the first request has been made.
+    struct HangingProvider {
+        settings: GenerationSettings,
+        requested: Arc<AtomicBool>,
+    }
+
+    impl HangingProvider {
+        async fn hang(&self) -> LLMResponse {
+            self.requested.store(true, Ordering::SeqCst);
+            std::future::pending().await
+        }
+    }
+
+    #[async_trait]
+    impl LLMProviderDyn for HangingProvider {
+        fn api_key(&self) -> Option<String> {
+            None
+        }
+        fn api_base(&self) -> Option<String> {
+            None
+        }
+        fn extra_headers(&self) -> Option<std::collections::HashMap<String, String>> {
+            None
+        }
+        fn generation_settings(&self) -> &GenerationSettings {
+            &self.settings
+        }
+        fn generation_settings_mut(&mut self) -> &mut GenerationSettings {
+            &mut self.settings
+        }
+        fn spec(&self) -> Option<&crate::providers::registry::ProviderSpec> {
+            None
+        }
+        fn get_default_model(&self) -> String {
+            String::new()
+        }
+        async fn chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+        async fn safe_chat(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: usize,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+        async fn chat_with_retry(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+        async fn chat_stream_with_retry_boxed(
+            &self,
+            _: Vec<Value>,
+            _: Option<Vec<Value>>,
+            _: Option<String>,
+            _: Option<usize>,
+            _: Option<f32>,
+            _: Option<String>,
+            _: Option<Value>,
+            _: Option<crate::providers::base::BoxedStreamCallback>,
+            _: Option<crate::providers::base::BoxedProgressCallback>,
+        ) -> LLMResponse {
+            self.hang().await
+        }
+    }
+
+    /// Poll `condition` until it holds, failing the test after a timeout.
+    async fn wait_until(what: &str, mut condition: impl FnMut() -> bool) {
+        for _ in 0..400 {
+            if condition() {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("timed out waiting for {what}");
+    }
+
+    /// Every outbound message published within a short quiet period.
+    async fn drain_outbound(bus: &MessageBus) -> Vec<OutboundMessage> {
+        let mut collected = Vec::new();
+        while let Ok(Some(message)) =
+            tokio::time::timeout(Duration::from_millis(300), bus.consume_outbound()).await
+        {
+            collected.push(message);
+        }
+        collected
+    }
+
+    fn user_message(channel: &str, chat_id: &str, content: &str) -> InboundMessage {
+        InboundMessage {
+            channel: channel.to_string(),
+            sender_id: "user".to_string(),
+            chat_id: chat_id.to_string(),
+            content: content.to_string(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: HashMap::new(),
+            session_key_override: None,
+            request_id: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn a_long_system_turn_does_not_block_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let requested = Arc::new(AtomicBool::new(false));
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(HangingProvider {
+            settings: GenerationSettings::new(),
+            requested: Arc::clone(&requested),
+        });
+        let bus = Arc::new(MessageBus::new());
+        let loop_ = Arc::new(AgentLoop::new(
+            Arc::clone(&bus),
+            provider,
+            dir.path().to_path_buf(),
+            Config::default(),
+            None,
+            None,
+            None,
+        ));
+        let running = tokio::spawn({
+            let loop_ = Arc::clone(&loop_);
+            async move { loop_.run().await }
+        });
+
+        // A sub-agent's result arrives and its follow-up turn hangs on the model.
+        bus.publish_inbound(announcement_for("cli", "direct"))
+            .unwrap();
+        wait_until("the follow-up turn to ask the model", || {
+            requested.load(Ordering::SeqCst)
+        })
+        .await;
+        let activity = loop_.subagents.activity();
+        assert_eq!(activity.snapshot("cli:direct").follow_up_runs, 1);
+
+        // The loop is free: `/stop` is read, answered, and ends the turn.
+        bus.publish_inbound(user_message("cli", "direct", "/stop"))
+            .unwrap();
+        // (`/stop` first publishes a turn end, then its reply.)
+        let reply = tokio::time::timeout(Duration::from_secs(10), async {
+            loop {
+                let message = bus.consume_outbound().await.expect("the bus stays open");
+                if message.content.contains("Stopped") {
+                    return message;
+                }
+            }
+        })
+        .await
+        .expect("/stop must be answered while a system turn runs");
+        assert!(
+            reply.content.contains("Stopped 1 task"),
+            "{}",
+            reply.content
+        );
+        wait_until("the follow-up to stop counting", || {
+            activity.snapshot("cli:direct").follow_up_runs == 0
+        })
+        .await;
+
+        loop_.stop();
+        running.abort();
+    }
+
+    #[tokio::test]
+    async fn a_system_turn_counts_as_follow_up_work_while_it_runs() {
+        let fixture = resume_fixture(Config::default());
+        let activity = fixture.loop_.subagents.activity();
+        let mut changes = activity.subscribe();
+
+        Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("cli", "direct"))
+            .await
+            .expect("a reply");
+
+        let started = changes.try_recv().expect("start announced");
+        assert_eq!(started.session_key, "cli:direct");
+        assert_eq!(started.snapshot.follow_up_runs, 1);
+        let ended = changes.try_recv().expect("end announced");
+        assert!(ended.snapshot.is_idle());
+    }
+
+    fn read_file_call(path: &Path) -> LLMResponse {
+        LLMResponse {
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: "call_read".to_string(),
+                name: "read_file".to_string(),
+                arguments: HashMap::from([(
+                    "path".to_string(),
+                    json!(path.to_string_lossy().to_string()),
+                )]),
+                extra_content: None,
+                provider_specific_fields: None,
+                function_provider_specific_fields: None,
+            }],
+            finish_reason: "tool_calls".to_string(),
+            ..LLMResponse::new()
+        }
+    }
+
+    /// A fixture whose provider first asks to read the note, then answers.
+    fn fixture_with_a_tool_call() -> ResumeFixture {
+        let fixture = resume_fixture(Config::default());
+        let note = read_file_call(&fixture.note_path);
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(RecordingProvider {
+            settings: GenerationSettings::new(),
+            reply: "all done".into(),
+            script: Mutex::new(vec![note]),
+            requests: fixture.requests.clone(),
+        });
+        let loop_ = Arc::new(AgentLoop::new(
+            Arc::new(MessageBus::new()),
+            provider,
+            fixture._dir.path().to_path_buf(),
+            Config::default(),
+            None,
+            None,
+            None,
+        ));
+        ResumeFixture { loop_, ..fixture }
+    }
+
+    #[tokio::test]
+    async fn a_webui_system_turn_publishes_its_tool_calls_as_progress() {
+        let fixture = fixture_with_a_tool_call();
+        mark_session_webui(&fixture.loop_, "websocket:chat-1");
+
+        Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("websocket", "chat-1"))
+            .await
+            .expect("a reply");
+
+        let published = drain_outbound(&fixture.loop_.bus()).await;
+        let hints: Vec<&OutboundMessage> = published
+            .iter()
+            .filter(|message| {
+                matches!(
+                    &message.event,
+                    Some(OutboundEvent::Progress(event)) if event.kind == ProgressKind::ToolHint
+                )
+            })
+            .collect();
+        assert_eq!(hints.len(), 1, "one tool call, one hint: {published:?}");
+        assert!(
+            hints[0].content.contains("note.txt"),
+            "{}",
+            hints[0].content
+        );
+        assert_eq!(hints[0].channel, "websocket");
+        assert_eq!(hints[0].chat_id, "chat-1");
+        // Marked like the final reply, so the channel records it in the transcript
+        // under the same turn.
+        assert_eq!(hints[0].metadata.get("webui"), Some(&Value::Bool(true)));
+        assert!(hints[0].metadata.contains_key("webui_turn_id"));
+    }
+
+    #[tokio::test]
+    async fn a_system_turn_publishes_no_reasoning_stream() {
+        let fixture = fixture_with_a_tool_call();
+        mark_session_webui(&fixture.loop_, "websocket:chat-1");
+
+        Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("websocket", "chat-1"))
+            .await
+            .expect("a reply");
+
+        let published = drain_outbound(&fixture.loop_.bus()).await;
+        assert!(published.iter().all(|message| !matches!(
+            &message.event,
+            Some(OutboundEvent::Progress(event)) if is_reasoning_progress(event.kind)
+        )));
+    }
+
+    #[tokio::test]
+    async fn a_system_turn_outside_a_webui_chat_publishes_no_progress() {
+        let fixture = fixture_with_a_tool_call();
+
+        Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("cli", "direct"))
+            .await
+            .expect("a reply");
+
+        assert!(drain_outbound(&fixture.loop_.bus()).await.is_empty());
+    }
+
+    #[test]
+    fn a_system_chat_id_splits_into_channel_and_chat() {
+        assert_eq!(split_system_chat_id("websocket:abc"), ("websocket", "abc"));
+        assert_eq!(split_system_chat_id("telegram:a:b"), ("telegram", "a:b"));
+        assert_eq!(split_system_chat_id("direct"), ("cli", "direct"));
     }
 }
