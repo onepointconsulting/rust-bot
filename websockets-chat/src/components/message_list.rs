@@ -40,6 +40,17 @@ fn last_user_entry_id(entries: &[ChatEntry]) -> Option<u64> {
         .map(|entry| entry.id)
 }
 
+/// Id of the user message that opened the block containing `entry_id`: the
+/// closest user entry at or before it. `None` when there is no such entry.
+fn preceding_user_entry_id(entries: &[ChatEntry], entry_id: u64) -> Option<u64> {
+    let position = entries.iter().position(|entry| entry.id == entry_id)?;
+    entries[..=position]
+        .iter()
+        .rev()
+        .find(|entry| entry.role == Role::User)
+        .map(|entry| entry.id)
+}
+
 fn cancel_pending_auto_scroll(auto_scroll_generation: RwSignal<u64>) {
     auto_scroll_generation.update(|generation| {
         *generation = generation.wrapping_add(1);
@@ -62,6 +73,33 @@ fn scroll_list_to_bottom(list_ref: NodeRef<Div>, auto_scroll_generation: RwSigna
         });
         let _ = window.request_animation_frame(cb.as_ref().unchecked_ref());
         cb.forget();
+    }
+}
+
+/// Take the transcript out of follow-the-stream mode so a navigation jump is
+/// not immediately undone by the pending auto-scroll.
+fn release_auto_scroll(pinned_to_bottom: RwSignal<bool>, auto_scroll_generation: RwSignal<u64>) {
+    pinned_to_bottom.set(false);
+    cancel_pending_auto_scroll(auto_scroll_generation);
+}
+
+/// Jump to the very top of the transcript.
+fn scroll_list_to_top(list_ref: NodeRef<Div>) {
+    if let Some(el) = list_ref.get_untracked() {
+        el.set_scroll_top(0);
+    }
+}
+
+/// Scroll the user message with `user_entry_id` to the top of the
+/// transcript. Rows carry a `data-entry-id` attribute (stamped in the `<For>`
+/// below). Does nothing when the row is not rendered.
+fn scroll_list_to_entry(list_ref: NodeRef<Div>, user_entry_id: u64) {
+    let Some(el) = list_ref.get_untracked() else {
+        return;
+    };
+    let selector = format!("[data-entry-id='{user_entry_id}']");
+    if let Ok(Some(row)) = el.query_selector(&selector) {
+        row.scroll_into_view();
     }
 }
 
@@ -135,6 +173,7 @@ fn ChatEntryBubble(
     reasoning_expanded_ids: RwSignal<HashSet<u64>>,
     show_fork: bool,
     on_fork_reply: impl Fn(u64) + 'static + Send + Sync + Copy,
+    on_scroll_to_user: impl Fn(u64) + 'static + Send + Sync + Copy,
 ) -> impl IntoView {
     let streaming = entry.streaming;
     let entry_id = entry.id;
@@ -142,6 +181,7 @@ fn ChatEntryBubble(
     // takes a bare `Callback<()>`, not `Option<Callback<()>>`, so the Fork
     // control is either passed or the prop is omitted entirely.
     let on_fork = show_fork.then(|| Callback::new(move |_| on_fork_reply(entry_id)));
+    let on_scroll_to_user = Callback::new(move |_| on_scroll_to_user(entry_id));
     let tool_events = entry.tool_events.clone().unwrap_or_default();
     let reasoning = entry.reasoning.clone().unwrap_or_default();
     let has_extra = !tool_events.is_empty() || !reasoning.is_empty();
@@ -192,6 +232,7 @@ fn ChatEntryBubble(
             view! {
                 <MessageBubble
                     entry=entry
+                    on_scroll_to_user=on_scroll_to_user
                     streaming=Signal::derive(move || streaming)
                     token_streaming=token_streaming
                     extra=extra
@@ -203,6 +244,7 @@ fn ChatEntryBubble(
             view! {
                 <MessageBubble
                     entry=entry
+                    on_scroll_to_user=on_scroll_to_user
                     streaming=Signal::derive(move || streaming)
                     token_streaming=token_streaming
                     extra=extra
@@ -214,7 +256,8 @@ fn ChatEntryBubble(
         view! {
             <MessageBubble
                 entry=entry
-                streaming=Signal::derive(move || streaming)
+                on_scroll_to_user=on_scroll_to_user
+                    streaming=Signal::derive(move || streaming)
                 token_streaming=token_streaming
                 on_fork=on_fork
             />
@@ -224,7 +267,8 @@ fn ChatEntryBubble(
         view! {
             <MessageBubble
                 entry=entry
-                streaming=Signal::derive(move || streaming)
+                on_scroll_to_user=on_scroll_to_user
+                    streaming=Signal::derive(move || streaming)
                 token_streaming=token_streaming
             />
         }
@@ -337,7 +381,22 @@ pub fn MessageList(
     // transcript.
     let show_suggestions = move || entries.get().is_empty() && !example_prompts.get().is_empty();
 
+    let on_navigate_top = move |_| {
+        release_auto_scroll(pinned_to_bottom, auto_scroll_generation);
+        scroll_list_to_top(list_ref);
+    };
+    // Jump to the user message that opened the clicked reply's block.
+    let on_scroll_to_user = move |entry_id: u64| {
+        let user_entry_id = entries.with_untracked(|list| preceding_user_entry_id(list, entry_id));
+        if let Some(user_entry_id) = user_entry_id {
+            release_auto_scroll(pinned_to_bottom, auto_scroll_generation);
+            scroll_list_to_entry(list_ref, user_entry_id);
+        }
+    };
+    let has_entries = move || !entries.with(Vec::is_empty);
+
     view! {
+        <div class="relative flex min-h-0 flex-1 flex-col">
         <div
             node_ref=list_ref
             class="flex flex-1 flex-col gap-3 overflow-y-auto px-4 py-4"
@@ -354,23 +413,67 @@ pub fn MessageList(
                         .into_iter()
                         .map(|entry| {
                             let show_fork = show_fork_for_entry(&entry, pending);
-                            (entry, show_fork)
+                            let row_id = entry.id;
+                            (entry, show_fork, row_id)
                         })
                         .collect::<Vec<_>>()
                 }
-                key=|(entry, show_fork)| entry_render_key(entry, *show_fork)
-                let((entry, show_fork))
+                key=|(entry, show_fork, _)| entry_render_key(entry, *show_fork)
+                let((entry, show_fork, row_id))
             >
-                <ChatEntryBubble
-                    entry=entry
-                    entries=entries
-                    token_streaming=token_streaming
-                    reasoning_expanded_ids=reasoning_expanded_ids
-                    show_fork=show_fork
-                    on_fork_reply=on_fork_reply
-                />
+                <div data-entry-id=row_id>
+                    <ChatEntryBubble
+                        entry=entry
+                        entries=entries
+                        token_streaming=token_streaming
+                        reasoning_expanded_ids=reasoning_expanded_ids
+                        show_fork=show_fork
+                        on_fork_reply=on_fork_reply
+                        on_scroll_to_user=on_scroll_to_user
+                    />
+                </div>
             </For>
         </div>
+        <Show when=has_entries>
+            <div class="pointer-events-none absolute bottom-4 right-6 flex flex-col gap-2">
+                <NavButton label="Scroll to top" on_click=on_navigate_top>
+                    <path d="M5 15l7-7 7 7M5 8h14" />
+                </NavButton>
+            </div>
+        </Show>
+        </div>
+    }
+}
+
+/// One floating round navigation button; `children` are the SVG path(s) of
+/// its icon.
+#[component]
+fn NavButton(
+    label: &'static str,
+    on_click: impl Fn(web_sys::MouseEvent) + 'static,
+    children: Children,
+) -> impl IntoView {
+    view! {
+        <button
+            type="button"
+            class="pointer-events-auto flex h-9 w-9 items-center justify-center rounded-full border border-slate-200 bg-white/90 text-slate-600 shadow-md transition hover:border-orange-400 hover:text-orange-600"
+            title=label
+            aria-label=label
+            on:click=on_click
+        >
+            <svg
+                class="h-5 w-5"
+                viewBox="0 0 24 24"
+                fill="none"
+                stroke="currentColor"
+                stroke-width="2"
+                stroke-linecap="round"
+                stroke-linejoin="round"
+                aria-hidden="true"
+            >
+                {children()}
+            </svg>
+        </button>
     }
 }
 
@@ -395,5 +498,45 @@ fn SuggestionPrompts(
                 </button>
             </For>
         </div>
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn entry(id: u64, role: Role) -> ChatEntry {
+        ChatEntry {
+            id,
+            role,
+            content: String::new(),
+            attachments: Vec::new(),
+            streaming: false,
+            tool_events: None,
+            reasoning: None,
+            user_id: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn reply_maps_to_the_user_message_that_opened_its_block() {
+        let entries = vec![
+            entry(1, Role::User),
+            entry(2, Role::Assistant),
+            entry(3, Role::Assistant),
+            entry(4, Role::User),
+            entry(5, Role::Assistant),
+        ];
+        assert_eq!(preceding_user_entry_id(&entries, 3), Some(1));
+        assert_eq!(preceding_user_entry_id(&entries, 5), Some(4));
+        assert_eq!(preceding_user_entry_id(&entries, 4), Some(4));
+    }
+
+    #[test]
+    fn reply_without_a_preceding_user_message_has_no_target() {
+        let entries = vec![entry(1, Role::Assistant), entry(2, Role::User)];
+        assert_eq!(preceding_user_entry_id(&entries, 1), None);
+        assert_eq!(preceding_user_entry_id(&entries, 99), None);
     }
 }

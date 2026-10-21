@@ -33,6 +33,10 @@ fn copy_text_to_clipboard(text: &str) -> Result<js_sys::Promise, String> {
 /// control only when the bubble has visible message text — attachment-only
 /// and thinking/tool/reasoning rows omit it.
 ///
+/// `on_scroll_to_user`, when set, adds a "go to your message" control next to
+/// the copy button on an assistant bubble; the parent decides where it
+/// scrolls (the user message that opened the bubble's block).
+///
 /// While `streaming` is true, the in-progress indicator is the thinking
 /// spinner until the first visible token arrives, then a blinking cursor
 /// when `token_streaming` is true (omitted defaults to true). Non-streaming
@@ -45,6 +49,7 @@ pub fn MessageBubble(
     #[prop(into)] streaming: Signal<bool>,
     #[prop(into, optional)] token_streaming: Option<Signal<bool>>,
     #[prop(optional)] on_fork: Option<Callback<()>>,
+    #[prop(optional)] on_scroll_to_user: Option<Callback<()>>,
 ) -> impl IntoView {
     let is_user = entry.role == Role::User;
     let content = entry.content.clone();
@@ -57,6 +62,8 @@ pub fn MessageBubble(
     let token_streaming = token_streaming.unwrap_or_else(|| Signal::derive(|| true));
     let awaiting_first_token = !markdown::has_visible_chars(&content);
     let fork_button = on_fork.map(|on_fork| view! { <ForkButton on_fork=on_fork /> }.into_any());
+    let scroll_to_user_button = on_scroll_to_user
+        .map(|on_scroll| view! { <ScrollToUserButton on_scroll=on_scroll /> }.into_any());
     let timestamp = entry.timestamp.clone();
 
     // One lightbox per bubble instance: only ever holds the URL of the
@@ -164,6 +171,7 @@ pub fn MessageBubble(
                     </div>
                     <div class="flex items-center gap-1.5">
                         {copy_button}
+                        {has_text.then_some(scroll_to_user_button)}
                         {fork_button}
                         {timestamp_label}
                     </div>
@@ -420,6 +428,43 @@ fn IconFork() -> impl IntoView {
             <path d="M18 9v1a2 2 0 0 1-2 2H8a2 2 0 0 1-2-2V9" />
             <path d="M12 12v3" />
         </svg>
+    }
+}
+
+#[component]
+fn IconScrollToUser() -> impl IntoView {
+    view! {
+        <svg
+            xmlns="http://www.w3.org/2000/svg"
+            viewBox="0 0 24 24"
+            fill="none"
+            stroke="currentColor"
+            stroke-width="1.75"
+            stroke-linecap="round"
+            stroke-linejoin="round"
+            class="h-4 w-4"
+            aria-hidden="true"
+        >
+            <circle cx="9" cy="7" r="4" />
+            <path d="M3 21v-2a4 4 0 0 1 4-4h4" />
+            <path d="M18 21v-7" />
+            <path d="M15 17l3-3 3 3" />
+        </svg>
+    }
+}
+
+#[component]
+fn ScrollToUserButton(on_scroll: Callback<()>) -> impl IntoView {
+    view! {
+        <button
+            type="button"
+            aria-label="Scroll to your message"
+            title="Scroll to your message"
+            class="mb-1 shrink-0 rounded-md p-1.5 text-slate-400 transition hover:bg-slate-100 hover:text-slate-600 focus:outline-none focus:ring-2 focus:ring-slate-300"
+            on:click=move |_| on_scroll.run(())
+        >
+            <IconScrollToUser />
+        </button>
     }
 }
 
