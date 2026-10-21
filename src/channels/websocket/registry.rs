@@ -134,6 +134,15 @@ impl ConnectionRegistry {
         self.senders.get(connection_id).cloned()
     }
 
+    /// Every chat id that has at least one connection subscribed.
+    pub fn subscribed_chat_ids(&self) -> Vec<String> {
+        self.subs
+            .iter()
+            .filter(|(_, connections)| !connections.is_empty())
+            .map(|(chat_id, _)| chat_id.clone())
+            .collect()
+    }
+
     /// Drop all state. Mirrors nanobot's `stop()` clearing `_subs`/`_conn_chats`/etc.
     pub fn clear(&mut self) {
         self.subs.clear();
@@ -226,6 +235,17 @@ mod tests {
         let recipients = registry.senders_for_chat("chat-1");
         assert_eq!(recipients.len(), 1);
         assert_eq!(recipients[0].0, "conn-2");
+    }
+
+    #[test]
+    fn subscribed_chat_ids_lists_only_chats_with_a_connection() {
+        let mut registry = ConnectionRegistry::default();
+        assert!(registry.subscribed_chat_ids().is_empty());
+        registry.register("conn-1", "chat-1", dummy_sender());
+        registry.register("conn-2", "chat-2", dummy_sender());
+        registry.cleanup_connection("conn-2");
+
+        assert_eq!(registry.subscribed_chat_ids(), vec!["chat-1".to_string()]);
     }
 
     #[test]

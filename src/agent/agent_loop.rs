@@ -76,7 +76,7 @@ use crate::session::inbox::{self, InboxLedger, LedgerGuard, RedriveAction};
 use crate::session::journal::{
     JournalRecord, JournalStore, RunJournal, ToolCallStatus, TurnOutcome,
 };
-use crate::session::keys::{COMMAND_KEY, RUNTIME_CHECKPOINT_KEY};
+use crate::session::keys::{COMMAND_KEY, RUNTIME_CHECKPOINT_KEY, SESSION_WEBUI_METADATA_KEY};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
@@ -167,6 +167,41 @@ fn safe_strip_think(text: Option<&str>) -> Option<String> {
 /// How long to wait before trying again to connect MCP servers that failed, so a broken
 /// server does not make every chat message wait for another failed attempt.
 const MCP_RETRY_INTERVAL: Duration = Duration::from_secs(60);
+
+/// Outbound metadata flag that makes the websocket channel record a delivery
+/// in the chat's WebUI transcript (the same key `MessageTool` copies).
+const WEBUI_METADATA_KEY: &str = "webui";
+/// Outbound metadata key naming the WebUI turn a recorded row belongs to.
+const WEBUI_TURN_ID_METADATA_KEY: &str = "webui_turn_id";
+/// Prefix of the turn id given to a reply to a system message (a sub-agent's
+/// result), which has no user turn of its own.
+const SYSTEM_TURN_ID_PREFIX: &str = "system-";
+
+/// The WebUI markers for a turn run for a system message (e.g. a sub-agent's
+/// result) on `session`: `webui` and a fresh turn id when the session is a
+/// WebUI websocket chat, nothing otherwise. Attached to the turn's replies so
+/// the websocket channel persists them, exactly as it does for a user turn.
+fn webui_system_turn_metadata(channel: &str, session: &Session) -> HashMap<String, Value> {
+    let is_webui_chat = channel == crate::channels::websocket::CHANNEL_NAME
+        && session
+            .metadata
+            .get(SESSION_WEBUI_METADATA_KEY)
+            .and_then(Value::as_bool)
+            == Some(true);
+    if !is_webui_chat {
+        return HashMap::new();
+    }
+    HashMap::from([
+        (WEBUI_METADATA_KEY.to_string(), Value::Bool(true)),
+        (
+            WEBUI_TURN_ID_METADATA_KEY.to_string(),
+            Value::String(format!(
+                "{SYSTEM_TURN_ID_PREFIX}{}",
+                uuid::Uuid::new_v4().simple()
+            )),
+        ),
+    ])
+}
 
 /// Which MCP servers are up, which failed (and why), and when we last tried.
 #[derive(Default)]
@@ -2125,7 +2160,6 @@ impl AgentLoop {
             chat_id,
             msg.metadata.get("message_id").and_then(Value::as_str),
         );
-        self.apply_message_tool_inbound_metadata(&msg.metadata);
 
         // Re-read the session AFTER consolidation so history reflects any archiving.
         let snapshot = {
@@ -2135,6 +2169,14 @@ impl AgentLoop {
                 .unwrap_or_else(|e| e.into_inner());
             manager.get_or_create_session(&key).clone()
         };
+        // A reply to a sub-agent's result has no user turn to inherit the WebUI
+        // markers from; without them the websocket channel would deliver it live
+        // but never record it in the chat's transcript, and a refresh or a switch
+        // to another chat would lose it.
+        let webui_turn_metadata = webui_system_turn_metadata(channel, &snapshot);
+        let mut turn_metadata = msg.metadata.clone();
+        turn_metadata.extend(webui_turn_metadata.clone());
+        self.apply_message_tool_inbound_metadata(&turn_metadata);
         // Pick up any idle-compaction summary produced since this session was
         // last used, refreshing `snapshot` again if a background archive is
         // still in flight (or the session still looks idle-expired).
@@ -2196,7 +2238,7 @@ impl AgentLoop {
             content: final_content.unwrap_or_else(|| "Background task completed.".to_string()),
             reply_to: None,
             media: vec![],
-            metadata: HashMap::new(),
+            metadata: webui_turn_metadata,
             event: None,
         })
     }
@@ -4688,5 +4730,120 @@ mod tests {
                 .metadata
                 .contains_key(SESSION_AGENT_MODE_METADATA_KEY)
         );
+    }
+
+    // ── WebUI markers on system-message turns ─────────────────────────────────
+
+    fn session_with_webui_flag(key: &str, webui: Option<bool>) -> Session {
+        let mut session = Session::new(key.to_string());
+        if let Some(webui) = webui {
+            session
+                .metadata
+                .insert(SESSION_WEBUI_METADATA_KEY.to_string(), Value::Bool(webui));
+        }
+        session
+    }
+
+    #[test]
+    fn webui_websocket_chats_get_the_webui_markers_and_a_turn_id() {
+        let session = session_with_webui_flag("websocket:chat-1", Some(true));
+
+        let metadata = webui_system_turn_metadata("websocket", &session);
+
+        assert_eq!(metadata.get("webui"), Some(&Value::Bool(true)));
+        let turn_id = metadata
+            .get("webui_turn_id")
+            .and_then(Value::as_str)
+            .expect("a turn id");
+        assert!(turn_id.starts_with(SYSTEM_TURN_ID_PREFIX), "{turn_id}");
+        assert!(turn_id.len() > SYSTEM_TURN_ID_PREFIX.len());
+    }
+
+    #[test]
+    fn every_system_turn_gets_its_own_turn_id() {
+        let session = session_with_webui_flag("websocket:chat-1", Some(true));
+        let first = webui_system_turn_metadata("websocket", &session);
+        let second = webui_system_turn_metadata("websocket", &session);
+        assert_ne!(first.get("webui_turn_id"), second.get("webui_turn_id"));
+    }
+
+    #[test]
+    fn chats_that_are_not_webui_get_no_markers() {
+        for session in [
+            session_with_webui_flag("websocket:chat-1", None),
+            session_with_webui_flag("websocket:chat-1", Some(false)),
+        ] {
+            assert!(webui_system_turn_metadata("websocket", &session).is_empty());
+        }
+    }
+
+    #[test]
+    fn other_channels_get_no_markers_even_with_the_flag() {
+        let session = session_with_webui_flag("cli:direct", Some(true));
+        assert!(webui_system_turn_metadata("cli", &session).is_empty());
+        assert!(webui_system_turn_metadata("telegram", &session).is_empty());
+    }
+
+    /// A sub-agent's result announced to `chat_id` on `channel`, as `announce_result` builds it.
+    fn announcement_for(channel: &str, chat_id: &str) -> InboundMessage {
+        InboundMessage {
+            channel: "system".to_string(),
+            sender_id: "subagent".to_string(),
+            chat_id: format!("{channel}:{chat_id}"),
+            content: "[Subagent 'job' completed successfully]".to_string(),
+            timestamp: Utc::now(),
+            media: vec![],
+            metadata: HashMap::new(),
+            session_key_override: Some(format!("{channel}:{chat_id}")),
+            request_id: None,
+        }
+    }
+
+    fn mark_session_webui(loop_: &AgentLoop, key: &str) {
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session(key);
+        session
+            .metadata
+            .insert(SESSION_WEBUI_METADATA_KEY.to_string(), Value::Bool(true));
+        let snapshot = session.clone();
+        manager.save(snapshot).unwrap();
+    }
+
+    #[tokio::test]
+    async fn the_reply_to_a_subagent_result_is_marked_for_the_webui_transcript() {
+        let fixture = resume_fixture(Config::default());
+        mark_session_webui(&fixture.loop_, "websocket:chat-1");
+
+        let reply = Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("websocket", "chat-1"))
+            .await
+            .expect("a reply");
+
+        assert_eq!(reply.channel, "websocket");
+        assert_eq!(reply.chat_id, "chat-1");
+        assert_eq!(reply.content, "all done");
+        assert_eq!(reply.metadata.get("webui"), Some(&Value::Bool(true)));
+        assert!(
+            reply
+                .metadata
+                .get("webui_turn_id")
+                .and_then(Value::as_str)
+                .is_some_and(|id| id.starts_with(SYSTEM_TURN_ID_PREFIX))
+        );
+    }
+
+    #[tokio::test]
+    async fn the_reply_to_a_subagent_result_in_a_cli_session_stays_unmarked() {
+        let fixture = resume_fixture(Config::default());
+
+        let reply = Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("cli", "direct"))
+            .await
+            .expect("a reply");
+
+        assert!(reply.metadata.is_empty());
     }
 }

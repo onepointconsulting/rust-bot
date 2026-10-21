@@ -926,12 +926,15 @@ pub enum ServerEvent {
     /// Sustained-goal state snapshot. Shape not yet finalized server-side, so
     /// the raw JSON is kept as-is.
     GoalState(serde_json::Value),
-    /// Sustained-goal lifecycle status (e.g. `"running"`).
+    /// Sustained-goal lifecycle status (e.g. `"running"`). Also reports how many
+    /// background sub-agents the chat has running: `background_agents` is `None`
+    /// when the frame carries no count (a turn start/end), which is *not* zero.
     GoalStatus {
         chat_id: String,
         status: String,
         started_at: Option<f64>,
         turn_id: Option<String>,
+        background_agents: Option<usize>,
     },
     /// A complete chat message. When `kind` is `Some("progress")` or
     /// `Some("tool_hint")` this is a live-progress update (often carrying
@@ -1390,6 +1393,8 @@ struct GoalStatusWire {
     started_at: Option<f64>,
     #[serde(default)]
     turn_id: Option<String>,
+    #[serde(default)]
+    background_agents: Option<usize>,
 }
 
 #[derive(Deserialize)]
@@ -1701,6 +1706,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             status: w.status,
             started_at: w.started_at,
             turn_id: w.turn_id,
+            background_agents: w.background_agents,
         }),
         "message" => decode::<MessageWire>(&value).map(|w| ServerEvent::Message {
             chat_id: w.chat_id,
@@ -2343,6 +2349,7 @@ mod tests {
                 status: "running".to_string(),
                 started_at: Some(123.4),
                 turn_id: Some("turn-1".to_string()),
+                background_agents: None,
             }
         );
     }
@@ -2358,8 +2365,47 @@ mod tests {
                 status: "running".to_string(),
                 started_at: None,
                 turn_id: None,
+                background_agents: None,
             }
         );
+    }
+
+    #[test]
+    fn parses_goal_status_with_a_background_agent_count() {
+        let raw =
+            r#"{"event":"goal_status","chat_id":"chat-1","status":"idle","background_agents":2}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::GoalStatus {
+                chat_id: "chat-1".to_string(),
+                status: "idle".to_string(),
+                started_at: None,
+                turn_id: None,
+                background_agents: Some(2),
+            }
+        );
+    }
+
+    #[test]
+    fn parses_a_zero_background_agent_count_as_zero_not_as_missing() {
+        let raw =
+            r#"{"event":"goal_status","chat_id":"chat-1","status":"idle","background_agents":0}"#;
+        let ServerEvent::GoalStatus {
+            background_agents, ..
+        } = parse_server_event(raw).expect("should parse")
+        else {
+            panic!("expected GoalStatus");
+        };
+        assert_eq!(background_agents, Some(0));
+    }
+
+    #[test]
+    fn goal_status_is_scoped_to_its_chat() {
+        let raw =
+            r#"{"event":"goal_status","chat_id":"chat-7","status":"idle","background_agents":1}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(event.chat_id(), Some("chat-7"));
     }
 
     #[test]

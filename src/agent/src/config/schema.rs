@@ -1,0 +1,3463 @@
+use std::{collections::HashMap, path::PathBuf};
+
+use garde::Validate;
+use serde::{Deserialize, Serialize};
+
+use crate::{
+    agent::modes::AgentMode,
+    channels::websocket::types::DEFAULT_AUD,
+    providers::{
+        anthropic_provider::AnthropicProvider,
+        registry::{find_by_name, providers},
+    },
+    utils::helpers::expand_tilde_path,
+};
+
+// ── ProviderConfig ────────────────────────────────────────────────────────────
+
+/// LLM provider configuration.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
+pub struct ProviderConfig {
+    /// API key for the provider. Defaults to an empty string so it can be
+    /// supplied via an environment variable at runtime instead.
+    #[serde(alias = "api_key")]
+    #[garde(skip)]
+    pub api_key: String,
+
+    /// Base URL override for the provider API endpoint.
+    #[serde(alias = "api_base")]
+    #[garde(skip)]
+    pub api_base: Option<String>,
+
+    /// Custom HTTP headers forwarded with every request (e.g. `APP-Code` for AiHubMix).
+    #[serde(alias = "extra_headers")]
+    #[garde(skip)]
+    pub extra_headers: Option<HashMap<String, String>>,
+}
+
+// ── ChannelsConfig ────────────────────────────────────────────────────────────
+
+fn default_send_progress() -> bool {
+    true
+}
+
+fn default_streaming() -> bool {
+    true
+}
+
+fn default_send_max_retries() -> u8 {
+    3
+}
+fn default_transcription_provider() -> Option<String> {
+    Some("groq".to_string())
+}
+
+/// Configuration for chat channels.
+///
+/// Built-in and plugin channel configs are stored in `extra`. Each channel
+/// parses its own config independently. Per-channel `"streaming": true`
+/// enables streaming output (requires a `send_delta` implementation).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ChannelsConfig {
+    /// Stream agent's text progress to the channel.
+    #[serde(alias = "streaming", default = "default_streaming")]
+    #[garde(skip)]
+    pub streaming: bool,
+
+    /// Stream agent's text progress to the channel.
+    #[serde(alias = "send_progress")]
+    #[garde(skip)]
+    pub send_progress: bool,
+
+    /// Stream tool-call hints (e.g. `read_file("…")`).
+    #[serde(alias = "send_tool_hints")]
+    #[garde(skip)]
+    pub send_tool_hints: bool,
+
+    /// Surface model reasoning/thinking content when a channel implements it.
+    #[serde(alias = "show_reasoning")]
+    #[garde(skip)]
+    pub show_reasoning: bool,
+
+    /// Max delivery attempts, including the initial send. Range: 0–10.
+    #[serde(alias = "send_max_retries", default = "default_send_max_retries")]
+    #[garde(range(min = 0, max = 10))]
+    pub send_max_retries: u8,
+
+    /// Voice transcription backend: `"groq"` or `"openai"`. `None` disables transcription.
+    #[serde(
+        alias = "transcription_provider",
+        default = "default_transcription_provider",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[garde(skip)]
+    pub transcription_provider: Option<String>,
+
+    /// Plugin-specific channel configs not covered by the typed fields above.
+    #[serde(flatten)]
+    #[garde(skip)]
+    pub extra: HashMap<String, serde_json::Value>,
+
+    /// List of allowed sender IDs.
+    #[serde(alias = "allow_from")]
+    #[garde(skip)]
+    pub allow_from: Vec<String>,
+}
+
+impl Default for ChannelsConfig {
+    fn default() -> Self {
+        Self {
+            send_progress: default_send_progress(),
+            streaming: default_streaming(),
+            send_tool_hints: true,
+            show_reasoning: true,
+            send_max_retries: default_send_max_retries(),
+            transcription_provider: default_transcription_provider(),
+            extra: HashMap::new(),
+            allow_from: vec!["*".to_string()],
+        }
+    }
+}
+
+// ── CronSchedule / DreamConfig ────────────────────────────────────────────────
+
+/// Represents a cron-based or interval-based schedule used by Dream.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "camelCase")]
+pub enum CronSchedule {
+    /// A standard cron expression schedule.
+    Cron { expr: String, tz: String },
+    /// A fixed millisecond interval schedule.
+    Every { every_ms: u64 },
+}
+
+fn default_dream_interval_h() -> u32 {
+    2
+}
+fn default_dream_max_batch_size() -> u32 {
+    20
+}
+fn default_dream_max_iterations() -> u32 {
+    10
+}
+
+/// Dream memory consolidation configuration.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DreamConfig {
+    /// Consolidation interval in whole hours. Must be ≥ 1. Default: 2.
+    #[serde(alias = "interval_h", default = "default_dream_interval_h")]
+    #[garde(range(min = 1))]
+    pub interval_h: u32,
+
+    /// Legacy cron expression override. When present, takes priority over
+    /// `interval_h`. Excluded from serialised output.
+    #[serde(alias = "cron", skip_serializing)]
+    #[garde(skip)]
+    pub cron: Option<String>,
+
+    /// Optional Dream-specific model override. Accepts `modelOverride`,
+    /// `model`, or `model_override` as JSON keys. A raw model string, applied
+    /// directly — unrelated to named presets. See `dream_model_preset` for
+    /// selecting a named `model_presets` entry instead.
+    #[serde(alias = "model", alias = "model_override")]
+    #[garde(skip)]
+    pub model_override: Option<String>,
+
+    /// Name of a `model_presets` entry Dream should use instead of the
+    /// process-wide default. Takes precedence over `model_override` when set.
+    #[serde(alias = "dream_model_preset")]
+    #[garde(skip)]
+    pub dream_model_preset: Option<String>,
+
+    /// Maximum history entries processed per consolidation run. Must be ≥ 1.
+    #[serde(alias = "max_batch_size", default = "default_dream_max_batch_size")]
+    #[garde(range(min = 1))]
+    pub max_batch_size: u32,
+
+    /// Maximum tool calls allowed per Phase 2 run. Must be ≥ 1.
+    #[serde(alias = "max_iterations", default = "default_dream_max_iterations")]
+    #[garde(range(min = 1))]
+    pub max_iterations: u32,
+}
+
+impl Default for DreamConfig {
+    fn default() -> Self {
+        Self {
+            interval_h: default_dream_interval_h(),
+            cron: None,
+            model_override: None,
+            dream_model_preset: None,
+            max_batch_size: default_dream_max_batch_size(),
+            max_iterations: default_dream_max_iterations(),
+        }
+    }
+}
+
+impl DreamConfig {
+    const HOUR_MS: u64 = 3_600_000;
+
+    /// Build the runtime schedule
+    pub fn build_schedule(&self, timezone: &str) -> crate::cron::types::CronSchedule {
+        if let Some(ref expr) = self.cron {
+            return crate::cron::types::CronSchedule {
+                kind: crate::cron::types::CronScheduleKind::Cron,
+                expr: Some(expr.clone()),
+                tz: Some(timezone.to_string()),
+                ..Default::default()
+            };
+        }
+        crate::cron::types::CronSchedule {
+            kind: crate::cron::types::CronScheduleKind::Every,
+            every_ms: Some(self.interval_h as i64 * Self::HOUR_MS as i64),
+            ..Default::default()
+        }
+    }
+
+    /// Return a human-readable schedule summary for logs and startup output.
+    pub fn describe_schedule(&self) -> String {
+        if let Some(ref expr) = self.cron {
+            return format!("cron {expr} (legacy)");
+        }
+        format!("every {}h", self.interval_h)
+    }
+}
+
+// ── AgentsConfig ──────────────────────────────────────────────────────────────
+
+#[derive(Deserialize, Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum ProviderRetryMode {
+    #[default]
+    Standard,
+    Persistent,
+}
+
+impl std::fmt::Display for ProviderRetryMode {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl ProviderRetryMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Standard => "standard",
+            Self::Persistent => "persistent",
+        }
+    }
+}
+
+fn default_agent_workspace() -> String {
+    "~/.rust-bot/workspace".to_string()
+}
+fn default_agent_model() -> String {
+    "anthropic/claude-opus-4-6".to_string()
+}
+fn default_agent_provider() -> String {
+    "auto".to_string()
+}
+fn default_agent_max_tokens() -> u32 {
+    8192 * 4
+}
+fn default_agent_context_window_tokens() -> u64 {
+    131_072
+}
+fn default_agent_temperature() -> f32 {
+    0.1
+}
+fn default_agent_max_tool_iterations() -> u32 {
+    100
+}
+fn default_agent_max_tool_result_chars() -> u32 {
+    16_000
+}
+fn default_agent_provider_retry_mode() -> ProviderRetryMode {
+    ProviderRetryMode::Standard
+}
+fn default_agent_reasoning_effort() -> Option<String> {
+    None
+}
+fn default_agent_timezone() -> String {
+    "UTC".to_string()
+}
+fn default_agent_dream_config() -> DreamConfig {
+    DreamConfig::default()
+}
+fn default_agent_session_ttl_minutes() -> u32 {
+    15
+}
+pub(crate) fn default_agent_session_eviction_threshold_hours() -> u32 {
+    6
+}
+pub(crate) fn default_agent_session_eviction_cron_interval_hours() -> u32 {
+    1
+}
+fn default_agent_idle_compact_check_interval_seconds() -> u32 {
+    60
+}
+fn default_agent_mode() -> AgentMode {
+    AgentMode::Standard
+}
+fn default_model_preset_provider() -> String {
+    "auto".to_string()
+}
+
+/// A named, reusable bundle of model + provider + generation settings.
+///
+/// Selected as the process-wide default via `AgentsConfig::model_preset`, or
+/// switched per chat session on the fly via `/model <name>`. The name
+/// `"default"` is reserved: it always means "use `AgentsConfig`'s own flat
+/// `model`/`provider`/... fields," for backward compatibility with configs
+/// that predate presets, and must not be defined as an entry in
+/// `Config::model_presets` (enforced by `validate_model_presets`).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ModelPresetConfig {
+    /// Optional human-readable display label.
+    #[serde(alias = "label")]
+    #[garde(skip)]
+    pub label: Option<String>,
+
+    /// Model identifier, e.g. `"anthropic/claude-opus-4-6"`. Emptiness is
+    /// checked by `validate_model_presets` rather than by garde, since the
+    /// container-level `#[serde(default)]` attribute silently produces an
+    /// empty string for a missing key rather than failing to parse.
+    #[serde(alias = "model")]
+    #[garde(skip)]
+    pub model: String,
+
+    /// Provider name (e.g. `"anthropic"`, `"openrouter"`) or `"auto"`.
+    #[serde(alias = "provider", default = "default_model_preset_provider")]
+    #[garde(skip)]
+    pub provider: String,
+
+    #[serde(alias = "max_tokens", default = "default_agent_max_tokens")]
+    #[garde(range(min = 1))]
+    pub max_tokens: u32,
+
+    #[serde(
+        alias = "context_window_tokens",
+        default = "default_agent_context_window_tokens"
+    )]
+    #[garde(range(min = 1))]
+    pub context_window_tokens: u64,
+
+    #[serde(alias = "temperature", default = "default_agent_temperature")]
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub temperature: f32,
+
+    #[serde(alias = "reasoning_effort", default = "default_agent_reasoning_effort")]
+    #[garde(skip)]
+    pub reasoning_effort: Option<String>,
+}
+
+impl Default for ModelPresetConfig {
+    fn default() -> Self {
+        Self {
+            label: None,
+            model: String::new(),
+            provider: default_model_preset_provider(),
+            max_tokens: default_agent_max_tokens(),
+            context_window_tokens: default_agent_context_window_tokens(),
+            temperature: default_agent_temperature(),
+            reasoning_effort: None,
+        }
+    }
+}
+
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AgentsConfig {
+    #[serde(alias = "workspace", default = "default_agent_workspace")]
+    #[garde(skip)]
+    pub workspace: String,
+
+    #[serde(alias = "model", default = "default_agent_model")]
+    #[garde(skip)]
+    pub model: String,
+
+    // Provider name (e.g. "anthropic", "openrouter") or "auto" for auto-detection
+    #[serde(alias = "provider", default = "default_agent_provider")]
+    #[garde(skip)]
+    pub provider: String,
+
+    #[serde(alias = "max_tokens", default = "default_agent_max_tokens")]
+    #[garde(range(min = 1))]
+    pub max_tokens: u32,
+
+    #[serde(
+        alias = "context_window_tokens",
+        default = "default_agent_context_window_tokens"
+    )]
+    #[garde(range(min = 1))]
+    pub context_window_tokens: u64,
+
+    #[serde(alias = "context_block_limit", skip_serializing)]
+    #[garde(skip)]
+    pub context_block_limit: Option<u32>,
+
+    #[serde(alias = "temperature", default = "default_agent_temperature")]
+    #[garde(range(min = 0.0, max = 1.0))]
+    pub temperature: f32,
+
+    #[serde(
+        alias = "max_tool_iterations",
+        default = "default_agent_max_tool_iterations"
+    )]
+    #[garde(range(min = 1))]
+    pub max_tool_iterations: u32,
+
+    #[serde(
+        alias = "max_tool_result_chars",
+        default = "default_agent_max_tool_result_chars"
+    )]
+    #[garde(range(min = 1))]
+    pub max_tool_result_chars: u32,
+
+    #[serde(
+        alias = "provider_retry_mode",
+        default = "default_agent_provider_retry_mode"
+    )]
+    #[garde(skip)]
+    pub provider_retry_mode: ProviderRetryMode,
+
+    /// Enables LLM thinking mode. Accepted values vary by provider:
+    /// `"low"`, `"medium"`, `"high"`, `"adaptive"`, etc.
+    #[serde(alias = "reasoning_effort", default = "default_agent_reasoning_effort")]
+    #[garde(skip)]
+    pub reasoning_effort: Option<String>,
+
+    #[serde(alias = "timezone", default = "default_agent_timezone")]
+    #[garde(skip)]
+    pub timezone: String,
+
+    #[serde(alias = "dream", default = "default_agent_dream_config")]
+    #[garde(skip)]
+    pub dream: DreamConfig,
+
+    /// Auto-compact idle threshold in minutes (0 = disabled). Matches
+    /// nanobot's `AgentDefaults.session_ttl_minutes`, whose canonical JSON
+    /// name is `idleCompactAfterMinutes` (its own field name, camelCased,
+    /// is accepted too for tolerance).
+    #[serde(
+        alias = "session_ttl_minutes",
+        alias = "idleCompactAfterMinutes",
+        alias = "idle_compact_after_minutes",
+        default = "default_agent_session_ttl_minutes"
+    )]
+    #[garde(skip)]
+    pub session_ttl_minutes: u32,
+
+    /// Hours without use after which a session is dropped from the in-memory
+    /// cache (not deleted from disk). Canonical JSON name is
+    /// `sessionEvictionThresholdHours`. `0` disables cache cleanup.
+    #[serde(
+        alias = "session_eviction_threshold_hours",
+        default = "default_agent_session_eviction_threshold_hours"
+    )]
+    #[garde(skip)]
+    pub session_eviction_threshold_hours: u32,
+
+    /// How often (hours) to scan the session cache and drop unused entries.
+    /// Canonical JSON name is `sessionEvictionCronIntervalHours`.
+    /// `0` disables the cleanup job.
+    #[serde(
+        alias = "session_eviction_cron_interval_hours",
+        default = "default_agent_session_eviction_cron_interval_hours"
+    )]
+    #[garde(skip)]
+    pub session_eviction_cron_interval_hours: u32,
+
+    /// Minimum interval in seconds between scans for idle sessions.
+    #[serde(
+        alias = "idle_compact_check_interval_seconds",
+        default = "default_agent_idle_compact_check_interval_seconds"
+    )]
+    #[garde(skip)]
+    pub idle_compact_check_interval_seconds: u32,
+
+    /// Name of a `model_presets` entry to use as the process-wide default.
+    /// `None` or `"default"` both mean: use this struct's own flat
+    /// `model`/`provider`/... fields (the implicit, backward-compatible
+    /// `"default"` preset).
+    #[serde(alias = "model_preset")]
+    #[garde(skip)]
+    pub model_preset: Option<String>,
+
+    /// Process-wide default agent composition (`standard`, `minimal` or `no_mcp`).
+    /// Sessions may override this via `/mode` / `set_mode`.
+    #[serde(alias = "mode", default = "default_agent_mode")]
+    #[garde(skip)]
+    pub mode: AgentMode,
+}
+
+impl Default for AgentsConfig {
+    fn default() -> Self {
+        Self {
+            workspace: default_agent_workspace(),
+            model: default_agent_model(),
+            provider: default_agent_provider(),
+            max_tokens: default_agent_max_tokens(),
+            context_window_tokens: default_agent_context_window_tokens(),
+            context_block_limit: None,
+            temperature: default_agent_temperature(),
+            max_tool_iterations: default_agent_max_tool_iterations(),
+            max_tool_result_chars: default_agent_max_tool_result_chars(),
+            provider_retry_mode: default_agent_provider_retry_mode(),
+            reasoning_effort: None,
+            timezone: default_agent_timezone(),
+            dream: default_agent_dream_config(),
+            session_ttl_minutes: default_agent_session_ttl_minutes(),
+            idle_compact_check_interval_seconds: default_agent_idle_compact_check_interval_seconds(
+            ),
+            session_eviction_threshold_hours: default_agent_session_eviction_threshold_hours(),
+            session_eviction_cron_interval_hours:
+                default_agent_session_eviction_cron_interval_hours(),
+            model_preset: None,
+            mode: default_agent_mode(),
+        }
+    }
+}
+
+// ── ProvidersConfig ───────────────────────────────────────────────────────────
+
+/// Configuration for all LLM providers.
+///
+/// Each field holds the credentials and endpoint settings for one provider.
+/// All fields default to an empty `ProviderConfig` so missing sections in the
+/// config file are silently filled in with safe no-op values.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+#[derive(Default)]
+pub struct ProvidersConfig {
+    /// Any OpenAI-compatible endpoint (custom deployments, local models, etc.).
+    #[serde(alias = "custom")]
+    #[garde(dive)]
+    pub custom: ProviderConfig,
+
+    /// Azure OpenAI — the `model` field is the deployment name.
+    #[serde(alias = "azure_openai")]
+    #[garde(dive)]
+    pub azure_openai: ProviderConfig,
+
+    /// Anthropic (Claude) provider.
+    #[serde(alias = "anthropic")]
+    #[garde(dive)]
+    pub anthropic: ProviderConfig,
+
+    /// OpenAI provider.
+    #[serde(alias = "openai")]
+    #[garde(dive)]
+    pub openai: ProviderConfig,
+
+    /// OpenRouter provider.
+    #[serde(alias = "openrouter")]
+    #[garde(dive)]
+    pub openrouter: ProviderConfig,
+
+    /// Gemini provider.
+    #[serde(alias = "gemini")]
+    #[garde(dive)]
+    pub gemini: ProviderConfig,
+
+    /// Groq provider.
+    #[serde(alias = "groq")]
+    #[garde(dive)]
+    pub groq: ProviderConfig,
+}
+
+impl ProvidersConfig {
+    /// Return the [`ProviderConfig`] for the given provider name (e.g. `"openai"`).
+    ///
+    /// This is the Rust equivalent of Python's `getattr(self.providers, spec.name, None)`.
+    pub fn get_by_name(&self, name: &str) -> Option<&ProviderConfig> {
+        match name {
+            "custom" => Some(&self.custom),
+            "azure_openai" => Some(&self.azure_openai),
+            "anthropic" => Some(&self.anthropic),
+            "openai" => Some(&self.openai),
+            "openrouter" => Some(&self.openrouter),
+            "gemini" => Some(&self.gemini),
+            _ => None,
+        }
+    }
+}
+
+// ── HeartbeatConfig ───────────────────────────────────────────────────────────
+
+fn default_heartbeat_enabled() -> bool {
+    true
+}
+fn default_heartbeat_interval_s() -> u64 {
+    30 * 60
+}
+fn default_heartbeat_keep_recent_messages() -> u32 {
+    8
+}
+
+/// Heartbeat service configuration.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct HeartbeatConfig {
+    /// Whether the heartbeat service is active.
+    #[serde(alias = "enabled", default = "default_heartbeat_enabled")]
+    #[garde(skip)]
+    pub enabled: bool,
+
+    /// Interval between heartbeats in seconds. Default: 1800 (30 minutes).
+    #[serde(alias = "interval_s", default = "default_heartbeat_interval_s")]
+    #[garde(range(min = 1))]
+    pub interval_s: u64,
+
+    /// Number of recent messages to retain for context. Default: 8.
+    #[serde(
+        alias = "keep_recent_messages",
+        default = "default_heartbeat_keep_recent_messages"
+    )]
+    #[garde(range(min = 1))]
+    pub keep_recent_messages: u32,
+}
+
+impl Default for HeartbeatConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_heartbeat_enabled(),
+            interval_s: default_heartbeat_interval_s(),
+            keep_recent_messages: default_heartbeat_keep_recent_messages(),
+        }
+    }
+}
+
+// ── JwtConfig ──────────────────────────────────────────────────────────────────
+
+fn jwt_enabled() -> bool {
+    false
+}
+
+fn default_jwt_private_key_path() -> String {
+    "./.rust-bot/credentials/private_key.pem".to_string()
+}
+
+fn default_jwt_public_key_path() -> String {
+    "./.rust-bot/credentials/public_key.pem".to_string()
+}
+
+fn default_jwt_iss() -> String {
+    "rust-bot".to_string()
+}
+
+fn default_jwt_aud() -> String {
+    DEFAULT_AUD.to_string()
+}
+
+fn validate_jwt_aud_when_enabled(value: &JwtConfig, _ctx: &()) -> garde::Result {
+    if value.enabled && value.aud.trim().is_empty() {
+        return Err(garde::Error::new(
+            "aud must be non-empty when JWT is enabled",
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Debug, Deserialize, Serialize, Clone, PartialEq)]
+#[serde(rename_all = "camelCase", default)]
+pub struct JwtConfig {
+    /// Whether the JWT service is active.
+    #[serde(alias = "enabled", default = "jwt_enabled")]
+    pub enabled: bool,
+
+    /// Path to the Ed25519 private key PEM (used for minting tokens).
+    #[serde(alias = "private_key_path")]
+    pub private_key_path: String,
+
+    /// Path to the Ed25519 public key PEM (used for validating tokens).
+    #[serde(alias = "public_key_path")]
+    pub public_key_path: String,
+
+    /// JWT issuer claim. Default: `rust-bot`.
+    #[serde(alias = "iss", default = "default_jwt_iss")]
+    pub iss: String,
+
+    /// JWT audience claim. Empty means omit on mint; required non-empty when enabled.
+    #[serde(alias = "aud", default = "default_jwt_aud")]
+    pub aud: String,
+}
+
+impl Default for JwtConfig {
+    fn default() -> Self {
+        Self {
+            enabled: jwt_enabled(),
+            private_key_path: default_jwt_private_key_path(),
+            public_key_path: default_jwt_public_key_path(),
+            iss: default_jwt_iss(),
+            aud: default_jwt_aud(),
+        }
+    }
+}
+
+impl Validate for JwtConfig {
+    type Context = ();
+
+    fn validate_into(
+        &self,
+        ctx: &Self::Context,
+        parent: &mut dyn FnMut() -> garde::Path,
+        report: &mut garde::Report,
+    ) {
+        if let Err(err) = validate_jwt_aud_when_enabled(self, ctx) {
+            report.append(parent().join("aud"), err);
+        }
+    }
+}
+
+// ── ApiConfig ─────────────────────────────────────────────────────────────────
+
+fn default_api_host() -> String {
+    "127.0.0.1".to_string()
+}
+
+fn default_api_port() -> u16 {
+    8900
+}
+
+fn default_api_timeout() -> f64 {
+    120.0
+}
+
+fn default_users_file() -> String {
+    "./.rust-bot/users.json".to_string()
+}
+
+fn cors_enabled() -> bool {
+    true
+}
+
+fn default_cors_origins() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+/// Cross-Origin Resource Sharing (CORS) settings for the API server.
+///
+/// When `enabled` is true, browsers on other origins can call the API.
+/// Use `origins: ["*"]` (the default) to allow any origin, or list specific
+/// origins such as `["https://app.example.com"]` for tighter control.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct CorsConfig {
+    /// Whether CORS middleware is active. Default: `true`.
+    #[serde(alias = "enabled", default = "cors_enabled")]
+    #[garde(skip)]
+    pub enabled: bool,
+
+    /// Allowed origins. `"*"` (or an empty list) allows any origin.
+    #[serde(alias = "origins", default = "default_cors_origins")]
+    #[garde(skip)]
+    pub origins: Vec<String>,
+}
+
+impl Default for CorsConfig {
+    fn default() -> Self {
+        Self {
+            enabled: cors_enabled(),
+            origins: default_cors_origins(),
+        }
+    }
+}
+
+/// OpenAI-compatible API server configuration.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ApiConfig {
+    /// Bind address for the API server. Defaults to local-only `127.0.0.1`.
+    #[serde(alias = "host", default = "default_api_host")]
+    #[garde(skip)]
+    pub host: String,
+
+    /// TCP port the server listens on. Default: 8900.
+    #[serde(alias = "port", default = "default_api_port")]
+    #[garde(range(min = 1, max = 65535))]
+    pub port: u16,
+
+    /// Per-request timeout in seconds. Default: 120.0.
+    #[serde(alias = "timeout", default = "default_api_timeout")]
+    #[garde(range(min = 0.0))]
+    pub timeout: f64,
+
+    /// JWT service configuration.
+    #[serde(alias = "jwt")]
+    #[garde(dive)]
+    pub jwt: JwtConfig,
+
+    /// User registry file path.
+    #[serde(alias = "users_file", default = "default_users_file")]
+    #[garde(skip)]
+    pub users_file: String,
+
+    /// CORS configuration for browser clients on other origins.
+    #[serde(alias = "cors")]
+    #[garde(dive)]
+    pub cors: CorsConfig,
+
+    /// Directory of pre-built web-chat static assets (`index.html`, JS,
+    /// WASM) to serve alongside the API. When unset, the CLI falls back
+    /// to `./web` if that directory exists; otherwise the API runs
+    /// without serving a web UI.
+    #[serde(alias = "web_root", default)]
+    #[garde(skip)]
+    pub web_root: Option<String>,
+}
+
+impl Default for ApiConfig {
+    fn default() -> Self {
+        Self {
+            host: default_api_host(),
+            port: default_api_port(),
+            timeout: default_api_timeout(),
+            jwt: JwtConfig::default(),
+            users_file: default_users_file(),
+            cors: CorsConfig::default(),
+            web_root: None,
+        }
+    }
+}
+
+// ── GatewayConfig ─────────────────────────────────────────────────────────────
+
+fn default_gateway_host() -> String {
+    "0.0.0.0".to_string()
+}
+fn default_gateway_port() -> u16 {
+    18790
+}
+
+/// Gateway/server configuration.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GatewayConfig {
+    /// Bind address for the gateway. Defaults to `0.0.0.0` (all interfaces).
+    #[serde(alias = "host", default = "default_gateway_host")]
+    #[garde(skip)]
+    pub host: String,
+
+    /// TCP port the gateway listens on. Default: 18790.
+    #[serde(alias = "port", default = "default_gateway_port")]
+    #[garde(range(min = 1, max = 65535))]
+    pub port: u16,
+
+    /// Heartbeat service configuration.
+    #[serde(alias = "heartbeat")]
+    #[garde(dive)]
+    pub heartbeat: HeartbeatConfig,
+
+    /// Directory of pre-built websockets-chat static assets (`index.html`,
+    /// JS, WASM) to serve alongside the combined login + WebSocket gateway
+    /// server. When unset, the gateway serves the UI compiled into the
+    /// binary. Set this (or pass `--web-root`) to override with an on-disk
+    /// Trunk build. Unlike `ApiConfig::web_root`, there is no implicit
+    /// `./web` fallback — that folder is the REST UI.
+    #[serde(alias = "web_root", default)]
+    #[garde(skip)]
+    pub web_root: Option<String>,
+
+    /// Strapi admin JWT exchange for the combined gateway (`POST /v1/sso/strapi`).
+    /// Empty `strapiUrl` disables the route's verification target (handler
+    /// returns 500 until configured).
+    #[serde(alias = "strapi_sso", default)]
+    #[garde(dive)]
+    pub strapi_sso: StrapiSsoConfig,
+}
+
+/// Config for exchanging a Strapi admin JWT for a rust-bot WebUI JWT.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct StrapiSsoConfig {
+    /// Base URL of the Strapi instance used to validate admin JWTs via
+    /// `GET {strapiUrl}/admin/users/me`. Must not be taken from the client.
+    #[serde(alias = "strapi_url", default)]
+    #[garde(skip)]
+    pub strapi_url: String,
+}
+
+impl Default for GatewayConfig {
+    fn default() -> Self {
+        Self {
+            host: default_gateway_host(),
+            port: default_gateway_port(),
+            heartbeat: HeartbeatConfig::default(),
+            web_root: None,
+            strapi_sso: StrapiSsoConfig::default(),
+        }
+    }
+}
+
+// ── WebSearchConfig ───────────────────────────────────────────────────────────
+
+/// Search backend used by the `web_search` tool.
+///
+/// `ExaFree` (Exa's keyless MCP endpoint) is the default; it and `DuckDuckGo`
+/// require no registration/API key. `Brave` and `Exa` require an API key (read
+/// from `BRAVE_API_KEY` / `EXA_API_KEY` respectively, or the `api_key` config
+/// field). See `WebSearchTool::execute` in `src/agent/tools/web.rs` for the
+/// dispatch logic.
+#[derive(Debug, Deserialize, Serialize, Default, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchProvider {
+    /// DuckDuckGo Instant Answer API. No registration/API key required.
+    DuckDuckGo,
+    /// Requires a Brave Search API key.
+    Brave,
+    /// Requires an Exa API key.
+    Exa,
+    /// Exa's keyless MCP endpoint (`mcp.exa.ai`) — the default. Rate-limited.
+    #[default]
+    #[serde(rename = "exa_free", alias = "exafree")]
+    ExaFree,
+}
+
+impl std::fmt::Display for WebSearchProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl WebSearchProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::DuckDuckGo => "duckduckgo",
+            Self::Brave => "brave",
+            Self::Exa => "exa",
+            Self::ExaFree => "exa_free",
+        }
+    }
+}
+
+fn default_web_search_provider() -> WebSearchProvider {
+    WebSearchProvider::ExaFree
+}
+fn default_web_search_max_results() -> u32 {
+    20
+}
+fn default_web_search_timeout() -> u32 {
+    30
+}
+
+/// Web search tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WebSearchConfig {
+    /// Search backend: `"exa_free"` (default, no registration required),
+    /// `"duckduckgo"` (no registration required), `"brave"`, or `"exa"`.
+    #[serde(alias = "provider", default = "default_web_search_provider")]
+    #[garde(skip)]
+    pub provider: WebSearchProvider,
+
+    /// API key for providers that require authentication.
+    #[serde(alias = "api_key")]
+    #[garde(skip)]
+    pub api_key: String,
+
+    /// Base URL override for providers that support a custom endpoint.
+    #[serde(alias = "base_url")]
+    #[garde(skip)]
+    pub base_url: String,
+
+    /// Maximum number of results to return per query. Default: 5.
+    #[serde(alias = "max_results", default = "default_web_search_max_results")]
+    #[garde(range(min = 1))]
+    pub max_results: u32,
+
+    /// Wall-clock timeout in seconds for each search operation. Default: 30.
+    #[serde(alias = "timeout", default = "default_web_search_timeout")]
+    #[garde(range(min = 1))]
+    pub timeout: u32,
+}
+
+impl Default for WebSearchConfig {
+    fn default() -> Self {
+        Self {
+            provider: default_web_search_provider(),
+            api_key: String::new(),
+            base_url: String::new(),
+            max_results: default_web_search_max_results(),
+            timeout: default_web_search_timeout(),
+        }
+    }
+}
+
+// ── WebToolsConfig ────────────────────────────────────────────────────────────
+
+fn default_web_tools_enable() -> bool {
+    true
+}
+
+fn default_web_tools_timeout() -> u32 {
+    60
+}
+
+/// Web tools configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct WebToolsConfig {
+    /// Enable or disable the web tools entirely. Default: `true`.
+    #[serde(alias = "enable", default = "default_web_tools_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// Optional HTTP or SOCKS5 proxy URL used for all web requests.
+    /// Examples: `"http://127.0.0.1:7890"`, `"socks5://127.0.0.1:1080"`.
+    #[serde(alias = "proxy")]
+    #[garde(skip)]
+    pub proxy: Option<String>,
+
+    /// Timeout for web requests in seconds. Default: 60.
+    /// Examples: `30`, `60`, `120`.
+    #[serde(alias = "timeout", default = "default_web_tools_timeout")]
+    #[garde(range(min = 1))]
+    pub timeout: u32,
+
+    /// Web search backend configuration.
+    #[serde(alias = "search")]
+    #[garde(dive)]
+    pub search: WebSearchConfig,
+}
+
+impl Default for WebToolsConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_web_tools_enable(),
+            proxy: None,
+            timeout: default_web_tools_timeout(),
+            search: WebSearchConfig::default(),
+        }
+    }
+}
+
+fn default_gmail_tool_enable() -> bool {
+    false
+}
+
+fn default_gmail_max_results() -> u32 {
+    20
+}
+
+fn default_gmail_token_cache_path() -> String {
+    "~/.rust-bot/credentials/token_cache.json".to_string()
+}
+
+fn default_gmail_client_secret_path() -> String {
+    "~/.rust-bot/credentials/client_secret.json".to_string()
+}
+
+fn default_ocr_tool_enable() -> bool {
+    false
+}
+
+fn default_ocr_tool_model() -> String {
+    AnthropicProvider::DEFAULT_MODEL.to_string()
+}
+
+fn default_ocr_tool_base_url() -> String {
+    AnthropicProvider::DEFAULT_API_BASE.to_string()
+}
+
+fn default_ocr_tool_provider() -> OcrProvider {
+    OcrProvider::Anthropic
+}
+
+fn default_ocr_tool_api_key() -> String {
+    String::new()
+}
+
+fn default_docx_tool_enable() -> bool {
+    false
+}
+
+// ── GmailToolConfig ───────────────────────────────────────────────────────────
+
+/// Gmail Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct GmailToolConfig {
+    /// Enable or disable the Gmail Tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_gmail_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// OAuth client secret file (client_secret.json). Default: `~/.rust-bot/credentials/client_secret.json`.
+    #[serde(
+        alias = "client_secret_path",
+        default = "default_gmail_client_secret_path"
+    )]
+    #[garde(skip)]
+    pub client_secret_path: String,
+
+    /// OAuth token cache file (refresh/access tokens). Default: `~/.rust-bot/credentials/token_cache.json`.
+    #[serde(alias = "token_cache_path", default = "default_gmail_token_cache_path")]
+    #[garde(skip)]
+    pub token_cache_path: String,
+
+    /// Maximum number of results to return per query. Default: 20.
+    #[serde(alias = "max_results", default = "default_gmail_max_results")]
+    #[garde(range(min = 1))]
+    pub max_results: u32,
+}
+
+impl GmailToolConfig {
+    pub fn token_cache_path(&self) -> PathBuf {
+        PathBuf::from(expand_tilde_path(&self.token_cache_path).as_ref())
+    }
+
+    pub fn client_secret_path(&self) -> PathBuf {
+        PathBuf::from(expand_tilde_path(&self.client_secret_path).as_ref())
+    }
+}
+
+impl Default for GmailToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_gmail_tool_enable(),
+            token_cache_path: default_gmail_token_cache_path(),
+            client_secret_path: default_gmail_client_secret_path(),
+            max_results: default_gmail_max_results(),
+        }
+    }
+}
+
+// ── DocxToolConfig ───────────────────────────────────────────────────────────
+
+/// Gmail Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DocxToolConfig {
+    /// Enable or disable the Gmail Tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_docx_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+}
+
+impl Default for DocxToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_docx_tool_enable(),
+        }
+    }
+}
+
+// ── QuestionToolConfig ───────────────────────────────────────────────────────
+
+fn default_question_tool_enabled() -> bool {
+    true
+}
+
+/// Question Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct QuestionToolConfig {
+    /// Enable or disable the question tool. Default: `true`.
+    #[serde(alias = "enable", default = "default_question_tool_enabled")]
+    #[garde(skip)]
+    pub enabled: bool,
+}
+
+impl Default for QuestionToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: default_question_tool_enabled(),
+        }
+    }
+}
+
+// ── ImageGenerationToolConfig ───────────────────────────────────────────────────────────
+
+fn default_image_generation_tool_enable() -> bool {
+    false
+}
+
+fn default_image_generation_tool_model() -> String {
+    "openai/gpt-image-2".to_string()
+}
+
+fn default_image_generation_tool_api_key() -> String {
+    String::new()
+}
+
+fn default_image_generation_tool_base_url() -> String {
+    "https://openrouter.ai/api/v1/images".to_string()
+}
+
+fn default_image_generation_tool_size() -> String {
+    String::new()
+}
+
+fn default_image_generation_tool_quality() -> String {
+    String::new()
+}
+
+/// Image Generation Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ImageGenerationToolConfig {
+    /// Enable or disable the Image Generation Tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_image_generation_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// Model to use for image generation. Default: `"openai/gpt-image-2"`.
+    #[serde(alias = "model", default = "default_image_generation_tool_model")]
+    #[garde(skip)]
+    pub model: String,
+
+    /// API key for the image generation tool. Falls back to `OPENROUTER_API_KEY` when empty. Default: `""`.
+    #[serde(alias = "api_key", default = "default_image_generation_tool_api_key")]
+    #[garde(skip)]
+    pub api_key: String,
+
+    /// API base URL for image generation requests. Default: `"https://openrouter.ai/api/v1/images"`.
+    #[serde(alias = "base_url", default = "default_image_generation_tool_base_url")]
+    #[garde(skip)]
+    pub base_url: String,
+
+    /// Default image size (tier such as `"1K"`/`"2K"` or explicit pixels such as `"1024x1024"`).
+    /// Empty means omit from the request. Default: `""`.
+    #[serde(alias = "size", default = "default_image_generation_tool_size")]
+    #[garde(skip)]
+    pub size: String,
+
+    /// Default rendering quality (`"auto"`, `"low"`, `"medium"`, or `"high"`).
+    /// Empty means omit from the request. Default: `""`.
+    #[serde(alias = "quality", default = "default_image_generation_tool_quality")]
+    #[garde(skip)]
+    pub quality: String,
+}
+
+impl Default for ImageGenerationToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_image_generation_tool_enable(),
+            model: default_image_generation_tool_model(),
+            api_key: default_image_generation_tool_api_key(),
+            base_url: default_image_generation_tool_base_url(),
+            size: default_image_generation_tool_size(),
+            quality: default_image_generation_tool_quality(),
+        }
+    }
+}
+
+// ── ExecToolConfig ────────────────────────────────────────────────────────────
+
+fn default_exec_tool_enable() -> bool {
+    true
+}
+fn default_exec_tool_timeout() -> u32 {
+    60
+}
+
+/// Shell exec tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ExecToolConfig {
+    /// Enable or disable the shell exec tool. Default: `true`.
+    #[serde(alias = "enable", default = "default_exec_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// Command execution timeout in seconds. Default: 60.
+    #[serde(alias = "timeout", default = "default_exec_tool_timeout")]
+    #[garde(range(min = 1))]
+    pub timeout: u32,
+
+    /// Extra directories appended to `PATH` inside the subprocess.
+    #[serde(alias = "path_append")]
+    #[garde(skip)]
+    pub path_append: String,
+
+    /// Sandbox backend: `""` (none) or `"bwrap"` (Bubblewrap).
+    #[serde(alias = "sandbox")]
+    #[garde(skip)]
+    pub sandbox: String,
+}
+
+impl Default for ExecToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_exec_tool_enable(),
+            timeout: default_exec_tool_timeout(),
+            path_append: String::new(),
+            sandbox: String::new(),
+        }
+    }
+}
+
+// ── OcrToolConfig ───────────────────────────────────────────────────────────
+
+/// LLM provider for the OCR tool.
+#[derive(Deserialize, Serialize, Default, Debug, Clone, Copy, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum OcrProvider {
+    #[default]
+    Anthropic,
+}
+
+impl std::fmt::Display for OcrProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl OcrProvider {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Anthropic => "anthropic",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct OcrToolConfig {
+    /// Enable or disable the OCR tool. Default: `false`.
+    #[serde(alias = "enable", default = "default_ocr_tool_enable")]
+    #[garde(skip)]
+    pub enable: bool,
+
+    /// The model to use for the OCR tool. Default: Claude Sonnet (Anthropic default).
+    #[serde(alias = "model", default = "default_ocr_tool_model")]
+    #[garde(skip)]
+    pub model: String,
+
+    /// API base URL for the OCR provider.
+    #[serde(alias = "base_url", default = "default_ocr_tool_base_url")]
+    #[garde(skip)]
+    pub base_url: String,
+
+    /// LLM provider for OCR. Default: `"anthropic"`.
+    #[serde(alias = "provider", default = "default_ocr_tool_provider")]
+    #[garde(skip)]
+    pub provider: OcrProvider,
+
+    /// API key for the OCR provider. Empty string uses `ANTHROPIC_API_KEY` at runtime.
+    #[serde(alias = "api_key", default = "default_ocr_tool_api_key")]
+    #[garde(skip)]
+    pub api_key: String,
+}
+
+impl Default for OcrToolConfig {
+    fn default() -> Self {
+        Self {
+            enable: default_ocr_tool_enable(),
+            model: default_ocr_tool_model(),
+            base_url: default_ocr_tool_base_url(),
+            provider: default_ocr_tool_provider(),
+            api_key: default_ocr_tool_api_key(),
+        }
+    }
+}
+
+// ── MCPServerConfig ───────────────────────────────────────────────────────────
+
+fn default_mcp_tool_timeout() -> u32 {
+    30
+}
+fn default_mcp_enabled_tools() -> Vec<String> {
+    vec!["*".to_string()]
+}
+
+/// Transport type for an MCP server connection.
+#[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub enum McpTransportType {
+    Stdio,
+    Sse,
+    StreamableHttp,
+}
+
+/// MCP server connection configuration (stdio or HTTP).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct McpServerConfig {
+    /// Transport type. Auto-detected from `command`/`url` when `None`.
+    #[serde(alias = "type")]
+    #[garde(skip)]
+    pub transport_type: Option<McpTransportType>,
+
+    /// Stdio: executable to run (e.g. `"npx"`).
+    #[serde(alias = "command")]
+    #[garde(skip)]
+    pub command: String,
+
+    /// Stdio: command-line arguments.
+    #[serde(alias = "args")]
+    #[garde(skip)]
+    pub args: Vec<String>,
+
+    /// Stdio: extra environment variables injected into the subprocess.
+    #[serde(alias = "env")]
+    #[garde(skip)]
+    pub env: HashMap<String, String>,
+
+    /// HTTP/SSE: endpoint URL.
+    #[serde(alias = "url")]
+    #[garde(skip)]
+    pub url: String,
+
+    /// HTTP/SSE: custom request headers.
+    #[serde(alias = "headers")]
+    #[garde(skip)]
+    pub headers: HashMap<String, String>,
+
+    /// Seconds before a tool call is cancelled. Default: 30.
+    #[serde(alias = "tool_timeout", default = "default_mcp_tool_timeout")]
+    #[garde(range(min = 1))]
+    pub tool_timeout: u32,
+
+    /// Tools to register. Accepts raw MCP names or wrapped `mcp_<server>_<tool>` names.
+    /// `["*"]` registers all tools; `[]` registers none. Default: `["*"]`.
+    #[serde(alias = "enabled_tools", default = "default_mcp_enabled_tools")]
+    #[garde(skip)]
+    pub enabled_tools: Vec<String>,
+}
+
+impl Default for McpServerConfig {
+    fn default() -> Self {
+        Self {
+            transport_type: None,
+            command: String::new(),
+            args: Vec::new(),
+            env: HashMap::new(),
+            url: String::new(),
+            headers: HashMap::new(),
+            tool_timeout: default_mcp_tool_timeout(),
+            enabled_tools: default_mcp_enabled_tools(),
+        }
+    }
+}
+
+// ── ToolsConfig ───────────────────────────────────────────────────────────────
+
+fn default_mcp_presets_path() -> String {
+    "~/.rust-bot/mcp_presets.json".to_string()
+}
+
+/// Tools configuration.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct ToolsConfig {
+    /// Web tool configuration (search, proxy, etc.).
+    #[serde(alias = "web")]
+    #[garde(dive)]
+    pub web: WebToolsConfig,
+
+    /// Shell exec tool configuration.
+    #[serde(alias = "exec")]
+    #[garde(dive)]
+    pub exec: ExecToolConfig,
+
+    /// Restrict all tool file access to the agent workspace directory.
+    #[serde(alias = "restrict_to_workspace")]
+    #[garde(skip)]
+    pub restrict_to_workspace: bool,
+
+    /// Tool names that are never registered (including MCP tools and the ones
+    /// subagents get), e.g. `["write_file", "edit_file"]` for a read-only agent.
+    #[serde(alias = "disabled_tools")]
+    #[garde(skip)]
+    pub disabled_tools: Vec<String>,
+
+    /// When true, the CLI `agent` command asks before each tool call.
+    #[serde(alias = "confirm_before_execute")]
+    #[garde(skip)]
+    pub confirm_before_execute: bool,
+
+    /// Named MCP server configurations, keyed by server name.
+    #[serde(alias = "mcp_servers")]
+    #[garde(dive)]
+    pub mcp_servers: HashMap<String, McpServerConfig>,
+
+    /// The file path to the MCP presets configuration. Default: `~/.rust-bot/mcp_presets.json`.
+    #[serde(alias = "mcp_presets_path", default = "default_mcp_presets_path")]
+    #[garde(skip)]
+    pub mcp_presets_path: String,
+
+    /// CIDR ranges exempt from SSRF blocking (e.g. `["100.64.0.0/10"]` for Tailscale).
+    #[serde(alias = "ssrf_whitelist")]
+    #[garde(skip)]
+    pub ssrf_whitelist: Vec<String>,
+
+    #[serde(alias = "gmail")]
+    #[garde(dive)]
+    pub gmail: GmailToolConfig,
+
+    #[serde(alias = "docx")]
+    #[garde(dive)]
+    pub docx: DocxToolConfig,
+
+    #[serde(alias = "ocr")]
+    #[garde(dive)]
+    pub ocr: OcrToolConfig,
+
+    #[serde(alias = "image_generation")]
+    #[garde(dive)]
+    pub image_generation: ImageGenerationToolConfig,
+
+    #[serde(alias = "question")]
+    #[garde(dive)]
+    pub question: QuestionToolConfig,
+
+    /// Driving child agents over ACP (`acp_*` tools).
+    #[serde(alias = "acp")]
+    #[garde(dive)]
+    pub acp: AcpConfig,
+}
+
+impl Default for ToolsConfig {
+    fn default() -> Self {
+        Self {
+            web: WebToolsConfig::default(),
+            exec: ExecToolConfig::default(),
+            restrict_to_workspace: false,
+            disabled_tools: Vec::new(),
+            confirm_before_execute: false,
+            mcp_servers: HashMap::new(),
+            ssrf_whitelist: Vec::new(),
+            gmail: GmailToolConfig::default(),
+            docx: DocxToolConfig::default(),
+            ocr: OcrToolConfig::default(),
+            image_generation: ImageGenerationToolConfig::default(),
+            question: QuestionToolConfig::default(),
+            acp: AcpConfig::default(),
+            mcp_presets_path: default_mcp_presets_path(),
+        }
+    }
+}
+
+// ── AcpConfig ───────────────────────────────────────────────────────────────
+
+fn default_acp_max_depth() -> u32 {
+    2
+}
+
+fn default_acp_allow_dynamic_agents() -> bool {
+    true
+}
+
+fn default_acp_timeout_secs() -> u64 {
+    600
+}
+
+fn default_acp_shutdown_grace_secs() -> u64 {
+    180
+}
+
+/// How a parent answers a child's `session/request_permission`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AcpPermissionPolicy {
+    /// Approve `read` / `search` calls, deny everything else.
+    #[default]
+    AutoApproveRead,
+    /// Ask the human through the tool-approval broker on the parent turn's
+    /// channel; deny when that channel cannot ask.
+    Escalate,
+    /// Approve every request. Explicit opt-in only.
+    AllowAll,
+}
+
+/// Which ACP session a parent session talks to inside a child.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum AcpSessionScope {
+    /// One child session per `(agent, parent session)`: two operators chatting
+    /// with the parent do not see each other's thread in the child.
+    #[default]
+    PerParentSession,
+    /// One child session per agent.
+    Shared,
+}
+
+/// How to launch an ACP agent: an argv array, never a shell string.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, Default)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AcpLaunchPreset {
+    /// Program and arguments. `"self"` as the program means this executable.
+    #[garde(length(min = 1))]
+    pub command: Vec<String>,
+}
+
+/// ACP (Agent Client Protocol) settings: this process driving child agents.
+///
+/// `enabled` defaults to `false`: the `acp_*` tools only exist when an operator
+/// turns them on. Children inherit this section through the config overlay, which
+/// can only narrow it (see `config::overlay`).
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct AcpConfig {
+    /// Register the `acp_*` tools. Default: `false`.
+    #[serde(alias = "enable")]
+    #[garde(skip)]
+    pub enabled: bool,
+
+    /// How many levels of children may exist below this process. `0` means none.
+    #[serde(alias = "max_depth", default = "default_acp_max_depth")]
+    #[garde(skip)]
+    pub max_depth: u32,
+
+    /// Whether the LLM may create and update agents (running existing ones is
+    /// always allowed while `enabled`).
+    #[serde(
+        alias = "allow_dynamic_agents",
+        default = "default_acp_allow_dynamic_agents"
+    )]
+    #[garde(skip)]
+    pub allow_dynamic_agents: bool,
+
+    /// Seconds one child turn may take before it is cancelled.
+    #[serde(alias = "default_timeout_secs", default = "default_acp_timeout_secs")]
+    #[garde(range(min = 1))]
+    pub default_timeout_secs: u64,
+
+    /// Seconds a child gets to exit after its input is closed (it drains
+    /// background work and dreams) before its process tree is killed.
+    #[serde(
+        alias = "shutdown_grace_secs",
+        default = "default_acp_shutdown_grace_secs"
+    )]
+    #[garde(range(min = 1))]
+    pub shutdown_grace_secs: u64,
+
+    /// How the child's permission requests are answered.
+    #[serde(alias = "permission_policy")]
+    #[garde(skip)]
+    pub permission_policy: AcpPermissionPolicy,
+
+    /// Child session sharing.
+    #[serde(alias = "session_scope")]
+    #[garde(skip)]
+    pub session_scope: AcpSessionScope,
+
+    /// Named launch commands. The built-in `rustbot` preset (this executable)
+    /// always exists and need not be listed. Never settable by an overlay.
+    #[serde(alias = "launch_presets")]
+    #[garde(dive)]
+    pub launch_presets: HashMap<String, AcpLaunchPreset>,
+}
+
+impl Default for AcpConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_depth: default_acp_max_depth(),
+            allow_dynamic_agents: default_acp_allow_dynamic_agents(),
+            default_timeout_secs: default_acp_timeout_secs(),
+            shutdown_grace_secs: default_acp_shutdown_grace_secs(),
+            permission_policy: AcpPermissionPolicy::default(),
+            session_scope: AcpSessionScope::default(),
+            launch_presets: HashMap::new(),
+        }
+    }
+}
+
+// ── Subagent Config ───────────────────────────────────────────────────────────
+/// Subagent configuration to change subagent behaviour.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct SubagentConfig {
+    /// Used to fail the subagent if a tool call fails.
+    #[serde(alias = "fail_on_tool_error")]
+    #[garde(skip)]
+    pub fail_on_tool_error: bool,
+}
+
+impl Default for SubagentConfig {
+    fn default() -> Self {
+        Self {
+            fail_on_tool_error: true,
+        }
+    }
+}
+
+// ── Config ────────────────────────────────────────────────────────────────────
+
+fn default_example_prompts() -> Vec<String> {
+    vec![]
+}
+
+/// Root configuration for the bot.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+#[serde(rename_all = "camelCase", default)]
+pub struct Config {
+    /// Agent behaviour and model configuration.
+    #[serde(alias = "agents")]
+    #[garde(dive)]
+    pub agents: AgentsConfig,
+
+    /// Agent behaviour and model configuration.
+    #[serde(alias = "channels")]
+    #[garde(dive)]
+    pub channels: ChannelsConfig,
+
+    /// Agent behaviour and model configuration.
+    #[serde(alias = "providers")]
+    #[garde(dive)]
+    pub providers: ProvidersConfig,
+
+    /// Agent behaviour and model configuration.
+    #[serde(alias = "api")]
+    #[garde(dive)]
+    pub api: ApiConfig,
+
+    /// Agent behaviour and model configuration.
+    #[serde(alias = "gateway")]
+    #[garde(dive)]
+    pub gateway: GatewayConfig,
+
+    /// Agent behaviour and model configuration.
+    #[serde(alias = "tools")]
+    #[garde(dive)]
+    pub tools: ToolsConfig,
+
+    #[serde(alias = "subagent")]
+    #[garde(dive)]
+    pub subagent: SubagentConfig,
+
+    /// Some example prompts to be displayed in the web chat.
+    #[serde(alias = "example_prompts", default = "default_example_prompts")]
+    #[garde(skip)]
+    pub example_prompts: Vec<String>,
+
+    /// Named model+provider+generation-setting bundles, selectable via
+    /// `agents.modelPreset` (process-wide default) or per-session via
+    /// `/model <name>`. The reserved name `"default"` must not appear as a
+    /// key here — see `validate_model_presets`.
+    #[serde(alias = "model_presets")]
+    #[garde(dive)]
+    pub model_presets: HashMap<String, ModelPresetConfig>,
+
+    /// Crash recovery: run journal, auto-resume of interrupted turns.
+    #[garde(dive)]
+    pub durability: DurabilityConfig,
+}
+
+impl Config {
+    pub fn workspace_path(&self) -> PathBuf {
+        let workspace = &self.agents.workspace;
+        PathBuf::from(expand_tilde_path(workspace).as_ref())
+    }
+
+    fn match_provider(&self, model: Option<&str>) -> (Option<&ProviderConfig>, Option<String>) {
+        let forced = self.agents.provider.clone();
+        if forced != "auto" {
+            let spec_option = find_by_name(forced.as_str());
+            if let Some(spec) = spec_option {
+                return (Some(&self.providers.custom), Some(spec.name.clone()));
+            } else {
+                return (None, None);
+            }
+        }
+
+        let model_lower = model
+            .map(|m| m.to_lowercase())
+            .unwrap_or(self.agents.model.to_lowercase());
+        let model_replaced = model_lower.replace('-', "_");
+        let model_normalized = model_replaced.as_str();
+        let model_prefix = if model_lower.contains('/') {
+            model_lower.split('/').next().unwrap_or(&model_lower)
+        } else {
+            ""
+        };
+        let normalized_prefix = model_prefix.replace('-', "_").to_lowercase();
+
+        fn kw_matches(kw: &str, model_lower: &str, model_normalized: &str) -> bool {
+            let kw_lower = kw.to_lowercase();
+            model_lower.contains(kw_lower.as_str())
+                || model_normalized.contains(&kw_lower.replace('-', "_"))
+        }
+
+        for spec in providers() {
+            let p = self.providers.get_by_name(&spec.name);
+            if let Some(p) = p {
+                if !model_prefix.is_empty()
+                    && normalized_prefix == spec.name
+                    && (spec.is_oauth || spec.is_local || !p.api_key.is_empty())
+                {
+                    return (Some(p), Some(spec.name.clone()));
+                }
+                if spec
+                    .keywords
+                    .iter()
+                    .any(|kw| kw_matches(kw, &model_lower, model_normalized))
+                    && (spec.is_oauth || spec.is_local || !p.api_key.is_empty())
+                {
+                    return (Some(p), Some(spec.name.clone()));
+                }
+            }
+        }
+
+        // Fallback: configured local providers can route models without
+        // provider-specific keywords (e.g. plain "llama3.2" on Ollama).
+        // Prefer providers whose detect_by_base_keyword matches the configured
+        // api_base (e.g. Ollama's "11434" in "http://localhost:11434") over
+        // plain registry order.
+        let mut local_fallback: Option<(&ProviderConfig, String)> = None;
+        for spec in providers() {
+            if !spec.is_local {
+                continue;
+            }
+            let Some(p) = self.providers.get_by_name(&spec.name) else {
+                continue;
+            };
+            if p.api_base.is_none() {
+                continue;
+            }
+            let api_base = p.api_base.as_deref().unwrap_or("");
+            log::info!("api_base: {}", api_base);
+            log::info!(
+                "spec.detect_by_base_keyword: {}",
+                spec.detect_by_base_keyword
+            );
+            if !spec.detect_by_base_keyword.is_empty()
+                && api_base.contains(&spec.detect_by_base_keyword)
+            {
+                return (Some(p), Some(spec.name));
+            }
+            if local_fallback.is_none() {
+                local_fallback = Some((p, spec.name));
+            }
+        }
+        if let Some((p, name)) = local_fallback {
+            return (Some(p), Some(name));
+        }
+
+        // Last resort: return the first non-OAuth provider that has an API key configured.
+        for spec in providers() {
+            if spec.is_oauth {
+                continue;
+            }
+            let Some(p) = self.providers.get_by_name(&spec.name) else {
+                continue;
+            };
+            if !p.api_key.is_empty() {
+                return (Some(p), Some(spec.name));
+            }
+        }
+
+        (None, None)
+    }
+
+    /// Get matched provider config (api_key, api_base, extra_headers). Falls back to first available.
+    pub fn get_provider(&self, model: Option<&str>) -> Option<&ProviderConfig> {
+        let (p, _) = self.match_provider(model);
+        p
+    }
+
+    pub fn get_provider_name(&self, model: Option<&str>) -> Option<String> {
+        let (_, name) = self.match_provider(model);
+        name
+    }
+
+    pub fn get_api_key(&self, model: Option<&str>) -> Option<String> {
+        self.get_provider(model).map(|p| p.api_key.clone())
+    }
+
+    /// Get the API base URL for the given model.
+    ///
+    /// Returns the explicitly configured `api_base` first. For gateway and local
+    /// providers that have no explicit base URL, falls back to the registry default.
+    /// Standard providers resolve their base URL inside the provider constructor.
+    pub fn get_api_base(&self, model: Option<&str>) -> Option<String> {
+        let (p, name) = self.match_provider(model);
+
+        if let Some(p) = p
+            && p.api_base.is_some()
+        {
+            return p.api_base.clone();
+        }
+
+        if let Some(name) = name
+            && let Some(spec) = crate::providers::registry::find_by_name(&name)
+            && (spec.is_gateway || spec.is_local)
+            && spec.default_api_base.is_some()
+        {
+            return spec.default_api_base;
+        }
+
+        None
+    }
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            agents: AgentsConfig::default(),
+            channels: ChannelsConfig::default(),
+            providers: ProvidersConfig::default(),
+            api: ApiConfig::default(),
+            gateway: GatewayConfig::default(),
+            tools: ToolsConfig::default(),
+            subagent: SubagentConfig::default(),
+            example_prompts: default_example_prompts(),
+            model_presets: HashMap::new(),
+            durability: DurabilityConfig::default(),
+        }
+    }
+}
+
+// ── DurabilityConfig ────────────────────────────────────────────────────────────────────
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_resume_max_age_secs() -> u64 {
+    24 * 60 * 60
+}
+
+fn default_max_resume_attempts() -> u32 {
+    2
+}
+
+fn default_max_concurrent_resumes() -> usize {
+    4
+}
+
+fn default_ledger_ttl_days() -> u64 {
+    14
+}
+
+fn default_ledger_max_entries() -> usize {
+    1000
+}
+
+/// Crash-recovery settings (`durability` in the config file).
+#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[serde(rename_all = "camelCase", default)]
+pub struct DurabilityConfig {
+    /// Resume turns that a crash interrupted when the gateway or API starts.
+    /// Default: `true`. When `false` an interrupted turn is only merged into
+    /// the session transcript on the session's next message.
+    #[serde(default = "default_true")]
+    #[garde(skip)]
+    pub auto_resume: bool,
+
+    /// Turns older than this many seconds are not resumed (stale tool calls
+    /// would act on outdated state). Default: 86400 (24 h).
+    #[serde(default = "default_resume_max_age_secs")]
+    #[garde(skip)]
+    pub resume_max_age_secs: u64,
+
+    /// How often one turn may be resumed before it is abandoned, which stops a
+    /// turn that kills the process from crash-looping. Default: 2.
+    #[serde(default = "default_max_resume_attempts")]
+    #[garde(skip)]
+    pub max_resume_attempts: u32,
+
+    /// Interrupted turns resumed in parallel at startup. Default: 4.
+    #[serde(default = "default_max_concurrent_resumes")]
+    #[garde(skip)]
+    pub max_concurrent_resumes: usize,
+
+    /// How long the inbox ledger remembers an answered request id, in days.
+    /// A redelivery after that is processed again. Default: 14.
+    #[serde(default = "default_ledger_ttl_days")]
+    #[garde(skip)]
+    pub ledger_ttl_days: u64,
+
+    /// Most answered request ids the ledger keeps per session. Default: 1000.
+    #[serde(default = "default_ledger_max_entries")]
+    #[garde(skip)]
+    pub ledger_max_entries: usize,
+}
+
+impl Default for DurabilityConfig {
+    fn default() -> Self {
+        Self {
+            auto_resume: default_true(),
+            resume_max_age_secs: default_resume_max_age_secs(),
+            max_resume_attempts: default_max_resume_attempts(),
+            max_concurrent_resumes: default_max_concurrent_resumes(),
+            ledger_ttl_days: default_ledger_ttl_days(),
+            ledger_max_entries: default_ledger_max_entries(),
+        }
+    }
+}
+
+/// Reserved `model_presets` key: always means "use `AgentsConfig`'s own flat
+/// `model`/`provider`/... fields," never a real entry in `model_presets`.
+pub const RESERVED_MODEL_PRESET_NAME: &str = "default";
+
+/// Cross-field checks for `model_presets` that garde's per-struct
+/// `#[derive(Validate)]` can't express (they span sibling fields of `Config`
+/// itself): the reserved name, per-preset emptiness, and that any preset
+/// name referenced elsewhere (`agents.modelPreset`, `agents.dream.dreamModelPreset`)
+/// actually exists. Mirrors nanobot's pydantic `model_validator(mode="after")`
+/// on `Config`. Called from `load_config()`.
+pub fn validate_model_presets(config: &Config) -> Result<(), String> {
+    if config
+        .model_presets
+        .contains_key(RESERVED_MODEL_PRESET_NAME)
+    {
+        return Err(format!(
+            "model_presets: the name '{RESERVED_MODEL_PRESET_NAME}' is reserved (it is \
+             synthesized automatically from agents.model/provider/... for backward \
+             compatibility) and must not be defined explicitly"
+        ));
+    }
+
+    for (name, preset) in &config.model_presets {
+        if preset.model.trim().is_empty() {
+            return Err(format!("model_presets.{name}: 'model' must not be empty"));
+        }
+        if let Err(e) = preset.validate() {
+            return Err(format!("model_presets.{name}: {e}"));
+        }
+    }
+
+    if let Some(selected) = &config.agents.model_preset
+        && selected != RESERVED_MODEL_PRESET_NAME
+        && !config.model_presets.contains_key(selected)
+    {
+        return Err(format!(
+            "agents.modelPreset references unknown preset '{selected}'; known presets: {:?}",
+            config.model_presets.keys().collect::<Vec<_>>()
+        ));
+    }
+
+    if let Some(selected) = &config.agents.dream.dream_model_preset
+        && selected != RESERVED_MODEL_PRESET_NAME
+        && !config.model_presets.contains_key(selected)
+    {
+        return Err(format!(
+            "agents.dream.dreamModelPreset references unknown preset '{selected}'; \
+                 known presets: {:?}",
+            config.model_presets.keys().collect::<Vec<_>>()
+        ));
+    }
+
+    Ok(())
+}
+
+/// Default agent configuration.
+#[derive(Debug, Clone)]
+pub struct AgentDefaults {
+    pub workspace: String,
+    pub model: String,
+    pub provider: String,
+    pub max_tokens: u32,
+    pub context_window_tokens: u64,
+    pub context_block_limit: Option<u32>,
+    pub temperature: f32,
+    pub max_tool_iterations: u32,
+    pub max_tool_result_chars: u32,
+    pub provider_retry_mode: ProviderRetryMode,
+    pub reasoning_effort: Option<String>,
+    pub timezone: String,
+    pub dream: DreamConfig,
+}
+
+impl Default for AgentDefaults {
+    fn default() -> Self {
+        Self {
+            workspace: default_agent_workspace(),
+            model: default_agent_model(),
+            provider: default_agent_provider(),
+            max_tokens: default_agent_max_tokens(),
+            context_window_tokens: default_agent_context_window_tokens(),
+            context_block_limit: None,
+            temperature: default_agent_temperature(),
+            max_tool_iterations: default_agent_max_tool_iterations(),
+            max_tool_result_chars: default_agent_max_tool_result_chars(),
+            provider_retry_mode: default_agent_provider_retry_mode(),
+            reasoning_effort: default_agent_reasoning_effort(),
+            timezone: default_agent_timezone(),
+            dream: default_agent_dream_config(),
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn durability_defaults_apply_when_the_section_or_its_keys_are_absent() {
+        let absent: Config = serde_json::from_str("{}").unwrap();
+        let partial: Config =
+            serde_json::from_str(r#"{"durability": {"maxResumeAttempts": 5}}"#).unwrap();
+
+        for durability in [&absent.durability, &partial.durability] {
+            assert!(durability.auto_resume);
+            assert_eq!(durability.resume_max_age_secs, 86_400);
+            assert_eq!(durability.max_concurrent_resumes, 4);
+            assert_eq!(durability.ledger_ttl_days, 14);
+            assert_eq!(durability.ledger_max_entries, 1000);
+        }
+        assert_eq!(absent.durability.max_resume_attempts, 2);
+        assert_eq!(partial.durability.max_resume_attempts, 5);
+    }
+
+    use super::*;
+
+    #[test]
+    fn test_defaults() {
+        let cfg = ChannelsConfig::default();
+        assert!(cfg.send_progress);
+        assert!(cfg.send_tool_hints);
+        assert!(cfg.show_reasoning);
+        assert_eq!(cfg.send_max_retries, 3);
+        assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
+        assert!(cfg.extra.is_empty());
+    }
+
+    #[test]
+    fn test_deserialize_camel_case() {
+        let json = r#"{"sendProgress": false, "sendMaxRetries": 5, "showReasoning": false}"#;
+        let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.send_progress);
+        assert_eq!(cfg.send_max_retries, 5);
+        assert!(!cfg.show_reasoning);
+        assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_snake_case_alias() {
+        let json = r#"{"send_progress": false, "send_max_retries": 2}"#;
+        let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.send_progress);
+        assert_eq!(cfg.send_max_retries, 2);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_deserialize_extra_fields() {
+        let json = r#"{"telegram": {"token": "abc123"}, "slack": {"webhook": "https://hooks.slack.com/x"}}"#;
+        let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.extra.contains_key("telegram"));
+        assert!(cfg.extra.contains_key("slack"));
+        assert_eq!(cfg.send_max_retries, default_send_max_retries());
+    }
+
+    #[test]
+    fn test_retries_out_of_range_fails_validation() {
+        let json = r#"{"sendMaxRetries": 11}"#;
+        let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+        assert_eq!(cfg.transcription_provider, Some("groq".to_string()));
+        assert_eq!(cfg.send_progress, default_send_progress());
+    }
+
+    #[test]
+    fn test_transcription_provider_null_is_none() {
+        let json = r#"{"transcriptionProvider": null}"#;
+        let cfg: ChannelsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transcription_provider, None);
+    }
+
+    #[test]
+    fn test_dream_defaults() {
+        let cfg = DreamConfig::default();
+        assert_eq!(cfg.interval_h, default_dream_interval_h());
+        assert_eq!(cfg.max_batch_size, default_dream_max_batch_size());
+        assert_eq!(cfg.max_iterations, default_dream_max_iterations());
+        assert_eq!(cfg.model_override, None);
+        assert_eq!(cfg.cron, None);
+    }
+
+    #[test]
+    fn test_dream_deserialize_camel_case() {
+        let interval_h = 4;
+        let max_batch_size = 25;
+        let max_iterations = 30;
+        let json = format!(
+            "{{\"intervalH\": {interval_h}, \"maxBatchSize\": {max_batch_size}, \"maxIterations\": {max_iterations}}}"
+        );
+        let cfg: DreamConfig = serde_json::from_str(&json).unwrap();
+        assert_eq!(cfg.interval_h, interval_h);
+        assert_eq!(cfg.max_batch_size, max_batch_size);
+        assert_eq!(cfg.max_iterations, max_iterations);
+        assert_eq!(cfg.model_override, None);
+        assert_eq!(cfg.cron, None);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dream_deserialize_snake_case_aliases() {
+        let json = r#"{"interval_h": 6, "max_batch_size": 10, "max_iterations": 5}"#;
+        let cfg: DreamConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.interval_h, 6);
+        assert_eq!(cfg.max_batch_size, 10);
+        assert_eq!(cfg.max_iterations, 5);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dream_deserialize_model_override_aliases() {
+        // "model" alias
+        let cfg: DreamConfig = serde_json::from_str(r#"{"model": "gpt-4o"}"#).unwrap();
+        assert_eq!(cfg.model_override.as_deref(), Some("gpt-4o"));
+
+        // "model_override" alias
+        let cfg: DreamConfig = serde_json::from_str(r#"{"model_override": "claude-3"}"#).unwrap();
+        assert_eq!(cfg.model_override.as_deref(), Some("claude-3"));
+
+        // "modelOverride" camelCase (from rename_all)
+        let cfg: DreamConfig = serde_json::from_str(r#"{"modelOverride": "mistral"}"#).unwrap();
+        assert_eq!(cfg.model_override.as_deref(), Some("mistral"));
+    }
+
+    #[test]
+    fn test_dream_validation_rejects_zero_values() {
+        let json = r#"{"intervalH": 0, "maxBatchSize": 0, "maxIterations": 0}"#;
+        let cfg: DreamConfig = serde_json::from_str(json).unwrap();
+        let result = cfg.validate();
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_dream_describe_schedule_interval() {
+        let cfg = DreamConfig {
+            interval_h: 6,
+            ..DreamConfig::default()
+        };
+        assert_eq!(cfg.describe_schedule(), "every 6h");
+    }
+
+    #[test]
+    fn test_dream_describe_schedule_cron() {
+        let cfg = DreamConfig {
+            cron: Some("0 3 * * *".to_string()),
+            ..DreamConfig::default()
+        };
+        assert_eq!(cfg.describe_schedule(), "cron 0 3 * * * (legacy)");
+    }
+
+    #[test]
+    fn test_dream_cron_excluded_from_serialization() {
+        let cfg = DreamConfig {
+            cron: Some("0 2 * * *".to_string()),
+            interval_h: 4,
+            ..DreamConfig::default()
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        // cron is marked skip_serializing so it must not appear in output
+        assert!(!json.contains("cron"));
+        // other fields are serialized normally
+        assert!(json.contains("intervalH") || json.contains("interval_h") || json.contains("4"));
+    }
+
+    #[test]
+    fn test_agents_config_default() {
+        let cfg = AgentsConfig::default();
+        assert_eq!(cfg.workspace, default_agent_workspace());
+        assert_eq!(cfg.model, default_agent_model());
+        assert_eq!(cfg.provider, default_agent_provider());
+        assert_eq!(cfg.max_tokens, default_agent_max_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
+        assert_eq!(cfg.context_block_limit, None);
+        assert_eq!(cfg.temperature, default_agent_temperature());
+        assert_eq!(cfg.max_tool_iterations, default_agent_max_tool_iterations());
+        assert_eq!(
+            cfg.max_tool_result_chars,
+            default_agent_max_tool_result_chars()
+        );
+        assert_eq!(cfg.mode, default_agent_mode());
+        assert_eq!(
+            cfg.session_eviction_threshold_hours,
+            default_agent_session_eviction_threshold_hours()
+        );
+        assert_eq!(
+            cfg.session_eviction_cron_interval_hours,
+            default_agent_session_eviction_cron_interval_hours()
+        );
+        assert_eq!(
+            cfg.idle_compact_check_interval_seconds,
+            default_agent_idle_compact_check_interval_seconds()
+        );
+        assert_eq!(cfg.session_ttl_minutes, default_agent_session_ttl_minutes());
+    }
+
+    #[test]
+    fn test_agents_config_session_eviction_settings_from_json() {
+        let omitted: AgentsConfig = serde_json::from_str(r#"{"model": "mistral"}"#).unwrap();
+        assert_eq!(
+            omitted.session_eviction_threshold_hours,
+            default_agent_session_eviction_threshold_hours()
+        );
+        assert_eq!(
+            omitted.session_eviction_cron_interval_hours,
+            default_agent_session_eviction_cron_interval_hours()
+        );
+
+        let camel: AgentsConfig = serde_json::from_str(
+            r#"{"sessionEvictionThresholdHours": 12, "sessionEvictionCronIntervalHours": 4}"#,
+        )
+        .unwrap();
+        assert_eq!(camel.session_eviction_threshold_hours, 12);
+        assert_eq!(camel.session_eviction_cron_interval_hours, 4);
+
+        let snake: AgentsConfig = serde_json::from_str(
+            r#"{"session_eviction_threshold_hours": 9, "session_eviction_cron_interval_hours": 2}"#,
+        )
+        .unwrap();
+        assert_eq!(snake.session_eviction_threshold_hours, 9);
+        assert_eq!(snake.session_eviction_cron_interval_hours, 2);
+    }
+
+    #[test]
+    fn test_agents_config_mode_defaults_to_standard_and_accepts_minimal() {
+        let cfg: AgentsConfig = serde_json::from_str(r#"{"model": "mistral"}"#).unwrap();
+        assert_eq!(cfg.mode, crate::agent::modes::AgentMode::Standard);
+        let cfg: AgentsConfig = serde_json::from_str(r#"{"mode": "minimal"}"#).unwrap();
+        assert_eq!(cfg.mode, crate::agent::modes::AgentMode::Minimal);
+    }
+
+    #[test]
+    fn test_agents_config_agent_model() {
+        let cfg: AgentsConfig = serde_json::from_str(r#"{"model": "mistral"}"#).unwrap();
+        assert_eq!(cfg.model, "mistral");
+        assert_eq!(cfg.workspace, default_agent_workspace());
+        assert_eq!(cfg.provider, default_agent_provider());
+        assert_eq!(cfg.max_tokens, default_agent_max_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
+        assert_eq!(cfg.context_block_limit, None);
+        assert_eq!(cfg.temperature, default_agent_temperature());
+        assert_eq!(cfg.max_tool_iterations, default_agent_max_tool_iterations());
+        assert_eq!(
+            cfg.max_tool_result_chars,
+            default_agent_max_tool_result_chars()
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_provider_config_default() {
+        let cfg = ProviderConfig::default();
+        assert_eq!(cfg.api_key, String::new());
+        assert_eq!(cfg.api_base, None);
+        assert_eq!(cfg.extra_headers, None);
+    }
+
+    #[test]
+    fn test_provider_config_deserialize_camel_case() {
+        let json = r#"{"apiKey": "abc123", "apiBase": "https://api.provider.com", "extraHeaders": {"APP-Code": "123456"}}"#;
+        let cfg: ProviderConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.api_key, "abc123");
+        assert_eq!(cfg.api_base, Some("https://api.provider.com".to_string()));
+        assert_eq!(
+            cfg.extra_headers,
+            Some(HashMap::from([(
+                "APP-Code".to_string(),
+                "123456".to_string()
+            )]))
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_providers_config_deserialize_snake_case_aliases() {
+        let json = r#"{"openrouter": {"apiKey": "abc123", "apiBase": "https://api.provider.com", "extraHeaders": {"APP-Code": "123456"}}}"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.openrouter.api_key, "abc123");
+        assert_eq!(
+            cfg.openrouter.api_base,
+            Some("https://api.provider.com".to_string())
+        );
+        assert_eq!(
+            cfg.openrouter.extra_headers,
+            Some(HashMap::from([(
+                "APP-Code".to_string(),
+                "123456".to_string()
+            )]))
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_providers_config_default_all_empty() {
+        let cfg = ProvidersConfig::default();
+        for provider in [
+            &cfg.custom,
+            &cfg.azure_openai,
+            &cfg.anthropic,
+            &cfg.openai,
+            &cfg.openrouter,
+        ] {
+            assert_eq!(provider.api_key, "");
+            assert_eq!(provider.api_base, None);
+            assert_eq!(provider.extra_headers, None);
+        }
+    }
+
+    #[test]
+    fn test_providers_config_absent_providers_default() {
+        // Only "anthropic" is provided; all other providers should have empty defaults.
+        let json = r#"{"anthropic": {"apiKey": "sk-ant-123"}}"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.anthropic.api_key, "sk-ant-123");
+        assert_eq!(cfg.openai.api_key, "");
+        assert_eq!(cfg.openrouter.api_key, "");
+        assert_eq!(cfg.azure_openai.api_key, "");
+        assert_eq!(cfg.custom.api_key, "");
+    }
+
+    #[test]
+    fn test_providers_config_multiple_providers() {
+        let json = r#"{
+            "openai": {"apiKey": "sk-openai"},
+            "anthropic": {"apiKey": "sk-anthropic"},
+            "openrouter": {"apiKey": "sk-openrouter"}
+        }"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.openai.api_key, "sk-openai");
+        assert_eq!(cfg.anthropic.api_key, "sk-anthropic");
+        assert_eq!(cfg.openrouter.api_key, "sk-openrouter");
+        assert_eq!(cfg.azure_openai.api_key, "");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_providers_config_azure_openai_snake_case_alias() {
+        let json = r#"{"azure_openai": {"apiKey": "az-key", "apiBase": "https://mydeployment.openai.azure.com"}}"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.azure_openai.api_key, "az-key");
+        assert_eq!(
+            cfg.azure_openai.api_base,
+            Some("https://mydeployment.openai.azure.com".to_string())
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_providers_config_azure_openai_camel_case() {
+        let json = r#"{"azureOpenai": {"apiKey": "az-key"}}"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.azure_openai.api_key, "az-key");
+    }
+
+    #[test]
+    fn test_providers_config_custom_provider() {
+        let json = r#"{"custom": {"apiKey": "local-key", "apiBase": "http://localhost:11434/v1"}}"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.custom.api_key, "local-key");
+        assert_eq!(
+            cfg.custom.api_base,
+            Some("http://localhost:11434/v1".to_string())
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── HeartbeatConfig ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_heartbeat_defaults() {
+        let cfg = HeartbeatConfig::default();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval_s, 30 * 60);
+        assert_eq!(cfg.keep_recent_messages, 8);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_deserialize_camel_case() {
+        let json = r#"{"enabled": false, "intervalS": 600, "keepRecentMessages": 4}"#;
+        let cfg: HeartbeatConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.interval_s, 600);
+        assert_eq!(cfg.keep_recent_messages, 4);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_deserialize_snake_case_aliases() {
+        let json = r#"{"enabled": true, "interval_s": 120, "keep_recent_messages": 16}"#;
+        let cfg: HeartbeatConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval_s, 120);
+        assert_eq!(cfg.keep_recent_messages, 16);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_heartbeat_absent_fields_use_defaults() {
+        // Only "enabled" is supplied; other fields fall back to defaults.
+        let json = r#"{"enabled": false}"#;
+        let cfg: HeartbeatConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.interval_s, default_heartbeat_interval_s());
+        assert_eq!(
+            cfg.keep_recent_messages,
+            default_heartbeat_keep_recent_messages()
+        );
+    }
+
+    #[test]
+    fn test_heartbeat_validation_rejects_zero_interval() {
+        let json = r#"{"intervalS": 0}"#;
+        let cfg: HeartbeatConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_heartbeat_validation_rejects_zero_keep_recent() {
+        let json = r#"{"keepRecentMessages": 0}"#;
+        let cfg: HeartbeatConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── ApiConfig ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_api_defaults() {
+        let cfg = ApiConfig::default();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8900);
+        assert_eq!(cfg.timeout, 120.0);
+        assert!(!cfg.jwt.enabled);
+        assert_eq!(cfg.jwt.iss, "rust-bot");
+        assert_eq!(cfg.jwt.aud, "/ws");
+        assert!(cfg.cors.enabled);
+        assert_eq!(cfg.cors.origins, vec!["*".to_string()]);
+        assert_eq!(cfg.web_root, None);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_web_root_deserialize() {
+        let json = r#"{"webRoot": "./web"}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.web_root, Some("./web".to_string()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_deserialize_nested_under_api() {
+        let json = r#"{
+            "cors": {
+                "enabled": true,
+                "origins": ["https://app.example.com", "http://localhost:5173"]
+            }
+        }"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.cors.enabled);
+        assert_eq!(
+            cfg.cors.origins,
+            vec![
+                "https://app.example.com".to_string(),
+                "http://localhost:5173".to_string()
+            ]
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_cors_can_be_disabled() {
+        let json = r#"{"cors": {"enabled": false}}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.cors.enabled);
+        assert_eq!(cfg.cors.origins, vec!["*".to_string()]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_deserialize_camel_case() {
+        let json = r#"{"host": "0.0.0.0", "port": 9000, "timeout": 30.5}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 9000);
+        assert_eq!(cfg.timeout, 30.5);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_absent_fields_use_defaults() {
+        let json = r#"{"port": 8080}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, default_api_host());
+        assert_eq!(cfg.port, 8080);
+        assert_eq!(cfg.timeout, default_api_timeout());
+    }
+
+    #[test]
+    fn test_api_empty_object_uses_all_defaults() {
+        let cfg: ApiConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 8900);
+        assert_eq!(cfg.timeout, 120.0);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_api_validation_rejects_port_zero() {
+        let json = r#"{"port": 0}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_api_validation_rejects_negative_timeout() {
+        let json = r#"{"timeout": -1.0}"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── JwtConfig ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_jwt_defaults() {
+        let cfg = JwtConfig::default();
+        assert!(!cfg.enabled);
+        assert_eq!(
+            cfg.private_key_path,
+            "./.rust-bot/credentials/private_key.pem"
+        );
+        assert_eq!(
+            cfg.public_key_path,
+            "./.rust-bot/credentials/public_key.pem"
+        );
+        assert_eq!(cfg.iss, "rust-bot");
+        assert_eq!(cfg.aud, DEFAULT_AUD);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_jwt_enabled_requires_non_empty_aud() {
+        let cfg = JwtConfig {
+            enabled: true,
+            aud: String::new(),
+            ..JwtConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_jwt_enabled_with_aud_ok() {
+        let cfg = JwtConfig {
+            enabled: true,
+            aud: "https://api.example.com".to_string(),
+            ..JwtConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_jwt_deserialize_nested_under_api() {
+        let json = r#"{
+            "jwt": {
+                "enabled": true,
+                "privateKeyPath": "/keys/private_key.pem",
+                "publicKeyPath": "/keys/public_key.pem",
+                "iss": "my-bot",
+                "aud": "https://api.example.com"
+            }
+        }"#;
+        let cfg: ApiConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.jwt.enabled);
+        assert_eq!(cfg.jwt.private_key_path, "/keys/private_key.pem");
+        assert_eq!(cfg.jwt.public_key_path, "/keys/public_key.pem");
+        assert_eq!(cfg.jwt.iss, "my-bot");
+        assert_eq!(cfg.jwt.aud, "https://api.example.com");
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── GatewayConfig ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_gateway_defaults() {
+        let cfg = GatewayConfig::default();
+        assert_eq!(cfg.host, "0.0.0.0");
+        assert_eq!(cfg.port, 18790);
+        // nested HeartbeatConfig should also have its own defaults
+        assert!(cfg.heartbeat.enabled);
+        assert_eq!(cfg.heartbeat.interval_s, 30 * 60);
+        assert_eq!(cfg.heartbeat.keep_recent_messages, 8);
+        assert_eq!(cfg.web_root, None);
+        assert!(cfg.strapi_sso.strapi_url.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_strapi_sso_deserialize() {
+        let json = r#"{"strapiSso": {"strapiUrl": "http://localhost:1337"}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.strapi_sso.strapi_url, "http://localhost:1337");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_web_root_deserialize() {
+        let json = r#"{"webRoot": "./websockets-chat-web"}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.web_root, Some("./websockets-chat-web".to_string()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_web_root_deserialize_snake_case_alias() {
+        let json = r#"{"web_root": "./websockets-chat-web"}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.web_root, Some("./websockets-chat-web".to_string()));
+    }
+
+    #[test]
+    fn test_gateway_deserialize_top_level_fields() {
+        let json = r#"{"host": "127.0.0.1", "port": 9090}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, "127.0.0.1");
+        assert_eq!(cfg.port, 9090);
+        // heartbeat not supplied → defaults
+        assert!(cfg.heartbeat.enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_deserialize_nested_heartbeat() {
+        let json =
+            r#"{"heartbeat": {"enabled": false, "intervalS": 300, "keepRecentMessages": 4}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, default_gateway_host());
+        assert_eq!(cfg.port, default_gateway_port());
+        assert!(!cfg.heartbeat.enabled);
+        assert_eq!(cfg.heartbeat.interval_s, 300);
+        assert_eq!(cfg.heartbeat.keep_recent_messages, 4);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_deserialize_snake_case_aliases() {
+        let json = r#"{"host": "10.0.0.1", "port": 18791, "heartbeat": {"interval_s": 60}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.host, "10.0.0.1");
+        assert_eq!(cfg.port, 18791);
+        assert_eq!(cfg.heartbeat.interval_s, 60);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_validation_rejects_port_zero() {
+        let json = r#"{"port": 0}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_gateway_validation_propagates_nested_error() {
+        // heartbeat.intervalS = 0 should fail garde validation on the nested struct
+        let json = r#"{"heartbeat": {"intervalS": 0}}"#;
+        let cfg: GatewayConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── WebSearchConfig ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_web_search_defaults() {
+        let cfg = WebSearchConfig::default();
+        assert_eq!(cfg.provider, WebSearchProvider::ExaFree);
+        assert_eq!(cfg.api_key, "");
+        assert_eq!(cfg.base_url, "");
+        assert_eq!(cfg.max_results, 20);
+        assert_eq!(cfg.timeout, 30);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_search_deserialize_camel_case() {
+        let json = r#"{"provider": "brave", "apiKey": "bk-123", "maxResults": 10, "timeout": 60}"#;
+        let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::Brave);
+        assert_eq!(cfg.api_key, "bk-123");
+        assert_eq!(cfg.max_results, 10);
+        assert_eq!(cfg.timeout, 60);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_search_deserialize_snake_case_aliases() {
+        let json = r#"{"provider": "exa", "api_key": "", "base_url": "http://localhost:8080", "max_results": 3, "timeout": 15}"#;
+        let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::Exa);
+        assert_eq!(cfg.base_url, "http://localhost:8080");
+        assert_eq!(cfg.max_results, 3);
+        assert_eq!(cfg.timeout, 15);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_search_absent_fields_use_defaults() {
+        let json = r#"{"provider": "exa"}"#;
+        let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::Exa);
+        assert_eq!(cfg.max_results, default_web_search_max_results());
+        assert_eq!(cfg.timeout, default_web_search_timeout());
+        assert_eq!(cfg.api_key, "");
+        assert_eq!(cfg.base_url, "");
+    }
+
+    #[test]
+    fn test_web_search_exa_free_round_trip() {
+        let cfg: WebSearchConfig = serde_json::from_str(r#"{"provider": "exa_free"}"#).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::ExaFree);
+        assert_eq!(
+            serde_json::to_value(WebSearchProvider::ExaFree).unwrap(),
+            serde_json::json!("exa_free")
+        );
+        assert_eq!(WebSearchProvider::ExaFree.as_str(), "exa_free");
+    }
+
+    #[test]
+    fn test_web_search_deserialize_duckduckgo_explicit() {
+        let cfg: WebSearchConfig = serde_json::from_str(r#"{"provider": "duckduckgo"}"#).unwrap();
+        assert_eq!(cfg.provider, WebSearchProvider::DuckDuckGo);
+    }
+
+    #[test]
+    fn test_web_search_deserialize_rejects_unknown_provider() {
+        let json = r#"{"provider": "tavily"}"#;
+        assert!(serde_json::from_str::<WebSearchConfig>(json).is_err());
+    }
+
+    #[test]
+    fn test_web_search_validation_rejects_zero_max_results() {
+        let json = r#"{"maxResults": 0}"#;
+        let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_web_search_validation_rejects_zero_timeout() {
+        let json = r#"{"timeout": 0}"#;
+        let cfg: WebSearchConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── WebToolsConfig ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_web_tools_defaults() {
+        let cfg = WebToolsConfig::default();
+        assert!(cfg.enable);
+        assert_eq!(cfg.proxy, None);
+        assert_eq!(cfg.timeout, 60);
+        // nested search should carry WebSearchConfig defaults
+        assert_eq!(cfg.search.provider, WebSearchProvider::ExaFree);
+        assert_eq!(cfg.search.max_results, 20);
+        assert_eq!(cfg.search.timeout, 30);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_deserialize_disable() {
+        let json = r#"{"enable": false}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enable);
+        assert_eq!(cfg.proxy, None);
+        assert_eq!(cfg.timeout, 60);
+        assert_eq!(cfg.search.provider, WebSearchProvider::ExaFree);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_deserialize_proxy() {
+        let json = r#"{"proxy": "http://127.0.0.1:7890"}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.proxy, Some("http://127.0.0.1:7890".to_string()));
+        assert!(cfg.enable);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_deserialize_socks5_proxy() {
+        let json = r#"{"proxy": "socks5://127.0.0.1:1080"}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.proxy, Some("socks5://127.0.0.1:1080".to_string()));
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_deserialize_timeout() {
+        let json = r#"{"timeout": 45}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.timeout, 45);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_web_tools_validation_rejects_zero_timeout() {
+        let json = r#"{"timeout": 0}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_web_tools_deserialize_nested_search() {
+        let json = r#"{"search": {"provider": "brave", "apiKey": "bk-key", "maxResults": 8}}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.search.provider, WebSearchProvider::Brave);
+        assert_eq!(cfg.search.api_key, "bk-key");
+        assert_eq!(cfg.search.max_results, 8);
+        assert!(cfg.validate().is_ok());
+    }
+
+    // ── QuestionToolConfig ────────────────────────────────────────────────────
+
+    #[test]
+    fn test_question_tool_defaults() {
+        let cfg = QuestionToolConfig::default();
+        assert!(cfg.enabled);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_question_tool_deserialize_disable() {
+        let json = r#"{"enabled": false}"#;
+        let cfg: QuestionToolConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn test_question_tool_deserialize_disable_via_enable_alias() {
+        let json = r#"{"enable": false}"#;
+        let cfg: QuestionToolConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enabled);
+    }
+
+    #[test]
+    fn test_web_tools_validation_propagates_nested_error() {
+        // search.maxResults = 0 should fail garde validation on the nested struct
+        let json = r#"{"search": {"maxResults": 0}}"#;
+        let cfg: WebToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── ExecToolConfig ────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_exec_tool_defaults() {
+        let cfg = ExecToolConfig::default();
+        assert!(cfg.enable);
+        assert_eq!(cfg.timeout, 60);
+        assert_eq!(cfg.path_append, "");
+        assert_eq!(cfg.sandbox, "");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_exec_tool_deserialize_camel_case() {
+        let json = r#"{"enable": false, "timeout": 120, "pathAppend": "/usr/local/bin", "sandbox": "bwrap"}"#;
+        let cfg: ExecToolConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.enable);
+        assert_eq!(cfg.timeout, 120);
+        assert_eq!(cfg.path_append, "/usr/local/bin");
+        assert_eq!(cfg.sandbox, "bwrap");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_exec_tool_deserialize_snake_case_aliases() {
+        let json = r#"{"enable": true, "timeout": 30, "path_append": "/opt/bin", "sandbox": ""}"#;
+        let cfg: ExecToolConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enable);
+        assert_eq!(cfg.timeout, 30);
+        assert_eq!(cfg.path_append, "/opt/bin");
+        assert_eq!(cfg.sandbox, "");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_exec_tool_absent_fields_use_defaults() {
+        let json = r#"{"sandbox": "bwrap"}"#;
+        let cfg: ExecToolConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enable);
+        assert_eq!(cfg.timeout, default_exec_tool_timeout());
+        assert_eq!(cfg.path_append, "");
+        assert_eq!(cfg.sandbox, "bwrap");
+    }
+
+    #[test]
+    fn test_exec_tool_validation_rejects_zero_timeout() {
+        let json = r#"{"timeout": 0}"#;
+        let cfg: ExecToolConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── McpServerConfig ───────────────────────────────────────────────────────
+
+    #[test]
+    fn test_mcp_server_defaults() {
+        let cfg = McpServerConfig::default();
+        assert_eq!(cfg.transport_type, None);
+        assert_eq!(cfg.command, "");
+        assert!(cfg.args.is_empty());
+        assert!(cfg.env.is_empty());
+        assert_eq!(cfg.url, "");
+        assert!(cfg.headers.is_empty());
+        assert_eq!(cfg.tool_timeout, 30);
+        assert_eq!(cfg.enabled_tools, vec!["*"]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_deserialize_stdio() {
+        let json = r#"{
+            "type": "stdio",
+            "command": "npx",
+            "args": ["-y", "@modelcontextprotocol/server-filesystem"],
+            "env": {"NODE_ENV": "production"}
+        }"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transport_type, Some(McpTransportType::Stdio));
+        assert_eq!(cfg.command, "npx");
+        assert_eq!(
+            cfg.args,
+            vec!["-y", "@modelcontextprotocol/server-filesystem"]
+        );
+        assert_eq!(
+            cfg.env.get("NODE_ENV").map(String::as_str),
+            Some("production")
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_deserialize_sse() {
+        let json = r#"{
+            "type": "sse",
+            "url": "http://localhost:8080/sse",
+            "headers": {"Authorization": "Bearer token123"}
+        }"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transport_type, Some(McpTransportType::Sse));
+        assert_eq!(cfg.url, "http://localhost:8080/sse");
+        assert_eq!(
+            cfg.headers.get("Authorization").map(String::as_str),
+            Some("Bearer token123")
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_deserialize_streamable_http() {
+        let json = r#"{"type": "streamableHttp", "url": "https://mcp.example.com/v1"}"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.transport_type, Some(McpTransportType::StreamableHttp));
+        assert_eq!(cfg.url, "https://mcp.example.com/v1");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_enabled_tools_subset() {
+        let json = r#"{"enabledTools": ["read_file", "mcp_fs_write_file"]}"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.enabled_tools, vec!["read_file", "mcp_fs_write_file"]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_enabled_tools_empty_disables_all() {
+        let json = r#"{"enabledTools": []}"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled_tools.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_snake_case_aliases() {
+        let json = r#"{"tool_timeout": 90, "enabled_tools": ["search"]}"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.tool_timeout, 90);
+        assert_eq!(cfg.enabled_tools, vec!["search"]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_validation_rejects_zero_timeout() {
+        let json = r#"{"toolTimeout": 0}"#;
+        let cfg: McpServerConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── ToolsConfig ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_tools_config_defaults() {
+        let cfg = ToolsConfig::default();
+        assert!(cfg.web.enable);
+        assert!(cfg.exec.enable);
+        assert!(!cfg.restrict_to_workspace);
+        assert!(!cfg.confirm_before_execute);
+        assert!(cfg.mcp_servers.is_empty());
+        assert!(cfg.ssrf_whitelist.is_empty());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_restrict_to_workspace() {
+        let json = r#"{"restrictToWorkspace": true}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.restrict_to_workspace);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_confirm_before_execute() {
+        let json = r#"{"confirmBeforeExecute": true}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.confirm_before_execute);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_confirm_before_execute_snake_case_alias() {
+        let json = r#"{"confirm_before_execute": true}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.confirm_before_execute);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_snake_case_alias() {
+        let json = r#"{"restrict_to_workspace": true}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.restrict_to_workspace);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_mcp_servers() {
+        let json = r#"{
+            "mcpServers": {
+                "filesystem": {
+                    "type": "stdio",
+                    "command": "npx",
+                    "args": ["-y", "@modelcontextprotocol/server-filesystem"]
+                },
+                "search": {
+                    "type": "sse",
+                    "url": "http://localhost:8080/sse"
+                }
+            }
+        }"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.mcp_servers.len(), 2);
+        let fs = cfg.mcp_servers.get("filesystem").unwrap();
+        assert_eq!(fs.transport_type, Some(McpTransportType::Stdio));
+        assert_eq!(fs.command, "npx");
+        let search = cfg.mcp_servers.get("search").unwrap();
+        assert_eq!(search.transport_type, Some(McpTransportType::Sse));
+        assert_eq!(search.url, "http://localhost:8080/sse");
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_ssrf_whitelist() {
+        let json = r#"{"ssrfWhitelist": ["100.64.0.0/10", "192.168.0.0/16"]}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.ssrf_whitelist, vec!["100.64.0.0/10", "192.168.0.0/16"]);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_nested_web_override() {
+        let json = r#"{"web": {"enable": false, "search": {"provider": "brave"}}}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(!cfg.web.enable);
+        assert_eq!(cfg.web.search.provider, WebSearchProvider::Brave);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_validation_propagates_nested_error() {
+        // exec.timeout = 0 should bubble up through #[garde(dive)]
+        let json = r#"{"exec": {"timeout": 0}}"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    // ── Config ────────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_config_defaults() {
+        let cfg = Config::default();
+        assert_eq!(cfg.agents.model, default_agent_model());
+        assert_eq!(cfg.agents.workspace, default_agent_workspace());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_empty_object_uses_all_defaults() {
+        let cfg: Config = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.agents.model, default_agent_model());
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_deserialize_nested_agents() {
+        let json = r#"{"agents": {"model": "gpt-4o", "maxTokens": 4096}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.agents.model, "gpt-4o");
+        assert_eq!(cfg.agents.max_tokens, 4096);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_snake_case_alias() {
+        let model = "claude-3-5-sonnet";
+        let json = format!("{{\"agents\": {{\"model\": \"{model}\"}}}}");
+        let cfg: Config = serde_json::from_str(json.as_str()).unwrap();
+        assert_eq!(cfg.agents.model, model);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_validation_propagates_nested_error() {
+        // agents.maxTokens = 0 violates garde(range(min = 1))
+        let json = r#"{"agents": {"maxTokens": 0}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn test_config_channels_config() {
+        let json = r#"{"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"}}"#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        assert!(!cfg.channels.send_progress);
+        assert_eq!(cfg.channels.send_max_retries, 5);
+        assert_eq!(
+            cfg.channels.transcription_provider,
+            Some("test".to_string())
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_match_openai_compat_provider() {
+        let json = r#"
+{
+"providers": {"openai": {"api_key": "test", "model": "gpt-5-mini"}},
+"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"}
+}
+        "#;
+        let cfg: Config = serde_json::from_str(json).unwrap();
+        let p = cfg.get_provider(Some("gpt-5-mini"));
+        let name = cfg.get_provider_name(Some("gpt-5-mini"));
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().api_key, "test");
+        assert!(name.is_some());
+        println!("provider: {:?}", name.unwrap());
+    }
+
+    #[test]
+    fn test_config_match_openai_codex_provider() {
+        let json = r#"
+{
+"providers": {"openai": {"api_key": "test", "model": "gpt-5.2-codex"}},
+"channels": {"sendProgress": false, "sendMaxRetries": 5, "transcriptionProvider": "test"},
+"tools": {"ssrfWhitelist": ["100.64.0.0/10", "192.168.0.0/16"]}
+}
+        "#;
+        let mut cfg: Config = serde_json::from_str(json).unwrap();
+        cfg.agents.provider = "auto".to_string();
+        let p = cfg.get_provider(Some("gpt-5.2-codex"));
+        let name = cfg.get_provider_name(Some("gpt-5.2-codex"));
+        let ssrf_whitelist = cfg.tools.ssrf_whitelist.clone();
+        assert!(p.is_some());
+        assert_eq!(p.unwrap().api_key, "test");
+        assert!(name.is_some());
+        assert_eq!(ssrf_whitelist, vec!["100.64.0.0/10", "192.168.0.0/16"]);
+        println!("provider: {:?}", name.unwrap());
+    }
+
+    #[test]
+    fn test_model_preset_config_defaults() {
+        let cfg = ModelPresetConfig::default();
+        assert_eq!(cfg.model, "");
+        assert_eq!(cfg.provider, "auto");
+        assert_eq!(cfg.max_tokens, default_agent_max_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
+        assert_eq!(cfg.temperature, default_agent_temperature());
+        assert_eq!(cfg.reasoning_effort, None);
+        assert_eq!(cfg.label, None);
+    }
+
+    #[test]
+    fn test_model_preset_config_deserializes_camel_case_and_defaults() {
+        let json = r#"{"model": "anthropic/claude-opus-4-6", "provider": "anthropic", "temperature": 0.5}"#;
+        let cfg: ModelPresetConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg.model, "anthropic/claude-opus-4-6");
+        assert_eq!(cfg.provider, "anthropic");
+        assert_eq!(cfg.temperature, 0.5);
+        assert_eq!(cfg.max_tokens, default_agent_max_tokens());
+        assert_eq!(
+            cfg.context_window_tokens,
+            default_agent_context_window_tokens()
+        );
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_config_rejects_reserved_default_preset_name() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert(
+            RESERVED_MODEL_PRESET_NAME.to_string(),
+            ModelPresetConfig {
+                model: "some-model".to_string(),
+                ..ModelPresetConfig::default()
+            },
+        );
+        assert!(validate_model_presets(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_config_rejects_empty_model_in_preset() {
+        let mut cfg = Config::default();
+        cfg.model_presets
+            .insert("fast".to_string(), ModelPresetConfig::default());
+        let err = validate_model_presets(&cfg).unwrap_err();
+        assert!(err.contains("fast"));
+        assert!(err.contains("must not be empty"));
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_referenced_preset() {
+        let mut cfg = Config::default();
+        cfg.agents.model_preset = Some("nope".to_string());
+        let err = validate_model_presets(&cfg).unwrap_err();
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn test_config_rejects_unknown_referenced_dream_preset() {
+        let mut cfg = Config::default();
+        cfg.agents.dream.dream_model_preset = Some("nope".to_string());
+        let err = validate_model_presets(&cfg).unwrap_err();
+        assert!(err.contains("nope"));
+    }
+
+    #[test]
+    fn test_config_accepts_valid_preset_with_flat_fallback() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert(
+            "fast".to_string(),
+            ModelPresetConfig {
+                model: "openai/gpt-4.1-mini".to_string(),
+                provider: "openai".to_string(),
+                ..ModelPresetConfig::default()
+            },
+        );
+        // agents.model_preset left None -> falls back to implicit "default"; still valid.
+        assert!(validate_model_presets(&cfg).is_ok());
+
+        cfg.agents.model_preset = Some("fast".to_string());
+        assert!(validate_model_presets(&cfg).is_ok());
+
+        cfg.agents.model_preset = Some(RESERVED_MODEL_PRESET_NAME.to_string());
+        assert!(validate_model_presets(&cfg).is_ok());
+    }
+
+    #[test]
+    fn test_config_dive_validates_preset_numeric_ranges() {
+        let mut cfg = Config::default();
+        cfg.model_presets.insert(
+            "bad".to_string(),
+            ModelPresetConfig {
+                model: "openai/gpt-4.1-mini".to_string(),
+                temperature: 5.0,
+                ..ModelPresetConfig::default()
+            },
+        );
+        assert!(validate_model_presets(&cfg).is_err());
+    }
+
+    #[test]
+    fn test_config_model_presets_empty_by_default_is_noop() {
+        let cfg = Config::default();
+        assert!(cfg.model_presets.is_empty());
+        assert!(validate_model_presets(&cfg).is_ok());
+    }
+
+    // ── tools.acp ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn acp_defaults_are_off_and_conservative() {
+        let acp = AcpConfig::default();
+        assert!(!acp.enabled);
+        assert_eq!(acp.max_depth, 2);
+        assert!(acp.allow_dynamic_agents);
+        assert_eq!(acp.default_timeout_secs, 600);
+        assert_eq!(acp.shutdown_grace_secs, 180);
+        assert_eq!(acp.permission_policy, AcpPermissionPolicy::AutoApproveRead);
+        assert_eq!(acp.session_scope, AcpSessionScope::PerParentSession);
+        assert!(acp.launch_presets.is_empty());
+        assert!(!Config::default().tools.acp.enabled);
+    }
+
+    #[test]
+    fn acp_parses_camel_case_and_snake_case() {
+        let camel: AcpConfig = serde_json::from_str(
+            r#"{"enabled": true, "maxDepth": 1, "allowDynamicAgents": false,
+                "defaultTimeoutSecs": 30, "shutdownGraceSecs": 5,
+                "permissionPolicy": "escalate", "sessionScope": "shared",
+                "launchPresets": {"gemini": {"command": ["gemini", "--acp"]}}}"#,
+        )
+        .unwrap();
+        assert!(camel.enabled);
+        assert_eq!(camel.max_depth, 1);
+        assert!(!camel.allow_dynamic_agents);
+        assert_eq!(camel.default_timeout_secs, 30);
+        assert_eq!(camel.shutdown_grace_secs, 5);
+        assert_eq!(camel.permission_policy, AcpPermissionPolicy::Escalate);
+        assert_eq!(camel.session_scope, AcpSessionScope::Shared);
+        assert_eq!(
+            camel.launch_presets["gemini"].command,
+            vec!["gemini", "--acp"]
+        );
+
+        let snake: AcpConfig = serde_json::from_str(
+            r#"{"max_depth": 3, "allow_dynamic_agents": false, "permission_policy": "allow-all"}"#,
+        )
+        .unwrap();
+        assert_eq!(snake.max_depth, 3);
+        assert!(!snake.allow_dynamic_agents);
+        assert_eq!(snake.permission_policy, AcpPermissionPolicy::AllowAll);
+    }
+
+    #[test]
+    fn acp_rejects_an_unknown_policy() {
+        assert!(serde_json::from_str::<AcpConfig>(r#"{"permissionPolicy": "yolo"}"#).is_err());
+        assert!(serde_json::from_str::<AcpConfig>(r#"{"sessionScope": "everyone"}"#).is_err());
+    }
+
+    #[test]
+    fn acp_validation_rejects_zero_timeouts_and_empty_presets() {
+        let zero_timeout: AcpConfig = serde_json::from_str(r#"{"defaultTimeoutSecs": 0}"#).unwrap();
+        assert!(zero_timeout.validate().is_err());
+        let zero_grace: AcpConfig = serde_json::from_str(r#"{"shutdownGraceSecs": 0}"#).unwrap();
+        assert!(zero_grace.validate().is_err());
+        let empty_preset: AcpConfig =
+            serde_json::from_str(r#"{"launchPresets": {"x": {"command": []}}}"#).unwrap();
+        assert!(empty_preset.validate().is_err());
+        assert!(AcpConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn acp_round_trips_inside_the_tools_config() {
+        let mut tools = ToolsConfig::default();
+        tools.acp.enabled = true;
+        tools.acp.permission_policy = AcpPermissionPolicy::Escalate;
+        let text = serde_json::to_string(&tools).unwrap();
+        assert!(text.contains(r#""permissionPolicy":"escalate""#), "{text}");
+        let back: ToolsConfig = serde_json::from_str(&text).unwrap();
+        assert!(back.acp.enabled);
+        assert_eq!(back.acp.permission_policy, AcpPermissionPolicy::Escalate);
+    }
+}

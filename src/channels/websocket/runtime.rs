@@ -20,12 +20,13 @@ use axum::{
 };
 use futures::{SinkExt, StreamExt};
 use regex::Regex;
-use tokio::sync::{Mutex as AsyncMutex, Notify, mpsc};
+use tokio::sync::{Mutex as AsyncMutex, Notify, broadcast, mpsc};
 use uuid::Uuid;
 
 use crate::agent::acp::listing::{AcpAgentSummary, list_acp_rows, summarize_acp_rows};
 use crate::agent::acp::manager::AcpManager;
 use crate::agent::agent_loop::AgentLoop;
+use crate::agent::background_activity::BackgroundActivity;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
 use crate::agent::question_broker::{QuestionChoice, ResolveError};
@@ -4001,6 +4002,9 @@ async fn workspace_scope_or_error(
 async fn hydrate_after_subscribe(chat_id: &str, ws_shared: &WsShared) {
     maybe_push_active_goal_state(chat_id, ws_shared).await;
     maybe_push_turn_run_wall_clock(chat_id, ws_shared).await;
+    if let Some(subagents) = &ws_shared.subagents {
+        maybe_push_background_agents(chat_id, &subagents.activity(), ws_shared).await;
+    }
 }
 
 async fn maybe_push_active_goal_state(chat_id: &str, ws_shared: &WsShared) {
@@ -4166,6 +4170,22 @@ async fn send_goal_status(
     turn_id: Option<String>,
     ws_shared: &WsShared,
 ) {
+    send_goal_status_with_background_agents(chat_id, status, started_at, turn_id, None, ws_shared)
+        .await;
+}
+
+/// [`send_goal_status`] that can also carry `background_agents`: how many
+/// spawned sub-agents are running for the chat. `None` leaves the field out,
+/// which clients read as "no information", never as zero. An additive field, so
+/// readers that only know the nanobot shape ignore it.
+async fn send_goal_status_with_background_agents(
+    chat_id: &str,
+    status: &str,
+    started_at: Option<f64>,
+    turn_id: Option<String>,
+    background_agents: Option<usize>,
+    ws_shared: &WsShared,
+) {
     let recipients = ws_shared.connections.lock().await.senders_for_chat(chat_id);
     if recipients.is_empty() {
         return;
@@ -4183,6 +4203,9 @@ async fn send_goal_status(
     if let Some(turn_id) = turn_id.filter(|t| !t.is_empty()) {
         body["turn_id"] = serde_json::json!(turn_id);
     }
+    if let Some(background_agents) = background_agents {
+        body["background_agents"] = serde_json::json!(background_agents);
+    }
     let raw = body.to_string();
     for (connection_id, tx) in recipients {
         if tx.send(Message::text(raw.clone())).is_err() {
@@ -4195,6 +4218,94 @@ async fn send_goal_status(
                 .await
                 .cleanup_connection(&connection_id);
         }
+    }
+}
+
+/// The chat id of a websocket session key (`websocket:{chat_id}`), or `None`
+/// for a session of another channel.
+fn chat_id_of_session_key(session_key: &str) -> Option<&str> {
+    session_key
+        .strip_prefix(CHANNEL_NAME)?
+        .strip_prefix(':')
+        .filter(|chat_id| !chat_id.is_empty())
+}
+
+/// Send the chat's `goal_status` with the number of running background agents.
+/// `status` and the turn fields come from the turn registry at send time, so the
+/// frame is true to the chat's turn state whether or not a turn is running.
+async fn push_background_agents_status(
+    chat_id: &str,
+    background_agents: usize,
+    ws_shared: &WsShared,
+) {
+    // Scoped so the lock is dropped before the `.await` below.
+    let (status, started_at, turn_id) = {
+        let turn_registry = ws_shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        match turn_registry.websocket_turn_wall_started_at(chat_id) {
+            Some(started_at) => (
+                "running",
+                Some(started_at),
+                turn_registry.websocket_turn_id(chat_id),
+            ),
+            None => ("idle", None, None),
+        }
+    };
+    send_goal_status_with_background_agents(
+        chat_id,
+        status,
+        started_at,
+        turn_id,
+        Some(background_agents),
+        ws_shared,
+    )
+    .await;
+}
+
+/// Replay the chat's running background agents to a client that just
+/// subscribed, so one that joined mid-run (or missed the change that ended
+/// them) is correct. Silent when none run: clients reset to zero on attach.
+async fn maybe_push_background_agents(
+    chat_id: &str,
+    activity: &BackgroundActivity,
+    ws_shared: &WsShared,
+) {
+    let running = activity.snapshot(&get_session_id(chat_id)).spawn_count;
+    if running > 0 {
+        push_background_agents_status(chat_id, running, ws_shared).await;
+    }
+}
+
+/// Forward every change of the running background agents of a websocket chat
+/// to that chat's subscribers, until the tracker is gone. Sessions of other
+/// channels are ignored; a lagging receiver re-reads the current state.
+async fn forward_background_agent_changes(activity: Arc<BackgroundActivity>, ws_shared: WsShared) {
+    let mut changes = activity.subscribe();
+    loop {
+        let (session_key, running) = match changes.recv().await {
+            Ok(change) => (change.session_key, change.snapshot.spawn_count),
+            Err(broadcast::error::RecvError::Lagged(skipped)) => {
+                log::warn!("background agent updates lagged by {skipped}; resyncing");
+                resync_background_agents(&activity, &ws_shared).await;
+                continue;
+            }
+            Err(broadcast::error::RecvError::Closed) => return,
+        };
+        if let Some(chat_id) = chat_id_of_session_key(&session_key) {
+            push_background_agents_status(chat_id, running, &ws_shared).await;
+        }
+    }
+}
+
+/// Send the current count to every chat that has a subscriber, after missed updates.
+async fn resync_background_agents(activity: &BackgroundActivity, ws_shared: &WsShared) {
+    let chat_ids = ws_shared.connections.lock().await.subscribed_chat_ids();
+    for chat_id in chat_ids {
+        let running = activity.snapshot(&get_session_id(&chat_id)).spawn_count;
+        push_background_agents_status(&chat_id, running, ws_shared).await;
     }
 }
 
@@ -4762,7 +4873,17 @@ impl BaseChannel for WebSocketChannel {
             return;
         }
         self.base.running.store(true, Ordering::Relaxed);
+        // Tell each chat's subscribers when its background agents start and end.
+        let background_agent_updates = self.subagents.as_ref().map(|subagents| {
+            tokio::spawn(forward_background_agent_changes(
+                subagents.activity(),
+                self.shared(),
+            ))
+        });
         self.shutdown.notified().await;
+        if let Some(updates) = background_agent_updates {
+            updates.abort();
+        }
         // Mirrors nanobot's `stop()` clearing `_subs`/`_conn_chats`/etc. once
         // the server task is confirmed stopped, so a later `start()` (e.g.
         // after a restart) never inherits stale registry entries.
@@ -11771,6 +11892,185 @@ mod tests {
         assert!(body["started_at"].is_number());
     }
 
+    // --- background agents on goal_status ---
+
+    use crate::agent::background_activity::ActivityKind;
+
+    /// Register a connection subscribed to `chat_id` and return its frame receiver.
+    async fn subscribe_connection(
+        shared: &WsShared,
+        connection_id: &str,
+        chat_id: &str,
+    ) -> mpsc::UnboundedReceiver<Message> {
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register(connection_id, chat_id, tx);
+        rx
+    }
+
+    fn frame_body(message: Message) -> serde_json::Value {
+        serde_json::from_str(&message.into_text().unwrap()).unwrap()
+    }
+
+    /// The next frame, failing the test when none arrives in time.
+    async fn next_frame(rx: &mut mpsc::UnboundedReceiver<Message>) -> serde_json::Value {
+        let message = tokio::time::timeout(std::time::Duration::from_secs(5), rx.recv())
+            .await
+            .expect("a frame within the timeout")
+            .expect("the connection stays open");
+        frame_body(message)
+    }
+
+    #[tokio::test]
+    async fn send_goal_status_leaves_background_agents_out_by_default() {
+        let shared = test_shared("browser");
+        let mut rx = subscribe_connection(&shared, "conn-1", "chat-1").await;
+
+        send_goal_status("chat-1", "idle", None, None, &shared).await;
+
+        assert!(
+            frame_body(rx.try_recv().unwrap())
+                .get("background_agents")
+                .is_none()
+        );
+    }
+
+    #[tokio::test]
+    async fn send_goal_status_can_carry_the_background_agent_count() {
+        let shared = test_shared("browser");
+        let mut rx = subscribe_connection(&shared, "conn-1", "chat-1").await;
+
+        send_goal_status_with_background_agents("chat-1", "idle", None, None, Some(0), &shared)
+            .await;
+        send_goal_status_with_background_agents("chat-1", "idle", None, None, Some(3), &shared)
+            .await;
+
+        assert_eq!(frame_body(rx.try_recv().unwrap())["background_agents"], 0);
+        assert_eq!(frame_body(rx.try_recv().unwrap())["background_agents"], 3);
+    }
+
+    #[test]
+    fn chat_id_of_session_key_only_accepts_websocket_sessions() {
+        assert_eq!(chat_id_of_session_key("websocket:abc"), Some("abc"));
+        assert_eq!(chat_id_of_session_key("websocket:a:b"), Some("a:b"));
+        assert_eq!(chat_id_of_session_key("cli:direct"), None);
+        assert_eq!(chat_id_of_session_key("websocket:"), None);
+        assert_eq!(chat_id_of_session_key("websocketx:abc"), None);
+        assert_eq!(chat_id_of_session_key("websocket"), None);
+    }
+
+    #[tokio::test]
+    async fn background_agents_status_is_idle_when_no_turn_runs() {
+        let shared = test_shared("browser");
+        let mut rx = subscribe_connection(&shared, "conn-1", "chat-1").await;
+
+        push_background_agents_status("chat-1", 2, &shared).await;
+
+        let body = frame_body(rx.try_recv().unwrap());
+        assert_eq!(body["event"], "goal_status");
+        assert_eq!(body["status"], "idle");
+        assert_eq!(body["background_agents"], 2);
+        assert!(body.get("started_at").is_none());
+    }
+
+    #[tokio::test]
+    async fn background_agents_status_keeps_the_running_turn_state() {
+        let shared = test_shared("browser");
+        let mut rx = subscribe_connection(&shared, "conn-1", "chat-1").await;
+        shared
+            .gateway_services
+            .turn_registry
+            .lock()
+            .unwrap()
+            .start_turn("chat-1", "owner-1", Some("turn-1"));
+
+        push_background_agents_status("chat-1", 1, &shared).await;
+
+        let body = frame_body(rx.try_recv().unwrap());
+        assert_eq!(body["status"], "running");
+        assert_eq!(body["turn_id"], "turn-1");
+        assert!(body["started_at"].is_number());
+        assert_eq!(body["background_agents"], 1);
+    }
+
+    #[tokio::test]
+    async fn attaching_replays_running_background_agents() {
+        let shared = test_shared("browser");
+        let mut rx = subscribe_connection(&shared, "conn-1", "chat-1").await;
+        let activity = BackgroundActivity::new();
+        let _guard = activity.begin("websocket:chat-1", ActivityKind::Spawn);
+        let _other_chat = activity.begin("websocket:chat-2", ActivityKind::Spawn);
+
+        maybe_push_background_agents("chat-1", &activity, &shared).await;
+
+        let body = frame_body(rx.try_recv().unwrap());
+        assert_eq!(body["background_agents"], 1);
+        assert!(rx.try_recv().is_err(), "one frame only");
+    }
+
+    #[tokio::test]
+    async fn attaching_says_nothing_when_no_background_agent_runs() {
+        let shared = test_shared("browser");
+        let mut rx = subscribe_connection(&shared, "conn-1", "chat-1").await;
+
+        maybe_push_background_agents("chat-1", &BackgroundActivity::new(), &shared).await;
+
+        assert!(rx.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn changes_are_forwarded_to_the_subscribers_of_that_chat_only() {
+        let shared = test_shared("browser");
+        let mut chat_1 = subscribe_connection(&shared, "conn-1", "chat-1").await;
+        let mut chat_2 = subscribe_connection(&shared, "conn-2", "chat-2").await;
+        let activity = BackgroundActivity::new();
+        let forwarder = tokio::spawn(forward_background_agent_changes(
+            Arc::clone(&activity),
+            shared.clone(),
+        ));
+        // Let the forwarder subscribe before the first change.
+        tokio::task::yield_now().await;
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+
+        // A CLI session is not a chat: nothing is sent for it.
+        let _cli = activity.begin("cli:direct", ActivityKind::Spawn);
+        let guard = activity.begin("websocket:chat-1", ActivityKind::Spawn);
+        let started = next_frame(&mut chat_1).await;
+        assert_eq!(started["chat_id"], "chat-1");
+        assert_eq!(started["background_agents"], 1);
+
+        drop(guard);
+        let ended = next_frame(&mut chat_1).await;
+        assert_eq!(ended["background_agents"], 0);
+
+        assert!(chat_2.try_recv().is_err(), "other chats are not told");
+        assert!(chat_1.try_recv().is_err(), "no frame for the CLI session");
+        forwarder.abort();
+    }
+
+    #[tokio::test]
+    async fn resync_tells_every_subscribed_chat_its_current_count() {
+        let shared = test_shared("browser");
+        let mut chat_1 = subscribe_connection(&shared, "conn-1", "chat-1").await;
+        let mut chat_2 = subscribe_connection(&shared, "conn-2", "chat-2").await;
+        let activity = BackgroundActivity::new();
+        let _guard = activity.begin("websocket:chat-1", ActivityKind::Spawn);
+
+        resync_background_agents(&activity, &shared).await;
+
+        assert_eq!(
+            frame_body(chat_1.try_recv().unwrap())["background_agents"],
+            1
+        );
+        assert_eq!(
+            frame_body(chat_2.try_recv().unwrap())["background_agents"],
+            0
+        );
+    }
+
     // --- send / send_delta / send_reasoning_delta / send_reasoning_end / send_file_edit_events ---
 
     fn test_channel() -> WebSocketChannel {
@@ -12314,6 +12614,80 @@ mod tests {
         assert_eq!(rows[0]["event"], "message");
         assert_eq!(rows[0]["text"], "hi there");
         assert_eq!(rows[0]["turn_phase"], "answer");
+    }
+
+    #[tokio::test]
+    async fn a_reply_to_a_subagent_result_survives_in_the_attach_history() {
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        // The user's own turn, then the reply to a sub-agent's result: the latter
+        // has a turn id of its own and no user row.
+        channel
+            .gateway_services
+            .transcripts
+            .lock()
+            .unwrap()
+            .append_user_message(
+                "chat-1",
+                "spawn two agents",
+                &webui_meta("turn-1"),
+                None,
+                None,
+                None,
+            );
+        let mut first_reply = outbound("chat-1", "both agents are running", None);
+        first_reply.metadata = webui_meta("turn-1");
+        BaseChannel::send(&channel, first_reply).await.unwrap();
+        let mut subagent_reply = outbound("chat-1", "the first agent is done", None);
+        subagent_reply.metadata = webui_meta("system-0123abcd");
+        BaseChannel::send(&channel, subagent_reply).await.unwrap();
+        rx.try_recv().unwrap();
+        rx.try_recv().unwrap();
+
+        let history = channel
+            .gateway_services
+            .transcripts
+            .lock()
+            .unwrap()
+            .chat_history(&get_session_id("chat-1"), 500);
+
+        let contents: Vec<&str> = history
+            .iter()
+            .filter_map(|entry| entry["content"].as_str())
+            .collect();
+        assert_eq!(
+            contents,
+            vec![
+                "spawn two agents",
+                "both agents are running",
+                "the first agent is done"
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_reply_without_webui_markers_is_delivered_live_but_not_recorded() {
+        // The behavior the markers exist to change, kept as a guard that
+        // recording stays opt-in for chats that are not WebUI chats.
+        let channel = test_channel();
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+
+        BaseChannel::send(&channel, outbound("chat-1", "unmarked", None))
+            .await
+            .unwrap();
+
+        rx.try_recv().expect("delivered live");
+        assert!(transcript_rows(&channel, "chat-1").is_empty());
     }
 
     #[tokio::test]

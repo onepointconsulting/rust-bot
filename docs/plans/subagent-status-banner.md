@@ -123,6 +123,12 @@ The websocket path has exactly one lifecycle event, `goal_status` (`status: "run
 - Client logic: pure reducer for the signal map (set, clear on 0, clear on disconnect).
 - Manual check in browser: spawn agents from chat A, confirm chat B shows nothing; reload mid-run; cancel; confirm banner clears.
 
+### M2 status (implemented 2026-10-19, uncommitted on `feature/background-agents-banner`)
+
+Built: `send_goal_status_with_background_agents` (additive `background_agents` field; `send_goal_status` unchanged for existing callers), `forward_background_agent_changes` spawned from `WebSocketChannel::start()` (fans out per chat, reading turn state from the registry at send time), attach replay in `hydrate_after_subscribe`, `ConnectionRegistry::subscribed_chat_ids` for resync after a lagged receiver. Client: `ServerEvent::GoalStatus.background_agents`, `state::background_agents_after` / `background_agents_banner`, `WsContext.background_agents` (reset on attach and on disconnect), `BackgroundAgentsBanner` row above the approval/question cards and composer. No other client parses `goal_status`, so the Step 0 unknown-field check is closed.
+
+Notes: `background_agents` counts spawn tasks only (ACP names arrive in M3). The wording is duplicated in `websockets-chat/src/state.rs` because it is a separate wasm crate. Still to do: the manual browser check below, and rebuilding the UI bundle (`websockets-chat/dist` is git-ignored; `trunk build`).
+
 ### M2 done when
 
 Banner appears and disappears in websockets-chat per chat, survives reload/reconnect, no cross-chat leakage; docs updated (`docs/WEBSOCKETS_CHAT.md` protocol section).

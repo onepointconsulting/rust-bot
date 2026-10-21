@@ -426,6 +426,10 @@ struct WsContext {
     subagents_acp_enabled: RwSignal<bool>,
     /// Whether the reply to the latest `list_subagents` request has arrived.
     subagents_loaded: RwSignal<bool>,
+    /// How many background sub-agents the active chat has running, from the
+    /// `background_agents` field of `goal_status` frames. Reset on attach (the
+    /// gateway re-sends a non-zero count right after) and on disconnect.
+    background_agents: RwSignal<usize>,
     /// Sidebar Summary dialog: `None` when closed, `Some` with empty
     /// `text` while the `get_session_summary` reply is in flight.
     summary_popup: RwSignal<Option<SessionSummaryPopup>>,
@@ -798,10 +802,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             status,
             started_at,
             turn_id,
+            background_agents,
         } => {
             log::info!(
-                "goal status: chat_id={chat_id} status={status} started_at={started_at:?} turn_id={turn_id:?}"
+                "goal status: chat_id={chat_id} status={status} started_at={started_at:?} turn_id={turn_id:?} background_agents={background_agents:?}"
             );
+            ctx.background_agents.update(|running| {
+                *running = state::background_agents_after(*running, background_agents);
+            });
         }
         ServerEvent::Message {
             text,
@@ -918,6 +926,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             );
             adopt_chat_id(ctx, chat_id);
             ctx.chat_error.set(None);
+            // The gateway re-sends a non-zero count right after `attached`.
+            ctx.background_agents.set(0);
             ctx.turn_index.set(HashMap::new());
             ctx.active_turn_id.set(None);
             // A still-open request is re-sent right after `attached`.
@@ -1218,6 +1228,9 @@ fn handle_connection_closed(ctx: WsContext, generation_at_open: u64) {
         return;
     }
     ctx.ws_sender.get_untracked().borrow_mut().take();
+    // Nothing reports changes while offline; the re-attach after a reconnect
+    // brings back the real count.
+    ctx.background_agents.set(0);
     let should_reconnect =
         ctx.token.get_untracked().is_some() || ctx.require_login.get_untracked() == Some(false);
     if should_reconnect {
@@ -2129,6 +2142,7 @@ pub fn App() -> impl IntoView {
     let spawn_tasks = RwSignal::new(Vec::<SpawnTaskSummary>::new());
     let subagents_acp_enabled = RwSignal::new(false);
     let subagents_loaded = RwSignal::new(false);
+    let background_agents = RwSignal::new(0usize);
     let mcp_presets = RwSignal::new(Vec::<McpPresetSummary>::new());
     let mcp_custom = RwSignal::new(Vec::<McpCustomServerSummary>::new());
     let mcp_loaded = RwSignal::new(false);
@@ -2189,6 +2203,7 @@ pub fn App() -> impl IntoView {
         spawn_tasks,
         subagents_acp_enabled,
         subagents_loaded,
+        background_agents,
         summary_popup,
         workspace_popup,
         pending_approval,
@@ -2539,6 +2554,7 @@ pub fn App() -> impl IntoView {
                     on_delete_session=on_delete_session
                     on_clear_session=on_clear_session
                     on_abort_turn=on_abort_turn
+                    background_agents=Signal::derive(move || background_agents.get())
                     pending_approval=Signal::derive(move || pending_approval.get())
                     on_toggle_approval_call=on_toggle_approval_call
                     on_answer_approval=on_answer_approval

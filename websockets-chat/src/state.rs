@@ -642,6 +642,23 @@ pub fn reconnect_attempts_exhausted(attempt: u32) -> bool {
     attempt >= MAX_RECONNECT_ATTEMPTS
 }
 
+/// The running background-agent count after a `goal_status` frame: the count
+/// it reports, or `current` unchanged when it reports none (a plain turn
+/// start/end says nothing about background agents).
+pub fn background_agents_after(current: usize, reported: Option<usize>) -> usize {
+    reported.unwrap_or(current)
+}
+
+/// The status line for `running` background agents, or `None` when there are
+/// none. Worded like the gateway CLI's own banner.
+pub fn background_agents_banner(running: usize) -> Option<String> {
+    match running {
+        0 => None,
+        1 => Some("Waiting for 1 background agent to finish".to_string()),
+        count => Some(format!("Waiting for {count} background agents to finish")),
+    }
+}
+
 /// Percent-encode a string for safe inclusion in a URL query value.
 ///
 /// Reimplements just the RFC 3986 "unreserved characters" allowlist locally
@@ -860,6 +877,36 @@ impl PendingQuestion {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_reported_background_agent_count_replaces_the_current_one() {
+        assert_eq!(background_agents_after(3, Some(1)), 1);
+        assert_eq!(background_agents_after(3, Some(0)), 0);
+        assert_eq!(background_agents_after(0, Some(2)), 2);
+    }
+
+    #[test]
+    fn a_frame_without_a_count_leaves_the_current_one() {
+        assert_eq!(background_agents_after(2, None), 2);
+        assert_eq!(background_agents_after(0, None), 0);
+    }
+
+    #[test]
+    fn background_agents_banner_is_hidden_at_zero() {
+        assert_eq!(background_agents_banner(0), None);
+    }
+
+    #[test]
+    fn background_agents_banner_uses_singular_and_plural() {
+        assert_eq!(
+            background_agents_banner(1).as_deref(),
+            Some("Waiting for 1 background agent to finish")
+        );
+        assert_eq!(
+            background_agents_banner(4).as_deref(),
+            Some("Waiting for 4 background agents to finish")
+        );
+    }
 
     fn mcp_preset(name: &str, enabled: bool) -> McpPresetSummary {
         McpPresetSummary {

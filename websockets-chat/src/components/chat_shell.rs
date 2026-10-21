@@ -11,7 +11,10 @@ use crate::components::{
     SettingsDialog, SubagentsPage, ToolApprovalCard,
 };
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
-use crate::state::{ConfigFileView, ConnectionStatus, MainView, PendingApproval, PendingQuestion};
+use crate::state::{
+    background_agents_banner, ConfigFileView, ConnectionStatus, MainView, PendingApproval,
+    PendingQuestion,
+};
 
 /// Small dot + label in the header showing the gateway WebSocket's current
 /// lifecycle state (see [`ConnectionStatus`] for what drives it).
@@ -22,6 +25,22 @@ fn ConnectionBadge(#[prop(into)] status: Signal<ConnectionStatus>) -> impl IntoV
             <span class=move || format!("connection-dot {}", status.get().dot_modifier_class())></span>
             <span>{move || status.get().label()}</span>
         </div>
+    }
+}
+
+/// The "Waiting for N background agents to finish" line above the composer.
+/// Rendered only while at least one background sub-agent runs in the chat.
+#[component]
+fn BackgroundAgentsBanner(#[prop(into)] running: Signal<usize>) -> impl IntoView {
+    view! {
+        <Show when=move || running.get() != 0>
+            <p
+                class="border-t border-slate-100 bg-slate-50 px-4 py-1.5 text-xs text-slate-500"
+                role="status"
+            >
+                {move || background_agents_banner(running.get()).unwrap_or_default()}
+            </p>
+        </Show>
     }
 }
 
@@ -71,6 +90,7 @@ pub fn ChatShell(
     on_delete_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_clear_session: impl Fn(String) + 'static + Send + Sync + Copy,
     on_abort_turn: impl Fn() + 'static + Send + Sync + Copy,
+    #[prop(into)] background_agents: Signal<usize>,
     #[prop(into)] pending_approval: Signal<Option<PendingApproval>>,
     on_toggle_approval_call: impl Fn(String) + 'static + Send + Sync + Copy,
     on_answer_approval: impl Fn(Vec<String>) + 'static + Send + Sync + Copy,
@@ -259,6 +279,7 @@ pub fn ChatShell(
                         on_use_prompt=on_use_prompt
                         on_fork_reply=on_fork_reply
                     />
+                    <BackgroundAgentsBanner running=background_agents />
                     <ToolApprovalCard
                         approval=pending_approval
                         on_toggle=Callback::new(move |id| on_toggle_approval_call(id))
