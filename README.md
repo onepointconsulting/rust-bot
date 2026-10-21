@@ -4,10 +4,10 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 
 ## Table of contents
 
+- [Quick start](#quick-start)
 - [Pre-requisites](#pre-requisites)
 - [Testing](#testing)
 - [Build](#build)
-- [Quick start](#quick-start)
 - [Command line](#command-line) (see [docs/COMMAND_LINE.md](docs/COMMAND_LINE.md))
 - [Interactive console](#interactive-console) (including chat commands; see [docs/INTERACTIVE_CONSOLE.md](docs/INTERACTIVE_CONSOLE.md))
 - [Gmail support](#gmail-support) (see [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md))
@@ -17,6 +17,47 @@ A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot)
 
 ---
 
+
+
+## Quick start
+
+### One-line install
+
+Installs the latest release for your user, puts `rust-bot` on your `PATH` and starts `rust-bot onboard`. Config and workspace are created under `~/.rust-bot/`, and `rust-bot` finds them from any directory.
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.ps1 | iex
+```
+
+Set `RUST_BOT_VERSION` (for example `0.3.3`) to pin a version.
+
+### Manual install
+
+Pre-built packages are on [GitHub Releases](https://github.com/onepointconsulting/rust-bot/releases). Linux example:
+
+```bash
+# Download the binary distribution with wget
+VERSION=0.3.0
+wget "https://github.com/onepointconsulting/rust-bot/releases/download/v${VERSION}/rust-bot-${VERSION}-linux-x86_64.tar.gz"
+
+# Unpack
+tar xzf "rust-bot-${VERSION}-linux-x86_64.tar.gz"
+cd "rust-bot-${VERSION}-linux-x86_64"
+
+# Run onboard and follow prompted instructions
+./rust-bot onboard
+
+# Run on the command line
+./rust-bot agent -c ./.rust-bot/config.json -m "Hello!"
+```
+
+Omit `-m` to enter the [interactive console](docs/INTERACTIVE_CONSOLE.md). Windows, Linux ARM64, and macOS archives are `rust-bot-<version>-windows-x86_64.zip`, `rust-bot-<version>-linux-aarch64.tar.gz`, and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
 
 
 ## Pre-requisites
@@ -77,46 +118,6 @@ Windows:
 ```ps1
 .\scripts\build_all.bat [--release]
 ```
-
-## Quick start
-
-### One-line install
-
-Installs the latest release for your user, puts `rust-bot` on your `PATH` and starts `rust-bot onboard`. Config and workspace are created under `~/.rust-bot/`, and `rust-bot` finds them from any directory.
-
-```bash
-# Linux / macOS
-curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.sh | sh
-```
-
-```powershell
-# Windows (PowerShell)
-irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.ps1 | iex
-```
-
-Set `RUST_BOT_VERSION` (for example `0.3.3`) to pin a version.
-
-### Manual install
-
-Pre-built packages are on [GitHub Releases](https://github.com/onepointconsulting/rust-bot/releases). Linux example:
-
-```bash
-# Download the binary distribution with wget
-VERSION=0.3.0
-wget "https://github.com/onepointconsulting/rust-bot/releases/download/v${VERSION}/rust-bot-${VERSION}-linux-x86_64.tar.gz"
-
-# Unpack
-tar xzf "rust-bot-${VERSION}-linux-x86_64.tar.gz"
-cd "rust-bot-${VERSION}-linux-x86_64"
-
-# Run onboard and follow prompted instructions
-./rust-bot onboard
-
-# Run on the command line
-./rust-bot agent -c ./.rust-bot/config.json -m "Hello!"
-```
-
-Omit `-m` to enter the [interactive console](docs/INTERACTIVE_CONSOLE.md). Windows, Linux ARM64, and macOS archives are `rust-bot-<version>-windows-x86_64.zip`, `rust-bot-<version>-linux-aarch64.tar.gz`, and `rust-bot-<version>-macos-aarch64.tar.gz`; after unpacking, run `.\rust-bot.exe onboard` or `./rust-bot onboard`. Onboard writes config and workspace under `./.rust-bot/` next to the binary. See `INSTALL.md` in the archive for the full first-run walkthrough.
 
 ---
 

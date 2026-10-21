@@ -5567,7 +5567,7 @@ dependencies = [
 
 [[package]]
 name = "rust-bot"
-version = "0.3.6"
+version = "0.3.7"
 dependencies = [
  "adk-anthropic",
  "agent-client-protocol",
