@@ -2,6 +2,11 @@
 target = "index.html"
 dist = "dist"
 
+# Pin the Tailwind CLI: style/input.css and tailwind.config.js use v3 syntax,
+# and Trunk otherwise downloads the latest (v4), which drops most utilities.
+[tools]
+tailwindcss = "3.3.5"
+
 [watch]
 watch = ["src", "index.html", "style", "tailwind.config.js", "../chat-ui/src", "../chat-ui/style"]
 
