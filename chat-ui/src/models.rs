@@ -138,6 +138,49 @@ pub struct ToolSummary {
     pub description: String,
 }
 
+/// One built-in tool in the Settings dialog, as surfaced by the gateway's `tool_settings`
+/// event.
+///
+/// Mirrors the backend's `ToolSettingRow` (`src/channels/websocket/config_toggles.rs`) — a
+/// plain re-declaration for the same reason as [`SkillSummary`].
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ToolSettingSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Whether `config.json` leaves the tool on (what the switch shows).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether the running process has the tool on. Differs from `enabled` while a
+    /// change waits for a restart.
+    #[serde(default)]
+    pub active: bool,
+    /// `false` for tools the gateway needs, whose switch is locked.
+    #[serde(default = "default_toggleable")]
+    pub toggleable: bool,
+}
+
+fn default_toggleable() -> bool {
+    true
+}
+
+/// One configured MCP server in the Settings dialog, as surfaced by the gateway's
+/// `mcp_servers` event.
+///
+/// Mirrors the backend's `McpServerSettingRow` (`src/channels/websocket/config_toggles.rs`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct McpServerSettingSummary {
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+    /// Whether `config.json` leaves the server on (what the switch shows).
+    #[serde(default)]
+    pub enabled: bool,
+    /// Whether the running process was started with the server on.
+    #[serde(default)]
+    pub active: bool,
+}
+
 /// Setup state of one field a preset needs, as surfaced by the gateway's `mcp_presets`
 /// event. Never carries the field's value.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

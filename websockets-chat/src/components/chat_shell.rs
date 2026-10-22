@@ -8,7 +8,7 @@ use leptos::prelude::*;
 
 use crate::components::{
     AskQuestionCard, ConfigSavedNotice, McpChangeRequest, McpPresetsPage, MessageList,
-    SettingsDialog, SubagentsPage, ToolApprovalCard,
+    SettingsActions, SettingsDialog, SettingsPanel, SubagentsPage, ToolApprovalCard,
 };
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
 use crate::state::{
@@ -153,6 +153,8 @@ pub fn ChatShell(
     // independently.
     #[prop(default = false)] show_settings: bool,
     #[prop(into)] settings_open: Signal<bool>,
+    settings_panel: SettingsPanel,
+    settings_actions: SettingsActions,
     #[prop(into)] config_file: Signal<ConfigFileView>,
     #[prop(into)] config_saving: Signal<bool>,
     #[prop(into)] config_error: Signal<Option<String>>,
@@ -359,6 +361,8 @@ pub fn ChatShell(
             </div>
             <SettingsDialog
                 open=settings_open
+                panel=settings_panel
+                actions=settings_actions
                 config_file=config_file
                 saving=config_saving
                 error=config_error

@@ -81,7 +81,7 @@ use tower_http::services::{ServeDir, ServeFile};
 use utoipa::OpenApi;
 use utoipa_swagger_ui::SwaggerUi;
 
-use crate::agent::agent_loop::{AgentLoop, ProgressCallback};
+use crate::agent::agent_loop::{AgentLoop, ProgressCallback, enabled_mcp_servers};
 use crate::agent::hook::AgentHook;
 use crate::bus::queue::MessageBus;
 use crate::cli::confirm_tools::CliAskHook;
@@ -1087,6 +1087,11 @@ fn resolve_websocket_channel(
     );
     channel.default_agent_mode = config.agents.mode;
     channel.tool_registry = Some(tool_registry);
+    channel.running_mcp_servers = Arc::new(
+        enabled_mcp_servers(&config.tools.mcp_servers)
+            .into_keys()
+            .collect(),
+    );
     channel.acp_manager = acp_manager;
     channel.subagents = subagents;
     Some(Arc::new(channel))

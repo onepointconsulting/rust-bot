@@ -1,4 +1,5 @@
 pub mod config_file;
+pub mod config_toggles;
 pub mod registry;
 pub mod runtime;
 pub mod types;

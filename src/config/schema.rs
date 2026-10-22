@@ -1366,6 +1366,10 @@ fn default_mcp_enabled_tools() -> Vec<String> {
     vec!["*".to_string()]
 }
 
+fn default_mcp_enabled() -> bool {
+    true
+}
+
 /// Transport type for an MCP server connection.
 #[derive(Deserialize, Serialize, Debug, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -1379,6 +1383,11 @@ pub enum McpTransportType {
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpServerConfig {
+    /// Enable or disable this mcp server globally. Default: `true`.
+    #[serde(default = "default_mcp_enabled")]
+    #[garde(skip)]
+    pub enabled: bool,
+
     /// Transport type. Auto-detected from `command`/`url` when `None`.
     #[serde(alias = "type")]
     #[garde(skip)]
@@ -1424,6 +1433,7 @@ pub struct McpServerConfig {
 impl Default for McpServerConfig {
     fn default() -> Self {
         Self {
+            enabled: default_mcp_enabled(),
             transport_type: None,
             command: String::new(),
             args: Vec::new(),
@@ -3153,6 +3163,20 @@ mod tests {
         assert_eq!(search.transport_type, Some(McpTransportType::Sse));
         assert_eq!(search.url, "http://localhost:8080/sse");
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_mcp_server_enabled_defaults_to_true_and_can_be_switched_off() {
+        let json = r#"{
+            "mcpServers": {
+                "on": {"command": "npx"},
+                "off": {"command": "npx", "enabled": false}
+            }
+        }"#;
+        let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.mcp_servers["on"].enabled);
+        assert!(!cfg.mcp_servers["off"].enabled);
+        assert!(McpServerConfig::default().enabled);
     }
 
     #[test]

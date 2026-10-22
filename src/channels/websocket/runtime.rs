@@ -43,6 +43,7 @@ use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::config_file;
+use crate::channels::websocket::config_toggles;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     AuthorizeResult, ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType,
@@ -671,6 +672,18 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SaveConfigFile => {
             handle_save_config_file(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListToolSettings => {
+            handle_list_tool_settings(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetToolEnabled => {
+            handle_set_tool_enabled(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListMcpServers => {
+            handle_list_mcp_servers(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetMcpServerEnabled => {
+            handle_set_mcp_server_enabled(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -3101,6 +3114,297 @@ async fn handle_save_config_file<'a>(envelope_dispatch_context: EnvelopeDispatch
     }
 }
 
+/// Which kind of item a Settings dialog toggle changes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SettingKind {
+    Tool,
+    McpServer,
+}
+
+impl SettingKind {
+    /// The `kind` the browser sees in `setting_error` events.
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Tool => "tool",
+            Self::McpServer => "mcp_server",
+        }
+    }
+
+    /// The reply event for a successful toggle of this kind.
+    fn saved_event(self) -> WsOutboundEvent {
+        match self {
+            Self::Tool => WsOutboundEvent::ToolSettingSet,
+            Self::McpServer => WsOutboundEvent::McpServerSet,
+        }
+    }
+
+    /// The edit that makes `name` enabled or disabled in the config text.
+    fn edit(
+        self,
+        text: &str,
+        name: &str,
+        enabled: bool,
+    ) -> Result<Option<String>, config_toggles::ToggleError> {
+        match self {
+            Self::Tool => config_toggles::with_tool_disabled(text, name, !enabled),
+            Self::McpServer => config_toggles::with_mcp_server_enabled(text, name, enabled),
+        }
+    }
+}
+
+/// Tell the requester a tool or MCP server toggle was refused or failed. `message` must
+/// not contain any part of the configuration file.
+async fn send_setting_error(
+    shared: &WsShared,
+    connection_id: &str,
+    kind: SettingKind,
+    name: &str,
+    detail: &str,
+    message: &str,
+) {
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::SettingError,
+        None,
+        serde_json::json!({
+            "kind": kind.as_str(),
+            "name": name,
+            "detail": detail,
+            "message": message,
+        }),
+    )
+    .await;
+}
+
+/// Why this connection may not switch tools or MCP servers, as `(detail, message)`, or
+/// `None` when it may. Same rights as editing the file by hand (see [`mcp_write_denial`]).
+fn setting_write_denial(
+    shared: &WsShared,
+    envelope_dispatch_context: &EnvelopeDispatchContext<'_>,
+) -> Option<(&'static str, &'static str)> {
+    let detail = mcp_write_denial(
+        shared,
+        envelope_dispatch_context.remote_addr,
+        envelope_dispatch_context.auth,
+        overlay_is_active(),
+    )?;
+    let message = if detail == "child_agent_config" {
+        "This agent runs on its parent's configuration and cannot change it."
+    } else {
+        "Tools and MCP servers can only be switched from a signed-in browser on the gateway machine."
+    };
+    Some((detail, message))
+}
+
+/// Read `config.json` for a settings list, as a message for the user on failure.
+fn read_config_for_settings() -> Result<String, String> {
+    config_file::read_config_text(&get_config_path())
+        .map_err(|e| format!("Could not read the configuration file: {e}"))
+}
+
+/// Handle a `list_tool_settings` envelope: reply with a `tool_settings` event listing
+/// every built-in tool (MCP tools excluded) A–Z, with its description, whether the
+/// configuration leaves it on (`enabled`) and whether the running process has it on
+/// (`active`). Authenticated connections only. Rust-side addition with no nanobot
+/// precedent.
+async fn handle_list_tool_settings<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
+    let catalogue = shared
+        .tool_registry
+        .as_ref()
+        .map(|registry| {
+            registry
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .catalogue()
+        })
+        .unwrap_or_default();
+    let disabled_names = read_config_for_settings()
+        .and_then(|text| config_toggles::disabled_tool_names(&text).map_err(|e| e.message()));
+    match disabled_names {
+        Ok(disabled_names) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::ToolSettings,
+                None,
+                serde_json::json!({
+                    "tools": config_toggles::tool_setting_rows(&catalogue, &disabled_names),
+                    "can_modify": can_modify,
+                }),
+            )
+            .await;
+        }
+        Err(message) => {
+            send_setting_error(
+                shared,
+                connection_id,
+                SettingKind::Tool,
+                "",
+                "config_error",
+                &message,
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle a `list_mcp_servers` envelope: reply with an `mcp_servers` event listing every
+/// MCP server in `config.json` A–Z, with whether the configuration leaves it on
+/// (`enabled`) and whether the running process was started with it on (`active`).
+/// Authenticated connections only. Rust-side addition with no nanobot precedent.
+async fn handle_list_mcp_servers<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
+    let configured = read_config_for_settings()
+        .and_then(|text| config_toggles::configured_mcp_servers(&text).map_err(|e| e.message()));
+    match configured {
+        Ok(configured) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::McpServers,
+                None,
+                serde_json::json!({
+                    "servers": config_toggles::mcp_server_setting_rows(
+                        &configured,
+                        &shared.running_mcp_servers,
+                    ),
+                    "can_modify": can_modify,
+                }),
+            )
+            .await;
+        }
+        Err(message) => {
+            send_setting_error(
+                shared,
+                connection_id,
+                SettingKind::McpServer,
+                "",
+                "config_error",
+                &message,
+            )
+            .await;
+        }
+    }
+}
+
+/// Switch the tool or MCP server named in the envelope `{name, enabled}` on or off by
+/// editing `config.json` (validated, previous file backed up), replying with the kind's
+/// saved event `{name, enabled, restart_required}` or a `setting_error`. The running
+/// process is not changed: `restart_required` is true when the file changed.
+async fn handle_toggle_setting<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+    kind: SettingKind,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let envelope = envelope_dispatch_context.envelope;
+    let name = envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    if let Some((detail, message)) = setting_write_denial(shared, &envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, &name, detail, message).await;
+        return;
+    }
+    let Some(enabled) = envelope.get("enabled").and_then(|v| v.as_bool()) else {
+        send_setting_error(
+            shared,
+            connection_id,
+            kind,
+            &name,
+            "invalid_request",
+            "The request was malformed.",
+        )
+        .await;
+        return;
+    };
+
+    let result = {
+        // Shares the lock with the other writers: each one rewrites the whole file.
+        let _write_guard = MCP_CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        config_toggles::apply_edit(&get_config_path(), |text| kind.edit(text, &name, enabled))
+    };
+
+    match result {
+        Ok(outcome) => {
+            if outcome.changed {
+                log::info!(
+                    "{} '{name}' {} from the WebUI (client '{client_id}'); previous config kept as {:?}",
+                    kind.as_str(),
+                    if enabled { "enabled" } else { "disabled" },
+                    outcome.backup,
+                );
+            }
+            send_event(
+                shared,
+                connection_id,
+                kind.saved_event(),
+                None,
+                serde_json::json!({
+                    "name": name,
+                    "enabled": enabled,
+                    "restart_required": outcome.changed,
+                }),
+            )
+            .await;
+        }
+        Err(config_toggles::ApplyError::Toggle(error)) => {
+            send_setting_error(
+                shared,
+                connection_id,
+                kind,
+                &name,
+                error.detail(),
+                &error.message(),
+            )
+            .await;
+        }
+        Err(config_toggles::ApplyError::Save(message)) => {
+            send_setting_error(shared, connection_id, kind, &name, "config_error", &message).await;
+        }
+    }
+}
+
+/// Handle a `set_tool_enabled` envelope; see [`handle_toggle_setting`].
+/// Rust-side addition with no nanobot precedent.
+async fn handle_set_tool_enabled<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    handle_toggle_setting(envelope_dispatch_context, SettingKind::Tool).await;
+}
+
+/// Handle a `set_mcp_server_enabled` envelope; see [`handle_toggle_setting`].
+/// Rust-side addition with no nanobot precedent.
+async fn handle_set_mcp_server_enabled<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    handle_toggle_setting(envelope_dispatch_context, SettingKind::McpServer).await;
+}
+
 /// Handle a `set_mcp_preset` envelope `{name, enabled, fields?}`: enable or disable the
 /// preset in `config.json` and reply with `mcp_preset_set`, or with `mcp_preset_error`.
 /// The change only takes effect after a restart. Refused for anonymous, remote and child
@@ -4591,6 +4895,9 @@ pub struct WebSocketChannel {
     pub(crate) acp_manager: Option<Arc<AcpManager>>,
     /// Same `Arc` as `AgentLoop::subagents`, cloned into every [`WsShared`] snapshot.
     pub(crate) subagents: Option<Arc<SubagentManager>>,
+    /// Names of the MCP servers the process was started with switched on, cloned into
+    /// every [`WsShared`] snapshot. Empty until set by the gateway.
+    pub(crate) running_mcp_servers: Arc<HashSet<String>>,
     /// Filesystem root [`serve_media`] confines keys to. Captured at
     /// construction (`get_media_dir(None)`) so tests can point it at a
     /// tempdir the same way they override `gateway_services`.
@@ -4636,6 +4943,7 @@ impl WebSocketChannel {
             tool_registry: None,
             acp_manager: None,
             subagents: None,
+            running_mcp_servers: Arc::new(HashSet::new()),
             media_root: get_media_dir(None),
         }
     }
@@ -4759,6 +5067,7 @@ impl WebSocketChannel {
             tool_registry: self.tool_registry.clone(),
             acp_manager: self.acp_manager.clone(),
             subagents: self.subagents.clone(),
+            running_mcp_servers: Arc::clone(&self.running_mcp_servers),
         }
     }
 
@@ -5642,6 +5951,7 @@ mod tests {
             tool_registry: None,
             acp_manager: None,
             subagents: None,
+            running_mcp_servers: Arc::new(HashSet::new()),
         }
     }
 
@@ -8523,6 +8833,134 @@ mod tests {
             .expect("expected an error frame");
         assert_eq!(body["event"], "mcp_preset_error");
         assert_eq!(body["detail"], "access_denied");
+    }
+
+    /// Dispatch one `{type, name, enabled}` envelope and return the first reply frame.
+    async fn dispatch_setting_envelope(
+        shared: &WsShared,
+        auth: &AuthorizeResult,
+        remote: &str,
+        envelope_type: &str,
+    ) -> serde_json::Value {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert("type".to_string(), serde_json::json!(envelope_type));
+        envelope.insert("name".to_string(), serde_json::json!("grep"));
+        envelope.insert("enabled".to_string(), serde_json::json!(false));
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr(remote),
+            auth,
+        };
+        dispatch_envelope(ctx).await;
+        let frame = rx.try_recv().expect("expected a reply frame");
+        serde_json::from_str(&frame.into_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn setting_lists_deny_anonymous_connections() {
+        let shared = test_shared("browser");
+        for envelope_type in ["list_tool_settings", "list_mcp_servers"] {
+            let body = dispatch_setting_envelope(
+                &shared,
+                &AuthorizeResult::UNAUTHENTICATED,
+                "127.0.0.1",
+                envelope_type,
+            )
+            .await;
+
+            assert_eq!(body["event"], "error", "{envelope_type}");
+            assert_eq!(body["detail"], "access_denied", "{envelope_type}");
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_toggles_are_refused_for_anonymous_and_remote_connections() {
+        let shared = test_shared("browser");
+        for envelope_type in ["set_tool_enabled", "set_mcp_server_enabled"] {
+            let anonymous = dispatch_setting_envelope(
+                &shared,
+                &AuthorizeResult::UNAUTHENTICATED,
+                "127.0.0.1",
+                envelope_type,
+            )
+            .await;
+            let remote =
+                dispatch_setting_envelope(&shared, &authenticated(), "203.0.113.5", envelope_type)
+                    .await;
+
+            for body in [anonymous, remote] {
+                assert_eq!(body["event"], "setting_error", "{envelope_type}");
+                assert_eq!(body["detail"], "access_denied", "{envelope_type}");
+                assert_eq!(body["name"], "grep", "{envelope_type}");
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn setting_toggle_errors_name_the_kind_of_item() {
+        let shared = test_shared("browser");
+
+        let tool = dispatch_setting_envelope(
+            &shared,
+            &AuthorizeResult::UNAUTHENTICATED,
+            "127.0.0.1",
+            "set_tool_enabled",
+        )
+        .await;
+        let server = dispatch_setting_envelope(
+            &shared,
+            &AuthorizeResult::UNAUTHENTICATED,
+            "127.0.0.1",
+            "set_mcp_server_enabled",
+        )
+        .await;
+
+        assert_eq!(tool["kind"], "tool");
+        assert_eq!(server["kind"], "mcp_server");
+    }
+
+    #[tokio::test]
+    async fn list_tool_settings_reports_catalogue_tools_without_mcp_tools() {
+        let mut shared = shared_with_tools(&["shell", "mcp_github_search", "web_search"]);
+        shared
+            .tool_registry
+            .as_ref()
+            .unwrap()
+            .lock()
+            .unwrap()
+            .disable("web_search");
+
+        let body =
+            dispatch_setting_envelope(&shared, &authenticated(), "127.0.0.1", "list_tool_settings")
+                .await;
+
+        assert_eq!(body["event"], "tool_settings");
+        let names: Vec<&str> = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert!(names.contains(&"shell"));
+        assert!(names.contains(&"web_search"), "disabled tools stay listed");
+        assert!(!names.contains(&"mcp_github_search"));
+        let web_search = body["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|tool| tool["name"] == "web_search")
+            .unwrap();
+        assert_eq!(web_search["active"], false);
+        shared.tool_registry = None;
     }
 
     fn spawn_record(task_id: &str, session_key: Option<&str>) -> SubagentRecord {

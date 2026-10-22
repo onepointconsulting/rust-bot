@@ -19,8 +19,9 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary, Role,
-    SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolEvent, ToolSummary,
+    AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
+    McpServerSettingSummary, Role, SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolEvent,
+    ToolSettingSummary, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -359,6 +360,51 @@ impl ClientEnvelope {
             enabled: Some(enabled),
             pinned: None,
             fields: (!fields.is_empty()).then_some(fields),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway for every built-in tool (MCP tools excluded) with its on/off
+    /// state. Authenticated connections only — an anonymous connection is answered
+    /// with an `access_denied` error. The reply is a `tool_settings` event (see
+    /// [`ServerEvent::ToolSettings`]).
+    pub fn list_tool_settings() -> Self {
+        Self {
+            type_: "list_tool_settings",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to switch the tool `name` on (`enabled == true`) or off in
+    /// `config.json`. Refused unless this connection is signed in and local. The reply
+    /// is a `tool_setting_set` or a `setting_error` event.
+    pub fn set_tool_enabled(name: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            type_: "set_tool_enabled",
+            name: Some(name.into()),
+            enabled: Some(enabled),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway for the configured MCP servers with their on/off state.
+    /// Authenticated connections only. The reply is an `mcp_servers` event (see
+    /// [`ServerEvent::McpServers`]).
+    pub fn list_mcp_servers() -> Self {
+        Self {
+            type_: "list_mcp_servers",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to switch the configured MCP server `name` on or off in
+    /// `config.json`. Refused unless this connection is signed in and local. The reply
+    /// is an `mcp_server_set` or a `setting_error` event.
+    pub fn set_mcp_server_enabled(name: impl Into<String>, enabled: bool) -> Self {
+        Self {
+            type_: "set_mcp_server_enabled",
+            name: Some(name.into()),
+            enabled: Some(enabled),
             ..Self::list_skills()
         }
     }
@@ -1013,6 +1059,44 @@ pub enum ServerEvent {
         /// The list is read-only otherwise.
         can_modify: bool,
     },
+    /// Reply to a [`ClientEnvelope::list_tool_settings`] envelope: every built-in tool,
+    /// sorted A–Z. Not scoped to any one `chat_id`.
+    ToolSettings {
+        tools: Vec<ToolSettingSummary>,
+        /// Whether this connection may switch tools (signed in and local). The list is
+        /// read-only otherwise.
+        can_modify: bool,
+    },
+    /// Reply to a [`ClientEnvelope::list_mcp_servers`] envelope: every configured MCP
+    /// server, sorted A–Z. Not scoped to any one `chat_id`.
+    McpServers {
+        servers: Vec<McpServerSettingSummary>,
+        /// Whether this connection may switch MCP servers (signed in and local).
+        can_modify: bool,
+    },
+    /// Reply to a successful [`ClientEnvelope::set_tool_enabled`]: the tool now has
+    /// `enabled` in `config.json`; `restart_required` is true when the file changed.
+    ToolSettingSet {
+        name: String,
+        enabled: bool,
+        restart_required: bool,
+    },
+    /// Reply to a successful [`ClientEnvelope::set_mcp_server_enabled`], like
+    /// [`ServerEvent::ToolSettingSet`].
+    McpServerSet {
+        name: String,
+        enabled: bool,
+        restart_required: bool,
+    },
+    /// Reply to a refused or failed tool or MCP server toggle (or list). `kind` is
+    /// `tool` or `mcp_server`; `detail` is a stable code (`access_denied`,
+    /// `child_agent_config`, `protected_tool`, `unknown_server`, `config_error`, ...).
+    SettingError {
+        kind: String,
+        name: String,
+        detail: String,
+        message: String,
+    },
     /// Reply to a [`ClientEnvelope::list_subagents`] envelope: the durable ACP child
     /// agents (`acp_enabled` is false when ACP is switched off on the gateway) and the
     /// spawn tasks the connection may see. Not scoped to any one `chat_id`.
@@ -1173,6 +1257,11 @@ impl ServerEvent {
             | ServerEvent::McpPresetSet { .. }
             | ServerEvent::Subagents { .. }
             | ServerEvent::McpPresetError { .. }
+            | ServerEvent::ToolSettings { .. }
+            | ServerEvent::McpServers { .. }
+            | ServerEvent::ToolSettingSet { .. }
+            | ServerEvent::McpServerSet { .. }
+            | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
             | ServerEvent::ConfigFileSaved { .. }
             | ServerEvent::ConfigFileError { .. }
@@ -1525,6 +1614,39 @@ struct McpPresetErrorWire {
 }
 
 #[derive(Deserialize)]
+struct ToolSettingsWire {
+    tools: Vec<ToolSettingSummary>,
+    #[serde(default)]
+    can_modify: bool,
+}
+
+#[derive(Deserialize)]
+struct McpServersWire {
+    servers: Vec<McpServerSettingSummary>,
+    #[serde(default)]
+    can_modify: bool,
+}
+
+#[derive(Deserialize)]
+struct SettingSetWire {
+    name: String,
+    enabled: bool,
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
+struct SettingErrorWire {
+    #[serde(default)]
+    kind: String,
+    #[serde(default)]
+    name: String,
+    detail: String,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
 struct ConfigFileWire {
     #[serde(default)]
     path: String,
@@ -1784,6 +1906,32 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 fields: w.fields,
             })
         }
+        "tool_settings" => decode::<ToolSettingsWire>(&value).map(|w| ServerEvent::ToolSettings {
+            tools: w.tools,
+            can_modify: w.can_modify,
+        }),
+        "mcp_servers" => decode::<McpServersWire>(&value).map(|w| ServerEvent::McpServers {
+            servers: w.servers,
+            can_modify: w.can_modify,
+        }),
+        "tool_setting_set" => {
+            decode::<SettingSetWire>(&value).map(|w| ServerEvent::ToolSettingSet {
+                name: w.name,
+                enabled: w.enabled,
+                restart_required: w.restart_required,
+            })
+        }
+        "mcp_server_set" => decode::<SettingSetWire>(&value).map(|w| ServerEvent::McpServerSet {
+            name: w.name,
+            enabled: w.enabled,
+            restart_required: w.restart_required,
+        }),
+        "setting_error" => decode::<SettingErrorWire>(&value).map(|w| ServerEvent::SettingError {
+            kind: w.kind,
+            name: w.name,
+            detail: w.detail,
+            message: w.message,
+        }),
         "config_file" => decode::<ConfigFileWire>(&value).map(|w| ServerEvent::ConfigFile {
             path: w.path,
             content: w.content,
@@ -2965,6 +3113,107 @@ mod tests {
         assert_eq!(
             save,
             serde_json::json!({"type": "save_config_file", "content": "{}", "webui": true})
+        );
+    }
+
+    #[test]
+    fn client_envelope_setting_requests_serialize() {
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::list_tool_settings()).unwrap(),
+            serde_json::json!({"type": "list_tool_settings", "webui": true})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::list_mcp_servers()).unwrap(),
+            serde_json::json!({"type": "list_mcp_servers", "webui": true})
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_tool_enabled("grep", false)).unwrap(),
+            serde_json::json!({
+                "type": "set_tool_enabled", "name": "grep", "enabled": false, "webui": true
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_mcp_server_enabled("files", true)).unwrap(),
+            serde_json::json!({
+                "type": "set_mcp_server_enabled", "name": "files", "enabled": true, "webui": true
+            })
+        );
+    }
+
+    #[test]
+    fn parses_tool_settings() {
+        let raw = r#"{"event":"tool_settings","can_modify":true,"tools":[
+            {"name":"grep","description":"Search files","enabled":false,"active":true,"toggleable":true},
+            {"name":"message"}]}"#;
+        let ServerEvent::ToolSettings { tools, can_modify } = parse_server_event(raw).unwrap()
+        else {
+            panic!("expected ToolSettings");
+        };
+        assert!(can_modify);
+        assert_eq!(tools[0].name, "grep");
+        assert!(!tools[0].enabled && tools[0].active);
+        // Missing flags fall back to: off, inactive, switchable.
+        assert!(!tools[1].enabled && !tools[1].active && tools[1].toggleable);
+    }
+
+    #[test]
+    fn parses_mcp_servers() {
+        let raw = r#"{"event":"mcp_servers","servers":[
+            {"name":"files","description":"MCP server (stdio)","enabled":true,"active":false}]}"#;
+        let ServerEvent::McpServers {
+            servers,
+            can_modify,
+        } = parse_server_event(raw).unwrap()
+        else {
+            panic!("expected McpServers");
+        };
+        assert!(!can_modify, "can_modify defaults to false");
+        assert_eq!(servers[0].name, "files");
+        assert!(servers[0].enabled && !servers[0].active);
+    }
+
+    #[test]
+    fn parses_setting_set_events() {
+        let tool = parse_server_event(
+            r#"{"event":"tool_setting_set","name":"grep","enabled":false,"restart_required":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            tool,
+            ServerEvent::ToolSettingSet {
+                name: "grep".to_string(),
+                enabled: false,
+                restart_required: true
+            }
+        );
+        let server =
+            parse_server_event(r#"{"event":"mcp_server_set","name":"files","enabled":true}"#)
+                .unwrap();
+        assert_eq!(
+            server,
+            ServerEvent::McpServerSet {
+                name: "files".to_string(),
+                enabled: true,
+                restart_required: false
+            }
+        );
+    }
+
+    #[test]
+    fn parses_setting_error_and_it_has_no_scoping_chat_id() {
+        let event = parse_server_event(
+            r#"{"event":"setting_error","kind":"tool","name":"message","detail":"protected_tool","message":"No."}"#,
+        )
+        .unwrap();
+        assert_eq!(event.chat_id(), None);
+        assert_eq!(
+            event,
+            ServerEvent::SettingError {
+                kind: "tool".to_string(),
+                name: "message".to_string(),
+                detail: "protected_tool".to_string(),
+                message: "No.".to_string()
+            }
         );
     }
 

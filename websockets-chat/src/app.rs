@@ -30,7 +30,10 @@ use chat_ui::models::{
 };
 
 use crate::api::{self, WsSender};
-use crate::components::{ChatShell, McpChangeRequest};
+use crate::components::{
+    apply_enabled, ChatShell, McpChangeRequest, SettingsActions, SettingsPage, SettingsPanel,
+    ToggleRequest,
+};
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
 use crate::storage_keys::CHAT_ID_STORAGE_KEY;
@@ -417,6 +420,9 @@ struct WsContext {
     config_error: RwSignal<Option<String>>,
     /// Whether the "restart the rust-bot process" notice is showing.
     config_saved_notice: RwSignal<bool>,
+    /// The Settings dialog's Tools and MCP Servers pages: which one is open and what
+    /// they list. Only filled while the dialog is open; cleared whenever it closes.
+    settings_panel: SettingsPanel,
     /// Durable ACP child agents from the gateway's `subagents` event. Only filled
     /// while the sub-agents page is open; cleared whenever it closes.
     subagent_agents: RwSignal<Vec<AcpAgentSummary>>,
@@ -1101,6 +1107,66 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
             ctx.mcp_row_error.set(Some((name, message)));
         }
+        ServerEvent::ToolSettings { tools, can_modify } => {
+            // A reply that lands after the dialog closed must not leave data behind.
+            if ctx.settings_open.get_untracked() {
+                ctx.settings_panel.tools.set(tools);
+                ctx.settings_panel.can_modify.set(can_modify);
+                ctx.settings_panel.tools_loaded.set(true);
+            }
+        }
+        ServerEvent::McpServers {
+            servers,
+            can_modify,
+        } => {
+            if ctx.settings_open.get_untracked() {
+                ctx.settings_panel.mcp_servers.set(servers);
+                ctx.settings_panel.can_modify.set(can_modify);
+                ctx.settings_panel.mcp_servers_loaded.set(true);
+            }
+        }
+        ServerEvent::ToolSettingSet {
+            name,
+            enabled,
+            restart_required,
+        } => {
+            finish_setting_change(ctx, restart_required);
+            ctx.settings_panel
+                .tools
+                .update(|tools| apply_enabled(tools, &name, enabled));
+        }
+        ServerEvent::McpServerSet {
+            name,
+            enabled,
+            restart_required,
+        } => {
+            finish_setting_change(ctx, restart_required);
+            ctx.settings_panel
+                .mcp_servers
+                .update(|servers| apply_enabled(servers, &name, enabled));
+        }
+        ServerEvent::SettingError {
+            kind,
+            name,
+            detail,
+            message,
+        } => {
+            let panel = ctx.settings_panel;
+            panel.busy.set(None);
+            // The gateway no longer allows changes on this connection: go read-only.
+            if matches!(detail.as_str(), "access_denied" | "child_agent_config") {
+                panel.can_modify.set(false);
+            }
+            // A list that failed to load must not leave its page on "Loading...".
+            if name.is_empty() {
+                if kind == "tool" {
+                    panel.tools_loaded.set(true);
+                } else {
+                    panel.mcp_servers_loaded.set(true);
+                }
+            }
+            panel.error.set(Some((name, message)));
+        }
         ServerEvent::ConfigFile { path, content } => {
             ctx.config_file
                 .update(|view| *view = view.after_file_arrived(path, content));
@@ -1484,17 +1550,78 @@ fn clear_subagents_data(ctx: &WsContext) {
     ctx.subagents_acp_enabled.set(false);
 }
 
-/// Open the Settings dialog, on its intro (no configuration editor yet).
+/// Open the Settings dialog on its Tools page (no configuration editor yet) and fetch
+/// the page's list. Fetched on demand, never on connect.
 fn open_settings(ctx: &WsContext) {
     ctx.config_error.set(None);
     ctx.config_file.set(ConfigFileView::Closed);
     ctx.settings_open.set(true);
+    select_settings_page(ctx, SettingsPage::Tools);
 }
 
-/// Close the Settings dialog and drop the configuration text it held.
+/// Close the Settings dialog and drop the configuration text and lists it held.
 fn close_settings(ctx: &WsContext) {
     ctx.settings_open.set(false);
+    ctx.settings_panel.clear();
     close_config_file(ctx);
+}
+
+/// Ask the gateway for the list `page` shows. Fire-and-forget; the reply fills the
+/// panel (see the `ToolSettings` and `McpServers` arms of the event handler).
+fn request_settings_list(ctx: &WsContext, page: SettingsPage) {
+    let envelope = match page {
+        SettingsPage::Tools => protocol::ClientEnvelope::list_tool_settings(),
+        SettingsPage::McpServers => protocol::ClientEnvelope::list_mcp_servers(),
+    };
+    send_client_envelope(
+        *ctx,
+        envelope,
+        "Failed to encode the settings list request.",
+    );
+}
+
+/// Show `page` in the Settings dialog and (re)fetch its list.
+fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
+    let panel = ctx.settings_panel;
+    panel.page.set(page);
+    panel.error.set(None);
+    panel.busy.set(None);
+    match page {
+        SettingsPage::Tools => panel.tools_loaded.set(false),
+        SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
+    }
+    request_settings_list(ctx, page);
+}
+
+/// Re-fetch the list of the page that is open.
+fn refresh_settings_page(ctx: &WsContext) {
+    select_settings_page(ctx, ctx.settings_panel.page.get_untracked());
+}
+
+/// Ask the gateway to switch one tool or MCP server on or off in `config.json`. The reply
+/// is a `tool_setting_set` / `mcp_server_set` or a `setting_error` event.
+fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest) {
+    ctx.settings_panel.error.set(None);
+    ctx.settings_panel.busy.set(Some(name.clone()));
+    let envelope = match page {
+        SettingsPage::Tools => protocol::ClientEnvelope::set_tool_enabled(name, enabled),
+        SettingsPage::McpServers => protocol::ClientEnvelope::set_mcp_server_enabled(name, enabled),
+    };
+    send_client_envelope(
+        *ctx,
+        envelope,
+        "Failed to encode the settings change request.",
+    );
+}
+
+/// A tool or MCP server change was saved: the switch is no longer in flight, and a
+/// restart is needed when the file actually changed.
+fn finish_setting_change(ctx: &WsContext, restart_required: bool) {
+    ctx.settings_panel.busy.set(None);
+    ctx.settings_panel.error.set(None);
+    if restart_required {
+        ctx.settings_panel.restart_notice.set(true);
+    }
 }
 
 /// Ask the gateway for `config.json` and show the editor once it arrives (see the
@@ -2211,6 +2338,7 @@ pub fn App() -> impl IntoView {
     let config_saving = RwSignal::new(false);
     let config_error = RwSignal::new(None::<String>);
     let config_saved_notice = RwSignal::new(false);
+    let settings_panel = SettingsPanel::new();
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
     let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
     let pending_approval = RwSignal::new(None::<state::PendingApproval>);
@@ -2255,6 +2383,7 @@ pub fn App() -> impl IntoView {
         config_saving,
         config_error,
         config_saved_notice,
+        settings_panel,
         subagent_agents,
         spawn_tasks,
         subagents_acp_enabled,
@@ -2530,6 +2659,11 @@ pub fn App() -> impl IntoView {
     let on_close_config_file = move || close_config_file(&ws_context);
     let on_save_config_file = move |content: String| request_save_config_file(&ws_context, content);
     let on_close_config_saved_notice = move || config_saved_notice.set(false);
+    let settings_actions = SettingsActions {
+        on_select_page: Callback::new(move |page| select_settings_page(&ws_context, page)),
+        on_toggle: Callback::new(move |request| request_toggle_setting(&ws_context, request)),
+        on_refresh: Callback::new(move |()| refresh_settings_page(&ws_context)),
+    };
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {
         request_set_mcp_preset(&ws_context, name, enabled, fields);
     };
@@ -2652,6 +2786,8 @@ pub fn App() -> impl IntoView {
                     on_change_mcp=on_change_mcp
                     show_settings=token.get_untracked().is_some()
                     settings_open=Signal::derive(move || settings_open.get())
+                    settings_panel=settings_panel
+                    settings_actions=settings_actions
                     config_file=Signal::derive(move || config_file.get())
                     config_saving=Signal::derive(move || config_saving.get())
                     config_error=Signal::derive(move || config_error.get())

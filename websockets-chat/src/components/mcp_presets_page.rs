@@ -170,7 +170,7 @@ fn switch_knob_class(on: bool) -> &'static str {
 
 /// An on/off switch. Inert while `disabled` (read-only page, or a change in flight).
 #[component]
-fn ToggleSwitch(
+pub(crate) fn ToggleSwitch(
     on: bool,
     label: String,
     #[prop(into)] disabled: Signal<bool>,

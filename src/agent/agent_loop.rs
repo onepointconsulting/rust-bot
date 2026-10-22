@@ -233,6 +233,18 @@ struct McpConnectionState {
     last_attempt: Option<Instant>,
 }
 
+/// The configured MCP servers whose `enabled` flag is on; disabled ones are never
+/// connected, counted or reported.
+pub(crate) fn enabled_mcp_servers(
+    configured: &HashMap<String, McpServerConfig>,
+) -> HashMap<String, McpServerConfig> {
+    configured
+        .iter()
+        .filter(|(_, config)| config.enabled)
+        .map(|(name, config)| (name.clone(), config.clone()))
+        .collect()
+}
+
 /// The configured servers that still need connecting, sorted by name.
 fn pending_mcp_servers(
     configured: &HashMap<String, McpServerConfig>,
@@ -477,7 +489,7 @@ impl AgentLoop {
         let restrict_to_workspace = tools_cfg.restrict_to_workspace;
         let workspace_scopes =
             WorkspaceScopeResolver::new(workspace.clone(), restrict_to_workspace);
-        let mcp_servers = tools_cfg.mcp_servers.clone();
+        let mcp_servers = enabled_mcp_servers(&tools_cfg.mcp_servers);
 
         let context_window_tokens = agents_cfg.context_window_tokens;
         let max_tool_result_chars = agents_cfg.max_tool_result_chars;
@@ -552,7 +564,7 @@ impl AgentLoop {
             register_acp_tools(&mut tools, acp_tools);
         }
         for name in &tools_cfg.disabled_tools {
-            tools.unregister(name);
+            tools.disable(name);
         }
         let tools = Arc::new(Mutex::new(tools));
         let mut context_builder = ContextBuilder::with_default_mode(
@@ -3076,6 +3088,16 @@ mod tests {
 
         let names: Vec<&str> = pending.iter().map(|(name, _)| name.as_str()).collect();
         assert_eq!(names, vec!["alpha", "zeta"]);
+    }
+
+    #[test]
+    fn enabled_mcp_servers_drops_servers_switched_off() {
+        let mut configured = mcp_servers(&["on", "off"]);
+        configured.get_mut("off").unwrap().enabled = false;
+
+        let enabled = enabled_mcp_servers(&configured);
+
+        assert_eq!(enabled.keys().collect::<Vec<_>>(), vec!["on"]);
     }
 
     #[test]

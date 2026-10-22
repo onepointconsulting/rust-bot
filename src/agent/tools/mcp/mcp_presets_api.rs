@@ -846,7 +846,7 @@ fn summarize_preset(preset: &McpPreset, cfg: Option<&McpServerConfig>) -> McpPre
         description: preset.description.clone(),
         category: preset.category.clone(),
         transport: preset.transport.as_str().to_string(),
-        enabled: cfg.is_some(),
+        enabled: cfg.is_some_and(|server| server.enabled),
         status: status_for(preset, cfg).as_str().to_string(),
         install_supported: preset.install_supported,
         requires: preset.requires.clone(),
@@ -1417,6 +1417,18 @@ mod tests {
         assert!(overview.presets[0].enabled);
         assert!(!overview.presets[1].enabled);
         assert_eq!(overview.presets[1].status, "not_installed");
+    }
+
+    #[test]
+    fn summarize_presets_marks_server_switched_off_as_not_enabled() {
+        let preset = preset_with_fields(Some(stdio_server("cmd", &[])), vec![]);
+        let mut switched_off = stdio_server("cmd", &[]);
+        switched_off.enabled = false;
+        let configured = HashMap::from([(preset.name.clone(), switched_off)]);
+
+        let overview = summarize_presets(&[preset], &configured);
+
+        assert!(!overview.presets[0].enabled);
     }
 
     #[test]

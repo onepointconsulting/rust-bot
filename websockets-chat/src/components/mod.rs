@@ -5,6 +5,7 @@ mod mcp_presets_page;
 mod message_list;
 mod reasoning_panel;
 mod settings_dialog;
+mod settings_pages;
 mod subagents_page;
 mod tool_activity;
 mod tool_approval;
@@ -15,6 +16,9 @@ pub use mcp_presets_page::{McpChangeRequest, McpPresetsPage};
 pub use message_list::MessageList;
 pub use reasoning_panel::ReasoningPanel;
 pub use settings_dialog::{ConfigSavedNotice, SettingsDialog};
+pub use settings_pages::{
+    apply_enabled, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
+};
 pub use subagents_page::SubagentsPage;
 pub use tool_activity::ToolActivity;
 pub use tool_approval::ToolApprovalCard;

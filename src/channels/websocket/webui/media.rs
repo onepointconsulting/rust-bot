@@ -598,6 +598,7 @@ mod tests {
             tool_registry: None,
             acp_manager: None,
             subagents: None,
+            running_mcp_servers: Default::default(),
         }
     }
 

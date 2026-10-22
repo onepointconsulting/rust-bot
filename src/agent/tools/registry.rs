@@ -16,16 +16,30 @@ pub struct ToolSummary {
     pub description: String,
 }
 
+/// One built-in tool as listed in the Settings dialog: its description and whether it
+/// is active in this process (`false` when `tools.disabledTools` switched it off at
+/// startup).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ToolCatalogueEntry {
+    pub name: String,
+    pub description: String,
+    pub active: bool,
+}
+
 // ── ToolRegistry ──────────────────────────────────────────────────────────────
 #[derive(Clone)]
 pub struct ToolRegistry {
     tools: HashMap<String, Arc<dyn Tool>>,
+    /// Tools switched off by `tools.disabledTools`: not callable, but remembered (with
+    /// their description) so the Settings dialog can still list and re-enable them.
+    disabled: HashMap<String, ToolSummary>,
 }
 
 impl ToolRegistry {
     pub fn new() -> Self {
         Self {
             tools: HashMap::new(),
+            disabled: HashMap::new(),
         }
     }
 
@@ -38,6 +52,20 @@ impl ToolRegistry {
 
     pub fn unregister(&mut self, name: &str) {
         self.tools.remove(name);
+    }
+
+    /// Switch the tool called `name` off: remove it from the callable tools but remember
+    /// its summary for [`Self::catalogue`]. Does nothing for a tool that is not registered.
+    pub fn disable(&mut self, name: &str) {
+        if let Some(tool) = self.tools.remove(name) {
+            self.disabled.insert(
+                name.to_string(),
+                ToolSummary {
+                    name: tool.name(),
+                    description: tool.description(),
+                },
+            );
+        }
     }
 
     pub fn get(&self, name: &str) -> Option<Arc<dyn Tool>> {
@@ -155,6 +183,27 @@ impl ToolRegistry {
         summaries
     }
 
+    /// Every built-in (non-MCP) tool this process knows about, active or switched off,
+    /// sorted A–Z ignoring case. MCP tools are left out: servers are managed separately.
+    pub fn catalogue(&self) -> Vec<ToolCatalogueEntry> {
+        let active = self.tools.values().map(|tool| ToolCatalogueEntry {
+            name: tool.name(),
+            description: tool.description(),
+            active: true,
+        });
+        let switched_off = self.disabled.values().map(|summary| ToolCatalogueEntry {
+            name: summary.name.clone(),
+            description: summary.description.clone(),
+            active: false,
+        });
+        let mut entries: Vec<ToolCatalogueEntry> = active
+            .chain(switched_off)
+            .filter(|entry| !Self::is_mcp_tool_name(&entry.name))
+            .collect();
+        entries.sort_by_key(|entry| entry.name.to_lowercase());
+        entries
+    }
+
     pub fn len(&self) -> usize {
         self.tools.len()
     }
@@ -176,7 +225,10 @@ impl ToolRegistry {
             .filter(|(name, _)| keep(name))
             .map(|(name, tool)| (name.clone(), tool.clone()))
             .collect();
-        ToolRegistry { tools }
+        ToolRegistry {
+            tools,
+            disabled: HashMap::new(),
+        }
     }
 
     /// Whether `name` is an MCP-provided tool (see [`MCP_TOOL_PREFIX`]).
@@ -428,6 +480,39 @@ mod tests {
         let (tool, _, error) = view.prepare_call("add", &serde_json::json!({}));
         assert!(tool.is_none());
         assert!(error.unwrap().contains("not found"));
+    }
+
+    // ── catalogue tests ───────────────────────────────────────────────────────
+
+    #[test]
+    fn disable_removes_the_tool_but_keeps_it_in_the_catalogue() {
+        let mut reg = registry_with_defaults();
+        reg.disable("echo");
+
+        assert!(!reg.has("echo"));
+        let catalogue = reg.catalogue();
+        let echo = catalogue.iter().find(|e| e.name == "echo").unwrap();
+        assert!(!echo.active);
+        assert_eq!(echo.description, "Echoes the input message.");
+        assert!(catalogue.iter().find(|e| e.name == "add").unwrap().active);
+    }
+
+    #[test]
+    fn disable_of_an_unknown_tool_is_a_noop() {
+        let mut reg = registry_with_defaults();
+        reg.disable("ghost");
+        assert_eq!(reg.catalogue().len(), 2);
+    }
+
+    #[test]
+    fn catalogue_excludes_mcp_tools_and_sorts_ignoring_case() {
+        let mut reg = registry_with_defaults();
+        reg.register(Box::new(McpSearchTool));
+        reg.register(Box::new(FailTool));
+
+        let names: Vec<String> = reg.catalogue().into_iter().map(|e| e.name).collect();
+
+        assert_eq!(names, vec!["add", "echo", "fail"]);
     }
 
     // ── get_definitions ordering tests ───────────────────────────────────────

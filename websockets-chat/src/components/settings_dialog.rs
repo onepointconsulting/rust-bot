@@ -1,16 +1,18 @@
 //! The Settings dialog and the "configuration saved" notice.
 //!
-//! The dialog has one action for now: "Open configuration file", which swaps the dialog
-//! body for an editor holding the gateway's raw `config.json`. Saving sends the text to
-//! the gateway, which validates it; on success [`ConfigSavedNotice`] tells the user to
-//! restart the rust-bot process, because the running bot does not reload its
-//! configuration.
+//! The dialog has a menu on the left ("Tools", "MCP Servers": see `settings_pages.rs`)
+//! and, on the right, the open page. Its header has one more action, "Open configuration
+//! file", which swaps the page for an editor holding the gateway's raw `config.json`.
+//! Saving sends the text to the gateway, which validates it; on success
+//! [`ConfigSavedNotice`] tells the user to restart the rust-bot process, because the
+//! running bot does not reload its configuration.
 //!
 //! All data and actions come in as signals and callbacks (see `app.rs`), so the
-//! component holds only the text being edited.
+//! component holds only the text being edited and the search text.
 
 use leptos::prelude::*;
 
+use super::settings_pages::{SettingsActions, SettingsPage, SettingsPageView, SettingsPanel};
 use crate::state::ConfigFileView;
 
 /// Message in the notice shown after the configuration was saved.
@@ -28,6 +30,15 @@ fn save_label(saving: bool) -> &'static str {
         "Saving…"
     } else {
         "Save"
+    }
+}
+
+/// Classes of a menu entry in the dialog's left column; `active` highlights the open page.
+fn menu_button_class(active: bool) -> &'static str {
+    if active {
+        "w-full rounded-lg bg-slate-100 px-3 py-2 text-left text-sm font-medium text-slate-900"
+    } else {
+        "w-full rounded-lg px-3 py-2 text-left text-sm text-slate-600 hover:bg-slate-50"
     }
 }
 
@@ -95,10 +106,13 @@ fn CloseButton(on_close: Callback<()>) -> impl IntoView {
 
 /// The Settings dialog. Shown while `open`; `config_file` says whether the configuration
 /// editor is showing (and holds the text to edit), `error` is the last failure to show
-/// above the body, and `saving` is true while a save is in flight.
+/// above the body, and `saving` is true while a save is in flight. `panel` and `actions`
+/// drive the Tools and MCP Servers pages.
 #[component]
 pub fn SettingsDialog(
     #[prop(into)] open: Signal<bool>,
+    panel: SettingsPanel,
+    actions: SettingsActions,
     #[prop(into)] config_file: Signal<ConfigFileView>,
     #[prop(into)] saving: Signal<bool>,
     #[prop(into)] error: Signal<Option<String>>,
@@ -115,10 +129,19 @@ pub fn SettingsDialog(
         }
     });
     let editor_open = move || config_file.get() != ConfigFileView::Closed;
+    // The search text belongs to the open page, so it starts empty on every page change.
+    let search = RwSignal::new(String::new());
+    let select_page = move |page: SettingsPage| {
+        if editor_open() {
+            on_close_config_file.run(());
+        }
+        search.set(String::new());
+        actions.on_select_page.run(page);
+    };
 
     view! {
         <Show when=move || open.get()>
-            <DialogFrame title_id="settings-title" max_width_class="max-w-3xl" on_close=on_close>
+            <DialogFrame title_id="settings-title" max_width_class="max-w-4xl" on_close=on_close>
                 <div class="mb-4 flex items-center justify-between gap-3">
                     <h2 id="settings-title" class="text-lg font-semibold text-slate-900">
                         "Settings"
@@ -143,51 +166,74 @@ pub fn SettingsDialog(
                         {move || error.get().unwrap_or_default()}
                     </p>
                 </Show>
-                {move || match config_file.get() {
-                    ConfigFileView::Closed => {
-                        view! {
-                            <p class="py-6 text-sm text-slate-500">
-                                "Use \"Open configuration file\" to view and edit the rust-bot configuration."
-                            </p>
-                        }
-                            .into_any()
-                    }
-                    ConfigFileView::Loading => {
-                        view! { <p class="py-6 text-sm text-slate-400">"Loading…"</p> }.into_any()
-                    }
-                    ConfigFileView::Loaded { path, .. } => {
-                        view! {
-                            <div class="flex min-h-0 flex-1 flex-col">
-                                <p class="mb-2 break-all text-xs text-slate-500">{path}</p>
-                                <textarea
-                                    aria-label="Configuration file"
-                                    spellcheck="false"
-                                    class="h-[min(28rem,55vh)] w-full resize-none rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs leading-5 text-slate-900 outline-none focus:border-orange-500"
-                                    prop:value=move || draft.get()
-                                    on:input=move |ev| draft.set(event_target_value(&ev))
-                                ></textarea>
-                                <div class="mt-4 flex justify-end gap-2">
+                <div class="flex h-[min(34rem,65vh)] min-h-0 gap-4">
+                    <nav aria-label="Settings sections" class="w-40 shrink-0 space-y-1">
+                        {SettingsPage::ALL
+                            .into_iter()
+                            .map(|page| {
+                                view! {
                                     <button
                                         type="button"
-                                        class="rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-200"
-                                        on:click=move |_| on_close_config_file.run(())
+                                        class=move || {
+                                            menu_button_class(
+                                                !editor_open() && panel.page.get() == page,
+                                            )
+                                        }
+                                        on:click=move |_| select_page(page)
                                     >
-                                        "Cancel"
+                                        {page.title()}
                                     </button>
-                                    <button
-                                        type="button"
-                                        class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
-                                        disabled=move || !can_save(saving.get())
-                                        on:click=move |_| on_save_config_file.run(draft.get_untracked())
-                                    >
-                                        {move || save_label(saving.get())}
-                                    </button>
-                                </div>
-                            </div>
-                        }
-                            .into_any()
-                    }
-                }}
+                                }
+                            })
+                            .collect_view()}
+                    </nav>
+                    <div class="flex min-h-0 min-w-0 flex-1 flex-col">
+                        {move || match config_file.get() {
+                            ConfigFileView::Closed => {
+                                view! {
+                                    <SettingsPageView panel=panel actions=actions search=search />
+                                }
+                                    .into_any()
+                            }
+                            ConfigFileView::Loading => {
+                                view! { <p class="py-6 text-sm text-slate-400">"Loading…"</p> }
+                                    .into_any()
+                            }
+                            ConfigFileView::Loaded { path, .. } => {
+                                view! {
+                                    <div class="flex min-h-0 flex-1 flex-col">
+                                        <p class="mb-2 break-all text-xs text-slate-500">{path}</p>
+                                        <textarea
+                                            aria-label="Configuration file"
+                                            spellcheck="false"
+                                            class="min-h-0 w-full flex-1 resize-none rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs leading-5 text-slate-900 outline-none focus:border-orange-500"
+                                            prop:value=move || draft.get()
+                                            on:input=move |ev| draft.set(event_target_value(&ev))
+                                        ></textarea>
+                                        <div class="mt-4 flex justify-end gap-2">
+                                            <button
+                                                type="button"
+                                                class="rounded-lg bg-slate-100 px-3 py-1.5 text-sm font-medium text-slate-700 hover:bg-slate-200"
+                                                on:click=move |_| on_close_config_file.run(())
+                                            >
+                                                "Cancel"
+                                            </button>
+                                            <button
+                                                type="button"
+                                                class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800 disabled:opacity-50"
+                                                disabled=move || !can_save(saving.get())
+                                                on:click=move |_| on_save_config_file.run(draft.get_untracked())
+                                            >
+                                                {move || save_label(saving.get())}
+                                            </button>
+                                        </div>
+                                    </div>
+                                }
+                                    .into_any()
+                            }
+                        }}
+                    </div>
+                </div>
             </DialogFrame>
         </Show>
     }
@@ -232,6 +278,12 @@ mod tests {
     fn save_is_disabled_only_while_saving() {
         assert!(can_save(false));
         assert!(!can_save(true));
+    }
+
+    #[test]
+    fn menu_button_is_highlighted_only_for_the_open_page() {
+        assert!(menu_button_class(true).contains("bg-slate-100"));
+        assert!(!menu_button_class(false).contains("bg-slate-100"));
     }
 
     #[test]

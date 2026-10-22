@@ -5,7 +5,7 @@
 //! manageable; nothing here has any logic beyond `WebSocketConfig`'s own
 //! deserialization/validation.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex as StdMutex};
@@ -73,6 +73,22 @@ pub enum EnvelopeType {
     /// validating it. Rust-side addition with no nanobot precedent. Same access rules as
     /// [`Self::GetConfigFile`].
     SaveConfigFile,
+    /// List every built-in tool (MCP tools excluded) with its description and on/off
+    /// state, for the Settings dialog's Tools page. Rust-side addition with no nanobot
+    /// precedent. Authenticated connections only.
+    ListToolSettings,
+    /// Switch one built-in tool on or off globally (`{name, enabled}`) by editing
+    /// `tools.disabledTools` in `config.json`. Rust-side addition with no nanobot
+    /// precedent. Same access rules as [`Self::SaveConfigFile`].
+    SetToolEnabled,
+    /// List the configured MCP servers with their on/off state, for the Settings
+    /// dialog's MCP Servers page. Rust-side addition with no nanobot precedent.
+    /// Authenticated connections only.
+    ListMcpServers,
+    /// Switch one configured MCP server on or off (`{name, enabled}`) by editing its
+    /// `enabled` flag in `config.json`. Rust-side addition with no nanobot precedent.
+    /// Same access rules as [`Self::SaveConfigFile`].
+    SetMcpServerEnabled,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -156,6 +172,10 @@ impl From<&str> for EnvelopeType {
             "set_mcp_preset" => Self::SetMcpPreset,
             "get_config_file" => Self::GetConfigFile,
             "save_config_file" => Self::SaveConfigFile,
+            "list_tool_settings" => Self::ListToolSettings,
+            "set_tool_enabled" => Self::SetToolEnabled,
+            "list_mcp_servers" => Self::ListMcpServers,
+            "set_mcp_server_enabled" => Self::SetMcpServerEnabled,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -210,6 +230,19 @@ pub enum WsOutboundEvent {
     /// Reply to a refused or failed config file read or save — `{detail, message}`.
     /// Never carries any of the file's content.
     ConfigFileError,
+    /// Reply to [`EnvelopeType::ListToolSettings`] — `{tools, can_modify}`.
+    ToolSettings,
+    /// Reply to a successful [`EnvelopeType::SetToolEnabled`] — `{name, enabled,
+    /// restart_required}`.
+    ToolSettingSet,
+    /// Reply to [`EnvelopeType::ListMcpServers`] — `{servers, can_modify}`.
+    McpServers,
+    /// Reply to a successful [`EnvelopeType::SetMcpServerEnabled`] — `{name, enabled,
+    /// restart_required}`.
+    McpServerSet,
+    /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
+    /// message}`. Never carries any of the file's content.
+    SettingError,
     /// Reply to [`EnvelopeType::ListSubagents`] — `{acp: {enabled, agents}, spawn: {tasks}}`.
     Subagents,
     /// Reply to [`EnvelopeType::RenameChat`] — Rust-side addition, no nanobot
@@ -281,6 +314,11 @@ impl WsOutboundEvent {
             Self::ConfigFile => "config_file",
             Self::ConfigFileSaved => "config_file_saved",
             Self::ConfigFileError => "config_file_error",
+            Self::ToolSettings => "tool_settings",
+            Self::ToolSettingSet => "tool_setting_set",
+            Self::McpServers => "mcp_servers",
+            Self::McpServerSet => "mcp_server_set",
+            Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
             Self::ChatPinned => "chat_pinned",
@@ -498,6 +536,10 @@ pub struct WsShared {
     /// Same `Arc` as `AgentLoop::subagents`, so `list_subagents` sees the spawn
     /// tasks of this process. `None` when no agent loop was wired in.
     pub subagents: Option<Arc<SubagentManager>>,
+    /// Names of the MCP servers this process was started with switched on. The
+    /// Settings dialog compares it with `config.json` to tell which toggles still wait
+    /// for a restart.
+    pub running_mcp_servers: Arc<HashSet<String>>,
 }
 
 /// Upgrade-time JWT outcome for one WebSocket connection. Produced by
@@ -700,6 +742,27 @@ mod tests {
             WsOutboundEvent::ConfigFileError.as_str(),
             "config_file_error"
         );
+        assert_eq!(
+            EnvelopeType::from("list_tool_settings"),
+            EnvelopeType::ListToolSettings
+        );
+        assert_eq!(
+            EnvelopeType::from("set_tool_enabled"),
+            EnvelopeType::SetToolEnabled
+        );
+        assert_eq!(
+            EnvelopeType::from("list_mcp_servers"),
+            EnvelopeType::ListMcpServers
+        );
+        assert_eq!(
+            EnvelopeType::from("set_mcp_server_enabled"),
+            EnvelopeType::SetMcpServerEnabled
+        );
+        assert_eq!(WsOutboundEvent::ToolSettings.as_str(), "tool_settings");
+        assert_eq!(WsOutboundEvent::ToolSettingSet.as_str(), "tool_setting_set");
+        assert_eq!(WsOutboundEvent::McpServers.as_str(), "mcp_servers");
+        assert_eq!(WsOutboundEvent::McpServerSet.as_str(), "mcp_server_set");
+        assert_eq!(WsOutboundEvent::SettingError.as_str(), "setting_error");
         assert_eq!(
             EnvelopeType::from("list_subagents"),
             EnvelopeType::ListSubagents
