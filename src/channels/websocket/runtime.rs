@@ -35,6 +35,7 @@ use crate::agent::subagent::{
     SpawnTaskSummary, SubagentManager, SubagentRecord, summarize_spawn_records,
 };
 use crate::agent::tool_approval::ToolApprovalCall;
+use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
 use crate::agent::tools::mcp::mcp_presets_api::{
     self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
 };
@@ -666,6 +667,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SetMcpPreset => {
             handle_set_mcp_preset(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetToolConfig => {
+            handle_set_tool_config(envelope_dispatch_context).await;
         }
         EnvelopeType::GetConfigFile => {
             handle_get_config_file(envelope_dispatch_context).await;
@@ -3236,13 +3240,17 @@ async fn handle_list_tool_settings<'a>(envelope_dispatch_context: EnvelopeDispat
         .and_then(|text| config_toggles::disabled_tool_names(&text).map_err(|e| e.message()));
     match disabled_names {
         Ok(disabled_names) => {
+            let rows = config_toggles::merge_section_rows(
+                config_toggles::tool_setting_rows(&catalogue, &disabled_names),
+                tool_settings_api::tool_settings_overview(&load_config(None).tools),
+            );
             send_event(
                 shared,
                 connection_id,
                 WsOutboundEvent::ToolSettings,
                 None,
                 serde_json::json!({
-                    "tools": config_toggles::tool_setting_rows(&catalogue, &disabled_names),
+                    "tools": rows,
                     "can_modify": can_modify,
                 }),
             )
@@ -3393,10 +3401,89 @@ async fn handle_toggle_setting<'a>(
     }
 }
 
-/// Handle a `set_tool_enabled` envelope; see [`handle_toggle_setting`].
-/// Rust-side addition with no nanobot precedent.
+/// Handle a `set_tool_enabled` envelope; see [`handle_toggle_setting`]. A name that is a
+/// tool section (e.g. `gmail`) switches that section's own `enable` setting instead of
+/// `disabledTools`. Rust-side addition with no nanobot precedent.
 async fn handle_set_tool_enabled<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
-    handle_toggle_setting(envelope_dispatch_context, SettingKind::Tool).await;
+    let name = envelope_dispatch_context
+        .envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    if tool_settings_api::is_section_name(name) {
+        handle_set_section_enabled(envelope_dispatch_context).await;
+    } else {
+        handle_toggle_setting(envelope_dispatch_context, SettingKind::Tool).await;
+    }
+}
+
+/// Switch a tool section on or off through its `enable` setting and reply like any other
+/// tool toggle (`tool_setting_set` / `setting_error`).
+async fn handle_set_section_enabled<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let envelope = envelope_dispatch_context.envelope;
+    let name = envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .to_string();
+    let kind = SettingKind::Tool;
+    if let Some((detail, message)) = setting_write_denial(shared, &envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, &name, detail, message).await;
+        return;
+    }
+    let Some(enabled) = envelope.get("enabled").and_then(|v| v.as_bool()) else {
+        send_setting_error(
+            shared,
+            connection_id,
+            kind,
+            &name,
+            "invalid_request",
+            "The request was malformed.",
+        )
+        .await;
+        return;
+    };
+    let result = {
+        let _write_guard = MCP_CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut config = load_config(None);
+        tool_settings_api::set_section_enabled(&mut config, &name, enabled)
+            .map_err(|e| (tool_config_error_detail(&e), e.to_string()))
+            .and_then(|changed| {
+                if changed {
+                    save_config(&config, None)
+                        .map_err(|e| ("config_error", format!("Error saving config: {e}")))?;
+                }
+                Ok(changed)
+            })
+    };
+    match result {
+        Ok(changed) => {
+            if changed {
+                log::info!(
+                    "Tool '{name}' {} from the WebUI (client '{client_id}')",
+                    if enabled { "enabled" } else { "disabled" },
+                );
+            }
+            send_event(
+                shared,
+                connection_id,
+                kind.saved_event(),
+                None,
+                serde_json::json!({
+                    "name": name,
+                    "enabled": enabled,
+                    "restart_required": changed,
+                }),
+            )
+            .await;
+        }
+        Err((detail, message)) => {
+            send_setting_error(shared, connection_id, kind, &name, detail, &message).await;
+        }
+    }
 }
 
 /// Handle a `set_mcp_server_enabled` envelope; see [`handle_toggle_setting`].
@@ -3512,6 +3599,133 @@ async fn handle_set_mcp_preset<'a>(envelope_dispatch_context: EnvelopeDispatchCo
         Err(message) => {
             send_mcp_preset_error(shared, connection_id, &name, "config_error", &message, &[])
                 .await;
+        }
+    }
+}
+
+/// Read the `values` object of a `set_tool_config` envelope (`property -> value`). A
+/// missing `values` means no changes; anything that is not an object is rejected.
+fn parse_tool_config_values(envelope: &Envelope) -> Option<HashMap<String, serde_json::Value>> {
+    let Some(values) = envelope.get("values") else {
+        return Some(HashMap::new());
+    };
+    Some(
+        values
+            .as_object()?
+            .iter()
+            .map(|(name, value)| (name.clone(), value.clone()))
+            .collect(),
+    )
+}
+
+/// Stable code the browser switches on for a refused tool configuration change.
+fn tool_config_error_detail(error: &ToolSettingsError) -> &'static str {
+    match error {
+        ToolSettingsError::UnknownTool(_) => "unknown_tool",
+        ToolSettingsError::UnknownField(..) => "unknown_field",
+        ToolSettingsError::InvalidValue(..) => "invalid_value",
+        ToolSettingsError::Invalid(_) => "invalid_config",
+    }
+}
+
+/// Tell the requester a `set_tool_config` was refused or failed. `message` never
+/// contains a submitted value: error events are logged in full.
+async fn send_tool_config_error(
+    shared: &WsShared,
+    connection_id: &str,
+    tool: &str,
+    detail: &str,
+    message: &str,
+) {
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ToolConfigError,
+        None,
+        serde_json::json!({"tool": tool, "detail": detail, "message": message}),
+    )
+    .await;
+}
+
+/// Handle a `set_tool_config` envelope: validate the submitted `values` for `tool`
+/// against its schema, save `config.json` when something changed, and reply with the
+/// tool's fresh summary and whether a restart is needed. Local, authenticated
+/// connections only.
+async fn handle_set_tool_config<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let envelope = envelope_dispatch_context.envelope;
+    let tool = envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+
+    if let Some((detail, message)) = setting_write_denial(shared, &envelope_dispatch_context) {
+        send_tool_config_error(shared, connection_id, &tool, detail, message).await;
+        return;
+    }
+    let Some(values) = parse_tool_config_values(envelope) else {
+        send_tool_config_error(
+            shared,
+            connection_id,
+            &tool,
+            "invalid_request",
+            "The request was malformed.",
+        )
+        .await;
+        return;
+    };
+
+    let result = {
+        // Held across load + save only; no `.await` while it is held.
+        let _write_guard = MCP_CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let mut config = load_config(None);
+        match tool_settings_api::apply_tool_settings(&mut config, &tool, &values) {
+            Err(error) => Ok(Err(error)),
+            Ok(changed) => {
+                let saved = if changed {
+                    save_config(&config, None).map_err(|e| format!("Error saving config: {e}"))
+                } else {
+                    Ok(())
+                };
+                saved.map(|()| {
+                    let summary = tool_settings_api::tool_settings_overview(&config.tools)
+                        .into_iter()
+                        .find(|summary| summary.name == tool);
+                    Ok((changed, summary))
+                })
+            }
+        }
+    };
+
+    match result {
+        Ok(Ok((changed, summary))) => {
+            if changed {
+                log::info!("Tool '{tool}' configured from the WebUI (client '{client_id}')");
+            }
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::ToolConfigSet,
+                None,
+                serde_json::json!({
+                    "tool": tool,
+                    "summary": summary,
+                    "restart_required": changed,
+                }),
+            )
+            .await;
+        }
+        Ok(Err(error)) => {
+            let detail = tool_config_error_detail(&error);
+            send_tool_config_error(shared, connection_id, &tool, detail, &error.to_string())
+                .await;
+        }
+        Err(message) => {
+            send_tool_config_error(shared, connection_id, &tool, "config_error", &message).await;
         }
     }
 }
@@ -8906,6 +9120,52 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn tool_config_changes_are_refused_for_anonymous_and_remote_connections() {
+        let shared = test_shared("browser");
+        let anonymous = dispatch_setting_envelope(
+            &shared,
+            &AuthorizeResult::UNAUTHENTICATED,
+            "127.0.0.1",
+            "set_tool_config",
+        )
+        .await;
+        let remote =
+            dispatch_setting_envelope(&shared, &authenticated(), "203.0.113.5", "set_tool_config")
+                .await;
+
+        for body in [anonymous, remote] {
+            assert_eq!(body["event"], "tool_config_error");
+            assert_eq!(body["detail"], "access_denied");
+        }
+    }
+
+    #[test]
+    fn tool_config_values_must_be_an_object_when_present() {
+        let mut envelope: Envelope = HashMap::new();
+        assert_eq!(parse_tool_config_values(&envelope), Some(HashMap::new()));
+
+        envelope.insert("values".to_string(), serde_json::json!({"model": "m", "n": 3}));
+        let values = parse_tool_config_values(&envelope).unwrap();
+        assert_eq!(values["model"], "m");
+        assert_eq!(values["n"], 3);
+
+        envelope.insert("values".to_string(), serde_json::json!(["model"]));
+        assert_eq!(parse_tool_config_values(&envelope), None);
+    }
+
+    #[test]
+    fn tool_config_error_details_are_stable_codes() {
+        assert_eq!(
+            tool_config_error_detail(&ToolSettingsError::UnknownTool("x".into())),
+            "unknown_tool"
+        );
+        assert_eq!(
+            tool_config_error_detail(&ToolSettingsError::InvalidValue("x".into(), "y".into())),
+            "invalid_value"
+        );
+    }
+
+    #[tokio::test]
     async fn setting_toggle_errors_name_the_kind_of_item() {
         let shared = test_shared("browser");
 
@@ -8930,14 +9190,14 @@ mod tests {
 
     #[tokio::test]
     async fn list_tool_settings_reports_catalogue_tools_without_mcp_tools() {
-        let mut shared = shared_with_tools(&["shell", "mcp_github_search", "web_search"]);
+        let mut shared = shared_with_tools(&["grep", "mcp_github_search", "glob"]);
         shared
             .tool_registry
             .as_ref()
             .unwrap()
             .lock()
             .unwrap()
-            .disable("web_search");
+            .disable("glob");
 
         let body =
             dispatch_setting_envelope(&shared, &authenticated(), "127.0.0.1", "list_tool_settings")
@@ -8950,16 +9210,16 @@ mod tests {
             .iter()
             .map(|tool| tool["name"].as_str().unwrap())
             .collect();
-        assert!(names.contains(&"shell"));
-        assert!(names.contains(&"web_search"), "disabled tools stay listed");
+        assert!(names.contains(&"grep"));
+        assert!(names.contains(&"glob"), "disabled tools stay listed");
         assert!(!names.contains(&"mcp_github_search"));
-        let web_search = body["tools"]
+        let glob = body["tools"]
             .as_array()
             .unwrap()
             .iter()
-            .find(|tool| tool["name"] == "web_search")
+            .find(|tool| tool["name"] == "glob")
             .unwrap();
-        assert_eq!(web_search["active"], false);
+        assert_eq!(glob["active"], false);
         shared.tool_registry = None;
     }
 

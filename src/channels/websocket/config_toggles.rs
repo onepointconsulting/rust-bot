@@ -16,6 +16,7 @@ use serde_json::{Map, Value};
 
 use super::config_file::{read_config_text, save_config_text};
 use crate::agent::tools::registry::ToolCatalogueEntry;
+use crate::agent::tools::tool_settings_api::ToolSettingsSummary;
 
 /// Tools that cannot be switched off from the dialog: other parts of the gateway call
 /// them directly (the REST API sends replies through `message`).
@@ -281,6 +282,9 @@ pub struct ToolSettingRow {
     pub active: bool,
     /// `false` for tools the gateway needs (see [`PROTECTED_TOOLS`]).
     pub toggleable: bool,
+    /// The configuration form, for a row that stands for a whole tool section.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ToolSettingsSummary>,
 }
 
 /// What the dialog shows for one configured MCP server.
@@ -313,6 +317,7 @@ pub fn tool_setting_rows(
             enabled: !is_disabled(&entry.name),
             active: entry.active,
             toggleable: !is_protected_tool(&entry.name),
+            config: None,
         })
         .collect();
     let known: HashSet<&str> = catalogue.iter().map(|e| e.name.as_str()).collect();
@@ -327,10 +332,45 @@ pub fn tool_setting_rows(
             enabled: false,
             active: false,
             toggleable: true,
+            config: None,
         });
     }
     rows.sort_by_key(|row| row.name.to_lowercase());
     rows
+}
+
+/// Fold the tool section forms into `rows`: the rows of the tools a section owns are
+/// replaced by one row for the section, whose switch is the section's own `enable`
+/// setting and which carries the form. `active` is whether any owned tool is running
+/// (a section that is off registers none of them). Result is sorted A–Z.
+pub fn merge_section_rows(
+    rows: Vec<ToolSettingRow>,
+    sections: Vec<ToolSettingsSummary>,
+) -> Vec<ToolSettingRow> {
+    let owned: HashSet<&str> = sections
+        .iter()
+        .flat_map(|section| section.tool_names.iter().map(String::as_str))
+        .collect();
+    let mut merged: Vec<ToolSettingRow> = rows
+        .iter()
+        .filter(|row| !owned.contains(row.name.as_str()))
+        .cloned()
+        .collect();
+    for section in sections {
+        let active = rows
+            .iter()
+            .any(|row| row.active && section.tool_names.contains(&row.name));
+        merged.push(ToolSettingRow {
+            name: section.name.clone(),
+            description: section.description.clone(),
+            enabled: section.enabled.unwrap_or(true),
+            active,
+            toggleable: true,
+            config: Some(section),
+        });
+    }
+    merged.sort_by_key(|row| row.name.to_lowercase());
+    merged
 }
 
 /// The MCP server rows: every configured server, sorted A–Z ignoring case.
@@ -447,6 +487,30 @@ mod tests {
         assert_eq!(unknown.len(), 1);
         assert!(!unknown[0].enabled && !unknown[0].active);
         assert_eq!(unknown[0].description, UNKNOWN_TOOL_DESCRIPTION);
+    }
+
+    #[test]
+    fn section_rows_replace_the_rows_of_the_tools_they_own() {
+        use crate::agent::tools::tool_settings_api::tool_settings_overview;
+        use crate::config::schema::ToolsConfig;
+
+        let mut tools = ToolsConfig::default();
+        tools.image_generation.enable = true;
+        let rows = tool_setting_rows(
+            &[entry("grep", true), entry("image_generation", true)],
+            &[],
+        );
+
+        let merged = merge_section_rows(rows, tool_settings_overview(&tools));
+
+        let names: Vec<&str> = merged.iter().map(|r| r.name.as_str()).collect();
+        assert!(names.contains(&"grep") && names.contains(&"imageGeneration"));
+        assert!(!names.contains(&"image_generation"), "owned tool row is replaced");
+        let image = merged.iter().find(|r| r.name == "imageGeneration").unwrap();
+        assert!(image.enabled && image.active && image.config.is_some());
+        let gmail = merged.iter().find(|r| r.name == "gmail").unwrap();
+        assert!(!gmail.enabled && !gmail.active);
+        assert!(merged.iter().find(|r| r.name == "grep").unwrap().config.is_none());
     }
 
     #[test]

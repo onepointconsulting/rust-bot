@@ -31,7 +31,7 @@ use chat_ui::models::{
 
 use crate::api::{self, WsSender};
 use crate::components::{
-    apply_enabled, ChatShell, McpChangeRequest, SettingsActions, SettingsPage, SettingsPanel,
+    apply_enabled, apply_tool_config, ChatShell, McpChangeRequest, ToolConfigChange, SettingsActions, SettingsPage, SettingsPanel,
     ToggleRequest,
 };
 use crate::protocol::{self, ServerEvent};
@@ -1115,6 +1115,31 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 ctx.settings_panel.tools_loaded.set(true);
             }
         }
+        ServerEvent::ToolConfigSet {
+            tool,
+            summary,
+            restart_required,
+        } => {
+            finish_setting_change(ctx, restart_required);
+            if let Some(summary) = summary {
+                ctx.settings_panel
+                    .tools
+                    .update(|tools| apply_tool_config(tools, &tool, summary));
+            }
+        }
+        ServerEvent::ToolConfigError {
+            tool,
+            detail,
+            message,
+        } => {
+            let panel = ctx.settings_panel;
+            panel.busy.set(None);
+            // The gateway no longer allows changes on this connection: go read-only.
+            if matches!(detail.as_str(), "access_denied" | "child_agent_config") {
+                panel.can_modify.set(false);
+            }
+            panel.error.set(Some((tool, message)));
+        }
         ServerEvent::McpServers {
             servers,
             can_modify,
@@ -1611,6 +1636,18 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
         *ctx,
         envelope,
         "Failed to encode the settings change request.",
+    );
+}
+
+/// Ask the gateway to save changed settings of one tool section. The reply is a
+/// `tool_config_set` or a `tool_config_error` event.
+fn request_set_tool_config(ctx: &WsContext, (tool, values): ToolConfigChange) {
+    ctx.settings_panel.error.set(None);
+    ctx.settings_panel.busy.set(Some(tool.clone()));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_tool_config(tool, values),
+        "Failed to encode the tool settings change request.",
     );
 }
 
@@ -2663,6 +2700,7 @@ pub fn App() -> impl IntoView {
         on_select_page: Callback::new(move |page| select_settings_page(&ws_context, page)),
         on_toggle: Callback::new(move |request| request_toggle_setting(&ws_context, request)),
         on_refresh: Callback::new(move |()| refresh_settings_page(&ws_context)),
+        on_save_config: Callback::new(move |change| request_set_tool_config(&ws_context, change)),
     };
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {
         request_set_mcp_preset(&ws_context, name, enabled, fields);

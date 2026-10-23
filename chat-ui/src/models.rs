@@ -158,6 +158,67 @@ pub struct ToolSettingSummary {
     /// `false` for tools the gateway needs, whose switch is locked.
     #[serde(default = "default_toggleable")]
     pub toggleable: bool,
+    /// The settings form, when the row stands for a whole tool section (e.g. `gmail`).
+    #[serde(default)]
+    pub config: Option<ToolConfigSummary>,
+}
+
+/// What kind of input a tool setting needs. Mirrors the backend's `FieldKind`
+/// (`src/agent/tools/tool_settings_api.rs`): internally tagged by `kind`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum ToolFieldKind {
+    Bool,
+    Integer {
+        #[serde(default)]
+        min: Option<i64>,
+        #[serde(default)]
+        max: Option<i64>,
+    },
+    Text,
+    Choice { choices: Vec<String> },
+    StringList,
+}
+
+/// One editable setting of a tool. Mirrors the backend's `ToolFieldSummary`; the kind is
+/// flattened into the same object. Secret fields never carry a `value`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolFieldSummary {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default)]
+    pub help: String,
+    #[serde(flatten)]
+    pub kind: ToolFieldKind,
+    #[serde(default)]
+    pub secret: bool,
+    /// Environment variable that satisfies the field, empty when there is none.
+    #[serde(default)]
+    pub env_var: String,
+    /// Whether the field already has a usable value (stored, or via its env var).
+    #[serde(default)]
+    pub configured: bool,
+    #[serde(default)]
+    pub value: Option<serde_json::Value>,
+    #[serde(default)]
+    pub default: Option<serde_json::Value>,
+}
+
+/// The settings form of one tool section. Mirrors the backend's `ToolSettingsSummary`.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ToolConfigSummary {
+    pub name: String,
+    #[serde(default)]
+    pub title: String,
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub enabled: Option<bool>,
+    #[serde(default)]
+    pub tool_names: Vec<String>,
+    #[serde(default)]
+    pub fields: Vec<ToolFieldSummary>,
 }
 
 fn default_toggleable() -> bool {

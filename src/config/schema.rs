@@ -1,6 +1,7 @@
 use std::{collections::HashMap, path::PathBuf};
 
 use garde::Validate;
+use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -946,18 +947,25 @@ fn default_web_search_timeout() -> u32 {
 }
 
 /// Web search tool configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(inline)]
 pub struct WebSearchConfig {
     /// Search backend: `"exa_free"` (default, no registration required),
     /// `"duckduckgo"` (no registration required), `"brave"`, or `"exa"`.
     #[serde(alias = "provider", default = "default_web_search_provider")]
     #[garde(skip)]
+    #[schemars(
+        with = "String",
+        extend("x-choices" = ["exa_free", "duckduckgo", "brave", "exa"])
+    )]
     pub provider: WebSearchProvider,
 
-    /// API key for providers that require authentication.
+    /// API key for providers that require authentication. Empty falls back to
+    /// `BRAVE_API_KEY` or `EXA_API_KEY`.
     #[serde(alias = "api_key")]
     #[garde(skip)]
+    #[schemars(extend("x-secret" = true))]
     pub api_key: String,
 
     /// Base URL override for providers that support a custom endpoint.
@@ -968,11 +976,13 @@ pub struct WebSearchConfig {
     /// Maximum number of results to return per query. Default: 5.
     #[serde(alias = "max_results", default = "default_web_search_max_results")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub max_results: u32,
 
     /// Wall-clock timeout in seconds for each search operation. Default: 30.
     #[serde(alias = "timeout", default = "default_web_search_timeout")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub timeout: u32,
 }
 
@@ -999,8 +1009,13 @@ fn default_web_tools_timeout() -> u32 {
 }
 
 /// Web tools configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend(
+    "x-editable" = true,
+    "x-title" = "Web",
+    "x-tools" = ["web_search", "web_fetch"]
+))]
 pub struct WebToolsConfig {
     /// Enable or disable the web tools entirely. Default: `true`.
     #[serde(alias = "enable", default = "default_web_tools_enable")]
@@ -1017,6 +1032,7 @@ pub struct WebToolsConfig {
     /// Examples: `30`, `60`, `120`.
     #[serde(alias = "timeout", default = "default_web_tools_timeout")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub timeout: u32,
 
     /// Web search backend configuration.
@@ -1079,8 +1095,13 @@ fn default_docx_tool_enable() -> bool {
 // ── GmailToolConfig ───────────────────────────────────────────────────────────
 
 /// Gmail Tool configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend(
+    "x-editable" = true,
+    "x-title" = "Gmail",
+    "x-tools" = ["gmail", "gmail_email_send", "gmail_email_download"]
+))]
 pub struct GmailToolConfig {
     /// Enable or disable the Gmail Tool. Default: `false`.
     #[serde(alias = "enable", default = "default_gmail_tool_enable")]
@@ -1103,6 +1124,7 @@ pub struct GmailToolConfig {
     /// Maximum number of results to return per query. Default: 20.
     #[serde(alias = "max_results", default = "default_gmail_max_results")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub max_results: u32,
 }
 
@@ -1129,11 +1151,12 @@ impl Default for GmailToolConfig {
 
 // ── DocxToolConfig ───────────────────────────────────────────────────────────
 
-/// Gmail Tool configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+/// DOCX conversion tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-editable" = true, "x-title" = "DOCX conversion", "x-tools" = ["docx"]))]
 pub struct DocxToolConfig {
-    /// Enable or disable the Gmail Tool. Default: `false`.
+    /// Enable or disable the DOCX conversion tool. Default: `false`.
     #[serde(alias = "enable", default = "default_docx_tool_enable")]
     #[garde(skip)]
     pub enable: bool,
@@ -1154,8 +1177,9 @@ fn default_question_tool_enabled() -> bool {
 }
 
 /// Question Tool configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-editable" = true, "x-title" = "Question", "x-tools" = ["question"]))]
 pub struct QuestionToolConfig {
     /// Enable or disable the question tool. Default: `true`.
     #[serde(alias = "enable", default = "default_question_tool_enabled")]
@@ -1198,8 +1222,13 @@ fn default_image_generation_tool_quality() -> String {
 }
 
 /// Image Generation Tool configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend(
+    "x-editable" = true,
+    "x-title" = "Image generation",
+    "x-tools" = ["image_generation"]
+))]
 pub struct ImageGenerationToolConfig {
     /// Enable or disable the Image Generation Tool. Default: `false`.
     #[serde(alias = "enable", default = "default_image_generation_tool_enable")]
@@ -1214,6 +1243,7 @@ pub struct ImageGenerationToolConfig {
     /// API key for the image generation tool. Falls back to `OPENROUTER_API_KEY` when empty. Default: `""`.
     #[serde(alias = "api_key", default = "default_image_generation_tool_api_key")]
     #[garde(skip)]
+    #[schemars(extend("x-secret" = true, "x-env-var" = "OPENROUTER_API_KEY"))]
     pub api_key: String,
 
     /// API base URL for image generation requests. Default: `"https://openrouter.ai/api/v1/images"`.
@@ -1231,6 +1261,7 @@ pub struct ImageGenerationToolConfig {
     /// Empty means omit from the request. Default: `""`.
     #[serde(alias = "quality", default = "default_image_generation_tool_quality")]
     #[garde(skip)]
+    #[schemars(extend("x-choices" = ["", "auto", "low", "medium", "high"]))]
     pub quality: String,
 }
 
@@ -1257,8 +1288,9 @@ fn default_exec_tool_timeout() -> u32 {
 }
 
 /// Shell exec tool configuration.
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-editable" = true, "x-title" = "Shell", "x-tools" = ["shell"]))]
 pub struct ExecToolConfig {
     /// Enable or disable the shell exec tool. Default: `true`.
     #[serde(alias = "enable", default = "default_exec_tool_enable")]
@@ -1268,6 +1300,7 @@ pub struct ExecToolConfig {
     /// Command execution timeout in seconds. Default: 60.
     #[serde(alias = "timeout", default = "default_exec_tool_timeout")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub timeout: u32,
 
     /// Extra directories appended to `PATH` inside the subprocess.
@@ -1278,6 +1311,7 @@ pub struct ExecToolConfig {
     /// Sandbox backend: `""` (none) or `"bwrap"` (Bubblewrap).
     #[serde(alias = "sandbox")]
     #[garde(skip)]
+    #[schemars(extend("x-choices" = ["", "bwrap"]))]
     pub sandbox: String,
 }
 
@@ -1316,8 +1350,10 @@ impl OcrProvider {
     }
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+/// OCR Tool configuration.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-editable" = true, "x-title" = "OCR", "x-tools" = ["ocr"]))]
 pub struct OcrToolConfig {
     /// Enable or disable the OCR tool. Default: `false`.
     #[serde(alias = "enable", default = "default_ocr_tool_enable")]
@@ -1337,11 +1373,13 @@ pub struct OcrToolConfig {
     /// LLM provider for OCR. Default: `"anthropic"`.
     #[serde(alias = "provider", default = "default_ocr_tool_provider")]
     #[garde(skip)]
+    #[schemars(with = "String", extend("x-choices" = ["anthropic"]))]
     pub provider: OcrProvider,
 
     /// API key for the OCR provider. Empty string uses `ANTHROPIC_API_KEY` at runtime.
     #[serde(alias = "api_key", default = "default_ocr_tool_api_key")]
     #[garde(skip)]
+    #[schemars(extend("x-secret" = true, "x-env-var" = "ANTHROPIC_API_KEY"))]
     pub api_key: String,
 }
 
@@ -1602,8 +1640,13 @@ pub struct AcpLaunchPreset {
 /// `enabled` defaults to `false`: the `acp_*` tools only exist when an operator
 /// turns them on. Children inherit this section through the config overlay, which
 /// can only narrow it (see `config::overlay`).
-#[derive(Debug, Clone, Deserialize, Serialize, Validate)]
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend(
+    "x-editable" = true,
+    "x-title" = "ACP agents",
+    "x-tools" = ["acp_create_agent", "acp_update_agent", "acp_run_agent", "acp_list_agents"]
+))]
 pub struct AcpConfig {
     /// Register the `acp_*` tools. Default: `false`.
     #[serde(alias = "enable")]
@@ -1627,6 +1670,7 @@ pub struct AcpConfig {
     /// Seconds one child turn may take before it is cancelled.
     #[serde(alias = "default_timeout_secs", default = "default_acp_timeout_secs")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub default_timeout_secs: u64,
 
     /// Seconds a child gets to exit after its input is closed (it drains
@@ -1636,22 +1680,29 @@ pub struct AcpConfig {
         default = "default_acp_shutdown_grace_secs"
     )]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub shutdown_grace_secs: u64,
 
     /// How the child's permission requests are answered.
     #[serde(alias = "permission_policy")]
     #[garde(skip)]
+    #[schemars(
+        with = "String",
+        extend("x-choices" = ["auto-approve-read", "escalate", "allow-all"])
+    )]
     pub permission_policy: AcpPermissionPolicy,
 
     /// Child session sharing.
     #[serde(alias = "session_scope")]
     #[garde(skip)]
+    #[schemars(with = "String", extend("x-choices" = ["perParentSession", "shared"]))]
     pub session_scope: AcpSessionScope,
 
     /// Named launch commands. The built-in `rustbot` preset (this executable)
     /// always exists and need not be listed. Never settable by an overlay.
     #[serde(alias = "launch_presets")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub launch_presets: HashMap<String, AcpLaunchPreset>,
 }
 
@@ -2089,6 +2140,21 @@ impl Default for AgentDefaults {
 
 #[cfg(test)]
 mod tests {
+    /// The tool config structs expose the metadata the settings UI relies on:
+    /// editable flag, secret/env-var hints, choices, and numeric bounds.
+    #[test]
+    fn tool_config_schemas_carry_the_ui_metadata() {
+        let gmail = serde_json::to_value(schemars::schema_for!(GmailToolConfig)).unwrap();
+        assert_eq!(gmail["x-editable"], true);
+        assert_eq!(gmail["properties"]["maxResults"]["minimum"], 1);
+
+        let image = serde_json::to_value(schemars::schema_for!(ImageGenerationToolConfig)).unwrap();
+        let api_key = &image["properties"]["apiKey"];
+        assert_eq!(api_key["x-secret"], true);
+        assert_eq!(api_key["x-env-var"], "OPENROUTER_API_KEY");
+        assert_eq!(image["properties"]["quality"]["x-choices"][1], "auto");
+    }
+
     #[test]
     fn durability_defaults_apply_when_the_section_or_its_keys_are_absent() {
         let absent: Config = serde_json::from_str("{}").unwrap();

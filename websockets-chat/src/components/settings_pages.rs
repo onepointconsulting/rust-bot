@@ -10,11 +10,12 @@
 //! The row ordering, filtering and labelling are plain functions so they are
 //! unit-testable on the host target without Leptos.
 
-use chat_ui::models::{McpServerSettingSummary, ToolSettingSummary};
+use chat_ui::models::{McpServerSettingSummary, ToolConfigSummary, ToolSettingSummary};
 use leptos::prelude::*;
 
 use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, switch_hint, ToggleSwitch};
+use super::tool_config_form::{ToolConfigChange, ToolConfigForm};
 
 /// Tooltip on the switch of a tool the gateway itself depends on.
 const PROTECTED_TOOL_HINT: &str = "Required by the gateway; it cannot be switched off.";
@@ -75,6 +76,8 @@ pub struct SettingRow {
     pub active: bool,
     /// Whether the switch can be flipped at all.
     pub toggleable: bool,
+    /// The settings form, for a row that stands for a whole tool section.
+    pub config: Option<ToolConfigSummary>,
 }
 
 /// An item the Settings pages list: it has a name, a switch and a running state.
@@ -95,6 +98,7 @@ impl SettingItem for ToolSettingSummary {
             enabled: self.enabled,
             active: self.active,
             toggleable: self.toggleable,
+            config: self.config.clone(),
         }
     }
     fn name(&self) -> &str {
@@ -113,6 +117,7 @@ impl SettingItem for McpServerSettingSummary {
             enabled: self.enabled,
             active: self.active,
             toggleable: true,
+            config: None,
         }
     }
     fn name(&self) -> &str {
@@ -120,6 +125,14 @@ impl SettingItem for McpServerSettingSummary {
     }
     fn set_enabled(&mut self, enabled: bool) {
         self.enabled = enabled;
+    }
+}
+
+/// Replace the settings form of the tool called `name` with the gateway's fresh `summary`.
+/// Does nothing when no tool has that name.
+pub fn apply_tool_config(tools: &mut [ToolSettingSummary], name: &str, summary: ToolConfigSummary) {
+    if let Some(tool) = tools.iter_mut().find(|tool| tool.name == name) {
+        tool.config = Some(summary);
     }
 }
 
@@ -198,6 +211,8 @@ pub struct SettingsPanel {
     pub can_modify: RwSignal<bool>,
     /// The item a change request is in flight for.
     pub busy: RwSignal<Option<String>>,
+    /// The tool whose settings form is open, if any.
+    pub expanded_tool: RwSignal<Option<String>>,
     /// The last failed request as `(item name, message)`; the name is empty for a
     /// failure of the whole list.
     pub error: RwSignal<Option<(String, String)>>,
@@ -216,6 +231,7 @@ impl SettingsPanel {
             mcp_servers_loaded: RwSignal::new(false),
             can_modify: RwSignal::new(false),
             busy: RwSignal::new(None),
+            expanded_tool: RwSignal::new(None),
             error: RwSignal::new(None),
             restart_notice: RwSignal::new(false),
         }
@@ -251,6 +267,7 @@ impl SettingsPanel {
         self.mcp_servers_loaded.set(false);
         self.can_modify.set(false);
         self.busy.set(None);
+        self.expanded_tool.set(None);
         self.error.set(None);
     }
 }
@@ -270,6 +287,8 @@ pub struct SettingsActions {
     pub on_toggle: Callback<ToggleRequest>,
     /// Re-fetch the open page's list.
     pub on_refresh: Callback<()>,
+    /// Save the changed settings of one tool section.
+    pub on_save_config: Callback<ToolConfigChange>,
 }
 
 /// One row: tile, name, description, restart note, error line and switch.
@@ -288,6 +307,10 @@ fn SettingRowView(
     let toggleable = row.toggleable;
     let pending = pending_label(&row);
     let hint_row = row.clone();
+    let config = row.config.clone();
+    let name_for_expand = row.name.clone();
+    let name_for_form_busy = row.name.clone();
+    let name_for_open = row.name.clone();
     let disabled = Signal::derive(move || {
         !panel.can_modify.get() || !toggleable || is_busy(&panel.busy.get(), &name_for_busy)
     });
@@ -303,6 +326,30 @@ fn SettingRowView(
                             view! { <p class="mt-1 text-xs font-medium text-amber-700">{label}</p> }
                         })}
                 </div>
+                {config
+                    .as_ref()
+                    .map(|_| {
+                        view! {
+                            <button
+                                type="button"
+                                class="rounded-full px-3 py-1 text-sm text-slate-600 hover:bg-slate-100"
+                                on:click=move |_| {
+                                    let target = name_for_expand.clone();
+                                    panel
+                                        .expanded_tool
+                                        .update(|open| {
+                                            *open = if open.as_deref() == Some(target.as_str()) {
+                                                None
+                                            } else {
+                                                Some(target)
+                                            };
+                                        });
+                                }
+                            >
+                                "Settings"
+                            </button>
+                        }
+                    })}
                 <ToggleSwitch
                     on=enabled
                     label=format!("{name} enabled")
@@ -313,6 +360,26 @@ fn SettingRowView(
                     })
                 />
             </div>
+            {config
+                .map(|config| {
+                    let form_busy = Signal::derive(move || {
+                        is_busy(&panel.busy.get(), &name_for_form_busy)
+                    });
+                    view! {
+                        <Show when=move || {
+                            panel.expanded_tool.get().as_deref() == Some(name_for_open.as_str())
+                        }>
+                            <div class="mt-3">
+                                <ToolConfigForm
+                                    config=config.clone()
+                                    can_modify=panel.can_modify
+                                    busy=form_busy
+                                    on_save=actions.on_save_config
+                                />
+                            </div>
+                        </Show>
+                    }
+                })}
             {move || {
                 panel
                     .error
@@ -440,6 +507,7 @@ mod tests {
             enabled,
             active,
             toggleable: true,
+            config: None,
         }
     }
 
@@ -450,6 +518,7 @@ mod tests {
             enabled,
             active: enabled,
             toggleable: true,
+            config: None,
         }
     }
 

@@ -65,6 +65,9 @@ pub enum EnvelopeType {
     /// of the fields it needs (API keys, tokens). Rust-side addition with no nanobot
     /// precedent. Local, authenticated connections only — see `mcp_write_denial`.
     SetMcpPreset,
+    /// Change the settings of one built-in tool in `config.json`. Local, authenticated
+    /// connections only — see `mcp_write_denial`.
+    SetToolConfig,
     /// Read the raw text of `config.json` for the WebUI's Settings dialog. Rust-side
     /// addition with no nanobot precedent. Local, authenticated connections only — the
     /// file holds credentials; see `mcp_write_denial`.
@@ -170,6 +173,7 @@ impl From<&str> for EnvelopeType {
             "list_tools" => Self::ListTools,
             "list_mcp_presets" => Self::ListMcpPresets,
             "set_mcp_preset" => Self::SetMcpPreset,
+            "set_tool_config" => Self::SetToolConfig,
             "get_config_file" => Self::GetConfigFile,
             "save_config_file" => Self::SaveConfigFile,
             "list_tool_settings" => Self::ListToolSettings,
@@ -222,6 +226,12 @@ pub enum WsOutboundEvent {
     /// Reply to a refused or failed [`EnvelopeType::SetMcpPreset`] — `{name, detail,
     /// message, fields}`. Never carries a submitted field value.
     McpPresetError,
+    /// Reply to a successful [`EnvelopeType::SetToolConfig`] — `{tool, summary,
+    /// restart_required}`.
+    ToolConfigSet,
+    /// Reply to a refused or failed [`EnvelopeType::SetToolConfig`] — `{tool, detail,
+    /// message}`. Never carries a submitted value.
+    ToolConfigError,
     /// Reply to [`EnvelopeType::GetConfigFile`] — `{path, content}`.
     ConfigFile,
     /// Reply to a successful [`EnvelopeType::SaveConfigFile`] — a restart is needed for
@@ -311,6 +321,8 @@ impl WsOutboundEvent {
             Self::McpPresets => "mcp_presets",
             Self::McpPresetSet => "mcp_preset_set",
             Self::McpPresetError => "mcp_preset_error",
+            Self::ToolConfigSet => "tool_config_set",
+            Self::ToolConfigError => "tool_config_error",
             Self::ConfigFile => "config_file",
             Self::ConfigFileSaved => "config_file_saved",
             Self::ConfigFileError => "config_file_error",
@@ -725,6 +737,15 @@ mod tests {
         );
         assert_eq!(WsOutboundEvent::McpPresetSet.as_str(), "mcp_preset_set");
         assert_eq!(WsOutboundEvent::McpPresetError.as_str(), "mcp_preset_error");
+        assert_eq!(
+            EnvelopeType::from("set_tool_config"),
+            EnvelopeType::SetToolConfig
+        );
+        assert_eq!(WsOutboundEvent::ToolConfigSet.as_str(), "tool_config_set");
+        assert_eq!(
+            WsOutboundEvent::ToolConfigError.as_str(),
+            "tool_config_error"
+        );
         assert_eq!(
             EnvelopeType::from("get_config_file"),
             EnvelopeType::GetConfigFile

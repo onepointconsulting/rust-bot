@@ -21,7 +21,7 @@ use std::collections::HashMap;
 use chat_ui::models::{
     AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
     McpServerSettingSummary, Role, SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolEvent,
-    ToolSettingSummary, ToolSummary,
+    ToolConfigSummary, ToolSettingSummary, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -105,6 +105,10 @@ pub struct ClientEnvelope {
     /// field name to value (API keys, tokens). Secret: never logged or echoed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<HashMap<String, String>>,
+    /// Set only by [`Self::set_tool_config`] — tool setting name to its new value.
+    /// May hold secrets: never logged or echoed.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub values: Option<HashMap<String, serde_json::Value>>,
     /// Always `true`: this crate *is* the WebUI frontend, and the gateway's
     /// dispatch logic (`webui_authenticated` in
     /// `EnvelopeDispatchContext`) treats this flag as a client's own
@@ -142,6 +146,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -174,6 +179,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -205,6 +211,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -249,6 +256,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -278,6 +286,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -307,6 +316,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -360,6 +370,22 @@ impl ClientEnvelope {
             enabled: Some(enabled),
             pinned: None,
             fields: (!fields.is_empty()).then_some(fields),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to change settings of the tool section `tool` (e.g. `gmail`).
+    /// `values` maps setting names to new values; a blank secret keeps the stored one.
+    /// Refused unless this connection is signed in and local. The reply is a
+    /// `tool_config_set` or a `tool_config_error` event (see [`ServerEvent::ToolConfigSet`]).
+    pub fn set_tool_config(
+        tool: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "set_tool_config",
+            name: Some(tool.into()),
+            values: Some(values),
             ..Self::list_skills()
         }
     }
@@ -447,6 +473,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -494,6 +521,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -526,6 +554,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -560,6 +589,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -592,6 +622,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -630,6 +661,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -662,6 +694,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -690,6 +723,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -721,6 +755,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -754,6 +789,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -789,6 +825,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -826,6 +863,7 @@ impl ClientEnvelope {
             enabled: None,
             pinned: None,
             fields: None,
+            values: None,
             webui: true,
         }
     }
@@ -1111,6 +1149,20 @@ pub enum ServerEvent {
         preset: McpPresetSummary,
         restart_required: bool,
     },
+    /// Reply to a successful [`ClientEnvelope::set_tool_config`]: the tool section's
+    /// fresh form and whether a restart is needed for the change to take effect.
+    ToolConfigSet {
+        tool: String,
+        summary: Option<ToolConfigSummary>,
+        restart_required: bool,
+    },
+    /// Reply to a refused or failed [`ClientEnvelope::set_tool_config`]. `detail` is a
+    /// stable code (`access_denied`, `invalid_value`, ...). Never echoes a value.
+    ToolConfigError {
+        tool: String,
+        detail: String,
+        message: String,
+    },
     /// Reply to a refused or failed [`ClientEnvelope::set_mcp_preset`]. `detail` is a
     /// stable code (`access_denied`, `child_agent_config`, `missing_fields`,
     /// `invalid_field`, ...); `fields` lists the labels of missing required fields.
@@ -1257,6 +1309,8 @@ impl ServerEvent {
             | ServerEvent::McpPresetSet { .. }
             | ServerEvent::Subagents { .. }
             | ServerEvent::McpPresetError { .. }
+            | ServerEvent::ToolConfigSet { .. }
+            | ServerEvent::ToolConfigError { .. }
             | ServerEvent::ToolSettings { .. }
             | ServerEvent::McpServers { .. }
             | ServerEvent::ToolSettingSet { .. }
@@ -1603,6 +1657,24 @@ struct McpPresetSetWire {
 }
 
 #[derive(Deserialize)]
+struct ToolConfigSetWire {
+    tool: String,
+    #[serde(default)]
+    summary: Option<ToolConfigSummary>,
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
+struct ToolConfigErrorWire {
+    #[serde(default)]
+    tool: String,
+    detail: String,
+    #[serde(default)]
+    message: String,
+}
+
+#[derive(Deserialize)]
 struct McpPresetErrorWire {
     #[serde(default)]
     name: String,
@@ -1898,6 +1970,20 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             preset: w.preset,
             restart_required: w.restart_required,
         }),
+        "tool_config_set" => {
+            decode::<ToolConfigSetWire>(&value).map(|w| ServerEvent::ToolConfigSet {
+                tool: w.tool,
+                summary: w.summary,
+                restart_required: w.restart_required,
+            })
+        }
+        "tool_config_error" => {
+            decode::<ToolConfigErrorWire>(&value).map(|w| ServerEvent::ToolConfigError {
+                tool: w.tool,
+                detail: w.detail,
+                message: w.message,
+            })
+        }
         "mcp_preset_error" => {
             decode::<McpPresetErrorWire>(&value).map(|w| ServerEvent::McpPresetError {
                 name: w.name,
@@ -3243,6 +3329,58 @@ mod tests {
                 "webui": true,
             })
         );
+    }
+
+    #[test]
+    fn client_envelope_set_tool_config_serializes_name_and_values() {
+        let values = HashMap::from([("quality".to_string(), serde_json::json!("high"))]);
+        let value =
+            serde_json::to_value(ClientEnvelope::set_tool_config("imageGeneration", values))
+                .unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_tool_config",
+                "name": "imageGeneration",
+                "values": {"quality": "high"},
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn tool_config_events_decode() {
+        let set = parse_server_event(
+            r#"{"event":"tool_config_set","tool":"gmail","restart_required":true,
+                "summary":{"name":"gmail","title":"Gmail","enabled":false,"tool_names":["gmail"],
+                "fields":[{"name":"maxResults","label":"Max results","help":"","kind":"integer","min":1,
+                "secret":false,"env_var":"","configured":true,"value":20,"default":20}]}}"#,
+        )
+        .unwrap();
+        let ServerEvent::ToolConfigSet {
+            tool,
+            summary,
+            restart_required,
+        } = set
+        else {
+            panic!("expected ToolConfigSet");
+        };
+        assert_eq!(tool, "gmail");
+        assert!(restart_required);
+        let field = &summary.unwrap().fields[0];
+        assert_eq!(
+            field.kind,
+            chat_ui::models::ToolFieldKind::Integer {
+                min: Some(1),
+                max: None
+            }
+        );
+
+        let error = parse_server_event(
+            r#"{"event":"tool_config_error","tool":"gmail","detail":"invalid_value","message":"no"}"#,
+        )
+        .unwrap();
+        assert!(matches!(error, ServerEvent::ToolConfigError { .. }));
     }
 
     #[test]
