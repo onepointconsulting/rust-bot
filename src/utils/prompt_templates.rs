@@ -104,11 +104,29 @@ fn overlay_disk_templates(tera: &mut Tera, root: &Path) -> Result<(), String> {
     overlay_disk_dir(tera, root, root)
 }
 
+/// Recursively overlay `.md` files under `dir` onto `tera`.
+///
+/// The disk overlay is best-effort: the embedded bundle already provides every
+/// prompt, so an unreadable directory or file (e.g. an ACL denying access to a
+/// stray `templates/` folder found by the ancestor walk) is logged and skipped
+/// rather than failing the whole environment. Only template syntax errors in a
+/// readable on-disk file are treated as hard errors.
 fn overlay_disk_dir(tera: &mut Tera, root: &Path, dir: &Path) -> Result<(), String> {
-    let entries = std::fs::read_dir(dir)
-        .map_err(|e| format!("Failed to read templates from {:?}: {}", dir, e))?;
+    let entries = match std::fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(e) => {
+            log::warn!("Skipping unreadable templates directory {dir:?}: {e}");
+            return Ok(());
+        }
+    };
     for entry in entries {
-        let entry = entry.map_err(|e| format!("Failed to read templates from {:?}: {}", dir, e))?;
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(e) => {
+                log::warn!("Skipping unreadable entry in templates directory {dir:?}: {e}");
+                continue;
+            }
+        };
         let path = entry.path();
         if path.is_dir() {
             overlay_disk_dir(tera, root, &path)?;
@@ -125,8 +143,13 @@ fn overlay_disk_dir(tera: &mut Tera, root: &Path, dir: &Path) -> Result<(), Stri
             .unwrap_or(&path)
             .to_string_lossy()
             .replace('\\', "/");
-        let content = std::fs::read_to_string(&path)
-            .map_err(|e| format!("Failed to read template '{rel}': {e}"))?;
+        let content = match std::fs::read_to_string(&path) {
+            Ok(content) => content,
+            Err(e) => {
+                log::warn!("Skipping unreadable template '{rel}': {e}");
+                continue;
+            }
+        };
         tera.add_raw_template(&rel, &content)
             .map_err(|e| format!("Failed to load on-disk template '{rel}': {e}"))?;
     }
@@ -227,6 +250,16 @@ mod tests {
             "missing disk root should not hide embedded templates: {:?}",
             result.err()
         );
+    }
+
+    #[test]
+    fn test_unreadable_disk_root_is_skipped() {
+        // A path that is a file, not a directory, makes `read_dir` fail like an ACL denial.
+        let tmp = tempfile::tempdir().unwrap();
+        let not_a_dir = tmp.path().join("templates");
+        std::fs::write(&not_a_dir, "x").unwrap();
+        let mut tera = Tera::default();
+        assert!(overlay_disk_dir(&mut tera, &not_a_dir, &not_a_dir).is_ok());
     }
 
     #[test]
