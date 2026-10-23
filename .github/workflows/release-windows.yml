@@ -118,6 +118,7 @@ jobs:
           Copy-Item "packaging\samples\*" -Destination "$stageName\configuration\samples\"
           Copy-Item "web-chat\dist" -Destination "$stageName\web" -Recurse
           Copy-Item "websockets-chat\dist" -Destination "$stageName\websockets" -Recurse
+          Copy-Item "scripts\install.ps1", "scripts\uninstall.ps1", "packaging\uninstall.cmd" -Destination $stageName
 
           Compress-Archive -Path $stageName -DestinationPath $archiveName -Force
 

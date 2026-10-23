@@ -37,6 +37,22 @@ irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/i
 
 Set `RUST_BOT_VERSION` (for example `0.3.3`) to pin a version.
 
+### Update and uninstall
+
+**Update:** run the install command again. An existing install is updated in place (your config in `~/.rust-bot/` is not touched and onboarding is skipped); if the requested version is already installed nothing happens. Set `RUST_BOT_FORCE=1` to reinstall anyway. Stop a running `rust-bot` first on Windows, which locks the files of a running program.
+
+**Uninstall:** the installer leaves an uninstall script in the install folder, so you can run it straight away: `sh ~/.local/share/rust-bot/uninstall.sh` (Linux / macOS) or `%LOCALAPPDATA%\rust-bot\uninstall.cmd` (Windows; the `.cmd` wrapper avoids PowerShell's script execution policy). The download one-liners below work too, for example on installs that predate this change. The script removes the program and its `PATH` entry, then asks whether to also delete your config, API keys and workspace in `~/.rust-bot/` (the default is to keep them). Set `RUST_BOT_PURGE=yes` or `no` to answer without being asked.
+
+```bash
+# Linux / macOS
+curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/uninstall.sh | sh
+```
+
+```powershell
+# Windows (PowerShell)
+irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/uninstall.ps1 | iex
+```
+
 ### Manual install
 
 Pre-built packages are on [GitHub Releases](https://github.com/onepointconsulting/rust-bot/releases). Linux example:

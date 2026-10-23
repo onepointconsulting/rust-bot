@@ -17,6 +17,7 @@ rust-bot-<version>-<platform>/
   rust-bot[.exe]
   gmail-auth[.exe]
   INSTALL.md
+  install.sh / uninstall.sh          (Windows: install.ps1, uninstall.ps1, uninstall.cmd)
   web/                 REST API chat UI (rust-bot api)
     index.html
     *.js
@@ -344,7 +345,21 @@ the binary and neither is set, it is used automatically.
 
 The REST UI needs `api.jwt.enabled: true` and a registered user.
 
-## 7. Next steps
+## 7. Updating and uninstalling
+
+This archive contains `install.sh` / `install.ps1` and `uninstall.sh` /
+`uninstall.ps1` (plus `uninstall.cmd` on Windows). If you installed with the
+one-line installer they sit in the install folder (`~/.local/share/rust-bot` or
+`%LOCALAPPDATA%\rust-bot`): run `install.sh` / `install.ps1` to update (config is
+kept, onboarding is skipped) and `uninstall.sh` / `uninstall.cmd` to remove it.
+Stop any running `rust-bot` first on Windows. See the main README ("Update and
+uninstall") for details.
+
+If you unpacked this archive by hand, update by replacing the files with a newer
+archive and uninstall by deleting the folder (plus `.rust-bot/` if you also want
+to remove your config and workspace).
+
+## 8. Next steps
 
 - Edit `.rust-bot/config.json` (workspace path, ports, tools) once you are
   up and running.

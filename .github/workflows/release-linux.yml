@@ -123,7 +123,8 @@ jobs:
           cp packaging/samples/* "${stage_name}/configuration/samples/"
           cp -r web-chat/dist "${stage_name}/web"
           cp -r websockets-chat/dist "${stage_name}/websockets"
-          chmod +x "${stage_name}/rust-bot" "${stage_name}/gmail-auth"
+          cp scripts/install.sh scripts/uninstall.sh "${stage_name}/"
+          chmod +x "${stage_name}/rust-bot" "${stage_name}/gmail-auth" "${stage_name}/install.sh" "${stage_name}/uninstall.sh"
 
           tar czf "$archive_name" "$stage_name"
 
