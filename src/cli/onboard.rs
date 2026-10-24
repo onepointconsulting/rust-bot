@@ -6,7 +6,7 @@ use std::path::{Path, PathBuf};
 use anstyle::{AnsiColor, Color, Style};
 
 use crate::channels::websocket::CHANNEL_NAME;
-use crate::cli::commands::{CliError, OnboardArgs};
+use crate::cli::commands::{CliError, OnboardArgs, OnboardMode, resolve_onboard_targets_from_env};
 use crate::cli::wizard::{
     apply_workspace_override, choose_providers, config_model, configure_websocket_channel,
     resolve_onboard_config_path, wizard,
@@ -21,7 +21,9 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
     if args.wizard {
         return wizard(args);
     }
-    let config_path = resolve_onboard_config_path(args.config);
+    let targets = resolve_onboard_targets_from_env(&args)?;
+    let config_path = resolve_onboard_config_path(targets.config_path);
+    let workspace_override = targets.workspace;
 
     let config = if config_path.exists() {
         let yellow = Style::new().fg_color(Some(Color::Ansi(AnsiColor::Yellow)));
@@ -43,7 +45,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
             bold.render_reset()
         );
         if confirm_overwrite() {
-            let config = apply_workspace_override(Config::default(), args.workspace);
+            let config = new_default_config(workspace_override, &config_path);
             save_config(&config, Some(config_path.clone()))?;
             print_onboard_ok(format!(
                 "Config reset to defaults at {}",
@@ -61,7 +63,7 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
             config
         }
     } else {
-        let mut config = apply_workspace_override(Config::default(), args.workspace);
+        let mut config = new_default_config(workspace_override, &config_path);
         choose_providers(&mut config, false)?;
         config_model(&mut config.agents, &config.providers)?;
         create_default_model_presets(&mut config);
@@ -82,11 +84,55 @@ pub fn run_onboard(args: OnboardArgs) -> Result<(), CliError> {
 
     sync_workspace_templates(&workspace_path, false);
 
+    if args.mode == Some(OnboardMode::Local)
+        && let Some(instance_dir) = config_path.parent()
+    {
+        match write_instance_gitignore(instance_dir) {
+            Ok(true) => print_onboard_ok(format!(
+                "Created {} (keeps secrets out of version control)",
+                instance_dir.join(INSTANCE_GITIGNORE_FILE).display()
+            )),
+            Ok(false) => {}
+            Err(err) => print_onboard_err(format!("Failed to write .gitignore: {err}")),
+        }
+    }
+
     create_env_file();
 
     let users_file = websocket_jwt_enabled(&config).then_some(config.api.users_file.as_str());
     print_next_steps(&config_path, users_file);
     Ok(())
+}
+
+/// Build the default config for a new or reset instance.
+///
+/// The workspace is `workspace`, and every other built-in default path (credentials, users
+/// file, MCP presets, Gmail tokens) is moved next to `config_path` so instances stay isolated.
+fn new_default_config(workspace: PathBuf, config_path: &Path) -> Config {
+    let mut config = Config::default();
+    if let Some(instance_dir) = config_path.parent() {
+        config.rebase_default_paths(instance_dir);
+    }
+    apply_workspace_override(config, workspace)
+}
+
+/// File name of the ignore file written into a local instance directory.
+const INSTANCE_GITIGNORE_FILE: &str = ".gitignore";
+
+/// Write `<instance_dir>/.gitignore` ignoring everything in the directory.
+///
+/// A local instance keeps API keys and JWT keys inside the project, so the directory must
+/// never be committed by accident. An existing file is left untouched.
+///
+/// Returns `true` when the file was created, `false` when it already existed.
+fn write_instance_gitignore(instance_dir: &Path) -> io::Result<bool> {
+    let gitignore_path = instance_dir.join(INSTANCE_GITIGNORE_FILE);
+    if gitignore_path.exists() {
+        return Ok(false);
+    }
+    std::fs::create_dir_all(instance_dir)?;
+    std::fs::write(&gitignore_path, "*\n")?;
+    Ok(true)
 }
 
 /// File name of the binary inside a release archive.
@@ -198,8 +244,13 @@ fn create_default_model_presets(config: &mut Config) {
     if config.agents.model.is_empty() || config.agents.provider.is_empty() {
         return;
     }
+    let preset_name: &str = if !config.providers.together.api_key.is_empty() {
+        "together1"
+    } else {
+        "primary"
+    };
     config.model_presets.insert(
-        "primary".to_string(),
+        preset_name.to_string(),
         ModelPresetConfig {
             label: None,
             model: config.agents.model.clone(),
@@ -210,7 +261,7 @@ fn create_default_model_presets(config: &mut Config) {
             reasoning_effort: config.agents.reasoning_effort.clone(),
         },
     );
-    config.agents.model_preset = Some("primary".to_string());
+    config.agents.model_preset = Some(preset_name.to_string());
 }
 
 fn websocket_jwt_enabled(config: &Config) -> bool {
@@ -244,6 +295,36 @@ fn configure_web_app(config: &mut Config, config_path: PathBuf) -> Result<(), Cl
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn new_default_config_keeps_every_default_path_next_to_the_config() {
+        let instance_dir = std::env::temp_dir()
+            .join("rust-bot-onboard-instance")
+            .join(".rust-bot");
+        let config = new_default_config(
+            instance_dir.join("workspace"),
+            &instance_dir.join("config.json"),
+        );
+        let in_instance = |path: &str| Path::new(path).starts_with(&instance_dir);
+        assert!(in_instance(&config.agents.workspace));
+        assert!(in_instance(&config.api.users_file));
+        assert!(in_instance(&config.api.jwt.private_key_path));
+        assert!(in_instance(&config.tools.mcp_presets_path));
+        assert!(in_instance(&config.tools.gmail.token_cache_path));
+    }
+
+    #[test]
+    fn instance_gitignore_is_created_once_and_never_overwritten() {
+        let dir = tempfile::tempdir().unwrap();
+        let instance_dir = dir.path().join(".rust-bot");
+        assert!(write_instance_gitignore(&instance_dir).unwrap());
+        let gitignore = instance_dir.join(INSTANCE_GITIGNORE_FILE);
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "*\n");
+
+        std::fs::write(&gitignore, "custom\n").unwrap();
+        assert!(!write_instance_gitignore(&instance_dir).unwrap());
+        assert_eq!(std::fs::read_to_string(&gitignore).unwrap(), "custom\n");
+    }
 
     #[test]
     fn cli_bin_uses_platform_invocation() {

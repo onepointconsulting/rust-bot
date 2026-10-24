@@ -53,7 +53,10 @@ pub fn validate_config_text(text: &str) -> Result<(), String> {
 /// does not allow `:` in file names.
 pub fn backup_path_for(path: &Path, now: DateTime<Utc>) -> PathBuf {
     let folder = path.parent().unwrap_or_else(|| Path::new("."));
-    folder.join(format!("config_{}.json.bck", now.format("%Y-%m-%dT%H%M%SZ")))
+    folder.join(format!(
+        "config_{}.json.bck",
+        now.format("%Y-%m-%dT%H%M%SZ")
+    ))
 }
 
 /// Copy the file at `path` to its backup path. Returns the backup's path, or `None`

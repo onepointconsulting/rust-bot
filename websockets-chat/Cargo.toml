@@ -37,6 +37,7 @@ gloo-timers = { version = "0.3", features = ["futures"] }
 # here for app.rs's window().location() WebSocket URL construction.
 web-sys = { version = "0.3", features = [
     "HtmlElement",
+    "HtmlTextAreaElement",
     "Element",
     "Node",
     "NodeList",

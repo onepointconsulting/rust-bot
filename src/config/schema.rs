@@ -1,4 +1,7 @@
-use std::{collections::HashMap, path::PathBuf};
+use std::{
+    collections::HashMap,
+    path::{Path, PathBuf},
+};
 
 use garde::Validate;
 use schemars::JsonSchema;
@@ -569,6 +572,10 @@ pub struct ProvidersConfig {
     #[serde(alias = "groq")]
     #[garde(dive)]
     pub groq: ProviderConfig,
+
+    #[serde(alias = "together")]
+    #[garde(dive)]
+    pub together: ProviderConfig,
 }
 
 impl ProvidersConfig {
@@ -583,6 +590,7 @@ impl ProvidersConfig {
             "openai" => Some(&self.openai),
             "openrouter" => Some(&self.openrouter),
             "gemini" => Some(&self.gemini),
+            "together" => Some(&self.together),
             _ => None,
         }
     }
@@ -1491,17 +1499,27 @@ fn default_mcp_presets_path() -> String {
 }
 
 /// Tools configuration.
-#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+///
+/// Only the settings that are not owned by a single tool appear in the settings schema
+/// (the "General" section of the Tools page); every other field is `schemars(skip)`
+/// and is edited through its own tool section or the raw configuration editor.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(
+    description = "Settings that apply to all tools.",
+    extend("x-editable" = true, "x-title" = "General", "x-tools" = [])
+)]
 pub struct ToolsConfig {
     /// Web tool configuration (search, proxy, etc.).
     #[serde(alias = "web")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub web: WebToolsConfig,
 
     /// Shell exec tool configuration.
     #[serde(alias = "exec")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub exec: ExecToolConfig,
 
     /// Restrict all tool file access to the agent workspace directory.
@@ -1513,6 +1531,7 @@ pub struct ToolsConfig {
     /// subagents get), e.g. `["write_file", "edit_file"]` for a read-only agent.
     #[serde(alias = "disabled_tools")]
     #[garde(skip)]
+    #[schemars(skip)]
     pub disabled_tools: Vec<String>,
 
     /// When true, the CLI `agent` command asks before each tool call.
@@ -1523,41 +1542,51 @@ pub struct ToolsConfig {
     /// Named MCP server configurations, keyed by server name.
     #[serde(alias = "mcp_servers")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub mcp_servers: HashMap<String, McpServerConfig>,
 
     /// The file path to the MCP presets configuration. Default: `~/.rust-bot/mcp_presets.json`.
     #[serde(alias = "mcp_presets_path", default = "default_mcp_presets_path")]
     #[garde(skip)]
+    #[schemars(skip)]
     pub mcp_presets_path: String,
 
-    /// CIDR ranges exempt from SSRF blocking (e.g. `["100.64.0.0/10"]` for Tailscale).
+    /// CIDR ranges exempt from SSRF blocking (e.g. `["100.64.0.0/10"]` for Tailscale),
+    /// one per line.
     #[serde(alias = "ssrf_whitelist")]
     #[garde(skip)]
+    #[schemars(extend("x-label" = "SSRF whitelist"))]
     pub ssrf_whitelist: Vec<String>,
 
     #[serde(alias = "gmail")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub gmail: GmailToolConfig,
 
     #[serde(alias = "docx")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub docx: DocxToolConfig,
 
     #[serde(alias = "ocr")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub ocr: OcrToolConfig,
 
     #[serde(alias = "image_generation")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub image_generation: ImageGenerationToolConfig,
 
     #[serde(alias = "question")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub question: QuestionToolConfig,
 
     /// Driving child agents over ACP (`acp_*` tools).
     #[serde(alias = "acp")]
     #[garde(dive)]
+    #[schemars(skip)]
     pub acp: AcpConfig,
 }
 
@@ -1803,6 +1832,57 @@ pub struct Config {
 }
 
 impl Config {
+    /// Move every path that still holds its built-in default into `instance_dir`.
+    ///
+    /// The built-in defaults point at `~/.rust-bot/...` or the current directory, which would
+    /// make every instance on a machine share credentials, users and presets. Calling this
+    /// on a freshly created config keeps those files next to the config file instead.
+    /// Paths a user has already changed are left untouched.
+    pub fn rebase_default_paths(&mut self, instance_dir: &Path) {
+        fn rebase(value: &mut String, built_in_default: String, new_location: PathBuf) {
+            if *value == built_in_default {
+                *value = new_location.display().to_string();
+            }
+        }
+        let credentials_dir = instance_dir.join("credentials");
+
+        rebase(
+            &mut self.agents.workspace,
+            default_agent_workspace(),
+            instance_dir.join("workspace"),
+        );
+        rebase(
+            &mut self.api.jwt.private_key_path,
+            default_jwt_private_key_path(),
+            credentials_dir.join("private_key.pem"),
+        );
+        rebase(
+            &mut self.api.jwt.public_key_path,
+            default_jwt_public_key_path(),
+            credentials_dir.join("public_key.pem"),
+        );
+        rebase(
+            &mut self.api.users_file,
+            default_users_file(),
+            instance_dir.join("users.json"),
+        );
+        rebase(
+            &mut self.tools.mcp_presets_path,
+            default_mcp_presets_path(),
+            instance_dir.join("mcp_presets.json"),
+        );
+        rebase(
+            &mut self.tools.gmail.client_secret_path,
+            default_gmail_client_secret_path(),
+            credentials_dir.join("client_secret.json"),
+        );
+        rebase(
+            &mut self.tools.gmail.token_cache_path,
+            default_gmail_token_cache_path(),
+            credentials_dir.join("token_cache.json"),
+        );
+    }
+
     pub fn workspace_path(&self) -> PathBuf {
         let workspace = &self.agents.workspace;
         PathBuf::from(expand_tilde_path(workspace).as_ref())
@@ -3549,5 +3629,72 @@ mod tests {
         let back: ToolsConfig = serde_json::from_str(&text).unwrap();
         assert!(back.acp.enabled);
         assert_eq!(back.acp.permission_policy, AcpPermissionPolicy::Escalate);
+    }
+
+    #[test]
+    fn rebase_default_paths_moves_built_in_defaults_into_the_instance_dir() {
+        let instance_dir = Path::new("/project/.rust-bot");
+        let mut config = Config::default();
+        config.rebase_default_paths(instance_dir);
+
+        let credentials = instance_dir.join("credentials");
+        assert_eq!(
+            config.agents.workspace,
+            instance_dir.join("workspace").display().to_string()
+        );
+        assert_eq!(
+            config.api.jwt.private_key_path,
+            credentials.join("private_key.pem").display().to_string()
+        );
+        assert_eq!(
+            config.api.jwt.public_key_path,
+            credentials.join("public_key.pem").display().to_string()
+        );
+        assert_eq!(
+            config.api.users_file,
+            instance_dir.join("users.json").display().to_string()
+        );
+        assert_eq!(
+            config.tools.mcp_presets_path,
+            instance_dir.join("mcp_presets.json").display().to_string()
+        );
+        assert_eq!(
+            config.tools.gmail.client_secret_path,
+            credentials.join("client_secret.json").display().to_string()
+        );
+        assert_eq!(
+            config.tools.gmail.token_cache_path,
+            credentials.join("token_cache.json").display().to_string()
+        );
+    }
+
+    #[test]
+    fn rebase_default_paths_keeps_paths_the_user_changed() {
+        let mut config = Config::default();
+        config.api.users_file = "/custom/users.json".to_string();
+        config.tools.mcp_presets_path = "/custom/presets.json".to_string();
+        config.rebase_default_paths(Path::new("/project/.rust-bot"));
+
+        assert_eq!(config.api.users_file, "/custom/users.json");
+        assert_eq!(config.tools.mcp_presets_path, "/custom/presets.json");
+    }
+
+    #[test]
+    fn rebased_instances_do_not_share_any_default_path() {
+        let mut first = Config::default();
+        let mut second = Config::default();
+        first.rebase_default_paths(Path::new("/a/.rust-bot"));
+        second.rebase_default_paths(Path::new("/b/.rust-bot"));
+
+        assert_ne!(first.api.users_file, second.api.users_file);
+        assert_ne!(
+            first.api.jwt.private_key_path,
+            second.api.jwt.private_key_path
+        );
+        assert_ne!(first.tools.mcp_presets_path, second.tools.mcp_presets_path);
+        assert_ne!(
+            first.tools.gmail.token_cache_path,
+            second.tools.gmail.token_cache_path
+        );
     }
 }

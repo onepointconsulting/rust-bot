@@ -13,8 +13,9 @@
 use chat_ui::models::{McpServerSettingSummary, ToolConfigSummary, ToolSettingSummary};
 use leptos::prelude::*;
 
+use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
-use super::mcp_presets_page::{is_busy, switch_hint, ToggleSwitch};
+use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
 use super::tool_config_form::{ToolConfigChange, ToolConfigForm};
 
 /// Tooltip on the switch of a tool the gateway itself depends on.
@@ -29,17 +30,25 @@ const RESTART_WARNING: &str =
 pub enum SettingsPage {
     #[default]
     Tools,
+    /// The settings that apply to every tool (workspace restriction, confirmation, SSRF
+    /// whitelist), kept apart from the long tool list.
+    ToolSafety,
     McpServers,
 }
 
 impl SettingsPage {
-    /// Both pages, in menu order.
-    pub const ALL: [SettingsPage; 2] = [SettingsPage::Tools, SettingsPage::McpServers];
+    /// All pages, in menu order.
+    pub const ALL: [SettingsPage; 3] = [
+        SettingsPage::Tools,
+        SettingsPage::ToolSafety,
+        SettingsPage::McpServers,
+    ];
 
     /// Menu entry and page heading.
     pub fn title(self) -> &'static str {
         match self {
             Self::Tools => "Tools",
+            Self::ToolSafety => "Tool Safety",
             Self::McpServers => "MCP Servers",
         }
     }
@@ -48,6 +57,7 @@ impl SettingsPage {
     pub fn subtitle(self) -> &'static str {
         match self {
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
+            Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
             Self::McpServers => "Switch the configured MCP servers on or off. A server that is off is not started.",
         }
     }
@@ -56,6 +66,7 @@ impl SettingsPage {
     pub fn noun(self) -> &'static str {
         match self {
             Self::Tools => "tools",
+            Self::ToolSafety => "settings",
             Self::McpServers => "MCP servers",
         }
     }
@@ -187,6 +198,35 @@ pub fn count_label(shown: usize, total: usize, noun: &str) -> String {
     }
 }
 
+/// The general tool settings (the section without an on/off switch), if the gateway sent
+/// them.
+pub fn general_settings(tools: &[ToolSettingSummary]) -> Option<ToolConfigSummary> {
+    tools
+        .iter()
+        .filter_map(|tool| tool.config.as_ref())
+        .find(|config| config.enabled.is_none())
+        .cloned()
+}
+
+/// The heading of a row: the tool section's title (e.g. "Image generation") when the row
+/// has a settings form, else its name.
+pub fn row_title(row: &SettingRow) -> String {
+    row.config
+        .as_ref()
+        .map(|config| config.title.as_str())
+        .filter(|title| !title.is_empty())
+        .unwrap_or(&row.name)
+        .to_string()
+}
+
+/// Whether the row has an on/off switch: a tool section without an `enable` setting
+/// (the general tool settings) only has its form.
+pub fn has_switch(row: &SettingRow) -> bool {
+    row.config
+        .as_ref()
+        .is_none_or(|config| config.enabled.is_some())
+}
+
 /// The tooltip for a row's switch.
 fn row_hint(row: &SettingRow, can_modify: bool) -> &'static str {
     if !can_modify {
@@ -240,7 +280,15 @@ impl SettingsPanel {
     /// The rows of the open page.
     fn open_rows(&self) -> Vec<SettingRow> {
         match self.page.get() {
-            SettingsPage::Tools => self.tools.get().iter().map(SettingItem::to_row).collect(),
+            // The general settings have their own page.
+            SettingsPage::Tools => self
+                .tools
+                .get()
+                .iter()
+                .map(SettingItem::to_row)
+                .filter(has_switch)
+                .collect(),
+            SettingsPage::ToolSafety => Vec::new(),
             SettingsPage::McpServers => self
                 .mcp_servers
                 .get()
@@ -253,7 +301,7 @@ impl SettingsPanel {
     /// Whether the open page's list has arrived.
     fn open_page_loaded(&self) -> bool {
         match self.page.get() {
-            SettingsPage::Tools => self.tools_loaded.get(),
+            SettingsPage::Tools | SettingsPage::ToolSafety => self.tools_loaded.get(),
             SettingsPage::McpServers => self.mcp_servers_loaded.get(),
         }
     }
@@ -308,6 +356,8 @@ fn SettingRowView(
     let pending = pending_label(&row);
     let hint_row = row.clone();
     let config = row.config.clone();
+    let title = row_title(&row);
+    let switch_shown = has_switch(&row);
     let name_for_expand = row.name.clone();
     let name_for_form_busy = row.name.clone();
     let name_for_open = row.name.clone();
@@ -319,46 +369,51 @@ fn SettingRowView(
             <div class="flex items-start gap-4">
                 <Tile title=name.clone() />
                 <div class="min-w-0 flex-1">
-                    <span class="break-all text-sm font-medium text-slate-900">{name.clone()}</span>
+                    <span class="break-words text-sm font-medium text-slate-900">{title}</span>
                     <p class="line-clamp-2 text-sm text-slate-500">{row.description.clone()}</p>
                     {pending
                         .map(|label| {
                             view! { <p class="mt-1 text-xs font-medium text-amber-700">{label}</p> }
                         })}
+                    {config
+                        .as_ref()
+                        .map(|_| {
+                            view! {
+                                <button
+                                    type="button"
+                                    class="mt-2 rounded-full border border-slate-200 px-3 py-1 text-sm text-slate-600 hover:bg-slate-100"
+                                    on:click=move |_| {
+                                        let target = name_for_expand.clone();
+                                        panel
+                                            .expanded_tool
+                                            .update(|open| {
+                                                *open = if open.as_deref() == Some(target.as_str()) {
+                                                    None
+                                                } else {
+                                                    Some(target)
+                                                };
+                                            });
+                                    }
+                                >
+                                    "Settings"
+                                </button>
+                            }
+                        })}
                 </div>
-                {config
-                    .as_ref()
-                    .map(|_| {
+                {switch_shown
+                    .then(|| {
                         view! {
-                            <button
-                                type="button"
-                                class="rounded-full px-3 py-1 text-sm text-slate-600 hover:bg-slate-100"
-                                on:click=move |_| {
-                                    let target = name_for_expand.clone();
-                                    panel
-                                        .expanded_tool
-                                        .update(|open| {
-                                            *open = if open.as_deref() == Some(target.as_str()) {
-                                                None
-                                            } else {
-                                                Some(target)
-                                            };
-                                        });
-                                }
-                            >
-                                "Settings"
-                            </button>
+                            <ToggleSwitch
+                                on=enabled
+                                label=format!("{name} enabled")
+                                disabled=disabled
+                                hint=Signal::derive(move || row_hint(&hint_row, panel.can_modify.get()))
+                                on_toggle=Callback::new(move |()| {
+                                    actions.on_toggle.run((page, name_for_toggle.clone(), !enabled));
+                                })
+                            />
                         }
                     })}
-                <ToggleSwitch
-                    on=enabled
-                    label=format!("{name} enabled")
-                    disabled=disabled
-                    hint=Signal::derive(move || row_hint(&hint_row, panel.can_modify.get()))
-                    on_toggle=Callback::new(move |()| {
-                        actions.on_toggle.run((page, name_for_toggle.clone(), !enabled));
-                    })
-                />
             </div>
             {config
                 .map(|config| {
@@ -386,7 +441,7 @@ fn SettingRowView(
                     .get()
                     .filter(|(failed_name, _)| *failed_name == name_for_error)
                     .map(|(_, message)| {
-                        view! { <p class="mt-2 ml-16 text-xs text-red-600">{message}</p> }
+                        view! { <p class="mt-2 text-xs text-red-600 sm:ml-16">{message}</p> }
                     })
             }}
         </li>
@@ -409,7 +464,9 @@ pub fn SettingsPageView(
             <div class="flex items-start justify-between gap-4">
                 <div>
                     <h3 class="text-base font-semibold text-slate-900">{move || page().title()}</h3>
-                    <p class="text-sm text-slate-500">{move || page().subtitle()}</p>
+                    <p class="line-clamp-2 text-sm text-slate-500 sm:line-clamp-none">
+                        {move || page().subtitle()}
+                    </p>
                 </div>
                 <button
                     type="button"
@@ -440,6 +497,45 @@ pub fn SettingsPageView(
                         }
                     })
             }}
+            <Show when=move || page() == SettingsPage::ToolSafety>
+                <div class="min-h-0 flex-1 overflow-y-auto">
+                    {move || {
+                        if !panel.tools_loaded.get() {
+                            return view! { <p class="pt-6 text-sm text-slate-400">"Loading…"</p> }
+                                .into_any();
+                        }
+                        match general_settings(&panel.tools.get()) {
+                            Some(config) => {
+                                let tool = config.name.clone();
+                                let busy_tool = tool.clone();
+                                view! {
+                                    <GeneralSettings
+                                        config=config
+                                        can_modify=panel.can_modify
+                                        busy=Signal::derive(move || {
+                                            is_busy(&panel.busy.get(), &busy_tool)
+                                        })
+                                        error=Signal::derive(move || {
+                                            row_error_for(&panel.error.get(), &tool)
+                                        })
+                                        on_save=actions.on_save_config
+                                    />
+                                }
+                                    .into_any()
+                            }
+                            None => {
+                                view! {
+                                    <p class="py-4 text-sm text-slate-500">
+                                        "No general tool settings available."
+                                    </p>
+                                }
+                                    .into_any()
+                            }
+                        }
+                    }}
+                </div>
+            </Show>
+            <Show when=move || page() != SettingsPage::ToolSafety>
             <input
                 type="search"
                 aria-label=move || format!("Search {}", page().noun())
@@ -492,6 +588,7 @@ pub fn SettingsPageView(
                     }
                 }}
             </Show>
+            </Show>
         </div>
     }
 }
@@ -520,6 +617,56 @@ mod tests {
             toggleable: true,
             config: None,
         }
+    }
+
+    fn section_row(name: &str, title: &str, enabled: Option<bool>) -> SettingRow {
+        SettingRow {
+            config: Some(ToolConfigSummary {
+                name: name.to_string(),
+                title: title.to_string(),
+                description: String::new(),
+                enabled,
+                tool_names: Vec::new(),
+                fields: Vec::new(),
+            }),
+            ..row(name, "", true, true)
+        }
+    }
+
+    #[test]
+    fn general_settings_are_found_by_having_no_enable_setting() {
+        let mut tools = vec![tool("grep", true)];
+        assert_eq!(general_settings(&tools), None);
+        tools.push(ToolSettingSummary {
+            config: section_row("general", "General", None).config,
+            ..tool("general", true)
+        });
+        tools.push(ToolSettingSummary {
+            config: section_row("gmail", "Gmail", Some(false)).config,
+            ..tool("gmail", false)
+        });
+        assert_eq!(general_settings(&tools).unwrap().name, "general");
+    }
+
+    #[test]
+    fn section_rows_are_titled_and_plain_rows_keep_their_name() {
+        assert_eq!(
+            row_title(&section_row(
+                "imageGeneration",
+                "Image generation",
+                Some(true)
+            )),
+            "Image generation"
+        );
+        assert_eq!(row_title(&section_row("general", "", None)), "general");
+        assert_eq!(row_title(&row("grep", "", true, true)), "grep");
+    }
+
+    #[test]
+    fn only_a_section_without_an_enable_setting_lacks_a_switch() {
+        assert!(has_switch(&row("grep", "", true, true)));
+        assert!(has_switch(&section_row("gmail", "Gmail", Some(false))));
+        assert!(!has_switch(&section_row("general", "General", None)));
     }
 
     #[test]
@@ -631,7 +778,7 @@ mod tests {
     #[test]
     fn pages_have_titles_in_menu_order() {
         let titles: Vec<&str> = SettingsPage::ALL.iter().map(|p| p.title()).collect();
-        assert_eq!(titles, vec!["Tools", "MCP Servers"]);
+        assert_eq!(titles, vec!["Tools", "Tool Safety", "MCP Servers"]);
         assert_eq!(SettingsPage::default(), SettingsPage::Tools);
     }
 

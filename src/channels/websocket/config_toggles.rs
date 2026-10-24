@@ -357,9 +357,11 @@ pub fn merge_section_rows(
         .cloned()
         .collect();
     for section in sections {
-        let active = rows
-            .iter()
-            .any(|row| row.active && section.tool_names.contains(&row.name));
+        // A section without a switch (general settings) is always in effect.
+        let active = section.enabled.is_none()
+            || rows
+                .iter()
+                .any(|row| row.active && section.tool_names.contains(&row.name));
         merged.push(ToolSettingRow {
             name: section.name.clone(),
             description: section.description.clone(),
@@ -496,21 +498,28 @@ mod tests {
 
         let mut tools = ToolsConfig::default();
         tools.image_generation.enable = true;
-        let rows = tool_setting_rows(
-            &[entry("grep", true), entry("image_generation", true)],
-            &[],
-        );
+        let rows = tool_setting_rows(&[entry("grep", true), entry("image_generation", true)], &[]);
 
         let merged = merge_section_rows(rows, tool_settings_overview(&tools));
 
         let names: Vec<&str> = merged.iter().map(|r| r.name.as_str()).collect();
         assert!(names.contains(&"grep") && names.contains(&"imageGeneration"));
-        assert!(!names.contains(&"image_generation"), "owned tool row is replaced");
+        assert!(
+            !names.contains(&"image_generation"),
+            "owned tool row is replaced"
+        );
         let image = merged.iter().find(|r| r.name == "imageGeneration").unwrap();
         assert!(image.enabled && image.active && image.config.is_some());
         let gmail = merged.iter().find(|r| r.name == "gmail").unwrap();
         assert!(!gmail.enabled && !gmail.active);
-        assert!(merged.iter().find(|r| r.name == "grep").unwrap().config.is_none());
+        assert!(
+            merged
+                .iter()
+                .find(|r| r.name == "grep")
+                .unwrap()
+                .config
+                .is_none()
+        );
     }
 
     #[test]

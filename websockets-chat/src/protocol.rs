@@ -20,8 +20,8 @@ use std::collections::HashMap;
 
 use chat_ui::models::{
     AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
-    McpServerSettingSummary, Role, SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolEvent,
-    ToolConfigSummary, ToolSettingSummary, ToolSummary,
+    McpServerSettingSummary, Role, SessionTokenUsage, SkillSummary, SpawnTaskSummary,
+    ToolConfigSummary, ToolEvent, ToolSettingSummary, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 

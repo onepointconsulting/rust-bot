@@ -105,7 +105,7 @@ function Invoke-RustBotInstall {
     Write-Host "Installed rust-bot $version. To remove it later, run: $installDir\uninstall.cmd"
     Write-Host "Starting onboarding..."
     Set-Location $env:USERPROFILE
-    & (Join-Path $installDir "rust-bot.exe") onboard
+    & (Join-Path $installDir "rust-bot.exe") onboard --mode user
 }
 
 if (-not $env:RUST_BOT_SOURCE_ONLY) { Invoke-RustBotInstall }

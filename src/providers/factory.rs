@@ -27,7 +27,7 @@ pub type AutoProviderSelection = (
 
 /// Resolve `"auto"` to a concrete provider name + credentials by picking the
 /// first configured provider (by API key presence) in this fixed order:
-/// openai, openrouter, custom, anthropic. Mirrors the CLI's own
+/// openai, openrouter, custom, anthropic, together. Mirrors the CLI's own
 /// `get_auto_provider` selection order exactly — do not reorder without
 /// updating both.
 pub fn try_auto_provider_selection(config: &Config) -> Result<AutoProviderSelection, String> {
@@ -63,8 +63,16 @@ pub fn try_auto_provider_selection(config: &Config) -> Result<AutoProviderSelect
             config.providers.anthropic.extra_headers.clone(),
         ));
     }
+    if !config.providers.together.api_key.is_empty() {
+        return Ok((
+            "together".to_string(),
+            Some(config.providers.together.api_key.clone()),
+            config.providers.together.api_base.clone(),
+            config.providers.together.extra_headers.clone(),
+        ));
+    }
     Err(
-        "Could not resolve auto provider, please set a provider (custom, openai, openrouter, anthropic) in the config"
+        "Could not resolve auto provider, please set a provider (custom, openai, openrouter, anthropic, together) in the config"
             .to_string(),
     )
 }
@@ -95,7 +103,7 @@ pub fn create_provider_for(
     provider_name: &str,
 ) -> Result<Arc<dyn LLMProviderDyn>, String> {
     match provider_name {
-        "openai" | "custom" | "openrouter" | "auto" => {
+        "openai" | "custom" | "openrouter" | "auto" | "together" => {
             let (api_key, api_base, extra_headers) = if provider_name == "openai" {
                 (
                     Some(config.providers.openai.api_key.clone()),
@@ -113,6 +121,12 @@ pub fn create_provider_for(
                     Some(config.providers.openrouter.api_key.clone()),
                     config.providers.openrouter.api_base.clone(),
                     config.providers.openrouter.extra_headers.clone(),
+                )
+            } else if provider_name == "together" {
+                (
+                    Some(config.providers.together.api_key.clone()),
+                    config.providers.together.api_base.clone(),
+                    config.providers.together.extra_headers.clone(),
                 )
             } else {
                 // "auto"
@@ -175,6 +189,49 @@ mod tests {
         let (name, key, _, _) = try_auto_provider_selection(&config).unwrap();
         assert_eq!(name, "anthropic");
         assert_eq!(key, Some("k2".to_string()));
+    }
+
+    #[test]
+    fn test_auto_provider_selection_falls_back_to_together() {
+        let mut config = Config::default();
+        config.providers.together.api_key = "tk".to_string();
+        let (name, key, _, _) = try_auto_provider_selection(&config).unwrap();
+        assert_eq!(name, "together");
+        assert_eq!(key, Some("tk".to_string()));
+    }
+
+    #[test]
+    fn test_explicit_together_uses_together_credentials_even_when_others_are_set() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "openai-key".to_string();
+        config.providers.openrouter.api_key = "openrouter-key".to_string();
+        config.providers.anthropic.api_key = "anthropic-key".to_string();
+        config.providers.together.api_key = "together-key".to_string();
+        config.providers.together.api_base = Some("https://together.example/v1".to_string());
+
+        let provider = create_provider_for(
+            &config,
+            "meta-llama/Llama-3.3-70B-Instruct-Turbo",
+            "together",
+        )
+        .unwrap();
+        assert_eq!(provider.api_key(), Some("together-key".to_string()));
+        assert_eq!(
+            provider.api_base(),
+            Some("https://together.example/v1".to_string())
+        );
+        assert_eq!(provider.spec().map(|s| s.name.as_str()), Some("together"));
+    }
+
+    #[test]
+    fn test_explicit_together_defaults_to_the_together_api_base() {
+        let mut config = Config::default();
+        config.providers.together.api_key = "together-key".to_string();
+        let provider = create_provider_for(&config, "any/model", "together").unwrap();
+        assert_eq!(
+            provider.api_base(),
+            Some(crate::providers::registry::TOGETHER_API_BASE.to_string())
+        );
     }
 
     #[test]

@@ -176,7 +176,9 @@ pub enum ToolFieldKind {
         max: Option<i64>,
     },
     Text,
-    Choice { choices: Vec<String> },
+    Choice {
+        choices: Vec<String>,
+    },
     StringList,
 }
 

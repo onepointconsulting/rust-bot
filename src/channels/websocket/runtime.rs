@@ -35,11 +35,11 @@ use crate::agent::subagent::{
     SpawnTaskSummary, SubagentManager, SubagentRecord, summarize_spawn_records,
 };
 use crate::agent::tool_approval::ToolApprovalCall;
-use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
 use crate::agent::tools::mcp::mcp_presets_api::{
     self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
 };
 use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
+use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
@@ -3721,8 +3721,7 @@ async fn handle_set_tool_config<'a>(envelope_dispatch_context: EnvelopeDispatchC
         }
         Ok(Err(error)) => {
             let detail = tool_config_error_detail(&error);
-            send_tool_config_error(shared, connection_id, &tool, detail, &error.to_string())
-                .await;
+            send_tool_config_error(shared, connection_id, &tool, detail, &error.to_string()).await;
         }
         Err(message) => {
             send_tool_config_error(shared, connection_id, &tool, "config_error", &message).await;
@@ -9144,7 +9143,10 @@ mod tests {
         let mut envelope: Envelope = HashMap::new();
         assert_eq!(parse_tool_config_values(&envelope), Some(HashMap::new()));
 
-        envelope.insert("values".to_string(), serde_json::json!({"model": "m", "n": 3}));
+        envelope.insert(
+            "values".to_string(),
+            serde_json::json!({"model": "m", "n": 3}),
+        );
         let values = parse_tool_config_values(&envelope).unwrap();
         assert_eq!(values["model"], "m");
         assert_eq!(values["n"], 3);

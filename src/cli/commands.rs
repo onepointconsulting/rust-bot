@@ -115,6 +115,12 @@ pub const DEFAULT_CONFIG_PATH: &str = "./.rust-bot/config.json";
 /// Per-user config location (`~/.rust-bot/config.json`) written by the one-line installer.
 const HOME_CONFIG_RELATIVE_PATH: &str = ".rust-bot/config.json";
 
+/// File name of the instance configuration inside the instance directory.
+const CONFIG_FILE_NAME: &str = "config.json";
+
+/// Directory name of the default workspace inside the instance directory.
+const WORKSPACE_DIR_NAME: &str = "workspace";
+
 /// Pick the config path used when `--config` is omitted.
 ///
 /// A project-local config (`local_config`) always wins. Otherwise the per-user config
@@ -294,15 +300,111 @@ pub struct GatewayArgs {
     pub web_root: Option<PathBuf>,
 }
 
+/// Directory name that holds a rust-bot instance (config, workspace, runtime data).
+const INSTANCE_DIR_NAME: &str = ".rust-bot";
+
+/// Where `rust-bot onboard` creates the instance directory.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnboardMode {
+    /// Install in the current directory: `./.rust-bot/` (config and workspace).
+    Local,
+    /// Install for the current user: `~/.rust-bot/` (config and workspace).
+    User,
+}
+
+impl OnboardMode {
+    /// Instance directory for this mode: `current_dir/.rust-bot` or `home_dir/.rust-bot`.
+    ///
+    /// # Errors
+    ///
+    /// `User` mode fails when the home directory is unknown.
+    pub(crate) fn instance_dir(
+        self,
+        current_dir: &std::path::Path,
+        home_dir: Option<&std::path::Path>,
+    ) -> Result<PathBuf, String> {
+        match self {
+            OnboardMode::Local => Ok(current_dir.join(INSTANCE_DIR_NAME)),
+            OnboardMode::User => home_dir
+                .map(|home| home.join(INSTANCE_DIR_NAME))
+                .ok_or_else(|| {
+                    "Cannot resolve the home directory for `--mode user`; set HOME.".to_string()
+                }),
+        }
+    }
+}
+
+/// Config file and workspace that `onboard` will create or refresh.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OnboardTargets {
+    pub config_path: PathBuf,
+    pub workspace: PathBuf,
+}
+
+/// Resolve the config file and workspace for `onboard`.
+///
+/// * `mode` set: both live under that mode's instance directory.
+/// * `mode` unset: `config` if given, else [`default_config_path`] (an existing local or
+///   per-user config is reused).
+/// * `workspace` always wins when given; otherwise it is `workspace/` next to the config
+///   file, so a config and its workspace stay together wherever the instance lives.
+pub(crate) fn resolve_onboard_targets(
+    mode: Option<OnboardMode>,
+    config: Option<PathBuf>,
+    workspace: Option<PathBuf>,
+    current_dir: &std::path::Path,
+    home_dir: Option<&std::path::Path>,
+) -> Result<OnboardTargets, String> {
+    let config_path = match (mode, config) {
+        (Some(mode), _) => mode
+            .instance_dir(current_dir, home_dir)?
+            .join(CONFIG_FILE_NAME),
+        (None, Some(config)) => config,
+        (None, None) => default_config_path(),
+    };
+    let workspace = workspace.unwrap_or_else(|| {
+        config_path
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."))
+            .join(WORKSPACE_DIR_NAME)
+    });
+    Ok(OnboardTargets {
+        config_path,
+        workspace,
+    })
+}
+
+/// Resolve [`OnboardTargets`] for the real process environment (cwd and home directory).
+pub(crate) fn resolve_onboard_targets_from_env(
+    args: &OnboardArgs,
+) -> Result<OnboardTargets, CliError> {
+    let current_dir = std::env::current_dir()
+        .map_err(|e| CliError::Other(format!("Cannot resolve the current directory: {e}")))?;
+    resolve_onboard_targets(
+        args.mode,
+        args.config.clone(),
+        args.workspace.clone(),
+        &current_dir,
+        home::home_dir().as_deref(),
+    )
+    .map_err(CliError::Other)
+}
+
 #[derive(Debug, Parser)]
 pub struct OnboardArgs {
-    /// Workspace directory
-    #[arg(short, long, default_value = "./.rust-bot/workspace")]
-    pub workspace: PathBuf,
+    /// Install location: `local` = `./.rust-bot/` in the current directory, `user` =
+    /// `~/.rust-bot/`. Config and workspace are both placed there. Without it, an
+    /// existing local or per-user config is reused, else `./.rust-bot/` is created.
+    #[arg(long, value_enum, conflicts_with = "config")]
+    pub mode: Option<OnboardMode>,
 
-    /// JSON configuration file path
-    #[arg(short, long, default_value_os_t = default_config_path())]
-    pub config: PathBuf,
+    /// Workspace directory (default: `workspace/` next to the config file)
+    #[arg(short, long)]
+    pub workspace: Option<PathBuf>,
+
+    /// JSON configuration file path (cannot be combined with `--mode`)
+    #[arg(short, long)]
+    pub config: Option<PathBuf>,
 
     /// Use interactive setup wizard
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
@@ -331,8 +433,9 @@ pub struct GenerateJwtKeypairArgs {
     pub config: PathBuf,
 
     /// Directory where private_key.pem and public_key.pem are written
-    #[arg(long, default_value = "./.rust-bot/credentials")]
-    pub credentials_dir: PathBuf,
+    /// (default: `credentials/` next to the config file)
+    #[arg(long)]
+    pub credentials_dir: Option<PathBuf>,
 
     /// Overwrite existing key files
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
@@ -526,9 +629,21 @@ pub(crate) fn path_for_config(path: PathBuf) -> PathBuf {
     canonical
 }
 
+/// Default key directory for a config file: `credentials/` in the config's own directory,
+/// so a local or per-user instance keeps its keys with its config.
+fn default_credentials_dir(config_path: &std::path::Path) -> PathBuf {
+    config_path
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."))
+        .join("credentials")
+}
+
 fn run_generate_keypair(args: GenerateJwtKeypairArgs) -> Result<(), CliError> {
     let mut config = load_config(Some(args.config.clone()));
-    run_generate_keypair_with_config(&mut config, args.credentials_dir, args.force)?;
+    let credentials_dir = args
+        .credentials_dir
+        .unwrap_or_else(|| default_credentials_dir(&args.config));
+    run_generate_keypair_with_config(&mut config, credentials_dir, args.force)?;
 
     save_config(&config, Some(args.config.clone()))?;
 
@@ -2510,6 +2625,84 @@ mod tests {
             select_default_config_path(&missing_local, None),
             missing_local
         );
+    }
+
+    #[test]
+    fn onboard_local_mode_puts_config_and_workspace_in_current_dir() {
+        let cwd = std::path::Path::new("/project");
+        let home = std::path::Path::new("/home/me");
+        let targets =
+            resolve_onboard_targets(Some(OnboardMode::Local), None, None, cwd, Some(home)).unwrap();
+        assert_eq!(targets.config_path, cwd.join(".rust-bot/config.json"));
+        assert_eq!(targets.workspace, cwd.join(".rust-bot/workspace"));
+    }
+
+    #[test]
+    fn onboard_user_mode_puts_config_and_workspace_in_home() {
+        let cwd = std::path::Path::new("/project");
+        let home = std::path::Path::new("/home/me");
+        let targets =
+            resolve_onboard_targets(Some(OnboardMode::User), None, None, cwd, Some(home)).unwrap();
+        assert_eq!(targets.config_path, home.join(".rust-bot/config.json"));
+        assert_eq!(targets.workspace, home.join(".rust-bot/workspace"));
+    }
+
+    #[test]
+    fn onboard_user_mode_requires_a_home_directory() {
+        let cwd = std::path::Path::new("/project");
+        let result = resolve_onboard_targets(Some(OnboardMode::User), None, None, cwd, None);
+        assert!(result.unwrap_err().contains("home directory"));
+    }
+
+    #[test]
+    fn onboard_explicit_workspace_overrides_the_mode_workspace() {
+        let cwd = std::path::Path::new("/project");
+        let targets = resolve_onboard_targets(
+            Some(OnboardMode::Local),
+            None,
+            Some(PathBuf::from("/data/ws")),
+            cwd,
+            None,
+        )
+        .unwrap();
+        assert_eq!(targets.workspace, PathBuf::from("/data/ws"));
+        assert_eq!(targets.config_path, cwd.join(".rust-bot/config.json"));
+    }
+
+    #[test]
+    fn onboard_explicit_config_gets_a_workspace_next_to_it() {
+        let cwd = std::path::Path::new("/project");
+        let targets = resolve_onboard_targets(
+            None,
+            Some(PathBuf::from("/srv/bot/config.json")),
+            None,
+            cwd,
+            None,
+        )
+        .unwrap();
+        assert_eq!(targets.config_path, PathBuf::from("/srv/bot/config.json"));
+        assert_eq!(targets.workspace, PathBuf::from("/srv/bot/workspace"));
+    }
+
+    #[test]
+    fn onboard_mode_parses_and_conflicts_with_config() {
+        let local = Cli::try_parse_from(["rust-bot", "onboard", "--mode", "local"]).unwrap();
+        let Commands::Onboard(args) = local.command else {
+            panic!("expected the onboard command");
+        };
+        assert_eq!(args.mode, Some(OnboardMode::Local));
+
+        let user = Cli::try_parse_from(["rust-bot", "onboard", "--mode", "user"]).unwrap();
+        let Commands::Onboard(args) = user.command else {
+            panic!("expected the onboard command");
+        };
+        assert_eq!(args.mode, Some(OnboardMode::User));
+
+        assert!(
+            Cli::try_parse_from(["rust-bot", "onboard", "--mode", "local", "-c", "x.json"])
+                .is_err()
+        );
+        assert!(Cli::try_parse_from(["rust-bot", "onboard", "--mode", "bogus"]).is_err());
     }
 
     #[test]

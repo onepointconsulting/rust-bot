@@ -12,6 +12,7 @@
 
 use leptos::prelude::*;
 
+use super::json_editor::JsonEditor;
 use super::settings_pages::{SettingsActions, SettingsPage, SettingsPageView, SettingsPanel};
 use crate::state::ConfigFileView;
 
@@ -36,23 +37,45 @@ fn save_label(saving: bool) -> &'static str {
 /// Classes of a menu entry in the dialog's left column; `active` highlights the open page.
 fn menu_button_class(active: bool) -> &'static str {
     if active {
-        "w-full rounded-lg bg-slate-100 px-3 py-2 text-left text-sm font-medium text-slate-900"
+        "shrink-0 whitespace-nowrap rounded-lg bg-slate-100 px-3 py-2 text-left text-sm font-medium text-slate-900 sm:w-full"
     } else {
-        "w-full rounded-lg px-3 py-2 text-left text-sm text-slate-600 hover:bg-slate-50"
+        "shrink-0 whitespace-nowrap rounded-lg px-3 py-2 text-left text-sm text-slate-600 hover:bg-slate-50 sm:w-full"
+    }
+}
+
+/// Classes of the panel: a card of at most `max_width_class` (a `sm:max-w-*` class when
+/// `fullscreen_on_mobile`) on wide screens, and with `fullscreen_on_mobile` the whole
+/// screen on phones.
+pub fn dialog_panel_class(max_width_class: &str, fullscreen_on_mobile: bool) -> String {
+    if fullscreen_on_mobile {
+        format!(
+            "relative flex h-[100dvh] w-full {max_width_class} flex-col bg-white p-4 sm:h-auto sm:max-h-[90vh] sm:rounded-2xl sm:p-5 sm:shadow-2xl sm:ring-1 sm:ring-slate-200"
+        )
+    } else {
+        format!(
+            "relative flex max-h-[90vh] w-full {max_width_class} flex-col rounded-2xl bg-white p-5 shadow-2xl ring-1 ring-slate-200"
+        )
     }
 }
 
 /// Backdrop plus centred panel shared by the dialog and the notice. Clicking the
-/// backdrop calls `on_close`; Escape inside the panel does too.
+/// backdrop calls `on_close`; Escape inside the panel does too. With
+/// `fullscreen_on_mobile` the panel fills the screen below the `sm` breakpoint.
 #[component]
 fn DialogFrame(
     title_id: &'static str,
     max_width_class: &'static str,
     on_close: Callback<()>,
+    #[prop(optional)] fullscreen_on_mobile: bool,
     children: Children,
 ) -> impl IntoView {
+    let wrapper_class = if fullscreen_on_mobile {
+        "fixed inset-0 z-[60] flex items-center justify-center sm:p-4"
+    } else {
+        "fixed inset-0 z-[60] flex items-center justify-center p-4"
+    };
     view! {
-        <div class="fixed inset-0 z-[60] flex items-center justify-center p-4">
+        <div class=wrapper_class>
             <div
                 class="absolute inset-0 bg-slate-900/40"
                 aria-hidden="true"
@@ -62,9 +85,7 @@ fn DialogFrame(
                 role="dialog"
                 aria-modal="true"
                 aria-labelledby=title_id
-                class=format!(
-                    "relative flex max-h-[90vh] w-full {max_width_class} flex-col rounded-2xl bg-white p-5 shadow-2xl ring-1 ring-slate-200",
-                )
+                class=dialog_panel_class(max_width_class, fullscreen_on_mobile)
                 on:keydown=move |ev| {
                     if ev.key() == "Escape" {
                         on_close.run(());
@@ -141,7 +162,12 @@ pub fn SettingsDialog(
 
     view! {
         <Show when=move || open.get()>
-            <DialogFrame title_id="settings-title" max_width_class="max-w-4xl" on_close=on_close>
+            <DialogFrame
+                title_id="settings-title"
+                max_width_class="sm:max-w-4xl"
+                on_close=on_close
+                fullscreen_on_mobile=true
+            >
                 <div class="mb-4 flex items-center justify-between gap-3">
                     <h2 id="settings-title" class="text-lg font-semibold text-slate-900">
                         "Settings"
@@ -153,7 +179,8 @@ pub fn SettingsDialog(
                             disabled=editor_open
                             on:click=move |_| on_open_config_file.run(())
                         >
-                            "Open configuration file"
+                            <span class="sm:hidden">"Config file"</span>
+                            <span class="hidden sm:inline">"Open configuration file"</span>
                         </button>
                         <CloseButton on_close=on_close />
                     </div>
@@ -166,8 +193,11 @@ pub fn SettingsDialog(
                         {move || error.get().unwrap_or_default()}
                     </p>
                 </Show>
-                <div class="flex h-[min(34rem,65vh)] min-h-0 gap-4">
-                    <nav aria-label="Settings sections" class="w-40 shrink-0 space-y-1">
+                <div class="flex min-h-0 flex-1 flex-col gap-3 sm:h-[min(34rem,65vh)] sm:flex-none sm:flex-row sm:gap-4">
+                    <nav
+                        aria-label="Settings sections"
+                        class="flex shrink-0 gap-2 overflow-x-auto sm:w-40 sm:flex-col sm:gap-0 sm:space-y-1 sm:overflow-visible"
+                    >
                         {SettingsPage::ALL
                             .into_iter()
                             .map(|page| {
@@ -203,13 +233,7 @@ pub fn SettingsDialog(
                                 view! {
                                     <div class="flex min-h-0 flex-1 flex-col">
                                         <p class="mb-2 break-all text-xs text-slate-500">{path}</p>
-                                        <textarea
-                                            aria-label="Configuration file"
-                                            spellcheck="false"
-                                            class="min-h-0 w-full flex-1 resize-none rounded-lg border border-slate-200 bg-slate-50 p-3 font-mono text-xs leading-5 text-slate-900 outline-none focus:border-orange-500"
-                                            prop:value=move || draft.get()
-                                            on:input=move |ev| draft.set(event_target_value(&ev))
-                                        ></textarea>
+                                        <JsonEditor draft=draft aria_label="Configuration file" />
                                         <div class="mt-4 flex justify-end gap-2">
                                             <button
                                                 type="button"
@@ -278,6 +302,15 @@ mod tests {
     fn save_is_disabled_only_while_saving() {
         assert!(can_save(false));
         assert!(!can_save(true));
+    }
+
+    #[test]
+    fn the_panel_is_fullscreen_on_phones_only_when_asked() {
+        let fullscreen = dialog_panel_class("sm:max-w-4xl", true);
+        assert!(fullscreen.contains("h-[100dvh]") && fullscreen.contains("sm:rounded-2xl"));
+        assert!(fullscreen.contains("sm:max-w-4xl"));
+        let card = dialog_panel_class("max-w-sm", false);
+        assert!(card.contains("rounded-2xl") && !card.contains("100dvh"));
     }
 
     #[test]

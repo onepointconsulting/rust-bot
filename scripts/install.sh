@@ -128,9 +128,9 @@ main() {
     cd "$HOME"
     # stdin is the script when piped from curl, so attach the terminal for the prompts.
     if [ -r /dev/tty ]; then
-        "$BIN_DIR/rust-bot" onboard </dev/tty
+        "$BIN_DIR/rust-bot" onboard --mode user </dev/tty
     else
-        echo "No terminal available; run 'rust-bot onboard' to finish setup."
+        echo "No terminal available; run 'rust-bot onboard --mode user' to finish setup."
     fi
 }
 

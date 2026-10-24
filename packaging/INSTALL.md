@@ -56,6 +56,35 @@ This writes a config at `./.rust-bot/config.json` by default, creates
 `./.rust-bot/workspace`, and (if missing) a `.env` file next to the binary
 with `RUST_LOG` settings.
 
+### Local or per-user install (`--mode`)
+
+An instance is one directory (`.rust-bot/`) holding its config, workspace,
+credentials, users file, MCP presets, CLI history, WhatsApp bridge, and logs.
+`--mode` chooses where that directory is created:
+
+| Mode | Instance directory | Use it for |
+|------|--------------------|------------|
+| `--mode local` | `./.rust-bot/` (current directory) | One bot per project; several instances on one machine |
+| `--mode user` | `~/.rust-bot/` (home directory) | One bot per user account, usable from any directory |
+
+```bash
+rust-bot onboard --mode local   # ./.rust-bot/config.json + ./.rust-bot/workspace
+rust-bot onboard --mode user    # ~/.rust-bot/config.json + ~/.rust-bot/workspace
+```
+
+- The one-line installers (`install.sh`, `install.ps1`) run `onboard --mode user`.
+- Without `--mode`, onboard reuses an existing `./.rust-bot/config.json`, then an
+  existing `~/.rust-bot/config.json`, and otherwise creates `./.rust-bot/`
+  (a local install, as in the unpacked-archive flow above).
+- `--mode` cannot be combined with `--config`. `--workspace` can still override the
+  workspace of either mode.
+- In local mode onboard also writes `.rust-bot/.gitignore` (containing `*`) so API
+  keys and JWT keys are not committed by accident.
+- Other commands (`agent`, `gateway`, `api`, …) need no flag: they use
+  `./.rust-bot/config.json` if it exists, else `~/.rust-bot/config.json`. Every
+  instance needs its own ports (`gateway.port`, WebSocket port) if you run
+  several at once.
+
 On a first run it asks for:
 
 1. **Provider** — `openrouter`, `anthropic`, `edenai`, or `requesty`
@@ -83,8 +112,9 @@ Useful flags:
 
 | Flag | Default | Description |
 |------|---------|-------------|
-| `-c`, `--config` | `./.rust-bot/config.json` | Config file to create or update |
-| `-w`, `--workspace` | `./.rust-bot/workspace` | Agent workspace directory |
+| `--mode` | auto (see above) | `local` = `./.rust-bot/`, `user` = `~/.rust-bot/`; config and workspace go there |
+| `-c`, `--config` | `./.rust-bot/config.json` | Config file to create or update (not with `--mode`) |
+| `-w`, `--workspace` | `workspace/` next to the config | Agent workspace directory |
 | `--wizard` | off | Full interactive wizard instead of the short onboard flow |
 
 If the config file already exists, onboard asks whether to overwrite it with

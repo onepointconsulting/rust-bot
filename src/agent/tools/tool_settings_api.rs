@@ -30,6 +30,10 @@ use crate::config::schema::{
 /// Names of the toggle property of a tool section; shown as the switch, not a field.
 const ENABLE_PROPERTY_NAMES: [&str; 2] = ["enable", "enabled"];
 
+/// Key of the section made of the settings that sit directly under `tools` (not inside a
+/// tool's own object), such as `restrictToWorkspace`.
+const GENERAL_SECTION_KEY: &str = "general";
+
 /// An editable tool section: its key inside `tools` and its JSON Schema.
 struct Section {
     key: &'static str,
@@ -48,6 +52,7 @@ fn section_of<T: JsonSchema>(key: &'static str) -> Section {
 /// `JsonSchema` + `x-editable` on the struct) to expose another tool.
 fn editable_sections() -> Vec<Section> {
     vec![
+        section_of::<ToolsConfig>(GENERAL_SECTION_KEY),
         section_of::<GmailToolConfig>("gmail"),
         section_of::<ImageGenerationToolConfig>("imageGeneration"),
         section_of::<OcrToolConfig>("ocr"),
@@ -192,6 +197,25 @@ fn flatten_properties(schema: &Value, prefix: &str) -> Vec<(String, Value)> {
     flattened
 }
 
+/// The JSON of the section `key` inside the serialized `tools` config: the root object
+/// for the general section, the `tools.<key>` object otherwise.
+fn section_value<'a>(tools_json: &'a Value, key: &str) -> &'a Value {
+    if key == GENERAL_SECTION_KEY {
+        tools_json
+    } else {
+        &tools_json[key]
+    }
+}
+
+/// Mutable counterpart of [`section_value`].
+fn section_value_mut<'a>(tools_json: &'a mut Value, key: &str) -> &'a mut Value {
+    if key == GENERAL_SECTION_KEY {
+        tools_json
+    } else {
+        &mut tools_json[key]
+    }
+}
+
 /// The value at the dotted `path` inside `root`, or `Null`.
 fn value_at<'a>(root: &'a Value, path: &str) -> &'a Value {
     path.split('.').fold(root, |value, key| &value[key])
@@ -245,7 +269,10 @@ fn summarize_field(name: &str, property: &Value, current: &Value) -> Option<Tool
     let configured = has_value(current) || env_var_is_set(&env_var);
     Some(ToolFieldSummary {
         name: name.to_string(),
-        label: label_from_property_name(&name.replace('.', " ")),
+        label: property["x-label"]
+            .as_str()
+            .map(str::to_string)
+            .unwrap_or_else(|| label_from_property_name(&name.replace('.', " "))),
         help: help_text(property["description"].as_str().unwrap_or_default()),
         kind,
         secret,
@@ -293,7 +320,7 @@ pub fn tool_settings_overview(tools: &ToolsConfig) -> Vec<ToolSettingsSummary> {
     let tools_json = serde_json::to_value(tools).unwrap_or(Value::Null);
     editable_sections()
         .iter()
-        .map(|section| summarize_section(section, &tools_json[section.key]))
+        .map(|section| summarize_section(section, section_value(&tools_json, section.key)))
         .collect()
 }
 
@@ -348,7 +375,7 @@ pub fn apply_tool_settings(
 
     let mut tools_json = serde_json::to_value(&config.tools)
         .map_err(|error| ToolSettingsError::Invalid(error.to_string()))?;
-    let section_json = tools_json[tool]
+    let section_json = section_value_mut(&mut tools_json, tool)
         .as_object_mut()
         .ok_or_else(|| ToolSettingsError::UnknownTool(tool.to_string()))?;
 
@@ -379,12 +406,30 @@ pub fn apply_tool_settings(
 
     let updated: ToolsConfig = serde_json::from_value(tools_json)
         .map_err(|error| ToolSettingsError::Invalid(error.to_string()))?;
+    if changes.contains_key("ssrfWhitelist") {
+        check_cidr_list("ssrfWhitelist", &updated.ssrf_whitelist)?;
+    }
     updated
         .validate()
         .map_err(|report| ToolSettingsError::Invalid(report.to_string()))?;
     let changed = serde_json::to_value(&updated).ok() != serde_json::to_value(&config.tools).ok();
     config.tools = updated;
     Ok(changed)
+}
+
+/// Refuse a list holding something that is not a CIDR range (the gateway would silently
+/// ignore it at startup).
+fn check_cidr_list(field: &str, entries: &[String]) -> Result<(), ToolSettingsError> {
+    match entries
+        .iter()
+        .find(|entry| entry.parse::<ipnet::IpNet>().is_err())
+    {
+        Some(entry) => Err(ToolSettingsError::InvalidValue(
+            field.to_string(),
+            format!("'{entry}' is not a CIDR range such as 100.64.0.0/10"),
+        )),
+        None => Ok(()),
+    }
 }
 
 /// Whether `name` is the key of an editable tool section.
@@ -485,6 +530,7 @@ mod tests {
         assert_eq!(
             names,
             [
+                "general",
                 "gmail",
                 "imageGeneration",
                 "ocr",
@@ -503,7 +549,8 @@ mod tests {
 
     #[test]
     fn overview_maps_property_types_to_field_kinds() {
-        let gmail = &tool_settings_overview(&ToolsConfig::default())[0];
+        let overview = tool_settings_overview(&ToolsConfig::default());
+        let gmail = section(&overview, "gmail");
         assert_eq!(
             field(gmail, "maxResults").kind,
             FieldKind::Integer {
@@ -596,10 +643,13 @@ mod tests {
     fn sections_list_the_tool_names_they_own() {
         let overview = tool_settings_overview(&ToolsConfig::default());
         assert_eq!(
-            overview[0].tool_names,
+            section(&overview, "gmail").tool_names,
             ["gmail", "gmail_email_send", "gmail_email_download"]
         );
-        assert_eq!(overview[1].tool_names, ["image_generation"]);
+        assert_eq!(
+            section(&overview, "imageGeneration").tool_names,
+            ["image_generation"]
+        );
     }
 
     #[test]
@@ -702,6 +752,69 @@ mod tests {
             Ok(true)
         );
         assert!(!config.tools.question.enabled);
+    }
+
+    #[test]
+    fn general_section_holds_only_the_settings_not_owned_by_a_tool() {
+        let overview = tool_settings_overview(&ToolsConfig::default());
+        let general = section(&overview, "general");
+        let names: Vec<&str> = general.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "restrictToWorkspace",
+                "confirmBeforeExecute",
+                "ssrfWhitelist"
+            ]
+        );
+        assert_eq!(general.enabled, None);
+        assert!(general.tool_names.is_empty());
+        assert_eq!(field(general, "ssrfWhitelist").kind, FieldKind::StringList);
+    }
+
+    #[test]
+    fn a_field_can_override_its_generated_label() {
+        let overview = tool_settings_overview(&ToolsConfig::default());
+        let general = section(&overview, "general");
+        assert_eq!(field(general, "ssrfWhitelist").label, "SSRF whitelist");
+        assert_eq!(
+            field(general, "restrictToWorkspace").label,
+            "Restrict to workspace"
+        );
+    }
+
+    #[test]
+    fn general_settings_can_be_applied() {
+        let mut config = Config::default();
+        let changes = change(&[
+            ("restrictToWorkspace", json!(true)),
+            ("confirmBeforeExecute", json!(true)),
+            ("ssrfWhitelist", json!(["100.64.0.0/10"])),
+        ]);
+        assert_eq!(
+            apply_tool_settings(&mut config, "general", &changes),
+            Ok(true)
+        );
+        assert!(config.tools.restrict_to_workspace);
+        assert!(config.tools.confirm_before_execute);
+        assert_eq!(config.tools.ssrf_whitelist, ["100.64.0.0/10"]);
+        assert_eq!(config.tools.web.timeout, ToolsConfig::default().web.timeout);
+    }
+
+    #[test]
+    fn general_section_rejects_other_fields_and_bad_cidr_ranges() {
+        let mut config = Config::default();
+        let other_field = change(&[("disabledTools", json!(["x"]))]);
+        assert!(matches!(
+            apply_tool_settings(&mut config, "general", &other_field),
+            Err(ToolSettingsError::UnknownField(..))
+        ));
+        let bad_range = change(&[("ssrfWhitelist", json!(["nope"]))]);
+        assert!(matches!(
+            apply_tool_settings(&mut config, "general", &bad_range),
+            Err(ToolSettingsError::InvalidValue(..))
+        ));
+        assert!(config.tools.ssrf_whitelist.is_empty());
     }
 
     #[test]

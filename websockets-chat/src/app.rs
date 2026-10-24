@@ -31,8 +31,8 @@ use chat_ui::models::{
 
 use crate::api::{self, WsSender};
 use crate::components::{
-    apply_enabled, apply_tool_config, ChatShell, McpChangeRequest, ToolConfigChange, SettingsActions, SettingsPage, SettingsPanel,
-    ToggleRequest,
+    apply_enabled, apply_tool_config, ChatShell, McpChangeRequest, SettingsActions, SettingsPage,
+    SettingsPanel, ToggleRequest, ToolConfigChange,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -1595,7 +1595,9 @@ fn close_settings(ctx: &WsContext) {
 /// panel (see the `ToolSettings` and `McpServers` arms of the event handler).
 fn request_settings_list(ctx: &WsContext, page: SettingsPage) {
     let envelope = match page {
-        SettingsPage::Tools => protocol::ClientEnvelope::list_tool_settings(),
+        SettingsPage::Tools | SettingsPage::ToolSafety => {
+            protocol::ClientEnvelope::list_tool_settings()
+        }
         SettingsPage::McpServers => protocol::ClientEnvelope::list_mcp_servers(),
     };
     send_client_envelope(
@@ -1612,7 +1614,7 @@ fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
     panel.error.set(None);
     panel.busy.set(None);
     match page {
-        SettingsPage::Tools => panel.tools_loaded.set(false),
+        SettingsPage::Tools | SettingsPage::ToolSafety => panel.tools_loaded.set(false),
         SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
     }
     request_settings_list(ctx, page);
@@ -1629,7 +1631,9 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
     ctx.settings_panel.error.set(None);
     ctx.settings_panel.busy.set(Some(name.clone()));
     let envelope = match page {
-        SettingsPage::Tools => protocol::ClientEnvelope::set_tool_enabled(name, enabled),
+        SettingsPage::Tools | SettingsPage::ToolSafety => {
+            protocol::ClientEnvelope::set_tool_enabled(name, enabled)
+        }
         SettingsPage::McpServers => protocol::ClientEnvelope::set_mcp_server_enabled(name, enabled),
     };
     send_client_envelope(

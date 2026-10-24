@@ -1,4 +1,4 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use crate::{
     config::loader::get_config_path,
@@ -48,27 +48,37 @@ pub fn get_logs_dir() -> PathBuf {
     get_runtime_subdir("logs")
 }
 
+/// Default agent workspace inside an instance directory: `<instance_dir>/workspace`.
+fn default_workspace_in(instance_dir: &Path) -> PathBuf {
+    instance_dir.join("workspace")
+}
+
+/// CLI history file inside an instance directory.
+fn cli_history_path_in(instance_dir: &Path) -> PathBuf {
+    instance_dir.join("history").join("cli_history")
+}
+
+/// WhatsApp bridge installation directory inside an instance directory.
+fn bridge_install_dir_in(instance_dir: &Path) -> PathBuf {
+    instance_dir.join("bridge")
+}
+
 /// Resolve and ensure the agent workspace path.
+///
+/// Without an explicit `workspace`, the default is `workspace/` in the instance directory
+/// (the config file's directory), so local and per-user installs each get their own.
 pub fn get_workspace_path(workspace: Option<&str>) -> PathBuf {
     let path = if let Some(workspace) = workspace {
         PathBuf::from(expand_tilde_path(workspace).as_ref())
     } else {
-        home::home_dir()
-            .unwrap_or_else(|| {
-                panic!("Home directory not found. Please set the HOME environment variable.")
-            })
-            .join(".rust-bot/workspace")
+        default_workspace_in(&get_data_dir())
     };
     ensure_dir(path)
 }
 
-/// Return whether a workspace path resolves to the default workspace.
+/// Return whether a workspace path resolves to the instance's default workspace.
 pub fn is_default_workspace(workspace: Option<&str>) -> bool {
-    let default = home::home_dir()
-        .unwrap_or_else(|| {
-            panic!("Home directory not found. Please set the HOME environment variable.")
-        })
-        .join(".rust-bot/workspace");
+    let default = default_workspace_in(&get_data_dir());
 
     let current = match workspace {
         Some(ws) => PathBuf::from(expand_tilde_path(ws).as_ref()),
@@ -88,17 +98,21 @@ fn rust_bot_home() -> PathBuf {
         .join(".rust-bot")
 }
 
-/// Return the shared CLI history file path.
+/// Return the CLI history file path of this instance.
 pub fn get_cli_history_path() -> PathBuf {
-    rust_bot_home().join("history").join("cli_history")
+    cli_history_path_in(&get_data_dir())
 }
 
-/// Return the shared WhatsApp bridge installation directory.
+/// Return the WhatsApp bridge installation directory of this instance.
+///
+/// Per instance because the bridge holds a login session that two instances must not share.
 pub fn get_bridge_install_dir() -> PathBuf {
-    rust_bot_home().join("bridge")
+    bridge_install_dir_in(&get_data_dir())
 }
 
 /// Return the legacy global session directory used for migration fallback.
+///
+/// Intentionally stays in the user's home: it is where sessions lived before instances existed.
 pub fn get_legacy_sessions_dir() -> PathBuf {
     rust_bot_home().join("sessions")
 }
@@ -203,10 +217,9 @@ mod tests {
     }
 
     #[test]
-    fn test_get_workspace_path_none_uses_default() {
-        let result = get_workspace_path(None);
-        let expected = home::home_dir().unwrap().join(".rust-bot/workspace");
-        assert_eq!(result, expected);
+    fn test_default_workspace_is_inside_the_instance_dir() {
+        let instance = Path::new("/project/.rust-bot");
+        assert_eq!(default_workspace_in(instance), instance.join("workspace"));
     }
 
     // ── is_default_workspace ─────────────────────────────────────────────────
@@ -217,36 +230,33 @@ mod tests {
     }
 
     #[test]
-    fn test_is_default_workspace_tilde_path_is_default() {
-        assert!(is_default_workspace(Some("~/.rust-bot/workspace")));
-    }
-
-    #[test]
-    fn test_is_default_workspace_absolute_default_path() {
-        let default = home::home_dir().unwrap().join(".rust-bot/workspace");
-        let path = default.to_str().unwrap().to_string();
-        assert!(is_default_workspace(Some(&path)));
-    }
-
-    #[test]
     fn test_is_default_workspace_different_path_is_not_default() {
         assert!(!is_default_workspace(Some("/tmp/my_workspace")));
     }
 
-    // ── static home-relative paths ────────────────────────────────────────────
+    // ── per-instance paths ────────────────────────────────────────────────────
 
     #[test]
-    fn test_get_cli_history_path() {
-        let path = get_cli_history_path();
-        let home = home::home_dir().unwrap();
-        assert_eq!(path, home.join(".rust-bot/history/cli_history"));
+    fn test_cli_history_path_is_inside_the_instance_dir() {
+        let instance = Path::new("/project/.rust-bot");
+        assert_eq!(
+            cli_history_path_in(instance),
+            instance.join("history").join("cli_history")
+        );
     }
 
     #[test]
-    fn test_get_bridge_install_dir() {
-        let path = get_bridge_install_dir();
-        let home = home::home_dir().unwrap();
-        assert_eq!(path, home.join(".rust-bot/bridge"));
+    fn test_bridge_install_dir_is_inside_the_instance_dir() {
+        let instance = Path::new("/project/.rust-bot");
+        assert_eq!(bridge_install_dir_in(instance), instance.join("bridge"));
+    }
+
+    #[test]
+    fn test_two_instances_do_not_share_history_or_bridge() {
+        let first = Path::new("/a/.rust-bot");
+        let second = Path::new("/b/.rust-bot");
+        assert_ne!(cli_history_path_in(first), cli_history_path_in(second));
+        assert_ne!(bridge_install_dir_in(first), bridge_install_dir_in(second));
     }
 
     #[test]

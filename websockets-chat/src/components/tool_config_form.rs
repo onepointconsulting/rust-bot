@@ -45,7 +45,7 @@ pub fn initial_drafts(fields: &[ToolFieldSummary]) -> HashMap<String, String> {
 }
 
 /// Convert a draft into the JSON value the gateway expects, or say why it cannot be.
-fn draft_to_value(field: &ToolFieldSummary, draft: &str) -> Result<Value, String> {
+pub fn draft_to_value(field: &ToolFieldSummary, draft: &str) -> Result<Value, String> {
     match &field.kind {
         ToolFieldKind::Bool => Ok(Value::Bool(draft == "true")),
         ToolFieldKind::Integer { .. } => draft
@@ -99,7 +99,10 @@ pub fn field_note(field: &ToolFieldSummary) -> String {
         note.push_str(" A value is configured; leave blank to keep it.");
     }
     if !field.env_var.is_empty() {
-        note.push_str(&format!(" The environment variable {} also works.", field.env_var));
+        note.push_str(&format!(
+            " The environment variable {} also works.",
+            field.env_var
+        ));
     }
     note.trim().to_string()
 }
@@ -219,9 +222,8 @@ pub fn ToolConfigForm(
     let fields_for_error = config.fields.clone();
     let fields_for_save = config.fields.clone();
     let tool = config.name.clone();
-    let save_ready = move || {
-        can_modify.get() && !busy.get() && can_save(&fields_for_check, &drafts.get())
-    };
+    let save_ready =
+        move || can_modify.get() && !busy.get() && can_save(&fields_for_check, &drafts.get());
     let draft_error = move || changed_values(&fields_for_error, &drafts.get()).err();
     let save = move |_| {
         if let Ok(changes) = changed_values(&fields_for_save, &drafts.get_untracked()) {
@@ -229,7 +231,7 @@ pub fn ToolConfigForm(
         }
     };
     view! {
-        <div class="mb-3 ml-16 rounded-xl border border-slate-200 bg-slate-50 p-4">
+        <div class="mb-3 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:ml-16">
             <p class="mb-3 text-xs text-slate-500">
                 "Stored in config.json on this machine. Changes apply after a restart."
             </p>
@@ -290,7 +292,14 @@ mod tests {
         let fields = vec![
             field("model", ToolFieldKind::Text, Some(json!("m"))),
             field("on", ToolFieldKind::Bool, Some(json!(true))),
-            field("n", ToolFieldKind::Integer { min: None, max: None }, Some(json!(20))),
+            field(
+                "n",
+                ToolFieldKind::Integer {
+                    min: None,
+                    max: None,
+                },
+                Some(json!(20)),
+            ),
             field("dirs", ToolFieldKind::StringList, Some(json!(["a", "b"]))),
             secret("apiKey"),
         ];
@@ -304,7 +313,10 @@ mod tests {
 
     #[test]
     fn untouched_drafts_send_nothing() {
-        let fields = vec![field("model", ToolFieldKind::Text, Some(json!("m"))), secret("apiKey")];
+        let fields = vec![
+            field("model", ToolFieldKind::Text, Some(json!("m"))),
+            secret("apiKey"),
+        ];
         let changes = changed_values(&fields, &initial_drafts(&fields)).unwrap();
         assert!(changes.is_empty());
         assert!(!can_save(&fields, &initial_drafts(&fields)));
@@ -314,11 +326,23 @@ mod tests {
     fn only_edited_fields_are_sent_with_typed_values() {
         let fields = vec![
             field("model", ToolFieldKind::Text, Some(json!("m"))),
-            field("n", ToolFieldKind::Integer { min: Some(1), max: None }, Some(json!(20))),
+            field(
+                "n",
+                ToolFieldKind::Integer {
+                    min: Some(1),
+                    max: None,
+                },
+                Some(json!(20)),
+            ),
             field("dirs", ToolFieldKind::StringList, Some(json!([]))),
             field("on", ToolFieldKind::Bool, Some(json!(false))),
         ];
-        let edited = drafts(&[("model", " new "), ("n", "5"), ("dirs", "x\n\n y "), ("on", "true")]);
+        let edited = drafts(&[
+            ("model", " new "),
+            ("n", "5"),
+            ("dirs", "x\n\n y "),
+            ("on", "true"),
+        ]);
 
         let changes = changed_values(&fields, &edited).unwrap();
 
@@ -331,14 +355,23 @@ mod tests {
     #[test]
     fn a_secret_is_sent_only_when_something_was_typed() {
         let fields = vec![secret("apiKey")];
-        assert!(changed_values(&fields, &drafts(&[("apiKey", "  ")])).unwrap().is_empty());
+        assert!(changed_values(&fields, &drafts(&[("apiKey", "  ")]))
+            .unwrap()
+            .is_empty());
         let changes = changed_values(&fields, &drafts(&[("apiKey", "sk-1")])).unwrap();
         assert_eq!(changes["apiKey"], json!("sk-1"));
     }
 
     #[test]
     fn text_in_a_number_field_is_reported_and_blocks_saving() {
-        let fields = vec![field("n", ToolFieldKind::Integer { min: None, max: None }, Some(json!(1)))];
+        let fields = vec![field(
+            "n",
+            ToolFieldKind::Integer {
+                min: None,
+                max: None,
+            },
+            Some(json!(1)),
+        )];
         let edited = drafts(&[("n", "many")]);
         assert_eq!(
             changed_values(&fields, &edited),

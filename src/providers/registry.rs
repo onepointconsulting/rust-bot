@@ -1,3 +1,5 @@
+pub const TOGETHER_API_BASE: &str = "https://api.together.xyz/v1";
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ProviderSpec {
     // identity
@@ -146,6 +148,16 @@ pub fn providers() -> Vec<ProviderSpec> {
             ),
             ..ProviderSpec::default()
         },
+        ProviderSpec {
+            name: "together".to_string(),
+            keywords: vec!["together".to_string()],
+            env_key: "TOGETHER_API_KEY".to_string(),
+            display_name: "Together AI".to_string(),
+            backend: "openai_compat".to_string(),
+            default_api_base: Some(TOGETHER_API_BASE.to_string()),
+            detect_by_base_keyword: "together".to_string(),
+            ..ProviderSpec::default()
+        },
     ]
 }
 
@@ -160,5 +172,13 @@ mod tests {
         assert_eq!(spec.name, "openai");
         let spec1 = find_by_name("azure-openai").unwrap();
         assert_eq!(spec1.name, "azure_openai");
+    }
+
+    #[test]
+    fn test_together_is_registered_with_its_api_base() {
+        let spec = find_by_name("together").unwrap();
+        assert_eq!(spec.env_key, "TOGETHER_API_KEY");
+        assert_eq!(spec.backend, "openai_compat");
+        assert_eq!(spec.default_api_base.as_deref(), Some(TOGETHER_API_BASE));
     }
 }

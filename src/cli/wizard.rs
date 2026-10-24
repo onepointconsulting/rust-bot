@@ -12,9 +12,14 @@ use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
 use crate::cli::onboard::create_env_file;
 use crate::config::schema::ProvidersConfig;
 use crate::providers::anthropic_provider::AnthropicProvider;
+use crate::providers::registry::TOGETHER_API_BASE;
 use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_token};
 use crate::{
-    cli::{CliError, commands::OnboardArgs, eprint_error},
+    cli::{
+        CliError,
+        commands::{OnboardArgs, resolve_onboard_targets_from_env},
+        eprint_error,
+    },
     config::{
         channels::EmailConfig,
         loader::{load_config, save_config, set_config_path},
@@ -50,6 +55,7 @@ const PROVIDER_ANTHROPIC: &str = "anthropic";
 const PROVIDER_NANOGPT: &str = "nanogpt";
 const PROVIDER_ZAI_SUBSCRIPTION: &str = "zai_subscription";
 const PROVIDER_XIAOMI_SUBSCRIPTION: &str = "xiaomi_subscription";
+const PROVIDER_TOGETHER: &str = "together";
 
 const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
@@ -101,9 +107,16 @@ const OCR_PROVIDERS: [&str; 1] = ["anthropic"];
 const MCP_TRANSPORT_OPTIONS: [&str; 4] = ["auto", "stdio", "sse", "streamableHttp"];
 
 pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
-    let config_path = resolve_onboard_config_path(args.config);
-    let mut config =
-        apply_workspace_override(load_config(Some(config_path.clone())), args.workspace);
+    let targets = resolve_onboard_targets_from_env(&args)?;
+    let config_path = resolve_onboard_config_path(targets.config_path);
+    let mut config = load_config(Some(config_path.clone()));
+    if !config_path.exists()
+        && let Some(instance_dir) = config_path.parent()
+    {
+        // A brand-new instance keeps its credentials, users and presets next to its config.
+        config.rebase_default_paths(instance_dir);
+    }
+    let mut config = apply_workspace_override(config, targets.workspace);
     loop {
         let answer = Select::new(
             "What would you like to configure?",
@@ -170,6 +183,7 @@ pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, C
         PROVIDER_NANOGPT,
         PROVIDER_ZAI_SUBSCRIPTION,
         PROVIDER_XIAOMI_SUBSCRIPTION,
+        PROVIDER_TOGETHER,
     ];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
@@ -197,6 +211,7 @@ fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
     match provider_name {
         PROVIDER_OPENROUTER => Some("openrouter"),
         PROVIDER_ANTHROPIC => Some("anthropic"),
+        PROVIDER_TOGETHER => Some("together"),
         PROVIDER_EDENAI
         | PROVIDER_REQUESTY
         | PROVIDER_NANOGPT
@@ -218,6 +233,7 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
     match provider_config_slot(provider_name) {
         Some("openrouter") => config.providers.openrouter.api_key = api_key,
         Some("anthropic") => config.providers.anthropic.api_key = api_key,
+        Some("together") => config.providers.together.api_key = api_key,
         Some("custom") => config.providers.custom.api_key = api_key,
         _ => return Err(invalid_provider_error()),
     }
@@ -234,6 +250,7 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
             PROVIDER_NANOGPT => "https://nano-gpt.com/api/v1",
             PROVIDER_ZAI_SUBSCRIPTION => "https://api.z.ai/api/coding/paas/v4",
             PROVIDER_XIAOMI_SUBSCRIPTION => "https://token-plan-ams.xiaomimimo.com/v1",
+            PROVIDER_TOGETHER => TOGETHER_API_BASE,
             _ => "",
         }
     }
@@ -245,6 +262,7 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
     match provider_config_slot(provider_name) {
         Some("openrouter") => config.providers.openrouter.api_base = Some(endpoint),
         Some("anthropic") => config.providers.anthropic.api_base = Some(endpoint),
+        Some("together") => config.providers.together.api_base = Some(endpoint),
         Some("custom") => config.providers.custom.api_base = Some(endpoint),
         _ => return Err(invalid_provider_error()),
     }
@@ -285,6 +303,7 @@ pub fn configure_extra_headers(
     match provider_config_slot(provider_name) {
         Some("openrouter") => config.providers.openrouter.extra_headers = headers,
         Some("anthropic") => config.providers.anthropic.extra_headers = headers,
+        Some("together") => config.providers.together.extra_headers = headers,
         Some("custom") => config.providers.custom.extra_headers = headers,
         _ => return Err(invalid_provider_error()),
     }
@@ -740,6 +759,7 @@ pub fn config_model(
     providers: &ProvidersConfig,
 ) -> Result<(), CliError> {
     let model = agents.model.clone();
+    let selected_provider = agents.provider.as_str();
     let custom = &providers.custom;
     let (default_model, help_message) = if let Some(api_base) = &custom.api_base
         && (api_base.contains("z.ai") || api_base.contains("xiaomi"))
@@ -749,6 +769,11 @@ pub fn config_model(
         } else {
             ("mimo-v2.6-pro", "e.g. mimo-v2.6, mimo-v2.6-flash")
         }
+    } else if selected_provider == PROVIDER_TOGETHER {
+        (
+            "zai-org/GLM-5.3-Flash",
+            "e.g. deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        )
     } else {
         (
             model.as_str(),
