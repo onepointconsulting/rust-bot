@@ -5,17 +5,43 @@ use crate::{
     utils::helpers::{ensure_dir, expand_tilde_path},
 };
 
+/// Environment variable that moves runtime data (sessions, cron, logs, media, the
+/// default workspace) away from the config file's directory.
+///
+/// It lets a container mount the config read-only (a Docker/Kubernetes config object)
+/// while state lives on a separate writable volume.
+pub const DATA_DIR_ENV_VAR: &str = "RUST_BOT_DATA_DIR";
+
+/// Pick the runtime data directory: a non-empty `env_override` (the value of
+/// [`DATA_DIR_ENV_VAR`]) wins, otherwise the directory that holds `config_path`.
+///
+/// # Panics
+///
+/// Panics when there is no override and `config_path` has no parent directory.
+fn data_dir_for(config_path: &Path, env_override: Option<std::ffi::OsString>) -> PathBuf {
+    if let Some(explicit) = env_override.filter(|value| !value.is_empty()) {
+        return PathBuf::from(explicit);
+    }
+    config_path
+        .parent()
+        .unwrap_or_else(|| {
+            panic!(
+                "Config path '{}' has no parent directory. \
+                 Ensure the config path points to a file, not a filesystem root.",
+                config_path.display()
+            )
+        })
+        .to_path_buf()
+}
+
 /// Return the instance-level runtime data directory.
+///
+/// This is the config file's directory unless [`DATA_DIR_ENV_VAR`] points elsewhere.
 pub fn get_data_dir() -> PathBuf {
-    let config_path = get_config_path();
-    let data_dir = config_path.parent().unwrap_or_else(|| {
-        panic!(
-            "Config path '{}' has no parent directory. \
-             Ensure the config path points to a file, not a filesystem root.",
-            config_path.display()
-        )
-    });
-    ensure_dir(data_dir)
+    ensure_dir(data_dir_for(
+        &get_config_path(),
+        std::env::var_os(DATA_DIR_ENV_VAR),
+    ))
 }
 
 /// Return the directory for WebUI-only persisted display threads (JSON).
@@ -150,6 +176,33 @@ mod tests {
         let sub = get_runtime_subdir("test_sub");
         assert!(sub.is_dir());
         assert_eq!(sub.file_name().unwrap(), "test_sub");
+    }
+
+    #[test]
+    fn test_data_dir_defaults_to_the_config_directory() {
+        assert_eq!(
+            data_dir_for(Path::new("/etc/rust-bot/config.json"), None),
+            Path::new("/etc/rust-bot")
+        );
+        // An empty variable (`RUST_BOT_DATA_DIR=`) counts as unset.
+        assert_eq!(
+            data_dir_for(
+                Path::new("/etc/rust-bot/config.json"),
+                Some(std::ffi::OsString::new())
+            ),
+            Path::new("/etc/rust-bot")
+        );
+    }
+
+    #[test]
+    fn test_data_dir_env_override_wins_over_the_config_directory() {
+        assert_eq!(
+            data_dir_for(
+                Path::new("/etc/rust-bot/config.json"),
+                Some("/data".into())
+            ),
+            Path::new("/data")
+        );
     }
 
     // ── get_media_dir ─────────────────────────────────────────────────────────

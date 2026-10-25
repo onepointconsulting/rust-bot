@@ -3,6 +3,7 @@
 /websockets-chat/dist
 notes.txt
 .env
+.env.docker
 
 # Auto-generated cache directories (e.g. Python install manager)
 **/_cache/

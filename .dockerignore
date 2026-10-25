@@ -1,0 +1,25 @@
+# Build outputs and local state
+target
+**/target
+**/dist
+node_modules
+.git
+logs
+media
+workspace
+Python
+relative
+
+# Secrets and local config must never end up in an image layer
+.env*
+!.env.docker.example
+credentials
+.rust-bot
+**/.rust-bot
+
+# Not needed to build
+docs
+scripts
+packaging
+*.log
+notes.txt

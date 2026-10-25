@@ -1,4 +1,5 @@
 pub mod channels;
+pub mod check;
 pub mod child_env;
 pub mod loader;
 pub mod log;

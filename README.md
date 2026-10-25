@@ -173,6 +173,8 @@ The agent reads its configuration from a JSON file passed via `--config`. Sample
 
 Typical keys: provider, model, API key / base URL (read from env), and channel settings. See `src/config/schema.rs` for the full schema.
 
+`RUST_BOT_CONFIG` names the config file when `--config` is omitted, `RUST_BOT_DATA_DIR` moves runtime state away from the config's directory, and `rust-bot check-config` validates a config (including unset `${VAR}` placeholders). To run in a container, see [docs/DOCKER.md](docs/DOCKER.md).
+
 The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`, plus the standard folder layout. These come from the compiled-in template bundle by default; drop a `templates/` directory next to the binary (or set `RUST_BOT_TEMPLATES_DIR`) if you want to override them with your own copies.
 
 ---

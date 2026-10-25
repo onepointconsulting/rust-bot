@@ -138,9 +138,30 @@ pub(crate) fn select_default_config_path(
     }
 }
 
-/// Default `--config` value for every subcommand; see [`select_default_config_path`].
+/// Environment variable that names the config file when `--config` is omitted.
+///
+/// It exists for containers, where the config lives on a mounted volume and the
+/// command line is fixed by the image.
+pub const CONFIG_PATH_ENV_VAR: &str = "RUST_BOT_CONFIG";
+
+/// Pick the default config path, letting a non-empty `env_override` (the value of
+/// [`CONFIG_PATH_ENV_VAR`]) win over the local and per-user search of
+/// [`select_default_config_path`].
+pub(crate) fn resolve_default_config_path(
+    env_override: Option<std::ffi::OsString>,
+    local_config: &std::path::Path,
+    home_dir: Option<&std::path::Path>,
+) -> PathBuf {
+    match env_override.filter(|value| !value.is_empty()) {
+        Some(explicit) => PathBuf::from(explicit),
+        None => select_default_config_path(local_config, home_dir),
+    }
+}
+
+/// Default `--config` value for every subcommand; see [`resolve_default_config_path`].
 pub fn default_config_path() -> PathBuf {
-    select_default_config_path(
+    resolve_default_config_path(
+        std::env::var_os(CONFIG_PATH_ENV_VAR),
         std::path::Path::new(DEFAULT_CONFIG_PATH),
         home::home_dir().as_deref(),
     )
@@ -187,6 +208,16 @@ pub enum Commands {
 
     /// List the ACP child agents stored in the workspace
     Subagents(SubagentsArgs),
+
+    /// Validate the config file (JSON, schema, unset `${VAR}` placeholders) and exit
+    CheckConfig(CheckConfigArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct CheckConfigArgs {
+    /// JSON configuration file path
+    #[arg(short, long, default_value_os_t = default_config_path())]
+    pub config: PathBuf,
 }
 
 #[derive(Debug, Parser)]
@@ -586,6 +617,35 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::GenerateJwtKeypair(args) => run_generate_keypair(args),
         Commands::GenerateJwtToken(args) => run_generate_token(args),
         Commands::Subagents(args) => run_subagents(args),
+        Commands::CheckConfig(args) => run_check_config(args),
+    }
+}
+
+/// `rust-bot check-config`: print the findings of
+/// [`check_config_text`](crate::config::check::check_config_text) and fail when there
+/// are errors, so an entrypoint script can stop before starting the gateway.
+fn run_check_config(args: CheckConfigArgs) -> Result<(), CliError> {
+    let text = std::fs::read_to_string(&args.config).map_err(|e| {
+        CliError::Other(format!("Cannot read config '{}': {e}", args.config.display()))
+    })?;
+    let report = crate::config::check::check_config_text(&text, |name| {
+        std::env::var_os(name).is_some()
+    });
+    for warning in &report.warnings {
+        eprintln!("warning: {warning}");
+    }
+    for error in &report.errors {
+        eprintln!("error: {error}");
+    }
+    if report.is_ok() {
+        println!("Config '{}' is valid.", args.config.display());
+        Ok(())
+    } else {
+        Err(CliError::Other(format!(
+            "Config '{}' has {} error(s)",
+            args.config.display(),
+            report.errors.len()
+        )))
     }
 }
 
@@ -2625,6 +2685,34 @@ mod tests {
             select_default_config_path(&missing_local, None),
             missing_local
         );
+    }
+
+    #[test]
+    fn env_override_wins_over_local_and_home_config() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let home_dir = tempfile::tempdir().unwrap();
+        let local_config = write_config_under(local_dir.path());
+        write_config_under(home_dir.path());
+        assert_eq!(
+            resolve_default_config_path(
+                Some("/data/config.json".into()),
+                &local_config,
+                Some(home_dir.path())
+            ),
+            PathBuf::from("/data/config.json")
+        );
+    }
+
+    #[test]
+    fn empty_or_missing_env_override_falls_back_to_the_search() {
+        let local_dir = tempfile::tempdir().unwrap();
+        let local_config = write_config_under(local_dir.path());
+        for env_override in [None, Some(std::ffi::OsString::new())] {
+            assert_eq!(
+                resolve_default_config_path(env_override, &local_config, None),
+                local_config
+            );
+        }
     }
 
     #[test]

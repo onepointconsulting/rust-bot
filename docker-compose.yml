@@ -1,0 +1,30 @@
+# rust-bot gateway. Copy .env.docker.example to .env.docker, fill in the secrets, then:
+#   docker compose up -d --build
+# The WebUI is then at http://127.0.0.1:18790
+services:
+  rust-bot:
+    build: .
+    image: rust-bot:local
+    restart: unless-stopped
+    # Secrets and per-deployment values: ${VAR} placeholders in /data/config.json are
+    # expanded from these. Add every variable your config references.
+    env_file: .env.docker
+    ports:
+      # Published on the host's loopback only. The gateway has no login unless you enable
+      # channels.websocket.jwt, so put a reverse proxy with authentication in front before
+      # exposing it beyond this machine.
+      - "127.0.0.1:18790:18790"
+    volumes:
+      # Config and all runtime state (sessions, cron, logs, workspace). The volume below
+      # is bound to a host folder; see docs/DOCKER.md for what that folder must contain.
+      - rust-bot-data:/data
+
+volumes:
+  rust-bot-data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      # An existing host folder with your config.json, and optionally credentials/ and
+      # users.json. Paths inside config.json must be /data/... (container paths).
+      device: C:\var\rust-bot\openrouter1\data

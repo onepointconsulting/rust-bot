@@ -1,0 +1,222 @@
+{
+  "agents": {
+    "workspace": "/data/workspace",
+    "model": "${OPENAI_API_MODEL}",
+    "provider": "openrouter",
+    "maxTokens": 32768,
+    "contextWindowTokens": 131072,
+    "temperature": 0.1,
+    "maxToolIterations": 100,
+    "maxToolResultChars": 16000,
+    "providerRetryMode": "standard",
+    "reasoningEffort": null,
+    "timezone": "UTC",
+    "dream": {
+      "intervalH": 2,
+      "modelOverride": null,
+      "dreamModelPreset": null,
+      "maxBatchSize": 20,
+      "maxIterations": 10
+    },
+    "sessionTtlMinutes": 15,
+    "sessionEvictionThresholdHours": 6,
+    "sessionEvictionCronIntervalHours": 1,
+    "idleCompactCheckIntervalSeconds": 60,
+    "modelPreset": "openrouter1",
+    "mode": "standard"
+  },
+  "channels": {
+    "streaming": true,
+    "sendProgress": true,
+    "sendToolHints": true,
+    "showReasoning": true,
+    "sendMaxRetries": 3,
+    "transcriptionProvider": "groq",
+    "websocket": {
+      "enabled": true,
+      "host": "0.0.0.0",
+      "port": 18790,
+      "path": "/ws",
+      "jwt": {
+        "enabled": true,
+        "privateKeyPath": "/data/credentials/private_key.pem",
+        "publicKeyPath": "/data/credentials/public_key.pem",
+        "iss": "rust-bot",
+        "aud": "/ws"
+      },
+      "requireAuth": true,
+      "allowFrom": [],
+      "streaming": true,
+      "maxMessageBytes": 33554432,
+      "pingIntervalS": 30,
+      "pingTimeoutS": 30,
+      "sslCertfile": "",
+      "sslKeyfile": "",
+      "runtimeSurface": "browser"
+    },
+    "allowFrom": [
+      "*"
+    ]
+  },
+  "providers": {
+    "custom": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "azureOpenai": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "anthropic": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "openai": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "openrouter": {
+      "apiKey": "${OPENAI_API_KEY}",
+      "apiBase": "${OPENAI_API_BASE}",
+      "extraHeaders": null
+    },
+    "gemini": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "groq": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    },
+    "together": {
+      "apiKey": "",
+      "apiBase": null,
+      "extraHeaders": null
+    }
+  },
+  "api": {
+    "host": "127.0.0.1",
+    "port": 8900,
+    "timeout": 120.0,
+    "jwt": {
+      "enabled": false,
+      "privateKeyPath": "/data/credentials/private_key.pem",
+      "publicKeyPath": "/data/credentials/public_key.pem",
+      "iss": "rust-bot",
+      "aud": "/ws"
+    },
+    "usersFile": "/data/users.json",
+    "cors": {
+      "enabled": true,
+      "origins": [
+        "*"
+      ]
+    },
+    "webRoot": null
+  },
+  "gateway": {
+    "host": "0.0.0.0",
+    "port": 18790,
+    "heartbeat": {
+      "enabled": true,
+      "intervalS": 1800,
+      "keepRecentMessages": 8
+    },
+    "webRoot": null,
+    "strapiSso": {
+      "strapiUrl": ""
+    }
+  },
+  "tools": {
+    "web": {
+      "enable": true,
+      "proxy": null,
+      "timeout": 60,
+      "search": {
+        "provider": "exa_free",
+        "apiKey": "",
+        "baseUrl": "",
+        "maxResults": 20,
+        "timeout": 30
+      }
+    },
+    "exec": {
+      "enable": true,
+      "timeout": 60,
+      "pathAppend": "",
+      "sandbox": ""
+    },
+    "restrictToWorkspace": false,
+    "disabledTools": [],
+    "confirmBeforeExecute": false,
+    "mcpServers": {},
+    "mcpPresetsPath": "/data/mcp_presets.json",
+    "ssrfWhitelist": [],
+    "gmail": {
+      "enable": false,
+      "clientSecretPath": "/data/credentials/client_secret.json",
+      "tokenCachePath": "/data/credentials/token_cache.json",
+      "maxResults": 20
+    },
+    "docx": {
+      "enable": false
+    },
+    "ocr": {
+      "enable": false,
+      "model": "claude-sonnet-4-6",
+      "baseUrl": "https://api.anthropic.com",
+      "provider": "anthropic",
+      "apiKey": ""
+    },
+    "imageGeneration": {
+      "enable": false,
+      "model": "openai/gpt-image-2",
+      "apiKey": "",
+      "baseUrl": "https://openrouter.ai/api/v1/images",
+      "size": "",
+      "quality": ""
+    },
+    "question": {
+      "enabled": true
+    },
+    "acp": {
+      "enabled": false,
+      "maxDepth": 2,
+      "allowDynamicAgents": true,
+      "defaultTimeoutSecs": 600,
+      "shutdownGraceSecs": 180,
+      "permissionPolicy": "auto-approve-read",
+      "sessionScope": "perParentSession",
+      "launchPresets": {}
+    }
+  },
+  "subagent": {
+    "failOnToolError": true
+  },
+  "examplePrompts": [],
+  "modelPresets": {
+    "openrouter1": {
+      "label": null,
+      "model": "${OPENAI_API_MODEL}",
+      "provider": "openrouter",
+      "maxTokens": 32768,
+      "contextWindowTokens": 131072,
+      "temperature": 0.1,
+      "reasoningEffort": null
+    }
+  },
+  "durability": {
+    "autoResume": true,
+    "resumeMaxAgeSecs": 86400,
+    "maxResumeAttempts": 2,
+    "maxConcurrentResumes": 4,
+    "ledgerTtlDays": 14,
+    "ledgerMaxEntries": 1000
+  }
+}
