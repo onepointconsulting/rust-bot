@@ -197,10 +197,7 @@ mod tests {
     #[test]
     fn test_data_dir_env_override_wins_over_the_config_directory() {
         assert_eq!(
-            data_dir_for(
-                Path::new("/etc/rust-bot/config.json"),
-                Some("/data".into())
-            ),
+            data_dir_for(Path::new("/etc/rust-bot/config.json"), Some("/data".into())),
             Path::new("/data")
         );
     }
