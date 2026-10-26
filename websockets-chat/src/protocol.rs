@@ -354,6 +354,17 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway to restart the whole bot process; `chat_id` is the chat told
+    /// when it is back. Refused unless the signed-in user is an administrator. The
+    /// reply is a `restarting` or a `restart_error` event (see [`ServerEvent::Restarting`]).
+    pub fn restart_gateway(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "restart_gateway",
+            chat_id: Some(chat_id.into()),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway to enable (`enabled == true`) or disable the MCP preset `name`.
     /// `fields` carries the values for the fields the preset needs (API keys, tokens);
     /// it is omitted from the wire when empty. Refused by the gateway unless this
@@ -954,6 +965,10 @@ pub enum ServerEvent {
         chat_id: String,
         client_id: String,
         streaming: bool,
+        /// Whether the signed-in user is an administrator (`role == "admin"` on the
+        /// `ready` frame). `false` for plain users, guests and older gateways. Only
+        /// decides what the UI offers; the gateway enforces it on every request.
+        is_admin: bool,
     },
     /// A server-side error, optionally scoped to one chat / in-flight turn.
     /// `chat_id` is omitted when the error is not attached to any chat yet
@@ -1182,6 +1197,12 @@ pub enum ServerEvent {
     /// code (`access_denied`, `child_agent_config`, `invalid_config`, ...); `message`
     /// is the explanation to show.
     ConfigFileError { detail: String, message: String },
+    /// Reply to an accepted [`ClientEnvelope::restart_gateway`]: the process restarts a
+    /// moment later and the connection drops.
+    Restarting,
+    /// Reply to a refused restart (`admin_required`, `access_denied`, ...); `message`
+    /// is the explanation to show.
+    RestartError { message: String },
     /// Reply to a `rename_chat` envelope: `chat_id` now has display `title`.
     ChatRenamed { chat_id: String, title: String },
     /// Reply to a `pin_chat` envelope: `chat_id` is now pinned or unpinned.
@@ -1319,6 +1340,8 @@ impl ServerEvent {
             | ServerEvent::ConfigFile { .. }
             | ServerEvent::ConfigFileSaved { .. }
             | ServerEvent::ConfigFileError { .. }
+            | ServerEvent::Restarting
+            | ServerEvent::RestartError { .. }
             | ServerEvent::ChatRenamed { .. }
             | ServerEvent::ChatPinned { .. }
             | ServerEvent::ChatDeleted { .. }
@@ -1367,6 +1390,8 @@ struct ReadyWire {
     client_id: String,
     #[serde(default)]
     streaming: bool,
+    #[serde(default)]
+    role: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -1876,6 +1901,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             chat_id: w.chat_id,
             client_id: w.client_id,
             streaming: w.streaming,
+            is_admin: w.role.as_deref() == Some("admin"),
         }),
         "error" => decode::<ErrorWire>(&value).map(|w| ServerEvent::Error {
             chat_id: w.chat_id,
@@ -2033,6 +2059,9 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 message: w.message,
             })
         }
+        "restarting" => Ok(ServerEvent::Restarting),
+        "restart_error" => decode::<ConfigFileErrorWire>(&value)
+            .map(|w| ServerEvent::RestartError { message: w.message }),
         "tools" => decode::<ToolsListWire>(&value).map(|w| ServerEvent::ToolsList {
             chat_id: w.chat_id,
             tools: w.tools,
@@ -2144,6 +2173,7 @@ mod tests {
                 chat_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_id: "browser-abc".to_string(),
                 streaming: false,
+                is_admin: false,
             }
         );
     }
@@ -2159,8 +2189,41 @@ mod tests {
                 chat_id: "chat-1".to_string(),
                 client_id: "browser-abc".to_string(),
                 streaming: true,
+                is_admin: false,
             }
         );
+    }
+
+    #[test]
+    fn parses_ready_with_the_admin_role() {
+        let admin = r#"{"event":"ready","chat_id":"c","client_id":"b","role":"admin"}"#;
+        let Ok(ServerEvent::Ready { is_admin, .. }) = parse_server_event(admin) else {
+            panic!("should parse");
+        };
+        assert!(is_admin);
+        let user = r#"{"event":"ready","chat_id":"c","client_id":"b","role":"user"}"#;
+        let Ok(ServerEvent::Ready { is_admin, .. }) = parse_server_event(user) else {
+            panic!("should parse");
+        };
+        assert!(!is_admin);
+    }
+
+    #[test]
+    fn parses_restart_events() {
+        assert_eq!(
+            parse_server_event(r#"{"event":"restarting"}"#).unwrap(),
+            ServerEvent::Restarting
+        );
+        let raw = r#"{"event":"restart_error","detail":"admin_required","message":"Only administrators"}"#;
+        assert_eq!(
+            parse_server_event(raw).unwrap(),
+            ServerEvent::RestartError {
+                message: "Only administrators".to_string()
+            }
+        );
+        let restart = serde_json::to_value(ClientEnvelope::restart_gateway("chat-1")).unwrap();
+        assert_eq!(restart["type"], "restart_gateway");
+        assert_eq!(restart["chat_id"], "chat-1");
     }
 
     #[test]

@@ -1055,6 +1055,10 @@ pub fn SessionsSidebar(
     /// `web-chat` and for anonymous visitors.
     #[prop(default = None)]
     on_settings: Option<Callback<()>>,
+    /// Whether the "Settings" button is shown while `on_settings` is set. Reactive,
+    /// because the user's role only arrives with the connection's `ready` frame.
+    #[prop(into, default = Signal::stored(true))]
+    settings_visible: Signal<bool>,
     /// When `true`, the header row shows the rust-bot logo + title instead of
     /// the "Chats" label.
     #[prop(default = false)]
@@ -1435,15 +1439,17 @@ pub fn SessionsSidebar(
                 </div>
                 {on_settings.map(|on_settings| {
                     view! {
-                        <div class="border-t border-slate-200 pb-2">
-                            <SidebarNavButton
-                                label="Settings"
-                                active=Signal::stored(false)
-                                on_click=on_settings
-                            >
-                                <IconSettings />
-                            </SidebarNavButton>
-                        </div>
+                        <Show when=move || settings_visible.get()>
+                            <div class="border-t border-slate-200 pb-2">
+                                <SidebarNavButton
+                                    label="Settings"
+                                    active=Signal::stored(false)
+                                    on_click=on_settings
+                                >
+                                    <IconSettings />
+                                </SidebarNavButton>
+                            </div>
+                        </Show>
                     }
                 })}
             </div>

@@ -60,13 +60,15 @@ use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
 use crate::security::{
-    WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
+    UserRole, WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope,
+    WorkspaceScopeError,
 };
 use crate::session::goal_state::goal_state_ws_blob;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
 use crate::session::{SESSION_MODEL_PRESET_METADATA_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY};
 use crate::utils::helpers::is_localhost;
+use crate::utils::restart::restart_with_notice;
 use crate::{
     bus::{
         events::OutboundMessage,
@@ -286,6 +288,7 @@ fn authorize(shared: &WsShared, token: Option<&str>) -> Result<AuthorizeResult, 
                 claims.purpose.as_deref() == Some(WEBUI_JWT_PURPOSE),
                 Some(claims.sub),
             )
+            .with_role(claims.role)
         })
         .map_err(|e| {
             log::warn!("WebSocket channel: rejected connection with invalid JWT: {e}");
@@ -398,12 +401,20 @@ async fn ws_upgrade_handler(
     ws.on_upgrade(move |socket| handle_socket(socket, shared, client_id, remote_addr, auth))
 }
 
-fn ready_event(chat_id: &str, client_id: &str, streaming: bool) -> serde_json::Value {
+/// Build the `ready` control frame. `role` tells the web UI whether to offer the
+/// settings (admins only); the gateway enforces the same rule on every request.
+fn ready_event(
+    chat_id: &str,
+    client_id: &str,
+    streaming: bool,
+    role: UserRole,
+) -> serde_json::Value {
     serde_json::json!({
         "event": WsOutboundEvent::Ready.as_str(),
         "chat_id": chat_id,
         "client_id": client_id,
         "streaming": streaming,
+        "role": role.as_str(),
     })
 }
 
@@ -480,7 +491,7 @@ async fn handle_socket(
     // the client learning its own chat_id (mirrors nanobot's ordering
     // comment at runtime.py:578). `streaming` tells the WebUI whether this
     // channel will emit `delta` frames or a single final `message`.
-    let ready = ready_event(&chat_id, &client_id, shared.supports_streaming);
+    let ready = ready_event(&chat_id, &client_id, shared.supports_streaming, auth.role);
     if sink.send(Message::text(ready.to_string())).await.is_err() {
         return;
     }
@@ -676,6 +687,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SaveConfigFile => {
             handle_save_config_file(envelope_dispatch_context).await;
+        }
+        EnvelopeType::RestartGateway => {
+            handle_restart_gateway(envelope_dispatch_context).await;
         }
         EnvelopeType::ListToolSettings => {
             handle_list_tool_settings(envelope_dispatch_context).await;
@@ -2824,6 +2838,25 @@ async fn handle_list_mcp_presets<'a>(envelope_dispatch_context: EnvelopeDispatch
 /// browser tabs changing presets at once cannot overwrite each other's change.
 static MCP_CONFIG_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
+/// `detail` code of a configuration write refused because the token is not an admin's.
+const ADMIN_REQUIRED_DETAIL: &str = "admin_required";
+
+/// Message shown to a signed-in user who is not an administrator.
+const ADMIN_REQUIRED_MESSAGE: &str =
+    "Only administrators can change the configuration or restart rust-bot.";
+
+/// The user-facing message for a refusal from [`mcp_write_denial`]. `locality_message`
+/// is what to say when the connection is simply not local / signed in.
+fn write_denial_message(detail: &str, locality_message: &'static str) -> &'static str {
+    match detail {
+        "child_agent_config" => {
+            "This agent runs on its parent's configuration and cannot change it."
+        }
+        ADMIN_REQUIRED_DETAIL => ADMIN_REQUIRED_MESSAGE,
+        _ => locality_message,
+    }
+}
+
 /// Why this connection may not change the MCP configuration, as the `detail` code to
 /// send back, or `None` when it may.
 ///
@@ -2831,18 +2864,36 @@ static MCP_CONFIG_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 /// server is a program the bot will run, so it needs more than reading does: an
 /// authenticated connection that is also local (a loopback client, or the native app
 /// shell), on a process that owns its configuration (not a child agent running on its
-/// parent's file). Takes `overlay_active` as a parameter so it stays a pure function.
+/// parent's file). Only administrators (`role == admin` in the token) may change the
+/// configuration, so a signed-in plain user gets `admin_required`. Takes
+/// `overlay_active` as a parameter so it stays a pure function.
 fn mcp_write_denial(
     shared: &WsShared,
     remote_addr: SocketAddr,
     auth: &AuthorizeResult,
     overlay_active: bool,
 ) -> Option<&'static str> {
-    if !connection_is_authenticated(auth) || !workspace_controls_available(shared, remote_addr) {
+    if let Some(detail) = admin_denial(auth) {
+        return Some(detail);
+    }
+    if !workspace_controls_available(shared, remote_addr) {
         return Some("access_denied");
     }
     if overlay_active {
         return Some("child_agent_config");
+    }
+    None
+}
+
+/// Why this connection is not an administrator, as the `detail` code to send back, or
+/// `None` when it is: anonymous connections get `access_denied`, signed-in plain users
+/// `admin_required`.
+fn admin_denial(auth: &AuthorizeResult) -> Option<&'static str> {
+    if !connection_is_authenticated(auth) {
+        return Some("access_denied");
+    }
+    if !auth.is_admin() {
+        return Some(ADMIN_REQUIRED_DETAIL);
     }
     None
 }
@@ -3013,22 +3064,18 @@ async fn send_config_file_error(
 
 /// Why this connection may not read or write `config.json`, as `(detail, message)`, or
 /// `None` when it may. The file holds credentials and the bot runs what it describes, so
-/// both directions need the same rights as changing MCP servers (see [`mcp_write_denial`]).
+/// both directions need an administrator (see [`admin_denial`]) on a process that owns
+/// its configuration. Unlike [`mcp_write_denial`], an administrator may open it from any
+/// address, not only from the gateway machine.
 fn config_file_denial(
-    shared: &WsShared,
     envelope_dispatch_context: &EnvelopeDispatchContext<'_>,
 ) -> Option<(&'static str, &'static str)> {
-    let detail = mcp_write_denial(
-        shared,
-        envelope_dispatch_context.remote_addr,
-        envelope_dispatch_context.auth,
-        overlay_is_active(),
-    )?;
-    let message = if detail == "child_agent_config" {
-        "This agent runs on its parent's configuration and cannot change it."
-    } else {
-        "The configuration file can only be opened from a signed-in browser on the gateway machine."
-    };
+    let detail = admin_denial(envelope_dispatch_context.auth)
+        .or_else(|| overlay_is_active().then_some("child_agent_config"))?;
+    let message = write_denial_message(
+        detail,
+        "Sign in as an administrator to open the configuration file.",
+    );
     Some((detail, message))
 }
 
@@ -3037,7 +3084,7 @@ fn config_file_denial(
 /// Rust-side addition with no nanobot precedent.
 async fn handle_get_config_file<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
-    if let Some((detail, message)) = config_file_denial(shared, &envelope_dispatch_context) {
+    if let Some((detail, message)) = config_file_denial(&envelope_dispatch_context) {
         send_config_file_error(shared, connection_id, detail, message).await;
         return;
     }
@@ -3069,7 +3116,7 @@ async fn handle_get_config_file<'a>(envelope_dispatch_context: EnvelopeDispatchC
 /// Rust-side addition with no nanobot precedent.
 async fn handle_save_config_file<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
-    if let Some((detail, message)) = config_file_denial(shared, &envelope_dispatch_context) {
+    if let Some((detail, message)) = config_file_denial(&envelope_dispatch_context) {
         send_config_file_error(shared, connection_id, detail, message).await;
         return;
     }
@@ -3116,6 +3163,60 @@ async fn handle_save_config_file<'a>(envelope_dispatch_context: EnvelopeDispatch
             send_config_file_error(shared, connection_id, "invalid_config", &message).await;
         }
     }
+}
+
+/// How long a restart waits after the `restarting` reply, so the frame is delivered
+/// before the process is replaced.
+const RESTART_DELAY: Duration = Duration::from_secs(1);
+
+/// Handle a `restart_gateway` envelope `{chat_id}`: restart the whole bot process so a
+/// saved configuration takes effect. Replies `restarting`, then restarts after
+/// [`RESTART_DELAY`]; `chat_id` is the chat told that the restart finished. Refused with
+/// `restart_error` unless the connection may change the configuration (see
+/// [`mcp_write_denial`]), which makes it admin-only. Rust-side addition with no nanobot
+/// precedent.
+async fn handle_restart_gateway<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    if let Some(detail) = mcp_write_denial(
+        shared,
+        envelope_dispatch_context.remote_addr,
+        envelope_dispatch_context.auth,
+        overlay_is_active(),
+    ) {
+        let message = write_denial_message(
+            detail,
+            "Restarting is only allowed from a signed-in browser on the gateway machine.",
+        );
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::RestartError,
+            None,
+            serde_json::json!({"detail": detail, "message": message}),
+        )
+        .await;
+        return;
+    }
+    let Some(chat_id) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    log::info!("restart requested from the WebUI (client '{client_id}')");
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::Restarting,
+        None,
+        serde_json::json!({}),
+    )
+    .await;
+    let chat_id = chat_id.to_string();
+    tokio::spawn(async move {
+        tokio::time::sleep(RESTART_DELAY).await;
+        // On a successful Unix exec the process is replaced and never returns.
+        if let Err(e) = restart_with_notice(CHANNEL_NAME, &chat_id) {
+            log::error!("Failed to restart: {e}");
+        }
+    });
 }
 
 /// Which kind of item a Settings dialog toggle changes.
@@ -3193,11 +3294,10 @@ fn setting_write_denial(
         envelope_dispatch_context.auth,
         overlay_is_active(),
     )?;
-    let message = if detail == "child_agent_config" {
-        "This agent runs on its parent's configuration and cannot change it."
-    } else {
-        "Tools and MCP servers can only be switched from a signed-in browser on the gateway machine."
-    };
+    let message = write_denial_message(
+        detail,
+        "Tools and MCP servers can only be switched from a signed-in browser on the gateway machine.",
+    );
     Some((detail, message))
 }
 
@@ -3514,11 +3614,10 @@ async fn handle_set_mcp_preset<'a>(envelope_dispatch_context: EnvelopeDispatchCo
         envelope_dispatch_context.auth,
         overlay_is_active(),
     ) {
-        let message = if denial == "child_agent_config" {
-            "This agent runs on its parent's configuration and cannot change it."
-        } else {
-            "Changing MCP servers is only allowed from a signed-in browser on the gateway machine."
-        };
+        let message = write_denial_message(
+            denial,
+            "Changing MCP servers is only allowed from a signed-in browser on the gateway machine.",
+        );
         send_mcp_preset_error(shared, connection_id, &name, denial, message, &[]).await;
         return;
     }
@@ -6084,14 +6183,16 @@ mod tests {
 
     #[test]
     fn ready_event_advertises_streaming() {
-        let body = ready_event("chat-1", "client-1", true);
+        let body = ready_event("chat-1", "client-1", true, UserRole::Admin);
         assert_eq!(body["event"], "ready");
         assert_eq!(body["chat_id"], "chat-1");
         assert_eq!(body["client_id"], "client-1");
         assert_eq!(body["streaming"], true);
+        assert_eq!(body["role"], "admin");
 
-        let body = ready_event("chat-1", "client-1", false);
+        let body = ready_event("chat-1", "client-1", false, UserRole::User);
         assert_eq!(body["streaming"], false);
+        assert_eq!(body["role"], "user");
     }
 
     // --- PingLiveness ---
@@ -6204,6 +6305,7 @@ mod tests {
             exp: now + 3600,
             iat: now,
             purpose: purpose.map(str::to_string),
+            role: Default::default(),
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(&private_pem).unwrap();
@@ -6302,6 +6404,7 @@ mod tests {
             exp: now + 3600,
             iat: now,
             purpose: Some(WEBUI_JWT_PURPOSE.to_string()),
+            role: UserRole::Admin,
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(&private_pem).unwrap();
@@ -6310,7 +6413,7 @@ mod tests {
         let result = authorize(&shared, Some(&token)).unwrap();
         assert_eq!(
             result,
-            AuthorizeResult::new(true, Some("a@b.com".to_string()))
+            AuthorizeResult::new(true, Some("a@b.com".to_string())).with_role(UserRole::Admin)
         );
     }
 
@@ -8763,7 +8866,11 @@ mod tests {
     }
 
     fn authenticated() -> AuthorizeResult {
-        AuthorizeResult::new(false, Some("user-1".to_string()))
+        AuthorizeResult::new(false, Some("user-1".to_string())).with_role(UserRole::Admin)
+    }
+
+    fn plain_user() -> AuthorizeResult {
+        AuthorizeResult::new(false, Some("user-2".to_string()))
     }
 
     #[test]
@@ -8772,6 +8879,75 @@ mod tests {
         assert_eq!(
             mcp_write_denial(&shared, addr("127.0.0.1"), &authenticated(), false),
             None
+        );
+    }
+
+    #[test]
+    fn mcp_write_denial_refuses_signed_in_users_who_are_not_admins() {
+        for shared in [test_shared("browser"), test_shared("native")] {
+            assert_eq!(
+                mcp_write_denial(&shared, addr("127.0.0.1"), &plain_user(), false),
+                Some("admin_required")
+            );
+        }
+    }
+
+    #[test]
+    fn write_denial_message_explains_each_refusal() {
+        assert_eq!(
+            write_denial_message("admin_required", "fallback"),
+            ADMIN_REQUIRED_MESSAGE
+        );
+        assert_eq!(
+            write_denial_message("access_denied", "fallback"),
+            "fallback"
+        );
+        assert!(write_denial_message("child_agent_config", "fallback").contains("parent"));
+    }
+
+    #[tokio::test]
+    async fn config_requests_and_restart_are_denied_to_plain_users() {
+        let shared = test_shared("browser");
+        for (envelope_type, expected_event) in [
+            ("get_config_file", "config_file_error"),
+            ("save_config_file", "config_file_error"),
+        ] {
+            let body = dispatch_config_file_envelope(&shared, &plain_user(), envelope_type).await;
+            assert_eq!(body["event"], expected_event, "{envelope_type}");
+            assert_eq!(body["detail"], "admin_required", "{envelope_type}");
+        }
+        let body = dispatch_config_file_envelope(&shared, &plain_user(), "restart_gateway").await;
+        assert_eq!(body["event"], "restart_error");
+        assert_eq!(body["detail"], "admin_required");
+    }
+
+    #[tokio::test]
+    async fn config_file_is_open_to_a_remote_admin_but_not_a_remote_plain_user() {
+        let shared = test_shared("browser");
+        let remote = addr("203.0.113.5");
+        let context = |auth| {
+            let envelope: Envelope = HashMap::new();
+            (envelope, auth)
+        };
+        let (envelope, admin) = context(authenticated());
+        let admin_context = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "c",
+            client_id: "k",
+            shared: &shared,
+            remote_addr: remote,
+            auth: &admin,
+        };
+        assert_eq!(config_file_denial(&admin_context), None);
+        let (envelope, user) = context(plain_user());
+        let user_context = EnvelopeDispatchContext {
+            auth: &user,
+            envelope: &envelope,
+            ..admin_context
+        };
+        assert_eq!(
+            config_file_denial(&user_context).map(|d| d.0),
+            Some("admin_required")
         );
     }
 

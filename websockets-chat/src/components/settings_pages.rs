@@ -259,6 +259,8 @@ pub struct SettingsPanel {
     /// Set once any change was saved: the restart is pending for the rest of the session,
     /// whichever page is showing.
     pub restart_notice: RwSignal<bool>,
+    /// Whether a restart was requested and the gateway is about to go down.
+    pub restarting: RwSignal<bool>,
 }
 
 impl SettingsPanel {
@@ -274,6 +276,7 @@ impl SettingsPanel {
             expanded_tool: RwSignal::new(None),
             error: RwSignal::new(None),
             restart_notice: RwSignal::new(false),
+            restarting: RwSignal::new(false),
         }
     }
 
@@ -337,6 +340,17 @@ pub struct SettingsActions {
     pub on_refresh: Callback<()>,
     /// Save the changed settings of one tool section.
     pub on_save_config: Callback<ToolConfigChange>,
+    /// Restart the whole bot process so the saved changes take effect.
+    pub on_restart: Callback<()>,
+}
+
+/// Label of the button that restarts the bot.
+pub fn restart_button_label(restarting: bool) -> &'static str {
+    if restarting {
+        "Restarting…"
+    } else {
+        "Restart now"
+    }
 }
 
 /// One row: tile, name, description, restart note, error line and switch.
@@ -482,6 +496,14 @@ pub fn SettingsPageView(
                     class="mt-3 rounded-lg bg-amber-50 px-3 py-2 text-sm text-amber-800"
                 >
                     {RESTART_WARNING}
+                    <button
+                        type="button"
+                        class="ml-3 rounded-lg bg-amber-600 px-2.5 py-1 text-xs font-medium text-white hover:bg-amber-700 disabled:opacity-60"
+                        disabled=move || panel.restarting.get()
+                        on:click=move |_| actions.on_restart.run(())
+                    >
+                        {move || restart_button_label(panel.restarting.get())}
+                    </button>
                 </p>
             </Show>
             {move || {
@@ -780,6 +802,12 @@ mod tests {
         let titles: Vec<&str> = SettingsPage::ALL.iter().map(|p| p.title()).collect();
         assert_eq!(titles, vec!["Tools", "Tool Safety", "MCP Servers"]);
         assert_eq!(SettingsPage::default(), SettingsPage::Tools);
+    }
+
+    #[test]
+    fn restart_button_says_what_it_is_doing() {
+        assert_eq!(restart_button_label(false), "Restart now");
+        assert_eq!(restart_button_label(true), "Restarting…");
     }
 
     #[test]

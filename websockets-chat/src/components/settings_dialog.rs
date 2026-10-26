@@ -13,7 +13,9 @@
 use leptos::prelude::*;
 
 use super::json_editor::JsonEditor;
-use super::settings_pages::{SettingsActions, SettingsPage, SettingsPageView, SettingsPanel};
+use super::settings_pages::{
+    restart_button_label, SettingsActions, SettingsPage, SettingsPageView, SettingsPanel,
+};
 use crate::state::ConfigFileView;
 
 /// Message in the notice shown after the configuration was saved.
@@ -268,6 +270,13 @@ pub fn SettingsDialog(
 #[component]
 pub fn ConfigSavedNotice(
     #[prop(into)] open: Signal<bool>,
+    /// Whether a restart was requested and is under way.
+    #[prop(into)]
+    restarting: Signal<bool>,
+    /// Why the last restart request was refused, if it was.
+    #[prop(into)]
+    error: Signal<Option<String>>,
+    on_restart: Callback<()>,
     on_close: Callback<()>,
 ) -> impl IntoView {
     view! {
@@ -280,7 +289,26 @@ pub fn ConfigSavedNotice(
                     <CloseButton on_close=on_close />
                 </div>
                 <p class="mb-5 text-sm text-slate-600">{RESTART_NOTICE}</p>
-                <div class="flex justify-end">
+                {move || {
+                    error
+                        .get()
+                        .map(|message| {
+                            view! {
+                                <p role="alert" class="mb-4 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-700">
+                                    {message}
+                                </p>
+                            }
+                        })
+                }}
+                <div class="flex justify-end gap-2">
+                    <button
+                        type="button"
+                        class="rounded-lg bg-amber-600 px-3 py-1.5 text-sm font-medium text-white hover:bg-amber-700 disabled:opacity-60"
+                        disabled=move || restarting.get()
+                        on:click=move |_| on_restart.run(())
+                    >
+                        {move || restart_button_label(restarting.get())}
+                    </button>
                     <button
                         type="button"
                         class="rounded-lg bg-slate-900 px-3 py-1.5 text-sm font-medium text-white hover:bg-slate-800"

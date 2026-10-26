@@ -17,11 +17,15 @@ use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, Salt
 use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
+use crate::security::jwt::UserRole;
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
     pub email: String,
     pub password_hash: Option<String>,
     pub token: String,
+    /// Role stamped into every token minted for this user at login.
+    pub role: UserRole,
 }
 
 /// On-disk representation of a single user entry, keyed by email in
@@ -31,6 +35,9 @@ struct StoredUser {
     token: String,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     password_hash: Option<String>,
+    /// Absent in entries written before roles existed, which read as plain users.
+    #[serde(default)]
+    role: UserRole,
 }
 
 #[derive(Debug)]
@@ -113,7 +120,7 @@ pub trait UserRegistry {
 }
 
 /// A [`UserRegistry`] persisted as a single JSON file containing a map of
-/// `{ "email": { "token": "...", "password_hash": "..." } }`. `password_hash`
+/// `{ "email": { "token": "...", "password_hash": "...", "role": "admin" } }`. `password_hash`
 /// is omitted when absent (legacy entries registered before a password was
 /// required).
 pub struct JsonUserRegistry {
@@ -158,6 +165,7 @@ fn to_user(email: &str, stored: &StoredUser) -> User {
         email: email.to_string(),
         password_hash: stored.password_hash.clone(),
         token: stored.token.clone(),
+        role: stored.role,
     }
 }
 
@@ -173,6 +181,7 @@ impl UserRegistry for JsonUserRegistry {
             StoredUser {
                 token: user.token.clone(),
                 password_hash: user.password_hash.clone(),
+                role: user.role,
             },
         );
         self.save()?;
@@ -223,6 +232,7 @@ impl UserRegistry for JsonUserRegistry {
             StoredUser {
                 token: user.token.clone(),
                 password_hash: user.password_hash.clone(),
+                role: user.role,
             },
         );
         self.save()?;
@@ -254,6 +264,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password_hash: None,
             token: "token-abc".to_string(),
+            role: UserRole::User,
         };
         registry.register_user(&user).unwrap();
 
@@ -272,6 +283,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password_hash: None,
             token: "token-abc".to_string(),
+            role: UserRole::User,
         };
         registry.register_user(&user).unwrap();
 
@@ -297,6 +309,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password_hash: None,
             token: "token-abc".to_string(),
+            role: UserRole::User,
         };
         registry.register_user(&user).unwrap();
         registry.delete_user("alice@example.com").unwrap();
@@ -320,6 +333,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password_hash: None,
             token: "token-abc".to_string(),
+            role: UserRole::User,
         };
         registry.register_user(&user).unwrap();
 
@@ -327,6 +341,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password_hash: None,
             token: "token-xyz".to_string(),
+            role: UserRole::User,
         };
         registry.update_user("alice@example.com", &updated).unwrap();
 
@@ -342,6 +357,7 @@ mod tests {
             email: "alice@example.com".to_string(),
             password_hash: None,
             token: "token-abc".to_string(),
+            role: UserRole::User,
         };
         let err = registry
             .update_user("alice@example.com", &user)
@@ -360,6 +376,7 @@ mod tests {
                     email: "alice@example.com".to_string(),
                     password_hash: None,
                     token: "token-abc".to_string(),
+                    role: UserRole::User,
                 })
                 .unwrap();
         }
@@ -389,6 +406,7 @@ mod tests {
                     email: "alice@example.com".to_string(),
                     password_hash: Some(hash.clone()),
                     token: "token-abc".to_string(),
+                    role: UserRole::User,
                 })
                 .unwrap();
         }
@@ -396,6 +414,27 @@ mod tests {
         let reopened = JsonUserRegistry::open(&path).unwrap();
         let fetched = reopened.get_user_by_email("alice@example.com").unwrap();
         assert_eq!(fetched.password_hash.as_ref(), Some(&hash));
+    }
+
+    #[test]
+    fn role_persists_across_reopen_and_legacy_entries_read_as_user() {
+        let dir = tempdir().unwrap();
+        let path = registry_path(&dir);
+        fs::write(
+            &path,
+            r#"{"old@example.com": {"token": "t1"}, "boss@example.com": {"token": "t2", "role": "admin"}}"#,
+        )
+        .unwrap();
+
+        let reopened = JsonUserRegistry::open(&path).unwrap();
+        assert_eq!(
+            reopened.get_user_by_email("old@example.com").unwrap().role,
+            UserRole::User
+        );
+        assert_eq!(
+            reopened.get_user_by_email("boss@example.com").unwrap().role,
+            UserRole::Admin
+        );
     }
 
     #[test]
@@ -409,6 +448,7 @@ mod tests {
                     email: "bob@example.com".to_string(),
                     password_hash: None,
                     token: "token-xyz".to_string(),
+                    role: UserRole::User,
                 })
                 .unwrap();
         }

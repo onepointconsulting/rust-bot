@@ -14,7 +14,7 @@ pub use ingress_policy::{
 };
 pub use jwt::{
     Claims, DEFAULT_EXPIRES_IN_MONTHS, GeneratedKeypair, GeneratedToken, JwtError,
-    JwtValidationOpts, generate_jwt_keypair, generate_jwt_token, validate_jwt_token,
+    JwtValidationOpts, UserRole, generate_jwt_keypair, generate_jwt_token, validate_jwt_token,
     validate_jwt_token_from_path,
 };
 pub use workspace_access::{

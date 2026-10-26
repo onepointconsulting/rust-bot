@@ -55,7 +55,7 @@ use crate::cron::service::now_ms;
 use crate::heartbeat::service::HeartbeatService;
 use crate::integrations::herdr::HerdrReporter;
 use crate::security::jwt::{
-    DEFAULT_EXPIRES_IN_MONTHS, JwtError, generate_jwt_keypair, generate_jwt_token,
+    DEFAULT_EXPIRES_IN_MONTHS, JwtError, UserRole, generate_jwt_keypair, generate_jwt_token,
 };
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::history_visibility::is_hidden_history_message;
@@ -504,6 +504,11 @@ pub struct GenerateJwtTokenArgs {
     #[arg(long, required = true)]
     pub password: String,
 
+    /// Role stamped into the token and stored with the user: `admin` may
+    /// change settings and restart the bot, `user` may not
+    #[arg(long, default_value = "user")]
+    pub role: UserRole,
+
     /// Path to the JSON user registry file (email -> token map)
     #[arg(long, required = true)]
     pub users_file: PathBuf,
@@ -626,11 +631,13 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
 /// are errors, so an entrypoint script can stop before starting the gateway.
 fn run_check_config(args: CheckConfigArgs) -> Result<(), CliError> {
     let text = std::fs::read_to_string(&args.config).map_err(|e| {
-        CliError::Other(format!("Cannot read config '{}': {e}", args.config.display()))
+        CliError::Other(format!(
+            "Cannot read config '{}': {e}",
+            args.config.display()
+        ))
     })?;
-    let report = crate::config::check::check_config_text(&text, |name| {
-        std::env::var_os(name).is_some()
-    });
+    let report =
+        crate::config::check::check_config_text(&text, |name| std::env::var_os(name).is_some());
     for warning in &report.warnings {
         eprintln!("warning: {warning}");
     }
@@ -802,6 +809,7 @@ pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
         purpose,
         args.expires_in_months,
         Some(args.user_email.clone()),
+        Some(args.role),
     )?;
 
     let mut registry = JsonUserRegistry::open(args.users_file.clone())?;
@@ -810,6 +818,7 @@ pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
             email: args.user_email,
             password_hash: Some(hash_password(args.password)?),
             token: minted.token.clone(),
+            role: args.role,
         })
         .map_err(|e| CliError::Other(e.to_string()))?;
     // Canonicalize after register_user so the file exists on disk.
@@ -852,6 +861,7 @@ pub fn run_generate_token(args: GenerateJwtTokenArgs) -> Result<(), CliError> {
     } else {
         eprintln!("aud: (omitted)");
     }
+    eprintln!("role: {}", minted.claims.role);
     if let Some(purpose) = &minted.claims.purpose {
         eprintln!("purpose: {purpose}");
     } else {

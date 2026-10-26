@@ -18,6 +18,7 @@ use crate::agent::acp::manager::AcpManager;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::ToolRegistry;
+use crate::security::jwt::UserRole;
 use crate::{
     bus::queue::MessageBus,
     channels::gateway_services::GatewayServices,
@@ -76,6 +77,10 @@ pub enum EnvelopeType {
     /// validating it. Rust-side addition with no nanobot precedent. Same access rules as
     /// [`Self::GetConfigFile`].
     SaveConfigFile,
+    /// Restart the whole bot process so saved configuration takes effect (`chat_id`,
+    /// optional: the chat that gets the "restarted" notice). Rust-side addition with no
+    /// nanobot precedent. Admin-only on top of the [`Self::SaveConfigFile`] access rules.
+    RestartGateway,
     /// List every built-in tool (MCP tools excluded) with its description and on/off
     /// state, for the Settings dialog's Tools page. Rust-side addition with no nanobot
     /// precedent. Authenticated connections only.
@@ -176,6 +181,7 @@ impl From<&str> for EnvelopeType {
             "set_tool_config" => Self::SetToolConfig,
             "get_config_file" => Self::GetConfigFile,
             "save_config_file" => Self::SaveConfigFile,
+            "restart_gateway" => Self::RestartGateway,
             "list_tool_settings" => Self::ListToolSettings,
             "set_tool_enabled" => Self::SetToolEnabled,
             "list_mcp_servers" => Self::ListMcpServers,
@@ -240,6 +246,11 @@ pub enum WsOutboundEvent {
     /// Reply to a refused or failed config file read or save — `{detail, message}`.
     /// Never carries any of the file's content.
     ConfigFileError,
+    /// Reply to an accepted [`EnvelopeType::RestartGateway`] — the process restarts a
+    /// moment later, so the connection is about to drop.
+    Restarting,
+    /// Reply to a refused or failed restart — `{detail, message}`.
+    RestartError,
     /// Reply to [`EnvelopeType::ListToolSettings`] — `{tools, can_modify}`.
     ToolSettings,
     /// Reply to a successful [`EnvelopeType::SetToolEnabled`] — `{name, enabled,
@@ -326,6 +337,8 @@ impl WsOutboundEvent {
             Self::ConfigFile => "config_file",
             Self::ConfigFileSaved => "config_file_saved",
             Self::ConfigFileError => "config_file_error",
+            Self::Restarting => "restarting",
+            Self::RestartError => "restart_error",
             Self::ToolSettings => "tool_settings",
             Self::ToolSettingSet => "tool_setting_set",
             Self::McpServers => "mcp_servers",
@@ -565,6 +578,8 @@ pub struct AuthorizeResult {
     /// JWT `sub` when a token was presented and validated. `None` for guests
     /// (JWT disabled, or optional-auth with no token).
     pub sub: Option<String>,
+    /// Role claim of the validated token; [`UserRole::User`] for guests.
+    pub role: UserRole,
 }
 
 impl AuthorizeResult {
@@ -573,13 +588,26 @@ impl AuthorizeResult {
     pub const UNAUTHENTICATED: Self = Self {
         webui_authenticated: false,
         sub: None,
+        role: UserRole::User,
     };
 
     pub fn new(webui_authenticated: bool, sub: Option<String>) -> Self {
         Self {
             webui_authenticated,
             sub: sub.filter(|s| !s.trim().is_empty()),
+            role: UserRole::User,
         }
+    }
+
+    /// The same outcome carrying the token's `role` claim.
+    pub fn with_role(mut self, role: UserRole) -> Self {
+        self.role = role;
+        self
+    }
+
+    /// Whether the connection's token carries the admin role.
+    pub fn is_admin(&self) -> bool {
+        self.role.is_admin()
     }
 
     pub fn failed() -> Self {
@@ -652,6 +680,13 @@ mod tests {
         let cfg: WebSocketConfig = serde_json::from_str(r#"{"requireAuth": false}"#)
             .expect("requireAuth: false should deserialize");
         assert!(!cfg.require_auth);
+    }
+
+    #[test]
+    fn authorize_result_defaults_to_a_plain_user_until_given_a_role() {
+        let result = AuthorizeResult::new(true, Some("a@b.com".to_string()));
+        assert!(!result.is_admin());
+        assert!(result.with_role(UserRole::Admin).is_admin());
     }
 
     #[test]
@@ -755,6 +790,12 @@ mod tests {
             EnvelopeType::SaveConfigFile
         );
         assert_eq!(WsOutboundEvent::ConfigFile.as_str(), "config_file");
+        assert_eq!(
+            EnvelopeType::from("restart_gateway"),
+            EnvelopeType::RestartGateway
+        );
+        assert_eq!(WsOutboundEvent::Restarting.as_str(), "restarting");
+        assert_eq!(WsOutboundEvent::RestartError.as_str(), "restart_error");
         assert_eq!(
             WsOutboundEvent::ConfigFileSaved.as_str(),
             "config_file_saved"

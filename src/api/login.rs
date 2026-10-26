@@ -100,7 +100,7 @@ pub(crate) async fn login(
         .ok_or_else(|| ApiError::internal("JWT is not enabled; cannot mint login tokens"))?;
 
     // Copy credentials out so Argon2 does not hold the registry lock.
-    let password_hash = {
+    let (password_hash, user_role) = {
         let registry = state
             .user_registry
             .lock()
@@ -108,7 +108,7 @@ pub(crate) async fn login(
         let user = registry
             .get_user_by_email(&request.email)
             .map_err(|_| unauthorized())?;
-        user.password_hash.ok_or_else(unauthorized)?
+        (user.password_hash.ok_or_else(unauthorized)?, user.role)
     };
 
     let password = request.password.clone();
@@ -136,6 +136,7 @@ pub(crate) async fn login(
             purpose,
             DEFAULT_EXPIRES_IN_MONTHS,
             sub,
+            Some(user_role),
         )
     })
     .await
@@ -153,6 +154,7 @@ pub(crate) async fn login(
                 email: request.email.clone(),
                 password_hash: Some(password_hash),
                 token: minted.token.clone(),
+                role: user_role,
             },
         ) {
             // Registry persistence is bookkeeping only; auth does not consult it.
@@ -224,6 +226,7 @@ pub(crate) struct GatewayApiDoc;
 mod tests {
     use super::*;
     use crate::api::user_registry::JsonUserRegistry;
+    use crate::security::jwt::UserRole;
     use crate::security::jwt::generate_jwt_keypair;
 
     fn login_state(jwt_auth: Option<JwtAuthState>) -> Arc<LoginState> {
@@ -285,6 +288,7 @@ mod tests {
                 email: "a@b.com".to_string(),
                 password_hash: Some(hash_password("correct horse".to_string()).unwrap()),
                 token: String::new(),
+                role: UserRole::Admin,
             })
             .unwrap();
         let state = Arc::new(LoginState {
@@ -316,6 +320,7 @@ mod tests {
         .unwrap();
         assert_eq!(claims.sub, "a@b.com");
         assert_eq!(claims.purpose.as_deref(), Some("webui"));
+        assert_eq!(claims.role, UserRole::Admin);
     }
 
     #[tokio::test]

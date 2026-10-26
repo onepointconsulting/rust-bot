@@ -12,7 +12,7 @@ use crate::api::login::LoginState;
 use crate::api::rest::ApiError;
 use crate::api::types::ChatLoginResponse;
 use crate::api::user_registry::User;
-use crate::security::jwt::{DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_token};
+use crate::security::jwt::{DEFAULT_EXPIRES_IN_MONTHS, UserRole, generate_jwt_token};
 
 const USERS_ME_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -55,6 +55,7 @@ pub(crate) async fn sso_strapi(
         .ok_or_else(|| ApiError::internal("JWT is not enabled; cannot mint SSO tokens"))?;
 
     let email = fetch_strapi_admin_email(strapi_url, strapi_jwt).await?;
+    let user_role = registered_role(&state, &email);
 
     let private_key_path = jwt.private_key_path.clone();
     let iss = jwt.opts.iss.clone();
@@ -69,6 +70,7 @@ pub(crate) async fn sso_strapi(
             purpose,
             DEFAULT_EXPIRES_IN_MONTHS,
             sub,
+            Some(user_role),
         )
     })
     .await
@@ -82,6 +84,19 @@ pub(crate) async fn sso_strapi(
     }))
 }
 
+/// Role of the already-registered user `email`, or a plain user when the
+/// email is not in the registry yet: signing in through Strapi never grants
+/// admin rights by itself, an operator promotes the user in the registry.
+fn registered_role(state: &LoginState, email: &str) -> UserRole {
+    state
+        .user_registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .get_user_by_email(email)
+        .map(|user| user.role)
+        .unwrap_or_default()
+}
+
 fn persist_sso_user(state: &LoginState, email: &str, token: &str) {
     let mut registry = state
         .user_registry
@@ -92,6 +107,7 @@ fn persist_sso_user(state: &LoginState, email: &str, token: &str) {
         email: email.to_string(),
         password_hash: existing.as_ref().and_then(|u| u.password_hash.clone()),
         token: token.to_string(),
+        role: existing.as_ref().map(|u| u.role).unwrap_or_default(),
     };
     let result = if existing.is_some() {
         registry.update_user(email, &user)
@@ -327,6 +343,7 @@ mod tests {
         assert_eq!(claims.sub, "admin@example.com");
         assert_eq!(claims.purpose.as_deref(), Some("webui"));
         assert_eq!(claims.aud.as_deref(), Some("/ws"));
+        assert_eq!(claims.role, UserRole::User);
 
         let stored = state
             .user_registry

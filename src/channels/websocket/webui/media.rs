@@ -632,6 +632,7 @@ mod tests {
             exp: now + 3600,
             iat: now,
             purpose: purpose.map(str::to_string),
+            role: Default::default(),
         };
         let header = jsonwebtoken::Header::new(jsonwebtoken::Algorithm::EdDSA);
         let encoding_key = jsonwebtoken::EncodingKey::from_ed_pem(&private_pem).unwrap();

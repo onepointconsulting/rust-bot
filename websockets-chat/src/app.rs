@@ -409,6 +409,9 @@ struct WsContext {
     /// Presets changed since the page was loaded; they need a restart. Kept when the
     /// list closes, since the restart is still pending.
     mcp_changed: RwSignal<Vec<String>>,
+    /// Whether the signed-in user is an administrator, from the connection's `ready`
+    /// frame. Only decides whether the Settings button shows.
+    is_admin: RwSignal<bool>,
     /// Whether the Settings dialog is open.
     settings_open: RwSignal<bool>,
     /// What the dialog's configuration file editor shows. Only filled while the
@@ -779,11 +782,15 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             chat_id,
             client_id,
             streaming,
+            is_admin,
         } => {
             log::info!(
-                "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming}"
+                "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming} is_admin={is_admin}"
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
+            ctx.is_admin.set(is_admin);
+            // A restart that brought the gateway back is over.
+            ctx.settings_panel.restarting.set(false);
             ctx.token_streaming.set(streaming);
             // A fresh connection starts on the chat, never on a list page.
             close_main_view(ctx);
@@ -1205,6 +1212,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             ctx.config_saving.set(false);
             ctx.config_file.update(|view| *view = view.after_failure());
             ctx.config_error.set(Some(message));
+        }
+        ServerEvent::Restarting => {
+            ctx.settings_panel.restarting.set(true);
+        }
+        ServerEvent::RestartError { message } => {
+            ctx.settings_panel.restarting.set(false);
+            ctx.config_error.set(Some(message.clone()));
+            ctx.settings_panel.error.set(Some((String::new(), message)));
         }
         ServerEvent::ChatRenamed { chat_id, title } => {
             apply_session_title(ctx, &chat_id, &title);
@@ -1693,6 +1708,24 @@ fn request_save_config_file(ctx: &WsContext, content: String) {
         *ctx,
         protocol::ClientEnvelope::save_config_file(content),
         "Failed to encode the configuration save request.",
+    );
+}
+
+/// Ask the gateway to restart the bot process (administrators only; anyone else gets a
+/// `restart_error`). The reply is `restarting`; the connection then drops and reconnects
+/// once the bot is back.
+fn request_restart(ctx: &WsContext) {
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        ctx.config_error
+            .set(Some("Not connected to a chat yet.".to_string()));
+        return;
+    };
+    ctx.config_error.set(None);
+    ctx.settings_panel.error.set(None);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::restart_gateway(chat_id),
+        "Failed to encode the restart request.",
     );
 }
 
@@ -2374,6 +2407,7 @@ pub fn App() -> impl IntoView {
     let mcp_busy = RwSignal::new(None::<String>);
     let mcp_row_error = RwSignal::new(None::<(String, String)>);
     let mcp_changed = RwSignal::new(Vec::<String>::new());
+    let is_admin = RwSignal::new(false);
     let settings_open = RwSignal::new(false);
     let config_file = RwSignal::new(ConfigFileView::Closed);
     let config_saving = RwSignal::new(false);
@@ -2419,6 +2453,7 @@ pub fn App() -> impl IntoView {
         mcp_busy,
         mcp_row_error,
         mcp_changed,
+        is_admin,
         settings_open,
         config_file,
         config_saving,
@@ -2554,6 +2589,7 @@ pub fn App() -> impl IntoView {
         close_main_view(&ws_context);
         mcp_changed.set(Vec::new());
         close_settings(&ws_context);
+        is_admin.set(false);
         config_saved_notice.set(false);
         summary_popup.set(None);
         workspace_popup.set(None);
@@ -2705,6 +2741,7 @@ pub fn App() -> impl IntoView {
         on_toggle: Callback::new(move |request| request_toggle_setting(&ws_context, request)),
         on_refresh: Callback::new(move |()| refresh_settings_page(&ws_context)),
         on_save_config: Callback::new(move |change| request_set_tool_config(&ws_context, change)),
+        on_restart: Callback::new(move |()| request_restart(&ws_context)),
     };
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {
         request_set_mcp_preset(&ws_context, name, enabled, fields);
@@ -2827,6 +2864,7 @@ pub fn App() -> impl IntoView {
                     on_refresh_mcps=on_refresh_mcps
                     on_change_mcp=on_change_mcp
                     show_settings=token.get_untracked().is_some()
+                    is_admin=Signal::derive(move || is_admin.get())
                     settings_open=Signal::derive(move || settings_open.get())
                     settings_panel=settings_panel
                     settings_actions=settings_actions

@@ -16,6 +16,54 @@ use uuid::Uuid;
 /// Default token lifetime: 6 months.
 pub const DEFAULT_EXPIRES_IN_MONTHS: u32 = 6;
 
+/// What a signed-in user may do. Only [`UserRole::Admin`] may change the
+/// configuration (settings) and restart the bot; everyone else is a plain user.
+/// Serialized as `"admin"` / `"user"`.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "lowercase")]
+pub enum UserRole {
+    Admin,
+    /// The default, also assumed for tokens minted before roles existed.
+    #[default]
+    User,
+}
+
+impl UserRole {
+    /// The wire / CLI spelling of the role (`"admin"` or `"user"`).
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Admin => "admin",
+            Self::User => "user",
+        }
+    }
+
+    /// Whether this role may change settings and restart the bot.
+    pub fn is_admin(self) -> bool {
+        self == Self::Admin
+    }
+}
+
+impl fmt::Display for UserRole {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+impl std::str::FromStr for UserRole {
+    type Err = String;
+
+    /// Parses `admin` / `user`, ignoring case and surrounding whitespace.
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "admin" => Ok(Self::Admin),
+            "user" => Ok(Self::User),
+            other => Err(format!(
+                "unknown role '{other}' (expected 'admin' or 'user')"
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct Claims {
     pub iss: String,
@@ -36,6 +84,10 @@ pub struct Claims {
     /// `channels::websocket::runtime::authorize`.
     #[serde(skip_serializing_if = "Option::is_none", default)]
     pub purpose: Option<String>,
+    /// The user's role. Tokens minted before roles existed lack the claim and
+    /// are treated as [`UserRole::User`] (never silently admin).
+    #[serde(default)]
+    pub role: UserRole,
 }
 
 #[derive(Debug)]
@@ -157,7 +209,8 @@ pub fn generate_jwt_keypair(
 ///
 /// Empty `aud`/`purpose` omit their respective claims. `sub` is the token
 /// identity (login / CLI pass the user email); `None` or a blank string
-/// mints a fresh UUID instead.
+/// mints a fresh UUID instead. `user_role` is stamped into the `role` claim;
+/// `None` mints a plain [`UserRole::User`] token.
 pub fn generate_jwt_token(
     private_key_path: impl AsRef<Path>,
     iss: impl Into<String>,
@@ -165,6 +218,7 @@ pub fn generate_jwt_token(
     purpose: impl Into<String>,
     expires_in_months: u32,
     sub: Option<String>,
+    user_role: Option<UserRole>,
 ) -> Result<GeneratedToken, JwtError> {
     let private_pem = fs::read(private_key_path.as_ref()).map_err(|e| {
         JwtError::msg(format!(
@@ -204,6 +258,7 @@ pub fn generate_jwt_token(
         exp,
         iat,
         purpose,
+        role: user_role.unwrap_or(UserRole::User),
     };
 
     let header = Header::new(Algorithm::EdDSA);
@@ -272,6 +327,7 @@ mod tests {
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
             None,
+            None,
         )
         .unwrap();
 
@@ -298,6 +354,7 @@ mod tests {
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
             None,
+            None,
         )
         .unwrap();
         assert!(minted.claims.purpose.is_none());
@@ -313,6 +370,7 @@ mod tests {
             "",
             "webui",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
             None,
         )
         .unwrap();
@@ -330,6 +388,7 @@ mod tests {
             "webui",
             DEFAULT_EXPIRES_IN_MONTHS,
             Some("a@b.com".to_string()),
+            None,
         )
         .unwrap();
         assert_eq!(minted.claims.sub, "a@b.com");
@@ -354,6 +413,7 @@ mod tests {
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
             Some("   ".to_string()),
+            None,
         )
         .unwrap();
         assert!(Uuid::parse_str(&minted.claims.sub).is_ok());
@@ -370,6 +430,7 @@ mod tests {
             "webui",
             DEFAULT_EXPIRES_IN_MONTHS,
             None,
+            None,
         )
         .unwrap();
 
@@ -380,6 +441,67 @@ mod tests {
         )
         .unwrap();
         assert_eq!(validated.purpose.as_deref(), Some("webui"));
+    }
+
+    #[test]
+    fn role_claim_round_trips_through_validation() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        for role in [UserRole::Admin, UserRole::User] {
+            let minted = generate_jwt_token(
+                &keys.private_key_path,
+                "rust-bot",
+                "",
+                "webui",
+                DEFAULT_EXPIRES_IN_MONTHS,
+                None,
+                Some(role),
+            )
+            .unwrap();
+            let validated = validate_jwt_token_from_path(
+                &minted.token,
+                &keys.public_key_path,
+                &opts("rust-bot", ""),
+            )
+            .unwrap();
+            assert_eq!(validated.role, role);
+        }
+    }
+
+    #[test]
+    fn token_minted_without_a_role_is_a_plain_user() {
+        let dir = tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let minted = generate_jwt_token(
+            &keys.private_key_path,
+            "rust-bot",
+            "",
+            "",
+            DEFAULT_EXPIRES_IN_MONTHS,
+            None,
+            None,
+        )
+        .unwrap();
+        assert_eq!(minted.claims.role, UserRole::User);
+    }
+
+    #[test]
+    fn claims_from_before_roles_existed_default_to_user() {
+        let legacy = serde_json::json!({
+            "iss": "rust-bot", "sub": "a@b.com", "exp": 1, "iat": 0
+        });
+        let claims: Claims = serde_json::from_value(legacy).unwrap();
+        assert_eq!(claims.role, UserRole::User);
+        assert!(!claims.role.is_admin());
+    }
+
+    #[test]
+    fn user_role_parses_case_insensitively_and_rejects_unknown() {
+        assert_eq!(" Admin ".parse::<UserRole>(), Ok(UserRole::Admin));
+        assert_eq!("USER".parse::<UserRole>(), Ok(UserRole::User));
+        assert!("root".parse::<UserRole>().is_err());
+        assert_eq!(UserRole::Admin.to_string(), "admin");
+        assert!(UserRole::Admin.is_admin());
     }
 
     #[test]
@@ -396,6 +518,7 @@ mod tests {
             "",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
             None,
         )
         .unwrap();
@@ -418,6 +541,7 @@ mod tests {
             "",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
             None,
         )
         .unwrap();
@@ -453,6 +577,7 @@ mod tests {
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
             None,
+            None,
         )
         .unwrap();
 
@@ -476,6 +601,7 @@ mod tests {
             "aud-1",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
             None,
         )
         .unwrap();
@@ -508,6 +634,7 @@ mod tests {
             "aud-1",
             "",
             DEFAULT_EXPIRES_IN_MONTHS,
+            None,
             None,
         )
         .unwrap();

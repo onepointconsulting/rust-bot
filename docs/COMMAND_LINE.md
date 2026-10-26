@@ -64,9 +64,16 @@ cargo run -- generate-jwt-token --config ./path/to/config.json \
 
 `--user-email`, `--users-file`, and `--password` are required. Optional
 flags: `--iss`, `--aud`, `--purpose` (e.g. `webui` for the WebSocket chat
-UI), `--expires-in-months` (default: 6). The JWT is printed to stdout. The
-password is hashed with Argon2id and stored in the users file for
-`/v1/login`.
+UI), `--expires-in-months` (default: 6), `--role` (`admin` or `user`, default
+`user`). The JWT is printed to stdout. The password is hashed with Argon2id
+and stored in the users file for `/v1/login`.
+
+Only `admin` users see the web UI's Settings and can change the configuration
+or restart rust-bot; `user` accounts can chat only. The role is stored in the
+users file and stamped into every token minted at login. To promote an
+existing user, edit their `"role"` in the users file (`"admin"` / `"user"`);
+entries without a role are plain users. Tokens issued before roles existed
+also count as `user`.
 
 For the full option list:
 

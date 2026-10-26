@@ -152,6 +152,8 @@ pub fn ChatShell(
     // the sidebar has no "Settings" button. The gateway enforces the same rule
     // independently.
     #[prop(default = false)] show_settings: bool,
+    // Only administrators get the Settings button; the gateway refuses everyone else.
+    #[prop(into)] is_admin: Signal<bool>,
     #[prop(into)] settings_open: Signal<bool>,
     settings_panel: SettingsPanel,
     settings_actions: SettingsActions,
@@ -238,6 +240,7 @@ pub fn ChatShell(
                     .then_some(Callback::new(move |()| on_open_subagents()))
                 subagents_active=Signal::derive(move || main_view.get() == MainView::Subagents)
                 on_settings=show_settings.then_some(Callback::new(move |()| on_open_settings()))
+                settings_visible=is_admin
                 show_brand=true
                 collapse_hint=shortcut_label.to_string()
                 compact=compact
@@ -373,6 +376,9 @@ pub fn ChatShell(
             />
             <ConfigSavedNotice
                 open=config_saved_notice
+                restarting=settings_panel.restarting
+                error=config_error
+                on_restart=settings_actions.on_restart
                 on_close=Callback::new(move |()| on_close_config_saved_notice())
             />
         </div>

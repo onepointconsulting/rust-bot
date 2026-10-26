@@ -13,7 +13,7 @@ use crate::cli::onboard::create_env_file;
 use crate::config::schema::ProvidersConfig;
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::registry::TOGETHER_API_BASE;
-use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, generate_jwt_token};
+use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, UserRole, generate_jwt_token};
 use crate::{
     cli::{
         CliError,
@@ -613,6 +613,7 @@ fn create_users_file(
             }
         })
         .prompt()?;
+    let user_role = prompt_user_role()?;
     let parent = config_path
         .parent()
         .map(PathBuf::from)
@@ -626,6 +627,7 @@ fn create_users_file(
         "webui",
         DEFAULT_EXPIRES_IN_MONTHS,
         Some(user_email.clone()),
+        Some(user_role),
     )?;
 
     let mut registry = JsonUserRegistry::open(users_file.clone())?;
@@ -634,12 +636,26 @@ fn create_users_file(
             email: user_email,
             password_hash: Some(hash_password(password)?),
             token: minted.token,
+            role: user_role,
         })
         .map_err(|e| CliError::Other(e.to_string()))?;
 
     config.api.users_file = path_for_config(users_file).display().to_string();
     eprintln!("Wrote users file: {}", config.api.users_file);
     Ok(())
+}
+
+/// Labels offered by [`prompt_user_role`], in display order; each parses with
+/// [`UserRole`]'s `FromStr`.
+const USER_ROLE_CHOICES: [&str; 2] = ["admin", "user"];
+
+/// Ask which role the user being created gets. Admins may change the settings
+/// and restart the bot from the web UI; plain users cannot.
+fn prompt_user_role() -> Result<UserRole, CliError> {
+    let choice = Select::new("Role of this user", USER_ROLE_CHOICES.to_vec())
+        .with_help_message("admin can change settings and restart rust-bot; user cannot")
+        .prompt()?;
+    choice.parse::<UserRole>().map_err(|e| CliError::Other(e))
 }
 
 fn parse_csv_list(input: &str) -> Vec<String> {
@@ -1684,6 +1700,13 @@ fn configure_subagent(config: &mut Config) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn every_offered_role_choice_parses() {
+        for choice in USER_ROLE_CHOICES {
+            assert!(choice.parse::<UserRole>().is_ok(), "{choice}");
+        }
+    }
 
     #[test]
     fn expand_and_absolutize_keeps_absolute_paths() {
