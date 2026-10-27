@@ -1,6 +1,6 @@
 # Rust Bot
 
-A simple bot implementation based on [Nanobot](https://github.com/HKUDS/nanobot), written in Rust. It ships as a CLI binary (`rust-bot`) that can run the agent in one-shot mode or as an interactive console, plus an optional `gmail-auth` helper for Gmail OAuth setup.
+A bot implementation initially based on [Nanobot](https://github.com/HKUDS/nanobot), written in Rust. It ships as a CLI binary (`rust-bot`) that can run the agent in one-shot mode or as an interactive console, plus an optional `gmail-auth` helper for Gmail OAuth setup.
 
 ## Table of contents
 
@@ -52,6 +52,15 @@ curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/sc
 # Windows (PowerShell)
 irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/uninstall.ps1 | iex
 ```
+
+### Installation modes
+
+`rust-bot onboard` supports two modes, chosen with `--mode`:
+
+- **`--mode user`**: one bot per user account. Config and workspace live in `~/.rust-bot/` and work from any directory. The one-line installers use this mode.
+- **`--mode local`**: one bot per project. Config and workspace live in `./.rust-bot/` in the current directory, so several instances can coexist on one machine. Manual installs from an archive default to this.
+
+Without `--mode`, onboard reuses an existing `./.rust-bot/`, then an existing `~/.rust-bot/`, and otherwise creates `./.rust-bot/`. See [INSTALL.md](packaging/INSTALL.md) for details.
 
 ### Manual install
 
