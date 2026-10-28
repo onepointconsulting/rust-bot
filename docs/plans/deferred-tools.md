@@ -112,7 +112,9 @@ User configuration. Deferral is chosen per MCP server; there is no automatic rul
 - `exposure` is `direct` (default) or `deferred`. Defer servers with many tools that are used now and then; keep
   servers used in most conversations `direct`.
 - `description` is one line for the model: what the server offers, in the words a user would use.
-- `enabledTools` still filters which tools are registered at all; `exposure` applies to the tools that remain.
+- `enabledTools` is documented as filtering which tools are registered, but it is not applied when MCP tools are
+  registered today (found during M1: only the wizard and the ACP config overlay read it; `record_mcp_batch`
+  registers every listed tool). Separate fix; until then every tool of a deferred server is searchable.
 
 Config validation, at load time:
 
@@ -248,7 +250,8 @@ Decision: the registry tells the provider where the boundary is, instead of the 
 
 - `get_definitions()` sets `"cache_boundary": true` at the top level of the last direct built-in definition (the
   same level as `cache_control`, outside `function`). This keeps today's meaning: built-ins are stable, direct MCP
-  tools arrive lazily after them.
+  tools arrive lazily after them. It is set only when the registry has deferred tools, so the definitions of a
+  setup without deferral are byte-for-byte what they were.
 - `tool_cache_marker_indices` uses the flagged index as the boundary when present and falls back to the `mcp_` rule
   otherwise, so callers that do not set it (subagents, existing tests) are unchanged.
 - The flag is internal and must never reach an API:
@@ -274,6 +277,20 @@ Each compiles green and is shippable on its own. Default behaviour is unchanged 
 as deferred.
 
 ### M1. Core, in memory
+
+Status (2026-10-28): implemented, unit tests green; baseline and deferred measurement with `ouryagya-strapi` not
+run yet. Loads last for one turn until M2 persists them.
+
+First manual test (Xiaomi model, `ouryagya-strapi` deferred, no description): asked for "the latest news from the
+strapi server", the model grepped the workspace and asked for a URL instead of searching; only when told to search
+for tools did it call `tool_search`. It then needed 7 searches, loading about 50 tools, before
+`mcp_ouryagya-strapi_list_new` surfaced (found by an exact-name query). Consequences:
+
+- The D4 prompt section was moved from M3 into M1 and is implemented (`deferred_tools_prompt_section` in
+  `tool_search.rs`). `PromptSection` closures now receive the session's `AgentMode`, so `no_mcp` lists no MCP
+  server. Format: one line per server, ``- MCP server `name` (N tools): description``, then one line per deferred
+  built-in.
+- Search noise is open: see "Ranking on CRUD-style servers" under Risks.
 
 - Baseline first: the `ouryagya-strapi` server (SSE, more than 100 tools, `enabledTools: ["*"]`), one session with
   `exposure: direct`, recording input tokens and `cache_creation` / `cache_read` per request from the usage logging.
@@ -313,7 +330,9 @@ as deferred.
   - **Refresh.** The popup requests the list when opened (`app.rs:1749`) and nothing is pushed. A tool loaded
     mid-turn shows up on the next open after `loaded_tools` is saved at `tools_completed` (D5). Accepted; a push
     event is not needed for M3.
-- Prompt section for deferred servers and deferred built-ins (D4).
+- Prompt section for deferred servers and deferred built-ins (D4): done in M1, see the M1 status.
+- `tool_search` is registered per turn, so the tools popup and `/tools` (which read the process-wide registry) do
+  not list it. Show it there when anything is deferred.
 - Settings schema and `mcp_presets_api.rs` expose `exposure` and `description`; README and `docs/` section.
 
 ### M4. Optional spike: native tool changes on Anthropic
@@ -327,7 +346,7 @@ larger than M1 to M3 combined. Not committed to here.
 Unit tests next to the code, as in the rest of the repo.
 
 - Ranker: tokenizer (camelCase, underscores, plurals, stop words); ranking order; exact-name query wins over a
-  shorter description; ties keep registration order; empty query, zero limit, empty corpus; a query matching only a
+  shorter description; ties keep corpus order (A-Z, since the registry map has no registration order); empty query, zero limit, empty corpus; a query matching only a
   schema property name still finds the tool.
 - Registry: deferred tool absent from `get_definitions` until loaded; loaded tools appended in load order after
   direct MCP; `prepare_call` on an unloaded deferred tool errors without listing deferred names; `restrict_by` keeps
@@ -340,7 +359,8 @@ Unit tests next to the code, as in the rest of the repo.
 - Runner: a run where iteration 1 calls `tool_search` and iteration 2 declares and calls the loaded tool (fake
   provider recording the `tools` it receives per request).
 - Cache boundary (M1):
-  - `get_definitions` flags only the last direct built-in, and nothing when there are no built-ins.
+  - `get_definitions` flags only the last direct built-in, and nothing when there are no built-ins or nothing is
+    deferred.
   - `tool_cache_marker_indices` with `[read, write*, mcp_a, docx]` (`*` = flagged) gives `[1, 3]`, not `[3]`.
   - Without a flag the existing `mcp_` cases still pass.
   - Anthropic and OpenAI-compatible request bodies contain no `cache_boundary` key.
@@ -371,6 +391,14 @@ Unit tests next to the code, as in the rest of the repo.
 - **Cache miss per load.** Accepted for M1, quantified through the existing usage logging (`cache_creation` tokens).
 - **Config surface.** `exposure` and `description` need to appear in the settings schema and presets API or users
   will hand-edit JSON.
+- **Ranking on CRUD-style servers.** Strapi exposes about 100 tools named `{verb}_{collection}` with near-identical
+  descriptions ("Content-manager list for api::new.new.") and large, similar schemas. BM25 then ranks
+  `list_news-occasion` above `list_new` for "list news", and each search loads 8 tools, most of them noise.
+  Options: a relative score cut-off (load only matches within X% of the best), a lower default limit, a smaller
+  length penalty (`b`), or a few example tool names per server in the D4 section so the model can query by name.
+  Done (2026-10-28): the cut-off (`LOAD_SCORE_RATIO` 0.5; exact-name matches always load; weaker matches are
+  listed as "not loaded") and up to 5 example names per server, one per leading word (`create_x`, `list_x`, ...).
+  Limit and `b` unchanged until the next manual test shows whether they still matter.
 - **Loaded set only grows.** Nothing is unloaded (D5), so a long session that searches widely drifts back toward
   declaring every schema, the cost this feature removes. Remedy for now: `/new`. If the M1 numbers show long
   sessions reaching that point, add a cap on loaded tools; dropping the oldest load would cost one cache write.

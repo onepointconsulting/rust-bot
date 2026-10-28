@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::providers::{
     base::{GenerationSettings, LLMProvider, LLMResponse, LLMUsage, ToolCallRequest},
+    cache_control::{CACHE_BOUNDARY_KEY, strip_internal_tool_fields},
     registry::ProviderSpec,
 };
 use adk_anthropic::{
@@ -229,6 +230,10 @@ impl AnthropicProvider {
             }
             if tool.get("cache_control").is_some() {
                 entry["cache_control"] = tool["cache_control"].clone();
+            }
+            // Carried until `apply_cache_control` has placed the markers, then removed.
+            if let Some(boundary) = tool.get(CACHE_BOUNDARY_KEY) {
+                entry[CACHE_BOUNDARY_KEY] = boundary.clone();
             }
             result.push(entry);
         }
@@ -470,6 +475,10 @@ impl AnthropicProvider {
             (system, anthropic_msgs, anthropic_tools) =
                 self.apply_cache_control(system, anthropic_msgs, anthropic_tools);
         }
+        // `apply_cache_control` already did this; without caching it never ran.
+        if let Some(tools) = anthropic_tools.as_mut() {
+            strip_internal_tool_fields(tools);
+        }
         let max_tokens = std::cmp::max(1, max_tokens);
         let thinking_enabled = if let Some(reasoning_effort) = reasoning_effort.clone() {
             !reasoning_effort.is_empty()
@@ -679,6 +688,7 @@ impl AnthropicProvider {
                 for idx in Self::tool_cache_marker_indices(Some(tools)).unwrap_or_default() {
                     new_tools[idx]["cache_control"] = marker.clone();
                 }
+                strip_internal_tool_fields(&mut new_tools);
                 Some(new_tools)
             }
         };
@@ -2057,5 +2067,75 @@ mod tests {
             false,
         );
         assert_eq!(args.get("temperature"), Some(&serde_json::json!(0.5)));
+    }
+
+    /// `[read, write*, mcp_a, docx]` where `*` marks the registry's cache boundary flag.
+    fn tools_with_cache_boundary() -> Vec<serde_json::Value> {
+        let tool = |name: &str| {
+            serde_json::json!({
+                "type": "function",
+                "function": {"name": name, "parameters": {"type": "object", "properties": {}}}
+            })
+        };
+        let mut write = tool("write");
+        write[CACHE_BOUNDARY_KEY] = serde_json::json!(true);
+        vec![tool("read"), write, tool("mcp_a"), tool("docx")]
+    }
+
+    fn build_args_with_tools(supports_caching: bool) -> HashMap<String, serde_json::Value> {
+        let provider = AnthropicProvider::new(
+            Some("sk-ant-test".to_string()),
+            None,
+            Some("claude-sonnet-4-6".to_string()),
+            None,
+            None,
+        );
+        provider.build_args(
+            &[serde_json::json!({ "role": "user", "content": "hi" })],
+            Some(tools_with_cache_boundary()),
+            Some("claude-sonnet-4-6".to_string()),
+            16,
+            None,
+            None,
+            None,
+            supports_caching,
+        )
+    }
+
+    #[test]
+    fn convert_tools_carries_the_cache_boundary_flag() {
+        let converted =
+            AnthropicProvider::convert_tools(Some(tools_with_cache_boundary())).unwrap();
+        assert_eq!(converted[1][CACHE_BOUNDARY_KEY], true);
+    }
+
+    #[test]
+    fn cache_markers_follow_the_boundary_flag_and_the_flag_is_not_sent() {
+        let args = build_args_with_tools(true);
+
+        let tools = args["tools"].as_array().unwrap();
+        let marked: Vec<&str> = tools
+            .iter()
+            .filter(|tool| tool.get("cache_control").is_some())
+            .map(|tool| tool["name"].as_str().unwrap())
+            .collect();
+        assert_eq!(marked, vec!["write", "docx"]);
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.get(CACHE_BOUNDARY_KEY).is_none())
+        );
+    }
+
+    #[test]
+    fn the_cache_boundary_flag_is_not_sent_without_caching() {
+        let args = build_args_with_tools(false);
+
+        let tools = args["tools"].as_array().unwrap();
+        assert!(
+            tools
+                .iter()
+                .all(|tool| tool.get(CACHE_BOUNDARY_KEY).is_none())
+        );
     }
 }

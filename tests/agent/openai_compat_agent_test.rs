@@ -453,6 +453,7 @@ async fn test_mcp_tool_with_mcp_config() {
         headers,
         tool_timeout: 30,
         enabled_tools: Vec::new(),
+        ..McpServerConfig::default()
     };
     let LoadedMcpTools {
         client: _mcp_client_keepalive,

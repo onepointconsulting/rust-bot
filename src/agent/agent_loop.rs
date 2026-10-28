@@ -46,6 +46,7 @@ use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::tools::tool_search::{ToolSearchTool, deferred_tools_prompt_section};
 use crate::agent::turn_journal::TurnJournal;
 use crate::agent::workspace_context::{
     bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
@@ -242,6 +243,45 @@ pub(crate) fn enabled_mcp_servers(
         .iter()
         .filter(|(_, config)| config.enabled)
         .map(|(name, config)| (name.clone(), config.clone()))
+        .collect()
+}
+
+/// `mcpServers.<name>.description` of every server that has one, keyed by server name.
+fn mcp_server_descriptions(servers: &HashMap<String, McpServerConfig>) -> HashMap<String, String> {
+    servers
+        .iter()
+        .filter(|(_, config)| !config.description.trim().is_empty())
+        .map(|(name, config)| (name.clone(), config.description.clone()))
+        .collect()
+}
+
+/// The names in `tools.deferredTools` that can be deferred: registered built-ins that
+/// are not also disabled. Logs a warning for every name it drops; disabled wins over
+/// deferred. (`tool_search` is rejected earlier, by config validation.)
+pub(crate) fn deferrable_builtins(
+    deferred_tools: &[String],
+    disabled_tools: &[String],
+    builtins: &ToolRegistry,
+) -> Vec<String> {
+    deferred_tools
+        .iter()
+        .filter(|name| {
+            if disabled_tools.contains(name) {
+                log::warn!(
+                    "tools.deferredTools: '{name}' is also in tools.disabledTools; it stays disabled"
+                );
+                false
+            } else if !builtins.has(name) {
+                log::warn!(
+                    "tools.deferredTools: '{name}' is not a built-in tool and is ignored \
+                     (defer MCP tools with the server's \"exposure\" setting)"
+                );
+                false
+            } else {
+                true
+            }
+        })
+        .cloned()
         .collect()
 }
 
@@ -566,6 +606,11 @@ impl AgentLoop {
         for name in &tools_cfg.disabled_tools {
             tools.disable(name);
         }
+        tools.defer_builtins(deferrable_builtins(
+            &tools_cfg.deferred_tools,
+            &tools_cfg.disabled_tools,
+            &tools,
+        ));
         let tools = Arc::new(Mutex::new(tools));
         let mut context_builder = ContextBuilder::with_default_mode(
             workspace.clone(),
@@ -575,9 +620,17 @@ impl AgentLoop {
         );
         if let Some(acp_tools) = &acp_tools {
             let acp_tools = Arc::clone(acp_tools);
-            context_builder =
-                context_builder.with_prompt_section(Arc::new(move || acp_tools.prompt_section()));
+            context_builder = context_builder
+                .with_prompt_section(Arc::new(move |_mode| acp_tools.prompt_section()));
         }
+        // Names the deferred servers and tools, so the model knows `tool_search` can load
+        // them. Built from the mode's view, so `no_mcp` lists no MCP server.
+        let server_descriptions = mcp_server_descriptions(&mcp_servers);
+        let section_tools = Arc::clone(&tools);
+        context_builder = context_builder.with_prompt_section(Arc::new(move |mode| {
+            let registry = section_tools.lock().unwrap_or_else(|e| e.into_inner());
+            deferred_tools_prompt_section(&mode.restrict_tools(&registry), &server_descriptions)
+        }));
         let context = Arc::new(context_builder);
         let consolidator = Arc::new(Consolidator::new(
             Arc::clone(&context.memory),
@@ -1273,7 +1326,13 @@ impl AgentLoop {
             });
 
         let mode = self.mode_for_session(session.as_ref());
-        let run_tools = self.tools_for_session(session.as_ref());
+        let mut run_tools = self.tools_for_session(session.as_ref());
+        // `tool_search` exists only when this view has something to load. It shares the
+        // view's loaded-tools handle, so its loads reach the runner's next request.
+        if run_tools.has_deferred_tools() {
+            let search_view = run_tools.clone();
+            run_tools.register(Box::new(ToolSearchTool::new(search_view)));
+        }
         log::info!(
             "Running agent loop with {} tools (mode={})",
             run_tools.len(),
@@ -3077,6 +3136,47 @@ mod tests {
             .iter()
             .map(|name| (name.to_string(), McpServerConfig::default()))
             .collect()
+    }
+
+    /// A registry of probe built-ins named `names`.
+    fn builtin_registry(names: &[&'static str]) -> ToolRegistry {
+        let mut registry = ToolRegistry::new();
+        for name in names {
+            registry.register(Box::new(CountingProbe {
+                name,
+                safe: false,
+                runs: Arc::new(std::sync::atomic::AtomicUsize::new(0)),
+            }));
+        }
+        registry
+    }
+
+    fn to_strings(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn deferrable_builtins_keeps_registered_builtins_only() {
+        let builtins = builtin_registry(&["docx", "read_file"]);
+
+        let deferrable = deferrable_builtins(
+            &to_strings(&["docx", "mcp_jira_search", "ghost"]),
+            &[],
+            &builtins,
+        );
+
+        assert_eq!(deferrable, to_strings(&["docx"]));
+    }
+
+    #[test]
+    fn deferrable_builtins_lets_disabled_win() {
+        // A disabled tool is no longer registered, so only the disabled check can name it.
+        let builtins = builtin_registry(&["read_file"]);
+
+        let deferrable =
+            deferrable_builtins(&to_strings(&["docx"]), &to_strings(&["docx"]), &builtins);
+
+        assert!(deferrable.is_empty());
     }
 
     #[test]

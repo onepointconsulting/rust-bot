@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use std::collections::HashMap;
 
+pub use crate::config::schema::ToolExposure;
+
 /// Mapping from JSON Schema primitive types to idiomatic Rust types.
 ///
 /// This is the Rust equivalent of the Python `_TYPE_MAP`:
@@ -100,6 +102,19 @@ pub trait Tool: std::any::Any + Send + Sync {
     /// never repeated, the model receives a synthetic "interrupted" result.
     fn replay_safe(&self) -> bool {
         false
+    }
+
+    /// Whether the tool is declared to the model on every request or only after
+    /// `tool_search` loads it. Built-ins are deferred through the registry
+    /// (`tools.deferredTools`), not here; MCP tools take it from their server config.
+    fn exposure(&self) -> ToolExposure {
+        ToolExposure::Direct
+    }
+
+    /// Name of the MCP server that provides this tool; `None` for built-ins.
+    /// `tool_search` ranks on it, so a query naming the server finds its tools.
+    fn mcp_server_name(&self) -> Option<String> {
+        None
     }
 
     /// Update routing context for tools that send messages or spawn subagents.

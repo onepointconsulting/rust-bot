@@ -1425,6 +1425,16 @@ pub enum McpTransportType {
     StreamableHttp,
 }
 
+/// Whether a tool is declared to the model on every request (`Direct`) or only after
+/// the model loads it through `tool_search` (`Deferred`).
+#[derive(Deserialize, Serialize, Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[serde(rename_all = "camelCase")]
+pub enum ToolExposure {
+    #[default]
+    Direct,
+    Deferred,
+}
+
 /// MCP server connection configuration (stdio or HTTP).
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
 #[serde(rename_all = "camelCase", default)]
@@ -1474,6 +1484,20 @@ pub struct McpServerConfig {
     #[serde(alias = "enabled_tools", default = "default_mcp_enabled_tools")]
     #[garde(skip)]
     pub enabled_tools: Vec<String>,
+
+    /// `"direct"` (default): every tool of this server is declared to the model on each
+    /// request. `"deferred"`: the tools are only declared after the model finds them
+    /// with `tool_search`. Use it for servers with many tools that are used now and then.
+    #[serde(default)]
+    #[garde(skip)]
+    pub exposure: ToolExposure,
+
+    /// One line telling the model what this server offers, in the words a user would
+    /// use (e.g. `"Jira: search, create and update issues and sprints"`). Empty: the
+    /// server is described by its name only.
+    #[serde(default)]
+    #[garde(skip)]
+    pub description: String,
 }
 
 impl Default for McpServerConfig {
@@ -1488,11 +1512,31 @@ impl Default for McpServerConfig {
             headers: HashMap::new(),
             tool_timeout: default_mcp_tool_timeout(),
             enabled_tools: default_mcp_enabled_tools(),
+            exposure: ToolExposure::default(),
+            description: String::new(),
         }
     }
 }
 
 // ── ToolsConfig ───────────────────────────────────────────────────────────────
+
+/// Name of the tool that loads deferred tools. It must stay declared, so it can never
+/// be listed in `tools.deferredTools`.
+pub const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
+
+/// Reject a `tools.deferredTools` list that defers `tool_search`: the model could then
+/// never load anything.
+fn validate_deferred_tools(deferred_tools: &[String], _ctx: &()) -> garde::Result {
+    if deferred_tools
+        .iter()
+        .any(|name| name == TOOL_SEARCH_TOOL_NAME)
+    {
+        return Err(garde::Error::new(
+            "tool_search cannot be deferred: it is how deferred tools are loaded",
+        ));
+    }
+    Ok(())
+}
 
 fn default_mcp_presets_path() -> String {
     "~/.rust-bot/mcp_presets.json".to_string()
@@ -1533,6 +1577,14 @@ pub struct ToolsConfig {
     #[garde(skip)]
     #[schemars(skip)]
     pub disabled_tools: Vec<String>,
+
+    /// Built-in tool names that are only declared to the model after it loads them
+    /// with `tool_search`, e.g. `["docx"]`. Subagents ignore this list. `tool_search`
+    /// itself cannot be deferred.
+    #[serde(alias = "deferred_tools")]
+    #[garde(custom(validate_deferred_tools))]
+    #[schemars(skip)]
+    pub deferred_tools: Vec<String>,
 
     /// When true, the CLI `agent` command asks before each tool call.
     #[serde(alias = "confirm_before_execute")]
@@ -1597,6 +1649,7 @@ impl Default for ToolsConfig {
             exec: ExecToolConfig::default(),
             restrict_to_workspace: false,
             disabled_tools: Vec::new(),
+            deferred_tools: Vec::new(),
             confirm_before_execute: false,
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
@@ -3696,5 +3749,39 @@ mod tests {
             first.tools.gmail.token_cache_path,
             second.tools.gmail.token_cache_path
         );
+    }
+    // ── deferred tools ────────────────────────────────────────────────────────
+
+    #[test]
+    fn mcp_server_exposure_and_description_default_to_direct_and_empty() {
+        let server: McpServerConfig = serde_json::from_str(r#"{"url": "https://x/mcp"}"#).unwrap();
+        assert_eq!(server.exposure, ToolExposure::Direct);
+        assert!(server.description.is_empty());
+    }
+
+    #[test]
+    fn mcp_server_exposure_and_description_are_read_from_camel_case_json() {
+        let server: McpServerConfig = serde_json::from_str(
+            r#"{"url": "https://x/mcp", "exposure": "deferred", "description": "Strapi CMS"}"#,
+        )
+        .unwrap();
+        assert_eq!(server.exposure, ToolExposure::Deferred);
+        assert_eq!(server.description, "Strapi CMS");
+    }
+
+    #[test]
+    fn deferred_tools_is_read_from_camel_case_json() {
+        let tools: ToolsConfig = serde_json::from_str(r#"{"deferredTools": ["docx"]}"#).unwrap();
+        assert_eq!(tools.deferred_tools, vec!["docx".to_string()]);
+    }
+
+    #[test]
+    fn deferring_tool_search_is_rejected() {
+        let mut cfg = Config::default();
+        cfg.tools.deferred_tools = vec!["docx".to_string(), TOOL_SEARCH_TOOL_NAME.to_string()];
+        assert!(cfg.validate().is_err());
+
+        cfg.tools.deferred_tools = vec!["docx".to_string()];
+        assert!(cfg.validate().is_ok());
     }
 }

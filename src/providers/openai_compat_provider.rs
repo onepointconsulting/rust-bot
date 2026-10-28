@@ -3,7 +3,7 @@ use crate::providers::{
         GenerationSettings, LLMProvider, LLMResponse, LLMUsage, ToolCallRequest,
         describe_error_chain,
     },
-    cache_control::apply_cache_control,
+    cache_control::{apply_cache_control, strip_internal_tool_fields},
     registry::ProviderSpec,
 };
 use std::collections::HashMap;
@@ -607,9 +607,10 @@ impl OpenAICompatProvider {
         }
 
         let effective_tools = cached_tools.or(tools);
-        if let Some(tool_list) = effective_tools
+        if let Some(mut tool_list) = effective_tools
             && !tool_list.is_empty()
         {
+            strip_internal_tool_fields(&mut tool_list);
             request["tools"] = serde_json::Value::Array(tool_list);
         }
 
@@ -1252,6 +1253,7 @@ impl LLMProvider for OpenAICompatProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::providers::cache_control::CACHE_BOUNDARY_KEY;
 
     #[test]
     fn test_short_tool_id() {
@@ -2160,6 +2162,25 @@ mod tests {
             request["tools"][0]["cache_control"],
             serde_json::json!({ "type": "ephemeral" })
         );
+    }
+
+    #[test]
+    fn build_request_never_sends_the_cache_boundary_flag() {
+        let mut flagged_tool = weather_tool();
+        flagged_tool[CACHE_BOUNDARY_KEY] = serde_json::json!(true);
+        for provider in [test_provider(), caching_provider()] {
+            let request = provider.build_request(
+                &[serde_json::json!({ "role": "user", "content": "weather?" })],
+                Some(vec![flagged_tool.clone()]),
+                Some("gpt-test".to_string()),
+                16,
+                None,
+                None,
+                None,
+            );
+            assert!(request["tools"][0].get(CACHE_BOUNDARY_KEY).is_none());
+            assert_eq!(request["tools"][0]["function"], weather_tool()["function"]);
+        }
     }
 
     #[test]

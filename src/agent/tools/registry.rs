@@ -1,13 +1,27 @@
 /// Tool registry for dynamic tool management.
-use std::collections::HashMap;
-use std::sync::Arc;
+use std::collections::{HashMap, HashSet};
+use std::sync::{Arc, Mutex};
 
-use crate::agent::tools::base::Tool;
+use crate::agent::tools::base::{Tool, ToolExposure};
+use crate::providers::cache_control::CACHE_BOUNDARY_KEY;
 
 /// Name prefix every MCP-provided tool is registered under.
 pub const MCP_TOOL_PREFIX: &str = "mcp_";
 
 const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
+
+/// A deferred tool as `tool_search` ranks it: everything the model would see once it
+/// is loaded, plus the MCP server it comes from.
+#[derive(Debug, Clone, PartialEq)]
+pub struct DeferredToolDefinition {
+    pub name: String,
+    pub description: String,
+    pub parameters: serde_json::Value,
+    /// `None` for a deferred built-in.
+    pub server_name: Option<String>,
+    /// Whether `tool_search` already loaded it in this view.
+    pub loaded: bool,
+}
 
 /// Display-oriented view of one registered tool (no parameter schema).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
@@ -33,6 +47,13 @@ pub struct ToolRegistry {
     /// Tools switched off by `tools.disabledTools`: not callable, but remembered (with
     /// their description) so the Settings dialog can still list and re-enable them.
     disabled: HashMap<String, ToolSummary>,
+    /// Built-in tools deferred by `tools.deferredTools`. MCP tools carry their own
+    /// exposure (see [`Tool::exposure`]).
+    deferred_builtins: HashSet<String>,
+    /// Deferred tools `tool_search` loaded in this view, in load order. `clone()` shares
+    /// it, so the runner's copy and `tool_search`'s copy of one turn see the same loads;
+    /// [`Self::restrict_by`] copies it, so a new view never writes into its source.
+    loaded: Arc<Mutex<Vec<String>>>,
 }
 
 impl ToolRegistry {
@@ -40,6 +61,8 @@ impl ToolRegistry {
         Self {
             tools: HashMap::new(),
             disabled: HashMap::new(),
+            deferred_builtins: HashSet::new(),
+            loaded: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -76,18 +99,113 @@ impl ToolRegistry {
         self.tools.contains_key(name)
     }
 
+    // ── deferred tools ────────────────────────────────────────────────────────
+
+    /// Defer the built-in tools in `names` (`tools.deferredTools`): they stay registered
+    /// and callable once loaded, but are only declared after `tool_search` loads them.
+    pub fn defer_builtins(&mut self, names: impl IntoIterator<Item = String>) {
+        self.deferred_builtins.extend(names);
+    }
+
+    /// Exposure of the registered tool `name`; `None` when no such tool is registered.
+    pub fn exposure_of(&self, name: &str) -> Option<ToolExposure> {
+        self.tools
+            .get(name)
+            .map(|tool| self.exposure_of_tool(name, tool))
+    }
+
+    /// Whether any registered tool is deferred, i.e. `tool_search` has something to find.
+    pub fn has_deferred_tools(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|(name, tool)| self.exposure_of_tool(name, tool) == ToolExposure::Deferred)
+    }
+
+    /// Load the deferred tools in `names`, so they are declared from the next
+    /// [`Self::get_definitions`] on. Names that are not registered, not deferred or
+    /// already loaded are skipped. Returns the names that were newly loaded, in order.
+    pub fn load_tools(&self, names: &[String]) -> Vec<String> {
+        let mut loaded = self.loaded.lock().unwrap_or_else(|e| e.into_inner());
+        let mut newly_loaded = Vec::new();
+        for name in names {
+            let is_deferred = self.exposure_of(name) == Some(ToolExposure::Deferred);
+            if is_deferred && !loaded.contains(name) {
+                loaded.push(name.clone());
+                newly_loaded.push(name.clone());
+            }
+        }
+        newly_loaded
+    }
+
+    /// Deferred tools loaded in this view that are still registered, in load order.
+    pub fn loaded_tools(&self) -> Vec<String> {
+        self.loaded_names()
+            .into_iter()
+            .filter(|name| self.exposure_of(name) == Some(ToolExposure::Deferred))
+            .collect()
+    }
+
+    /// Every registered deferred tool, loaded or not, sorted by name: the corpus
+    /// `tool_search` ranks over.
+    pub fn deferred_definitions(&self) -> Vec<DeferredToolDefinition> {
+        let loaded = self.loaded_names();
+        let mut definitions: Vec<DeferredToolDefinition> = self
+            .tools
+            .iter()
+            .filter(|(name, tool)| self.exposure_of_tool(name, tool) == ToolExposure::Deferred)
+            .map(|(name, tool)| DeferredToolDefinition {
+                name: name.clone(),
+                description: tool.description(),
+                parameters: tool.parameters(),
+                server_name: tool.mcp_server_name(),
+                loaded: loaded.contains(name),
+            })
+            .collect();
+        definitions.sort_by(|a, b| a.name.cmp(&b.name));
+        definitions
+    }
+
+    /// Whether the registered tool `name` is declared to the model now: it is direct,
+    /// or deferred and loaded.
+    fn is_declared(&self, name: &str, tool: &Arc<dyn Tool>) -> bool {
+        self.exposure_of_tool(name, tool) == ToolExposure::Direct
+            || self.loaded_names().iter().any(|loaded| loaded == name)
+    }
+
+    fn exposure_of_tool(&self, name: &str, tool: &Arc<dyn Tool>) -> ToolExposure {
+        if self.deferred_builtins.contains(name) {
+            ToolExposure::Deferred
+        } else {
+            tool.exposure()
+        }
+    }
+
+    fn loaded_names(&self) -> Vec<String> {
+        self.loaded
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
     // ── schema export ─────────────────────────────────────────────────────────
 
-    /// Get tool definitions with stable ordering for cache-friendly prompts.
+    /// Get the definitions of the tools declared to the model, ordered for prompt
+    /// caching: direct built-ins (alphabetical), direct MCP tools (alphabetical), then
+    /// loaded deferred tools in load order, so a load only ever appends to the tail.
     ///
-    /// Built-in tools (alphabetical) come first; MCP tools (`mcp_` prefix,
-    /// also alphabetical) are appended.
+    /// When the registry has deferred tools, the last direct built-in carries
+    /// [`CACHE_BOUNDARY_KEY`] so the Anthropic provider keeps a cache breakpoint on the
+    /// stable prefix (a loaded built-in at the tail would otherwise be mistaken for it).
     pub fn get_definitions(&self) -> Vec<serde_json::Value> {
         let mut builtins: Vec<serde_json::Value> = Vec::new();
         let mut mcp_tools: Vec<serde_json::Value> = Vec::new();
 
-        for schema in self.tools.values().map(|t| t.to_schema()) {
-            if Self::is_mcp_tool_name(&Self::schema_name(&schema)) {
+        for (name, tool) in &self.tools {
+            if self.exposure_of_tool(name, tool) == ToolExposure::Deferred {
+                continue;
+            }
+            let schema = tool.to_schema();
+            if Self::is_mcp_tool_name(name) {
                 mcp_tools.push(schema);
             } else {
                 builtins.push(schema);
@@ -96,7 +214,18 @@ impl ToolRegistry {
 
         builtins.sort_by_key(Self::schema_name);
         mcp_tools.sort_by_key(Self::schema_name);
+        if self.has_deferred_tools()
+            && let Some(last_builtin) = builtins.last_mut()
+        {
+            last_builtin[CACHE_BOUNDARY_KEY] = serde_json::Value::Bool(true);
+        }
         builtins.extend(mcp_tools);
+        builtins.extend(
+            self.loaded_tools()
+                .iter()
+                .filter_map(|name| self.tools.get(name))
+                .map(|tool| tool.to_schema()),
+        );
         builtins
     }
 
@@ -112,9 +241,19 @@ impl ToolRegistry {
         params: &serde_json::Value,
     ) -> (Option<Arc<dyn Tool>>, serde_json::Value, Option<String>) {
         let tool = match self.tools.get(name) {
-            Some(t) => t.clone(),
+            Some(t) if self.is_declared(name, t) => t.clone(),
+            Some(_) => {
+                return (
+                    None,
+                    params.clone(),
+                    Some(format!(
+                        "Error: Tool '{name}' is not loaded. Call tool_search first."
+                    )),
+                );
+            }
             None => {
-                let available = self.tool_names().join(", ");
+                // Only declared tools are listed, so the deferred catalogue does not leak.
+                let available = self.declared_tool_names().join(", ");
                 return (
                     None,
                     params.clone(),
@@ -168,6 +307,19 @@ impl ToolRegistry {
         self.tools.keys().cloned().collect()
     }
 
+    /// Names of the tools declared to the model now (direct, or deferred and loaded),
+    /// sorted A–Z.
+    pub fn declared_tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = self
+            .tools
+            .iter()
+            .filter(|(name, tool)| self.is_declared(name, tool))
+            .map(|(name, _)| name.clone())
+            .collect();
+        names.sort();
+        names
+    }
+
     /// Name and description of every registered tool, sorted by name so the
     /// order is stable across calls (the backing map is unordered).
     pub fn tool_summaries(&self) -> Vec<ToolSummary> {
@@ -218,6 +370,10 @@ impl ToolRegistry {
 
     /// Return a registry exposing only the tools whose name satisfies `keep`.
     /// The original registry is untouched, so this is a per-call view.
+    ///
+    /// The deferred built-ins carry over. The loaded tools are copied (those that are
+    /// kept) into a handle of the view's own, so loads in the view never reach the
+    /// source: the process-wide registry is shared by every chat.
     pub fn restrict_by(&self, keep: impl Fn(&str) -> bool) -> ToolRegistry {
         let tools = self
             .tools
@@ -225,9 +381,16 @@ impl ToolRegistry {
             .filter(|(name, _)| keep(name))
             .map(|(name, tool)| (name.clone(), tool.clone()))
             .collect();
+        let loaded = self
+            .loaded_names()
+            .into_iter()
+            .filter(|name| keep(name))
+            .collect();
         ToolRegistry {
             tools,
             disabled: HashMap::new(),
+            deferred_builtins: self.deferred_builtins.clone(),
+            loaded: Arc::new(Mutex::new(loaded)),
         }
     }
 
@@ -358,11 +521,59 @@ mod tests {
         }
     }
 
+    /// A tool of the deferred MCP server `srv`.
+    struct DeferredMcpTool(&'static str);
+
+    #[async_trait]
+    impl Tool for DeferredMcpTool {
+        fn name(&self) -> String {
+            self.0.to_string()
+        }
+        fn description(&self) -> String {
+            format!("Deferred tool {}.", self.0)
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {}, "required": [] })
+        }
+        fn exposure(&self) -> ToolExposure {
+            ToolExposure::Deferred
+        }
+        fn mcp_server_name(&self) -> Option<String> {
+            Some("srv".to_string())
+        }
+        async fn execute(&self, _params: &serde_json::Value) -> String {
+            "deferred result".to_string()
+        }
+    }
+
     fn registry_with_defaults() -> ToolRegistry {
         let mut reg = ToolRegistry::new();
         reg.register(Box::new(EchoTool));
         reg.register(Box::new(AddTool));
         reg
+    }
+
+    /// Direct built-ins `add` and `echo`, direct MCP tool `mcp_search`, deferred MCP
+    /// tools `mcp_srv_a` / `mcp_srv_b`, and the built-in `fail` deferred by config.
+    fn registry_with_deferred() -> ToolRegistry {
+        let mut reg = registry_with_defaults();
+        reg.register(Box::new(McpSearchTool));
+        reg.register(Box::new(DeferredMcpTool("mcp_srv_b")));
+        reg.register(Box::new(DeferredMcpTool("mcp_srv_a")));
+        reg.register(Box::new(FailTool));
+        reg.defer_builtins(["fail".to_string()]);
+        reg
+    }
+
+    fn definition_names(reg: &ToolRegistry) -> Vec<String> {
+        reg.get_definitions()
+            .iter()
+            .map(ToolRegistry::schema_name)
+            .collect()
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
     }
 
     // ── lifecycle tests ───────────────────────────────────────────────────────
@@ -542,6 +753,223 @@ mod tests {
             assert!(def["function"]["name"].is_string());
             assert!(def["function"]["description"].is_string());
         }
+    }
+
+    // ── deferred tools ────────────────────────────────────────────────────────
+
+    #[test]
+    fn exposure_comes_from_the_tool_or_the_deferred_builtins() {
+        let reg = registry_with_deferred();
+        assert_eq!(reg.exposure_of("echo"), Some(ToolExposure::Direct));
+        assert_eq!(reg.exposure_of("mcp_srv_a"), Some(ToolExposure::Deferred));
+        assert_eq!(reg.exposure_of("fail"), Some(ToolExposure::Deferred));
+        assert_eq!(reg.exposure_of("ghost"), None);
+        assert!(reg.has_deferred_tools());
+        assert!(!registry_with_defaults().has_deferred_tools());
+    }
+
+    #[test]
+    fn deferred_tools_are_not_declared_until_loaded() {
+        let reg = registry_with_deferred();
+        assert_eq!(
+            definition_names(&reg),
+            names(&["add", "echo", "mcp_search"])
+        );
+    }
+
+    #[test]
+    fn loaded_tools_are_appended_after_direct_mcp_in_load_order() {
+        let reg = registry_with_deferred();
+        reg.load_tools(&names(&["mcp_srv_b"]));
+        reg.load_tools(&names(&["fail", "mcp_srv_a"]));
+
+        assert_eq!(
+            definition_names(&reg),
+            names(&[
+                "add",
+                "echo",
+                "mcp_search",
+                "mcp_srv_b",
+                "fail",
+                "mcp_srv_a"
+            ])
+        );
+    }
+
+    #[test]
+    fn load_tools_skips_unknown_direct_and_already_loaded_names() {
+        let reg = registry_with_deferred();
+
+        let newly_loaded = reg.load_tools(&names(&["mcp_srv_a", "echo", "ghost", "mcp_srv_a"]));
+
+        assert_eq!(newly_loaded, names(&["mcp_srv_a"]));
+        assert!(reg.load_tools(&names(&["mcp_srv_a"])).is_empty());
+        assert_eq!(reg.loaded_tools(), names(&["mcp_srv_a"]));
+    }
+
+    #[test]
+    fn loaded_tools_skips_a_name_that_is_no_longer_registered() {
+        let mut reg = registry_with_deferred();
+        reg.load_tools(&names(&["mcp_srv_a", "mcp_srv_b"]));
+
+        reg.unregister("mcp_srv_a");
+
+        assert_eq!(reg.loaded_tools(), names(&["mcp_srv_b"]));
+        assert_eq!(
+            definition_names(&reg),
+            names(&["add", "echo", "mcp_search", "mcp_srv_b"])
+        );
+    }
+
+    #[test]
+    fn prepare_call_rejects_an_unloaded_deferred_tool_until_it_is_loaded() {
+        let reg = registry_with_deferred();
+
+        let (tool, _, error) = reg.prepare_call("mcp_srv_a", &serde_json::json!({}));
+        assert!(tool.is_none());
+        assert_eq!(
+            error.unwrap(),
+            "Error: Tool 'mcp_srv_a' is not loaded. Call tool_search first."
+        );
+
+        reg.load_tools(&names(&["mcp_srv_a"]));
+        let (tool, _, error) = reg.prepare_call("mcp_srv_a", &serde_json::json!({}));
+        assert!(tool.is_some());
+        assert!(error.is_none());
+    }
+
+    #[test]
+    fn unknown_tool_error_lists_declared_tools_only() {
+        let reg = registry_with_deferred();
+
+        let (_, _, error) = reg.prepare_call("ghost", &serde_json::json!({}));
+        let error = error.unwrap();
+
+        assert!(
+            error.ends_with("Available: add, echo, mcp_search"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn clones_share_loads_and_restricted_views_copy_them() {
+        let source = registry_with_deferred();
+        let view = source.restrict_by(|_| true);
+        let runner_copy = view.clone();
+
+        runner_copy.load_tools(&names(&["mcp_srv_a"]));
+        assert_eq!(view.loaded_tools(), names(&["mcp_srv_a"]));
+        assert!(
+            source.loaded_tools().is_empty(),
+            "a view must never load into the process-wide registry"
+        );
+
+        let nested_view = view.restrict_by(|_| true);
+        assert_eq!(nested_view.loaded_tools(), names(&["mcp_srv_a"]));
+        nested_view.load_tools(&names(&["mcp_srv_b"]));
+        assert_eq!(view.loaded_tools(), names(&["mcp_srv_a"]));
+    }
+
+    #[test]
+    fn two_views_of_one_registry_do_not_see_each_others_loads() {
+        let source = registry_with_deferred();
+        let first_chat = source.restrict_by(|_| true);
+        let second_chat = source.restrict_by(|_| true);
+
+        first_chat.load_tools(&names(&["mcp_srv_a"]));
+
+        assert!(second_chat.loaded_tools().is_empty());
+    }
+
+    #[test]
+    fn restrict_by_carries_the_deferred_builtins() {
+        let view = registry_with_deferred().restrict_by(|name| name != "add");
+        assert_eq!(view.exposure_of("fail"), Some(ToolExposure::Deferred));
+    }
+
+    #[test]
+    fn a_view_without_mcp_drops_loaded_mcp_tools_and_treats_them_as_unknown() {
+        let view = registry_with_deferred().restrict_by(|_| true);
+        view.load_tools(&names(&["mcp_srv_a", "fail"]));
+
+        let no_mcp = view.restrict_by(|name| !ToolRegistry::is_mcp_tool_name(name));
+
+        assert_eq!(no_mcp.loaded_tools(), names(&["fail"]));
+        let (_, _, error) = no_mcp.prepare_call("mcp_srv_a", &serde_json::json!({}));
+        assert!(error.unwrap().contains("Tool 'mcp_srv_a' not found"));
+    }
+
+    #[test]
+    fn a_view_without_mcp_has_nothing_deferred_when_only_mcp_tools_were() {
+        let mut reg = registry_with_defaults();
+        reg.register(Box::new(DeferredMcpTool("mcp_srv_a")));
+
+        let no_mcp = reg.restrict_by(|name| !ToolRegistry::is_mcp_tool_name(name));
+
+        assert!(reg.has_deferred_tools());
+        assert!(!no_mcp.has_deferred_tools());
+    }
+
+    #[test]
+    fn deferred_definitions_are_sorted_and_carry_server_and_loaded_flag() {
+        let reg = registry_with_deferred();
+        reg.load_tools(&names(&["mcp_srv_b"]));
+
+        let definitions = reg.deferred_definitions();
+
+        let summary: Vec<(&str, Option<&str>, bool)> = definitions
+            .iter()
+            .map(|d| (d.name.as_str(), d.server_name.as_deref(), d.loaded))
+            .collect();
+        assert_eq!(
+            summary,
+            vec![
+                ("fail", None, false),
+                ("mcp_srv_a", Some("srv"), false),
+                ("mcp_srv_b", Some("srv"), true),
+            ]
+        );
+        assert_eq!(definitions[1].description, "Deferred tool mcp_srv_a.");
+        assert_eq!(definitions[1].parameters["type"], "object");
+    }
+
+    #[test]
+    fn declared_tool_names_are_direct_plus_loaded() {
+        let reg = registry_with_deferred();
+        reg.load_tools(&names(&["mcp_srv_a"]));
+        assert_eq!(
+            reg.declared_tool_names(),
+            names(&["add", "echo", "mcp_search", "mcp_srv_a"])
+        );
+    }
+
+    // ── cache boundary flag ───────────────────────────────────────────────────
+
+    fn flagged_names(reg: &ToolRegistry) -> Vec<String> {
+        reg.get_definitions()
+            .iter()
+            .filter(|definition| definition.get(CACHE_BOUNDARY_KEY).is_some())
+            .map(ToolRegistry::schema_name)
+            .collect()
+    }
+
+    #[test]
+    fn cache_boundary_flags_only_the_last_direct_builtin() {
+        let reg = registry_with_deferred();
+        reg.load_tools(&names(&["fail"]));
+
+        assert_eq!(flagged_names(&reg), names(&["echo"]));
+        assert_eq!(reg.get_definitions()[1][CACHE_BOUNDARY_KEY], true);
+    }
+
+    #[test]
+    fn cache_boundary_is_absent_without_deferred_tools_or_builtins() {
+        assert!(flagged_names(&registry_with_defaults()).is_empty());
+
+        let mut only_mcp = ToolRegistry::new();
+        only_mcp.register(Box::new(McpSearchTool));
+        only_mcp.register(Box::new(DeferredMcpTool("mcp_srv_a")));
+        assert!(flagged_names(&only_mcp).is_empty());
     }
 
     // ── prepare_call tests ────────────────────────────────────────────────────

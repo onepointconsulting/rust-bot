@@ -730,6 +730,11 @@ pub trait LLMProvider: Send + Sync {
     }
 
     /// Return cache marker indices: builtin/MCP boundary and tail index.
+    ///
+    /// The boundary is the tool the registry flagged with
+    /// [`CACHE_BOUNDARY_KEY`](crate::providers::cache_control::CACHE_BOUNDARY_KEY) (the
+    /// last directly declared built-in) when present. Otherwise it is the last tool whose
+    /// name does not start with `mcp_`.
     fn tool_cache_marker_indices(tools: Option<Vec<serde_json::Value>>) -> Option<Vec<usize>> {
         let tools = tools?;
         if tools.is_empty() {
@@ -737,11 +742,18 @@ pub trait LLMProvider: Send + Sync {
         }
 
         let tail_idx = tools.len() - 1;
-        let mut last_builtin_idx: Option<usize> = None;
+        let flagged_boundary_idx = tools.iter().position(|tool| {
+            tool.get(crate::providers::cache_control::CACHE_BOUNDARY_KEY)
+                .and_then(|flag| flag.as_bool())
+                .unwrap_or(false)
+        });
+        let mut last_builtin_idx: Option<usize> = flagged_boundary_idx;
         for i in (0..=tail_idx).rev() {
+            if last_builtin_idx.is_some() {
+                break;
+            }
             if !Self::tool_name(&tools[i]).starts_with("mcp_") {
                 last_builtin_idx = Some(i);
-                break;
             }
         }
 
@@ -2206,6 +2218,23 @@ mod tests {
         assert_eq!(
             TestLLMProvider::tool_cache_marker_indices(Some(tools)),
             Some(vec![0])
+        );
+    }
+
+    #[test]
+    fn tool_cache_marker_indices_uses_the_flagged_boundary() {
+        let mut write = openai_tool("write");
+        write[crate::providers::cache_control::CACHE_BOUNDARY_KEY] = serde_json::json!(true);
+        let tools = vec![
+            openai_tool("read"),
+            write,
+            openai_tool("mcp_a"),
+            openai_tool("docx"),
+        ];
+
+        assert_eq!(
+            TestLLMProvider::tool_cache_marker_indices(Some(tools)),
+            Some(vec![1, 3])
         );
     }
 

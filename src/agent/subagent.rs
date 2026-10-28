@@ -1512,6 +1512,24 @@ mod tests {
     }
 
     #[test]
+    fn subagents_declare_every_tool_directly() {
+        // `tools.deferredTools` is applied to the main registry only: a subagent has no
+        // `tool_search`, so a deferred tool would be unreachable there.
+        let tmp = TempDir::new().unwrap();
+        let manager = SubagentManager::new_simple(
+            ScriptedProvider::arc(vec![]),
+            tmp.path().to_path_buf(),
+            Arc::new(MessageBus::new()),
+            4096,
+        );
+
+        let registry = manager.build_tool_registry();
+
+        assert!(!registry.has_deferred_tools());
+        assert_eq!(registry.get_definitions().len(), registry.len());
+    }
+
+    #[test]
     fn subagents_get_the_usual_tools_but_never_spawn_or_message() {
         let names = subagent_tool_names(&[]);
         for expected in ["read_file", "write_file", "edit_file", "shell"] {

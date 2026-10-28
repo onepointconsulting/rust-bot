@@ -2,6 +2,22 @@
 
 use serde_json::{Value, json};
 
+/// Internal flag the tool registry sets on the last tool of the stable, directly
+/// declared built-in prefix. The Anthropic provider puts its first tools cache marker
+/// there. It is not part of any provider API and is removed by
+/// [`strip_internal_tool_fields`] before a request is sent.
+pub const CACHE_BOUNDARY_KEY: &str = "cache_boundary";
+
+/// Remove the internal fields (see [`CACHE_BOUNDARY_KEY`]) from tool definitions so
+/// they never reach a provider API.
+pub fn strip_internal_tool_fields(tools: &mut [Value]) {
+    for tool in tools {
+        if let Some(tool) = tool.as_object_mut() {
+            tool.remove(CACHE_BOUNDARY_KEY);
+        }
+    }
+}
+
 /// Injects `cache_control` markers for prompt caching (e.g. Anthropic-style ephemeral blocks).
 ///
 /// Translation of the Python staticmethod `_apply_cache_control`.

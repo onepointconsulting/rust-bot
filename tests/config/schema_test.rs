@@ -20,6 +20,7 @@ fn test_create_mcp_server_config() {
         headers,
         tool_timeout: 30,
         enabled_tools: Vec::new(),
+        ..McpServerConfig::default()
     };
     let cfg = Config {
         tools: ToolsConfig {

@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
-use crate::agent::tools::base::Tool;
+use crate::agent::tools::base::{Tool, ToolExposure};
 use crate::config::schema::{McpServerConfig, McpTransportType};
 use http::HeaderName;
 use rmcp::model::{CallToolRequestParams, RawContent, Tool as McpToolDef};
@@ -522,13 +522,16 @@ pub async fn load_mcp_tools_with_file_refs(
         .tools
         .iter()
         .map(|tool_def| {
-            Box::new(MCPToolWrapper::with_file_refs(
-                peer.clone(),
-                server_name,
-                tool_def,
-                timeout,
-                file_refs.clone(),
-            )) as Box<dyn Tool>
+            Box::new(
+                MCPToolWrapper::with_file_refs(
+                    peer.clone(),
+                    server_name,
+                    tool_def,
+                    timeout,
+                    file_refs.clone(),
+                )
+                .with_exposure(config.exposure),
+            ) as Box<dyn Tool>
         })
         .collect();
     Ok(LoadedMcpTools { client, tools })
@@ -544,6 +547,11 @@ pub struct MCPToolWrapper {
     /// Expands `file://` / `$file` arguments just before dispatch. `None`
     /// disables the feature, in which case sentinels are sent through verbatim.
     file_refs: Option<FileRefResolver>,
+    /// The configured server name, kept because it cannot be parsed back out of
+    /// `mcp_{server}_{tool}` (server names may contain `_`).
+    server_name: String,
+    /// From the server's `exposure` setting; `Direct` unless configured otherwise.
+    exposure: ToolExposure,
 }
 
 impl MCPToolWrapper {
@@ -584,7 +592,15 @@ impl MCPToolWrapper {
             parameters: parameters.clone(),
             tool_timeout,
             file_refs,
+            server_name: server_name.to_string(),
+            exposure: ToolExposure::Direct,
         }
+    }
+
+    /// Set whether this tool is declared directly or only after `tool_search` loads it.
+    pub fn with_exposure(mut self, exposure: ToolExposure) -> Self {
+        self.exposure = exposure;
+        self
     }
 }
 
@@ -600,6 +616,14 @@ impl Tool for MCPToolWrapper {
 
     fn parameters(&self) -> Value {
         self.parameters.clone()
+    }
+
+    fn exposure(&self) -> ToolExposure {
+        self.exposure
+    }
+
+    fn mcp_server_name(&self) -> Option<String> {
+        Some(self.server_name.clone())
     }
 
     async fn execute(&self, params: &serde_json::Value) -> String {

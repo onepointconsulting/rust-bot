@@ -30,8 +30,9 @@ pub const BOOTSTRAP_FILES: [&str; 4] = [AGENTS_FILE, SOUL_FILE, USER_FILE, TOOLS
 const MAX_RECENT_HISTORY: usize = 50;
 
 /// A part of the system prompt that is worked out each time a prompt is built
-/// (it may change between turns, e.g. the agents that exist now).
-pub type PromptSection = Arc<dyn Fn() -> Option<String> + Send + Sync>;
+/// (it may change between turns, e.g. the agents that exist now). It receives the
+/// session's mode, so it can leave out what that mode hides (e.g. MCP servers).
+pub type PromptSection = Arc<dyn Fn(AgentMode) -> Option<String> + Send + Sync>;
 
 pub struct ContextBuilder {
     workspace: PathBuf,
@@ -159,7 +160,11 @@ impl ContextBuilder {
         }
 
         if mode.include_skills() {
-            parts.extend(self.prompt_sections.iter().filter_map(|section| section()));
+            parts.extend(
+                self.prompt_sections
+                    .iter()
+                    .filter_map(|section| section(mode)),
+            );
         }
 
         if mode.include_recent_history() {
@@ -918,6 +923,17 @@ mod tests {
             prompt.contains("\n\n---\n\n"),
             "sections should be separated by '\\n\\n---\\n\\n'"
         );
+    }
+
+    #[test]
+    fn prompt_sections_receive_the_mode_the_prompt_is_built_for() {
+        let tmp = TempDir::new().unwrap();
+        let b = make_builder(&tmp)
+            .with_prompt_section(Arc::new(|mode| Some(format!("section-for-{mode}"))));
+
+        let prompt = b.build_system_prompt_for_mode(None, None, AgentMode::NoMcp, None);
+
+        assert!(prompt.contains("section-for-no_mcp"), "{prompt}");
     }
 
     #[test]

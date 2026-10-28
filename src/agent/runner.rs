@@ -3006,20 +3006,43 @@ mod tests {
 
     // ── before_execute_tools decisions ────────────────────────────────────────
 
+    /// Names of the tools declared on each request, in request order.
+    type RequestedToolNames = Arc<Mutex<Vec<Vec<String>>>>;
+
     struct ScriptedProvider {
         settings: GenerationSettings,
         responses: Mutex<Vec<LLMResponse>>,
+        requested_tool_names: RequestedToolNames,
     }
 
     impl ScriptedProvider {
         fn new_boxed(responses: Vec<LLMResponse>) -> Arc<dyn LLMProviderDyn> {
-            Arc::new(Self {
-                settings: GenerationSettings::new(),
-                responses: Mutex::new(responses),
-            })
+            Self::new_recording(responses).0
         }
 
-        fn next(&self) -> LLMResponse {
+        /// Like [`Self::new_boxed`], plus the tool names each request declared.
+        fn new_recording(
+            responses: Vec<LLMResponse>,
+        ) -> (Arc<dyn LLMProviderDyn>, RequestedToolNames) {
+            let requested_tool_names = Arc::new(Mutex::new(Vec::new()));
+            let provider = Arc::new(Self {
+                settings: GenerationSettings::new(),
+                responses: Mutex::new(responses),
+                requested_tool_names: Arc::clone(&requested_tool_names),
+            });
+            (provider, requested_tool_names)
+        }
+
+        fn next(&self, tools: &Option<Vec<Value>>) -> LLMResponse {
+            let names = tools
+                .iter()
+                .flatten()
+                .filter_map(|tool| tool["function"]["name"].as_str().map(str::to_string))
+                .collect();
+            self.requested_tool_names
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push(names);
             let mut responses = self.responses.lock().unwrap_or_else(|e| e.into_inner());
             if responses.is_empty() {
                 LLMResponse {
@@ -3062,43 +3085,43 @@ mod tests {
         async fn chat(
             &self,
             _: Vec<Value>,
-            _: Option<Vec<Value>>,
+            tools: Option<Vec<Value>>,
             _: Option<String>,
             _: usize,
             _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
-            self.next()
+            self.next(&tools)
         }
         async fn safe_chat(
             &self,
             _: Vec<Value>,
-            _: Option<Vec<Value>>,
+            tools: Option<Vec<Value>>,
             _: Option<String>,
             _: usize,
             _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
-            self.next()
+            self.next(&tools)
         }
         async fn chat_with_retry(
             &self,
             _: Vec<Value>,
-            _: Option<Vec<Value>>,
+            tools: Option<Vec<Value>>,
             _: Option<String>,
             _: Option<usize>,
             _: Option<f32>,
             _: Option<String>,
             _: Option<Value>,
         ) -> LLMResponse {
-            self.next()
+            self.next(&tools)
         }
         async fn chat_stream_with_retry_boxed(
             &self,
             _: Vec<Value>,
-            _: Option<Vec<Value>>,
+            tools: Option<Vec<Value>>,
             _: Option<String>,
             _: Option<usize>,
             _: Option<f32>,
@@ -3107,7 +3130,7 @@ mod tests {
             _: Option<BoxedStreamCallback>,
             _: Option<BoxedProgressCallback>,
         ) -> LLMResponse {
-            self.next()
+            self.next(&tools)
         }
     }
 
@@ -3131,6 +3154,69 @@ mod tests {
             *self.hits.lock().unwrap_or_else(|e| e.into_inner()) += 1;
             "ok".into()
         }
+    }
+
+    // ── deferred tools ────────────────────────────────────────────────────────
+
+    /// A `CountingTool` that is only declared after `tool_search` loads it.
+    struct DeferredCountingTool(CountingTool);
+
+    #[async_trait::async_trait]
+    impl crate::agent::tools::base::Tool for DeferredCountingTool {
+        fn name(&self) -> String {
+            self.0.name()
+        }
+        fn description(&self) -> String {
+            "Count deferred things.".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            self.0.parameters()
+        }
+        fn exposure(&self) -> crate::agent::tools::base::ToolExposure {
+            crate::agent::tools::base::ToolExposure::Deferred
+        }
+        async fn execute(&self, params: &serde_json::Value) -> String {
+            self.0.execute(params).await
+        }
+    }
+
+    #[tokio::test]
+    async fn run_declares_a_tool_loaded_by_tool_search_from_the_next_request() {
+        use crate::agent::tools::tool_search::ToolSearchTool;
+
+        let hits = Arc::new(Mutex::new(0usize));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(DeferredCountingTool(CountingTool {
+            name: "mcp_srv_count".into(),
+            hits: Arc::clone(&hits),
+        })));
+        let search_view = tools.clone();
+        tools.register(Box::new(ToolSearchTool::new(search_view)));
+        let mut search_call = tc("tool_search");
+        search_call
+            .arguments
+            .insert("query".into(), serde_json::json!("count deferred"));
+        let (provider, requested_tool_names) = ScriptedProvider::new_recording(vec![
+            tool_call_llm_response(vec![search_call]),
+            tool_call_llm_response(vec![tc("mcp_srv_count")]),
+            text_llm_response("counted"),
+        ]);
+
+        let result = AgentRunner::new(provider)
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                tools,
+                model: "test".into(),
+                max_iterations: 4,
+                ..Default::default()
+            })
+            .await;
+
+        assert_eq!(result.final_content.as_deref(), Some("counted"));
+        assert_eq!(*hits.lock().unwrap(), 1);
+        let requested = requested_tool_names.lock().unwrap().clone();
+        assert_eq!(requested[0], vec!["tool_search"]);
+        assert_eq!(requested[1], vec!["tool_search", "mcp_srv_count"]);
     }
 
     struct FixedDecisionHook {
