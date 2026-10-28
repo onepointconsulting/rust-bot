@@ -10,6 +10,7 @@
 //! already decide whether the tool exists. It never blocks on user input.
 
 use std::collections::{BTreeMap, HashMap, HashSet};
+use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde_json::{Value, json};
@@ -129,9 +130,14 @@ fn first_line(description: &str) -> &str {
     description.trim().lines().next().unwrap_or("")
 }
 
+/// Called with every deferred tool loaded so far in the view, each time a search loads
+/// something new. The agent loop uses it to save the loads on the session.
+pub type OnToolsLoaded = Arc<dyn Fn(&[String]) + Send + Sync>;
+
 pub struct ToolSearchTool {
     /// The turn's tool view; shares its loaded-tools handle.
     tools: ToolRegistry,
+    on_load: Option<OnToolsLoaded>,
 }
 
 /// Matches of one search, best first.
@@ -145,7 +151,16 @@ struct SearchOutcome {
 
 impl ToolSearchTool {
     pub fn new(tools: ToolRegistry) -> Self {
-        Self { tools }
+        Self {
+            tools,
+            on_load: None,
+        }
+    }
+
+    /// Call `on_load` whenever a search loads a tool that was not loaded before.
+    pub fn on_load(mut self, on_load: OnToolsLoaded) -> Self {
+        self.on_load = Some(on_load);
+        self
     }
 
     /// Read `limit` from the arguments: absent means the default, a non-positive or
@@ -176,7 +191,12 @@ impl ToolSearchTool {
             .into_iter()
             .partition(|ranked| ranked.named || ranked.score >= best_score * LOAD_SCORE_RATIO);
         let strong_names: Vec<String> = strong_matches.into_iter().map(|m| m.name).collect();
-        self.tools.load_tools(&strong_names);
+        let newly_loaded = self.tools.load_tools(&strong_names);
+        if !newly_loaded.is_empty()
+            && let Some(on_load) = &self.on_load
+        {
+            on_load(&self.tools.loaded_tools());
+        }
         let definitions_of = |names: Vec<String>| -> Vec<DeferredToolDefinition> {
             names
                 .iter()
@@ -288,6 +308,7 @@ impl Tool for ToolSearchTool {
 mod tests {
     use super::*;
     use crate::agent::tools::base::ToolExposure;
+    use std::sync::Mutex;
 
     /// A tool with a fixed name, description and exposure.
     struct FakeTool {
@@ -607,6 +628,39 @@ Second line.",
         assert_eq!(
             example_tool_names("our_yagya-cms", &tool_names),
             vec!["list_new"]
+        );
+    }
+
+    // ── on_load ───────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn on_load_receives_all_loads_and_only_fires_when_something_is_new() {
+        let tools = registry();
+        let calls: Arc<Mutex<Vec<Vec<String>>>> = Arc::new(Mutex::new(Vec::new()));
+        let recorded = Arc::clone(&calls);
+        let search = ToolSearchTool::new(tools.clone()).on_load(Arc::new(move |loaded| {
+            recorded.lock().unwrap().push(loaded.to_vec());
+        }));
+
+        search.execute(&json!({"query": "cms entries"})).await;
+        search.execute(&json!({"query": "cms entries"})).await;
+        search.execute(&json!({"query": "weather"})).await;
+        search
+            .execute(&json!({"query": "mcp_jira_create_issue"}))
+            .await;
+
+        assert_eq!(
+            *calls.lock().unwrap(),
+            vec![
+                vec!["mcp_cms_find_entries".to_string()],
+                // The exact name loads `create_issue`; `search_issues` shares enough
+                // words ("jira", "issue") to pass the score cut-off.
+                vec![
+                    "mcp_cms_find_entries".to_string(),
+                    "mcp_jira_create_issue".to_string(),
+                    "mcp_jira_search_issues".to_string()
+                ],
+            ]
         );
     }
 }

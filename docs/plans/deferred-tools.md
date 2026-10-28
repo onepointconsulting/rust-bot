@@ -226,9 +226,19 @@ tool. Metadata does not have that problem.
   - hidden by the mode (for example `no_mcp`): switching modes back restores them;
   - not registered (server removed from config, or not connected yet): restored when it connects;
   - now direct (config changed): already declared, so seeding it would declare it twice in `get_definitions`.
-- Write it back when a turn finishes and with each `tools_completed` checkpoint, so a crash right after a load keeps
-  it. Needs a read of `checkpoint_payload.rs` and `resume.rs` first.
-- Clear it wherever session history is cleared (`/new`), since the history that used the tools is gone.
+- Save it the moment `tool_search` loads something new: `ToolSearchTool::on_load` calls
+  `AgentLoop::record_session_loaded_tools`, which adds the names to the live session and saves it. (The plan first
+  said "at each `tools_completed` checkpoint", but with a journal, the default, the runner writes checkpoints to the
+  journal and never calls the metadata callback.) A crash after a load therefore cannot lose it, and the session
+  file is only rewritten when a load actually happens.
+- At turn end, `persist_finished_turn` saves the snapshot taken when the turn started. It first copies
+  `loaded_tools` over from the live session (`carry_loaded_tools_from_live_session`), so the save does not erase the
+  turn's loads. Merging is a union: names the turn could not see stay.
+- Crash replay: `replay_interrupted_calls` looks tools up in the process-wide registry, where the per-turn
+  `tool_search` does not exist, so an interrupted `tool_search` call is not replayed; the model gets the usual
+  "interrupted" result and can search again. Its loads were already saved by `on_load`.
+- Clear it wherever session history is cleared: `Session::clear`, used by `reset_session` (`/new`, websocket reset)
+  and idle compaction, since the history that used the tools is gone.
 - The set only grows within a session. There is no unload, which also avoids history containing calls to tools that
   are no longer declared.
 
@@ -292,6 +302,19 @@ for tools did it call `tool_search`. It then needed 7 searches, loading about 50
   built-in.
 - Search noise is open: see "Ranking on CRUD-style servers" under Risks.
 
+Measurement (2026-10-28, Xiaomi model via the OpenAI-compatible provider, `ouryagya-strapi`, similar "list the 10
+latest X" prompts, from `token_usage` in session metadata):
+
+| Exposure | Model requests | Input | Cache read | Prompt tokens per request |
+|---|---|---|---|---|
+| `direct` | 6 | 406,517 | 2,439,680 | about 474,000 |
+| `deferred` | 8 | 40,620 | 74,240 | about 14,000 |
+
+About 33 times fewer prompt tokens per request. The prompts differed (avyakt signals vs articles), so this is
+indicative, not a controlled comparison. With `direct`, each request is larger than a 200k-token context window,
+so the server is only usable at all with very large-context models. The deferred session's first search was
+`"list_article"`, an exact-name query following the example names, and loaded the right tool at once.
+
 - Baseline first: the `ouryagya-strapi` server (SSE, more than 100 tools, `enabledTools: ["*"]`), one session with
   `exposure: direct`, recording input tokens and `cache_creation` / `cache_read` per request from the usage logging.
   Use the same prompts again with `deferred` after M1. Open question 3 depends on these numbers.
@@ -306,9 +329,12 @@ for tools did it call `tool_search`. It then needed 7 searches, loading about 50
 
 ### M2. Persistence and lifecycle
 
-- `loaded_tools` metadata key, seed at turn start, save at turn end and at `tools_completed`.
-- Reset on `/new`; respect `AgentMode` filtering (D5).
-- Verify crash replay of `tool_search` with the existing recovery tests as a model.
+Status (2026-10-28): implemented as described in D5, unit tests green, not yet tried on a real installation.
+
+- `loaded_tools` metadata key, seeded in `tools_for_session`, saved by `tool_search` on each new load, carried over
+  at turn end.
+- Reset with the history (`Session::clear`); `AgentMode` filtering respected (D5).
+- Crash replay of `tool_search` checked: not replayed (per-turn tool), harmless because loads are saved at once.
 
 ### M3. Surfaces
 
@@ -369,7 +395,8 @@ Unit tests next to the code, as in the rest of the repo.
 - Config validation (M1): deferring `tool_search` is rejected; an unknown deferred name and a name both disabled
   and deferred produce a warning, and disabled wins.
 - Persistence (M2): seed, save, ignore names outside the mode view, reset on `/new`. Seeding skips a name that is
-  not registered and a name that is now direct (no duplicate in `get_definitions`).
+  not registered and a name that is now direct (no duplicate in `get_definitions`). End to end: a tool loaded in one
+  turn is callable without a new search in the next (`a_tool_loaded_in_one_turn_can_be_called_in_the_next`).
 - Prompt section (M3): lists deferred servers and deferred built-ins; leaves out names outside the mode view;
   absent when nothing is deferred; starts with the "call tool_search before saying you cannot" instruction; uses
   `description` when set and the bare server name otherwise; leaves out a
@@ -409,7 +436,8 @@ Unit tests next to the code, as in the rest of the repo.
    rule for now. The user chooses in config, so the docs must show how (see "User configuration" under D1).
 2. Should deferred apply to subagents? Today they get no MCP tools, and D1 makes them ignore
    `tools.deferredTools`, so they get every built-in directly. Recommendation: keep it that way.
-3. Is M4 worth pursuing after M1 numbers are in?
+3. Is M4 worth pursuing after M1 numbers are in? Recommendation after the measurement: no. A load costs one cache
+   write of a ~14k-token prompt; the saving is about 460k tokens on every request.
 4. Should rust-bot handle `notifications/tools/list_changed`? For deferred servers it would be cheap: re-register the
    server's tools and the corpus follows, with no change to the `tools` array. A loaded tool the server removes
    would need the same treatment as a name outside the mode view (D5: skipped, not deleted). Recommendation: out of

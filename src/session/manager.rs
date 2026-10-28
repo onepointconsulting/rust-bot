@@ -20,8 +20,10 @@ use crate::{
     session::{
         GOAL_STATE_KEY, SESSION_PINNED_METADATA_KEY, SESSION_TITLE_METADATA_KEY,
         SESSION_TOKEN_USAGE_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY,
-        history_visibility::is_hidden_history_message, journal::JournalStore,
-        journal_file::FileJournalStore, keys::COMMAND_KEY,
+        history_visibility::is_hidden_history_message,
+        journal::JournalStore,
+        journal_file::FileJournalStore,
+        keys::{COMMAND_KEY, SESSION_LOADED_TOOLS_METADATA_KEY},
     },
     utils::fs::write_atomic,
     utils::helpers::{
@@ -661,8 +663,9 @@ impl Session {
     /// Also drops conversation-scoped metadata that would be wrong on an
     /// empty transcript: [`GOAL_STATE_KEY`] (would keep injecting the old
     /// objective into later turns), [`SESSION_TOKEN_USAGE_KEY`] (lifetime
-    /// totals for the conversation that was just wiped), and
-    /// [`SessionManager::LAST_SUMMARY_KEY`] (summarizes the wiped history).
+    /// totals for the conversation that was just wiped),
+    /// [`SessionManager::LAST_SUMMARY_KEY`] (summarizes the wiped history) and
+    /// [`SESSION_LOADED_TOOLS_METADATA_KEY`] (the history that used those tools is gone).
     /// Other metadata (workspace scope, owner, title, model preset, …) is
     /// left alone.
     pub fn clear(&mut self) {
@@ -671,6 +674,7 @@ impl Session {
         self.metadata.remove(GOAL_STATE_KEY);
         self.metadata.remove(SESSION_TOKEN_USAGE_KEY);
         self.metadata.remove(SessionManager::LAST_SUMMARY_KEY);
+        self.metadata.remove(SESSION_LOADED_TOOLS_METADATA_KEY);
         self.updated_at = Utc::now();
     }
 
@@ -739,6 +743,44 @@ impl Session {
         self.last_consolidated = before_lc.min(end_idx).saturating_sub(start_idx);
         self.messages = self.messages[start_idx..end_idx].to_vec();
         self.updated_at = Utc::now();
+    }
+
+    /// Deferred tools loaded by `tool_search` in this session, in load order. Entries
+    /// that are not strings are skipped.
+    pub fn loaded_tools(&self) -> Vec<String> {
+        self.metadata
+            .get(SESSION_LOADED_TOOLS_METADATA_KEY)
+            .and_then(Value::as_array)
+            .map(|names| {
+                names
+                    .iter()
+                    .filter_map(Value::as_str)
+                    .map(str::to_string)
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Add `names` to [`Self::loaded_tools`], keeping the existing order and appending
+    /// new names in the given order. Nothing is removed: a name the current turn could
+    /// not see (hidden by the mode, server not connected) stays for later turns.
+    /// Returns whether the list changed.
+    pub fn record_loaded_tools(&mut self, names: &[String]) -> bool {
+        let mut loaded = self.loaded_tools();
+        let before = loaded.len();
+        for name in names {
+            if !loaded.contains(name) {
+                loaded.push(name.clone());
+            }
+        }
+        if loaded.len() == before {
+            return false;
+        }
+        self.metadata.insert(
+            SESSION_LOADED_TOOLS_METADATA_KEY.to_string(),
+            Value::Array(loaded.into_iter().map(Value::String).collect()),
+        );
+        true
     }
 
     /// Accumulated LLM usage for this session, if any has been recorded.
@@ -1922,6 +1964,64 @@ mod tests {
                 .metadata
                 .contains_key(SessionManager::LAST_SUMMARY_KEY)
         );
+    }
+
+    #[test]
+    fn clear_removes_loaded_tools() {
+        let mut session = Session::new("k-loaded".into());
+        session.record_loaded_tools(&["mcp_srv_a".to_string()]);
+        session.clear();
+        assert!(session.loaded_tools().is_empty());
+        assert!(
+            !session
+                .metadata
+                .contains_key(SESSION_LOADED_TOOLS_METADATA_KEY)
+        );
+    }
+
+    fn tool_names(names: &[&str]) -> Vec<String> {
+        names.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn record_loaded_tools_appends_new_names_in_order_without_duplicates() {
+        let mut session = Session::new("k-record".into());
+
+        assert!(session.record_loaded_tools(&tool_names(&["b", "a"])));
+        assert!(session.record_loaded_tools(&tool_names(&["a", "c"])));
+
+        assert_eq!(session.loaded_tools(), tool_names(&["b", "a", "c"]));
+    }
+
+    #[test]
+    fn record_loaded_tools_never_removes_a_name() {
+        let mut session = Session::new("k-keep".into());
+        session.record_loaded_tools(&tool_names(&["hidden_by_mode", "a"]));
+
+        assert!(!session.record_loaded_tools(&tool_names(&["a"])));
+
+        assert_eq!(session.loaded_tools(), tool_names(&["hidden_by_mode", "a"]));
+    }
+
+    #[test]
+    fn record_loaded_tools_with_nothing_new_leaves_metadata_untouched() {
+        let mut session = Session::new("k-empty".into());
+        assert!(!session.record_loaded_tools(&[]));
+        assert!(
+            !session
+                .metadata
+                .contains_key(SESSION_LOADED_TOOLS_METADATA_KEY)
+        );
+    }
+
+    #[test]
+    fn loaded_tools_skips_entries_that_are_not_strings() {
+        let mut session = Session::new("k-bad".into());
+        session.metadata.insert(
+            SESSION_LOADED_TOOLS_METADATA_KEY.to_string(),
+            json!(["a", 7, null, "b"]),
+        );
+        assert_eq!(session.loaded_tools(), tool_names(&["a", "b"]));
     }
 
     #[test]

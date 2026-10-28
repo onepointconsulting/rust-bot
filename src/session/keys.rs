@@ -14,6 +14,11 @@ pub const SESSION_MODEL_PRESET_METADATA_KEY: &str = "model_preset";
 /// process-wide `agents.mode` default.
 pub const SESSION_AGENT_MODE_METADATA_KEY: &str = "mode";
 
+/// Deferred tools `tool_search` loaded in this session, in load order (a JSON array of
+/// tool names). Seeded into each turn's tool view, so a load lasts for the session.
+/// Only grows; cleared with the history (`/new`).
+pub const SESSION_LOADED_TOOLS_METADATA_KEY: &str = "loaded_tools";
+
 /// Sustained-goal blob (`objective` / `status` / `recap`). See `goal_state`.
 pub const GOAL_STATE_KEY: &str = "goal_state";
 

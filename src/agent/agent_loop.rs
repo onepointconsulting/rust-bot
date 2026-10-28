@@ -858,10 +858,20 @@ impl AgentLoop {
     }
 
     /// Tools visible to this session after applying its agent mode.
+    ///
+    /// The view has its own loaded-tools handle, seeded from the session's
+    /// `loaded_tools`. Names the view cannot load (hidden by the mode, not registered,
+    /// or no longer deferred) are skipped here but stay in the session metadata.
     pub fn tools_for_session(&self, session: Option<&Session>) -> ToolRegistry {
         let mode = self.mode_for_session(session);
-        let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
-        mode.restrict_tools(&registry)
+        let view = {
+            let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+            mode.restrict_tools(&registry)
+        };
+        if let Some(session) = session {
+            view.load_tools(&session.loaded_tools());
+        }
+        view
     }
 
     /// Resolve the workspace scope a session would use right now (its
@@ -1328,10 +1338,18 @@ impl AgentLoop {
         let mode = self.mode_for_session(session.as_ref());
         let mut run_tools = self.tools_for_session(session.as_ref());
         // `tool_search` exists only when this view has something to load. It shares the
-        // view's loaded-tools handle, so its loads reach the runner's next request.
+        // view's loaded-tools handle, so its loads reach the runner's next request, and
+        // it saves each load on the session right away, so later turns (and a restart)
+        // keep it.
         if run_tools.has_deferred_tools() {
-            let search_view = run_tools.clone();
-            run_tools.register(Box::new(ToolSearchTool::new(search_view)));
+            let mut tool_search = ToolSearchTool::new(run_tools.clone());
+            if let Some(key) = session_key.clone() {
+                let this = Arc::clone(self);
+                tool_search = tool_search.on_load(Arc::new(move |loaded_tools: &[String]| {
+                    this.record_session_loaded_tools(&key, loaded_tools);
+                }));
+            }
+            run_tools.register(Box::new(tool_search));
         }
         log::info!(
             "Running agent loop with {} tools (mode={})",
@@ -1831,6 +1849,23 @@ impl AgentLoop {
             in_flight.finish(status, result);
         }
         reset_workspace_scope(scope_token);
+    }
+
+    /// Add `loaded_tools` to the session's `loaded_tools` and save the session if that
+    /// changed it (see [`Session::record_loaded_tools`]).
+    fn record_session_loaded_tools(&self, session_key: &str, loaded_tools: &[String]) {
+        let mut manager = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session(session_key);
+        if !session.record_loaded_tools(loaded_tools) {
+            return;
+        }
+        let snapshot = session.clone();
+        if let Err(e) = manager.save(snapshot) {
+            log::error!("Failed to save the tools loaded by tool_search: {e}");
+        }
     }
 
     /// Persist the latest in-flight turn state into session metadata.
@@ -2499,6 +2534,7 @@ impl AgentLoop {
         save_error_context: &str,
     ) {
         session.update_usage(usage);
+        self.carry_loaded_tools_from_live_session(session);
         self.save_turn(session, messages, skip);
         self.clear_runtime_checkpoint(session);
         if let Err(e) = self
@@ -2509,6 +2545,20 @@ impl AgentLoop {
         {
             log::error!("Failed to save session after {save_error_context}: {e}");
         }
+    }
+
+    /// Copy the `loaded_tools` `tool_search` wrote to the live session during the turn into
+    /// `session`, the snapshot taken when the turn started, so saving the snapshot does
+    /// not drop the loads.
+    fn carry_loaded_tools_from_live_session(&self, session: &mut Session) {
+        let live_loaded_tools = self
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_session_internal(&session.key)
+            .map(|live| live.loaded_tools())
+            .unwrap_or_default();
+        session.record_loaded_tools(&live_loaded_tools);
     }
 
     /// Save new-turn messages into session, truncating large tool results.
@@ -5364,5 +5414,190 @@ mod tests {
         assert_eq!(split_system_chat_id("websocket:abc"), ("websocket", "abc"));
         assert_eq!(split_system_chat_id("telegram:a:b"), ("telegram", "a:b"));
         assert_eq!(split_system_chat_id("direct"), ("cli", "direct"));
+    }
+
+    // ── deferred tools across turns ───────────────────────────────────────────
+
+    /// A deferred tool of the MCP server `srv` that counts its runs.
+    struct DeferredProbe {
+        runs: Arc<std::sync::atomic::AtomicUsize>,
+    }
+
+    #[async_trait]
+    impl crate::agent::tools::base::Tool for DeferredProbe {
+        fn name(&self) -> String {
+            "mcp_srv_probe".into()
+        }
+        fn description(&self) -> String {
+            "Count deferred probe runs.".into()
+        }
+        fn parameters(&self) -> Value {
+            json!({"type": "object", "properties": {}})
+        }
+        fn exposure(&self) -> crate::agent::tools::base::ToolExposure {
+            crate::agent::tools::base::ToolExposure::Deferred
+        }
+        fn mcp_server_name(&self) -> Option<String> {
+            Some("srv".into())
+        }
+        async fn execute(&self, _: &Value) -> String {
+            self.runs.fetch_add(1, Ordering::SeqCst);
+            "probe ran".into()
+        }
+    }
+
+    fn register_deferred_probe(loop_: &AgentLoop) -> Arc<std::sync::atomic::AtomicUsize> {
+        let runs = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        loop_
+            .tools
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .register(Box::new(DeferredProbe { runs: runs.clone() }));
+        runs
+    }
+
+    fn tool_search_response(query: &str) -> LLMResponse {
+        LLMResponse {
+            tool_calls: vec![crate::providers::base::ToolCallRequest {
+                id: "c-search".into(),
+                name: "tool_search".into(),
+                arguments: HashMap::from([("query".to_string(), json!(query))]),
+                extra_content: None,
+                provider_specific_fields: None,
+                function_provider_specific_fields: None,
+            }],
+            finish_reason: "tool_calls".into(),
+            ..LLMResponse::new()
+        }
+    }
+
+    fn names(list: &[&str]) -> Vec<String> {
+        list.iter().map(|name| name.to_string()).collect()
+    }
+
+    #[test]
+    fn tools_for_session_seeds_the_loads_the_view_can_take() {
+        let loop_ = make_save_turn_loop(1000);
+        register_deferred_probe(&loop_);
+        let mut session = Session::new("test:seed-loaded".into());
+        session.record_loaded_tools(&names(&["mcp_srv_probe", "ghost", "read_file"]));
+
+        let view = loop_.tools_for_session(Some(&session));
+
+        assert_eq!(view.loaded_tools(), names(&["mcp_srv_probe"]));
+    }
+
+    #[test]
+    fn tools_for_session_skips_loads_the_mode_hides_but_keeps_them_in_the_session() {
+        let loop_ = make_save_turn_loop(1000);
+        register_deferred_probe(&loop_);
+        let mut session = Session::new("test:seed-no-mcp".into());
+        session.record_loaded_tools(&names(&["mcp_srv_probe"]));
+        session.metadata.insert(
+            SESSION_AGENT_MODE_METADATA_KEY.to_string(),
+            json!(AgentMode::NoMcp.as_str()),
+        );
+
+        let view = loop_.tools_for_session(Some(&session));
+
+        assert!(view.loaded_tools().is_empty());
+        assert_eq!(session.loaded_tools(), names(&["mcp_srv_probe"]));
+    }
+
+    #[test]
+    fn recording_loads_does_not_drop_names_the_turn_could_not_see() {
+        let loop_ = make_save_turn_loop(1000);
+        let key = format!("test:record-loaded-{}", uuid::Uuid::new_v4());
+        {
+            let mut manager = loop_.session_manager.lock().unwrap();
+            let session = manager.get_or_create_session(&key);
+            session.record_loaded_tools(&names(&["hidden_by_mode"]));
+        }
+
+        loop_.record_session_loaded_tools(&key, &names(&["mcp_srv_probe"]));
+
+        let mut manager = loop_.session_manager.lock().unwrap();
+        assert_eq!(
+            manager.get_or_create_session(&key).loaded_tools(),
+            names(&["hidden_by_mode", "mcp_srv_probe"])
+        );
+    }
+
+    #[test]
+    fn persist_finished_turn_keeps_loads_the_pre_run_snapshot_did_not_have() {
+        let loop_ = make_save_turn_loop(1000);
+        let key = format!("test:persist-loaded-{}", uuid::Uuid::new_v4());
+        let mut pre_run = Session::new(key.clone());
+        loop_.record_session_loaded_tools(&key, &names(&["mcp_srv_probe"]));
+
+        loop_.persist_finished_turn(
+            &mut pre_run,
+            &[
+                json!({"role": "user", "content": "hello"}),
+                json!({"role": "assistant", "content": "Hello!"}),
+            ],
+            1,
+            LLMUsage::new(),
+            "test",
+        );
+
+        let manager = loop_.session_manager.lock().unwrap();
+        let live = manager.get_session_internal(&key).unwrap();
+        assert_eq!(live.loaded_tools(), names(&["mcp_srv_probe"]));
+    }
+
+    #[tokio::test]
+    async fn a_tool_loaded_in_one_turn_can_be_called_in_the_next() {
+        let workspace = tempfile::tempdir().unwrap();
+        let model_requests = Arc::new(Mutex::new(Vec::new()));
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(RecordingProvider {
+            settings: GenerationSettings::new(),
+            reply: "done".into(),
+            script: Mutex::new(vec![
+                tool_search_response("probe"),
+                text_response("loaded"),
+                tool_call_response(&[("c-probe", "mcp_srv_probe")]),
+                text_response("probed"),
+            ]),
+            requests: model_requests.clone(),
+        });
+        let loop_ = Arc::new(AgentLoop::new(
+            Arc::new(MessageBus::new()),
+            provider,
+            workspace.path().to_path_buf(),
+            Config::default(),
+            None,
+            None,
+            None,
+        ));
+        let runs = register_deferred_probe(&loop_);
+        let send = |text: &'static str| {
+            Arc::clone(&loop_).process_direct(
+                text,
+                Some("chan:chat1"),
+                Some("chan"),
+                Some("chat1"),
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        send("find the probe").await;
+        let loaded_after_first_turn = loop_
+            .session_manager
+            .lock()
+            .unwrap()
+            .get_or_create_session("chan:chat1")
+            .loaded_tools();
+        send("run the probe").await;
+
+        assert_eq!(loaded_after_first_turn, names(&["mcp_srv_probe"]));
+        assert_eq!(
+            runs.load(Ordering::SeqCst),
+            1,
+            "the second turn could not call the probe"
+        );
     }
 }
