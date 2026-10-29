@@ -1408,8 +1408,11 @@ impl Default for OcrToolConfig {
 fn default_mcp_tool_timeout() -> u32 {
     30
 }
+/// Entry of `mcpServers.<name>.enabledTools` that enables every tool of the server.
+pub const MCP_ALL_TOOLS: &str = "*";
+
 fn default_mcp_enabled_tools() -> Vec<String> {
-    vec!["*".to_string()]
+    vec![MCP_ALL_TOOLS.to_string()]
 }
 
 fn default_mcp_enabled() -> bool {

@@ -36,7 +36,7 @@ use crate::config::loader::{load_config, resolve_config_env_vars};
 use crate::config::schema::{Config, validate_model_presets};
 
 /// Wildcard entry of `enabledTools`: "every tool of the server".
-const ALL_TOOLS: &str = "*";
+const ALL_TOOLS: &str = crate::config::schema::MCP_ALL_TOOLS;
 
 /// Set once this process runs on an overlay (i.e. it is a child).
 static OVERLAY_ACTIVE: AtomicBool = AtomicBool::new(false);

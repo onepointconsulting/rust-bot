@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
 use crate::agent::tools::base::{Tool, ToolExposure};
-use crate::config::schema::{McpServerConfig, McpTransportType};
+use crate::config::schema::{MCP_ALL_TOOLS, McpServerConfig, McpTransportType};
 use http::HeaderName;
 use rmcp::model::{CallToolRequestParams, RawContent, Tool as McpToolDef};
 use rmcp::service::ServiceError;
@@ -537,6 +537,53 @@ pub async fn load_mcp_tools_with_file_refs(
     Ok(LoadedMcpTools { client, tools })
 }
 
+/// The name an MCP tool is registered under: `mcp_{server_name}_{tool_name}`.
+pub fn wrapped_mcp_tool_name(server_name: &str, tool_name: &str) -> String {
+    format!("mcp_{server_name}_{tool_name}")
+}
+
+/// Whether one `enabledTools` entry of `server_name` enables the tool registered as
+/// `wrapped_tool_name`: the entry is `*`, the wrapped name, or the server's own (raw) name
+/// for the tool.
+fn enabled_tools_entry_matches(entry: &str, server_name: &str, wrapped_tool_name: &str) -> bool {
+    entry == MCP_ALL_TOOLS
+        || entry == wrapped_tool_name
+        || wrapped_mcp_tool_name(server_name, entry) == wrapped_tool_name
+}
+
+/// Whether `server_name`'s `enabledTools` enables the tool registered as
+/// `wrapped_tool_name`. `["*"]` enables every tool and `[]` none; other entries name tools
+/// raw (`list_new`) or wrapped (`mcp_cms_list_new`).
+pub fn is_mcp_tool_enabled(
+    enabled_tools: &[String],
+    server_name: &str,
+    wrapped_tool_name: &str,
+) -> bool {
+    enabled_tools
+        .iter()
+        .any(|entry| enabled_tools_entry_matches(entry, server_name, wrapped_tool_name))
+}
+
+/// The `enabledTools` entries of `server_name` that enable none of the server's tools
+/// (`wrapped_tool_names`), e.g. typos or tools the server no longer has. `*` always
+/// matches, so it is never reported.
+pub fn unmatched_enabled_tools<'a>(
+    enabled_tools: &'a [String],
+    server_name: &str,
+    wrapped_tool_names: &[String],
+) -> Vec<&'a str> {
+    enabled_tools
+        .iter()
+        .filter(|entry| {
+            entry.as_str() != MCP_ALL_TOOLS
+                && !wrapped_tool_names
+                    .iter()
+                    .any(|name| enabled_tools_entry_matches(entry, server_name, name))
+        })
+        .map(String::as_str)
+        .collect()
+}
+
 pub struct MCPToolWrapper {
     session: Peer<RoleClient>,
     original_name: String,
@@ -576,7 +623,7 @@ impl MCPToolWrapper {
         file_refs: Option<FileRefResolver>,
     ) -> Self {
         let original_name = tool_def.name.to_string();
-        let name = format!("mcp_{}_{}", server_name, tool_def.name);
+        let name = wrapped_mcp_tool_name(server_name, &tool_def.name);
         let description = tool_def
             .description
             .as_deref()
@@ -739,9 +786,134 @@ fn mcp_cast_params(params: &serde_json::Value) -> serde_json::Value {
     params.clone()
 }
 
+/// Test fixtures shared with other modules' tests.
+#[cfg(test)]
+pub(crate) mod test_support {
+    use super::McpServerConfig;
+
+    /// A stdio MCP server in a few lines of Python (written to `dir`) that answers
+    /// `initialize` and lists `tool_names`. `None` when no Python is on `PATH`, so tests
+    /// using it skip instead of failing.
+    pub(crate) fn fake_python_mcp_server(
+        dir: &std::path::Path,
+        tool_names: &[&str],
+    ) -> Option<McpServerConfig> {
+        let python = ["python3", "python"].into_iter().find(|candidate| {
+            std::process::Command::new(candidate)
+                .args(["-c", "print(1)"])
+                .output()
+                .is_ok_and(|output| output.status.success())
+        })?;
+        let tool_names_json = serde_json::to_string(tool_names).ok()?;
+        let script = dir.join("fake_mcp_server.py");
+        std::fs::write(
+            &script,
+            format!(
+                "import sys, json\n\
+                 NAMES = json.loads('{tool_names_json}')\n\
+                 for line in sys.stdin:\n\
+                 \x20   msg = json.loads(line)\n\
+                 \x20   method = msg.get('method')\n\
+                 \x20   if method == 'initialize':\n\
+                 \x20       res = {{'protocolVersion': msg['params']['protocolVersion'], 'capabilities': {{'tools': {{}}}}, 'serverInfo': {{'name': 'fake', 'version': '1'}}}}\n\
+                 \x20   elif method == 'tools/list':\n\
+                 \x20       res = {{'tools': [{{'name': n, 'description': 'p', 'inputSchema': {{'type': 'object', 'properties': {{}}}}}} for n in NAMES]}}\n\
+                 \x20   else:\n\
+                 \x20       continue\n\
+                 \x20   print(json.dumps({{'jsonrpc': '2.0', 'id': msg['id'], 'result': res}}), flush=True)\n"
+            ),
+        )
+        .ok()?;
+        Some(McpServerConfig {
+            command: python.to_string(),
+            args: vec![script.to_string_lossy().to_string()],
+            ..McpServerConfig::default()
+        })
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // ── enabledTools ──────────────────────────────────────────────────────────
+
+    fn entries(list: &[&str]) -> Vec<String> {
+        list.iter().map(|entry| entry.to_string()).collect()
+    }
+
+    #[test]
+    fn wrapped_mcp_tool_name_prefixes_server_and_tool() {
+        assert_eq!(
+            wrapped_mcp_tool_name("ouryagya-strapi", "list_new"),
+            "mcp_ouryagya-strapi_list_new"
+        );
+    }
+
+    #[test]
+    fn the_wildcard_enables_every_tool() {
+        assert!(is_mcp_tool_enabled(
+            &entries(&["*"]),
+            "cms",
+            "mcp_cms_list_new"
+        ));
+        assert!(is_mcp_tool_enabled(
+            &entries(&["get_new", "*"]),
+            "cms",
+            "mcp_cms_list_new"
+        ));
+    }
+
+    #[test]
+    fn an_empty_list_enables_no_tool() {
+        assert!(!is_mcp_tool_enabled(&[], "cms", "mcp_cms_list_new"));
+    }
+
+    #[test]
+    fn raw_and_wrapped_names_both_enable_a_tool() {
+        let enabled = entries(&["list_new", "mcp_cms_get_new"]);
+
+        assert!(is_mcp_tool_enabled(&enabled, "cms", "mcp_cms_list_new"));
+        assert!(is_mcp_tool_enabled(&enabled, "cms", "mcp_cms_get_new"));
+        assert!(!is_mcp_tool_enabled(&enabled, "cms", "mcp_cms_delete_new"));
+    }
+
+    #[test]
+    fn names_are_matched_exactly_not_by_prefix() {
+        let enabled = entries(&["list_new"]);
+        assert!(!is_mcp_tool_enabled(
+            &enabled,
+            "cms",
+            "mcp_cms_list_news-tag"
+        ));
+    }
+
+    #[test]
+    fn a_wrapped_name_of_another_server_does_not_match() {
+        let enabled = entries(&["mcp_other_list_new"]);
+        assert!(!is_mcp_tool_enabled(&enabled, "cms", "mcp_cms_list_new"));
+    }
+
+    #[test]
+    fn server_names_with_dashes_and_underscores_match_raw_names() {
+        let enabled = entries(&["list_new"]);
+        assert!(is_mcp_tool_enabled(
+            &enabled,
+            "our_yagya-cms",
+            "mcp_our_yagya-cms_list_new"
+        ));
+    }
+
+    #[test]
+    fn unmatched_enabled_tools_reports_entries_that_name_no_tool() {
+        let enabled = entries(&["*", "list_new", "mcp_cms_get_new", "lst_new", "mcp_other_x"]);
+        let tools = entries(&["mcp_cms_list_new", "mcp_cms_get_new"]);
+
+        assert_eq!(
+            unmatched_enabled_tools(&enabled, "cms", &tools),
+            vec!["lst_new", "mcp_other_x"]
+        );
+    }
     use serde_json::json;
 
     #[test]
@@ -799,33 +971,7 @@ mod tests {
     /// mixed working/broken case can be tested without a real server. `None` when no
     /// working Python is available, in which case the test is skipped.
     fn fake_python_mcp_server(dir: &std::path::Path) -> Option<McpServerConfig> {
-        let python = ["python3", "python"].into_iter().find(|candidate| {
-            std::process::Command::new(candidate)
-                .args(["-c", "print(1)"])
-                .output()
-                .is_ok_and(|output| output.status.success())
-        })?;
-        let script = dir.join("fake_mcp_server.py");
-        std::fs::write(
-            &script,
-            "import sys, json\n\
-             for line in sys.stdin:\n\
-             \x20   msg = json.loads(line)\n\
-             \x20   method = msg.get('method')\n\
-             \x20   if method == 'initialize':\n\
-             \x20       res = {'protocolVersion': msg['params']['protocolVersion'], 'capabilities': {'tools': {}}, 'serverInfo': {'name': 'fake', 'version': '1'}}\n\
-             \x20   elif method == 'tools/list':\n\
-             \x20       res = {'tools': [{'name': 'ping', 'description': 'p', 'inputSchema': {'type': 'object', 'properties': {}}}]}\n\
-             \x20   else:\n\
-             \x20       continue\n\
-             \x20   print(json.dumps({'jsonrpc': '2.0', 'id': msg['id'], 'result': res}), flush=True)\n",
-        )
-        .ok()?;
-        Some(McpServerConfig {
-            command: python.to_string(),
-            args: vec![script.to_string_lossy().to_string()],
-            ..McpServerConfig::default()
-        })
+        test_support::fake_python_mcp_server(dir, &["ping"])
     }
 
     #[tokio::test]

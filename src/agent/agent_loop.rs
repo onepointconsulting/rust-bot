@@ -40,7 +40,8 @@ use crate::agent::tools::filesystem::FsToolConfig;
 use crate::agent::tools::goal::UpdateGoalTool;
 use crate::agent::tools::mcp::mcp_file_ref::FileRefResolver;
 use crate::agent::tools::mcp::{
-    LoadedMcpTools, McpConnectBatch, connect_mcp_servers_independently,
+    LoadedMcpTools, McpConnectBatch, connect_mcp_servers_independently, is_mcp_tool_enabled,
+    unmatched_enabled_tools,
 };
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
@@ -63,7 +64,7 @@ use crate::command::types::ChatCommand;
 use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
     ChannelsConfig, Config, DocxToolConfig, DurabilityConfig, ExecToolConfig, GmailToolConfig,
-    ImageGenerationToolConfig, McpServerConfig, OcrToolConfig, QuestionToolConfig,
+    ImageGenerationToolConfig, MCP_ALL_TOOLS, McpServerConfig, OcrToolConfig, QuestionToolConfig,
     RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
 };
 use crate::cron::CronService;
@@ -1093,7 +1094,9 @@ impl AgentLoop {
     }
 
     /// Register the tools of the servers that connected, remember the ones that did
-    /// not (and why), and update whether every configured server is up.
+    /// not (and why), and update whether every configured server is up. A tool is
+    /// registered when the server's `enabledTools` enables it and `tools.disabledTools`
+    /// does not name it; `enabledTools` entries that match no tool are logged.
     fn record_mcp_batch(&self, batch: McpConnectBatch) {
         let McpConnectBatch { connected, failed } = batch;
         let mut mcp_tool_count = 0usize;
@@ -1102,12 +1105,28 @@ impl AgentLoop {
         {
             let mut registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
             for (name, mut session) in connected {
-                mcp_tool_count += session.tools.len();
+                // A connected server is always configured; the fallback keeps every tool.
+                let enabled_tools = self
+                    .mcp_servers
+                    .get(&name)
+                    .map(|config| config.enabled_tools.clone())
+                    .unwrap_or_else(|| vec![MCP_ALL_TOOLS.to_string()]);
+                let tool_names: Vec<String> =
+                    session.tools.iter().map(|tool| tool.name()).collect();
+                for entry in unmatched_enabled_tools(&enabled_tools, &name, &tool_names) {
+                    log::warn!(
+                        "MCP server '{name}': enabledTools entry '{entry}' matches none of its tools"
+                    );
+                }
                 for tool in session.tools.drain(..) {
-                    if self.disabled_tools.contains(&tool.name()) {
+                    let tool_name = tool.name();
+                    if self.disabled_tools.contains(&tool_name)
+                        || !is_mcp_tool_enabled(&enabled_tools, &name, &tool_name)
+                    {
                         continue;
                     }
                     registry.register(tool);
+                    mcp_tool_count += 1;
                 }
                 connected_names.push(name);
                 new_sessions.push(session);
@@ -5606,5 +5625,97 @@ mod tests {
             1,
             "the second turn could not call the probe"
         );
+    }
+
+    // ── enabledTools ──────────────────────────────────────────────────────────
+
+    /// An agent loop over `workspace` whose only MCP server, `fake`, lists `tool_names`
+    /// and has `enabled_tools`; `None` when no Python is on `PATH`.
+    fn loop_with_fake_mcp_server(
+        workspace: &Path,
+        tool_names: &[&str],
+        enabled_tools: &[&str],
+    ) -> Option<Arc<AgentLoop>> {
+        let mut server =
+            crate::agent::tools::mcp::test_support::fake_python_mcp_server(workspace, tool_names)?;
+        server.enabled_tools = enabled_tools.iter().map(|name| name.to_string()).collect();
+        let mut config = Config::default();
+        config.tools.mcp_servers.insert("fake".to_string(), server);
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(PlaceholderProvider {
+            settings: GenerationSettings::new(),
+        });
+        Some(Arc::new(AgentLoop::new(
+            Arc::new(MessageBus::new()),
+            provider,
+            workspace.to_path_buf(),
+            config,
+            None,
+            None,
+            None,
+        )))
+    }
+
+    fn registered_mcp_tools(loop_: &AgentLoop) -> Vec<String> {
+        let mut names: Vec<String> = loop_
+            .tools
+            .lock()
+            .unwrap()
+            .tool_names()
+            .into_iter()
+            .filter(|name| name.starts_with("mcp_"))
+            .collect();
+        names.sort();
+        names
+    }
+
+    #[tokio::test]
+    async fn enabled_tools_registers_only_the_named_mcp_tools() {
+        let workspace = tempfile::tempdir().unwrap();
+        let Some(loop_) = loop_with_fake_mcp_server(
+            workspace.path(),
+            &["ping", "pong", "skip"],
+            &["ping", "mcp_fake_pong", "typo"],
+        ) else {
+            eprintln!("skipped: no working python on PATH");
+            return;
+        };
+
+        loop_.connect_mcp().await;
+
+        assert_eq!(
+            registered_mcp_tools(&loop_),
+            vec!["mcp_fake_ping", "mcp_fake_pong"]
+        );
+    }
+
+    #[tokio::test]
+    async fn enabled_tools_wildcard_registers_every_mcp_tool() {
+        let workspace = tempfile::tempdir().unwrap();
+        let Some(loop_) = loop_with_fake_mcp_server(workspace.path(), &["ping", "pong"], &["*"])
+        else {
+            eprintln!("skipped: no working python on PATH");
+            return;
+        };
+
+        loop_.connect_mcp().await;
+
+        assert_eq!(
+            registered_mcp_tools(&loop_),
+            vec!["mcp_fake_ping", "mcp_fake_pong"]
+        );
+    }
+
+    #[tokio::test]
+    async fn empty_enabled_tools_registers_no_mcp_tool() {
+        let workspace = tempfile::tempdir().unwrap();
+        let Some(loop_) = loop_with_fake_mcp_server(workspace.path(), &["ping", "pong"], &[])
+        else {
+            eprintln!("skipped: no working python on PATH");
+            return;
+        };
+
+        loop_.connect_mcp().await;
+
+        assert!(registered_mcp_tools(&loop_).is_empty());
     }
 }
