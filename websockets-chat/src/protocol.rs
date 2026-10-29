@@ -446,6 +446,19 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway to load the configured MCP server `name`'s tools on demand
+    /// (`deferred`) or declare them to the model on every request. Same access rules and
+    /// reply shape as [`Self::set_mcp_server_enabled`]: an `mcp_server_exposure_set` or a
+    /// `setting_error` event.
+    pub fn set_mcp_server_deferred(name: impl Into<String>, deferred: bool) -> Self {
+        Self {
+            type_: "set_mcp_server_deferred",
+            name: Some(name.into()),
+            enabled: Some(deferred),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway for the durable ACP child agents and the spawn tasks of the
     /// gateway process, as `/subagents` lists them. Authenticated connections only — an
     /// anonymous connection is answered with an `access_denied` error. The reply is a
@@ -1141,6 +1154,12 @@ pub enum ServerEvent {
         enabled: bool,
         restart_required: bool,
     },
+    /// Reply to a successful [`ClientEnvelope::set_mcp_server_deferred`].
+    McpServerExposureSet {
+        name: String,
+        deferred: bool,
+        restart_required: bool,
+    },
     /// Reply to a refused or failed tool or MCP server toggle (or list). `kind` is
     /// `tool` or `mcp_server`; `detail` is a stable code (`access_denied`,
     /// `child_agent_config`, `protected_tool`, `unknown_server`, `config_error`, ...).
@@ -1336,6 +1355,7 @@ impl ServerEvent {
             | ServerEvent::McpServers { .. }
             | ServerEvent::ToolSettingSet { .. }
             | ServerEvent::McpServerSet { .. }
+            | ServerEvent::McpServerExposureSet { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
             | ServerEvent::ConfigFileSaved { .. }
@@ -2038,6 +2058,13 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             enabled: w.enabled,
             restart_required: w.restart_required,
         }),
+        "mcp_server_exposure_set" => {
+            decode::<SettingSetWire>(&value).map(|w| ServerEvent::McpServerExposureSet {
+                name: w.name,
+                deferred: w.enabled,
+                restart_required: w.restart_required,
+            })
+        }
         "setting_error" => decode::<SettingErrorWire>(&value).map(|w| ServerEvent::SettingError {
             kind: w.kind,
             name: w.name,
@@ -3287,6 +3314,12 @@ mod tests {
                 "type": "set_mcp_server_enabled", "name": "files", "enabled": true, "webui": true
             })
         );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_mcp_server_deferred("cms", true)).unwrap(),
+            serde_json::json!({
+                "type": "set_mcp_server_deferred", "name": "cms", "enabled": true, "webui": true
+            })
+        );
     }
 
     #[test]
@@ -3344,6 +3377,18 @@ mod tests {
                 name: "files".to_string(),
                 enabled: true,
                 restart_required: false
+            }
+        );
+        let exposure = parse_server_event(
+            r#"{"event":"mcp_server_exposure_set","name":"cms","enabled":true,"restart_required":true}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            exposure,
+            ServerEvent::McpServerExposureSet {
+                name: "cms".to_string(),
+                deferred: true,
+                restart_required: true
             }
         );
     }
@@ -3476,24 +3521,40 @@ mod tests {
 
     #[test]
     fn parses_tools_list() {
+        // `shell` has no `exposure`, as an older gateway sends it: it reads as direct.
         let raw = r#"{"event":"tools","chat_id":"chat-1","tools":[
-            {"name":"edit_file","description":"Edit a file"},
+            {"name":"edit_file","description":"Edit a file","exposure":"direct"},
+            {"name":"mcp_cms_list_new","exposure":"loaded"},
+            {"name":"mcp_cms_get_new","exposure":"deferred"},
             {"name":"shell"}
         ]}"#;
         let event = parse_server_event(raw).expect("should parse");
+        let tool = |name: &str, description: &str, exposure| ToolSummary {
+            name: name.to_string(),
+            description: description.to_string(),
+            exposure,
+        };
         assert_eq!(
             event,
             ServerEvent::ToolsList {
                 chat_id: "chat-1".to_string(),
                 tools: vec![
-                    ToolSummary {
-                        name: "edit_file".to_string(),
-                        description: "Edit a file".to_string(),
-                    },
-                    ToolSummary {
-                        name: "shell".to_string(),
-                        description: String::new(),
-                    },
+                    tool(
+                        "edit_file",
+                        "Edit a file",
+                        chat_ui::models::ToolExposure::Direct
+                    ),
+                    tool(
+                        "mcp_cms_list_new",
+                        "",
+                        chat_ui::models::ToolExposure::Loaded
+                    ),
+                    tool(
+                        "mcp_cms_get_new",
+                        "",
+                        chat_ui::models::ToolExposure::Deferred
+                    ),
+                    tool("shell", "", chat_ui::models::ToolExposure::Direct),
                 ],
             }
         );

@@ -12,6 +12,7 @@ A bot implementation initially based on [Nanobot](https://github.com/HKUDS/nanob
 - [Interactive console](#interactive-console) (including chat commands; see [docs/INTERACTIVE_CONSOLE.md](docs/INTERACTIVE_CONSOLE.md))
 - [Gmail support](#gmail-support) (see [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md))
 - [Configuration](#configuration)
+- [Deferred tools](#deferred-tools) (loading MCP tools on demand; see [docs/DEFERRED_TOOLS.md](docs/DEFERRED_TOOLS.md))
 - [Durability](#durability) (crash recovery; see [docs/DURABILITY.md](docs/DURABILITY.md))
 - [Project layout](#project-layout)
 
@@ -185,6 +186,16 @@ Typical keys: provider, model, API key / base URL (read from env), and channel s
 `RUST_BOT_CONFIG` names the config file when `--config` is omitted, `RUST_BOT_DATA_DIR` moves runtime state away from the config's directory, and `rust-bot check-config` validates a config (including unset `${VAR}` placeholders). To run in a container, see [docs/DOCKER.md](docs/DOCKER.md).
 
 The first run will seed the workspace directory with `AGENTS.md`, `SOUL.md`, `TOOLS.md`, and `USER.md`, plus the standard folder layout. These come from the compiled-in template bundle by default; drop a `templates/` directory next to the binary (or set `RUST_BOT_TEMPLATES_DIR`) if you want to override them with your own copies.
+
+---
+
+## Deferred tools
+
+MCP servers with many tools can make every model request very large. Set `"exposure": "deferred"` on such a
+server (or switch **Load tools on demand** in the web UI's MCP server settings) and its tools are only sent to
+the model after it finds them with the built-in `tool_search` tool. Give the server a one-line `description` so
+the model knows what it offers. Configuration, ranking and how to see what is loaded are described in
+[docs/DEFERRED_TOOLS.md](docs/DEFERRED_TOOLS.md).
 
 ---
 

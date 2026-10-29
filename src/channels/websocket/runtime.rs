@@ -25,7 +25,7 @@ use uuid::Uuid;
 
 use crate::agent::acp::listing::{AcpAgentSummary, list_acp_rows, summarize_acp_rows};
 use crate::agent::acp::manager::AcpManager;
-use crate::agent::agent_loop::AgentLoop;
+use crate::agent::agent_loop::{AgentLoop, session_tool_view};
 use crate::agent::background_activity::{ActivitySnapshot, BackgroundActivity};
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::modes::{AgentMode, RESERVED_AGENT_MODE_NAME, SESSION_AGENT_MODE_METADATA_KEY};
@@ -39,6 +39,7 @@ use crate::agent::tools::mcp::mcp_presets_api::{
     self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
 };
 use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
+use crate::agent::tools::tool_search::tool_summaries_for_view;
 use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
@@ -702,6 +703,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SetMcpServerEnabled => {
             handle_set_mcp_server_enabled(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetMcpServerDeferred => {
+            handle_set_mcp_server_deferred(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -2606,20 +2610,21 @@ async fn handle_envelope_list_skills<'a>(envelope_dispatch_context: EnvelopeDisp
     .await;
 }
 
-/// Name and description of every tool visible under `session`'s agent mode
-/// (session override, else the process default). Empty when no tool registry
-/// was wired into `shared`.
+/// Name, description and exposure (direct / deferred / loaded) of every tool visible
+/// under `session`'s agent mode (session override, else the process default), with
+/// `tool_search` when anything is deferred. Empty when no tool registry was wired into
+/// `shared`.
 fn visible_tool_summaries(shared: &WsShared, session: Option<&Session>) -> Vec<ToolSummary> {
     let Some(tool_registry) = &shared.tool_registry else {
         return Vec::new();
     };
     let mode = AgentMode::resolve(shared.default_agent_mode, session.map(|s| &s.metadata));
     let registry = tool_registry.lock().unwrap_or_else(|e| e.into_inner());
-    mode.restrict_tools(&registry).tool_summaries()
+    tool_summaries_for_view(&session_tool_view(&registry, mode, session))
 }
 
 /// Handle a `list_tools` envelope: reply with a `tools` event carrying the
-/// `{name, description}` of every tool the chat's agent mode exposes.
+/// `{name, description, exposure}` of every tool the chat's agent mode exposes.
 /// Rust-side addition with no nanobot precedent.
 async fn handle_list_tools<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
@@ -3224,6 +3229,8 @@ async fn handle_restart_gateway<'a>(envelope_dispatch_context: EnvelopeDispatchC
 enum SettingKind {
     Tool,
     McpServer,
+    /// Whether an MCP server's tools are loaded on demand (`exposure: deferred`).
+    McpServerExposure,
 }
 
 impl SettingKind {
@@ -3232,6 +3239,7 @@ impl SettingKind {
         match self {
             Self::Tool => "tool",
             Self::McpServer => "mcp_server",
+            Self::McpServerExposure => "mcp_server_exposure",
         }
     }
 
@@ -3240,10 +3248,12 @@ impl SettingKind {
         match self {
             Self::Tool => WsOutboundEvent::ToolSettingSet,
             Self::McpServer => WsOutboundEvent::McpServerSet,
+            Self::McpServerExposure => WsOutboundEvent::McpServerExposureSet,
         }
     }
 
-    /// The edit that makes `name` enabled or disabled in the config text.
+    /// The edit that makes `name` enabled or disabled in the config text (for
+    /// `McpServerExposure`, "enabled" means deferred).
     fn edit(
         self,
         text: &str,
@@ -3253,6 +3263,9 @@ impl SettingKind {
         match self {
             Self::Tool => config_toggles::with_tool_disabled(text, name, !enabled),
             Self::McpServer => config_toggles::with_mcp_server_enabled(text, name, enabled),
+            Self::McpServerExposure => {
+                config_toggles::with_mcp_server_deferred(text, name, enabled)
+            }
         }
     }
 }
@@ -3590,6 +3603,16 @@ async fn handle_set_section_enabled<'a>(envelope_dispatch_context: EnvelopeDispa
 /// Rust-side addition with no nanobot precedent.
 async fn handle_set_mcp_server_enabled<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     handle_toggle_setting(envelope_dispatch_context, SettingKind::McpServer).await;
+}
+
+/// Handle a `set_mcp_server_deferred` envelope `{name, enabled}`: load the server's tools
+/// on demand (`enabled: true`, `exposure: deferred`) or declare them on every request;
+/// see [`handle_toggle_setting`]. Takes effect after a restart. Rust-side addition with
+/// no nanobot precedent.
+async fn handle_set_mcp_server_deferred<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    handle_toggle_setting(envelope_dispatch_context, SettingKind::McpServerExposure).await;
 }
 
 /// Handle a `set_mcp_preset` envelope `{name, enabled, fields?}`: enable or disable the
@@ -8766,6 +8789,60 @@ mod tests {
         assert_eq!(names, vec!["shell", "web_search"]);
     }
 
+    /// A tool of a deferred MCP server, for the exposure tests.
+    struct DeferredNamedTool(&'static str);
+
+    #[async_trait::async_trait]
+    impl crate::agent::tools::base::Tool for DeferredNamedTool {
+        fn name(&self) -> String {
+            self.0.to_string()
+        }
+        fn description(&self) -> String {
+            format!("{} description", self.0)
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({ "type": "object", "properties": {} })
+        }
+        fn exposure(&self) -> crate::agent::tools::base::ToolExposure {
+            crate::agent::tools::base::ToolExposure::Deferred
+        }
+        async fn execute(&self, _params: &serde_json::Value) -> String {
+            String::new()
+        }
+    }
+
+    #[test]
+    fn visible_tool_summaries_mark_the_sessions_loads_and_list_tool_search() {
+        let shared = shared_with_tools(&["shell"]);
+        {
+            let registry = shared.tool_registry.as_ref().unwrap();
+            let mut registry = registry.lock().unwrap();
+            registry.register(Box::new(DeferredNamedTool("mcp_cms_list_new")));
+            registry.register(Box::new(DeferredNamedTool("mcp_cms_get_new")));
+        }
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.record_loaded_tools(&["mcp_cms_list_new".to_string()]);
+
+        let exposures: Vec<(String, serde_json::Value)> =
+            visible_tool_summaries(&shared, Some(&session))
+                .into_iter()
+                .map(|summary| {
+                    let exposure = serde_json::to_value(summary.exposure).unwrap();
+                    (summary.name, exposure)
+                })
+                .collect();
+
+        assert_eq!(
+            exposures,
+            vec![
+                ("mcp_cms_get_new".to_string(), serde_json::json!("deferred")),
+                ("mcp_cms_list_new".to_string(), serde_json::json!("loaded")),
+                ("shell".to_string(), serde_json::json!("direct")),
+                ("tool_search".to_string(), serde_json::json!("direct")),
+            ]
+        );
+    }
+
     async fn dispatch_list_mcp_presets(
         shared: &WsShared,
         auth: &AuthorizeResult,
@@ -9274,7 +9351,11 @@ mod tests {
     #[tokio::test]
     async fn setting_toggles_are_refused_for_anonymous_and_remote_connections() {
         let shared = test_shared("browser");
-        for envelope_type in ["set_tool_enabled", "set_mcp_server_enabled"] {
+        for envelope_type in [
+            "set_tool_enabled",
+            "set_mcp_server_enabled",
+            "set_mcp_server_deferred",
+        ] {
             let anonymous = dispatch_setting_envelope(
                 &shared,
                 &AuthorizeResult::UNAUTHENTICATED,
@@ -9362,8 +9443,17 @@ mod tests {
         )
         .await;
 
+        let exposure = dispatch_setting_envelope(
+            &shared,
+            &AuthorizeResult::UNAUTHENTICATED,
+            "127.0.0.1",
+            "set_mcp_server_deferred",
+        )
+        .await;
+
         assert_eq!(tool["kind"], "tool");
         assert_eq!(server["kind"], "mcp_server");
+        assert_eq!(exposure["kind"], "mcp_server_exposure");
     }
 
     #[tokio::test]

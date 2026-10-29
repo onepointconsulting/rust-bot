@@ -508,7 +508,28 @@ pub fn materialize_preset_server(
             missing,
         ));
     }
+    apply_description_and_exposure(&mut cfg, preset, existing);
     Ok(cfg)
+}
+
+/// Settle `cfg`'s `description` and `exposure`: what the user already configured for the
+/// server (`existing`) wins, so re-enabling a preset keeps their choices. A server that
+/// still has no description takes the preset's one-line description, which the model sees
+/// when the server is deferred.
+fn apply_description_and_exposure(
+    cfg: &mut McpServerConfig,
+    preset: &McpPreset,
+    existing: Option<&McpServerConfig>,
+) {
+    if let Some(existing) = existing {
+        cfg.exposure = existing.exposure;
+        if !existing.description.trim().is_empty() {
+            cfg.description = existing.description.clone();
+        }
+    }
+    if cfg.description.trim().is_empty() {
+        cfg.description = preset.description.trim().to_string();
+    }
 }
 
 /// Enable `preset` in `servers` (the `config.tools.mcp_servers` map): materialize it with
@@ -1081,6 +1102,45 @@ mod tests {
     }
 
     // ── materialize_preset_server: one test per target kind ────────────────
+
+    #[test]
+    fn materialize_preset_server_takes_the_preset_description_when_none_is_set() {
+        let mut preset = preset_with_fields(Some(stdio_server("cmd", &[])), Vec::new());
+        preset.description = "  Search and edit issues.  ".to_string();
+
+        let cfg = materialize_preset_server(&preset, &HashMap::new(), None).unwrap();
+
+        assert_eq!(cfg.description, "Search and edit issues.");
+        assert_eq!(cfg.exposure, crate::config::schema::ToolExposure::Direct);
+    }
+
+    #[test]
+    fn materialize_preset_server_keeps_the_template_exposure_and_description() {
+        let mut template = stdio_server("cmd", &[]);
+        template.exposure = crate::config::schema::ToolExposure::Deferred;
+        template.description = "From the template.".to_string();
+        let mut preset = preset_with_fields(Some(template), Vec::new());
+        preset.description = "From the preset.".to_string();
+
+        let cfg = materialize_preset_server(&preset, &HashMap::new(), None).unwrap();
+
+        assert_eq!(cfg.exposure, crate::config::schema::ToolExposure::Deferred);
+        assert_eq!(cfg.description, "From the template.");
+    }
+
+    #[test]
+    fn materialize_preset_server_keeps_the_users_exposure_and_description() {
+        let mut preset = preset_with_fields(Some(stdio_server("cmd", &[])), Vec::new());
+        preset.description = "From the preset.".to_string();
+        let mut existing = stdio_server("cmd", &[]);
+        existing.exposure = crate::config::schema::ToolExposure::Deferred;
+        existing.description = "Written by the user.".to_string();
+
+        let cfg = materialize_preset_server(&preset, &HashMap::new(), Some(&existing)).unwrap();
+
+        assert_eq!(cfg.exposure, crate::config::schema::ToolExposure::Deferred);
+        assert_eq!(cfg.description, "Written by the user.");
+    }
 
     #[test]
     fn materialize_preset_server_env_target_sets_env_map() {

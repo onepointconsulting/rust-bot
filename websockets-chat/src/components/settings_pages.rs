@@ -58,7 +58,7 @@ impl SettingsPage {
         match self {
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
             Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
-            Self::McpServers => "Switch the configured MCP servers on or off. A server that is off is not started.",
+            Self::McpServers => "Switch the configured MCP servers on or off. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
         }
     }
 
@@ -89,6 +89,8 @@ pub struct SettingRow {
     pub toggleable: bool,
     /// The settings form, for a row that stands for a whole tool section.
     pub config: Option<ToolConfigSummary>,
+    /// For an MCP server: whether its tools are loaded on demand. `None` for tools.
+    pub on_demand: Option<bool>,
 }
 
 /// An item the Settings pages list: it has a name, a switch and a running state.
@@ -110,6 +112,7 @@ impl SettingItem for ToolSettingSummary {
             active: self.active,
             toggleable: self.toggleable,
             config: self.config.clone(),
+            on_demand: None,
         }
     }
     fn name(&self) -> &str {
@@ -129,6 +132,7 @@ impl SettingItem for McpServerSettingSummary {
             active: self.active,
             toggleable: true,
             config: None,
+            on_demand: Some(self.deferred),
         }
     }
     fn name(&self) -> &str {
@@ -138,6 +142,22 @@ impl SettingItem for McpServerSettingSummary {
         self.enabled = enabled;
     }
 }
+
+/// Set whether the MCP server called `name` loads its tools on demand, after the gateway
+/// confirmed it saved the change. Does nothing when no server has that name.
+pub fn apply_on_demand(servers: &mut [McpServerSettingSummary], name: &str, deferred: bool) {
+    if let Some(server) = servers.iter_mut().find(|server| server.name == name) {
+        server.deferred = deferred;
+    }
+}
+
+/// Label of the on-demand switch of an MCP server row.
+pub const ON_DEMAND_LABEL: &str = "Load tools on demand";
+
+/// Explanation shown next to the on-demand switch.
+pub const ON_DEMAND_HINT: &str =
+    "Only send this server's tools to the model after it finds them with tool_search. \
+     Saves tokens for servers with many tools.";
 
 /// Replace the settings form of the tool called `name` with the gateway's fresh `summary`.
 /// Does nothing when no tool has that name.
@@ -336,6 +356,8 @@ pub struct SettingsActions {
     pub on_select_page: Callback<SettingsPage>,
     /// Flip one switch.
     pub on_toggle: Callback<ToggleRequest>,
+    /// Load an MCP server's tools on demand or not: `(server name, deferred)`.
+    pub on_set_on_demand: Callback<(String, bool)>,
     /// Re-fetch the open page's list.
     pub on_refresh: Callback<()>,
     /// Save the changed settings of one tool section.
@@ -375,6 +397,8 @@ fn SettingRowView(
     let name_for_expand = row.name.clone();
     let name_for_form_busy = row.name.clone();
     let name_for_open = row.name.clone();
+    let name_for_on_demand = row.name.clone();
+    let on_demand = row.on_demand;
     let disabled = Signal::derive(move || {
         !panel.can_modify.get() || !toggleable || is_busy(&panel.busy.get(), &name_for_busy)
     });
@@ -388,6 +412,25 @@ fn SettingRowView(
                     {pending
                         .map(|label| {
                             view! { <p class="mt-1 text-xs font-medium text-amber-700">{label}</p> }
+                        })}
+                    {on_demand
+                        .map(|deferred| {
+                            view! {
+                                <div class="mt-2 flex items-center gap-2" title=ON_DEMAND_HINT>
+                                    <ToggleSwitch
+                                        on=deferred
+                                        label=format!("{name_for_on_demand}: {ON_DEMAND_LABEL}")
+                                        disabled=disabled
+                                        hint=Signal::derive(move || switch_hint(panel.can_modify.get()))
+                                        on_toggle=Callback::new(move |()| {
+                                            actions
+                                                .on_set_on_demand
+                                                .run((name_for_on_demand.clone(), !deferred));
+                                        })
+                                    />
+                                    <span class="text-xs text-slate-500">{ON_DEMAND_LABEL}</span>
+                                </div>
+                            }
                         })}
                     {config
                         .as_ref()
@@ -627,6 +670,7 @@ mod tests {
             active,
             toggleable: true,
             config: None,
+            on_demand: None,
         }
     }
 
@@ -772,14 +816,37 @@ mod tests {
         assert!(tools[0].enabled);
     }
 
-    #[test]
-    fn mcp_servers_are_always_toggleable_and_tools_keep_their_lock() {
-        let server = McpServerSettingSummary {
-            name: "files".to_string(),
+    fn mcp_server(name: &str, deferred: bool) -> McpServerSettingSummary {
+        McpServerSettingSummary {
+            name: name.to_string(),
             description: String::new(),
             enabled: true,
             active: true,
-        };
+            deferred,
+        }
+    }
+
+    #[test]
+    fn mcp_server_rows_carry_the_on_demand_switch_and_tool_rows_do_not() {
+        assert_eq!(mcp_server("cms", true).to_row().on_demand, Some(true));
+        assert_eq!(mcp_server("files", false).to_row().on_demand, Some(false));
+        assert_eq!(tool("grep", true).to_row().on_demand, None);
+    }
+
+    #[test]
+    fn apply_on_demand_updates_only_the_named_server() {
+        let mut servers = vec![mcp_server("cms", false), mcp_server("files", false)];
+
+        apply_on_demand(&mut servers, "cms", true);
+        apply_on_demand(&mut servers, "ghost", true);
+
+        assert!(servers[0].deferred);
+        assert!(!servers[1].deferred);
+    }
+
+    #[test]
+    fn mcp_servers_are_always_toggleable_and_tools_keep_their_lock() {
+        let server = mcp_server("files", false);
         let mut locked = tool("message", true);
         locked.toggleable = false;
 

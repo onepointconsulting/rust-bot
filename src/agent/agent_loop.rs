@@ -246,6 +246,22 @@ pub(crate) fn enabled_mcp_servers(
         .collect()
 }
 
+/// The tools `session` sees in `mode`: `registry` restricted to the mode, with its own
+/// loaded-tools handle seeded from the session's `loaded_tools`. Names the view cannot
+/// load (hidden by the mode, not registered, no longer deferred) are skipped but stay
+/// in the session. Shared by the agent loop and the tool lists, so both agree.
+pub(crate) fn session_tool_view(
+    registry: &ToolRegistry,
+    mode: AgentMode,
+    session: Option<&Session>,
+) -> ToolRegistry {
+    let view = mode.restrict_tools(registry);
+    if let Some(session) = session {
+        view.load_tools(&session.loaded_tools());
+    }
+    view
+}
+
 /// `mcpServers.<name>.description` of every server that has one, keyed by server name.
 fn mcp_server_descriptions(servers: &HashMap<String, McpServerConfig>) -> HashMap<String, String> {
     servers
@@ -857,21 +873,12 @@ impl AgentLoop {
         }
     }
 
-    /// Tools visible to this session after applying its agent mode.
-    ///
-    /// The view has its own loaded-tools handle, seeded from the session's
-    /// `loaded_tools`. Names the view cannot load (hidden by the mode, not registered,
-    /// or no longer deferred) are skipped here but stay in the session metadata.
+    /// Tools visible to this session after applying its agent mode, with its loads
+    /// (see [`session_tool_view`]).
     pub fn tools_for_session(&self, session: Option<&Session>) -> ToolRegistry {
         let mode = self.mode_for_session(session);
-        let view = {
-            let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
-            mode.restrict_tools(&registry)
-        };
-        if let Some(session) = session {
-            view.load_tools(&session.loaded_tools());
-        }
-        view
+        let registry = self.tools.lock().unwrap_or_else(|e| e.into_inner());
+        session_tool_view(&registry, mode, session)
     }
 
     /// Resolve the workspace scope a session would use right now (its

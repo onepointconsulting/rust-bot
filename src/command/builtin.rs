@@ -5,7 +5,11 @@ use crate::{
         agent_loop::AgentLoop,
         context::BOOTSTRAP_FILES,
         subagent::format_subagents_list,
-        tools::mcp::{load_mcp_tools_from_config, mcp_presets_api},
+        tools::{
+            mcp::{load_mcp_tools_from_config, mcp_presets_api},
+            registry::{ToolListExposure, ToolSummary},
+            tool_search::tool_summaries_for_view,
+        },
     },
     bus::events::OutboundMessage,
     command::{
@@ -930,23 +934,52 @@ impl CommandHandler for CmdTools {
         };
         let (_session_manager, session) = ctx.lock_session_manager_and_session(agent_loop);
         let registry = agent_loop.tools_for_session(Some(&session));
-        let mut names = registry.tool_names();
-        names.sort();
-        let content = if names.is_empty() {
-            "No tools registered.".to_string()
-        } else {
-            let lines: Vec<String> = names
-                .iter()
-                .filter_map(|name| {
-                    registry
-                        .get(name)
-                        .map(|tool| format!("* **{name}** — {}", tool.description()))
-                })
-                .collect();
-            format!("Tools ({} available):\n{}", lines.len(), lines.join("\n"))
-        };
+        let content = format_tool_list(&tool_summaries_for_view(&registry));
         reply_as_text(ctx, convert_text_to_markdown(&content))
     }
+}
+
+/// The `/tools` reply: the tools the model can call now (loaded deferred tools marked),
+/// then the deferred tools `tool_search` can load, with the first line of their
+/// description only, since a deferred MCP server may have many.
+fn format_tool_list(summaries: &[ToolSummary]) -> String {
+    if summaries.is_empty() {
+        return "No tools registered.".to_string();
+    }
+    let (callable, on_demand): (Vec<&ToolSummary>, Vec<&ToolSummary>) = summaries
+        .iter()
+        .partition(|summary| summary.exposure.is_callable());
+    let callable_lines: Vec<String> = callable
+        .iter()
+        .map(|summary| {
+            let loaded = if summary.exposure == ToolListExposure::Loaded {
+                " _(loaded)_"
+            } else {
+                ""
+            };
+            format!("* **{}** — {}{loaded}", summary.name, summary.description)
+        })
+        .collect();
+    let mut content = format!(
+        "Tools ({} available):\n{}",
+        callable_lines.len(),
+        callable_lines.join("\n")
+    );
+    if !on_demand.is_empty() {
+        let on_demand_lines: Vec<String> = on_demand
+            .iter()
+            .map(|summary| {
+                let first_line = summary.description.trim().lines().next().unwrap_or("");
+                format!("* **{}** — {first_line}", summary.name)
+            })
+            .collect();
+        content.push_str(&format!(
+            "\n\nAvailable on demand ({}, loaded with tool_search):\n{}",
+            on_demand_lines.len(),
+            on_demand_lines.join("\n")
+        ));
+    }
+    content
 }
 
 struct CmdWorkspace;
@@ -1358,6 +1391,59 @@ mod tests {
     use super::*;
     use crate::bus::events::InboundMessage;
     use chrono::Utc;
+
+    fn summary(name: &str, description: &str, exposure: ToolListExposure) -> ToolSummary {
+        ToolSummary {
+            name: name.to_string(),
+            description: description.to_string(),
+            exposure,
+        }
+    }
+
+    #[test]
+    fn format_tool_list_separates_callable_and_on_demand_tools() {
+        let content = format_tool_list(&[
+            summary(
+                "mcp_cms_get_new",
+                "Get one entry.\nDetails.",
+                ToolListExposure::Deferred,
+            ),
+            summary(
+                "mcp_cms_list_new",
+                "List entries.",
+                ToolListExposure::Loaded,
+            ),
+            summary("read_file", "Read a file.", ToolListExposure::Direct),
+        ]);
+
+        assert_eq!(
+            content,
+            "Tools (2 available):\n\
+             * **mcp_cms_list_new** — List entries. _(loaded)_\n\
+             * **read_file** — Read a file.\n\
+             \n\
+             Available on demand (1, loaded with tool_search):\n\
+             * **mcp_cms_get_new** — Get one entry."
+        );
+    }
+
+    #[test]
+    fn format_tool_list_without_deferred_tools_has_no_on_demand_section() {
+        let content = format_tool_list(&[summary(
+            "read_file",
+            "Read a file.",
+            ToolListExposure::Direct,
+        )]);
+        assert_eq!(
+            content,
+            "Tools (1 available):\n* **read_file** — Read a file."
+        );
+    }
+
+    #[test]
+    fn format_tool_list_with_no_tools() {
+        assert_eq!(format_tool_list(&[]), "No tools registered.");
+    }
 
     fn stop_ctx(agent_loop: Option<Arc<crate::agent::agent_loop::AgentLoop>>) -> CommandContext {
         CommandContext::with_options(

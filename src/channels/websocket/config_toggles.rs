@@ -77,6 +77,11 @@ pub struct ConfiguredMcpServer {
     /// `stdio`, `sse` or `streamableHttp`, as written or detected; `unknown` otherwise.
     /// Never the command line, URL, headers or environment: those may hold credentials.
     pub transport: String,
+    /// Whether the server's `exposure` is `"deferred"` (tools loaded on demand).
+    pub deferred: bool,
+    /// The server's `description`, empty when not set. Written for the model, so it
+    /// holds no credentials.
+    pub description: String,
 }
 
 /// Whether `name` is acceptable as a tool or server name: 1–128 characters from
@@ -173,6 +178,13 @@ pub fn configured_mcp_servers(text: &str) -> Result<Vec<ConfiguredMcpServer>, To
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             transport: transport_of(server),
+            deferred: is_deferred(server),
+            description: server
+                .get("description")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .trim()
+                .to_string(),
         })
         .collect())
 }
@@ -270,6 +282,51 @@ pub fn with_mcp_server_enabled(
     Ok(Some(render(&root, text)))
 }
 
+/// Whether a server entry has `"exposure": "deferred"`.
+fn is_deferred(server: &Value) -> bool {
+    server.get("exposure").and_then(Value::as_str) == Some(MCP_EXPOSURE_DEFERRED)
+}
+
+/// The `exposure` value that makes a server's tools load on demand.
+const MCP_EXPOSURE_DEFERRED: &str = "deferred";
+
+/// `text` with `tools.mcpServers.<name>.exposure` set to `"deferred"` (`deferred`) or
+/// removed, which means direct (`!deferred`). `None` when the server already has that
+/// exposure. The server must already be configured: the dialog never creates one.
+pub fn with_mcp_server_deferred(
+    text: &str,
+    name: &str,
+    deferred: bool,
+) -> Result<Option<String>, ToggleError> {
+    if !is_valid_name(name) {
+        return Err(ToggleError::InvalidName);
+    }
+    let mut root = parse_root(text)?;
+    let tools = tools_object_mut(&mut root)?;
+    let key = existing_or_default_key(tools, MCP_SERVERS_KEYS).to_string();
+    let server = tools
+        .get_mut(&key)
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.get_mut(name))
+        .ok_or(ToggleError::UnknownServer)?;
+    let current = is_deferred(server);
+    let server = server.as_object_mut().ok_or_else(|| {
+        ToggleError::InvalidConfig("The MCP server entry is not an object.".to_string())
+    })?;
+    if current == deferred {
+        return Ok(None);
+    }
+    if deferred {
+        server.insert(
+            "exposure".to_string(),
+            Value::String(MCP_EXPOSURE_DEFERRED.to_string()),
+        );
+    } else {
+        server.remove("exposure");
+    }
+    Ok(Some(render(&root, text)))
+}
+
 /// What the dialog shows for one built-in tool.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ToolSettingRow {
@@ -296,6 +353,8 @@ pub struct McpServerSettingRow {
     pub enabled: bool,
     /// Whether the running process was started with the server on.
     pub active: bool,
+    /// Whether `config.json` has the server's tools loaded on demand (`exposure: deferred`).
+    pub deferred: bool,
 }
 
 /// Description shown for a tool named in `disabledTools` that this process does not know
@@ -385,13 +444,23 @@ pub fn mcp_server_setting_rows(
         .iter()
         .map(|server| McpServerSettingRow {
             name: server.name.clone(),
-            description: format!("MCP server ({})", server.transport),
+            description: mcp_server_row_description(server),
             enabled: server.enabled,
             active: running.contains(&server.name),
+            deferred: server.deferred,
         })
         .collect();
     rows.sort_by_key(|row| row.name.to_lowercase());
     rows
+}
+
+/// The row text for a server: its configured description, else its transport.
+fn mcp_server_row_description(server: &ConfiguredMcpServer) -> String {
+    if server.description.is_empty() {
+        format!("MCP server ({})", server.transport)
+    } else {
+        server.description.clone()
+    }
 }
 
 /// Why a toggle could not be saved.
@@ -640,17 +709,23 @@ mod tests {
                 ConfiguredMcpServer {
                     name: "files".into(),
                     enabled: true,
-                    transport: "stdio".into()
+                    transport: "stdio".into(),
+                    deferred: false,
+                    description: String::new(),
                 },
                 ConfiguredMcpServer {
                     name: "search".into(),
                     enabled: false,
-                    transport: "streamableHttp".into()
+                    transport: "streamableHttp".into(),
+                    deferred: false,
+                    description: String::new(),
                 },
                 ConfiguredMcpServer {
                     name: "legacy".into(),
                     enabled: true,
-                    transport: "sse".into()
+                    transport: "sse".into(),
+                    deferred: false,
+                    description: String::new(),
                 },
             ]
         );
@@ -725,6 +800,97 @@ mod tests {
             with_tool_disabled(r#"{"tools": {"disabledTools": "grep"}}"#, "x", true),
             Err(ToggleError::InvalidConfig(_))
         ));
+    }
+
+    const DEFERRED_CONFIG: &str = r#"{
+  "tools": {
+    "mcpServers": {
+      "cms": {"url": "https://x/mcp", "exposure": "deferred", "description": "  Strapi CMS  "},
+      "files": {"command": "npx"}
+    }
+  }
+}
+"#;
+
+    #[test]
+    fn configured_mcp_servers_reports_exposure_and_description() {
+        let servers = configured_mcp_servers(DEFERRED_CONFIG).unwrap();
+
+        let cms = servers.iter().find(|s| s.name == "cms").unwrap();
+        assert!(cms.deferred);
+        assert_eq!(cms.description, "Strapi CMS");
+        let files = servers.iter().find(|s| s.name == "files").unwrap();
+        assert!(!files.deferred);
+        assert!(files.description.is_empty());
+    }
+
+    #[test]
+    fn deferring_an_mcp_server_sets_its_exposure() {
+        let updated = with_mcp_server_deferred(DEFERRED_CONFIG, "files", true)
+            .unwrap()
+            .unwrap();
+
+        let value: Value = serde_json::from_str(&updated).unwrap();
+        assert_eq!(
+            value["tools"]["mcpServers"]["files"]["exposure"],
+            "deferred"
+        );
+    }
+
+    #[test]
+    fn making_an_mcp_server_direct_removes_its_exposure() {
+        let updated = with_mcp_server_deferred(DEFERRED_CONFIG, "cms", false)
+            .unwrap()
+            .unwrap();
+
+        let value: Value = serde_json::from_str(&updated).unwrap();
+        assert!(
+            value["tools"]["mcpServers"]["cms"]
+                .get("exposure")
+                .is_none()
+        );
+        assert_eq!(
+            value["tools"]["mcpServers"]["cms"]["description"],
+            "  Strapi CMS  "
+        );
+    }
+
+    #[test]
+    fn setting_an_mcp_server_to_its_current_exposure_changes_nothing() {
+        assert_eq!(
+            with_mcp_server_deferred(DEFERRED_CONFIG, "cms", true).unwrap(),
+            None
+        );
+        assert_eq!(
+            with_mcp_server_deferred(DEFERRED_CONFIG, "files", false).unwrap(),
+            None
+        );
+    }
+
+    #[test]
+    fn exposure_changes_reject_unknown_servers_and_invalid_names() {
+        assert_eq!(
+            with_mcp_server_deferred(DEFERRED_CONFIG, "ghost", true),
+            Err(ToggleError::UnknownServer)
+        );
+        assert_eq!(
+            with_mcp_server_deferred(DEFERRED_CONFIG, "../x", true),
+            Err(ToggleError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn mcp_server_rows_use_the_configured_description_and_report_exposure() {
+        let servers = configured_mcp_servers(DEFERRED_CONFIG).unwrap();
+
+        let rows = mcp_server_setting_rows(&servers, &HashSet::new());
+
+        let cms = rows.iter().find(|row| row.name == "cms").unwrap();
+        assert_eq!(cms.description, "Strapi CMS");
+        assert!(cms.deferred);
+        let files = rows.iter().find(|row| row.name == "files").unwrap();
+        assert_eq!(files.description, "MCP server (stdio)");
+        assert!(!files.deferred);
     }
 
     #[test]

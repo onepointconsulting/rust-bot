@@ -23,11 +23,31 @@ pub struct DeferredToolDefinition {
     pub loaded: bool,
 }
 
+/// Whether a listed tool can be called now, as shown in the tool lists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolListExposure {
+    /// Declared to the model on every request.
+    Direct,
+    /// Deferred and not loaded: `tool_search` can load it.
+    Deferred,
+    /// Deferred and loaded by `tool_search` in this session.
+    Loaded,
+}
+
+impl ToolListExposure {
+    /// Whether the model can call a tool with this exposure right now.
+    pub fn is_callable(self) -> bool {
+        self != Self::Deferred
+    }
+}
+
 /// Display-oriented view of one registered tool (no parameter schema).
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct ToolSummary {
     pub name: String,
     pub description: String,
+    pub exposure: ToolListExposure,
 }
 
 /// One built-in tool as listed in the Settings dialog: its description and whether it
@@ -86,6 +106,7 @@ impl ToolRegistry {
                 ToolSummary {
                     name: tool.name(),
                     description: tool.description(),
+                    exposure: ToolListExposure::Direct,
                 },
             );
         }
@@ -320,15 +341,22 @@ impl ToolRegistry {
         names
     }
 
-    /// Name and description of every registered tool, sorted by name so the
-    /// order is stable across calls (the backing map is unordered).
+    /// Name, description and exposure of every registered tool, sorted by name so the
+    /// order is stable across calls (the backing map is unordered). A deferred tool is
+    /// `Loaded` once loaded in this view (a session view is seeded with its loads).
     pub fn tool_summaries(&self) -> Vec<ToolSummary> {
+        let loaded = self.loaded_names();
         let mut summaries: Vec<ToolSummary> = self
             .tools
-            .values()
-            .map(|tool| ToolSummary {
+            .iter()
+            .map(|(name, tool)| ToolSummary {
                 name: tool.name(),
                 description: tool.description(),
+                exposure: match self.exposure_of_tool(name, tool) {
+                    ToolExposure::Direct => ToolListExposure::Direct,
+                    ToolExposure::Deferred if loaded.contains(name) => ToolListExposure::Loaded,
+                    ToolExposure::Deferred => ToolListExposure::Deferred,
+                },
             })
             .collect();
         summaries.sort_by(|a, b| a.name.cmp(&b.name));
@@ -931,6 +959,32 @@ mod tests {
         );
         assert_eq!(definitions[1].description, "Deferred tool mcp_srv_a.");
         assert_eq!(definitions[1].parameters["type"], "object");
+    }
+
+    #[test]
+    fn tool_summaries_carry_direct_deferred_and_loaded_exposure() {
+        let reg = registry_with_deferred();
+        reg.load_tools(&names(&["mcp_srv_a"]));
+
+        let exposures: Vec<(String, ToolListExposure)> = reg
+            .tool_summaries()
+            .into_iter()
+            .map(|summary| (summary.name, summary.exposure))
+            .collect();
+
+        assert_eq!(
+            exposures,
+            vec![
+                ("add".to_string(), ToolListExposure::Direct),
+                ("echo".to_string(), ToolListExposure::Direct),
+                ("fail".to_string(), ToolListExposure::Deferred),
+                ("mcp_search".to_string(), ToolListExposure::Direct),
+                ("mcp_srv_a".to_string(), ToolListExposure::Loaded),
+                ("mcp_srv_b".to_string(), ToolListExposure::Deferred),
+            ]
+        );
+        assert!(ToolListExposure::Loaded.is_callable());
+        assert!(!ToolListExposure::Deferred.is_callable());
     }
 
     #[test]

@@ -31,8 +31,8 @@ use chat_ui::models::{
 
 use crate::api::{self, WsSender};
 use crate::components::{
-    apply_enabled, apply_tool_config, ChatShell, McpChangeRequest, SettingsActions, SettingsPage,
-    SettingsPanel, ToggleRequest, ToolConfigChange,
+    apply_enabled, apply_on_demand, apply_tool_config, ChatShell, McpChangeRequest,
+    SettingsActions, SettingsPage, SettingsPanel, ToggleRequest, ToolConfigChange,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -1177,6 +1177,16 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 .mcp_servers
                 .update(|servers| apply_enabled(servers, &name, enabled));
         }
+        ServerEvent::McpServerExposureSet {
+            name,
+            deferred,
+            restart_required,
+        } => {
+            finish_setting_change(ctx, restart_required);
+            ctx.settings_panel
+                .mcp_servers
+                .update(|servers| apply_on_demand(servers, &name, deferred));
+        }
         ServerEvent::SettingError {
             kind,
             name,
@@ -1655,6 +1665,18 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
         *ctx,
         envelope,
         "Failed to encode the settings change request.",
+    );
+}
+
+/// Ask the gateway to load an MCP server's tools on demand or not in `config.json`. The
+/// reply is an `mcp_server_exposure_set` or a `setting_error` event.
+fn request_set_on_demand(ctx: &WsContext, (name, deferred): (String, bool)) {
+    ctx.settings_panel.error.set(None);
+    ctx.settings_panel.busy.set(Some(name.clone()));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_mcp_server_deferred(name, deferred),
+        "Failed to encode the MCP server change request.",
     );
 }
 
@@ -2739,6 +2761,7 @@ pub fn App() -> impl IntoView {
     let settings_actions = SettingsActions {
         on_select_page: Callback::new(move |page| select_settings_page(&ws_context, page)),
         on_toggle: Callback::new(move |request| request_toggle_setting(&ws_context, request)),
+        on_set_on_demand: Callback::new(move |change| request_set_on_demand(&ws_context, change)),
         on_refresh: Callback::new(move |()| refresh_settings_page(&ws_context)),
         on_save_config: Callback::new(move |change| request_set_tool_config(&ws_context, change)),
         on_restart: Callback::new(move |()| request_restart(&ws_context)),

@@ -127,6 +127,27 @@ pub struct SkillSummary {
     pub description: String,
 }
 
+/// Whether a listed tool can be called now. Mirrors the backend's `ToolListExposure`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum ToolExposure {
+    /// Declared to the model on every request. Also what an older gateway that sends
+    /// no exposure means.
+    #[default]
+    Direct,
+    /// Not loaded yet; the model can load it with `tool_search`.
+    Deferred,
+    /// Loaded by `tool_search` in this chat.
+    Loaded,
+}
+
+impl ToolExposure {
+    /// Whether the model can call a tool with this exposure right now.
+    pub fn is_callable(self) -> bool {
+        self != Self::Deferred
+    }
+}
+
 /// One tool the agent can call, as surfaced by the gateway's `tools` event.
 ///
 /// Mirrors the backend's `ToolSummary` (`src/agent/tools/registry.rs`) — a
@@ -136,6 +157,17 @@ pub struct ToolSummary {
     pub name: String,
     #[serde(default)]
     pub description: String,
+    #[serde(default)]
+    pub exposure: ToolExposure,
+}
+
+/// Split `tools` into the ones the model can call now and the ones `tool_search` can
+/// load, keeping the order of each.
+pub fn split_tools_by_availability(tools: &[ToolSummary]) -> (Vec<ToolSummary>, Vec<ToolSummary>) {
+    tools
+        .iter()
+        .cloned()
+        .partition(|tool| tool.exposure.is_callable())
 }
 
 /// One built-in tool in the Settings dialog, as surfaced by the gateway's `tool_settings`
@@ -242,6 +274,9 @@ pub struct McpServerSettingSummary {
     /// Whether the running process was started with the server on.
     #[serde(default)]
     pub active: bool,
+    /// Whether `config.json` loads the server's tools on demand (`exposure: deferred`).
+    #[serde(default)]
+    pub deferred: bool,
 }
 
 /// Setup state of one field a preset needs, as surfaced by the gateway's `mcp_presets`
@@ -505,6 +540,47 @@ pub struct WorkspaceDialogState {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn tool(name: &str, exposure: ToolExposure) -> ToolSummary {
+        ToolSummary {
+            name: name.to_string(),
+            description: String::new(),
+            exposure,
+        }
+    }
+
+    #[test]
+    fn tool_summary_without_exposure_is_direct() {
+        let summary: ToolSummary =
+            serde_json::from_str(r#"{"name": "shell", "description": "Run"}"#).unwrap();
+        assert_eq!(summary.exposure, ToolExposure::Direct);
+    }
+
+    #[test]
+    fn tool_summary_reads_deferred_and_loaded_exposure() {
+        let deferred: ToolSummary =
+            serde_json::from_str(r#"{"name": "a", "exposure": "deferred"}"#).unwrap();
+        let loaded: ToolSummary =
+            serde_json::from_str(r#"{"name": "b", "exposure": "loaded"}"#).unwrap();
+        assert_eq!(deferred.exposure, ToolExposure::Deferred);
+        assert_eq!(loaded.exposure, ToolExposure::Loaded);
+    }
+
+    #[test]
+    fn split_tools_by_availability_keeps_order_within_each_group() {
+        let tools = vec![
+            tool("a_deferred", ToolExposure::Deferred),
+            tool("b_direct", ToolExposure::Direct),
+            tool("c_loaded", ToolExposure::Loaded),
+            tool("d_deferred", ToolExposure::Deferred),
+        ];
+
+        let (callable, on_demand) = split_tools_by_availability(&tools);
+
+        let names = |list: &[ToolSummary]| list.iter().map(|t| t.name.clone()).collect::<Vec<_>>();
+        assert_eq!(names(&callable), vec!["b_direct", "c_loaded"]);
+        assert_eq!(names(&on_demand), vec!["a_deferred", "d_deferred"]);
+    }
 
     #[test]
     fn format_message_time_parts_matches_requested_display() {

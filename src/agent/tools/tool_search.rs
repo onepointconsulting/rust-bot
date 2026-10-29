@@ -16,7 +16,9 @@ use async_trait::async_trait;
 use serde_json::{Value, json};
 
 use crate::agent::tools::base::Tool;
-use crate::agent::tools::registry::{DeferredToolDefinition, MCP_TOOL_PREFIX, ToolRegistry};
+use crate::agent::tools::registry::{
+    DeferredToolDefinition, MCP_TOOL_PREFIX, ToolListExposure, ToolRegistry, ToolSummary,
+};
 use crate::agent::tools::tool_ranker::{create_tool_search_document, rank_tools};
 pub use crate::config::schema::TOOL_SEARCH_TOOL_NAME;
 
@@ -123,6 +125,22 @@ fn example_tool_names<'a>(server_name: &str, tool_names: &[&'a str]) -> Vec<&'a 
         })
         .take(MAX_EXAMPLE_TOOL_NAMES)
         .collect()
+}
+
+/// The tool list of `view` as the user sees it: every tool with its exposure, plus
+/// `tool_search` when `view` has deferred tools. `tool_search` is registered per turn
+/// (see the module docs), so it is not in a view itself but the model does get it.
+pub fn tool_summaries_for_view(view: &ToolRegistry) -> Vec<ToolSummary> {
+    let mut summaries = view.tool_summaries();
+    if view.has_deferred_tools() {
+        summaries.push(ToolSummary {
+            name: TOOL_SEARCH_TOOL_NAME.to_string(),
+            description: TOOL_SEARCH_DESCRIPTION.to_string(),
+            exposure: ToolListExposure::Direct,
+        });
+        summaries.sort_by(|a, b| a.name.cmp(&b.name));
+    }
+    summaries
 }
 
 /// First line of a tool description, trimmed.
@@ -662,5 +680,33 @@ Second line.",
                 ],
             ]
         );
+    }
+
+    // ── tool list ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tool_list_includes_tool_search_when_something_is_deferred() {
+        let summaries = tool_summaries_for_view(&registry());
+
+        let tool_search = summaries
+            .iter()
+            .find(|summary| summary.name == TOOL_SEARCH_TOOL_NAME)
+            .expect("tool_search listed");
+        assert_eq!(tool_search.exposure, ToolListExposure::Direct);
+        let names: Vec<&str> = summaries.iter().map(|s| s.name.as_str()).collect();
+        let mut sorted = names.clone();
+        sorted.sort();
+        assert_eq!(names, sorted);
+    }
+
+    #[test]
+    fn tool_list_has_no_tool_search_when_nothing_is_deferred() {
+        let mut tools = ToolRegistry::new();
+        tools.register(direct("read_file", "Read a file."));
+
+        let summaries = tool_summaries_for_view(&tools);
+
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].name, "read_file");
     }
 }

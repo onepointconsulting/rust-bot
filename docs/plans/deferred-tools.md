@@ -338,6 +338,22 @@ Status (2026-10-28): implemented as described in D5, unit tests green, not yet t
 
 ### M3. Surfaces
 
+Status (2026-10-29): implemented, unit tests green (backend, `chat-ui`, `websockets-chat`), not yet tried in a
+browser. As built:
+
+- `ToolSummary.exposure` (`direct` / `deferred` / `loaded`) from the session view; `session_tool_view` in
+  `agent_loop.rs` is the one place that restricts by mode and seeds loads, shared by the agent loop and the
+  websocket list. `tool_summaries_for_view` (`tool_search.rs`) adds `tool_search` when anything is deferred.
+- Tools popup: header counts callable tools, "loaded" badge, collapsed "Available on demand (N)" group. `/tools`:
+  same split in text.
+- Settings → MCP servers: a "Load tools on demand" switch per server (envelope `set_mcp_server_deferred`, event
+  `mcp_server_exposure_set`, edit `with_mcp_server_deferred`; mirrors the enable switch, takes effect after a
+  restart). Rows show the configured `description` when set. Editing the description stays in the raw config
+  editor.
+- Presets: a server enabled from a preset gets the preset's description when it has none; re-enabling keeps the
+  user's `exposure` and `description`.
+- Docs: `docs/DEFERRED_TOOLS.md` and a README section.
+
 - `/tools` and the websocket tool list (`visible_tool_summaries`, `runtime.rs:2612`) show deferred tools and whether
   they are loaded. Today both list every registered tool as `{name, description}` (`ToolRegistry::tool_summaries`,
   `registry.rs:173`; `CmdTools`, `command/builtin.rs:923`). Deferred tools stay registered (D1), so without this

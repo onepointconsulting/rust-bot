@@ -97,6 +97,10 @@ pub enum EnvelopeType {
     /// `enabled` flag in `config.json`. Rust-side addition with no nanobot precedent.
     /// Same access rules as [`Self::SaveConfigFile`].
     SetMcpServerEnabled,
+    /// Load one configured MCP server's tools on demand or not (`{name, enabled}`, where
+    /// `enabled` means "deferred") by editing its `exposure` in `config.json`. Rust-side
+    /// addition with no nanobot precedent. Same access rules as [`Self::SetMcpServerEnabled`].
+    SetMcpServerDeferred,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -186,6 +190,7 @@ impl From<&str> for EnvelopeType {
             "set_tool_enabled" => Self::SetToolEnabled,
             "list_mcp_servers" => Self::ListMcpServers,
             "set_mcp_server_enabled" => Self::SetMcpServerEnabled,
+            "set_mcp_server_deferred" => Self::SetMcpServerDeferred,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -261,6 +266,9 @@ pub enum WsOutboundEvent {
     /// Reply to a successful [`EnvelopeType::SetMcpServerEnabled`] — `{name, enabled,
     /// restart_required}`.
     McpServerSet,
+    /// Reply to a successful [`EnvelopeType::SetMcpServerDeferred`] — `{name, enabled,
+    /// restart_required}`, `enabled` meaning "deferred".
+    McpServerExposureSet,
     /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
     /// message}`. Never carries any of the file's content.
     SettingError,
@@ -343,6 +351,7 @@ impl WsOutboundEvent {
             Self::ToolSettingSet => "tool_setting_set",
             Self::McpServers => "mcp_servers",
             Self::McpServerSet => "mcp_server_set",
+            Self::McpServerExposureSet => "mcp_server_exposure_set",
             Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
@@ -824,6 +833,14 @@ mod tests {
         assert_eq!(WsOutboundEvent::ToolSettingSet.as_str(), "tool_setting_set");
         assert_eq!(WsOutboundEvent::McpServers.as_str(), "mcp_servers");
         assert_eq!(WsOutboundEvent::McpServerSet.as_str(), "mcp_server_set");
+        assert_eq!(
+            EnvelopeType::from("set_mcp_server_deferred"),
+            EnvelopeType::SetMcpServerDeferred
+        );
+        assert_eq!(
+            WsOutboundEvent::McpServerExposureSet.as_str(),
+            "mcp_server_exposure_set"
+        );
         assert_eq!(WsOutboundEvent::SettingError.as_str(), "setting_error");
         assert_eq!(
             EnvelopeType::from("list_subagents"),

@@ -20,7 +20,8 @@ pub use message_list::MessageList;
 pub use reasoning_panel::ReasoningPanel;
 pub use settings_dialog::{ConfigSavedNotice, SettingsDialog};
 pub use settings_pages::{
-    apply_enabled, apply_tool_config, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
+    apply_enabled, apply_on_demand, apply_tool_config, SettingsActions, SettingsPage,
+    SettingsPanel, ToggleRequest,
 };
 pub use subagents_page::SubagentsPage;
 pub use tool_activity::ToolActivity;

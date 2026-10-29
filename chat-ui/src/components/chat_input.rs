@@ -5,8 +5,8 @@ use wasm_bindgen::JsCast;
 use web_sys::{File, FileList, HtmlInputElement, HtmlTextAreaElement};
 
 use crate::models::{
-    format_compact_tokens, ImageAttachment, OutgoingMessage, SessionTokenUsage, SkillSummary,
-    ToolSummary,
+    format_compact_tokens, split_tools_by_availability, ImageAttachment, OutgoingMessage,
+    SessionTokenUsage, SkillSummary, ToolExposure, ToolSummary,
 };
 
 const MAX_TEXTAREA_HEIGHT_PX: f64 = 160.0;
@@ -479,15 +479,52 @@ fn SkillsPopup(skills: Signal<Vec<SkillSummary>>) -> impl IntoView {
     }
 }
 
+/// One row of the tools table: name, description, and a "loaded" badge for a tool
+/// `tool_search` loaded in this chat. `first_line_only` shortens the description (used
+/// for the on-demand list, where an MCP server may contribute many tools).
+#[component]
+fn ToolRow(tool: ToolSummary, first_line_only: bool) -> impl IntoView {
+    let description = if first_line_only {
+        tool.description
+            .trim()
+            .lines()
+            .next()
+            .unwrap_or("")
+            .to_string()
+    } else {
+        tool.description.clone()
+    };
+    let loaded = tool.exposure == ToolExposure::Loaded;
+    view! {
+        <tr class="border-b border-slate-100 align-top last:border-0">
+            <td class="break-words px-3 py-2 font-mono text-xs font-medium text-slate-700">
+                {tool.name.clone()}
+                <Show when=move || loaded>
+                    <span class="ml-1 rounded bg-emerald-50 px-1 py-px font-sans text-[10px] font-medium text-emerald-700 ring-1 ring-emerald-200">
+                        "loaded"
+                    </span>
+                </Show>
+            </td>
+            <td class="px-3 py-2 text-xs text-slate-500">{description}</td>
+        </tr>
+    }
+}
+
 /// Tools drop-up, rendered on the toolbar row right after [`SkillsPopup`].
 /// A wrench button opens a table of tool name + description. Unlike the
 /// skills popup it is always shown (the list is fetched on demand, so it is
 /// legitimately empty before the first click): `on_open` fires each time the
 /// popup opens so the caller can request the list for the chat's *current*
 /// agent mode. Read-only.
+///
+/// The header counts the tools the model can call now. Deferred tools that are not
+/// loaded yet are listed below, in a collapsed "Available on demand" group.
 #[component]
 fn ToolsPopup(tools: Signal<Vec<ToolSummary>>, on_open: Callback<()>) -> impl IntoView {
     let menu_open = RwSignal::new(false);
+    let tool_groups = Memo::new(move |_| split_tools_by_availability(&tools.get()));
+    let callable_tools = move || tool_groups.get().0;
+    let on_demand_tools = move || tool_groups.get().1;
 
     view! {
         <div class="relative">
@@ -530,11 +567,11 @@ fn ToolsPopup(tools: Signal<Vec<ToolSummary>>, on_open: Callback<()>) -> impl In
                 ></div>
                 <div
                     role="dialog"
-                    aria-label=move || format!("Available tools ({})", tools.get().len())
+                    aria-label=move || format!("Available tools ({})", callable_tools().len())
                     class="absolute bottom-full left-0 z-20 mb-1 max-h-72 w-[min(34rem,calc(100vw-4rem))] overflow-y-auto rounded-xl bg-white shadow-lg ring-1 ring-slate-200"
                 >
                     <p class="px-3 pb-1 pt-2 text-xs font-semibold uppercase tracking-wide text-slate-400">
-                        {move || format!("Tools ({})", tools.get().len())}
+                        {move || format!("Tools ({})", callable_tools().len())}
                     </p>
                     <Show
                         when=move || !tools.get().is_empty()
@@ -555,21 +592,37 @@ fn ToolsPopup(tools: Signal<Vec<ToolSummary>>, on_open: Callback<()>) -> impl In
                             </thead>
                             <tbody>
                                 <For
-                                    each=move || tools.get()
-                                    key=|tool| tool.name.clone()
+                                    each=callable_tools
+                                    key=|tool| (tool.name.clone(), tool.exposure)
                                     let(tool)
                                 >
-                                    <tr class="border-b border-slate-100 align-top last:border-0">
-                                        <td class="break-words px-3 py-2 font-mono text-xs font-medium text-slate-700">
-                                            {tool.name.clone()}
-                                        </td>
-                                        <td class="px-3 py-2 text-xs text-slate-500">
-                                            {tool.description.clone()}
-                                        </td>
-                                    </tr>
+                                    <ToolRow tool=tool first_line_only=false />
                                 </For>
                             </tbody>
                         </table>
+                        <Show when=move || !on_demand_tools().is_empty()>
+                            <details class="border-t border-slate-200">
+                                <summary class="cursor-pointer px-3 py-2 text-xs font-semibold uppercase tracking-wide text-slate-400 hover:text-slate-600">
+                                    {move || {
+                                        format!("Available on demand ({})", on_demand_tools().len())
+                                    }}
+                                </summary>
+                                <p class="px-3 pb-1 text-xs text-slate-400">
+                                    "Not loaded yet. The agent loads these with tool_search when a request needs them."
+                                </p>
+                                <table class="w-full table-fixed border-collapse text-left">
+                                    <tbody>
+                                        <For
+                                            each=on_demand_tools
+                                            key=|tool| tool.name.clone()
+                                            let(tool)
+                                        >
+                                            <ToolRow tool=tool first_line_only=true />
+                                        </For>
+                                    </tbody>
+                                </table>
+                            </details>
+                        </Show>
                     </Show>
                 </div>
             </div>
