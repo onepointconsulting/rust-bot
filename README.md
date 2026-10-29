@@ -4,6 +4,7 @@ A bot implementation initially based on [Nanobot](https://github.com/HKUDS/nanob
 
 ## Table of contents
 
+- [Features](#features)
 - [Quick start](#quick-start)
 - [Pre-requisites](#pre-requisites)
 - [Testing](#testing)
@@ -18,7 +19,38 @@ A bot implementation initially based on [Nanobot](https://github.com/HKUDS/nanob
 
 ---
 
+## Features
 
+- **Small footprint.** One native binary written in Rust: no Node.js or Python runtime to install, and the
+  browser UI is embedded in the executable. Install it with one command, or unpack an archive and run it.
+- **Many model providers.** Anthropic, OpenAI, Azure OpenAI, OpenRouter, Gemini, Together AI and any
+  OpenAI-compatible endpoint (local servers included), with named model presets you can switch per chat.
+  Prompt caching is used where the provider supports it.
+- **Several ways to talk to it.** A one-shot command and an interactive console, a WebSocket gateway with a
+  browser chat UI (streaming replies, live tool activity, reasoning panels), email, WhatsApp and a REST API. See
+  [Command line](#command-line), [Interactive console](#interactive-console) and
+  [docs/WEBSOCKETS_CHAT.md](docs/WEBSOCKETS_CHAT.md).
+- **Deferred tools.** MCP servers with many tools no longer bloat every request: mark a server as deferred and
+  the model finds and loads only the tools it needs through a built-in `tool_search`. In one test, a server with
+  more than 100 tools went from about 474,000 prompt tokens per request to about 14,000. See
+  [Deferred tools](#deferred-tools).
+- **MCP and tool control.** Connect any MCP server (stdio, SSE or streamable HTTP), pick which of its tools are
+  enabled, enable ready-made presets from the web UI, and switch built-in tools on or off. Agent modes such as
+  `minimal` and `no_mcp` change what a chat can use.
+- **Built-in tools.** Files, shell, web search and fetch, Gmail, OCR, document conversion, image generation,
+  scheduled reminders (cron), clarifying questions and sustained goals.
+- **Delegation.** Background subagents for long tasks, and external coding agents (such as Claude Code or Codex)
+  driven over the Agent Client Protocol.
+- **Skills and memory.** Reusable skills loaded into the prompt, long-term memory, and history consolidation so
+  long conversations stay within the context window.
+- **Crash recovery.** Interrupted turns are resumed, unsafe tool calls are never repeated and queued messages
+  are not lost. See [Durability](#durability).
+- **Access control.** Optional login for the web UI with admin and user roles (only admins change the
+  configuration), JWT tokens, and workspace limits for file and shell access.
+- **Easy to run.** A guided `onboard` setup with a per-user or per-project install, `check-config` validation, and
+  Docker support ([docs/DOCKER.md](docs/DOCKER.md)).
+
+---
 
 ## Quick start
 
@@ -36,7 +68,7 @@ curl -fsSL https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/sc
 irm https://raw.githubusercontent.com/onepointconsulting/rust-bot/main/scripts/install.ps1 | iex
 ```
 
-Set `RUST_BOT_VERSION` (for example `0.3.3`) to pin a version.
+Set `RUST_BOT_VERSION` (for example `0.4.1`) to pin a version.
 
 ### Update and uninstall
 
