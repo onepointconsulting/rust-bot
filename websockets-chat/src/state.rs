@@ -907,9 +907,35 @@ impl PendingQuestion {
     }
 }
 
+/// Gateway `error` detail for an answer to a question that is no longer open:
+/// it timed out, its turn was stopped, or another tab answered it first.
+pub const QUESTION_NOT_FOUND_DETAIL: &str = "question_not_found";
+
+/// What to tell the user when an answer was rejected with `detail` because the
+/// question is gone, or `None` when `detail` is not that rejection.
+pub fn question_gone_message(detail: &str) -> Option<&'static str> {
+    (detail == QUESTION_NOT_FOUND_DETAIL).then_some(
+        "This question is no longer waiting for an answer (it timed out, was cancelled, or was          already answered). The agent carried on without it; tell it your answer in a message if it matters.",
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_question_that_is_gone_gets_a_readable_message() {
+        let message = question_gone_message("question_not_found").expect("a message");
+        assert!(message.contains("no longer waiting"));
+        assert!(!message.contains("question_not_found"));
+    }
+
+    #[test]
+    fn other_error_details_have_no_question_message() {
+        assert_eq!(question_gone_message("access_denied"), None);
+        assert_eq!(question_gone_message("approval_not_found"), None);
+        assert_eq!(question_gone_message(""), None);
+    }
 
     #[test]
     fn a_reported_background_agent_count_replaces_the_current_one() {

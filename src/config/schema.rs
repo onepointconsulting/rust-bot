@@ -1184,6 +1184,11 @@ fn default_question_tool_enabled() -> bool {
     true
 }
 
+/// Seconds a question waits for an answer by default (10 minutes).
+fn default_question_tool_timeout_seconds() -> u64 {
+    600
+}
+
 /// Question Tool configuration.
 #[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
@@ -1193,12 +1198,22 @@ pub struct QuestionToolConfig {
     #[serde(alias = "enable", default = "default_question_tool_enabled")]
     #[garde(skip)]
     pub enabled: bool,
+
+    /// Seconds a question waits for the user's answer before the agent is told
+    /// it was cancelled and carries on. Must be ≥ 1. Default: 600.
+    #[serde(
+        alias = "timeout_seconds",
+        default = "default_question_tool_timeout_seconds"
+    )]
+    #[garde(range(min = 1))]
+    pub timeout_seconds: u64,
 }
 
 impl Default for QuestionToolConfig {
     fn default() -> Self {
         Self {
             enabled: default_question_tool_enabled(),
+            timeout_seconds: default_question_tool_timeout_seconds(),
         }
     }
 }
@@ -3124,6 +3139,28 @@ mod tests {
         let cfg = QuestionToolConfig::default();
         assert!(cfg.enabled);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_question_tool_timeout_defaults_to_ten_minutes() {
+        assert_eq!(QuestionToolConfig::default().timeout_seconds, 600);
+        let cfg: QuestionToolConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.timeout_seconds, 600);
+    }
+
+    #[test]
+    fn test_question_tool_timeout_deserializes_camel_and_snake_case() {
+        let camel: QuestionToolConfig =
+            serde_json::from_str(r#"{"timeoutSeconds": 3600}"#).unwrap();
+        assert_eq!(camel.timeout_seconds, 3600);
+        let snake: QuestionToolConfig = serde_json::from_str(r#"{"timeout_seconds": 90}"#).unwrap();
+        assert_eq!(snake.timeout_seconds, 90);
+    }
+
+    #[test]
+    fn test_question_tool_timeout_of_zero_is_invalid() {
+        let cfg: QuestionToolConfig = serde_json::from_str(r#"{"timeoutSeconds": 0}"#).unwrap();
+        assert!(cfg.validate().is_err());
     }
 
     #[test]

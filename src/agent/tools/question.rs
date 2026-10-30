@@ -21,9 +21,10 @@ use crate::integrations::herdr::HerdrReporter;
 pub const QUESTION_TOOL_NAME: &str = "question";
 
 /// How long a websocket-channel question waits for an answer before the
-/// agent gets told the user cancelled. Longer than tool-approval's 300s
-/// timeout since a clarifying question may need more thought than a yes/no.
-const QUESTION_TIMEOUT: Duration = Duration::from_secs(600);
+/// agent gets told the user cancelled, unless `tools.question.timeoutSeconds`
+/// says otherwise. Longer than tool-approval's 300s timeout since a
+/// clarifying question may need more thought than a yes/no.
+pub const DEFAULT_QUESTION_TIMEOUT: Duration = Duration::from_secs(600);
 
 /// One selectable option in a `question` tool call.
 #[derive(Debug, Clone, PartialEq)]
@@ -49,6 +50,8 @@ pub struct QuestionTool {
     chat_id: StdMutex<String>,
     bus: StdMutex<Option<Arc<MessageBus>>>,
     broker: Arc<QuestionBroker>,
+    /// How long a websocket-channel question waits for an answer.
+    timeout: Duration,
 }
 
 impl QuestionTool {
@@ -60,7 +63,20 @@ impl QuestionTool {
             chat_id: StdMutex::new(String::new()),
             bus: StdMutex::new(bus),
             broker: Arc::new(QuestionBroker::new()),
+            timeout: DEFAULT_QUESTION_TIMEOUT,
         }
+    }
+
+    /// How long a websocket-channel question waits for an answer.
+    pub fn timeout(&self) -> Duration {
+        self.timeout
+    }
+
+    /// Wait `timeout` (instead of [`DEFAULT_QUESTION_TIMEOUT`]) for a
+    /// websocket-channel answer.
+    pub fn with_timeout(mut self, timeout: Duration) -> Self {
+        self.timeout = timeout;
+        self
     }
 
     /// The broker backing this tool's websocket-channel questions, so
@@ -199,7 +215,7 @@ impl QuestionTool {
             return format!("Error: failed to publish question: {e}");
         }
 
-        let answer: QuestionAnswer = match tokio::time::timeout(QUESTION_TIMEOUT, rx).await {
+        let answer: QuestionAnswer = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(answer)) => answer,
             Ok(Err(_)) | Err(_) => return CANCELLED_ANSWER.to_string(),
         };
@@ -735,6 +751,33 @@ mod tests {
             )
             .unwrap();
         assert_eq!(run.await.unwrap(), "User answered: free text");
+    }
+
+    #[tokio::test]
+    async fn execute_websocket_question_times_out_after_the_configured_wait() {
+        let bus = Arc::new(MessageBus::new());
+        let tool =
+            QuestionTool::new(Some(Arc::clone(&bus))).with_timeout(Duration::from_millis(50));
+        tool.set_tool_context(WEBSOCKET_CHANNEL, "chat-1", None);
+        let broker = tool.broker();
+
+        let answer = tool
+            .execute(&serde_json::json!({
+                "question": "Which one?",
+                "options": [{"label": "A"}],
+            }))
+            .await;
+
+        assert_eq!(answer, CANCELLED_ANSWER);
+        assert!(
+            broker.pending_for_chat("chat-1").is_empty(),
+            "a timed-out question must leave the broker"
+        );
+    }
+
+    #[test]
+    fn a_new_question_tool_waits_the_default_time() {
+        assert_eq!(QuestionTool::new(None).timeout(), DEFAULT_QUESTION_TIMEOUT);
     }
 
     #[tokio::test]

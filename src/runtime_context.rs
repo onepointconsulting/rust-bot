@@ -141,9 +141,46 @@ pub fn runtime_context_blocks_from_metadata(
         .collect()
 }
 
+/// `text` without a runtime-context block a model copied into its own reply,
+/// cut at the first [`RUNTIME_CONTEXT_TAG`] with trailing whitespace trimmed.
+/// Text without the tag is returned unchanged.
+///
+/// The tag only ever belongs to injected input; a model that saw it in its
+/// history may imitate it and append fabricated context or results.
+pub fn strip_leaked_runtime_context(text: &str) -> &str {
+    match text.find(RUNTIME_CONTEXT_TAG) {
+        Some(tag_start) => text[..tag_start].trim_end(),
+        None => text,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- strip_leaked_runtime_context ---
+
+    #[test]
+    fn strip_leaked_runtime_context_cuts_from_the_tag_on() {
+        let reply = format!(
+            "Still waiting on 2 batches.\n\n{RUNTIME_CONTEXT_TAG}\nChannel: websocket\n\n[Subagent 'x' completed successfully]"
+        );
+        assert_eq!(
+            strip_leaked_runtime_context(&reply),
+            "Still waiting on 2 batches."
+        );
+    }
+
+    #[test]
+    fn strip_leaked_runtime_context_leaves_clean_text_unchanged() {
+        assert_eq!(strip_leaked_runtime_context("All done.\n"), "All done.\n");
+    }
+
+    #[test]
+    fn strip_leaked_runtime_context_of_a_tag_only_reply_is_empty() {
+        let reply = format!("{RUNTIME_CONTEXT_TAG}\nChannel: websocket");
+        assert_eq!(strip_leaked_runtime_context(&reply), "");
+    }
 
     // --- normalize_webui_quote ---
 

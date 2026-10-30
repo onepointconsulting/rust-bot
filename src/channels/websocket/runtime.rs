@@ -65,7 +65,7 @@ use crate::security::{
     WorkspaceScopeError,
 };
 use crate::session::goal_state::goal_state_ws_blob;
-use crate::session::history_visibility::is_hidden_history_message;
+use crate::session::history_visibility::{is_hidden_history_message, is_visible_user_message};
 use crate::session::keys::COMMAND_KEY;
 use crate::session::{SESSION_MODEL_PRESET_METADATA_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY};
 use crate::utils::helpers::is_localhost;
@@ -2342,7 +2342,7 @@ async fn handle_envelope_fork_chat<'a>(envelope_dispatch_context: EnvelopeDispat
                     session
                         .messages
                         .iter()
-                        .filter(|m| m.get("role").and_then(|v| v.as_str()) == Some("user"))
+                        .filter(|m| is_visible_user_message(m))
                         .count()
                 })
                 .unwrap_or(0)

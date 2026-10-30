@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::{
     agent::{
@@ -158,6 +159,14 @@ pub fn register_image_generation_tools(
     tools.register(Box::new(tool));
 }
 
+/// A question tool that waits as long as `tools.question.timeoutSeconds` says.
+fn question_tool_from_config(
+    question_config: &QuestionToolConfig,
+    bus: Arc<MessageBus>,
+) -> QuestionTool {
+    QuestionTool::new(Some(bus)).with_timeout(Duration::from_secs(question_config.timeout_seconds))
+}
+
 pub fn register_question_tool(
     question_config: &QuestionToolConfig,
     bus: Arc<MessageBus>,
@@ -167,12 +176,29 @@ pub fn register_question_tool(
         return;
     }
     log::debug!("Registering question tool");
-    tools.register(Box::new(QuestionTool::new(Some(bus))));
+    tools.register(Box::new(question_tool_from_config(question_config, bus)));
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn question_tool_waits_as_long_as_the_config_says() {
+        let config = QuestionToolConfig {
+            timeout_seconds: 1800,
+            ..QuestionToolConfig::default()
+        };
+        let tool = question_tool_from_config(&config, Arc::new(MessageBus::new()));
+        assert_eq!(tool.timeout(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn question_tool_default_config_keeps_the_ten_minute_wait() {
+        let tool =
+            question_tool_from_config(&QuestionToolConfig::default(), Arc::new(MessageBus::new()));
+        assert_eq!(tool.timeout(), Duration::from_secs(600));
+    }
 
     #[test]
     fn filesystem_tool_scope_restricted_includes_builtin_skills() {

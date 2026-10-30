@@ -69,7 +69,7 @@ use crate::config::schema::{
 };
 use crate::cron::CronService;
 use crate::providers::base::{LLMProviderDyn, LLMUsage};
-use crate::runtime_context::RUNTIME_CONTEXT_TAG;
+use crate::runtime_context::{RUNTIME_CONTEXT_TAG, strip_leaked_runtime_context};
 use crate::security::workspace_access::{
     WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
     WorkspaceScopeResolver, validate_workspace_scope_payload,
@@ -80,7 +80,9 @@ use crate::session::inbox::{self, InboxLedger, LedgerGuard, RedriveAction};
 use crate::session::journal::{
     JournalRecord, JournalStore, RunJournal, ToolCallStatus, TurnOutcome,
 };
-use crate::session::keys::{COMMAND_KEY, RUNTIME_CHECKPOINT_KEY, SESSION_WEBUI_METADATA_KEY};
+use crate::session::keys::{
+    COMMAND_KEY, HIDDEN_HISTORY_KEY, RUNTIME_CHECKPOINT_KEY, SESSION_WEBUI_METADATA_KEY,
+};
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
@@ -166,6 +168,34 @@ fn safe_strip_think(text: Option<&str>) -> Option<String> {
     text?;
     let text = strip_think(text.unwrap());
     if text.is_empty() { None } else { Some(text) }
+}
+
+/// A final reply as it may be shown and saved: without `<think>` blocks and
+/// without a runtime-context block the model copied from its input. `None`
+/// when nothing is left, so the runner treats the reply as blank.
+fn clean_final_content(text: Option<&str>) -> Option<String> {
+    let without_think = safe_strip_think(text)?;
+    let without_leak = strip_leaked_runtime_context(&without_think);
+    (!without_leak.is_empty()).then(|| without_leak.to_string())
+}
+
+/// The role of a sub-agent result in the prompt: always `user`. As an
+/// `assistant` turn it was merged into the previous reply, so the model took
+/// the result and its instructions for its own words and copied them into
+/// later replies.
+const SUBAGENT_ANNOUNCE_ROLE: &str = "user";
+
+/// Mark the sub-agent result at `announce_index` of a finished system turn
+/// hidden, so it is saved for the model's history but never shown as a chat
+/// turn. A no-op when that message is not the `user` result (e.g. it was
+/// merged into an unanswered user message).
+fn mark_announcement_hidden(messages: &mut [Value], announce_index: usize) {
+    if let Some(announcement) = messages.get_mut(announce_index)
+        && announcement.get("role").and_then(Value::as_str) == Some(SUBAGENT_ANNOUNCE_ROLE)
+        && let Some(fields) = announcement.as_object_mut()
+    {
+        fields.insert(HIDDEN_HISTORY_KEY.to_string(), Value::Bool(true));
+    }
 }
 
 /// How long to wait before trying again to connect MCP servers that failed, so a broken
@@ -422,7 +452,7 @@ impl AgentHook for LoopHook {
     }
 
     fn finalize_content(&self, _ctx: &AgentHookContext, content: Option<String>) -> Option<String> {
-        safe_strip_think(content.as_deref())
+        clean_final_content(content.as_deref())
     }
 }
 
@@ -2449,8 +2479,6 @@ impl AgentLoop {
         let (mut snapshot, pending_summary) = self.auto_compact.prepare_session(snapshot, &key);
 
         let history = snapshot.get_history(Some(0));
-        let turn_runtime = self.runtime_resolver.runtime_for_session(Some(&snapshot));
-        let current_role = Self::subagent_announce_role(&turn_runtime.model);
         let runtime_context_blocks =
             crate::runtime_context::runtime_context_blocks_from_metadata(&msg.metadata);
         let messages = self.context.build_messages(
@@ -2462,7 +2490,7 @@ impl AgentLoop {
             Some(chat_id),
             Some(&snapshot.metadata),
             (!runtime_context_blocks.is_empty()).then_some(runtime_context_blocks.as_slice()),
-            current_role,
+            SUBAGENT_ANNOUNCE_ROLE,
             pending_summary.as_deref(),
         );
         let agent_run_result = self
@@ -2480,12 +2508,15 @@ impl AgentLoop {
             )
             .await;
         let final_content = agent_run_result.final_content;
-        let all_msgs = agent_run_result.messages;
+        let mut all_msgs = agent_run_result.messages;
+        // After the system prompt and the history comes the sub-agent result.
+        let announce_index = 1 + history.len();
+        mark_announcement_hidden(&mut all_msgs, announce_index);
 
         self.persist_finished_turn(
             &mut snapshot,
             all_msgs.as_slice(),
-            1 + history.len() as u32,
+            announce_index as u32,
             agent_run_result.usage,
             "processing system message",
         );
@@ -3161,16 +3192,6 @@ impl AgentLoop {
         };
         self.process_message(msg, session_key, on_progress, on_stream, on_stream_end)
             .await
-    }
-
-    fn subagent_announce_role(model: &str) -> &'static str {
-        const REQUIRES_USER_LAST: &[&str] = &["claude", "anthropic"];
-        let model = model.to_ascii_lowercase();
-        if REQUIRES_USER_LAST.iter().any(|m| model.contains(m)) {
-            "user"
-        } else {
-            "assistant"
-        }
     }
 
     fn copy_token_usage_to_outbound(outbound: &mut OutboundMessage, usage: LLMUsage) {
@@ -5126,6 +5147,158 @@ mod tests {
         assert!(reply.metadata.is_empty());
     }
 
+    /// Give `key` a finished user turn: a question and its text-only answer.
+    fn seed_finished_turn(loop_: &AgentLoop, key: &str, question: &str, answer: &str) {
+        let mut manager = loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        let session = manager.get_or_create_session(key);
+        session
+            .messages
+            .push(json!({"role": "user", "content": question}));
+        session
+            .messages
+            .push(json!({"role": "assistant", "content": answer}));
+        let snapshot = session.clone();
+        manager.save(snapshot).unwrap();
+    }
+
+    fn session_messages(loop_: &AgentLoop, key: &str) -> Vec<Value> {
+        loop_
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_or_create_session(key)
+            .messages
+            .clone()
+    }
+
+    #[tokio::test]
+    async fn a_subagent_result_reaches_the_model_as_a_user_turn_of_its_own() {
+        let fixture = resume_fixture(Config::default());
+        seed_finished_turn(
+            &fixture.loop_,
+            "cli:direct",
+            "spawn a job",
+            "the job is running",
+        );
+
+        Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("cli", "direct"))
+            .await
+            .expect("a reply");
+
+        let requests = fixture.requests.lock().unwrap();
+        let request = requests.last().expect("one model request");
+        let tail = &request[request.len() - 2..];
+        assert_eq!(tail[0]["role"], "assistant");
+        assert_eq!(
+            tail[0]["content"], "the job is running",
+            "the earlier reply stays untouched"
+        );
+        assert_eq!(tail[1]["role"], "user");
+        assert!(
+            tail[1]["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("[Subagent 'job' completed successfully]")),
+            "{}",
+            tail[1]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_subagent_result_is_saved_hidden_before_the_reply_to_it() {
+        let fixture = resume_fixture(Config::default());
+        seed_finished_turn(
+            &fixture.loop_,
+            "cli:direct",
+            "spawn a job",
+            "the job is running",
+        );
+
+        Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("cli", "direct"))
+            .await
+            .expect("a reply");
+
+        let messages = session_messages(&fixture.loop_, "cli:direct");
+        assert_eq!(messages.len(), 4, "{messages:?}");
+        assert_eq!(messages[1]["content"], "the job is running");
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(
+            messages[2]["content"],
+            "[Subagent 'job' completed successfully]"
+        );
+        assert_eq!(messages[2][HIDDEN_HISTORY_KEY], json!(true));
+        assert_eq!(messages[3]["role"], "assistant");
+        assert_eq!(messages[3]["content"], "all done");
+    }
+
+    #[tokio::test]
+    async fn a_reply_that_copies_the_runtime_context_is_cut_before_it() {
+        let leaky_reply = format!(
+            "Still waiting on one batch.
+
+{RUNTIME_CONTEXT_TAG}
+Channel: cli
+
+[Subagent 'other' completed successfully]"
+        );
+        let fixture = fixture_with_provider(&leaky_reply, |_| Vec::new());
+
+        let reply = Arc::clone(&fixture.loop_)
+            .process_system_message(announcement_for("cli", "direct"))
+            .await
+            .expect("a reply");
+
+        assert_eq!(reply.content, "Still waiting on one batch.");
+        let messages = session_messages(&fixture.loop_, "cli:direct");
+        assert_eq!(
+            messages.last().map(|message| message["content"].clone()),
+            Some(json!("Still waiting on one batch."))
+        );
+    }
+
+    #[test]
+    fn mark_announcement_hidden_marks_only_a_user_message_at_the_index() {
+        let mut messages = vec![
+            json!({"role": "system", "content": "prompt"}),
+            json!({"role": "user", "content": "result"}),
+            json!({"role": "assistant", "content": "reply"}),
+        ];
+        mark_announcement_hidden(&mut messages, 1);
+        mark_announcement_hidden(&mut messages, 2);
+        mark_announcement_hidden(&mut messages, 9);
+
+        assert_eq!(messages[1][HIDDEN_HISTORY_KEY], json!(true));
+        assert!(messages[2].get(HIDDEN_HISTORY_KEY).is_none());
+    }
+
+    #[test]
+    fn clean_final_content_strips_think_blocks_and_leaked_runtime_context() {
+        let reply = format!(
+            "<think>plan</think>Done.
+{RUNTIME_CONTEXT_TAG}
+Channel: cli"
+        );
+        assert_eq!(clean_final_content(Some(&reply)), Some("Done.".to_string()));
+        assert_eq!(
+            clean_final_content(Some("Done.")),
+            Some("Done.".to_string())
+        );
+    }
+
+    #[test]
+    fn clean_final_content_of_nothing_but_leaked_context_is_none() {
+        let reply = format!(
+            "{RUNTIME_CONTEXT_TAG}
+Channel: cli"
+        );
+        assert_eq!(clean_final_content(Some(&reply)), None);
+        assert_eq!(clean_final_content(None), None);
+    }
+
     // ── system-message turns run as tasks and show their work ─────────────────
 
     /// A provider whose requests never return, standing in for a long model call;
@@ -5350,14 +5523,17 @@ mod tests {
         }
     }
 
-    /// A fixture whose provider first asks to read the note, then answers.
-    fn fixture_with_a_tool_call() -> ResumeFixture {
+    /// A fixture whose provider first hands out `script` (built from the
+    /// fixture's note path), then answers every request with `reply`.
+    fn fixture_with_provider(
+        reply: &str,
+        script: impl FnOnce(&Path) -> Vec<LLMResponse>,
+    ) -> ResumeFixture {
         let fixture = resume_fixture(Config::default());
-        let note = read_file_call(&fixture.note_path);
         let provider: Arc<dyn LLMProviderDyn> = Arc::new(RecordingProvider {
             settings: GenerationSettings::new(),
-            reply: "all done".into(),
-            script: Mutex::new(vec![note]),
+            reply: reply.into(),
+            script: Mutex::new(script(&fixture.note_path)),
             requests: fixture.requests.clone(),
         });
         let loop_ = Arc::new(AgentLoop::new(
@@ -5370,6 +5546,11 @@ mod tests {
             None,
         ));
         ResumeFixture { loop_, ..fixture }
+    }
+
+    /// A fixture whose provider first asks to read the note, then answers.
+    fn fixture_with_a_tool_call() -> ResumeFixture {
+        fixture_with_provider("all done", |note_path| vec![read_file_call(note_path)])
     }
 
     #[tokio::test]

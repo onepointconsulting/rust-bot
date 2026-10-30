@@ -16,11 +16,11 @@ use crate::{
     agent::model_runtime::ModelRuntime,
     config::paths::get_legacy_sessions_dir,
     providers::base::{LLMResponse, LLMUsage},
-    runtime_context::RUNTIME_CONTEXT_HISTORY_META,
+    runtime_context::{RUNTIME_CONTEXT_HISTORY_META, strip_leaked_runtime_context},
     session::{
         GOAL_STATE_KEY, SESSION_PINNED_METADATA_KEY, SESSION_TITLE_METADATA_KEY,
         SESSION_TOKEN_USAGE_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY,
-        history_visibility::is_hidden_history_message,
+        history_visibility::{is_hidden_history_message, is_visible_user_message},
         journal::JournalStore,
         journal_file::FileJournalStore,
         keys::{COMMAND_KEY, SESSION_LOADED_TOOLS_METADATA_KEY},
@@ -624,9 +624,19 @@ impl Session {
             if message.get(COMMAND_KEY).is_some() {
                 continue;
             }
+            let role = message.get("role").and_then(|v| v.as_str()).unwrap_or("");
+            let mut content = message
+                .get("content")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            // A reply that copied injected runtime context must not teach the
+            // model to keep doing so (or to invent results in that format).
+            if role == "assistant" {
+                content = strip_leaked_runtime_context(content);
+            }
             let mut entry = json!({
-                "role": message.get("role").and_then(|v| v.as_str()).unwrap_or(""),
-                "content": message.get("content").and_then(|v| v.as_str()).unwrap_or(""),
+                "role": role,
+                "content": content,
                 "timestamp": message.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
             });
             for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"] {
@@ -1187,7 +1197,9 @@ impl SessionManager {
 
     /// Create `target_key` from `source_key` before a global user-message index.
     ///
-    /// `before_user_index` is zero-based over user messages in the full session:
+    /// `before_user_index` is zero-based over the visible user messages in the
+    /// full session (hidden rows such as saved sub-agent results don't count,
+    /// as the WebUI doesn't show them):
     /// `0` means "before the first user message", `1` means "before the
     /// second user message", and so on. A value equal to the total user-message
     /// count copies the full session prefix. WebUI assistant-reply forks pass
@@ -1212,7 +1224,7 @@ impl SessionManager {
         let mut user_index = 0;
         let mut found_target = false;
         for message in &full_history {
-            if message.get("role").and_then(Value::as_str) == Some("user") {
+            if is_visible_user_message(message) {
                 if user_index == before_user_index {
                     found_target = true;
                     break;
@@ -1778,6 +1790,39 @@ mod tests {
         let session = Session::new("s1".into());
         assert!(session.get_history(None).is_empty());
         assert!(session.get_history(Some(10)).is_empty());
+    }
+
+    #[test]
+    fn get_history_cuts_runtime_context_an_assistant_reply_copied() {
+        use crate::runtime_context::RUNTIME_CONTEXT_TAG;
+        let leaked = format!(
+            "Two batches left.
+
+{RUNTIME_CONTEXT_TAG}
+Channel: websocket"
+        );
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", "status?"));
+        session.messages.push(fixture_message("assistant", &leaked));
+
+        let history = session.get_history(None);
+
+        assert_eq!(history[1]["content"], json!("Two batches left."));
+    }
+
+    #[test]
+    fn get_history_keeps_runtime_context_of_a_user_message() {
+        use crate::runtime_context::RUNTIME_CONTEXT_TAG;
+        let quoted = format!(
+            "explain this
+
+{RUNTIME_CONTEXT_TAG}
+quoted excerpt"
+        );
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", &quoted));
+
+        assert_eq!(session.get_history(None)[0]["content"], json!(quoted));
     }
 
     #[test]
@@ -3416,6 +3461,39 @@ mod tests {
         assert_eq!(forked.messages[1]["content"], json!("a0"));
         assert_eq!(forked.metadata.get("keep"), Some(&json!("yes")));
         assert!(!forked.metadata.contains_key("title"));
+    }
+
+    #[test]
+    fn fork_session_before_user_index_does_not_count_hidden_user_messages() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut mgr = SessionManager::with_default_eviction_threshold(dir.path().join("ws"));
+        let mut session = Session::new("src".into());
+        session.messages.push(fixture_message("user", "u0"));
+        session.messages.push(fixture_message("assistant", "a0"));
+        session.messages.push(json!({
+            "role": "user",
+            "content": "[Subagent 'job' completed successfully]",
+            HIDDEN_HISTORY_KEY: true,
+        }));
+        session
+            .messages
+            .push(fixture_message("assistant", "job done"));
+        session.messages.push(fixture_message("user", "u1"));
+        session.messages.push(fixture_message("assistant", "a1"));
+        mgr.save(session).unwrap();
+
+        mgr.fork_session_before_user_index("src", "dst", 1).unwrap();
+        let forked = mgr.get_session_internal("dst").unwrap();
+        let contents: Vec<&Value> = forked.messages.iter().map(|m| &m["content"]).collect();
+        assert_eq!(
+            contents,
+            [
+                &json!("u0"),
+                &json!("a0"),
+                &json!("[Subagent 'job' completed successfully]"),
+                &json!("job done"),
+            ]
+        );
     }
 
     #[test]

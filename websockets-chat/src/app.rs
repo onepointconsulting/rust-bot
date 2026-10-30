@@ -940,6 +940,16 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 log::info!("abort ignored: {detail}");
                 return;
             }
+            // The question timed out, was cancelled or was answered elsewhere. Drop
+            // the card and explain, but leave the turn alone: the agent carried on
+            // without the answer, and the generic handling below would close out
+            // the turn that is still running.
+            if let Some(message) = state::question_gone_message(&detail) {
+                log::info!("question answer rejected: {detail}");
+                ctx.pending_question.set(None);
+                ctx.chat_error.set(Some(message.to_string()));
+                return;
+            }
             // The approval was already answered elsewhere or its turn ended;
             // the turn itself (if any) is unaffected, so just drop the card.
             if matches!(detail.as_str(), "approval_not_found" | "missing_request_id") {

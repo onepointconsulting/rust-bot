@@ -16,6 +16,13 @@ pub fn is_hidden_history_message(message: &Value) -> bool {
     has_hidden_history_marker(message) || is_automation_history_message(message)
 }
 
+/// True for a persisted `user` message that is shown as a chat turn, i.e. one
+/// that counts when the WebUI numbers the user's messages (forks cut by it).
+pub fn is_visible_user_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && !is_hidden_history_message(message)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -28,6 +35,24 @@ mod tests {
             map.insert(HIDDEN_HISTORY_KEY.to_string(), marker);
         }
         Value::Object(map)
+    }
+
+    #[test]
+    fn plain_user_message_is_a_visible_user_message() {
+        assert!(is_visible_user_message(
+            &json!({"role": "user", "content": "hi"})
+        ));
+    }
+
+    #[test]
+    fn hidden_or_non_user_messages_are_not_visible_user_messages() {
+        assert!(!is_visible_user_message(&message_with_marker(Some(json!(
+            true
+        )))));
+        assert!(!is_visible_user_message(
+            &json!({"role": "assistant", "content": "hi"})
+        ));
+        assert!(!is_visible_user_message(&json!({})));
     }
 
     #[test]
