@@ -851,7 +851,39 @@ impl SubagentManager {
         }
     }
 
+    /// Labels of the other sub-agents spawned from the same conversation as
+    /// `task_id` (same session key, channel and chat) that are still running,
+    /// oldest first. Empty when `task_id` is unknown or has no running siblings.
+    ///
+    /// Every run leaves `Running` before it announces, so when the last two
+    /// tasks finish together at least one announcement reports none left.
+    fn still_running_sibling_labels(&self, task_id: &str) -> Vec<String> {
+        let tasks = self.tasks.lock().unwrap_or_else(|e| e.into_inner());
+        let Some(finished_record) = tasks.get(task_id) else {
+            return Vec::new();
+        };
+        let mut running_siblings: Vec<&SubagentRecord> = tasks
+            .values()
+            .filter(|record| {
+                record.task_id != task_id
+                    && record.status == SubagentStatus::Running
+                    && record.session_key == finished_record.session_key
+                    && record.channel == finished_record.channel
+                    && record.chat_id == finished_record.chat_id
+            })
+            .collect();
+        running_siblings.sort_by_key(|record| record.spawned_at);
+        running_siblings
+            .into_iter()
+            .map(|record| record.label.clone())
+            .collect()
+    }
+
     /// Announce the subagent result to the main agent via the message bus.
+    ///
+    /// The announcement says which sibling tasks of the same conversation are
+    /// still running, so the main agent knows whether to wait for more results
+    /// or to carry on with the user's request now.
     async fn announce_result(
         &self,
         task_id: &str,
@@ -866,11 +898,13 @@ impl SubagentManager {
             "partial" => "stopped before it finished",
             _ => "failed",
         };
+        let still_running_labels = self.still_running_sibling_labels(task_id);
         let mut ctx = Context::new();
         ctx.insert("label", label);
         ctx.insert("status_text", status_text);
         ctx.insert("task", task);
         ctx.insert("result", result);
+        ctx.insert("still_running_labels", &still_running_labels);
         let announce_content_result = render_template("agent/subagent_announce.md", &ctx, true);
 
         log::info!(
@@ -1339,6 +1373,147 @@ mod tests {
             )
             .await;
         assert_eq!(bus.inbound_size(), 1);
+    }
+
+    /// Seed `records` into a fresh manager, announce `finished_task_id` and
+    /// return the published announcement text.
+    async fn announce_with_records(records: Vec<SubagentRecord>, finished_task_id: &str) -> String {
+        let tmp = TempDir::new().unwrap();
+        let bus = Arc::new(MessageBus::new());
+        let manager = SubagentManager::new_simple(
+            TestProvider::arc(),
+            tmp.path().to_path_buf(),
+            bus.clone(),
+            4096,
+        );
+        for record in records {
+            seed(&manager, record);
+        }
+        manager
+            .announce_result(
+                finished_task_id,
+                "worker",
+                "task",
+                "result",
+                &origin("cli", "direct"),
+                "ok",
+            )
+            .await;
+        bus.consume_inbound()
+            .await
+            .expect("announce should publish")
+            .content
+    }
+
+    #[tokio::test]
+    async fn announce_result_lists_siblings_that_are_still_running() {
+        let now = Utc::now();
+        let content = announce_with_records(
+            vec![
+                record_at("done", Some("ws:1"), SubagentStatus::Completed, now),
+                record_at("busy", Some("ws:1"), SubagentStatus::Running, now),
+            ],
+            "done",
+        )
+        .await;
+        assert!(content.contains("1 other background task(s)"), "{content}");
+        assert!(content.contains("label-busy"), "{content}");
+        assert!(content.contains("brief progress update"), "{content}");
+        assert!(!content.contains("All background tasks"), "{content}");
+    }
+
+    #[tokio::test]
+    async fn announce_result_of_last_task_asks_to_continue_the_request() {
+        let now = Utc::now();
+        let content = announce_with_records(
+            vec![
+                record_at("first", Some("ws:1"), SubagentStatus::Completed, now),
+                record_at("last", Some("ws:1"), SubagentStatus::Completed, now),
+            ],
+            "last",
+        )
+        .await;
+        assert!(
+            content.contains("All background tasks started in this conversation have now finished"),
+            "{content}"
+        );
+        assert!(content.contains("continue that work now"), "{content}");
+        assert!(!content.contains("still running"), "{content}");
+    }
+
+    // ── still_running_sibling_labels ─────────────────────────────────────────
+
+    #[test]
+    fn still_running_sibling_labels_lists_running_siblings_oldest_first() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        let now = Utc::now();
+        let minutes_ago = |minutes| now - chrono::Duration::minutes(minutes);
+        seed(
+            &manager,
+            record_at(
+                "done",
+                Some("ws:1"),
+                SubagentStatus::Completed,
+                minutes_ago(9),
+            ),
+        );
+        seed(
+            &manager,
+            record_at(
+                "newer",
+                Some("ws:1"),
+                SubagentStatus::Running,
+                minutes_ago(1),
+            ),
+        );
+        seed(
+            &manager,
+            record_at(
+                "older",
+                Some("ws:1"),
+                SubagentStatus::Running,
+                minutes_ago(5),
+            ),
+        );
+
+        assert_eq!(
+            manager.still_running_sibling_labels("done"),
+            vec!["label-older".to_string(), "label-newer".to_string()]
+        );
+    }
+
+    #[test]
+    fn still_running_sibling_labels_ignores_finished_tasks_and_other_conversations() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        let now = Utc::now();
+        let mut other_chat = record_at("other-chat", Some("ws:1"), SubagentStatus::Running, now);
+        other_chat.chat_id = "elsewhere".to_string();
+        seed(
+            &manager,
+            record_at("done", Some("ws:1"), SubagentStatus::Completed, now),
+        );
+        seed(
+            &manager,
+            record_at("failed", Some("ws:1"), SubagentStatus::Failed, now),
+        );
+        seed(
+            &manager,
+            record_at("other-session", Some("ws:2"), SubagentStatus::Running, now),
+        );
+        seed(&manager, other_chat);
+
+        assert!(manager.still_running_sibling_labels("done").is_empty());
+    }
+
+    #[test]
+    fn still_running_sibling_labels_of_unknown_task_is_empty() {
+        let (manager, _tmp) = test_manager(TestProvider::arc());
+        seed(
+            &manager,
+            record_at("busy", Some("ws:1"), SubagentStatus::Running, Utc::now()),
+        );
+
+        assert!(manager.still_running_sibling_labels("unknown").is_empty());
     }
 
     // ── run_subagent_inner ───────────────────────────────────────────────────

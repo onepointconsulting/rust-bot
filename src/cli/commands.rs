@@ -203,7 +203,7 @@ pub enum Commands {
     /// Generate an Ed25519 keypair and update api.jwt key paths in the config file
     GenerateJwtKeypair(GenerateJwtKeypairArgs),
 
-    /// Mint an EdDSA JWT using the private key path from the config file
+    /// Mint an EdDSA JWT using the private key path from the config file and generate the corresponding user.
     GenerateJwtToken(GenerateJwtTokenArgs),
 
     /// List the ACP child agents stored in the workspace

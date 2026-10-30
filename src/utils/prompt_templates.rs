@@ -325,10 +325,35 @@ mod tests {
         ctx.insert("status_text", "completed");
         ctx.insert("task", "summarise the logs");
         ctx.insert("result", "Done.");
+        ctx.insert("still_running_labels", &Vec::<String>::new());
         let result = render_template("agent/subagent_announce.md", &ctx, true).unwrap();
         assert!(result.contains("worker-1"));
         assert!(result.contains("completed"));
         assert!(result.contains("summarise the logs"));
+        assert!(
+            result.contains("All background tasks started in this conversation have now finished")
+        );
+        assert!(result.contains("continue that work now"));
+        assert!(!result.contains("still running"));
+    }
+
+    #[test]
+    fn test_render_subagent_announce_with_tasks_still_running() {
+        let mut ctx = Context::new();
+        ctx.insert("label", "worker-1");
+        ctx.insert("status_text", "completed");
+        ctx.insert("task", "summarise the logs");
+        ctx.insert("result", "Done.");
+        ctx.insert("still_running_labels", &vec!["worker-2", "worker-3"]);
+        let result = render_template("agent/subagent_announce.md", &ctx, true).unwrap();
+        assert!(
+            result.contains(
+                "2 other background task(s) started in this conversation are still running: worker-2, worker-3."
+            ),
+            "{result}"
+        );
+        assert!(result.contains("brief progress update"));
+        assert!(!result.contains("All background tasks"));
     }
 
     // ── conditional blocks ────────────────────────────────────────────────────
