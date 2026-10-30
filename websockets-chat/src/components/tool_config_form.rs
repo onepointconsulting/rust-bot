@@ -1,8 +1,10 @@
 //! The settings form of a tool section on the Tools page (e.g. Gmail's paths, the image
-//! generation API key), generated from the field descriptions the gateway sends.
+//! generation API key) or of an MCP server on the MCP Servers page (command, URL,
+//! environment, ...), generated from the field descriptions the gateway sends.
 //!
-//! Every input is edited as text in a draft map keyed by setting name; only settings the
-//! user actually changed are sent. Secrets are never shown: an empty secret input means
+//! Every input is edited as text in a draft map keyed by setting name (lists one entry
+//! per line, maps one `NAME=value` per line); only settings the user actually changed
+//! are sent. Secrets are never shown: an empty secret input means
 //! "keep what is stored", and a field backed by an exported environment variable says so.
 //!
 //! The draft handling is plain functions so it is unit-testable on the host target
@@ -12,7 +14,7 @@ use std::collections::HashMap;
 
 use chat_ui::models::{ToolConfigSummary, ToolFieldKind, ToolFieldSummary};
 use leptos::prelude::*;
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// What the form reports when saved: the tool section's name and the changed settings.
 pub type ToolConfigChange = (String, HashMap<String, Value>);
@@ -32,8 +34,57 @@ pub fn initial_draft(field: &ToolFieldSummary) -> String {
             .filter_map(Value::as_str)
             .collect::<Vec<_>>()
             .join("\n"),
+        Value::Object(entries) => string_map_to_lines(entries),
         _ => String::new(),
     }
+}
+
+/// Separator between the name and the value of a map entry in its draft.
+const MAP_ENTRY_SEPARATOR: char = '=';
+
+/// A name -> text map as `NAME=value` lines, sorted by name so the draft is stable.
+fn string_map_to_lines(entries: &Map<String, Value>) -> String {
+    let mut lines: Vec<String> = entries
+        .iter()
+        .map(|(name, value)| {
+            format!(
+                "{name}{MAP_ENTRY_SEPARATOR}{}",
+                value.as_str().unwrap_or_default()
+            )
+        })
+        .collect();
+    lines.sort();
+    lines.join("\n")
+}
+
+/// Parse `NAME=value` lines (blank lines ignored) into a JSON object. The name ends at
+/// the first `=`, so values may contain `=` themselves. Fails with a message naming the
+/// line for a missing `=`, an empty name or a name given twice; values are never quoted
+/// back, as they may be credentials.
+pub fn lines_to_string_map(label: &str, draft: &str) -> Result<Value, String> {
+    let mut entries = Map::new();
+    for (index, line) in draft.lines().enumerate() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let line_number = index + 1;
+        let Some((name, value)) = line.split_once(MAP_ENTRY_SEPARATOR) else {
+            return Err(format!(
+                "{label}, line {line_number}: write NAME{MAP_ENTRY_SEPARATOR}value."
+            ));
+        };
+        let name = name.trim();
+        if name.is_empty() {
+            return Err(format!("{label}, line {line_number}: the name is missing."));
+        }
+        if entries
+            .insert(name.to_string(), Value::String(value.trim().to_string()))
+            .is_some()
+        {
+            return Err(format!("{label}: {name} is listed twice."));
+        }
+    }
+    Ok(Value::Object(entries))
 }
 
 /// The draft of every field, as shown before any edit.
@@ -64,6 +115,7 @@ pub fn draft_to_value(field: &ToolFieldSummary, draft: &str) -> Result<Value, St
                 .map(|line| Value::String(line.to_string()))
                 .collect(),
         )),
+        ToolFieldKind::StringMap => lines_to_string_map(&field.label, draft),
     }
 }
 
@@ -107,10 +159,14 @@ pub fn field_note(field: &ToolFieldSummary) -> String {
     note.trim().to_string()
 }
 
-/// Placeholder of a text-like input: the default for plain fields, nothing for secrets.
+/// Placeholder of a text-like input: the default for plain fields, the line format for
+/// maps, nothing for secrets.
 pub fn field_placeholder(field: &ToolFieldSummary) -> String {
     if field.secret {
         return String::new();
+    }
+    if field.kind == ToolFieldKind::StringMap {
+        return format!("NAME{MAP_ENTRY_SEPARATOR}value");
     }
     match field.default.as_ref() {
         Some(Value::String(text)) => text.clone(),
@@ -163,10 +219,12 @@ fn FieldInput(field: ToolFieldSummary, drafts: RwSignal<HashMap<String, String>>
             </select>
         }
         .into_any(),
-        ToolFieldKind::StringList => view! {
+        ToolFieldKind::StringList | ToolFieldKind::StringMap => view! {
             <textarea
                 rows="3"
+                spellcheck="false"
                 class=input_class
+                placeholder=placeholder.clone()
                 prop:value=draft
                 on:input=move |event| set_draft(event_target_value(&event))
             ></textarea>
@@ -399,5 +457,62 @@ mod tests {
         let mut api_key = secret("apiKey");
         api_key.default = Some(json!("x"));
         assert_eq!(field_placeholder(&api_key), "");
+    }
+
+    #[test]
+    fn a_map_is_drafted_as_sorted_name_value_lines() {
+        let env = field(
+            "env",
+            ToolFieldKind::StringMap,
+            Some(json!({"TOKEN": "${T}", "MODE": "a=b"})),
+        );
+        assert_eq!(initial_draft(&env), "MODE=a=b
+TOKEN=${T}");
+        assert_eq!(field_placeholder(&env), "NAME=value");
+    }
+
+    #[test]
+    fn map_lines_become_an_object_split_at_the_first_equals_sign() {
+        assert_eq!(
+            lines_to_string_map("Env", " TOKEN = ${T} 
+
+KEY=abc==
+"),
+            Ok(json!({"TOKEN": "${T}", "KEY": "abc=="}))
+        );
+        assert_eq!(lines_to_string_map("Env", ""), Ok(json!({})));
+    }
+
+    #[test]
+    fn malformed_map_lines_are_reported_without_their_value() {
+        assert_eq!(
+            lines_to_string_map("Env", "A=1
+secret-token"),
+            Err("Env, line 2: write NAME=value.".to_string())
+        );
+        assert_eq!(
+            lines_to_string_map("Env", "=x"),
+            Err("Env, line 1: the name is missing.".to_string())
+        );
+        assert_eq!(
+            lines_to_string_map("Env", "A=1
+A=2"),
+            Err("Env: A is listed twice.".to_string())
+        );
+    }
+
+    #[test]
+    fn only_a_changed_map_is_sent() {
+        let fields = vec![
+            field("env", ToolFieldKind::StringMap, Some(json!({"A": "1"}))),
+            field("headers", ToolFieldKind::StringMap, Some(json!({}))),
+        ];
+        let edited = drafts(&[("env", "A=1
+B=2"), ("headers", "")]);
+
+        let changes = changed_values(&fields, &edited).unwrap();
+
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes["env"], json!({"A": "1", "B": "2"}));
     }
 }

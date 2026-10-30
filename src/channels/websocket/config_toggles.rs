@@ -2,7 +2,8 @@
 //! WebUI's Settings dialog.
 //!
 //! The edits work on the JSON text (key order is preserved) and touch only
-//! `tools.disabledTools` and `tools.mcpServers.<name>.enabled`. Nothing is round-tripped
+//! `tools.disabledTools` and `tools.mcpServers.<name>.enabled` / `.exposure` (the other
+//! settings of a server are edited by [`super::mcp_server_form`]). Nothing is round-tripped
 //! through the typed `Config`, so `${ENV_VAR}` placeholders and every other setting stay
 //! exactly as the user wrote them. Everything here is a pure function of strings, which
 //! keeps it unit-testable; saving (validation, backup, atomic write) is
@@ -28,7 +29,7 @@ const MAX_NAME_LENGTH: usize = 128;
 /// Spellings the configuration schema accepts for `tools.disabledTools`.
 const DISABLED_TOOLS_KEYS: &[&str] = &["disabledTools", "disabled_tools"];
 /// Spellings the configuration schema accepts for `tools.mcpServers`.
-const MCP_SERVERS_KEYS: &[&str] = &["mcpServers", "mcp_servers"];
+pub(super) const MCP_SERVERS_KEYS: &[&str] = &["mcpServers", "mcp_servers"];
 
 /// Why a toggle was not applied. Messages name the tool or server only; they never
 /// contain any other part of the file.
@@ -42,6 +43,11 @@ pub enum ToggleError {
     ProtectedTool,
     /// No MCP server with that name is configured.
     UnknownServer,
+    /// A submitted setting is not one the form knows: `(setting)`.
+    UnknownField(String),
+    /// A submitted setting has a value it cannot take: `(setting, reason)`. The reason
+    /// never repeats the value.
+    InvalidValue(String, String),
 }
 
 impl ToggleError {
@@ -52,6 +58,8 @@ impl ToggleError {
             Self::InvalidName => "invalid_name",
             Self::ProtectedTool => "protected_tool",
             Self::UnknownServer => "unknown_server",
+            Self::UnknownField(_) => "unknown_field",
+            Self::InvalidValue(..) => "invalid_value",
         }
     }
 
@@ -64,6 +72,8 @@ impl ToggleError {
                 "This tool is required by the gateway and cannot be switched off.".to_string()
             }
             Self::UnknownServer => "No MCP server with that name is configured.".to_string(),
+            Self::UnknownField(field) => format!("'{field}' is not an MCP server setting."),
+            Self::InvalidValue(field, reason) => format!("Invalid value for '{field}': {reason}"),
         }
     }
 }
@@ -99,7 +109,7 @@ pub fn is_protected_tool(tool_name: &str) -> bool {
     PROTECTED_TOOLS.contains(&tool_name)
 }
 
-fn parse_root(text: &str) -> Result<Value, ToggleError> {
+pub(super) fn parse_root(text: &str) -> Result<Value, ToggleError> {
     let root: Value = serde_json::from_str(text)
         .map_err(|e| ToggleError::InvalidConfig(format!("Invalid JSON: {e}")))?;
     if root.is_object() {
@@ -112,7 +122,7 @@ fn parse_root(text: &str) -> Result<Value, ToggleError> {
 }
 
 /// The first of `keys` present in `object`, or the first key when none is.
-fn existing_or_default_key<'a>(object: &Map<String, Value>, keys: &[&'a str]) -> &'a str {
+pub(super) fn existing_or_default_key<'a>(object: &Map<String, Value>, keys: &[&'a str]) -> &'a str {
     keys.iter()
         .copied()
         .find(|key| object.contains_key(*key))
@@ -120,7 +130,7 @@ fn existing_or_default_key<'a>(object: &Map<String, Value>, keys: &[&'a str]) ->
 }
 
 /// `root.tools` as a mutable object, created when missing.
-fn tools_object_mut(root: &mut Value) -> Result<&mut Map<String, Value>, ToggleError> {
+pub(super) fn tools_object_mut(root: &mut Value) -> Result<&mut Map<String, Value>, ToggleError> {
     let root_object = root.as_object_mut().expect("parse_root checked this");
     root_object
         .entry("tools")
@@ -131,7 +141,7 @@ fn tools_object_mut(root: &mut Value) -> Result<&mut Map<String, Value>, ToggleE
 
 /// Serialize `root` the way the file was written: pretty-printed, with the trailing
 /// newline of `original` kept.
-fn render(root: &Value, original: &str) -> String {
+pub(super) fn render(root: &Value, original: &str) -> String {
     let mut text = serde_json::to_string_pretty(root).expect("a Value always serializes");
     if original.ends_with('\n') {
         text.push('\n');
@@ -178,7 +188,7 @@ pub fn configured_mcp_servers(text: &str) -> Result<Vec<ConfiguredMcpServer>, To
                 .and_then(Value::as_bool)
                 .unwrap_or(true),
             transport: transport_of(server),
-            deferred: is_deferred(server),
+            deferred: server.as_object().is_some_and(is_deferred),
             description: server
                 .get("description")
                 .and_then(Value::as_str)
@@ -260,17 +270,7 @@ pub fn with_mcp_server_enabled(
         return Err(ToggleError::InvalidName);
     }
     let mut root = parse_root(text)?;
-    let tools = tools_object_mut(&mut root)?;
-    let key = existing_or_default_key(tools, MCP_SERVERS_KEYS).to_string();
-    let server = tools
-        .get_mut(&key)
-        .and_then(Value::as_object_mut)
-        .and_then(|servers| servers.get_mut(name))
-        .ok_or(ToggleError::UnknownServer)?;
-    let server = server.as_object_mut().ok_or_else(|| {
-        ToggleError::InvalidConfig("The MCP server entry is not an object.".to_string())
-    })?;
-
+    let server = mcp_server_object_mut(&mut root, name)?;
     let current = server
         .get("enabled")
         .and_then(Value::as_bool)
@@ -282,8 +282,27 @@ pub fn with_mcp_server_enabled(
     Ok(Some(render(&root, text)))
 }
 
+/// The entry `tools.mcpServers.<name>` of a parsed config as a mutable object. The
+/// server must already be configured: the dialog never creates one.
+pub(super) fn mcp_server_object_mut<'a>(
+    root: &'a mut Value,
+    name: &str,
+) -> Result<&'a mut Map<String, Value>, ToggleError> {
+    let tools = tools_object_mut(root)?;
+    let key = existing_or_default_key(tools, MCP_SERVERS_KEYS).to_string();
+    tools
+        .get_mut(&key)
+        .and_then(Value::as_object_mut)
+        .and_then(|servers| servers.get_mut(name))
+        .ok_or(ToggleError::UnknownServer)?
+        .as_object_mut()
+        .ok_or_else(|| {
+            ToggleError::InvalidConfig("The MCP server entry is not an object.".to_string())
+        })
+}
+
 /// Whether a server entry has `"exposure": "deferred"`.
-fn is_deferred(server: &Value) -> bool {
+fn is_deferred(server: &Map<String, Value>) -> bool {
     server.get("exposure").and_then(Value::as_str) == Some(MCP_EXPOSURE_DEFERRED)
 }
 
@@ -302,18 +321,8 @@ pub fn with_mcp_server_deferred(
         return Err(ToggleError::InvalidName);
     }
     let mut root = parse_root(text)?;
-    let tools = tools_object_mut(&mut root)?;
-    let key = existing_or_default_key(tools, MCP_SERVERS_KEYS).to_string();
-    let server = tools
-        .get_mut(&key)
-        .and_then(Value::as_object_mut)
-        .and_then(|servers| servers.get_mut(name))
-        .ok_or(ToggleError::UnknownServer)?;
-    let current = is_deferred(server);
-    let server = server.as_object_mut().ok_or_else(|| {
-        ToggleError::InvalidConfig("The MCP server entry is not an object.".to_string())
-    })?;
-    if current == deferred {
+    let server = mcp_server_object_mut(&mut root, name)?;
+    if is_deferred(server) == deferred {
         return Ok(None);
     }
     if deferred {
@@ -355,6 +364,10 @@ pub struct McpServerSettingRow {
     pub active: bool,
     /// Whether `config.json` has the server's tools loaded on demand (`exposure: deferred`).
     pub deferred: bool,
+    /// The server's settings form (command, URL, environment, ...). Only sent to
+    /// connections that may change the configuration: it can hold credentials.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub config: Option<ToolSettingsSummary>,
 }
 
 /// Description shown for a tool named in `disabledTools` that this process does not know
@@ -435,10 +448,12 @@ pub fn merge_section_rows(
 }
 
 /// The MCP server rows: every configured server, sorted A–Z ignoring case.
-/// `running` holds the servers the process was started with switched on.
+/// `running` holds the servers the process was started with switched on; `form_of`
+/// gives the settings form of a server by name (`None` leaves it out).
 pub fn mcp_server_setting_rows(
     configured: &[ConfiguredMcpServer],
     running: &HashSet<String>,
+    form_of: impl Fn(&str) -> Option<ToolSettingsSummary>,
 ) -> Vec<McpServerSettingRow> {
     let mut rows: Vec<McpServerSettingRow> = configured
         .iter()
@@ -448,6 +463,7 @@ pub fn mcp_server_setting_rows(
             enabled: server.enabled,
             active: running.contains(&server.name),
             deferred: server.deferred,
+            config: form_of(&server.name),
         })
         .collect();
     rows.sort_by_key(|row| row.name.to_lowercase());
@@ -596,7 +612,7 @@ mod tests {
         let configured = configured_mcp_servers(CONFIG).unwrap();
         let running = HashSet::from(["files".to_string()]);
 
-        let rows = mcp_server_setting_rows(&configured, &running);
+        let rows = mcp_server_setting_rows(&configured, &running, |_| None);
 
         let names: Vec<&str> = rows.iter().map(|r| r.name.as_str()).collect();
         assert_eq!(names, vec!["files", "legacy", "search"]);
@@ -604,6 +620,30 @@ mod tests {
         assert!(rows[1].enabled && !rows[1].active, "added after startup");
         assert!(!rows[2].enabled && !rows[2].active);
         assert_eq!(rows[0].description, "MCP server (stdio)");
+    }
+
+    #[test]
+    fn mcp_rows_carry_the_settings_form_only_when_one_is_given() {
+        let configured = configured_mcp_servers(CONFIG).unwrap();
+        let form = |name: &str| ToolSettingsSummary {
+            name: name.to_string(),
+            title: String::new(),
+            description: String::new(),
+            enabled: None,
+            tool_names: Vec::new(),
+            fields: Vec::new(),
+        };
+
+        let with_forms =
+            mcp_server_setting_rows(&configured, &HashSet::new(), |name| Some(form(name)));
+        let without_forms = mcp_server_setting_rows(&configured, &HashSet::new(), |_| None);
+
+        assert!(with_forms.iter().all(|row| {
+            row.config.as_ref().map(|config| config.name.as_str()) == Some(row.name.as_str())
+        }));
+        assert!(without_forms.iter().all(|row| row.config.is_none()));
+        let json = serde_json::to_value(&without_forms[0]).unwrap();
+        assert!(json.get("config").is_none(), "no form, no key");
     }
 
     #[test]
@@ -883,7 +923,7 @@ mod tests {
     fn mcp_server_rows_use_the_configured_description_and_report_exposure() {
         let servers = configured_mcp_servers(DEFERRED_CONFIG).unwrap();
 
-        let rows = mcp_server_setting_rows(&servers, &HashSet::new());
+        let rows = mcp_server_setting_rows(&servers, &HashSet::new(), |_| None);
 
         let cms = rows.iter().find(|row| row.name == "cms").unwrap();
         assert_eq!(cms.description, "Strapi CMS");

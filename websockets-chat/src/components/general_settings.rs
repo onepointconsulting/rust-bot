@@ -116,7 +116,7 @@ fn GeneralFieldRow(
             </select>
         }
         .into_any(),
-        ToolFieldKind::StringList => view! {
+        ToolFieldKind::StringList | ToolFieldKind::StringMap => view! {
             <textarea
                 rows="3"
                 class=CONTROL_CLASS

@@ -11,9 +11,10 @@
 //! against the same schema and writes it into a [`Config`]. Both are pure, so the
 //! gateway only has to load and save the configuration around them.
 //!
-//! Every change only takes effect after the bot restarts. Collection and nested
-//! fields (objects, maps) are not supported and are skipped; they stay in the raw
-//! configuration editor.
+//! Every change only takes effect after the bot restarts. Maps of text values (e.g.
+//! environment variables) are edited as a whole; other collection and nested fields
+//! (maps of objects, arrays of non-strings) are not supported and are skipped; they
+//! stay in the raw configuration editor.
 
 use std::collections::HashMap;
 
@@ -76,6 +77,8 @@ pub enum FieldKind {
     Text,
     Choice { choices: Vec<String> },
     StringList,
+    /// A map of names to text values (e.g. environment variables, HTTP headers).
+    StringMap,
 }
 
 /// One editable setting of a tool, ready to render.
@@ -223,7 +226,7 @@ fn value_at<'a>(root: &'a Value, path: &str) -> &'a Value {
 
 /// The input kind a property needs, or `None` for properties the form cannot edit
 /// (objects, maps, arrays of non-strings, ...).
-fn field_kind(property: &Value) -> Option<FieldKind> {
+pub(crate) fn field_kind(property: &Value) -> Option<FieldKind> {
     if let Some(choices) = property["x-choices"].as_array() {
         let choices = choices
             .iter()
@@ -239,6 +242,9 @@ fn field_kind(property: &Value) -> Option<FieldKind> {
         }),
         "string" => Some(FieldKind::Text),
         "array" if property["items"]["type"] == "string" => Some(FieldKind::StringList),
+        "object" if property["additionalProperties"]["type"] == "string" => {
+            Some(FieldKind::StringMap)
+        }
         _ => None,
     }
 }
@@ -254,12 +260,17 @@ fn has_value(value: &Value) -> bool {
         Value::Null => false,
         Value::String(text) => !text.is_empty(),
         Value::Array(items) => !items.is_empty(),
+        Value::Object(entries) => !entries.is_empty(),
         _ => true,
     }
 }
 
 /// Summarize one property of a section against its current value.
-fn summarize_field(name: &str, property: &Value, current: &Value) -> Option<ToolFieldSummary> {
+pub(crate) fn summarize_field(
+    name: &str,
+    property: &Value,
+    current: &Value,
+) -> Option<ToolFieldSummary> {
     let kind = field_kind(property)?;
     let secret = property["x-secret"] == true;
     let env_var = property["x-env-var"]
@@ -325,7 +336,7 @@ pub fn tool_settings_overview(tools: &ToolsConfig) -> Vec<ToolSettingsSummary> {
 }
 
 /// Check `value` fits `kind` and return it normalized (strings trimmed), or why not.
-fn check_value(kind: &FieldKind, value: &Value) -> Result<Value, String> {
+pub(crate) fn check_value(kind: &FieldKind, value: &Value) -> Result<Value, String> {
     match (kind, value) {
         (FieldKind::Bool, Value::Bool(_)) => Ok(value.clone()),
         (FieldKind::Integer { min, max }, Value::Number(number)) => {
@@ -350,8 +361,31 @@ fn check_value(kind: &FieldKind, value: &Value) -> Result<Value, String> {
         (FieldKind::StringList, Value::Array(items)) if items.iter().all(Value::is_string) => {
             Ok(value.clone())
         }
+        (FieldKind::StringMap, Value::Object(entries)) => check_string_map(entries),
         _ => Err("has the wrong type".to_string()),
     }
+}
+
+/// Check a submitted name -> text map: every value is text and every name is non-empty
+/// once trimmed. Returns it with the names trimmed (values are kept as typed).
+fn check_string_map(entries: &Map<String, Value>) -> Result<Value, String> {
+    let mut checked = Map::new();
+    for (name, value) in entries {
+        let name = name.trim();
+        if name.is_empty() {
+            return Err("every entry needs a name".to_string());
+        }
+        let Some(text) = value.as_str() else {
+            return Err(format!("the value of '{name}' must be text"));
+        };
+        if checked
+            .insert(name.to_string(), Value::String(text.to_string()))
+            .is_some()
+        {
+            return Err(format!("'{name}' is listed twice"));
+        }
+    }
+    Ok(Value::Object(checked))
 }
 
 /// Validate and merge `changes` (property name -> value, plus `enable`/`enabled` for the
@@ -856,5 +890,26 @@ mod tests {
             config.tools.image_generation.model,
             ToolsConfig::default().image_generation.model
         );
+    }
+
+    #[test]
+    fn a_map_of_text_values_is_a_string_map_field() {
+        let map = json!({"type": "object", "additionalProperties": {"type": "string"}});
+        let map_of_objects = json!({"type": "object", "additionalProperties": {"$ref": "#/x"}});
+
+        assert_eq!(field_kind(&map), Some(FieldKind::StringMap));
+        assert_eq!(field_kind(&map_of_objects), None);
+    }
+
+    #[test]
+    fn string_map_values_are_checked_and_their_names_trimmed() {
+        assert_eq!(
+            check_value(&FieldKind::StringMap, &json!({" TOKEN ": "${T}"})),
+            Ok(json!({"TOKEN": "${T}"}))
+        );
+        assert!(check_value(&FieldKind::StringMap, &json!({" ": "x"})).is_err());
+        assert!(check_value(&FieldKind::StringMap, &json!({"A": 1})).is_err());
+        assert!(check_value(&FieldKind::StringMap, &json!({"A": "1", " A": "2"})).is_err());
+        assert!(check_value(&FieldKind::StringMap, &json!(["A=1"])).is_err());
     }
 }

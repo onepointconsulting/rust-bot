@@ -31,8 +31,9 @@ use chat_ui::models::{
 
 use crate::api::{self, WsSender};
 use crate::components::{
-    apply_enabled, apply_on_demand, apply_tool_config, ChatShell, McpChangeRequest,
-    SettingsActions, SettingsPage, SettingsPanel, ToggleRequest, ToolConfigChange,
+    after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand, apply_tool_config,
+    ChatShell, McpChangeRequest, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
+    ToolConfigChange,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -789,8 +790,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
             ctx.is_admin.set(is_admin);
-            // A restart that brought the gateway back is over.
-            ctx.settings_panel.restarting.set(false);
+            settings_after_reconnect(ctx);
             ctx.token_streaming.set(streaming);
             // A fresh connection starts on the chat, never on a list page.
             close_main_view(ctx);
@@ -1197,6 +1197,18 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 .mcp_servers
                 .update(|servers| apply_on_demand(servers, &name, deferred));
         }
+        ServerEvent::McpServerConfigSet {
+            name: _,
+            server,
+            restart_required,
+        } => {
+            finish_setting_change(ctx, restart_required);
+            if let Some(server) = server {
+                ctx.settings_panel
+                    .mcp_servers
+                    .update(|servers| apply_mcp_server(servers, server));
+            }
+        }
         ServerEvent::SettingError {
             kind,
             name,
@@ -1406,6 +1418,8 @@ fn handle_connection_closed(ctx: WsContext, generation_at_open: u64) {
         return;
     }
     ctx.ws_sender.get_untracked().borrow_mut().take();
+    // Settings changes would be lost until the connection is back.
+    ctx.settings_panel.offline.set(true);
     // Nothing reports changes while offline; the re-attach after a reconnect
     // brings back the real count.
     ctx.background_agents.set(0);
@@ -1700,6 +1714,41 @@ fn request_set_tool_config(ctx: &WsContext, (tool, values): ToolConfigChange) {
         protocol::ClientEnvelope::set_tool_config(tool, values),
         "Failed to encode the tool settings change request.",
     );
+}
+
+/// Ask the gateway to save changed settings of one MCP server (command, URL,
+/// environment, ...). The reply is an `mcp_server_config_set` or a `setting_error` event.
+fn request_set_mcp_server_config(ctx: &WsContext, (name, values): ToolConfigChange) {
+    ctx.settings_panel.error.set(None);
+    ctx.settings_panel.busy.set(Some(name.clone()));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_mcp_server_config(name, values),
+        "Failed to encode the MCP server settings request.",
+    );
+}
+
+/// The connection to the gateway is back: the Settings pages accept changes again. A
+/// change request still waiting for its reply is given up (replies go to the connection
+/// that asked, which is gone). When a restart was under way it is now over, so its
+/// banner and popup go; in both cases the open list is fetched again so it shows what
+/// the gateway now has.
+fn settings_after_reconnect(ctx: &WsContext) {
+    let panel = ctx.settings_panel;
+    let outcome = after_reconnect(
+        panel.restarting.get_untracked(),
+        panel.busy.get_untracked().is_some(),
+    );
+    panel.offline.set(false);
+    panel.restarting.set(false);
+    panel.busy.set(None);
+    if outcome.clear_restart_notice {
+        panel.restart_notice.set(false);
+        ctx.config_saved_notice.set(false);
+    }
+    if outcome.refetch_list && ctx.settings_open.get_untracked() {
+        refresh_settings_page(ctx);
+    }
 }
 
 /// A tool or MCP server change was saved: the switch is no longer in flight, and a
@@ -2774,6 +2823,9 @@ pub fn App() -> impl IntoView {
         on_set_on_demand: Callback::new(move |change| request_set_on_demand(&ws_context, change)),
         on_refresh: Callback::new(move |()| refresh_settings_page(&ws_context)),
         on_save_config: Callback::new(move |change| request_set_tool_config(&ws_context, change)),
+        on_save_mcp_config: Callback::new(move |change| {
+            request_set_mcp_server_config(&ws_context, change)
+        }),
         on_restart: Callback::new(move |()| request_restart(&ws_context)),
     };
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {

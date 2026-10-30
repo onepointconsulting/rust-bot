@@ -459,6 +459,22 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway to change settings of the configured MCP server `name` (command,
+    /// URL, environment, ...). `values` maps setting names to new values. Same access
+    /// rules as [`Self::set_mcp_server_enabled`]. The reply is an `mcp_server_config_set`
+    /// (see [`ServerEvent::McpServerConfigSet`]) or a `setting_error` event.
+    pub fn set_mcp_server_config(
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "set_mcp_server_config",
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway for the durable ACP child agents and the spawn tasks of the
     /// gateway process, as `/subagents` lists them. Authenticated connections only — an
     /// anonymous connection is answered with an `access_denied` error. The reply is a
@@ -1160,6 +1176,13 @@ pub enum ServerEvent {
         deferred: bool,
         restart_required: bool,
     },
+    /// Reply to a successful [`ClientEnvelope::set_mcp_server_config`]: the server's
+    /// fresh row (with its form) and whether a restart is needed for the change.
+    McpServerConfigSet {
+        name: String,
+        server: Option<McpServerSettingSummary>,
+        restart_required: bool,
+    },
     /// Reply to a refused or failed tool or MCP server toggle (or list). `kind` is
     /// `tool` or `mcp_server`; `detail` is a stable code (`access_denied`,
     /// `child_agent_config`, `protected_tool`, `unknown_server`, `config_error`, ...).
@@ -1356,6 +1379,7 @@ impl ServerEvent {
             | ServerEvent::ToolSettingSet { .. }
             | ServerEvent::McpServerSet { .. }
             | ServerEvent::McpServerExposureSet { .. }
+            | ServerEvent::McpServerConfigSet { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
             | ServerEvent::ConfigFileSaved { .. }
@@ -1745,6 +1769,15 @@ struct McpServersWire {
 }
 
 #[derive(Deserialize)]
+struct McpServerConfigSetWire {
+    name: String,
+    #[serde(default)]
+    server: Option<McpServerSettingSummary>,
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
 struct SettingSetWire {
     name: String,
     enabled: bool,
@@ -2062,6 +2095,13 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             decode::<SettingSetWire>(&value).map(|w| ServerEvent::McpServerExposureSet {
                 name: w.name,
                 deferred: w.enabled,
+                restart_required: w.restart_required,
+            })
+        }
+        "mcp_server_config_set" => {
+            decode::<McpServerConfigSetWire>(&value).map(|w| ServerEvent::McpServerConfigSet {
+                name: w.name,
+                server: w.server,
                 restart_required: w.restart_required,
             })
         }
@@ -3437,6 +3477,48 @@ mod tests {
                 "webui": true,
             })
         );
+    }
+
+    #[test]
+    fn client_envelope_set_mcp_server_config_serializes_name_and_values() {
+        let values = HashMap::from([("env".to_string(), serde_json::json!({"A": "${B}"}))]);
+        let value =
+            serde_json::to_value(ClientEnvelope::set_mcp_server_config("cms", values)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "set_mcp_server_config",
+                "name": "cms",
+                "values": {"env": {"A": "${B}"}},
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_server_config_set_decodes_the_fresh_row_and_its_form() {
+        let event = parse_server_event(
+            r#"{"event":"mcp_server_config_set","name":"cms","restart_required":true,
+                "server":{"name":"cms","description":"CMS","enabled":true,"active":true,"deferred":false,
+                "config":{"name":"cms","title":"cms","fields":[{"name":"env","label":"Env","help":"",
+                "kind":"string_map","secret":false,"env_var":"","configured":true,
+                "value":{"A":"${B}"},"default":{}}]}}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.chat_id(), None);
+        let ServerEvent::McpServerConfigSet {
+            name,
+            server,
+            restart_required,
+        } = event
+        else {
+            panic!("expected McpServerConfigSet");
+        };
+        assert_eq!(name, "cms");
+        assert!(restart_required);
+        let field = &server.unwrap().config.unwrap().fields[0];
+        assert_eq!(field.kind, chat_ui::models::ToolFieldKind::StringMap);
+        assert_eq!(field.value, Some(serde_json::json!({"A": "${B}"})));
     }
 
     #[test]

@@ -7,6 +7,10 @@
 //! banner warns that a restart is needed. A search box filters the list as the user
 //! types; rows are always listed A–Z.
 //!
+//! Nothing can be changed while the connection to the gateway is down (e.g. during a
+//! restart): a request sent then would be lost. When a restart is over, its banner goes
+//! and the open list is fetched again from the restarted bot.
+//!
 //! The row ordering, filtering and labelling are plain functions so they are
 //! unit-testable on the host target without Leptos.
 
@@ -24,6 +28,10 @@ const PROTECTED_TOOL_HINT: &str = "Required by the gateway; it cannot be switche
 /// Banner shown while any switch waits for a restart.
 const RESTART_WARNING: &str =
     "Restart the rust-bot process for these changes to take effect. The previous config.json was backed up next to it.";
+
+/// Notice shown while the connection to the gateway is down.
+const OFFLINE_NOTICE: &str =
+    "Reconnecting to the gateway… Changes can be saved again once it is back.";
 
 /// Which page of the Settings dialog's menu is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -58,7 +66,7 @@ impl SettingsPage {
         match self {
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
             Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
-            Self::McpServers => "Switch the configured MCP servers on or off. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
+            Self::McpServers => "Switch the configured MCP servers on or off, or change how they are started under Settings. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
         }
     }
 
@@ -87,7 +95,8 @@ pub struct SettingRow {
     pub active: bool,
     /// Whether the switch can be flipped at all.
     pub toggleable: bool,
-    /// The settings form, for a row that stands for a whole tool section.
+    /// The settings form, for a row that stands for a whole tool section or an MCP
+    /// server.
     pub config: Option<ToolConfigSummary>,
     /// For an MCP server: whether its tools are loaded on demand. `None` for tools.
     pub on_demand: Option<bool>,
@@ -131,7 +140,7 @@ impl SettingItem for McpServerSettingSummary {
             enabled: self.enabled,
             active: self.active,
             toggleable: true,
-            config: None,
+            config: self.config.clone(),
             on_demand: Some(self.deferred),
         }
     }
@@ -148,6 +157,15 @@ impl SettingItem for McpServerSettingSummary {
 pub fn apply_on_demand(servers: &mut [McpServerSettingSummary], name: &str, deferred: bool) {
     if let Some(server) = servers.iter_mut().find(|server| server.name == name) {
         server.deferred = deferred;
+    }
+}
+
+/// Replace the MCP server `server.name` with the gateway's fresh `server` row (switches
+/// and settings form), after it confirmed it saved a settings change. Does nothing when
+/// no server has that name.
+pub fn apply_mcp_server(servers: &mut [McpServerSettingSummary], server: McpServerSettingSummary) {
+    if let Some(slot) = servers.iter_mut().find(|slot| slot.name == server.name) {
+        *slot = server;
     }
 }
 
@@ -258,6 +276,33 @@ fn row_hint(row: &SettingRow, can_modify: bool) -> &'static str {
     }
 }
 
+/// Whether switches and forms accept changes: the connection may change the
+/// configuration (`can_modify`), is connected (`!offline`) and no restart is under way.
+/// A change made otherwise could not be sent, or would be lost with the old process.
+pub fn changes_allowed(can_modify: bool, offline: bool, restarting: bool) -> bool {
+    can_modify && !offline && !restarting
+}
+
+/// What to do with the Settings pages once the connection to the gateway is back.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AfterReconnect {
+    /// The restart the banner asked for has happened: drop the banner.
+    pub clear_restart_notice: bool,
+    /// What the pages show may be out of date (another process is running, or a change
+    /// request was lost with the old connection): fetch the open list again.
+    pub refetch_list: bool,
+}
+
+/// Decide [`AfterReconnect`] from whether a restart was under way when the connection
+/// dropped and whether a change request was still waiting for its reply (which will
+/// never come: replies go to the connection that asked).
+pub fn after_reconnect(restart_was_under_way: bool, request_in_flight: bool) -> AfterReconnect {
+    AfterReconnect {
+        clear_restart_notice: restart_was_under_way,
+        refetch_list: restart_was_under_way || request_in_flight,
+    }
+}
+
 /// Everything the pages show, as signals owned by the app: which page is open, the two
 /// lists, and the state of the switch being changed.
 #[derive(Clone, Copy)]
@@ -281,6 +326,8 @@ pub struct SettingsPanel {
     pub restart_notice: RwSignal<bool>,
     /// Whether a restart was requested and the gateway is about to go down.
     pub restarting: RwSignal<bool>,
+    /// Whether the connection to the gateway is down (it reconnects on its own).
+    pub offline: RwSignal<bool>,
 }
 
 impl SettingsPanel {
@@ -297,7 +344,18 @@ impl SettingsPanel {
             error: RwSignal::new(None),
             restart_notice: RwSignal::new(false),
             restarting: RwSignal::new(false),
+            offline: RwSignal::new(false),
         }
+    }
+
+    /// Whether switches and forms accept changes right now (see [`changes_allowed`]).
+    /// Reactive: tracks every signal it reads.
+    pub fn can_change(&self) -> bool {
+        changes_allowed(
+            self.can_modify.get(),
+            self.offline.get(),
+            self.restarting.get(),
+        )
     }
 
     /// The rows of the open page.
@@ -362,6 +420,8 @@ pub struct SettingsActions {
     pub on_refresh: Callback<()>,
     /// Save the changed settings of one tool section.
     pub on_save_config: Callback<ToolConfigChange>,
+    /// Save the changed settings of one MCP server.
+    pub on_save_mcp_config: Callback<ToolConfigChange>,
     /// Restart the whole bot process so the saved changes take effect.
     pub on_restart: Callback<()>,
 }
@@ -372,6 +432,15 @@ pub fn restart_button_label(restarting: bool) -> &'static str {
         "Restarting…"
     } else {
         "Restart now"
+    }
+}
+
+/// Where the settings form of a row on `page` saves to: MCP server settings and tool
+/// section settings are different requests.
+fn save_callback_for(page: SettingsPage, actions: SettingsActions) -> Callback<ToolConfigChange> {
+    match page {
+        SettingsPage::McpServers => actions.on_save_mcp_config,
+        SettingsPage::Tools | SettingsPage::ToolSafety => actions.on_save_config,
     }
 }
 
@@ -399,8 +468,9 @@ fn SettingRowView(
     let name_for_open = row.name.clone();
     let name_for_on_demand = row.name.clone();
     let on_demand = row.on_demand;
+    let on_save_form = save_callback_for(page, actions);
     let disabled = Signal::derive(move || {
-        !panel.can_modify.get() || !toggleable || is_busy(&panel.busy.get(), &name_for_busy)
+        !panel.can_change() || !toggleable || is_busy(&panel.busy.get(), &name_for_busy)
     });
     view! {
         <li class="py-3">
@@ -484,9 +554,9 @@ fn SettingRowView(
                             <div class="mt-3">
                                 <ToolConfigForm
                                     config=config.clone()
-                                    can_modify=panel.can_modify
+                                    can_modify=Signal::derive(move || panel.can_change())
                                     busy=form_busy
-                                    on_save=actions.on_save_config
+                                    on_save=on_save_form
                                 />
                             </div>
                         </Show>
@@ -549,6 +619,11 @@ pub fn SettingsPageView(
                     </button>
                 </p>
             </Show>
+            <Show when=move || panel.offline.get()>
+                <p role="status" class="mt-3 rounded-lg bg-slate-100 px-3 py-2 text-sm text-slate-600">
+                    {OFFLINE_NOTICE}
+                </p>
+            </Show>
             {move || {
                 panel
                     .error
@@ -576,7 +651,7 @@ pub fn SettingsPageView(
                                 view! {
                                     <GeneralSettings
                                         config=config
-                                        can_modify=panel.can_modify
+                                        can_modify=Signal::derive(move || panel.can_change())
                                         busy=Signal::derive(move || {
                                             is_busy(&panel.busy.get(), &busy_tool)
                                         })
@@ -823,7 +898,47 @@ mod tests {
             enabled: true,
             active: true,
             deferred,
+            config: None,
         }
+    }
+
+    fn form(name: &str) -> ToolConfigSummary {
+        ToolConfigSummary {
+            name: name.to_string(),
+            title: name.to_string(),
+            description: String::new(),
+            enabled: Some(true),
+            tool_names: Vec::new(),
+            fields: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn mcp_server_rows_carry_their_settings_form_when_sent_one() {
+        let mut cms = mcp_server("cms", false);
+        assert_eq!(cms.to_row().config, None);
+
+        cms.config = Some(form("cms"));
+
+        let row = cms.to_row();
+        assert_eq!(row.config, Some(form("cms")));
+        assert!(has_switch(&row), "the enabled switch stays");
+        assert_eq!(row_title(&row), "cms");
+    }
+
+    #[test]
+    fn apply_mcp_server_replaces_only_the_named_server() {
+        let mut servers = vec![mcp_server("cms", false), mcp_server("files", false)];
+        let mut fresh = mcp_server("cms", true);
+        fresh.description = "Strapi CMS".to_string();
+        fresh.config = Some(form("cms"));
+
+        apply_mcp_server(&mut servers, fresh.clone());
+        apply_mcp_server(&mut servers, mcp_server("ghost", true));
+
+        assert_eq!(servers[0], fresh);
+        assert_eq!(servers[1], mcp_server("files", false));
+        assert_eq!(servers.len(), 2);
     }
 
     #[test]
@@ -862,6 +977,47 @@ mod tests {
         assert_eq!(row_hint(&locked, true), PROTECTED_TOOL_HINT);
         assert_eq!(row_hint(&locked, false), switch_hint(false));
         assert_eq!(row_hint(&row("a", "", true, true), true), "");
+    }
+
+    #[test]
+    fn changes_need_permission_a_connection_and_no_restart_under_way() {
+        assert!(changes_allowed(true, false, false));
+        assert!(!changes_allowed(false, false, false), "read-only connection");
+        assert!(!changes_allowed(true, true, false), "offline");
+        assert!(!changes_allowed(true, false, true), "restarting");
+    }
+
+    #[test]
+    fn a_finished_restart_drops_the_banner_and_refetches_the_list() {
+        assert_eq!(
+            after_reconnect(true, false),
+            AfterReconnect {
+                clear_restart_notice: true,
+                refetch_list: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_request_lost_with_the_old_connection_refetches_but_keeps_the_banner() {
+        assert_eq!(
+            after_reconnect(false, true),
+            AfterReconnect {
+                clear_restart_notice: false,
+                refetch_list: true
+            }
+        );
+    }
+
+    #[test]
+    fn a_plain_reconnect_keeps_the_banner_and_the_list() {
+        assert_eq!(
+            after_reconnect(false, false),
+            AfterReconnect {
+                clear_restart_notice: false,
+                refetch_list: false
+            }
+        );
     }
 
     #[test]

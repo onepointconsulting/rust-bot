@@ -46,6 +46,7 @@ use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::config_file;
 use crate::channels::websocket::config_toggles;
+use crate::channels::websocket::mcp_server_form;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     AuthorizeResult, ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType,
@@ -706,6 +707,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::SetMcpServerDeferred => {
             handle_set_mcp_server_deferred(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetMcpServerConfig => {
+            handle_set_mcp_server_config(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -3231,6 +3235,8 @@ enum SettingKind {
     McpServer,
     /// Whether an MCP server's tools are loaded on demand (`exposure: deferred`).
     McpServerExposure,
+    /// The settings form of an MCP server (command, URL, environment, ...).
+    McpServerConfig,
 }
 
 impl SettingKind {
@@ -3240,6 +3246,7 @@ impl SettingKind {
             Self::Tool => "tool",
             Self::McpServer => "mcp_server",
             Self::McpServerExposure => "mcp_server_exposure",
+            Self::McpServerConfig => "mcp_server_config",
         }
     }
 
@@ -3249,6 +3256,7 @@ impl SettingKind {
             Self::Tool => WsOutboundEvent::ToolSettingSet,
             Self::McpServer => WsOutboundEvent::McpServerSet,
             Self::McpServerExposure => WsOutboundEvent::McpServerExposureSet,
+            Self::McpServerConfig => WsOutboundEvent::McpServerConfigSet,
         }
     }
 
@@ -3266,6 +3274,10 @@ impl SettingKind {
             Self::McpServerExposure => {
                 config_toggles::with_mcp_server_deferred(text, name, enabled)
             }
+            // A settings form has no on/off switch of its own.
+            Self::McpServerConfig => Err(config_toggles::ToggleError::UnknownField(
+                "enabled".to_string(),
+            )),
         }
     }
 }
@@ -3293,6 +3305,33 @@ async fn send_setting_error(
         }),
     )
     .await;
+}
+
+/// Tell the requester why a `config.json` edit of `kind` for `name` was refused or could
+/// not be saved.
+async fn send_apply_error(
+    shared: &WsShared,
+    connection_id: &str,
+    kind: SettingKind,
+    name: &str,
+    error: config_toggles::ApplyError,
+) {
+    match error {
+        config_toggles::ApplyError::Toggle(error) => {
+            send_setting_error(
+                shared,
+                connection_id,
+                kind,
+                name,
+                error.detail(),
+                &error.message(),
+            )
+            .await;
+        }
+        config_toggles::ApplyError::Save(message) => {
+            send_setting_error(shared, connection_id, kind, name, "config_error", &message).await;
+        }
+    }
 }
 
 /// Why this connection may not switch tools or MCP servers, as `(detail, message)`, or
@@ -3386,6 +3425,8 @@ async fn handle_list_tool_settings<'a>(envelope_dispatch_context: EnvelopeDispat
 /// Handle a `list_mcp_servers` envelope: reply with an `mcp_servers` event listing every
 /// MCP server in `config.json` A–Z, with whether the configuration leaves it on
 /// (`enabled`) and whether the running process was started with it on (`active`).
+/// Connections that may change the configuration also get each server's settings form
+/// (`config`), which shows its command, URL and credentials.
 /// Authenticated connections only. Rust-side addition with no nanobot precedent.
 async fn handle_list_mcp_servers<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
     let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
@@ -3401,20 +3442,15 @@ async fn handle_list_mcp_servers<'a>(envelope_dispatch_context: EnvelopeDispatch
         return;
     }
     let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
-    let configured = read_config_for_settings()
-        .and_then(|text| config_toggles::configured_mcp_servers(&text).map_err(|e| e.message()));
-    match configured {
-        Ok(configured) => {
+    match read_mcp_server_rows(shared, can_modify) {
+        Ok(rows) => {
             send_event(
                 shared,
                 connection_id,
                 WsOutboundEvent::McpServers,
                 None,
                 serde_json::json!({
-                    "servers": config_toggles::mcp_server_setting_rows(
-                        &configured,
-                        &shared.running_mcp_servers,
-                    ),
+                    "servers": rows,
                     "can_modify": can_modify,
                 }),
             )
@@ -3432,6 +3468,18 @@ async fn handle_list_mcp_servers<'a>(envelope_dispatch_context: EnvelopeDispatch
             .await;
         }
     }
+}
+
+/// The MCP server rows of the current `config.json`, with their settings forms when
+/// `with_forms`, as a message for the user on failure.
+fn read_mcp_server_rows(
+    shared: &WsShared,
+    with_forms: bool,
+) -> Result<Vec<config_toggles::McpServerSettingRow>, String> {
+    read_config_for_settings().and_then(|text| {
+        mcp_server_form::mcp_server_rows(&text, &shared.running_mcp_servers, with_forms)
+            .map_err(|e| e.message())
+    })
 }
 
 /// Switch the tool or MCP server named in the envelope `{name, enabled}` on or off by
@@ -3497,19 +3545,8 @@ async fn handle_toggle_setting<'a>(
             )
             .await;
         }
-        Err(config_toggles::ApplyError::Toggle(error)) => {
-            send_setting_error(
-                shared,
-                connection_id,
-                kind,
-                &name,
-                error.detail(),
-                &error.message(),
-            )
-            .await;
-        }
-        Err(config_toggles::ApplyError::Save(message)) => {
-            send_setting_error(shared, connection_id, kind, &name, "config_error", &message).await;
+        Err(error) => {
+            send_apply_error(shared, connection_id, kind, &name, error).await;
         }
     }
 }
@@ -3613,6 +3650,79 @@ async fn handle_set_mcp_server_deferred<'a>(
     envelope_dispatch_context: EnvelopeDispatchContext<'a>,
 ) {
     handle_toggle_setting(envelope_dispatch_context, SettingKind::McpServerExposure).await;
+}
+
+/// Handle a `set_mcp_server_config` envelope `{name, values}`: validate the submitted
+/// settings of the configured MCP server `name` against its schema and edit them into
+/// `config.json` (validated, previous file backed up). Replies with
+/// `mcp_server_config_set {name, server, restart_required}`, `server` being the fresh row
+/// with its form, or with a `setting_error`. Submitted values are never logged or echoed
+/// in errors. Takes effect after a restart. Rust-side addition with no nanobot precedent.
+async fn handle_set_mcp_server_config<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let envelope = envelope_dispatch_context.envelope;
+    let kind = SettingKind::McpServerConfig;
+    let name = envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if let Some((detail, message)) = setting_write_denial(shared, &envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, &name, detail, message).await;
+        return;
+    }
+    let Some(values) = parse_tool_config_values(envelope) else {
+        send_setting_error(
+            shared,
+            connection_id,
+            kind,
+            &name,
+            "invalid_request",
+            "The request was malformed.",
+        )
+        .await;
+        return;
+    };
+
+    let result = {
+        // Shares the lock with the other writers: each one rewrites the whole file.
+        let _write_guard = MCP_CONFIG_WRITE_LOCK
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        config_toggles::apply_edit(&get_config_path(), |text| {
+            mcp_server_form::with_mcp_server_settings(text, &name, &values)
+        })
+    };
+
+    match result {
+        Ok(outcome) => {
+            if outcome.changed {
+                log::info!(
+                    "MCP server '{name}' configured from the WebUI (client '{client_id}'); previous config kept as {:?}",
+                    outcome.backup,
+                );
+            }
+            let server = read_mcp_server_rows(shared, true)
+                .ok()
+                .and_then(|rows| rows.into_iter().find(|row| row.name == name));
+            send_event(
+                shared,
+                connection_id,
+                kind.saved_event(),
+                None,
+                serde_json::json!({
+                    "name": name,
+                    "server": server,
+                    "restart_required": outcome.changed,
+                }),
+            )
+            .await;
+        }
+        Err(error) => {
+            send_apply_error(shared, connection_id, kind, &name, error).await;
+        }
+    }
 }
 
 /// Handle a `set_mcp_preset` envelope `{name, enabled, fields?}`: enable or disable the
@@ -9355,6 +9465,7 @@ mod tests {
             "set_tool_enabled",
             "set_mcp_server_enabled",
             "set_mcp_server_deferred",
+            "set_mcp_server_config",
         ] {
             let anonymous = dispatch_setting_envelope(
                 &shared,
@@ -9451,9 +9562,18 @@ mod tests {
         )
         .await;
 
+        let server_config = dispatch_setting_envelope(
+            &shared,
+            &AuthorizeResult::UNAUTHENTICATED,
+            "127.0.0.1",
+            "set_mcp_server_config",
+        )
+        .await;
+
         assert_eq!(tool["kind"], "tool");
         assert_eq!(server["kind"], "mcp_server");
         assert_eq!(exposure["kind"], "mcp_server_exposure");
+        assert_eq!(server_config["kind"], "mcp_server_config");
     }
 
     #[tokio::test]

@@ -1454,30 +1454,40 @@ pub enum ToolExposure {
 }
 
 /// MCP server connection configuration (stdio or HTTP).
-#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+///
+/// The schema (minus `enabled`, which is the row switch) drives the MCP server form of
+/// the WebUI Settings dialog; doc comments become the help text of each field.
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct McpServerConfig {
     /// Enable or disable this mcp server globally. Default: `true`.
     #[serde(default = "default_mcp_enabled")]
     #[garde(skip)]
+    #[schemars(skip)]
     pub enabled: bool,
 
-    /// Transport type. Auto-detected from `command`/`url` when `None`.
+    /// How to connect: `stdio` runs a local command, `sse` and `streamableHttp` connect
+    /// to a URL. Empty: detected from the command or the URL.
     #[serde(alias = "type")]
     #[garde(skip)]
+    #[schemars(
+        with = "String",
+        extend("x-choices" = ["", "stdio", "sse", "streamableHttp"])
+    )]
     pub transport_type: Option<McpTransportType>,
 
-    /// Stdio: executable to run (e.g. `"npx"`).
+    /// Stdio: executable to run (e.g. `npx`).
     #[serde(alias = "command")]
     #[garde(skip)]
     pub command: String,
 
-    /// Stdio: command-line arguments.
+    /// Stdio: command-line arguments, one per line.
     #[serde(alias = "args")]
     #[garde(skip)]
     pub args: Vec<String>,
 
-    /// Stdio: extra environment variables injected into the subprocess.
+    /// Stdio: extra environment variables for the subprocess, one `NAME=value` per line.
+    /// `${VAR}` placeholders are expanded when the bot starts.
     #[serde(alias = "env")]
     #[garde(skip)]
     pub env: HashMap<String, String>,
@@ -1487,7 +1497,8 @@ pub struct McpServerConfig {
     #[garde(skip)]
     pub url: String,
 
-    /// HTTP/SSE: custom request headers.
+    /// HTTP/SSE: custom request headers, one `Name=value` per line. `${VAR}`
+    /// placeholders are expanded when the bot starts.
     #[serde(alias = "headers")]
     #[garde(skip)]
     pub headers: HashMap<String, String>,
@@ -1495,23 +1506,25 @@ pub struct McpServerConfig {
     /// Seconds before a tool call is cancelled. Default: 30.
     #[serde(alias = "tool_timeout", default = "default_mcp_tool_timeout")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub tool_timeout: u32,
 
-    /// Tools to register. Accepts raw MCP names or wrapped `mcp_<server>_<tool>` names.
-    /// `["*"]` registers all tools; `[]` registers none. Default: `["*"]`.
+    /// Tools to register, one per line: raw MCP names or wrapped `mcp_<server>_<tool>`
+    /// names. `*` registers all tools; an empty list registers none. Default: `["*"]`.
     #[serde(alias = "enabled_tools", default = "default_mcp_enabled_tools")]
     #[garde(skip)]
     pub enabled_tools: Vec<String>,
 
-    /// `"direct"` (default): every tool of this server is declared to the model on each
-    /// request. `"deferred"`: the tools are only declared after the model finds them
+    /// `direct` (default): every tool of this server is declared to the model on each
+    /// request. `deferred`: the tools are only declared after the model finds them
     /// with `tool_search`. Use it for servers with many tools that are used now and then.
     #[serde(default)]
     #[garde(skip)]
+    #[schemars(with = "String", extend("x-choices" = ["direct", "deferred"]))]
     pub exposure: ToolExposure,
 
     /// One line telling the model what this server offers, in the words a user would
-    /// use (e.g. `"Jira: search, create and update issues and sprints"`). Empty: the
+    /// use (e.g. `Jira: search, create and update issues and sprints`). Empty: the
     /// server is described by its name only.
     #[serde(default)]
     #[garde(skip)]

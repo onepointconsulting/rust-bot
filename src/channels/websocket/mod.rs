@@ -1,5 +1,6 @@
 pub mod config_file;
 pub mod config_toggles;
+pub mod mcp_server_form;
 pub mod registry;
 pub mod runtime;
 pub mod types;

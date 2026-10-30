@@ -212,6 +212,9 @@ pub enum ToolFieldKind {
         choices: Vec<String>,
     },
     StringList,
+    /// A map of names to text values (environment variables, HTTP headers), sent and
+    /// received as a JSON object.
+    StringMap,
 }
 
 /// One editable setting of a tool. Mirrors the backend's `ToolFieldSummary`; the kind is
@@ -277,6 +280,10 @@ pub struct McpServerSettingSummary {
     /// Whether `config.json` loads the server's tools on demand (`exposure: deferred`).
     #[serde(default)]
     pub deferred: bool,
+    /// The server's settings form (command, URL, environment, ...). Only sent to
+    /// connections that may change the configuration.
+    #[serde(default)]
+    pub config: Option<ToolConfigSummary>,
 }
 
 /// Setup state of one field a preset needs, as surfaced by the gateway's `mcp_presets`

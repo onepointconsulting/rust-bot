@@ -35,7 +35,9 @@ A bot implementation initially based on [Nanobot](https://github.com/HKUDS/nanob
   more than 100 tools went from about 474,000 prompt tokens per request to about 14,000. See
   [Deferred tools](#deferred-tools).
 - **MCP and tool control.** Connect any MCP server (stdio, SSE or streamable HTTP), pick which of its tools are
-  enabled, enable ready-made presets from the web UI, and switch built-in tools on or off. Agent modes such as
+  enabled, enable ready-made presets from the web UI, edit a configured server's settings (command, arguments,
+  environment, URL, headers, timeout, tools, exposure) under **Settings → MCP Servers**, and switch built-in
+  tools on or off. Agent modes such as
   `minimal` and `no_mcp` change what a chat can use.
 - **Built-in tools.** Files, shell, web search and fetch, Gmail, OCR, document conversion, image generation,
   scheduled reminders (cron), clarifying questions and sustained goals.
