@@ -17,6 +17,9 @@
 use chat_ui::models::{McpServerSettingSummary, ToolConfigSummary, ToolSettingSummary};
 use leptos::prelude::*;
 
+use super::add_mcp_server_panel::{
+    AddMcpServerButton, AddMcpServerPanel, ADD_BUSY_KEY,
+};
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
@@ -166,6 +169,15 @@ pub fn apply_on_demand(servers: &mut [McpServerSettingSummary], name: &str, defe
 pub fn apply_mcp_server(servers: &mut [McpServerSettingSummary], server: McpServerSettingSummary) {
     if let Some(slot) = servers.iter_mut().find(|slot| slot.name == server.name) {
         *slot = server;
+    }
+}
+
+/// Put the freshly added MCP server `server` into the list: replacing a row of the same
+/// name (a refetch may have brought it in already), else appending it.
+pub fn insert_mcp_server(servers: &mut Vec<McpServerSettingSummary>, server: McpServerSettingSummary) {
+    match servers.iter_mut().find(|slot| slot.name == server.name) {
+        Some(slot) => *slot = server,
+        None => servers.push(server),
     }
 }
 
@@ -328,6 +340,15 @@ pub struct SettingsPanel {
     pub restarting: RwSignal<bool>,
     /// Whether the connection to the gateway is down (it reconnects on its own).
     pub offline: RwSignal<bool>,
+    /// The blank settings form of a new MCP server; only sent to connections that may
+    /// change the configuration.
+    pub new_server_form: RwSignal<Option<ToolConfigSummary>>,
+    /// Whether the "Add MCP Server" panel is open (in place of its button).
+    pub adding: RwSignal<bool>,
+    /// Why the last add was refused, shown in the panel.
+    pub add_error: RwSignal<Option<String>>,
+    /// The success message of the last add, shown until the restart it asks for.
+    pub added_notice: RwSignal<Option<String>>,
 }
 
 impl SettingsPanel {
@@ -345,7 +366,17 @@ impl SettingsPanel {
             restart_notice: RwSignal::new(false),
             restarting: RwSignal::new(false),
             offline: RwSignal::new(false),
+            new_server_form: RwSignal::new(None),
+            adding: RwSignal::new(false),
+            add_error: RwSignal::new(None),
+            added_notice: RwSignal::new(None),
         }
+    }
+
+    /// Close the "Add MCP Server" panel and forget its last error.
+    pub fn close_add_panel(&self) {
+        self.adding.set(false);
+        self.add_error.set(None);
     }
 
     /// Whether switches and forms accept changes right now (see [`changes_allowed`]).
@@ -398,6 +429,9 @@ impl SettingsPanel {
         self.busy.set(None);
         self.expanded_tool.set(None);
         self.error.set(None);
+        self.new_server_form.set(None);
+        self.close_add_panel();
+        self.added_notice.set(None);
     }
 }
 
@@ -422,6 +456,8 @@ pub struct SettingsActions {
     pub on_save_config: Callback<ToolConfigChange>,
     /// Save the changed settings of one MCP server.
     pub on_save_mcp_config: Callback<ToolConfigChange>,
+    /// Add a new MCP server: `(name, settings)`.
+    pub on_add_mcp_server: Callback<ToolConfigChange>,
     /// Restart the whole bot process so the saved changes take effect.
     pub on_restart: Callback<()>,
 }
@@ -441,6 +477,43 @@ fn save_callback_for(page: SettingsPage, actions: SettingsActions) -> Callback<T
     match page {
         SettingsPage::McpServers => actions.on_save_mcp_config,
         SettingsPage::Tools | SettingsPage::ToolSafety => actions.on_save_config,
+    }
+}
+
+/// The "Add MCP Server" button, or its panel while it is open. Nothing for a connection
+/// that may not change the configuration (the gateway sends it no blank form).
+#[component]
+fn AddServerSection(panel: SettingsPanel, actions: SettingsActions) -> impl IntoView {
+    view! {
+        {move || {
+            let form = panel.new_server_form.get().filter(|_| panel.can_modify.get())?;
+            Some(
+                if panel.adding.get() {
+                    view! {
+                        <AddMcpServerPanel
+                            form=form
+                            can_change=Signal::derive(move || panel.can_change())
+                            busy=Signal::derive(move || is_busy(&panel.busy.get(), ADD_BUSY_KEY))
+                            error=panel.add_error
+                            on_apply=actions.on_add_mcp_server
+                            on_cancel=Callback::new(move |()| panel.close_add_panel())
+                        />
+                    }
+                        .into_any()
+                } else {
+                    view! {
+                        <AddMcpServerButton
+                            disabled=Signal::derive(move || !panel.can_change())
+                            on_click=Callback::new(move |()| {
+                                panel.add_error.set(None);
+                                panel.adding.set(true);
+                            })
+                        />
+                    }
+                        .into_any()
+                },
+            )
+        }}
     }
 }
 
@@ -603,6 +676,21 @@ pub fn SettingsPageView(
                     "Refresh"
                 </button>
             </div>
+            {move || {
+                panel
+                    .added_notice
+                    .get()
+                    .map(|message| {
+                        view! {
+                            <p
+                                role="status"
+                                class="mt-3 rounded-lg bg-emerald-50 px-3 py-2 text-sm text-emerald-800"
+                            >
+                                {message}
+                            </p>
+                        }
+                    })
+            }}
             <Show when=show_restart_warning>
                 <p
                     role="status"
@@ -686,6 +774,12 @@ pub fn SettingsPageView(
                 prop:value=move || search.get()
                 on:input=move |event| search.set(event_target_value(&event))
             />
+            <Show when=move || page() == SettingsPage::McpServers>
+                // Scrolls on its own when the open panel is taller than the dialog.
+                <div class="min-h-0 shrink overflow-y-auto">
+                    <AddServerSection panel=panel actions=actions />
+                </div>
+            </Show>
             <Show
                 when=move || panel.open_page_loaded()
                 fallback=|| view! { <p class="pt-6 text-sm text-slate-400">"Loading…"</p> }
@@ -924,6 +1018,47 @@ mod tests {
         assert_eq!(row.config, Some(form("cms")));
         assert!(has_switch(&row), "the enabled switch stays");
         assert_eq!(row_title(&row), "cms");
+    }
+
+    #[test]
+    fn insert_mcp_server_appends_a_new_name_and_replaces_a_known_one() {
+        let mut servers = vec![mcp_server("cms", false)];
+
+        insert_mcp_server(&mut servers, mcp_server("files", false));
+        insert_mcp_server(&mut servers, mcp_server("files", true));
+
+        assert_eq!(servers.len(), 2);
+        assert!(servers[1].deferred, "the second insert replaced the first");
+    }
+
+    #[test]
+    fn clearing_the_panel_drops_the_add_panel_and_its_messages() {
+        let panel = SettingsPanel::new();
+        panel.new_server_form.set(Some(form("")));
+        panel.adding.set(true);
+        panel.add_error.set(Some("no".to_string()));
+        panel.added_notice.set(Some("added".to_string()));
+
+        panel.clear();
+
+        assert!(panel.new_server_form.get_untracked().is_none());
+        assert!(!panel.adding.get_untracked());
+        assert!(panel.add_error.get_untracked().is_none());
+        assert!(panel.added_notice.get_untracked().is_none());
+    }
+
+    #[test]
+    fn closing_the_add_panel_keeps_the_success_message_of_an_earlier_add() {
+        let panel = SettingsPanel::new();
+        panel.adding.set(true);
+        panel.add_error.set(Some("no".to_string()));
+        panel.added_notice.set(Some("added".to_string()));
+
+        panel.close_add_panel();
+
+        assert!(!panel.adding.get_untracked());
+        assert!(panel.add_error.get_untracked().is_none());
+        assert!(panel.added_notice.get_untracked().is_some());
     }
 
     #[test]

@@ -106,6 +106,11 @@ pub enum EnvelopeType {
     /// `config.json`. Rust-side addition with no nanobot precedent. Same access rules as
     /// [`Self::SetMcpServerEnabled`].
     SetMcpServerConfig,
+    /// Add a new MCP server to `config.json` (`{name, values}`, `values` mapping setting
+    /// names such as `command` or `url` to their values). Refused when the name is already
+    /// configured. Rust-side addition with no nanobot precedent. Same access rules as
+    /// [`Self::SetMcpServerEnabled`].
+    AddMcpServer,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -197,6 +202,7 @@ impl From<&str> for EnvelopeType {
             "set_mcp_server_enabled" => Self::SetMcpServerEnabled,
             "set_mcp_server_deferred" => Self::SetMcpServerDeferred,
             "set_mcp_server_config" => Self::SetMcpServerConfig,
+            "add_mcp_server" => Self::AddMcpServer,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -278,6 +284,9 @@ pub enum WsOutboundEvent {
     /// Reply to a successful [`EnvelopeType::SetMcpServerConfig`] — `{name, server,
     /// restart_required}`, `server` being the server's fresh row with its form.
     McpServerConfigSet,
+    /// Reply to a successful [`EnvelopeType::AddMcpServer`] — `{name, server,
+    /// restart_required}`, `server` being the new server's row with its form.
+    McpServerAdded,
     /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
     /// message}`. Never carries any of the file's content.
     SettingError,
@@ -362,6 +371,7 @@ impl WsOutboundEvent {
             Self::McpServerSet => "mcp_server_set",
             Self::McpServerExposureSet => "mcp_server_exposure_set",
             Self::McpServerConfigSet => "mcp_server_config_set",
+            Self::McpServerAdded => "mcp_server_added",
             Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
@@ -858,6 +868,14 @@ mod tests {
         assert_eq!(
             WsOutboundEvent::McpServerConfigSet.as_str(),
             "mcp_server_config_set"
+        );
+        assert_eq!(
+            EnvelopeType::from("add_mcp_server"),
+            EnvelopeType::AddMcpServer
+        );
+        assert_eq!(
+            WsOutboundEvent::McpServerAdded.as_str(),
+            "mcp_server_added"
         );
         assert_eq!(WsOutboundEvent::SettingError.as_str(), "setting_error");
         assert_eq!(

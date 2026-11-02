@@ -7,8 +7,11 @@
 //! browser renders it with the same component. Values are read from and written to the
 //! raw JSON text, like [`super::config_toggles`]: `${ENV_VAR}` placeholders are shown and
 //! kept exactly as written, and nothing outside the edited server entry changes.
-//! Everything here is a pure function of strings; saving is
-//! [`super::config_toggles::apply_edit`]'s job.
+//! Everything here is a pure function of strings (the process environment is passed in
+//! where a check needs it); saving is [`super::config_toggles::apply_edit`]'s job.
+//!
+//! A `${VAR}` placeholder in a submitted value must name a variable that is set on this
+//! machine: an unset one is accepted by the file format but stops the bot from starting.
 
 use std::collections::{HashMap, HashSet};
 
@@ -16,12 +19,14 @@ use schemars::schema_for;
 use serde_json::{Map, Value};
 
 use super::config_toggles::{
-    McpServerSettingRow, ToggleError, configured_mcp_servers, is_valid_name,
-    mcp_server_object_mut, mcp_server_setting_rows, parse_root, render,
+    MCP_SERVERS_KEYS, McpServerSettingRow, ToggleError, configured_mcp_servers,
+    existing_or_default_key, is_valid_name, mcp_server_object_mut, mcp_server_setting_rows,
+    parse_root, render, tools_object_mut,
 };
 use crate::agent::tools::tool_settings_api::{
     ToolSettingsSummary, check_value, field_kind, summarize_field,
 };
+use crate::config::loader::referenced_env_vars;
 use crate::config::schema::McpServerConfig;
 
 /// Setting names (as the form calls them) with every spelling the configuration accepts,
@@ -77,28 +82,45 @@ pub fn mcp_server_form(text: &str, name: &str) -> Result<ToolSettingsSummary, To
     }
     let mut root = parse_root(text)?;
     let server = mcp_server_object_mut(&mut root, name)?;
-    let enabled = server
-        .get(ENABLED)
-        .and_then(Value::as_bool)
-        .unwrap_or(true);
-    let fields = form_properties()
-        .iter()
-        .filter_map(|(setting, property)| {
-            let shown = stored_value(server, setting)
-                .or_else(|| property.get("default"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            summarize_field(setting, property, &shown)
-        })
-        .collect();
+    let enabled = server.get(ENABLED).and_then(Value::as_bool).unwrap_or(true);
     Ok(ToolSettingsSummary {
         name: name.to_string(),
         title: name.to_string(),
         description: String::new(),
         enabled: Some(enabled),
         tool_names: Vec::new(),
-        fields,
+        fields: form_fields(Some(server)),
     })
+}
+
+/// The blank form for a server that does not exist yet: every setting at its default.
+/// It has no name (the browser asks for one) and no switch.
+pub fn new_server_form() -> ToolSettingsSummary {
+    ToolSettingsSummary {
+        name: String::new(),
+        title: String::new(),
+        description: String::new(),
+        enabled: None,
+        tool_names: Vec::new(),
+        fields: form_fields(None),
+    }
+}
+
+/// One form field per setting: what `server` stores for it, else the default.
+fn form_fields(
+    server: Option<&Map<String, Value>>,
+) -> Vec<crate::agent::tools::tool_settings_api::ToolFieldSummary> {
+    form_properties()
+        .iter()
+        .filter_map(|(setting, property)| {
+            let shown = server
+                .and_then(|server| stored_value(server, setting))
+                .or_else(|| property.get("default"))
+                .cloned()
+                .unwrap_or(Value::Null);
+            summarize_field(setting, property, &shown)
+        })
+        .collect()
 }
 
 /// The MCP server rows of the config `text` (see [`mcp_server_setting_rows`]), each
@@ -173,6 +195,57 @@ fn check_connection_target(server: &Map<String, Value>) -> Result<(), ToggleErro
     }
 }
 
+/// Whether the environment variable `name` is set on this machine.
+fn process_env_is_set(name: &str) -> bool {
+    std::env::var_os(name).is_some()
+}
+
+/// Why an unset `${VAR}` is refused, and what to do instead. Shown after the variable's
+/// name. People often expect the server's Env field to define variables for `${NAME}`;
+/// it does not (it only feeds the launched command), so the message says so.
+const UNSET_VARIABLE_EXPLANATION: &str = "which is not set in the environment of the process running rust-bot. ${NAME} is read from that environment, not from this server's Env field: set the variable there before starting rust-bot, or write the value here directly.";
+
+/// Refuse a submitted value naming a `${VAR}` placeholder whose variable is not set.
+/// The message names the variable, never the value.
+fn check_placeholders(
+    setting: &str,
+    value: &Value,
+    env_is_set: &dyn Fn(&str) -> bool,
+) -> Result<(), ToggleError> {
+    match referenced_env_vars(value)
+        .into_iter()
+        .find(|variable| !env_is_set(variable))
+    {
+        Some(variable) => Err(ToggleError::InvalidValue(
+            setting.to_string(),
+            format!("uses ${{{variable}}}, {UNSET_VARIABLE_EXPLANATION}"),
+        )),
+        None => Ok(()),
+    }
+}
+
+/// Check every submitted `changes` entry against the schema and the environment, write
+/// them into `server`, then check the result can connect. `server` may be left half
+/// edited on an error: callers work on a parsed copy of the config and drop it.
+fn apply_settings(
+    server: &mut Map<String, Value>,
+    changes: &HashMap<String, Value>,
+    env_is_set: &dyn Fn(&str) -> bool,
+) -> Result<(), ToggleError> {
+    let properties = form_properties();
+    for (setting, value) in changes {
+        let kind = properties
+            .get(setting)
+            .and_then(field_kind)
+            .ok_or_else(|| ToggleError::UnknownField(setting.clone()))?;
+        let checked = check_value(&kind, value)
+            .map_err(|reason| ToggleError::InvalidValue(setting.clone(), reason))?;
+        check_placeholders(setting, &checked, env_is_set)?;
+        store_setting(server, setting, checked);
+    }
+    check_connection_target(server)
+}
+
 /// `text` with the submitted `changes` (setting name -> value, as the form names them)
 /// applied to `tools.mcpServers.<name>`. Every change is checked against the schema
 /// first; nothing is applied unless all of them are valid. `None` when the entry already
@@ -182,27 +255,68 @@ pub fn with_mcp_server_settings(
     name: &str,
     changes: &HashMap<String, Value>,
 ) -> Result<Option<String>, ToggleError> {
+    with_mcp_server_settings_in(text, name, changes, &process_env_is_set)
+}
+
+/// [`with_mcp_server_settings`] with the environment lookup passed in.
+fn with_mcp_server_settings_in(
+    text: &str,
+    name: &str,
+    changes: &HashMap<String, Value>,
+    env_is_set: &dyn Fn(&str) -> bool,
+) -> Result<Option<String>, ToggleError> {
     if !is_valid_name(name) {
         return Err(ToggleError::InvalidName);
     }
-    let properties = form_properties();
     let mut root = parse_root(text)?;
     let server = mcp_server_object_mut(&mut root, name)?;
     let before = server.clone();
-    for (setting, value) in changes {
-        let kind = properties
-            .get(setting)
-            .and_then(field_kind)
-            .ok_or_else(|| ToggleError::UnknownField(setting.clone()))?;
-        let checked = check_value(&kind, value)
-            .map_err(|reason| ToggleError::InvalidValue(setting.clone(), reason))?;
-        store_setting(server, setting, checked);
-    }
-    check_connection_target(server)?;
+    apply_settings(server, changes, env_is_set)?;
     if *server == before {
         return Ok(None);
     }
     Ok(Some(render(&root, text)))
+}
+
+/// `text` with a new server `name` added to `tools.mcpServers` (created when missing,
+/// under the key spelling the file uses) holding the submitted `values`, checked like an
+/// edit. It starts enabled, as an entry without an `enabled` flag is. Refuses a name that
+/// is already configured: adding never overwrites.
+pub fn with_mcp_server_added(
+    text: &str,
+    name: &str,
+    values: &HashMap<String, Value>,
+) -> Result<String, ToggleError> {
+    with_mcp_server_added_in(text, name, values, &process_env_is_set)
+}
+
+/// [`with_mcp_server_added`] with the environment lookup passed in.
+fn with_mcp_server_added_in(
+    text: &str,
+    name: &str,
+    values: &HashMap<String, Value>,
+    env_is_set: &dyn Fn(&str) -> bool,
+) -> Result<String, ToggleError> {
+    if !is_valid_name(name) {
+        return Err(ToggleError::InvalidName);
+    }
+    let mut root = parse_root(text)?;
+    let tools = tools_object_mut(&mut root)?;
+    let key = existing_or_default_key(tools, MCP_SERVERS_KEYS).to_string();
+    let servers = tools
+        .entry(key)
+        .or_insert_with(|| Value::Object(Map::new()))
+        .as_object_mut()
+        .ok_or_else(|| {
+            ToggleError::InvalidConfig("\"mcpServers\" is not an object.".to_string())
+        })?;
+    if servers.contains_key(name) {
+        return Err(ToggleError::ServerExists);
+    }
+    let mut server = Map::new();
+    apply_settings(&mut server, values, env_is_set)?;
+    servers.insert(name.to_string(), Value::Object(server));
+    Ok(render(&root, text))
 }
 
 #[cfg(test)]
@@ -232,6 +346,25 @@ mod tests {
   }
 }
 "#;
+
+    /// The edit with every `${VAR}` treated as set, so tests do not depend on the real
+    /// environment. Shadows the public function this module imports.
+    fn with_mcp_server_settings(
+        text: &str,
+        name: &str,
+        changes: &HashMap<String, Value>,
+    ) -> Result<Option<String>, ToggleError> {
+        with_mcp_server_settings_in(text, name, changes, &|_| true)
+    }
+
+    /// The add with every `${VAR}` treated as set.
+    fn with_mcp_server_added(
+        text: &str,
+        name: &str,
+        values: &HashMap<String, Value>,
+    ) -> Result<String, ToggleError> {
+        with_mcp_server_added_in(text, name, values, &|_| true)
+    }
 
     fn field<'a>(form: &'a ToolSettingsSummary, name: &str) -> &'a ToolFieldSummary {
         form.fields
@@ -284,7 +417,10 @@ mod tests {
     fn the_form_maps_each_setting_to_its_input_kind() {
         let form = mcp_server_form(CONFIG, "files").unwrap();
 
-        assert!(matches!(field(&form, "transportType").kind, FieldKind::Choice { .. }));
+        assert!(matches!(
+            field(&form, "transportType").kind,
+            FieldKind::Choice { .. }
+        ));
         assert_eq!(field(&form, "command").kind, FieldKind::Text);
         assert_eq!(field(&form, "args").kind, FieldKind::StringList);
         assert_eq!(field(&form, "env").kind, FieldKind::StringMap);
@@ -306,16 +442,32 @@ mod tests {
     }
 
     #[test]
+    fn the_env_and_headers_help_explain_where_placeholders_come_from() {
+        let form = new_server_form();
+
+        let env_help = &field(&form, "env").help;
+        assert!(env_help.contains("Stdio only") && env_help.contains("cannot refer to them"));
+        let headers_help = &field(&form, "headers").help;
+        assert!(headers_help.contains("not by an entry of the Env field"));
+    }
+
+    #[test]
     fn the_form_shows_values_as_written_including_placeholders_and_aliases() {
         let form = mcp_server_form(CONFIG, "files").unwrap();
 
         assert_eq!(field(&form, "command").value, Some(json!("npx")));
         assert_eq!(field(&form, "args").value, Some(json!(["-y", "files-mcp"])));
-        assert_eq!(field(&form, "env").value, Some(json!({"TOKEN": "${FILES_TOKEN}"})));
+        assert_eq!(
+            field(&form, "env").value,
+            Some(json!({"TOKEN": "${FILES_TOKEN}"}))
+        );
         assert_eq!(field(&form, "toolTimeout").value, Some(json!(45)));
 
         let cms = mcp_server_form(CONFIG, "cms").unwrap();
-        assert_eq!(field(&cms, "transportType").value, Some(json!("streamableHttp")));
+        assert_eq!(
+            field(&cms, "transportType").value,
+            Some(json!("streamableHttp"))
+        );
         assert_eq!(
             field(&cms, "headers").value,
             Some(json!({"Authorization": "Bearer ${CMS_TOKEN}"}))
@@ -530,5 +682,172 @@ mod tests {
             .unwrap();
 
         assert!(super::super::config_file::validate_config_text(&updated).is_ok());
+    }
+
+    #[test]
+    fn the_blank_form_lists_every_setting_at_its_default() {
+        let form = new_server_form();
+
+        let names: Vec<&str> = form.fields.iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(names.len(), 10);
+        assert!(names.contains(&"command") && names.contains(&"headers"));
+        assert!(form.name.is_empty() && form.enabled.is_none());
+        assert_eq!(field(&form, "toolTimeout").value, Some(json!(30)));
+        assert_eq!(field(&form, "enabledTools").value, Some(json!(["*"])));
+        assert_eq!(field(&form, "exposure").value, Some(json!("direct")));
+        assert_eq!(field(&form, "command").value, Some(json!("")));
+    }
+
+    #[test]
+    fn adding_a_server_appends_an_entry_and_leaves_the_rest_alone() {
+        let values = change(&[
+            ("command", json!("uvx")),
+            ("args", json!(["server"])),
+            ("env", json!({"TOKEN": "${NEW_TOKEN}"})),
+            ("description", json!("New one")),
+        ]);
+
+        let updated = with_mcp_server_added(CONFIG, "fresh", &values).unwrap();
+
+        let added = server(&updated, "fresh");
+        assert_eq!(added["command"], "uvx");
+        assert_eq!(added["env"], json!({"TOKEN": "${NEW_TOKEN}"}));
+        assert!(added.get("enabled").is_none(), "starts enabled by default");
+        assert_eq!(server(&updated, "files"), server(CONFIG, "files"));
+        assert!(updated.contains("${FILES_TOKEN}") && updated.ends_with('\n'));
+        let names: Vec<String> =
+            serde_json::from_str::<Value>(&updated).unwrap()["tools"]["mcpServers"]
+                .as_object()
+                .unwrap()
+                .keys()
+                .cloned()
+                .collect();
+        assert_eq!(names, vec!["files", "cms", "fresh"], "appended last");
+        assert!(super::super::config_file::validate_config_text(&updated).is_ok());
+    }
+
+    #[test]
+    fn adding_creates_the_missing_sections_and_follows_the_key_spelling_in_use() {
+        let values = change(&[("url", json!("https://x/mcp"))]);
+
+        let from_empty = with_mcp_server_added("{}", "first", &values).unwrap();
+        assert_eq!(server(&from_empty, "first")["url"], "https://x/mcp");
+
+        let snake = r#"{"tools": {"mcp_servers": {}}}"#;
+        let updated = with_mcp_server_added(snake, "first", &values).unwrap();
+        assert!(updated.contains("mcp_servers") && !updated.contains("mcpServers"));
+    }
+
+    #[test]
+    fn adding_never_overwrites_and_checks_the_name() {
+        let values = change(&[("command", json!("x"))]);
+
+        assert_eq!(
+            with_mcp_server_added(CONFIG, "files", &values),
+            Err(ToggleError::ServerExists)
+        );
+        assert_eq!(
+            with_mcp_server_added(CONFIG, "a/b", &values),
+            Err(ToggleError::InvalidName)
+        );
+        assert_eq!(
+            with_mcp_server_added(CONFIG, "", &values),
+            Err(ToggleError::InvalidName)
+        );
+    }
+
+    #[test]
+    fn a_new_server_needs_a_command_or_a_url_and_valid_values() {
+        let refuse = |pairs: &[(&str, Value)]| {
+            with_mcp_server_added(CONFIG, "fresh", &change(pairs)).unwrap_err()
+        };
+
+        assert!(matches!(
+            refuse(&[("description", json!("nothing to connect to"))]),
+            ToggleError::InvalidValue(ref s, _) if s == "command"
+        ));
+        assert!(matches!(
+            refuse(&[("transportType", json!("sse"))]),
+            ToggleError::InvalidValue(ref s, _) if s == "url"
+        ));
+        assert!(matches!(
+            refuse(&[("command", json!("x")), ("toolTimeout", json!(0))]),
+            ToggleError::InvalidValue(ref s, _) if s == "toolTimeout"
+        ));
+        assert_eq!(
+            refuse(&[("command", json!("x")), ("cwd", json!("/"))]),
+            ToggleError::UnknownField("cwd".into())
+        );
+    }
+
+    #[test]
+    fn a_placeholder_for_an_unset_variable_is_refused_naming_it_but_not_the_value() {
+        let env_without_token = |name: &str| name != "MISSING_TOKEN";
+        let values = change(&[
+            ("url", json!("https://x/mcp")),
+            (
+                "headers",
+                json!({"Authorization": "Bearer ${MISSING_TOKEN}"}),
+            ),
+        ]);
+
+        let refused = with_mcp_server_added_in(CONFIG, "fresh", &values, &env_without_token);
+
+        let Err(ToggleError::InvalidValue(setting, reason)) = refused else {
+            panic!("expected a refusal");
+        };
+        assert_eq!(setting, "headers");
+        assert!(reason.contains("${MISSING_TOKEN}") && !reason.contains("Bearer"));
+        assert!(reason.contains("Env field") && reason.contains("environment"));
+    }
+
+    #[test]
+    fn a_set_placeholder_is_accepted_and_kept_as_written() {
+        let values = change(&[
+            ("env", json!({"A": "${PRESENT}:${ALSO_PRESENT}"})),
+            ("command", json!("x")),
+        ]);
+
+        let updated = with_mcp_server_added_in(CONFIG, "fresh", &values, &|_| true).unwrap();
+
+        assert_eq!(
+            server(&updated, "fresh")["env"]["A"],
+            "${PRESENT}:${ALSO_PRESENT}"
+        );
+    }
+
+    #[test]
+    fn editing_checks_only_the_submitted_values_for_unset_variables() {
+        let none_set = |_: &str| false;
+
+        // The stored `${FILES_TOKEN}` is not re-checked when something else changes.
+        let untouched = change(&[("description", json!("still fine"))]);
+        assert!(with_mcp_server_settings_in(CONFIG, "files", &untouched, &none_set).is_ok());
+
+        let submitted = change(&[("args", json!(["--token", "${NOT_SET_HERE}"]))]);
+        assert!(matches!(
+            with_mcp_server_settings_in(CONFIG, "files", &submitted, &none_set),
+            Err(ToggleError::InvalidValue(ref s, _)) if s == "args"
+        ));
+    }
+
+    #[test]
+    fn the_public_edit_and_add_read_the_real_environment() {
+        let values = change(&[
+            ("command", json!("x")),
+            (
+                "env",
+                json!({"A": "${RUST_BOT_SURELY_UNSET_VARIABLE_4711}"}),
+            ),
+        ]);
+
+        assert!(matches!(
+            super::with_mcp_server_added(CONFIG, "fresh", &values),
+            Err(ToggleError::InvalidValue(..))
+        ));
+        assert!(matches!(
+            super::with_mcp_server_settings(CONFIG, "files", &values),
+            Err(ToggleError::InvalidValue(..))
+        ));
     }
 }

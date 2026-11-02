@@ -1486,8 +1486,10 @@ pub struct McpServerConfig {
     #[garde(skip)]
     pub args: Vec<String>,
 
-    /// Stdio: extra environment variables for the subprocess, one `NAME=value` per line.
-    /// `${VAR}` placeholders are expanded when the bot starts.
+    /// Stdio only: environment variables passed to the command the server launches, one
+    /// `NAME=value` per line. They are not used by `sse` or `streamableHttp` servers, and
+    /// other settings (such as Headers) cannot refer to them with `${NAME}`.
+    /// `${VAR}` in a value is replaced by a variable of the process running rust-bot.
     #[serde(alias = "env")]
     #[garde(skip)]
     pub env: HashMap<String, String>,
@@ -1497,8 +1499,10 @@ pub struct McpServerConfig {
     #[garde(skip)]
     pub url: String,
 
-    /// HTTP/SSE: custom request headers, one `Name=value` per line. `${VAR}`
-    /// placeholders are expanded when the bot starts.
+    /// HTTP/SSE: custom request headers, one `Name=value` per line, e.g.
+    /// `Authorization=Bearer <token>`. `${VAR}` in a value is replaced by a variable of
+    /// the process running rust-bot (not by an entry of the Env field); a variable that is
+    /// not set there stops the bot from starting.
     #[serde(alias = "headers")]
     #[garde(skip)]
     pub headers: HashMap<String, String>,

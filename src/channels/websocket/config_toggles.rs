@@ -43,6 +43,8 @@ pub enum ToggleError {
     ProtectedTool,
     /// No MCP server with that name is configured.
     UnknownServer,
+    /// An MCP server with that name is already configured; adding never overwrites.
+    ServerExists,
     /// A submitted setting is not one the form knows: `(setting)`.
     UnknownField(String),
     /// A submitted setting has a value it cannot take: `(setting, reason)`. The reason
@@ -58,6 +60,7 @@ impl ToggleError {
             Self::InvalidName => "invalid_name",
             Self::ProtectedTool => "protected_tool",
             Self::UnknownServer => "unknown_server",
+            Self::ServerExists => "server_exists",
             Self::UnknownField(_) => "unknown_field",
             Self::InvalidValue(..) => "invalid_value",
         }
@@ -72,6 +75,7 @@ impl ToggleError {
                 "This tool is required by the gateway and cannot be switched off.".to_string()
             }
             Self::UnknownServer => "No MCP server with that name is configured.".to_string(),
+            Self::ServerExists => "An MCP server with that name already exists.".to_string(),
             Self::UnknownField(field) => format!("'{field}' is not an MCP server setting."),
             Self::InvalidValue(field, reason) => format!("Invalid value for '{field}': {reason}"),
         }
@@ -122,7 +126,10 @@ pub(super) fn parse_root(text: &str) -> Result<Value, ToggleError> {
 }
 
 /// The first of `keys` present in `object`, or the first key when none is.
-pub(super) fn existing_or_default_key<'a>(object: &Map<String, Value>, keys: &[&'a str]) -> &'a str {
+pub(super) fn existing_or_default_key<'a>(
+    object: &Map<String, Value>,
+    keys: &[&'a str],
+) -> &'a str {
     keys.iter()
         .copied()
         .find(|key| object.contains_key(*key))

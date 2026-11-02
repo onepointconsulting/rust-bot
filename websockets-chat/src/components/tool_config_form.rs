@@ -177,7 +177,7 @@ pub fn field_placeholder(field: &ToolFieldSummary) -> String {
 
 /// One input for `field`, bound to its entry in `drafts`.
 #[component]
-fn FieldInput(field: ToolFieldSummary, drafts: RwSignal<HashMap<String, String>>) -> impl IntoView {
+pub(super) fn FieldInput(field: ToolFieldSummary, drafts: RwSignal<HashMap<String, String>>) -> impl IntoView {
     let name = field.name.clone();
     let name_for_read = name.clone();
     let draft = move || drafts.with(|map| map.get(&name_for_read).cloned().unwrap_or_default());

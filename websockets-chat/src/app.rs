@@ -31,9 +31,9 @@ use chat_ui::models::{
 
 use crate::api::{self, WsSender};
 use crate::components::{
-    after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand, apply_tool_config,
-    ChatShell, McpChangeRequest, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
-    ToolConfigChange,
+    add_server_success_message, after_reconnect, apply_enabled, apply_mcp_server,
+    apply_on_demand, apply_tool_config, insert_mcp_server, ChatShell, McpChangeRequest, SettingsActions, SettingsPage,
+    SettingsPanel, ToggleRequest, ToolConfigChange, ADD_BUSY_KEY,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -1160,9 +1160,11 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::McpServers {
             servers,
             can_modify,
+            new_server_form,
         } => {
             if ctx.settings_open.get_untracked() {
                 ctx.settings_panel.mcp_servers.set(servers);
+                ctx.settings_panel.new_server_form.set(new_server_form);
                 ctx.settings_panel.can_modify.set(can_modify);
                 ctx.settings_panel.mcp_servers_loaded.set(true);
             }
@@ -1197,6 +1199,23 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 .mcp_servers
                 .update(|servers| apply_on_demand(servers, &name, deferred));
         }
+        ServerEvent::McpServerAdded {
+            name,
+            server,
+            restart_required,
+        } => {
+            finish_setting_change(ctx, restart_required);
+            let panel = ctx.settings_panel;
+            panel.close_add_panel();
+            panel
+                .added_notice
+                .set(Some(add_server_success_message(&name)));
+            if let Some(server) = server {
+                panel
+                    .mcp_servers
+                    .update(|servers| insert_mcp_server(servers, server));
+            }
+        }
         ServerEvent::McpServerConfigSet {
             name: _,
             server,
@@ -1220,6 +1239,11 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // The gateway no longer allows changes on this connection: go read-only.
             if matches!(detail.as_str(), "access_denied" | "child_agent_config") {
                 panel.can_modify.set(false);
+            }
+            // A refused add is reported in the panel, which stays open.
+            if kind == "mcp_server_add" {
+                panel.add_error.set(Some(message));
+                return;
             }
             // A list that failed to load must not leave its page on "Loading...".
             if name.is_empty() {
@@ -1662,6 +1686,7 @@ fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
     panel.page.set(page);
     panel.error.set(None);
     panel.busy.set(None);
+    panel.close_add_panel();
     match page {
         SettingsPage::Tools | SettingsPage::ToolSafety => panel.tools_loaded.set(false),
         SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
@@ -1716,6 +1741,18 @@ fn request_set_tool_config(ctx: &WsContext, (tool, values): ToolConfigChange) {
     );
 }
 
+/// Ask the gateway to add a new MCP server `name` with the given settings. The reply is
+/// an `mcp_server_added` or a `setting_error` event of kind `mcp_server_add`.
+fn request_add_mcp_server(ctx: &WsContext, (name, values): ToolConfigChange) {
+    ctx.settings_panel.add_error.set(None);
+    ctx.settings_panel.busy.set(Some(ADD_BUSY_KEY.to_string()));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::add_mcp_server(name, values),
+        "Failed to encode the add MCP server request.",
+    );
+}
+
 /// Ask the gateway to save changed settings of one MCP server (command, URL,
 /// environment, ...). The reply is an `mcp_server_config_set` or a `setting_error` event.
 fn request_set_mcp_server_config(ctx: &WsContext, (name, values): ToolConfigChange) {
@@ -1744,6 +1781,7 @@ fn settings_after_reconnect(ctx: &WsContext) {
     panel.busy.set(None);
     if outcome.clear_restart_notice {
         panel.restart_notice.set(false);
+        panel.added_notice.set(None);
         ctx.config_saved_notice.set(false);
     }
     if outcome.refetch_list && ctx.settings_open.get_untracked() {
@@ -2826,6 +2864,7 @@ pub fn App() -> impl IntoView {
         on_save_mcp_config: Callback::new(move |change| {
             request_set_mcp_server_config(&ws_context, change)
         }),
+        on_add_mcp_server: Callback::new(move |change| request_add_mcp_server(&ws_context, change)),
         on_restart: Callback::new(move |()| request_restart(&ws_context)),
     };
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {

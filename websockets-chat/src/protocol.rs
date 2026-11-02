@@ -459,6 +459,23 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway to add a new MCP server `name` with the given settings (command,
+    /// URL, environment, ...). Refused when the name is already configured. Same access
+    /// rules as [`Self::set_mcp_server_enabled`]. The reply is an `mcp_server_added`
+    /// (see [`ServerEvent::McpServerAdded`]) or a `setting_error` event of kind
+    /// `mcp_server_add`.
+    pub fn add_mcp_server(
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "add_mcp_server",
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway to change settings of the configured MCP server `name` (command,
     /// URL, environment, ...). `values` maps setting names to new values. Same access
     /// rules as [`Self::set_mcp_server_enabled`]. The reply is an `mcp_server_config_set`
@@ -1155,6 +1172,8 @@ pub enum ServerEvent {
         servers: Vec<McpServerSettingSummary>,
         /// Whether this connection may switch MCP servers (signed in and local).
         can_modify: bool,
+        /// The blank settings form for "Add MCP Server"; only sent when `can_modify`.
+        new_server_form: Option<ToolConfigSummary>,
     },
     /// Reply to a successful [`ClientEnvelope::set_tool_enabled`]: the tool now has
     /// `enabled` in `config.json`; `restart_required` is true when the file changed.
@@ -1174,6 +1193,13 @@ pub enum ServerEvent {
     McpServerExposureSet {
         name: String,
         deferred: bool,
+        restart_required: bool,
+    },
+    /// Reply to a successful [`ClientEnvelope::add_mcp_server`]: the new server's row
+    /// (with its form) and whether a restart is needed for it to start.
+    McpServerAdded {
+        name: String,
+        server: Option<McpServerSettingSummary>,
         restart_required: bool,
     },
     /// Reply to a successful [`ClientEnvelope::set_mcp_server_config`]: the server's
@@ -1380,6 +1406,7 @@ impl ServerEvent {
             | ServerEvent::McpServerSet { .. }
             | ServerEvent::McpServerExposureSet { .. }
             | ServerEvent::McpServerConfigSet { .. }
+            | ServerEvent::McpServerAdded { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
             | ServerEvent::ConfigFileSaved { .. }
@@ -1766,6 +1793,8 @@ struct McpServersWire {
     servers: Vec<McpServerSettingSummary>,
     #[serde(default)]
     can_modify: bool,
+    #[serde(default)]
+    new_server_form: Option<ToolConfigSummary>,
 }
 
 #[derive(Deserialize)]
@@ -2078,6 +2107,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
         "mcp_servers" => decode::<McpServersWire>(&value).map(|w| ServerEvent::McpServers {
             servers: w.servers,
             can_modify: w.can_modify,
+            new_server_form: w.new_server_form,
         }),
         "tool_setting_set" => {
             decode::<SettingSetWire>(&value).map(|w| ServerEvent::ToolSettingSet {
@@ -2095,6 +2125,13 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             decode::<SettingSetWire>(&value).map(|w| ServerEvent::McpServerExposureSet {
                 name: w.name,
                 deferred: w.enabled,
+                restart_required: w.restart_required,
+            })
+        }
+        "mcp_server_added" => {
+            decode::<McpServerConfigSetWire>(&value).map(|w| ServerEvent::McpServerAdded {
+                name: w.name,
+                server: w.server,
                 restart_required: w.restart_required,
             })
         }
@@ -3385,11 +3422,13 @@ mod tests {
         let ServerEvent::McpServers {
             servers,
             can_modify,
+            new_server_form,
         } = parse_server_event(raw).unwrap()
         else {
             panic!("expected McpServers");
         };
         assert!(!can_modify, "can_modify defaults to false");
+        assert!(new_server_form.is_none(), "no blank form for read-only connections");
         assert_eq!(servers[0].name, "files");
         assert!(servers[0].enabled && !servers[0].active);
     }
@@ -3477,6 +3516,55 @@ mod tests {
                 "webui": true,
             })
         );
+    }
+
+    #[test]
+    fn client_envelope_add_mcp_server_serializes_name_and_values() {
+        let values = HashMap::from([("command".to_string(), serde_json::json!("npx"))]);
+        let value = serde_json::to_value(ClientEnvelope::add_mcp_server("cms", values)).unwrap();
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "add_mcp_server",
+                "name": "cms",
+                "values": {"command": "npx"},
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn mcp_servers_decodes_the_blank_form_and_mcp_server_added_the_new_row() {
+        let list = parse_server_event(
+            r#"{"event":"mcp_servers","servers":[],"can_modify":true,
+                "new_server_form":{"name":"","fields":[{"name":"command","label":"Command","help":"",
+                "kind":"text","secret":false,"env_var":"","configured":false,"value":"","default":""}]}}"#,
+        )
+        .unwrap();
+        let ServerEvent::McpServers {
+            new_server_form, ..
+        } = list
+        else {
+            panic!("expected McpServers");
+        };
+        assert_eq!(new_server_form.unwrap().fields[0].name, "command");
+
+        let added = parse_server_event(
+            r#"{"event":"mcp_server_added","name":"cms","restart_required":true,
+                "server":{"name":"cms","description":"MCP server (stdio)","enabled":true,"active":false,"deferred":false}}"#,
+        )
+        .unwrap();
+        assert_eq!(added.chat_id(), None);
+        let ServerEvent::McpServerAdded {
+            name,
+            server,
+            restart_required,
+        } = added
+        else {
+            panic!("expected McpServerAdded");
+        };
+        assert_eq!(name, "cms");
+        assert!(restart_required && server.is_some_and(|s| !s.active));
     }
 
     #[test]
