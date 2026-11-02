@@ -31,9 +31,9 @@ use chat_ui::models::{
 
 use crate::api::{self, WsSender};
 use crate::components::{
-    add_server_success_message, after_reconnect, apply_enabled, apply_mcp_server,
-    apply_on_demand, apply_tool_config, insert_mcp_server, ChatShell, McpChangeRequest, SettingsActions, SettingsPage,
-    SettingsPanel, ToggleRequest, ToolConfigChange, ADD_BUSY_KEY,
+    add_server_success_message, after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand,
+    apply_tool_config, insert_mcp_server, ChatShell, McpChangeRequest, SettingsActions,
+    SettingsPage, SettingsPanel, ToggleRequest, ToolConfigChange, ADD_BUSY_KEY,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};

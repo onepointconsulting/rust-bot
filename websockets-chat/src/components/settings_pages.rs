@@ -17,9 +17,7 @@
 use chat_ui::models::{McpServerSettingSummary, ToolConfigSummary, ToolSettingSummary};
 use leptos::prelude::*;
 
-use super::add_mcp_server_panel::{
-    AddMcpServerButton, AddMcpServerPanel, ADD_BUSY_KEY,
-};
+use super::add_mcp_server_panel::{AddMcpServerButton, AddMcpServerPanel, ADD_BUSY_KEY};
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
@@ -174,7 +172,10 @@ pub fn apply_mcp_server(servers: &mut [McpServerSettingSummary], server: McpServ
 
 /// Put the freshly added MCP server `server` into the list: replacing a row of the same
 /// name (a refetch may have brought it in already), else appending it.
-pub fn insert_mcp_server(servers: &mut Vec<McpServerSettingSummary>, server: McpServerSettingSummary) {
+pub fn insert_mcp_server(
+    servers: &mut Vec<McpServerSettingSummary>,
+    server: McpServerSettingSummary,
+) {
     match servers.iter_mut().find(|slot| slot.name == server.name) {
         Some(slot) => *slot = server,
         None => servers.push(server),
@@ -1117,7 +1118,10 @@ mod tests {
     #[test]
     fn changes_need_permission_a_connection_and_no_restart_under_way() {
         assert!(changes_allowed(true, false, false));
-        assert!(!changes_allowed(false, false, false), "read-only connection");
+        assert!(
+            !changes_allowed(false, false, false),
+            "read-only connection"
+        );
         assert!(!changes_allowed(true, true, false), "offline");
         assert!(!changes_allowed(true, false, true), "restarting");
     }

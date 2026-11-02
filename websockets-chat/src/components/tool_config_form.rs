@@ -177,7 +177,10 @@ pub fn field_placeholder(field: &ToolFieldSummary) -> String {
 
 /// One input for `field`, bound to its entry in `drafts`.
 #[component]
-pub(super) fn FieldInput(field: ToolFieldSummary, drafts: RwSignal<HashMap<String, String>>) -> impl IntoView {
+pub(super) fn FieldInput(
+    field: ToolFieldSummary,
+    drafts: RwSignal<HashMap<String, String>>,
+) -> impl IntoView {
     let name = field.name.clone();
     let name_for_read = name.clone();
     let draft = move || drafts.with(|map| map.get(&name_for_read).cloned().unwrap_or_default());
@@ -466,18 +469,24 @@ mod tests {
             ToolFieldKind::StringMap,
             Some(json!({"TOKEN": "${T}", "MODE": "a=b"})),
         );
-        assert_eq!(initial_draft(&env), "MODE=a=b
-TOKEN=${T}");
+        assert_eq!(
+            initial_draft(&env),
+            "MODE=a=b
+TOKEN=${T}"
+        );
         assert_eq!(field_placeholder(&env), "NAME=value");
     }
 
     #[test]
     fn map_lines_become_an_object_split_at_the_first_equals_sign() {
         assert_eq!(
-            lines_to_string_map("Env", " TOKEN = ${T} 
+            lines_to_string_map(
+                "Env",
+                " TOKEN = ${T} 
 
 KEY=abc==
-"),
+"
+            ),
             Ok(json!({"TOKEN": "${T}", "KEY": "abc=="}))
         );
         assert_eq!(lines_to_string_map("Env", ""), Ok(json!({})));
@@ -486,8 +495,11 @@ KEY=abc==
     #[test]
     fn malformed_map_lines_are_reported_without_their_value() {
         assert_eq!(
-            lines_to_string_map("Env", "A=1
-secret-token"),
+            lines_to_string_map(
+                "Env",
+                "A=1
+secret-token"
+            ),
             Err("Env, line 2: write NAME=value.".to_string())
         );
         assert_eq!(
@@ -495,8 +507,10 @@ secret-token"),
             Err("Env, line 1: the name is missing.".to_string())
         );
         assert_eq!(
-            lines_to_string_map("Env", "A=1
-A=2"),
+            lines_to_string_map(
+                "Env", "A=1
+A=2"
+            ),
             Err("Env: A is listed twice.".to_string())
         );
     }
@@ -507,8 +521,13 @@ A=2"),
             field("env", ToolFieldKind::StringMap, Some(json!({"A": "1"}))),
             field("headers", ToolFieldKind::StringMap, Some(json!({}))),
         ];
-        let edited = drafts(&[("env", "A=1
-B=2"), ("headers", "")]);
+        let edited = drafts(&[
+            (
+                "env", "A=1
+B=2",
+            ),
+            ("headers", ""),
+        ]);
 
         let changes = changed_values(&fields, &edited).unwrap();
 

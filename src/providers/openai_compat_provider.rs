@@ -45,7 +45,9 @@ pub struct OpenAICompatProvider {
 }
 
 impl OpenAICompatProvider {
-    const DEFAULT_MODEL: &str = "gpt-5-mini";
+    pub const DEFAULT_API_BASE: &str = "https://api.openai.com/v1";
+
+    const DEFAULT_MODEL: &str = "gpt-6-luna";
 
     // Allowed message keys for OpenAI-compatible messages
     const ALLOWED_MSG_KEYS: &[&str] = &[
@@ -596,10 +598,11 @@ impl OpenAICompatProvider {
             .filter_map(Self::map_request_message)
             .collect();
 
+        let is_direct_openai_api = self.is_direct_openai_api();
         let mut request = serde_json::json!({
             "model": model_name,
             "messages": chat_messages,
-            "max_tokens": max_tokens as u32,
+            Self::max_tokens_key(is_direct_openai_api): max_tokens as u32,
         });
         if let Some(temperature) = temperature {
             log::info!("temperature: {}", temperature);
@@ -614,7 +617,12 @@ impl OpenAICompatProvider {
             request["tools"] = serde_json::Value::Array(tool_list);
         }
 
-        if let Some(effort) = reasoning_effort
+        // api.openai.com rejects function tools combined with any reasoning effort on
+        // /v1/chat/completions ("Function tools with reasoning_effort are not supported ...
+        // set reasoning_effort to 'none'"), so the configured effort is deliberately ignored.
+        if is_direct_openai_api {
+            request["reasoning_effort"] = serde_json::Value::String("none".to_string());
+        } else if let Some(effort) = reasoning_effort
             && !effort.is_empty()
         {
             request["reasoning_effort"] = serde_json::Value::String(effort);
@@ -624,6 +632,24 @@ impl OpenAICompatProvider {
         }
 
         request
+    }
+
+    /// Whether requests go straight to api.openai.com.
+    ///
+    /// Judged from the resolved chat-completions URL rather than `api_base`, because that URL is
+    /// already trailing-slash-trimmed and falls back to api.openai.com when no base is configured.
+    fn is_direct_openai_api(&self) -> bool {
+        self.chat_completions_url == format!("{}/chat/completions", Self::DEFAULT_API_BASE)
+    }
+
+    /// Name of the output-token-limit field: api.openai.com requires `max_completion_tokens`
+    /// (newer models reject `max_tokens`); other OpenAI-compatible gateways expect `max_tokens`.
+    fn max_tokens_key(is_direct_openai_api: bool) -> &'static str {
+        if is_direct_openai_api {
+            "max_completion_tokens"
+        } else {
+            "max_tokens"
+        }
     }
 
     fn apply_stream_flags(body: &mut serde_json::Value) {
@@ -2230,5 +2256,88 @@ mod tests {
             body["stream_options"],
             serde_json::json!({ "include_usage": true })
         );
+    }
+
+    /// Build a provider for `api_base` (`None` = unset, as with a key-only OpenAI config).
+    fn provider_with_base(api_base: Option<&str>) -> OpenAICompatProvider {
+        OpenAICompatProvider::new(
+            Some("test-key".to_string()),
+            api_base.map(str::to_string),
+            Some("gpt-test".to_string()),
+            None,
+            None,
+        )
+    }
+
+    /// Build a request for a plain user message with the given reasoning effort.
+    fn request_with_effort(
+        provider: &OpenAICompatProvider,
+        reasoning_effort: Option<&str>,
+    ) -> serde_json::Value {
+        provider.build_request(
+            &[serde_json::json!({ "role": "user", "content": "hi" })],
+            Some(vec![weather_tool()]),
+            Some("gpt-test".to_string()),
+            64,
+            None,
+            reasoning_effort.map(str::to_string),
+            None,
+        )
+    }
+
+    #[test]
+    fn direct_openai_uses_max_completion_tokens_and_forces_no_reasoning() {
+        for api_base in [
+            Some("https://api.openai.com/v1"),
+            Some("https://api.openai.com/v1/"),
+            None,
+        ] {
+            let provider = provider_with_base(api_base);
+            assert!(provider.is_direct_openai_api(), "{api_base:?}");
+            let request = request_with_effort(&provider, Some("high"));
+            assert_eq!(request["max_completion_tokens"], serde_json::json!(64));
+            assert!(request.get("max_tokens").is_none(), "{api_base:?}");
+            assert_eq!(request["reasoning_effort"], serde_json::json!("none"));
+        }
+    }
+
+    #[test]
+    fn direct_openai_forces_no_reasoning_even_without_configured_effort() {
+        let request = request_with_effort(&provider_with_base(None), None);
+        assert_eq!(request["reasoning_effort"], serde_json::json!("none"));
+    }
+
+    #[test]
+    fn other_gateways_use_max_tokens_and_pass_effort_through() {
+        let provider = provider_with_base(Some("https://api.together.xyz/v1"));
+        assert!(!provider.is_direct_openai_api());
+        let request = request_with_effort(&provider, Some("high"));
+        assert_eq!(request["max_tokens"], serde_json::json!(64));
+        assert!(request.get("max_completion_tokens").is_none());
+        assert_eq!(request["reasoning_effort"], serde_json::json!("high"));
+    }
+
+    #[test]
+    fn other_gateways_omit_missing_or_empty_reasoning_effort() {
+        let provider = provider_with_base(Some("https://example.com/v1"));
+        assert!(
+            request_with_effort(&provider, None)
+                .get("reasoning_effort")
+                .is_none()
+        );
+        assert!(
+            request_with_effort(&provider, Some(""))
+                .get("reasoning_effort")
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn max_tokens_key_depends_on_the_endpoint() {
+        assert_eq!(
+            OpenAICompatProvider::max_tokens_key(true),
+            "max_completion_tokens"
+        );
+        assert_eq!(OpenAICompatProvider::max_tokens_key(false), "max_tokens");
     }
 }

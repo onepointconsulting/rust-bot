@@ -73,9 +73,14 @@ fn editable_sections() -> Vec<Section> {
 #[serde(tag = "kind", rename_all = "snake_case")]
 pub enum FieldKind {
     Bool,
-    Integer { min: Option<i64>, max: Option<i64> },
+    Integer {
+        min: Option<i64>,
+        max: Option<i64>,
+    },
     Text,
-    Choice { choices: Vec<String> },
+    Choice {
+        choices: Vec<String>,
+    },
     StringList,
     /// A map of names to text values (e.g. environment variables, HTTP headers).
     StringMap,

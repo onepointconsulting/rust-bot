@@ -240,15 +240,23 @@ fn print_onboard_err(message: impl fmt::Display) {
     println!("{}✗{} {message}", red.render(), red.render_reset());
 }
 
+/// Name of the model preset created during onboarding: named after the provider whose API key
+/// was entered (Together wins over OpenAI), or `"primary"` when neither key is set.
+fn default_preset_name(config: &Config) -> &'static str {
+    if !config.providers.together.api_key.is_empty() {
+        "together-model"
+    } else if !config.providers.openai.api_key.is_empty() {
+        "openai-model"
+    } else {
+        "primary"
+    }
+}
+
 fn create_default_model_presets(config: &mut Config) {
     if config.agents.model.is_empty() || config.agents.provider.is_empty() {
         return;
     }
-    let preset_name: &str = if !config.providers.together.api_key.is_empty() {
-        "together1"
-    } else {
-        "primary"
-    };
+    let preset_name = default_preset_name(config);
     config.model_presets.insert(
         preset_name.to_string(),
         ModelPresetConfig {
@@ -368,5 +376,17 @@ mod tests {
         assert!(jwt_line.contains("--users-file \"./.rust-bot/users.json\""));
         #[cfg(windows)]
         assert!(jwt_line.contains(r#"--users-file ".\.rust-bot\users.json""#));
+    }
+
+    #[test]
+    fn default_preset_name_follows_the_configured_provider_key() {
+        let mut config = Config::default();
+        assert_eq!(default_preset_name(&config), "primary");
+
+        config.providers.openai.api_key = "sk-openai".to_string();
+        assert_eq!(default_preset_name(&config), "openai-model");
+
+        config.providers.together.api_key = "tg-key".to_string();
+        assert_eq!(default_preset_name(&config), "together-model");
     }
 }

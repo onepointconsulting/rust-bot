@@ -13,7 +13,7 @@ use std::collections::HashMap;
 use chat_ui::models::{ToolConfigSummary, ToolFieldSummary};
 use leptos::prelude::*;
 
-use super::tool_config_form::{FieldInput, ToolConfigChange, changed_values, initial_drafts};
+use super::tool_config_form::{changed_values, initial_drafts, FieldInput, ToolConfigChange};
 
 /// Label of the button that opens the panel.
 pub const ADD_BUTTON_LABEL: &str = "+ Add MCP Server";

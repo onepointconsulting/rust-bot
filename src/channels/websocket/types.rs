@@ -873,10 +873,7 @@ mod tests {
             EnvelopeType::from("add_mcp_server"),
             EnvelopeType::AddMcpServer
         );
-        assert_eq!(
-            WsOutboundEvent::McpServerAdded.as_str(),
-            "mcp_server_added"
-        );
+        assert_eq!(WsOutboundEvent::McpServerAdded.as_str(), "mcp_server_added");
         assert_eq!(WsOutboundEvent::SettingError.as_str(), "setting_error");
         assert_eq!(
             EnvelopeType::from("list_subagents"),

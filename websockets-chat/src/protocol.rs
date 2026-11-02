@@ -3428,7 +3428,10 @@ mod tests {
             panic!("expected McpServers");
         };
         assert!(!can_modify, "can_modify defaults to false");
-        assert!(new_server_form.is_none(), "no blank form for read-only connections");
+        assert!(
+            new_server_form.is_none(),
+            "no blank form for read-only connections"
+        );
         assert_eq!(servers[0].name, "files");
         assert!(servers[0].enabled && !servers[0].active);
     }

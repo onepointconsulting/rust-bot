@@ -12,6 +12,7 @@ use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
 use crate::cli::onboard::create_env_file;
 use crate::config::schema::ProvidersConfig;
 use crate::providers::anthropic_provider::AnthropicProvider;
+use crate::providers::openai_compat_provider::OpenAICompatProvider;
 use crate::providers::registry::TOGETHER_API_BASE;
 use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, UserRole, generate_jwt_token};
 use crate::{
@@ -56,6 +57,7 @@ const PROVIDER_NANOGPT: &str = "nanogpt";
 const PROVIDER_ZAI_SUBSCRIPTION: &str = "zai_subscription";
 const PROVIDER_XIAOMI_SUBSCRIPTION: &str = "xiaomi_subscription";
 const PROVIDER_TOGETHER: &str = "together";
+const PROVIDER_OPENAI: &str = "openai";
 
 const WIZARD_OPTIONS: [&str; 11] = [
     LLM_PROVIDER,
@@ -184,6 +186,7 @@ pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, C
         PROVIDER_ZAI_SUBSCRIPTION,
         PROVIDER_XIAOMI_SUBSCRIPTION,
         PROVIDER_TOGETHER,
+        PROVIDER_OPENAI,
     ];
     let answer = Select::new(
         "Select a provider to configure API key and endpoint",
@@ -209,9 +212,10 @@ pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, C
 /// Config field that stores credentials for a wizard LLM-provider choice.
 fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
     match provider_name {
-        PROVIDER_OPENROUTER => Some("openrouter"),
-        PROVIDER_ANTHROPIC => Some("anthropic"),
-        PROVIDER_TOGETHER => Some("together"),
+        PROVIDER_OPENROUTER => Some(PROVIDER_OPENROUTER),
+        PROVIDER_ANTHROPIC => Some(PROVIDER_ANTHROPIC),
+        PROVIDER_TOGETHER => Some(PROVIDER_TOGETHER),
+        PROVIDER_OPENAI => Some(PROVIDER_OPENAI),
         PROVIDER_EDENAI
         | PROVIDER_REQUESTY
         | PROVIDER_NANOGPT
@@ -232,37 +236,42 @@ pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Co
     let api_key = Text::new("Enter API key").prompt()?;
     match provider_config_slot(provider_name) {
         Some("openrouter") => config.providers.openrouter.api_key = api_key,
-        Some("anthropic") => config.providers.anthropic.api_key = api_key,
-        Some("together") => config.providers.together.api_key = api_key,
+        Some(PROVIDER_ANTHROPIC) => config.providers.anthropic.api_key = api_key,
+        Some(PROVIDER_TOGETHER) => config.providers.together.api_key = api_key,
+        Some(PROVIDER_OPENAI) => config.providers.openai.api_key = api_key,
         Some("custom") => config.providers.custom.api_key = api_key,
         _ => return Err(invalid_provider_error()),
     }
     Ok(config.clone())
 }
 
-pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
-    fn default_endpoint(provider_name: &str) -> &'static str {
-        match provider_name {
-            PROVIDER_OPENROUTER => "https://openrouter.ai/api/v1",
-            PROVIDER_EDENAI => "https://api.edenai.run/v3",
-            PROVIDER_REQUESTY => "https://router.requesty.ai/v1",
-            PROVIDER_ANTHROPIC => AnthropicProvider::DEFAULT_API_BASE,
-            PROVIDER_NANOGPT => "https://nano-gpt.com/api/v1",
-            PROVIDER_ZAI_SUBSCRIPTION => "https://api.z.ai/api/coding/paas/v4",
-            PROVIDER_XIAOMI_SUBSCRIPTION => "https://token-plan-ams.xiaomimimo.com/v1",
-            PROVIDER_TOGETHER => TOGETHER_API_BASE,
-            _ => "",
-        }
+/// Default API endpoint offered by the wizard for `provider_name` (empty when none applies).
+fn default_endpoint(provider_name: &str) -> &'static str {
+    match provider_name {
+        PROVIDER_OPENROUTER => "https://openrouter.ai/api/v1",
+        PROVIDER_EDENAI => "https://api.edenai.run/v3",
+        PROVIDER_REQUESTY => "https://router.requesty.ai/v1",
+        PROVIDER_ANTHROPIC => AnthropicProvider::DEFAULT_API_BASE,
+        PROVIDER_NANOGPT => "https://nano-gpt.com/api/v1",
+        PROVIDER_ZAI_SUBSCRIPTION => "https://api.z.ai/api/coding/paas/v4",
+        PROVIDER_XIAOMI_SUBSCRIPTION => "https://token-plan-ams.xiaomimimo.com/v1",
+        PROVIDER_TOGETHER => TOGETHER_API_BASE,
+        PROVIDER_OPENAI => OpenAICompatProvider::DEFAULT_API_BASE,
+        _ => "",
     }
+}
+
+pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
     let default = default_endpoint(provider_name);
     let endpoint = Text::new("Enter endpoint")
         .with_default(default)
         .with_help_message(default)
         .prompt()?;
     match provider_config_slot(provider_name) {
-        Some("openrouter") => config.providers.openrouter.api_base = Some(endpoint),
-        Some("anthropic") => config.providers.anthropic.api_base = Some(endpoint),
-        Some("together") => config.providers.together.api_base = Some(endpoint),
+        Some(PROVIDER_OPENROUTER) => config.providers.openrouter.api_base = Some(endpoint),
+        Some(PROVIDER_ANTHROPIC) => config.providers.anthropic.api_base = Some(endpoint),
+        Some(PROVIDER_TOGETHER) => config.providers.together.api_base = Some(endpoint),
+        Some(PROVIDER_OPENAI) => config.providers.openai.api_base = Some(endpoint),
         Some("custom") => config.providers.custom.api_base = Some(endpoint),
         _ => return Err(invalid_provider_error()),
     }
@@ -790,6 +799,8 @@ pub fn config_model(
             "zai-org/GLM-5.3-Flash",
             "e.g. deepseek-ai/DeepSeek-V4.1-Flash-1017",
         )
+    } else if selected_provider == PROVIDER_OPENAI {
+        ("gpt-6.1-terra", "e.g. gpt-6.1-sol, gpt-6-astra")
     } else {
         (
             model.as_str(),
@@ -1737,5 +1748,28 @@ mod tests {
     fn workspace_override_is_stored_as_absolute_path() {
         let config = apply_workspace_override(Config::default(), PathBuf::from("./ws"));
         assert!(std::path::Path::new(&config.agents.workspace).is_absolute());
+    }
+
+    #[test]
+    fn provider_config_slot_maps_credentialed_providers() {
+        for provider in [
+            PROVIDER_OPENROUTER,
+            PROVIDER_ANTHROPIC,
+            PROVIDER_TOGETHER,
+            PROVIDER_OPENAI,
+        ] {
+            assert_eq!(provider_config_slot(provider), Some(provider));
+        }
+        assert_eq!(provider_config_slot("not-a-provider"), None);
+    }
+
+    #[test]
+    fn openai_defaults_to_the_direct_api_endpoint() {
+        assert_eq!(
+            default_endpoint(PROVIDER_OPENAI),
+            OpenAICompatProvider::DEFAULT_API_BASE
+        );
+        assert_eq!(default_endpoint(PROVIDER_TOGETHER), TOGETHER_API_BASE);
+        assert_eq!(default_endpoint("unknown"), "");
     }
 }
