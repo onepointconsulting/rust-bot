@@ -6,12 +6,12 @@ use std::sync::{Arc, Mutex};
 
 use crate::agent::checkpoint_payload;
 use crate::agent::circuit_breaker::{
-    CIRCUIT_BREAKER_STOP_REASON, CIRCUIT_BREAKER_USER_MESSAGE, CircuitDecision,
-    DEFAULT_N_IDENTICAL_MESSAGES, MessageCircuitBreaker, is_tripped_error, tripped_error_message,
+    CIRCUIT_BREAKER_STOP_REASON, CIRCUIT_BREAKER_USER_MESSAGE, DEFAULT_N_IDENTICAL_MESSAGES,
+    MessageCircuitBreaker, is_tripped_error,
 };
 use crate::agent::crash_points::crash_point;
 use crate::agent::hook::{AgentHook, AgentHookContext, HOOK_ABORT_STOP_REASON, ToolHookDecision};
-use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
+use crate::agent::tool_pipeline::{ToolOutcome, run_tool_call};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::turn_journal::TurnJournal;
 use crate::bus::outbound_events::ProgressKind;
@@ -19,7 +19,7 @@ use crate::providers::base::{
     BoxedProgressCallback, BoxedStreamCallback, LLMProviderDyn, LLMResponse, LLMUsage,
     ToolCallRequest, is_unsupported_image_input_error,
 };
-use crate::session::journal::{JournalRecord, StepKind, ToolCallStatus};
+use crate::session::journal::{JournalRecord, StepKind};
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
     find_legal_message_start, maybe_persist_tool_result, truncate_text,
@@ -28,7 +28,7 @@ use crate::utils::helpers::{
 use crate::utils::runtime::{
     EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
     build_truncated_tool_call_recovery_message, coerce_tool_execute_result,
-    ensure_nonempty_tool_result, is_blank_text, repeated_external_lookup_error,
+    ensure_nonempty_tool_result, is_blank_text,
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
@@ -48,8 +48,6 @@ const COMPACTABLE_TOOLS: &[&str] = &[
     "list_dir",
 ];
 const BACKFILL_CONTENT: &str = "[Tool result unavailable — call was interrupted or lost]";
-const ARG_PARSE_ERROR_KEY: &str = "__args_json_parse_error";
-const ARG_PARSE_RAW_KEY: &str = "__args_json_raw";
 
 /// Configuration for a single agent execution.
 pub struct AgentRunSpec {
@@ -760,13 +758,7 @@ impl AgentRunner {
     }
 
     fn hook_block_result(name: &str, reason: &str) -> (String, HashMap<String, String>) {
-        let result = format!("Error: tool call blocked by hook: {reason}");
-        let detail: String = reason.replace('\n', " ").trim().chars().take(120).collect();
-        let event = HashMap::from([
-            ("name".to_string(), name.to_string()),
-            ("status".to_string(), "blocked".to_string()),
-            ("detail".to_string(), detail),
-        ]);
+        let (result, event, _) = ToolOutcome::blocked_by_hook(reason).into_triple(name);
         (result, event)
     }
 
@@ -845,14 +837,6 @@ impl AgentRunner {
         (results, events, fatal_error)
     }
 
-    /// Tool result as stored in the journal, capped like the transcript copy.
-    fn journaled_result(spec: &AgentRunSpec, result: &str) -> String {
-        if spec.max_tool_result_chars == 0 {
-            return result.to_string();
-        }
-        truncate_text(result, spec.max_tool_result_chars)
-    }
-
     /// Journal a tool call that a hook denied (no-op without a journal).
     fn journal_blocked_call(spec: &AgentRunSpec, tool_call: &ToolCallRequest, reason: &str) {
         let Some(journal) = &spec.journal else {
@@ -916,15 +900,8 @@ impl AgentRunner {
         batches
     }
 
-    /// Resolve, validate, and execute one tool call.
-    ///
-    /// Mirrors Python's `_request_model` / `_run_tool`:
-    ///   - Blocks repeated identical external lookups.
-    ///   - Delegates to `ToolRegistry::prepare_call` for parameter resolution
-    ///     and validation, then calls `Tool::execute` directly on the resolved
-    ///     tool.
-    ///   - Classifies every failure path (lookup block, prep error, error result)
-    ///     into a uniform `(result, event, fatal_error)` triple.
+    /// Run one tool call through the stage pipeline (see
+    /// [`crate::agent::tool_pipeline`]) and flatten the outcome.
     ///
     /// Returns `(result, event, fatal_error)`:
     ///   - `result`      — string fed back to the LLM as the tool result.
@@ -938,212 +915,14 @@ impl AgentRunner {
         external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
         message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
     ) -> (String, HashMap<String, String>, Option<String>) {
-        const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
-
-        // ── 0. Message circuit breaker (consecutive identical sends) ──────────
-        let decision = message_circuit_breaker
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .observe(&tool_call.name, &tool_call.arguments);
-        if let CircuitDecision::Tripped { streak } = decision {
-            let err = tripped_error_message(streak);
-            let event = HashMap::from([
-                ("name".to_string(), tool_call.name.clone()),
-                ("status".to_string(), "error".to_string()),
-                (
-                    "detail".to_string(),
-                    "message circuit breaker tripped".to_string(),
-                ),
-            ]);
-            return (err.clone(), event, Some(err));
-        }
-
-        // ── 1. Block repeated identical external lookups ──────────────────────
-        if let Some(lookup_error) = repeated_external_lookup_error(
-            &tool_call.name,
-            &tool_call.arguments,
-            &mut external_lookup_counts.lock().unwrap(),
-        ) {
-            let event = HashMap::from([
-                ("name".to_string(), tool_call.name.clone()),
-                ("status".to_string(), "error".to_string()),
-                (
-                    "detail".to_string(),
-                    "repeated external lookup blocked".to_string(),
-                ),
-            ]);
-            let error = if spec.fail_on_tool_error {
-                Some(lookup_error.clone())
-            } else {
-                None
-            };
-            return (format!("{lookup_error}{HINT}"), event, error);
-        }
-
-        // ── 2. Malformed arguments JSON (provider parse failure) ─────────────
-        if let Some(parse_error) = tool_call
-            .arguments
-            .get(ARG_PARSE_ERROR_KEY)
-            .and_then(Value::as_str)
-        {
-            let raw = tool_call
-                .arguments
-                .get(ARG_PARSE_RAW_KEY)
-                .and_then(Value::as_str)
-                .unwrap_or("");
-            let raw_preview: String = raw.chars().take(200).collect();
-            let err = format!(
-                "Error: malformed tool arguments JSON for '{}': {}. Raw arguments: {}",
-                tool_call.name, parse_error, raw_preview
-            );
-            let detail: String = err.replace('\n', " ").trim().chars().take(120).collect();
-            let event = HashMap::from([
-                ("name".to_string(), tool_call.name.clone()),
-                ("status".to_string(), "error".to_string()),
-                ("detail".to_string(), detail),
-            ]);
-            let error = if spec.fail_on_tool_error {
-                Some(err.clone())
-            } else {
-                None
-            };
-            return (format!("{err}{HINT}"), event, error);
-        }
-
-        // ── 3. Resolve and validate parameters ───────────────────────────────
-        // Convert HashMap<String, Value> → Value::Object so prepare_call can
-        // cast and validate the parameters against the tool's JSON schema.
-        let params_value = Value::Object(
-            tool_call
-                .arguments
-                .iter()
-                .map(|(k, v)| (k.clone(), v.clone()))
-                .collect(),
-        );
-        let (tool, cast_params, prep_error) =
-            spec.tools.prepare_call(&tool_call.name, &params_value);
-
-        if let Some(err) = prep_error {
-            // Strip the leading "Error: " / "Error: Tool '…':" prefix for the
-            // short telemetry detail (mirrors Python's `split(": ", 1)[-1]`).
-            let detail: String = err
-                .split_once(": ")
-                .map(|x| x.1)
-                .unwrap_or(&err)
-                .chars()
-                .take(120)
-                .collect();
-            let event = HashMap::from([
-                ("name".to_string(), tool_call.name.clone()),
-                ("status".to_string(), "error".to_string()),
-                ("detail".to_string(), detail),
-            ]);
-            let error = if spec.fail_on_tool_error {
-                Some(err.clone())
-            } else {
-                None
-            };
-            return (format!("{err}{HINT}"), event, error);
-        }
-
-        // ── 4. Execute ────────────────────────────────────────────────────────
-        // `prepare_call` guarantees `tool = Some(_)` when `prep_error = None`.
-        // Python's `await tool.execute(**params)` maps to the sync call below.
-        // Unlike Python, Rust tools do not raise exceptions; a tool that wants
-        // to signal failure returns a string starting with "Error".
-        let tool = tool.expect("prepare_call returned no tool and no error");
-        // Write-ahead: the intent is on disk before the tool starts, so a crash
-        // during `execute` leaves an intent without a terminal record.
-        // In strict durability mode a failed intent write refuses the call.
-        let in_flight = match spec.journal.as_ref().map(|journal| {
-            journal.begin_tool_call(
-                &tool_call.id,
-                &tool_call.name,
-                &cast_params,
-                tool.replay_safe(),
-            )
-        }) {
-            Some(Err(refusal)) => {
-                let err = format!("Error: {refusal}");
-                log::error!("{err}");
-                let event = HashMap::from([
-                    ("name".to_string(), tool_call.name.clone()),
-                    ("status".to_string(), "error".to_string()),
-                    (
-                        "detail".to_string(),
-                        "intent not journaled (strict durability mode)".to_string(),
-                    ),
-                ]);
-                let error = if spec.fail_on_tool_error {
-                    Some(err.clone())
-                } else {
-                    None
-                };
-                return (format!("{err}{HINT}"), event, error);
-            }
-            Some(Ok(in_flight)) => Some(in_flight),
-            None => None,
-        };
-        crash_point("after_intent");
-        let result = match &spec.journal {
-            Some(journal) => {
-                let identity = ToolCallIdentity {
-                    turn_id: journal.turn_id().to_string(),
-                    call_id: tool_call.id.clone(),
-                };
-                with_tool_call(identity, tool.execute(&cast_params)).await
-            }
-            None => tool.execute(&cast_params).await,
-        };
-        crash_point("before_terminal");
-        if let Some(in_flight) = in_flight {
-            let status = if result.starts_with("Error") {
-                ToolCallStatus::Error
-            } else {
-                ToolCallStatus::Done
-            };
-            in_flight.finish(status, Self::journaled_result(spec, &result));
-        }
-
-        // ── 5. Treat "Error…" result strings as soft errors ──────────────────
-        if result.starts_with("Error") {
-            let detail: String = result.replace('\n', " ").trim().chars().take(120).collect();
-            log::error!("Tool error: {}", result);
-            let event = HashMap::from([
-                ("name".to_string(), tool_call.name.clone()),
-                ("status".to_string(), "error".to_string()),
-                ("detail".to_string(), detail),
-            ]);
-            let error = if spec.fail_on_tool_error {
-                Some(result.clone())
-            } else {
-                None
-            };
-            return (format!("{result}{HINT}"), event, error);
-        }
-
-        // ── 6. Success ────────────────────────────────────────────────────────
-        let replaced = result.replace('\n', " ");
-        let trimmed = replaced.trim();
-        let detail = if trimmed.is_empty() {
-            "(empty)".to_string()
-        } else if trimmed.chars().count() > 120 {
-            let cutoff = trimmed
-                .char_indices()
-                .nth(120)
-                .map(|(i, _)| i)
-                .unwrap_or(trimmed.len());
-            format!("{}...", &trimmed[..cutoff])
-        } else {
-            trimmed.to_string()
-        };
-
-        let event = HashMap::from([
-            ("name".to_string(), tool_call.name.clone()),
-            ("status".to_string(), "ok".to_string()),
-            ("detail".to_string(), detail),
-        ]);
-        (result, event, None)
+        run_tool_call(
+            spec,
+            tool_call,
+            external_lookup_counts,
+            message_circuit_breaker,
+        )
+        .await
+        .into_triple(&tool_call.name)
     }
 
     fn append_final_message(messages: &mut Vec<Value>, content: Option<&str>) {
@@ -2686,6 +2465,151 @@ mod tests {
         );
     }
 
+    // ── run_tool: outcome characterization ────────────────────────────────────
+    //
+    // These pin the `(result, event, fatal)` triple of every `run_tool` exit
+    // path so the stage-by-stage pipeline refactor cannot change behaviour.
+
+    const ERROR_HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
+
+    /// Tool that requires a `path` argument and answers with a fixed reply.
+    struct ScriptedTool {
+        reply: String,
+    }
+
+    #[async_trait::async_trait]
+    impl crate::agent::tools::base::Tool for ScriptedTool {
+        fn name(&self) -> String {
+            "scripted".into()
+        }
+        fn description(&self) -> String {
+            "scripted".into()
+        }
+        fn parameters(&self) -> serde_json::Value {
+            serde_json::json!({
+                "type": "object",
+                "properties": {"path": {"type": "string"}},
+                "required": ["path"]
+            })
+        }
+        async fn execute(&self, _: &serde_json::Value) -> String {
+            self.reply.clone()
+        }
+    }
+
+    /// Spec holding one [`ScriptedTool`] that replies with `reply`.
+    fn scripted_spec(reply: &str, fail_on_tool_error: bool) -> AgentRunSpec {
+        AgentRunSpec {
+            tools: registry_with(vec![Box::new(ScriptedTool {
+                reply: reply.to_string(),
+            })]),
+            fail_on_tool_error,
+            ..Default::default()
+        }
+    }
+
+    /// Run `name` with one string argument per `(key, value)` pair.
+    async fn run_named_tool(
+        spec: &AgentRunSpec,
+        name: &str,
+        arguments: &[(&str, &str)],
+    ) -> (String, HashMap<String, String>, Option<String>) {
+        let mut call = tc(name);
+        for (key, value) in arguments {
+            call.arguments
+                .insert(key.to_string(), Value::String(value.to_string()));
+        }
+        AgentRunner::run_tool(
+            spec,
+            &call,
+            Arc::new(Mutex::new(HashMap::new())),
+            unused_message_circuit_breaker(),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn run_tool_success_returns_result_unchanged_with_ok_event() {
+        let spec = scripted_spec("hello", true);
+        let (result, event, fatal) = run_named_tool(&spec, "scripted", &[("path", "a")]).await;
+        assert_eq!(result, "hello");
+        assert_eq!(event["name"], "scripted");
+        assert_eq!(event["status"], "ok");
+        assert_eq!(event["detail"], "hello");
+        assert_eq!(fatal, None);
+    }
+
+    #[tokio::test]
+    async fn run_tool_success_detail_marks_empty_and_ellipsizes_long_results() {
+        let spec = scripted_spec("", false);
+        let (_, event, _) = run_named_tool(&spec, "scripted", &[("path", "a")]).await;
+        assert_eq!(event["detail"], "(empty)");
+
+        let spec = scripted_spec(&format!("{}\n{}", "a".repeat(100), "b".repeat(100)), false);
+        let (result, event, _) = run_named_tool(&spec, "scripted", &[("path", "a")]).await;
+        assert!(result.contains('\n'), "the result itself is not flattened");
+        assert_eq!(
+            event["detail"],
+            format!("{} {}...", "a".repeat(100), "b".repeat(19))
+        );
+    }
+
+    #[tokio::test]
+    async fn run_tool_soft_error_appends_hint_and_is_fatal_only_when_configured() {
+        let spec = scripted_spec("Error: boom\nsecond line", false);
+        let (result, event, fatal) = run_named_tool(&spec, "scripted", &[("path", "a")]).await;
+        assert_eq!(result, format!("Error: boom\nsecond line{ERROR_HINT}"));
+        assert_eq!(event["status"], "error");
+        assert_eq!(event["detail"], "Error: boom second line");
+        assert_eq!(fatal, None);
+
+        let spec = scripted_spec("Error: boom\nsecond line", true);
+        let (result, _, fatal) = run_named_tool(&spec, "scripted", &[("path", "a")]).await;
+        assert_eq!(result, format!("Error: boom\nsecond line{ERROR_HINT}"));
+        assert_eq!(fatal.as_deref(), Some("Error: boom\nsecond line"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_invalid_parameters_skip_execute_and_report_the_schema_error() {
+        let spec = scripted_spec("must not run", true);
+        let (result, event, fatal) = run_named_tool(&spec, "scripted", &[]).await;
+        assert!(
+            result.starts_with("Error: Invalid parameters for tool 'scripted': "),
+            "got {result:?}"
+        );
+        assert!(result.ends_with(ERROR_HINT));
+        assert_eq!(event["status"], "error");
+        assert!(event["detail"].starts_with("Invalid parameters for tool 'scripted'"));
+        assert!(fatal.unwrap().starts_with("Error: Invalid parameters"));
+    }
+
+    #[tokio::test]
+    async fn run_tool_blocks_the_fourth_identical_external_lookup() {
+        let spec = scripted_spec("unused", false);
+        let counts = Arc::new(Mutex::new(HashMap::new()));
+        let mut call = tc("web_search");
+        call.arguments
+            .insert("query".into(), Value::String("same".into()));
+        let mut last = None;
+        for _ in 0..4 {
+            last = Some(
+                AgentRunner::run_tool(
+                    &spec,
+                    &call,
+                    Arc::clone(&counts),
+                    unused_message_circuit_breaker(),
+                )
+                .await,
+            );
+        }
+        let (result, event, fatal) = last.unwrap();
+        assert!(result.starts_with("Error: repeated external lookup blocked."));
+        assert!(result.ends_with(ERROR_HINT));
+        assert_eq!(event["status"], "error");
+        assert_eq!(event["detail"], "repeated external lookup blocked");
+        assert_eq!(fatal, None);
+    }
+
     // ── partition_tool_batches ────────────────────────────────────────────────
 
     /// Build a minimal `ToolCallRequest` with the given name and no arguments.
@@ -3442,7 +3366,7 @@ mod tests {
 
     // ── tool-intent journal (WAL) ─────────────────────────────────────────────
 
-    use crate::session::journal::{JournalRecord, RunJournal};
+    use crate::session::journal::{JournalRecord, RunJournal, ToolCallStatus};
     use crate::session::journal_file::FileJournalStore;
 
     /// Tool that reports what the journal held at the moment `execute` ran.

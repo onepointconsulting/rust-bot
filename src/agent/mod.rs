@@ -19,6 +19,7 @@ pub mod skills;
 pub mod subagent;
 pub mod tool_approval;
 pub mod tool_call_context;
+pub mod tool_pipeline;
 pub mod tool_progress;
 pub mod tools;
 pub mod turn_journal;

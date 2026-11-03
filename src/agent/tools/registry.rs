@@ -2,13 +2,12 @@
 use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
+use crate::agent::tool_pipeline::ERROR_HINT;
 use crate::agent::tools::base::{Tool, ToolExposure};
 use crate::providers::cache_control::CACHE_BOUNDARY_KEY;
 
 /// Name prefix every MCP-provided tool is registered under.
 pub const MCP_TOOL_PREFIX: &str = "mcp_";
-
-const HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
 
 /// A deferred tool as `tool_search` ranks it: everything the model would see once it
 /// is loaded, plus the MCP server it comes from.
@@ -261,62 +260,72 @@ impl ToolRegistry {
         name: &str,
         params: &serde_json::Value,
     ) -> (Option<Arc<dyn Tool>>, serde_json::Value, Option<String>) {
-        let tool = match self.tools.get(name) {
-            Some(t) if self.is_declared(name, t) => t.clone(),
-            Some(_) => {
-                return (
-                    None,
-                    params.clone(),
-                    Some(format!(
-                        "Error: Tool '{name}' is not loaded. Call tool_search first."
-                    )),
-                );
-            }
+        let tool = match self.resolve_tool(name) {
+            Ok(tool) => tool,
+            Err(error) => return (None, params.clone(), Some(error)),
+        };
+        match Self::validate_call(name, &tool, params) {
+            Ok(cast_params) => (Some(tool), cast_params, None),
+            Err((cast_params, error)) => (Some(tool), cast_params, Some(error)),
+        }
+    }
+
+    /// Resolve `name` to a tool that is currently declared to the model.
+    ///
+    /// Fails (with the model-facing `"Error: ..."` text) when the tool is
+    /// unknown, or registered as deferred and not loaded yet.
+    pub fn resolve_tool(&self, name: &str) -> Result<Arc<dyn Tool>, String> {
+        match self.tools.get(name) {
+            Some(tool) if self.is_declared(name, tool) => Ok(tool.clone()),
+            Some(_) => Err(format!(
+                "Error: Tool '{name}' is not loaded. Call tool_search first."
+            )),
             None => {
                 // Only declared tools are listed, so the deferred catalogue does not leak.
                 let available = self.declared_tool_names().join(", ");
-                return (
-                    None,
-                    params.clone(),
-                    Some(format!(
-                        "Error: Tool '{}' not found. Available: {}",
-                        name, available
-                    )),
-                );
+                Err(format!(
+                    "Error: Tool '{name}' not found. Available: {available}"
+                ))
             }
-        };
+        }
+    }
 
+    /// Cast `params` to the schema types of the tool called `name` and validate them.
+    ///
+    /// Returns the cast parameters, or on failure the cast parameters together
+    /// with the model-facing `"Error: ..."` text.
+    pub fn validate_call(
+        name: &str,
+        tool: &Arc<dyn Tool>,
+        params: &serde_json::Value,
+    ) -> Result<serde_json::Value, (serde_json::Value, String)> {
         let cast_params = tool.cast_params(params);
         let errors = tool.validate_params(&cast_params);
-        if !errors.is_empty() {
-            return (
-                Some(tool),
-                cast_params,
-                Some(format!(
-                    "Error: Invalid parameters for tool '{}': {}",
-                    name,
-                    errors.join("; ")
-                )),
-            );
+        if errors.is_empty() {
+            return Ok(cast_params);
         }
-
-        (Some(tool), cast_params, None)
+        let error = format!(
+            "Error: Invalid parameters for tool '{}': {}",
+            name,
+            errors.join("; ")
+        );
+        Err((cast_params, error))
     }
 
     /// Execute a tool by name with the given parameters.
     ///
     /// Any error (unknown tool, invalid params, or a result beginning with
-    /// `"Error"`) has `HINT` appended to nudge the LLM to self-correct.
+    /// `"Error"`) has `ERROR_HINT` appended to nudge the LLM to self-correct.
     pub async fn execute(&self, name: &str, params: &serde_json::Value) -> String {
         let (tool, cast_params, error) = self.prepare_call(name, params);
         if let Some(err) = error {
-            return err + HINT;
+            return err + ERROR_HINT;
         }
 
         // prepare_call guarantees tool is Some when error is None
         let result = tool.unwrap().as_ref().execute(&cast_params).await;
         if result.starts_with("Error") {
-            result + HINT
+            result + ERROR_HINT
         } else {
             result
         }
@@ -864,6 +873,43 @@ mod tests {
         let (tool, _, error) = reg.prepare_call("mcp_srv_a", &serde_json::json!({}));
         assert!(tool.is_some());
         assert!(error.is_none());
+    }
+
+    #[test]
+    fn resolve_tool_returns_declared_tools_and_explains_every_refusal() {
+        let reg = registry_with_deferred();
+
+        assert_eq!(reg.resolve_tool("add").unwrap().name(), "add");
+        assert_eq!(
+            reg.resolve_tool("mcp_srv_a").err().unwrap(),
+            "Error: Tool 'mcp_srv_a' is not loaded. Call tool_search first."
+        );
+        assert!(
+            reg.resolve_tool("ghost")
+                .err()
+                .unwrap()
+                .starts_with("Error: Tool 'ghost' not found. Available: ")
+        );
+
+        reg.load_tools(&names(&["mcp_srv_a"]));
+        assert!(reg.resolve_tool("mcp_srv_a").is_ok());
+    }
+
+    #[test]
+    fn validate_call_casts_parameters_and_reports_schema_errors() {
+        let reg = registry_with_defaults();
+        let add = reg.resolve_tool("add").unwrap();
+
+        let cast = ToolRegistry::validate_call("add", &add, &serde_json::json!({"a": "1", "b": 2}))
+            .unwrap();
+        assert_eq!(cast, serde_json::json!({"a": 1, "b": 2}));
+
+        let (_, error) =
+            ToolRegistry::validate_call("add", &add, &serde_json::json!({"a": 1})).unwrap_err();
+        assert!(
+            error.starts_with("Error: Invalid parameters for tool 'add': "),
+            "got {error:?}"
+        );
     }
 
     #[test]
