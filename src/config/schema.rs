@@ -1621,7 +1621,9 @@ pub struct ToolsConfig {
     #[schemars(skip)]
     pub deferred_tools: Vec<String>,
 
-    /// When true, the CLI `agent` command asks before each tool call.
+    /// When true, every tool call asks for confirmation before it runs (a prompt in the CLI, an
+    /// approval card in the web chat). A call nobody can be asked about is denied, never run: piped
+    /// CLI input, or a turn from a channel without a web chat such as cron or email.
     #[serde(alias = "confirm_before_execute")]
     #[garde(skip)]
     pub confirm_before_execute: bool,

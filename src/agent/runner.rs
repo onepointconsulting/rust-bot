@@ -11,8 +11,8 @@ use crate::agent::circuit_breaker::{
     MessageCircuitBreaker, is_tripped_error,
 };
 use crate::agent::crash_points::crash_point;
-use crate::agent::hook::{AgentHook, AgentHookContext, HOOK_ABORT_STOP_REASON, ToolHookDecision};
-use crate::agent::tool_pipeline::{ToolOutcome, run_tool_call};
+use crate::agent::hook::{AgentHook, AgentHookContext};
+use crate::agent::tool_pipeline::{ToolOutcome, ToolStatus, complete_tool_call, prepare_tool_call};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::turn_journal::TurnJournal;
 use crate::bus::outbound_events::ProgressKind;
@@ -694,16 +694,11 @@ impl AgentRunner {
     /// Execute all tool calls and return their results, telemetry events, and
     /// the first fatal error (if any).
     ///
-    /// Mirrors Python's `_execute_tools`:
-    ///   - Partitions the calls into sequential / concurrent batches via
-    ///     `partition_tool_batches`.
-    ///   - For multi-tool concurrent batches the Python uses `asyncio.gather`.
-    ///     This implementation awaits each call sequentially within a batch;
-    ///     true parallelism would additionally require `external_lookup_counts`
-    ///     to be `Arc<Mutex<HashMap<String, usize>>>` so it can be shared across
-    ///     concurrent tasks.
-    ///   - Collects every `(result, event, error)` triple into three parallel
-    ///     vecs and captures the **first** fatal error encountered.
+    /// The calls are grouped into batches by `partition_tool_batches`. Within a
+    /// batch the calls are first *prepared* one after another (validation,
+    /// authorization, guards), so approval prompts are asked one at a time in call
+    /// order, and then *executed*, concurrently when the batch allows it. Every
+    /// call yields exactly one `(result, event)`, in the order of `tool_calls`.
     ///
     /// Returns `(results, events, fatal_error)`.
     async fn execute_tools(
@@ -712,151 +707,54 @@ impl AgentRunner {
         external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
         message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
     ) -> (Vec<String>, Vec<HashMap<String, String>>, Option<String>) {
-        let batches = Self::partition_tool_batches(spec, tool_calls);
-        let mut tool_results: Vec<(String, HashMap<String, String>, Option<String>)> =
-            Vec::with_capacity(tool_calls.len());
+        let mut results: Vec<String> = Vec::with_capacity(tool_calls.len());
+        let mut events: Vec<HashMap<String, String>> = Vec::with_capacity(tool_calls.len());
+        let mut fatal_error: Option<String> = None;
 
-        for batch in batches {
-            if spec.concurrent_tools && batch.len() > 1 {
-                let results = futures::future::join_all(batch.iter().map(|tool_call| {
-                    Self::run_tool(
+        for batch in Self::partition_tool_batches(spec, tool_calls) {
+            let mut prepared = Vec::with_capacity(batch.len());
+            for tool_call in &batch {
+                prepared.push(
+                    prepare_tool_call(
                         spec,
                         tool_call,
-                        Arc::clone(&external_lookup_counts),
-                        Arc::clone(&message_circuit_breaker),
+                        &external_lookup_counts,
+                        &message_circuit_breaker,
                     )
-                }))
-                .await;
-                tool_results.extend(results);
+                    .await,
+                );
+            }
+
+            let outcomes: Vec<ToolOutcome> = if spec.concurrent_tools && batch.len() > 1 {
+                futures::future::join_all(
+                    prepared
+                        .into_iter()
+                        .map(|prepared| complete_tool_call(spec, prepared)),
+                )
+                .await
             } else {
-                for tool_call in batch {
-                    tool_results.push(
-                        Self::run_tool(
-                            spec,
-                            tool_call,
-                            Arc::clone(&external_lookup_counts),
-                            Arc::clone(&message_circuit_breaker),
-                        )
-                        .await,
-                    );
+                let mut outcomes = Vec::with_capacity(prepared.len());
+                for prepared in prepared {
+                    outcomes.push(complete_tool_call(spec, prepared).await);
+                }
+                outcomes
+            };
+
+            for (tool_call, outcome) in batch.iter().zip(outcomes) {
+                log::info!(
+                    "Tool result: {}",
+                    outcome.content().chars().take(100).collect::<String>()
+                );
+                let (result, event, fatal) = outcome.into_triple(&tool_call.name);
+                results.push(result);
+                events.push(event);
+                if fatal_error.is_none() {
+                    fatal_error = fatal;
                 }
             }
         }
 
-        let mut results: Vec<String> = Vec::with_capacity(tool_results.len());
-        let mut events: Vec<HashMap<String, String>> = Vec::with_capacity(tool_results.len());
-        let mut fatal_error: Option<String> = None;
-
-        for (result, event, error) in tool_results {
-            log::info!(
-                "Tool result: {}",
-                result.chars().take(100).collect::<String>()
-            );
-            results.push(result);
-            events.push(event);
-            if error.is_some() && fatal_error.is_none() {
-                fatal_error = error;
-            }
-        }
-
         (results, events, fatal_error)
-    }
-
-    fn hook_block_result(name: &str, reason: &str) -> (String, HashMap<String, String>) {
-        let (result, event, _) = ToolOutcome::blocked_by_hook(reason).into_triple(name);
-        (result, event)
-    }
-
-    fn hook_denied_ids(
-        decision: &ToolHookDecision,
-        tool_calls: &[ToolCallRequest],
-    ) -> Option<(std::collections::HashSet<String>, String)> {
-        match decision {
-            ToolHookDecision::Continue | ToolHookDecision::Abort { .. } => None,
-            ToolHookDecision::Deny { reason } => Some((
-                tool_calls.iter().map(|tc| tc.id.clone()).collect(),
-                reason.clone(),
-            )),
-            ToolHookDecision::DenyCalls { ids, reason } => {
-                Some((ids.iter().cloned().collect(), reason.clone()))
-            }
-        }
-    }
-
-    /// Execute the allowed subset of `tool_calls` and stitch synthetic
-    /// blocked results into the original order so the transcript stays
-    /// aligned with the assistant's tool-call message.
-    async fn execute_tools_honoring_decision(
-        spec: &AgentRunSpec,
-        tool_calls: &[ToolCallRequest],
-        decision: &ToolHookDecision,
-        external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
-        message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
-    ) -> (Vec<String>, Vec<HashMap<String, String>>, Option<String>) {
-        let Some((denied, reason)) = Self::hook_denied_ids(decision, tool_calls) else {
-            return Self::execute_tools(
-                spec,
-                tool_calls,
-                external_lookup_counts,
-                message_circuit_breaker,
-            )
-            .await;
-        };
-
-        let to_run: Vec<ToolCallRequest> = tool_calls
-            .iter()
-            .filter(|tc| !denied.contains(&tc.id))
-            .cloned()
-            .collect();
-        let (run_results, run_events, fatal_error) = if to_run.is_empty() {
-            (Vec::new(), Vec::new(), None)
-        } else {
-            Self::execute_tools(
-                spec,
-                &to_run,
-                external_lookup_counts,
-                message_circuit_breaker,
-            )
-            .await
-        };
-
-        let mut run_results = run_results.into_iter();
-        let mut run_events = run_events.into_iter();
-        let mut results = Vec::with_capacity(tool_calls.len());
-        let mut events = Vec::with_capacity(tool_calls.len());
-        for tc in tool_calls {
-            if denied.contains(&tc.id) {
-                Self::journal_blocked_call(spec, tc, &reason);
-                let (result, event) = Self::hook_block_result(&tc.name, &reason);
-                results.push(result);
-                events.push(event);
-            } else {
-                results.push(
-                    run_results
-                        .next()
-                        .unwrap_or_else(|| format!("Error: tool call blocked by hook: {reason}")),
-                );
-                events.push(run_events.next().unwrap_or_default());
-            }
-        }
-        (results, events, fatal_error)
-    }
-
-    /// Journal a tool call that a hook denied (no-op without a journal).
-    fn journal_blocked_call(spec: &AgentRunSpec, tool_call: &ToolCallRequest, reason: &str) {
-        let Some(journal) = &spec.journal else {
-            return;
-        };
-        let args = Value::Object(tool_call.arguments.clone().into_iter().collect());
-        journal.record_blocked_call(&tool_call.id, &tool_call.name, &args, reason);
-    }
-
-    fn tool_call_denied(decision: &ToolHookDecision, tool_call_id: &str) -> bool {
-        match decision {
-            ToolHookDecision::Continue => false,
-            ToolHookDecision::Abort { .. } | ToolHookDecision::Deny { .. } => true,
-            ToolHookDecision::DenyCalls { ids, .. } => ids.iter().any(|id| id == tool_call_id),
-        }
     }
 
     /// Group tool calls into batches for (optionally concurrent) execution.
@@ -908,19 +806,23 @@ impl AgentRunner {
     /// Run one tool call through the stage pipeline (see
     /// [`crate::agent::tool_pipeline`]) and flatten the outcome.
     ///
+    /// The run loop prepares and executes whole batches through
+    /// [`Self::execute_tools`]; this single-call form exists for the tests.
+    ///
     /// Returns `(result, event, fatal_error)`:
     ///   - `result`      — string fed back to the LLM as the tool result.
     ///   - `event`       — telemetry map (`"name"`, `"status"`, `"detail"`).
     ///   - `fatal_error` — `Some(msg)` when the message circuit breaker trips
     ///     (always abort), or when `spec.fail_on_tool_error` is
     ///     set and an error occurred; the agent loop should abort.
+    #[cfg(test)]
     async fn run_tool(
         spec: &AgentRunSpec,
         tool_call: &ToolCallRequest,
         external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
         message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
     ) -> (String, HashMap<String, String>, Option<String>) {
-        run_tool_call(
+        crate::agent::tool_pipeline::run_tool_call(
             spec,
             tool_call,
             external_lookup_counts,
@@ -1161,62 +1063,21 @@ impl AgentRunner {
                 );
 
                 ctx.tool_calls = response.tool_calls.clone();
-                let decision = hook.before_execute_tools(&mut ctx).await;
+                hook.on_tool_calls(&mut ctx).await;
 
-                if let ToolHookDecision::Abort { reason } = &decision {
-                    log::warn!("Tool execution aborted by hook: {reason}");
-                    let mut abort_events = Vec::with_capacity(response.tool_calls.len());
-                    for tc in &response.tool_calls {
-                        Self::journal_blocked_call(&spec, tc, reason);
-                        let (result, event) = Self::hook_block_result(&tc.name, reason);
-                        let normalized = self.normalize_tool_result(
-                            &spec,
-                            &tc.id,
-                            &tc.name,
-                            coerce_tool_execute_result(result),
-                        );
-                        let tool_msg = serde_json::json!({
-                            "role": "tool",
-                            "tool_call_id": tc.id,
-                            "name": tc.name,
-                            "content": normalized,
-                        });
-                        ctx.tool_results.push(tool_msg.clone());
-                        messages.push(tool_msg);
-                        abort_events.push(event);
-                    }
-                    all_tool_events.extend(abort_events.clone());
-                    ctx.tool_events = abort_events;
-                    let error_msg = format!(
-                        "Error: {}\n{}",
-                        reason,
-                        spec.error_message
-                            .as_deref()
-                            .unwrap_or(DEFAULT_ERROR_MESSAGE)
-                    );
-                    stop_reason = HOOK_ABORT_STOP_REASON.to_string();
-                    Self::append_final_message(&mut messages, Some(&error_msg));
-                    ctx.stop_reason = Some(HOOK_ABORT_STOP_REASON.to_string());
-                    ctx.error = Some(reason.clone());
-                    hook.after_iteration(&mut ctx).await;
-                    final_result_content = Some(error_msg);
-                    final_error = Some(reason.clone());
-                    exhausted = false;
-                    break 'outer;
-                }
-
-                let (results, events, fatal_error) = Self::execute_tools_honoring_decision(
+                let (results, events, fatal_error) = Self::execute_tools(
                     &spec,
                     &response.tool_calls,
-                    &decision,
                     Arc::clone(&external_lookup_counts),
                     Arc::clone(&message_circuit_breaker),
                 )
                 .await;
 
-                for tc in &response.tool_calls {
-                    if !Self::tool_call_denied(&decision, &tc.id) && !tools_used.contains(&tc.name)
-                    {
+                // A blocked call never ran, so it does not count as a used tool.
+                for (tc, event) in response.tool_calls.iter().zip(&events) {
+                    let blocked = event.get("status").map(String::as_str)
+                        == Some(ToolStatus::Blocked.as_str());
+                    if !blocked && !tools_used.contains(&tc.name) {
                         tools_used.push(tc.name.clone());
                     }
                 }
@@ -1448,7 +1309,7 @@ impl AgentHook for NoopHook {}
 mod tests {
     use super::*;
     use crate::agent::tools::message::MessageTool;
-    use crate::agent::tools::test_support::ScriptedTool;
+    use crate::agent::tools::test_support::{NamedTool, ScriptedTool, spec_with_tool};
     use crate::bus::events::OutboundMessage;
     use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
     use crate::providers::registry::ProviderSpec;
@@ -2566,7 +2427,9 @@ mod tests {
 
     #[tokio::test]
     async fn run_tool_blocks_the_fourth_identical_external_lookup() {
-        let spec = scripted_spec("unused", false);
+        let spec = spec_with_tool(NamedTool {
+            name: "web_search".into(),
+        });
         let counts = Arc::new(Mutex::new(HashMap::new()));
         let mut call = tc("web_search");
         call.arguments
@@ -2931,7 +2794,7 @@ mod tests {
         assert_eq!(hook.streamed(), UNSUPPORTED_IMAGE_INPUT_MESSAGE);
     }
 
-    // ── before_execute_tools decisions ────────────────────────────────────────
+    // ── tool authorization ────────────────────────────────────────────────────
 
     /// Names of the tools declared on each request, in request order.
     type RequestedToolNames = Arc<Mutex<Vec<Vec<String>>>>;
@@ -3146,14 +3009,44 @@ mod tests {
         assert_eq!(requested[1], vec!["tool_search", "mcp_srv_count"]);
     }
 
-    struct FixedDecisionHook {
-        decision: ToolHookDecision,
+    /// Hook that denies the calls whose id is in `denied`, or every call when `None`.
+    struct DenyingHook {
+        denied: Option<Vec<String>>,
+        reason: String,
     }
 
     #[async_trait::async_trait]
-    impl AgentHook for FixedDecisionHook {
-        async fn before_execute_tools(&self, _ctx: &mut AgentHookContext) -> ToolHookDecision {
-            self.decision.clone()
+    impl AgentHook for DenyingHook {
+        async fn authorize_call(
+            &self,
+            request: &crate::agent::hook::ToolCallAuthorization<'_>,
+        ) -> crate::agent::hook::CallDecision {
+            let denied = self
+                .denied
+                .as_ref()
+                .is_none_or(|ids| ids.iter().any(|id| id == request.call_id));
+            if denied {
+                crate::agent::hook::CallDecision::deny(&self.reason)
+            } else {
+                crate::agent::hook::CallDecision::Allow
+            }
+        }
+    }
+
+    /// Hook that records the id of every call it is asked to authorize.
+    #[derive(Default)]
+    struct AskedHook {
+        asked: Arc<Mutex<Vec<String>>>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for AskedHook {
+        async fn authorize_call(
+            &self,
+            request: &crate::agent::hook::ToolCallAuthorization<'_>,
+        ) -> crate::agent::hook::CallDecision {
+            self.asked.lock().unwrap().push(request.call_id.to_string());
+            crate::agent::hook::CallDecision::Allow
         }
     }
 
@@ -3197,10 +3090,9 @@ mod tests {
                 tools,
                 model: "test".into(),
                 max_iterations: 3,
-                hook: Some(Arc::new(FixedDecisionHook {
-                    decision: ToolHookDecision::Deny {
-                        reason: "not allowed".into(),
-                    },
+                hook: Some(Arc::new(DenyingHook {
+                    denied: None,
+                    reason: "not allowed".into(),
                 })),
                 ..Default::default()
             })
@@ -3256,11 +3148,9 @@ mod tests {
                 tools,
                 model: "test".into(),
                 max_iterations: 3,
-                hook: Some(Arc::new(FixedDecisionHook {
-                    decision: ToolHookDecision::DenyCalls {
-                        ids: vec!["tool_a".into()],
-                        reason: "a is blocked".into(),
-                    },
+                hook: Some(Arc::new(DenyingHook {
+                    denied: Some(vec!["tool_a".into()]),
+                    reason: "a is blocked".into(),
                 })),
                 ..Default::default()
             })
@@ -3292,57 +3182,42 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn run_aborts_tool_execution() {
+    async fn run_only_asks_about_valid_calls_in_call_order() {
         let hits = Arc::new(Mutex::new(0usize));
         let mut tools = ToolRegistry::new();
         tools.register(Box::new(CountingTool {
-            name: "echo".into(),
+            name: "tool_a".into(),
             hits: Arc::clone(&hits),
         }));
-        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![tool_call_llm_response(
-            vec![tc("echo")],
-        )]));
+        tools.register(Box::new(CountingTool {
+            name: "tool_b".into(),
+            hits: Arc::clone(&hits),
+        }));
+        let hook = AskedHook::default();
+        let asked = Arc::clone(&hook.asked);
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![
+            tool_call_llm_response(vec![tc("tool_a"), tc("ghost"), tc("tool_b")]),
+            text_llm_response("done"),
+        ]));
+
         let result = runner
             .run(AgentRunSpec {
                 initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
                 tools,
                 model: "test".into(),
                 max_iterations: 3,
-                hook: Some(Arc::new(FixedDecisionHook {
-                    decision: ToolHookDecision::Abort {
-                        reason: "policy veto".into(),
-                    },
-                })),
+                hook: Some(Arc::new(hook)),
                 ..Default::default()
             })
             .await;
 
-        assert_eq!(*hits.lock().unwrap(), 0);
-        assert!(result.tools_used.is_empty());
-        assert_eq!(result.stop_reason, HOOK_ABORT_STOP_REASON);
-        assert_eq!(result.error.as_deref(), Some("policy veto"));
-        assert!(
-            result
-                .final_content
-                .as_deref()
-                .unwrap_or("")
-                .contains("policy veto")
-        );
-        let blocked = result
-            .messages
-            .iter()
-            .find(|m| m["role"] == "tool")
-            .expect("synthetic tool result");
-        assert!(
-            blocked["content"]
-                .as_str()
-                .unwrap_or("")
-                .contains("blocked by hook: policy veto")
-        );
         assert_eq!(
-            result.messages.last().and_then(|m| m["role"].as_str()),
-            Some("assistant")
+            asked.lock().unwrap().as_slice(),
+            ["tool_a", "tool_b"],
+            "the unknown tool must be rejected before anybody is asked"
         );
+        assert_eq!(*hits.lock().unwrap(), 2);
+        assert_eq!(result.stop_reason, "completed");
     }
 
     // ── tool-intent journal (WAL) ─────────────────────────────────────────────
@@ -3591,27 +3466,17 @@ mod tests {
 
     #[tokio::test]
     async fn runner_journal_hook_denied_call_is_journaled_blocked_and_never_executed() {
-        let fixture = journal_fixture("fine", true);
-        let counts = Arc::new(Mutex::new(HashMap::new()));
-        let breaker = Arc::new(Mutex::new(MessageCircuitBreaker::new(
-            DEFAULT_N_IDENTICAL_MESSAGES,
-        )));
-        let decision = ToolHookDecision::Deny {
+        let mut fixture = journal_fixture("fine", true);
+        fixture.spec.hook = Some(Arc::new(DenyingHook {
+            denied: None,
             reason: "nope".into(),
-        };
+        }));
 
-        let (results, _events, _fatal) = AgentRunner::execute_tools_honoring_decision(
-            &fixture.spec,
-            &[tc("probe")],
-            &decision,
-            counts,
-            breaker,
-        )
-        .await;
+        let result = run_probe(&fixture.spec).await;
 
         assert_eq!(tool_statuses(&fixture.journal), [ToolCallStatus::Blocked]);
         assert!(fixture.seen_at_execute.lock().unwrap().is_empty());
-        assert!(results[0].contains("nope"));
+        assert!(result.contains("nope"));
     }
 
     // ── step checkpoints ──────────────────────────────────────────────────────

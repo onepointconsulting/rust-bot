@@ -395,7 +395,7 @@ pub fn classify_tool_status(status: &str) -> ToolStatusBucket {
 /// Flip any tool-activity chip still marked as running to a finished state
 /// once the turn itself has ended.
 ///
-/// The backend hook that emits tool-hint progress (`before_execute_tools` in
+/// The backend hook that emits tool-hint progress (`on_tool_calls` in
 /// `agent_loop.rs`) fires *before* a tool executes and has no corresponding
 /// "after execute" hook to report a real success/failure outcome — see
 /// [`synthesize_tool_hint_event`]'s doc comment. Left alone, a chip could
@@ -437,7 +437,7 @@ pub fn finish_orphaned_entries(entries: &mut [ChatEntry]) {
 /// Wrap a free-text tool-hint as a single synthetic [`ToolEvent`] so
 /// `ToolActivity` has something concrete to render.
 ///
-/// The backend's `before_execute_tools` hook (`agent_loop.rs`) only ever
+/// The backend's `on_tool_calls` hook (`agent_loop.rs`) only ever
 /// publishes a human-readable hint string (e.g. `web_search("...")`, built by
 /// `format_tool_hints`) with `tool_events` left `None` — no code path in the
 /// backend currently populates the structured shape this crate was
@@ -458,7 +458,7 @@ pub fn synthesize_tool_hint_event(text: &str) -> ToolEvent {
 
 /// Wrap a free-text `progress` (non-tool-hint) narration line as a single
 /// synthetic [`ToolEvent`], for the same reason [`synthesize_tool_hint_event`]
-/// exists: `agent_loop.rs`'s `before_execute_tools` hook also fires
+/// exists: `agent_loop.rs`'s `on_tool_calls` hook also fires
 /// `on_progress(thought, ProgressKind::Plain)` — the model's in-between
 /// "thinking out loud" text, shown as `↳ ...` lines in the CLI — whenever no
 /// `on_stream` callback is wired up, and that too arrives with `tool_events`

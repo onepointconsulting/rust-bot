@@ -15,8 +15,8 @@ tool failure is detected by the text `"Error"`, and nothing protects the turn fr
 | Phase | Branch | Status |
 |---|---|---|
 | 1. Structure (no behaviour change) | `feature/tool-pipeline-p1-structure` | built and committed 2026-11-03 |
-| 2. Robustness | `feature/tool-pipeline-p2-robustness` | built 2026-11-03, uncommitted |
-| 3. Per-call authorize with `Ask` | `feature/tool-pipeline-p3-authorize` | not started |
+| 2. Robustness | `feature/tool-pipeline-p2-robustness` | committed 2026-11-03 |
+| 3. Per-call authorize | `feature/tool-pipeline-p3-authorize` | built 2026-11-03, uncommitted |
 | 4. Result model, post-hooks, observability | `feature/tool-pipeline-p4-results` | not started |
 
 One branch per phase. Phase N+1 branches from Phase N until N is merged. Commit only when asked.
@@ -84,7 +84,7 @@ Risk: low. Files: `runner.rs`, `tool_pipeline.rs`, `tools/registry.rs`, `agent/m
 
 ## Phase 2: robustness
 
-A tool must not be able to hang or crash a turn. Built 2026-11-03.
+A tool must not be able to hang or crash a turn. Committed 2026-11-03.
 
 - **Panic isolation.** The execute stage runs the tool under `catch_unwind`. A panic becomes
   `Error: tool '<name>' crashed: <message>` (message capped at 200 chars), which is journaled as a terminal
@@ -109,23 +109,41 @@ A tool must not be able to hang or crash a turn. Built 2026-11-03.
 Risk: medium. Not covered: a tool that blocks a thread synchronously (no `.await`) cannot be cancelled by the
 timeout; it would need `spawn_blocking` at the tool.
 
-## Phase 3: per-call authorize with `Ask`
+## Phase 3: per-call authorize
 
-The user approves validated calls, not raw ones.
+The user approves validated calls, not raw ones. Built 2026-11-03. See `docs/TOOL_PIPELINE.md` for the result.
 
-- New hook method `authorize_call(&ResolvedCall) -> CallDecision` with `Allow`, `Deny { reason }`,
-  `Ask { prompt }`. Runs in the pipeline after validate and before `journal_begin`.
-- Fail closed, as in the DeepSeek doc: a hook panic denies; an unanswerable `Ask` denies. Replace the three
-  fail-open paths (`CliAskHook` with non-terminal stdin, `WebsocketsAskHook` on a non-websocket channel, and with
-  no bus) with a denial that tells the model confirmation was required but could not be asked.
-- Migrate `CliAskHook`, `WebsocketsAskHook`, `AcpSessionHook`, `SubagentHook`, `LoopHook` and the test hooks.
-- Remove the batch-level `before_execute_tools`, `ToolHookDecision`'s batch semantics and
-  `execute_tools_honoring_decision` once nothing uses them. Keep the fail-closed merge of several hooks.
-- Denied calls journal through the existing `record_blocked_call`; the abort path (`Abort`) needs an equivalent.
-- Tests: ask, deny one call of a batch, invalid calls never prompt, panicking hook, unanswerable ask. Smoke-test
-  the CLI and websockets-chat by hand, because approvals are user-facing.
+- **`AgentHook::authorize_call(&ToolCallAuthorization) -> CallDecision`**, with `Allow` and `Deny { reason }`.
+  The request carries the call id, tool name, the cast and validated arguments, and the turn's channel and
+  chat id. There is **no `Ask` outcome**: a hook that has to ask someone awaits the answer itself and returns the
+  final decision, so a second approval mechanism would only duplicate that.
+- **The batch-level `before_execute_tools` and `ToolHookDecision` are gone**, with `Deny`, `DenyCalls`, `Abort`,
+  `HOOK_ABORT_STOP_REASON` and `execute_tools_honoring_decision`. No production hook ever returned `Abort`.
+- **`AgentHook::on_tool_calls(&mut ctx)` replaces it as a non-gating batch announcement.** `LoopHook` (tool hints
+  and progress), `SubagentHook` (logging) and `AcpSessionHook` (the `tool_call` cards) announce a batch rather
+  than decide about it, so they keep a once-per-batch hook that cannot veto.
+- **Order inside the pipeline:** parse guard, resolve + validate, **authorize**, then the stateful guards
+  (circuit breaker, repeated-lookup count), then journal and execute. The stateful guards moved after authorize
+  so a denied call neither counts towards the breaker's streak nor towards the lookup count.
+- **Prepare, then execute, per batch.** The runner prepares the calls of a batch one after another (so approval
+  prompts come one at a time, in call order, with no overlapping cards) and then executes them, concurrently where
+  the tools allow it.
+- **Fail closed everywhere.** A hook that panics denies. `CompositeHook` stops at the first denial so nobody is
+  asked about a call another hook refused. The three fail-open paths now deny with a reason the model can read:
+  `CliAskHook` with stdin not a terminal, `WebsocketsAskHook` on a channel that is not a websocket chat (or has
+  no chat id), and with no bus wired.
+- Denied calls are journaled as `Blocked` with the validated arguments (`record_blocked_call`).
+- `AcpSessionHook` announces the batch in `on_tool_calls`, asks for permission and sends `in_progress` in
+  `authorize_call`.
 
-Risk: medium-high (three channels, ordering semantics).
+Consequences to be aware of:
+- With `tools.confirmBeforeExecute` on, the gateway attaches `WebsocketsAskHook` to the whole agent loop, so
+  **every tool call on a channel without a websocket chat (cron, email, WhatsApp, ...) is now denied**, where it
+  used to run unconfirmed. Subagents are unaffected (their runs use `SubagentHook` only).
+- A batch of N calls now shows N approval cards one after another in the web chat, where it used to show one card
+  with N calls. Batching the card again would need a batch-shaped `authorize_calls` over the validated calls.
+
+Risk: medium-high (three channels, ordering semantics). Needs a manual smoke test of the CLI and websockets-chat.
 
 ## Phase 4: result model, post-hooks, observability
 

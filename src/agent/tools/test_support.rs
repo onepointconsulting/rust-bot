@@ -85,6 +85,27 @@ impl Tool for PanickingTool {
     }
 }
 
+/// Tool called `name` that accepts any arguments and answers `"ok"`.
+pub(crate) struct NamedTool {
+    pub name: String,
+}
+
+#[async_trait]
+impl Tool for NamedTool {
+    fn name(&self) -> String {
+        self.name.clone()
+    }
+    fn description(&self) -> String {
+        self.name.clone()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(&self, _: &serde_json::Value) -> String {
+        "ok".into()
+    }
+}
+
 /// A run spec whose registry holds only `tool`.
 pub(crate) fn spec_with_tool(tool: impl Tool + 'static) -> AgentRunSpec {
     let mut tools = ToolRegistry::new();

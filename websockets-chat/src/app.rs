@@ -644,7 +644,7 @@ fn handle_message_event(
                 log::info!("{kind} message with no known turn to attach to: {text}");
                 return;
             };
-            // The backend's `before_execute_tools` hook only ever sends
+            // The backend's `on_tool_calls` hook only ever sends
             // free-text hints — a tool-call line (e.g. `web_search("...")`,
             // `kind: "tool_hint"`) and, whenever no `on_stream` callback is
             // wired up, a narration line (the model's in-between "thinking

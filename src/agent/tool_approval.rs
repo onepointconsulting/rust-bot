@@ -16,7 +16,7 @@ use std::sync::Mutex as StdMutex;
 use serde::Serialize;
 use tokio::sync::oneshot;
 
-use crate::providers::base::ToolCallRequest;
+use crate::agent::hook::ToolCallAuthorization;
 
 /// Maximum characters of JSON-encoded arguments shown to the approver.
 pub const APPROVAL_ARG_PREVIEW_LIMIT: usize = 2000;
@@ -30,17 +30,18 @@ pub struct ToolApprovalCall {
 }
 
 impl ToolApprovalCall {
-    pub fn from_request(call: &ToolCallRequest) -> Self {
+    /// The call under authorization, as shown to the approver.
+    pub fn from_authorization(request: &ToolCallAuthorization<'_>) -> Self {
         Self {
-            id: call.id.clone(),
-            name: call.name.clone(),
-            arguments_preview: preview_arguments(&call.arguments, APPROVAL_ARG_PREVIEW_LIMIT),
+            id: request.call_id.to_string(),
+            name: request.tool_name.to_string(),
+            arguments_preview: preview_arguments(request.arguments, APPROVAL_ARG_PREVIEW_LIMIT),
         }
     }
 }
 
 /// JSON-encode `arguments`, truncated to `limit` characters (with `...`).
-pub fn preview_arguments(arguments: &HashMap<String, serde_json::Value>, limit: usize) -> String {
+pub fn preview_arguments(arguments: &serde_json::Value, limit: usize) -> String {
     let args_str = serde_json::to_string(arguments).unwrap_or_else(|_| "{}".to_string());
     let mut chars = args_str.chars();
     let preview: String = chars.by_ref().take(limit).collect();
@@ -222,13 +223,30 @@ mod tests {
 
     #[test]
     fn preview_arguments_truncates_long_payloads() {
-        let mut arguments = HashMap::new();
-        arguments.insert(
-            "content".to_string(),
-            serde_json::Value::String("x".repeat(200)),
-        );
+        let arguments = serde_json::json!({"content": "x".repeat(200)});
         let preview = preview_arguments(&arguments, 50);
         assert!(preview.ends_with("..."));
         assert_eq!(preview.chars().count(), 53);
+    }
+
+    #[test]
+    fn an_approval_call_shows_the_validated_arguments_of_the_authorization() {
+        use crate::agent::hook::ToolCallAuthorization;
+        let arguments = serde_json::json!({"path": "a.txt"});
+        let request = ToolCallAuthorization {
+            call_id: "c1",
+            tool_name: "read_file",
+            arguments: &arguments,
+            channel: None,
+            chat_id: None,
+        };
+        assert_eq!(
+            ToolApprovalCall::from_authorization(&request),
+            ToolApprovalCall {
+                id: "c1".into(),
+                name: "read_file".into(),
+                arguments_preview: r#"{"path":"a.txt"}"#.into(),
+            }
+        );
     }
 }

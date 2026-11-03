@@ -12,7 +12,7 @@ use crate::{
     agent::{
         background_activity::{ActivityGuard, ActivityKind, BackgroundActivity},
         context::ContextBuilder,
-        hook::{AgentHook, AgentHookContext, ToolHookDecision},
+        hook::{AgentHook, AgentHookContext},
         model_runtime::ModelRuntimeResolver,
         runner::{AgentRunResult, AgentRunSpec, AgentRunner},
         skills::SkillsLoader,
@@ -200,7 +200,7 @@ impl SubagentHook {
 /// Logging-only hook for subagent execution.
 #[async_trait]
 impl AgentHook for SubagentHook {
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
+    async fn on_tool_calls(&self, context: &mut AgentHookContext) {
         for tool_call in context.tool_calls.iter() {
             let args_str = serde_json::to_string(&tool_call.arguments).unwrap();
             log::info!(
@@ -210,7 +210,6 @@ impl AgentHook for SubagentHook {
                 args_str
             );
         }
-        ToolHookDecision::Continue
     }
 }
 
@@ -1011,26 +1010,26 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn before_execute_tools_no_panic_with_empty_tool_calls() {
+    async fn on_tool_calls_no_panic_with_empty_tool_calls() {
         let hook = SubagentHook::new("task-1".to_string());
         let mut ctx = AgentHookContext::new(0, vec![]);
         // Must complete without panic even when there are no tool calls.
-        hook.before_execute_tools(&mut ctx).await;
+        hook.on_tool_calls(&mut ctx).await;
     }
 
     #[tokio::test]
-    async fn before_execute_tools_no_panic_with_single_tool_call() {
+    async fn on_tool_calls_no_panic_with_single_tool_call() {
         let hook = SubagentHook::new("task-2".to_string());
         let mut ctx = AgentHookContext::new(0, vec![]);
         ctx.tool_calls.push(make_tool_call(
             "read_file",
             HashMap::from([("path".to_string(), serde_json::json!("/tmp/foo.txt"))]),
         ));
-        hook.before_execute_tools(&mut ctx).await;
+        hook.on_tool_calls(&mut ctx).await;
     }
 
     #[tokio::test]
-    async fn before_execute_tools_no_panic_with_multiple_tool_calls() {
+    async fn on_tool_calls_no_panic_with_multiple_tool_calls() {
         let hook = SubagentHook::new("task-3".to_string());
         let mut ctx = AgentHookContext::new(0, vec![]);
         ctx.tool_calls
@@ -1039,11 +1038,11 @@ mod tests {
             .push(make_tool_call("tool_b", HashMap::new()));
         ctx.tool_calls
             .push(make_tool_call("tool_c", HashMap::new()));
-        hook.before_execute_tools(&mut ctx).await;
+        hook.on_tool_calls(&mut ctx).await;
     }
 
     #[tokio::test]
-    async fn before_execute_tools_no_panic_with_complex_arguments() {
+    async fn on_tool_calls_no_panic_with_complex_arguments() {
         let hook = SubagentHook::new("task-4".to_string());
         let mut ctx = AgentHookContext::new(0, vec![]);
         ctx.tool_calls.push(make_tool_call(
@@ -1053,17 +1052,17 @@ mod tests {
                 ("content".to_string(), serde_json::json!({"key": [1, 2, 3]})),
             ]),
         ));
-        hook.before_execute_tools(&mut ctx).await;
+        hook.on_tool_calls(&mut ctx).await;
     }
 
     #[tokio::test]
-    async fn before_execute_tools_does_not_mutate_context() {
+    async fn on_tool_calls_does_not_mutate_context() {
         let hook = SubagentHook::new("task-5".to_string());
         let mut ctx = AgentHookContext::new(0, vec![]);
         ctx.tool_calls
             .push(make_tool_call("my_tool", HashMap::new()));
         let tool_count_before = ctx.tool_calls.len();
-        hook.before_execute_tools(&mut ctx).await;
+        hook.on_tool_calls(&mut ctx).await;
         assert_eq!(
             ctx.tool_calls.len(),
             tool_count_before,

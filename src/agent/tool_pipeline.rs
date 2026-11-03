@@ -1,19 +1,26 @@
 //! Stage-by-stage execution of a single tool call.
 //!
-//! [`run_tool_call`] runs one call through a fixed sequence of stages:
+//! A call goes through two phases. [`prepare_tool_call`] runs the stages that
+//! decide *whether* the call may run; [`execute_prepared_call`] runs it. The
+//! runner prepares the calls of a batch one after another (so approval prompts
+//! are asked one at a time, in order) and then executes them, concurrently where
+//! the tools allow it. [`run_tool_call`] chains both for a single call.
 //!
-//! | # | stage              | what it does                                              |
-//! |---|--------------------|-----------------------------------------------------------|
-//! | 0 | authorize          | batch-level `AgentHook::before_execute_tools`, run by the |
-//! |   |                    | caller before any call reaches this module                |
-//! | 1 | guard              | circuit breaker, repeated-lookup block, malformed args    |
-//! | 2 | resolve + validate | find the declared tool, cast and validate its arguments   |
-//! | 3 | journal            | write-ahead intent (may refuse the call in strict mode)   |
-//! | 4 | execute            | run the tool under the call identity, isolating panics   |
-//! |   |                    | and enforcing the optional execute timeout                |
-//! | 5 | journal finish     | terminal record, `Done` or `Error`                        |
-//! | 6 | normalize          | classify the result, add the retry hint, build the detail |
-//! | 7 | observe            | map an error to a fatal one when `fail_on_tool_error` set |
+//! | # | stage              | phase   | what it does                                       |
+//! |---|--------------------|---------|----------------------------------------------------|
+//! | 1 | parse guard        | prepare | reject arguments the provider could not parse      |
+//! | 2 | resolve + validate | prepare | find the declared tool, cast and validate arguments|
+//! | 3 | authorize          | prepare | `AgentHook::authorize_call`; a denial is journaled |
+//! | 4 | state guards       | prepare | circuit breaker, repeated-lookup block             |
+//! | 5 | journal            | execute | write-ahead intent (may refuse in strict mode)     |
+//! | 6 | execute            | execute | run under the call identity, isolate panics,       |
+//! |   |                    |         | enforce the optional timeout                       |
+//! | 7 | journal finish     | execute | terminal record, `Done` or `Error`                 |
+//! | 8 | normalize          | execute | classify the result, add the retry hint            |
+//! | 9 | observe            | both    | map an error to a fatal one if `fail_on_tool_error`|
+//!
+//! The state guards run after authorize on purpose: a call the user denied must
+//! not count towards the circuit breaker's streak or the repeated-lookup count.
 //!
 //! Every stage returns `Result<_, ToolOutcome>`: a failing stage short-circuits
 //! the pipeline with an error *result* (never a panic or an early `return` of a
@@ -32,6 +39,7 @@ use crate::agent::circuit_breaker::{
     CircuitDecision, MessageCircuitBreaker, tripped_error_message,
 };
 use crate::agent::crash_points::crash_point;
+use crate::agent::hook::{CallDecision, HOOK_PANIC_DENY_REASON, ToolCallAuthorization};
 use crate::agent::runner::AgentRunSpec;
 use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
 use crate::agent::tools::base::Tool;
@@ -239,6 +247,14 @@ pub fn journaled_result(spec: &AgentRunSpec, result: &str) -> String {
 
 // ── pipeline ──────────────────────────────────────────────────────────────────
 
+/// A call that passed every stage before execution and is ready to run.
+pub struct PreparedCall<'a> {
+    tool_call: &'a ToolCallRequest,
+    tool: Arc<dyn Tool>,
+    /// The cast, validated arguments the tool runs with.
+    params: Value,
+}
+
 /// Run one tool call through every stage and return its [`ToolOutcome`].
 pub async fn run_tool_call(
     spec: &AgentRunSpec,
@@ -246,44 +262,109 @@ pub async fn run_tool_call(
     external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
     message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
 ) -> ToolOutcome {
-    let outcome = run_stages(
+    let prepared = prepare_tool_call(
         spec,
         tool_call,
         &external_lookup_counts,
         &message_circuit_breaker,
     )
     .await;
-    let (Ok(outcome) | Err(outcome)) = outcome;
+    complete_tool_call(spec, prepared).await
+}
+
+/// Prepare phase (stages 1-4): everything that decides whether the call runs.
+///
+/// Fails with the error result the model should see: malformed arguments, an
+/// unknown or invalid call, a denial, or a tripped guard.
+pub async fn prepare_tool_call<'a>(
+    spec: &AgentRunSpec,
+    tool_call: &'a ToolCallRequest,
+    external_lookup_counts: &Mutex<HashMap<String, usize>>,
+    message_circuit_breaker: &Mutex<MessageCircuitBreaker>,
+) -> Result<PreparedCall<'a>, ToolOutcome> {
+    guard_well_formed_arguments(tool_call)?;
+    let (tool, params) = resolve_and_validate(&spec.tools, tool_call)?;
+    authorize(spec, tool_call, &params).await?;
+    guard_message_circuit_breaker(tool_call, message_circuit_breaker)?;
+    guard_repeated_external_lookup(tool_call, external_lookup_counts)?;
+    Ok(PreparedCall {
+        tool_call,
+        tool,
+        params,
+    })
+}
+
+/// Execute phase (stages 5-9) for a prepared call, or the observe stage alone
+/// for a call that failed preparation.
+pub async fn complete_tool_call(
+    spec: &AgentRunSpec,
+    prepared: Result<PreparedCall<'_>, ToolOutcome>,
+) -> ToolOutcome {
+    let outcome = match prepared {
+        Ok(prepared) => execute_prepared(spec, prepared).await,
+        Err(outcome) => outcome,
+    };
     outcome.observed(spec.fail_on_tool_error)
 }
 
-/// Stages 1–6; the first failing stage short-circuits with its outcome.
-async fn run_stages(
-    spec: &AgentRunSpec,
-    tool_call: &ToolCallRequest,
-    external_lookup_counts: &Mutex<HashMap<String, usize>>,
-    message_circuit_breaker: &Mutex<MessageCircuitBreaker>,
-) -> Result<ToolOutcome, ToolOutcome> {
-    guard(tool_call, external_lookup_counts, message_circuit_breaker)?;
-    let (tool, params) = resolve_and_validate(&spec.tools, tool_call)?;
-    let in_flight = journal_begin(spec, tool_call, tool.as_ref(), &params)?;
+/// Stages 5-8; the first failing stage short-circuits with its outcome.
+async fn execute_prepared(spec: &AgentRunSpec, prepared: PreparedCall<'_>) -> ToolOutcome {
+    let PreparedCall {
+        tool_call,
+        tool,
+        params,
+    } = prepared;
+    let in_flight = match journal_begin(spec, tool_call, tool.as_ref(), &params) {
+        Ok(in_flight) => in_flight,
+        Err(outcome) => return outcome,
+    };
     let result = execute(spec, tool_call, tool.as_ref(), &params).await;
     journal_finish(spec, in_flight, &result);
-    Ok(ToolOutcome::from_tool_result(result))
+    ToolOutcome::from_tool_result(result)
 }
 
-/// Stage 1: cheap checks that need no tool lookup.
-fn guard(
+/// Stage 3: ask the hook whether the validated call may run.
+///
+/// Fails closed: a hook that panics denies. A denied call is journaled as
+/// blocked, since it will never execute.
+async fn authorize(
+    spec: &AgentRunSpec,
     tool_call: &ToolCallRequest,
-    external_lookup_counts: &Mutex<HashMap<String, usize>>,
-    message_circuit_breaker: &Mutex<MessageCircuitBreaker>,
+    params: &Value,
 ) -> Result<(), ToolOutcome> {
-    guard_message_circuit_breaker(tool_call, message_circuit_breaker)?;
-    guard_repeated_external_lookup(tool_call, external_lookup_counts)?;
-    guard_well_formed_arguments(tool_call)
+    let Some(hook) = &spec.hook else {
+        return Ok(());
+    };
+    let request = ToolCallAuthorization {
+        call_id: &tool_call.id,
+        tool_name: &tool_call.name,
+        arguments: params,
+        channel: spec.channel.as_deref(),
+        chat_id: spec.chat_id.as_deref(),
+    };
+    let decision = match AssertUnwindSafe(hook.authorize_call(&request))
+        .catch_unwind()
+        .await
+    {
+        Ok(decision) => decision,
+        Err(_) => {
+            log::error!(
+                "AgentHook.authorize_call panicked for tool '{}'",
+                tool_call.name
+            );
+            CallDecision::deny(HOOK_PANIC_DENY_REASON)
+        }
+    };
+    let CallDecision::Deny { reason } = decision else {
+        return Ok(());
+    };
+    if let Some(journal) = &spec.journal {
+        journal.record_blocked_call(&tool_call.id, &tool_call.name, params, &reason);
+    }
+    Err(ToolOutcome::blocked_by_hook(&reason))
 }
 
-/// Trip on consecutive identical message sends.
+/// Stage 4a: trip on consecutive identical message sends.
 fn guard_message_circuit_breaker(
     tool_call: &ToolCallRequest,
     message_circuit_breaker: &Mutex<MessageCircuitBreaker>,
@@ -300,7 +381,7 @@ fn guard_message_circuit_breaker(
     }
 }
 
-/// Block the model from repeating an identical external lookup.
+/// Stage 4b: block the model from repeating an identical external lookup.
 fn guard_repeated_external_lookup(
     tool_call: &ToolCallRequest,
     external_lookup_counts: &Mutex<HashMap<String, usize>>,
@@ -319,7 +400,7 @@ fn guard_repeated_external_lookup(
     }
 }
 
-/// Reject calls whose arguments the provider could not parse as JSON.
+/// Stage 1: reject calls whose arguments the provider could not parse as JSON.
 fn guard_well_formed_arguments(tool_call: &ToolCallRequest) -> Result<(), ToolOutcome> {
     let Some(parse_error) = tool_call
         .arguments
@@ -365,7 +446,7 @@ fn resolve_and_validate(
     Ok((tool, cast_params))
 }
 
-/// Stage 3: write-ahead the intent so a crash during execute leaves a record.
+/// Stage 5: write-ahead the intent so a crash during execute leaves a record.
 ///
 /// Without a journal this is a no-op. In strict durability mode a failed
 /// intent write refuses the call.
@@ -391,7 +472,7 @@ fn journal_begin(
     }
 }
 
-/// Stage 4: run the tool and return its result text.
+/// Stage 6: run the tool and return its result text.
 ///
 /// A tool that panics or exceeds the timeout yields an error result instead
 /// of unwinding through the turn, so the journal still gets a terminal record.
@@ -472,7 +553,7 @@ fn panic_error(tool_name: &str, payload: &(dyn Any + Send)) -> String {
     message
 }
 
-/// Stage 5: write the terminal journal record (no-op without a journal).
+/// Stage 7: write the terminal journal record (no-op without a journal).
 fn journal_finish(spec: &AgentRunSpec, in_flight: Option<InFlightToolCall>, result: &str) {
     let Some(in_flight) = in_flight else {
         return;
@@ -489,7 +570,10 @@ fn journal_finish(spec: &AgentRunSpec, in_flight: Option<InFlightToolCall>, resu
 mod tests {
     use super::*;
     use crate::agent::circuit_breaker::{DEFAULT_N_IDENTICAL_MESSAGES, is_tripped_error};
-    use crate::agent::tools::test_support::{PanickingTool, SlowTool, spec_with_tool};
+    use crate::agent::hook::AgentHook;
+    use crate::agent::tools::test_support::{
+        NamedTool, PanickingTool, ScriptedTool, SlowTool, spec_with_tool,
+    };
 
     fn call(name: &str, arguments: &[(&str, &str)]) -> ToolCallRequest {
         ToolCallRequest {
@@ -789,5 +873,157 @@ mod tests {
     fn configured_seconds_zero_means_no_timeout() {
         assert_eq!(tool_timeout_from_seconds(0), None);
         assert_eq!(tool_timeout_from_seconds(30), Some(Duration::from_secs(30)));
+    }
+
+    // ── authorize stage ───────────────────────────────────────────────────────
+
+    /// What an [`AuthorizingHook`] was asked: tool name, arguments, channel, chat id.
+    type Asked = (String, Value, Option<String>, Option<String>);
+
+    /// Hook that answers every authorization with `decision` and records the request.
+    struct AuthorizingHook {
+        decision: CallDecision,
+        asked: Arc<Mutex<Vec<Asked>>>,
+    }
+
+    impl AuthorizingHook {
+        fn new(decision: CallDecision) -> (Arc<Self>, Arc<Mutex<Vec<Asked>>>) {
+            let asked = Arc::new(Mutex::new(Vec::new()));
+            let hook = Arc::new(Self {
+                decision,
+                asked: Arc::clone(&asked),
+            });
+            (hook, asked)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for AuthorizingHook {
+        async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
+            self.asked.lock().unwrap().push((
+                request.tool_name.to_string(),
+                request.arguments.clone(),
+                request.channel.map(str::to_string),
+                request.chat_id.map(str::to_string),
+            ));
+            self.decision.clone()
+        }
+    }
+
+    /// Hook whose `authorize_call` panics.
+    struct PanickingAuthorizer;
+
+    #[async_trait::async_trait]
+    impl AgentHook for PanickingAuthorizer {
+        async fn authorize_call(&self, _: &ToolCallAuthorization<'_>) -> CallDecision {
+            panic!("deliberate panic");
+        }
+    }
+
+    fn scripted_spec_with_hook(hook: Arc<dyn AgentHook>) -> AgentRunSpec {
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: "ran".into(),
+        });
+        spec.hook = Some(hook);
+        spec
+    }
+
+    #[tokio::test]
+    async fn the_hook_is_asked_with_the_validated_call_and_its_turn() {
+        let (hook, asked) = AuthorizingHook::new(CallDecision::Allow);
+        let mut spec = scripted_spec_with_hook(hook);
+        spec.channel = Some("websocket".into());
+        spec.chat_id = Some("chat-7".into());
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a.txt")])).await;
+
+        assert_eq!(outcome.content(), "ran");
+        assert_eq!(
+            asked.lock().unwrap().as_slice(),
+            [(
+                "scripted".to_string(),
+                serde_json::json!({"path": "a.txt"}),
+                Some("websocket".to_string()),
+                Some("chat-7".to_string()),
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn a_denied_call_is_blocked_not_run_and_never_fatal() {
+        let (hook, _) = AuthorizingHook::new(CallDecision::deny("no way"));
+        let mut spec = scripted_spec_with_hook(hook);
+        spec.fail_on_tool_error = true;
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a.txt")])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Blocked);
+        assert_eq!(
+            outcome.content(),
+            "Error: tool call blocked by hook: no way"
+        );
+        assert_eq!(outcome.fatal(), None, "a denial is not a tool failure");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_authorize_hook_denies_the_call() {
+        let spec = scripted_spec_with_hook(Arc::new(PanickingAuthorizer));
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a.txt")])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Blocked);
+        assert!(outcome.content().contains(HOOK_PANIC_DENY_REASON));
+    }
+
+    #[tokio::test]
+    async fn an_invalid_call_is_rejected_before_the_hook_is_asked() {
+        let (hook, asked) = AuthorizingHook::new(CallDecision::Allow);
+        let spec = scripted_spec_with_hook(hook);
+
+        // `path` is required.
+        let outcome = run(&spec, &call("scripted", &[])).await;
+        let unknown = run(&spec, &call("ghost", &[])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Error);
+        assert_eq!(unknown.status(), ToolStatus::Error);
+        assert!(asked.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn denied_calls_do_not_count_towards_the_circuit_breaker() {
+        let (hook, _) = AuthorizingHook::new(CallDecision::deny("no"));
+        let mut spec = spec_with_tool(NamedTool {
+            name: "message".into(),
+        });
+        spec.hook = Some(hook);
+        let request = call("message", &[("content", "same")]);
+
+        for _ in 0..DEFAULT_N_IDENTICAL_MESSAGES * 2 {
+            let outcome = run(&spec, &request).await;
+            assert_eq!(
+                outcome.status(),
+                ToolStatus::Blocked,
+                "a denied send is not a send, so the breaker must never trip"
+            );
+        }
+
+        // The same repeated sends do trip it once they are allowed.
+        spec.hook = None;
+        let breaker = Arc::new(Mutex::new(MessageCircuitBreaker::new(
+            DEFAULT_N_IDENTICAL_MESSAGES,
+        )));
+        let mut last = None;
+        for _ in 0..DEFAULT_N_IDENTICAL_MESSAGES {
+            last = Some(
+                run_tool_call(
+                    &spec,
+                    &request,
+                    Arc::new(Mutex::new(HashMap::new())),
+                    Arc::clone(&breaker),
+                )
+                .await,
+            );
+        }
+        assert!(is_tripped_error(last.unwrap().fatal().unwrap()));
     }
 }

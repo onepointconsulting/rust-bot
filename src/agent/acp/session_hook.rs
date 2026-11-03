@@ -1,10 +1,10 @@
 //! Agent-loop hook that turns tool activity into ACP events and asks the
 //! client for permission, failing closed.
 //!
-//! * `before_execute_tools`: one `tool_call` per call, then
-//!   `session/request_permission` for kinds that need approval. A refused,
-//!   cancelled, failed or unanswered request **denies** the call; nobody
-//!   answering never means "allow".
+//! * `on_tool_calls`: one `tool_call` per call of the batch.
+//! * `authorize_call`: `session/request_permission` for kinds that need approval,
+//!   then an `in_progress` update. A refused, cancelled, failed or unanswered
+//!   request **denies** the call; nobody answering never means "allow".
 //! * `after_iteration`: one `tool_call_update` per call with status and result.
 
 use std::sync::Arc;
@@ -24,7 +24,7 @@ use super::mapping::{
     requires_permission, tool_kind_for, tool_locations, tool_result_text,
 };
 use super::registry::SessionRegistry;
-use crate::agent::hook::{AgentHook, AgentHookContext, ToolHookDecision};
+use crate::agent::hook::{AgentHook, AgentHookContext, CallDecision, ToolCallAuthorization};
 use crate::providers::base::ToolCallRequest;
 use crate::utils::tool_hints::format_tool_hints;
 
@@ -62,9 +62,9 @@ impl AcpSessionHook {
     }
 
     /// ACP session id of the turn, or `None` for turns that are not ACP turns.
-    fn session_id(context: &AgentHookContext) -> Option<String> {
-        if context.channel.as_deref() == Some(ACP_CHANNEL) {
-            context.chat_id.clone()
+    fn session_id(channel: Option<&str>, chat_id: Option<&str>) -> Option<String> {
+        if channel == Some(ACP_CHANNEL) {
+            chat_id.map(str::to_string)
         } else {
             None
         }
@@ -108,6 +108,22 @@ impl AcpSessionHook {
     }
 }
 
+/// The call being authorized, as the ACP mapping helpers take it.
+fn tool_call_request_from(request: &ToolCallAuthorization<'_>) -> ToolCallRequest {
+    ToolCallRequest {
+        id: request.call_id.to_string(),
+        name: request.tool_name.to_string(),
+        arguments: request
+            .arguments
+            .as_object()
+            .map(|map| map.clone().into_iter().collect())
+            .unwrap_or_default(),
+        extra_content: None,
+        provider_specific_fields: None,
+        function_provider_specific_fields: None,
+    }
+}
+
 /// Build the `session/request_permission` request for one tool call.
 pub fn build_permission_request(
     session_id: &str,
@@ -146,54 +162,55 @@ pub fn outcome_is_allow(outcome: &RequestPermissionOutcome) -> bool {
 
 #[async_trait]
 impl AgentHook for AcpSessionHook {
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
-        let Some(session_id) = Self::session_id(context) else {
-            return ToolHookDecision::Continue;
+    async fn on_tool_calls(&self, context: &mut AgentHookContext) {
+        let Some(session_id) =
+            Self::session_id(context.channel.as_deref(), context.chat_id.as_deref())
+        else {
+            return;
         };
         let base_dir = self.registry.cwd_of(&session_id);
-        let mut denied_ids = Vec::new();
-
         for call in &context.tool_calls {
             self.notify(
                 &session_id,
                 SessionUpdate::ToolCall(build_tool_call(call, base_dir.as_deref())),
             )
             .await;
-
-            let kind = tool_kind_for(&call.name);
-            if requires_permission(kind, self.confirm_before_execute)
-                && !self
-                    .permission_granted(&session_id, call, base_dir.as_deref())
-                    .await
-            {
-                // The runner answers denied calls with a synthetic result;
-                // `after_iteration` reports it to the client as failed.
-                denied_ids.push(call.id.clone());
-                continue;
-            }
-
-            self.notify(
-                &session_id,
-                SessionUpdate::ToolCallUpdate(build_status_update(
-                    &call.id,
-                    ToolCallStatus::InProgress,
-                )),
-            )
-            .await;
-        }
-
-        if denied_ids.is_empty() {
-            ToolHookDecision::Continue
-        } else {
-            ToolHookDecision::DenyCalls {
-                ids: denied_ids,
-                reason: DENIED_REASON.to_string(),
-            }
         }
     }
 
+    async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
+        let Some(session_id) = Self::session_id(request.channel, request.chat_id) else {
+            return CallDecision::Allow;
+        };
+        let base_dir = self.registry.cwd_of(&session_id);
+        let call = tool_call_request_from(request);
+
+        let kind = tool_kind_for(&call.name);
+        if requires_permission(kind, self.confirm_before_execute)
+            && !self
+                .permission_granted(&session_id, &call, base_dir.as_deref())
+                .await
+        {
+            // The runner answers a denied call with a synthetic result;
+            // `after_iteration` reports it to the client as failed.
+            return CallDecision::deny(DENIED_REASON);
+        }
+
+        self.notify(
+            &session_id,
+            SessionUpdate::ToolCallUpdate(build_status_update(
+                &call.id,
+                ToolCallStatus::InProgress,
+            )),
+        )
+        .await;
+        CallDecision::Allow
+    }
+
     async fn after_iteration(&self, context: &mut AgentHookContext) {
-        let Some(session_id) = Self::session_id(context) else {
+        let Some(session_id) =
+            Self::session_id(context.channel.as_deref(), context.chat_id.as_deref())
+        else {
             return;
         };
         // Events line up with calls one-to-one; if they ever do not, fall back
@@ -334,6 +351,26 @@ mod tests {
         context
     }
 
+    /// Announce the batch, then authorize each call in order, as the runner does.
+    async fn decide(hook: &AcpSessionHook, context: &mut AgentHookContext) -> Vec<CallDecision> {
+        hook.on_tool_calls(context).await;
+        let mut decisions = Vec::new();
+        for call in context.tool_calls.clone() {
+            let arguments = Value::Object(call.arguments.clone().into_iter().collect());
+            decisions.push(
+                hook.authorize_call(&ToolCallAuthorization {
+                    call_id: &call.id,
+                    tool_name: &call.name,
+                    arguments: &arguments,
+                    channel: context.channel.as_deref(),
+                    chat_id: context.chat_id.as_deref(),
+                })
+                .await,
+            );
+        }
+        decisions
+    }
+
     fn tool_call_ids(updates: &[SessionUpdate]) -> Vec<String> {
         updates
             .iter()
@@ -350,9 +387,9 @@ mod tests {
         let hook = hook_with(&link, false);
         let mut context = acp_context(vec![call("c1", "read_file", json!({"path": "a.txt"}))]);
 
-        let decision = hook.before_execute_tools(&mut context).await;
+        let decisions = decide(&hook, &mut context).await;
 
-        assert_eq!(decision, ToolHookDecision::Continue);
+        assert_eq!(decisions, vec![CallDecision::Allow]);
         assert_eq!(link.permission_request_count(), 0);
         let updates = link.updates();
         assert_eq!(tool_call_ids(&updates), vec!["c1"]);
@@ -376,9 +413,9 @@ mod tests {
         let hook = hook_with(&link, false);
         let mut context = acp_context(vec![call("c1", "shell", json!({"command": "ls"}))]);
 
-        let decision = hook.before_execute_tools(&mut context).await;
+        let decisions = decide(&hook, &mut context).await;
 
-        assert_eq!(decision, ToolHookDecision::Continue);
+        assert_eq!(decisions, vec![CallDecision::Allow]);
         assert_eq!(link.permission_request_count(), 1);
     }
 
@@ -388,12 +425,9 @@ mod tests {
         let hook = hook_with(&link, false);
         let mut context = acp_context(vec![call("c1", "shell", json!({"command": "ls"}))]);
 
-        let decision = hook.before_execute_tools(&mut context).await;
+        let decisions = decide(&hook, &mut context).await;
 
-        assert!(matches!(
-            decision,
-            ToolHookDecision::DenyCalls { ref ids, .. } if ids == &vec!["c1".to_string()]
-        ));
+        assert_eq!(decisions, vec![CallDecision::deny(DENIED_REASON)]);
     }
 
     #[tokio::test]
@@ -403,10 +437,11 @@ mod tests {
             let hook = hook_with(&link, false);
             let mut context = acp_context(vec![call("c1", "shell", json!({"command": "ls"}))]);
 
-            let decision = hook.before_execute_tools(&mut context).await;
+            let decisions = decide(&hook, &mut context).await;
 
-            assert!(
-                matches!(decision, ToolHookDecision::DenyCalls { .. }),
+            assert_eq!(
+                decisions,
+                vec![CallDecision::deny(DENIED_REASON)],
                 "must fail closed"
             );
         }
@@ -418,10 +453,10 @@ mod tests {
         let hook = hook_with(&link, true);
         let mut context = acp_context(vec![call("c1", "read_file", json!({"path": "a.txt"}))]);
 
-        let decision = hook.before_execute_tools(&mut context).await;
+        let decisions = decide(&hook, &mut context).await;
 
         assert_eq!(link.permission_request_count(), 1);
-        assert!(matches!(decision, ToolHookDecision::DenyCalls { .. }));
+        assert_eq!(decisions, vec![CallDecision::deny(DENIED_REASON)]);
     }
 
     #[tokio::test]
@@ -433,12 +468,12 @@ mod tests {
             call("c2", "shell", json!({"command": "ls"})),
         ]);
 
-        let decision = hook.before_execute_tools(&mut context).await;
+        let decisions = decide(&hook, &mut context).await;
 
-        assert!(matches!(
-            decision,
-            ToolHookDecision::DenyCalls { ref ids, .. } if ids == &vec!["c2".to_string()]
-        ));
+        assert_eq!(
+            decisions,
+            vec![CallDecision::Allow, CallDecision::deny(DENIED_REASON)]
+        );
         assert_eq!(tool_call_ids(&link.updates()), vec!["c1", "c2"]);
     }
 
@@ -449,9 +484,9 @@ mod tests {
         let mut context = acp_context(vec![call("c1", "shell", json!({"command": "ls"}))]);
         context.channel = Some("websocket".to_string());
 
-        let decision = hook.before_execute_tools(&mut context).await;
+        let decisions = decide(&hook, &mut context).await;
 
-        assert_eq!(decision, ToolHookDecision::Continue);
+        assert_eq!(decisions, vec![CallDecision::Allow]);
         assert!(link.updates().is_empty());
         assert_eq!(link.permission_request_count(), 0);
     }
@@ -462,7 +497,7 @@ mod tests {
         let hook = hook_with(&link, false);
         let mut context = acp_context(vec![call("c9", "shell", json!({"command": "ls"}))]);
 
-        hook.before_execute_tools(&mut context).await;
+        decide(&hook, &mut context).await;
 
         let requests = link.permission_requests.lock().unwrap();
         let request = &requests[0];

@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 use std::io::IsTerminal;
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
@@ -7,7 +6,7 @@ use async_trait::async_trait;
 use futures::lock::Mutex;
 use inquire::Confirm;
 
-use crate::agent::hook::{AgentHook, AgentHookContext, ToolHookDecision};
+use crate::agent::hook::{AgentHook, CallDecision, ToolCallAuthorization};
 use crate::agent::tool_approval::{self, ToolApprovalBroker, ToolApprovalCall};
 use crate::bus::outbound_events::{
     OutboundEvent, ToolApprovalRequestEvent, outbound_message_for_event,
@@ -17,11 +16,12 @@ use crate::channels::websocket::CHANNEL_NAME as WEBSOCKET_CHANNEL;
 use crate::cli::cancel::pause_for_prompt;
 use crate::cli::stream::StreamRenderer;
 use crate::integrations::herdr::HerdrReporter;
-use crate::providers::base::ToolCallRequest;
 
 const ARG_PREVIEW_LIMIT: usize = 120;
-/// How long a WebSocket approval request waits before denying the batch.
+/// How long a WebSocket approval request waits before denying the call.
 const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
+/// Reason shown to the model when the user declined (or never answered).
+const USER_DENIED_REASON: &str = "User denied tool execution";
 
 /// CLI-only hook that asks before each tool call when stdin is a terminal.
 pub struct CliAskHook {
@@ -53,8 +53,19 @@ impl CliAskHook {
     }
 }
 
-fn preview_arguments(arguments: &HashMap<String, serde_json::Value>) -> String {
+fn preview_arguments(arguments: &serde_json::Value) -> String {
     tool_approval::preview_arguments(arguments, ARG_PREVIEW_LIMIT)
+}
+
+/// Denial for a call that needs confirmation when nobody can be asked.
+///
+/// Confirmation being switched on means no call may run unconfirmed, so a
+/// missing way to ask is a refusal, never a pass.
+fn unanswerable(why: &str) -> CallDecision {
+    log::warn!("tools.confirmBeforeExecute is enabled but {why}; denying the tool call");
+    CallDecision::deny(format!(
+        "confirmation is required (tools.confirmBeforeExecute) but {why}, so the call was not run"
+    ))
 }
 
 fn prompt_for_tool(name: &str, args_preview: &str) -> Result<bool, inquire::InquireError> {
@@ -69,41 +80,11 @@ fn prompt_for_tool(name: &str, args_preview: &str) -> Result<bool, inquire::Inqu
         .prompt()
 }
 
-fn prompt_tool_calls(tool_calls: &[ToolCallRequest]) -> Vec<String> {
-    let mut denied_ids = Vec::new();
-    for tool_call in tool_calls {
-        let args_preview = preview_arguments(&tool_call.arguments);
-        let approved = prompt_for_tool(&tool_call.name, &args_preview);
-        if !matches!(approved, Ok(true)) {
-            denied_ids.push(tool_call.id.clone());
-        }
-    }
-    denied_ids
-}
-
-fn decision_from_denied_ids(ids: Vec<String>) -> ToolHookDecision {
-    if ids.is_empty() {
-        ToolHookDecision::Continue
-    } else {
-        ToolHookDecision::DenyCalls {
-            ids,
-            reason: "User denied tool execution".into(),
-        }
-    }
-}
-
 #[async_trait]
 impl AgentHook for CliAskHook {
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
-        if context.tool_calls.is_empty() {
-            return ToolHookDecision::Continue;
-        }
-
+    async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
         if !std::io::stdin().is_terminal() {
-            log::warn!(
-                "tools.confirmBeforeExecute is enabled but stdin is not a terminal; executing tools without prompts"
-            );
-            return ToolHookDecision::Continue;
+            return unanswerable("stdin is not a terminal");
         }
 
         if let Some(renderer) = self.renderer() {
@@ -111,22 +92,20 @@ impl AgentHook for CliAskHook {
         }
         self.herdr.report_blocked(None);
         let _pause = pause_for_prompt();
-        let tool_calls = context.tool_calls.clone();
-        let denied_ids = tokio::task::spawn_blocking(move || prompt_tool_calls(&tool_calls))
-            .await
-            .unwrap_or_else(|_| {
-                context
-                    .tool_calls
-                    .iter()
-                    .map(|tool_call| tool_call.id.clone())
-                    .collect()
-            });
+        let tool_name = request.tool_name.to_string();
+        let arguments_preview = preview_arguments(request.arguments);
+        let approved =
+            tokio::task::spawn_blocking(move || prompt_for_tool(&tool_name, &arguments_preview))
+                .await;
         drop(_pause);
         self.herdr.report_working();
         if let Some(renderer) = self.renderer() {
             renderer.lock().await.resume_after_input();
         }
-        decision_from_denied_ids(denied_ids)
+        match approved {
+            Ok(Ok(true)) => CallDecision::Allow,
+            _ => CallDecision::deny(USER_DENIED_REASON),
+        }
     }
 }
 
@@ -175,43 +154,21 @@ impl Drop for PendingGuard<'_> {
     }
 }
 
-fn denied_ids_from_approved(tool_calls: &[ToolCallRequest], approved: &[String]) -> Vec<String> {
-    tool_calls
-        .iter()
-        .filter(|call| !approved.contains(&call.id))
-        .map(|call| call.id.clone())
-        .collect()
-}
-
 #[async_trait]
 impl AgentHook for WebsocketsAskHook {
-    async fn before_execute_tools(&self, context: &mut AgentHookContext) -> ToolHookDecision {
-        if context.tool_calls.is_empty() {
-            return ToolHookDecision::Continue;
-        }
-        let chat_id = match (context.channel.as_deref(), context.chat_id.as_deref()) {
+    async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
+        let chat_id = match (request.channel, request.chat_id) {
             (Some(WEBSOCKET_CHANNEL), Some(chat_id)) if !chat_id.is_empty() => chat_id.to_string(),
             (channel, _) => {
-                log::warn!(
-                    "tools.confirmBeforeExecute is enabled but channel {:?} cannot prompt; executing tools without confirmation",
-                    channel
-                );
-                return ToolHookDecision::Continue;
+                return unanswerable(&format!("channel {channel:?} cannot ask for it"));
             }
         };
         let Some(bus) = self.bus() else {
-            log::warn!(
-                "tools.confirmBeforeExecute is enabled but no bus is wired; executing tools without confirmation"
-            );
-            return ToolHookDecision::Continue;
+            return unanswerable("no bus is wired to ask through");
         };
 
-        let calls: Vec<ToolApprovalCall> = context
-            .tool_calls
-            .iter()
-            .map(ToolApprovalCall::from_request)
-            .collect();
-        let (request_id, rx) = self.broker.register(&chat_id, calls.clone());
+        let call = ToolApprovalCall::from_authorization(request);
+        let (request_id, rx) = self.broker.register(&chat_id, vec![call.clone()]);
         let _guard = PendingGuard {
             broker: &self.broker,
             request_id: request_id.clone(),
@@ -221,27 +178,29 @@ impl AgentHook for WebsocketsAskHook {
             &chat_id,
             OutboundEvent::ToolApprovalRequest(ToolApprovalRequestEvent {
                 request_id: request_id.clone(),
-                calls,
+                calls: vec![call],
             }),
             None,
             None,
         );
         if let Err(e) = bus.publish_outbound(outbound) {
             log::error!("Failed to publish tool approval request: {e}");
-            return decision_from_denied_ids(
-                context.tool_calls.iter().map(|c| c.id.clone()).collect(),
-            );
+            return CallDecision::deny(USER_DENIED_REASON);
         }
 
         let approved = match tokio::time::timeout(self.timeout, rx).await {
             Ok(Ok(approved)) => approved,
             Ok(Err(_)) => Vec::new(),
             Err(_) => {
-                log::warn!("Tool approval request {request_id} timed out; denying all calls");
+                log::warn!("Tool approval request {request_id} timed out; denying the call");
                 Vec::new()
             }
         };
-        decision_from_denied_ids(denied_ids_from_approved(&context.tool_calls, &approved))
+        if approved.iter().any(|id| id == request.call_id) {
+            CallDecision::Allow
+        } else {
+            CallDecision::deny(USER_DENIED_REASON)
+        }
     }
 }
 
@@ -249,28 +208,24 @@ impl AgentHook for WebsocketsAskHook {
 mod tests {
     use super::*;
 
-    fn make_tool_call(
-        id: &str,
-        name: &str,
-        arguments: HashMap<String, serde_json::Value>,
-    ) -> ToolCallRequest {
-        ToolCallRequest {
-            id: id.to_string(),
-            name: name.to_string(),
+    /// An authorization request for call `call_id` of tool `exec` in `channel`/`chat_id`.
+    fn request<'a>(
+        arguments: &'a serde_json::Value,
+        channel: Option<&'a str>,
+        chat_id: Option<&'a str>,
+    ) -> ToolCallAuthorization<'a> {
+        ToolCallAuthorization {
+            call_id: "a",
+            tool_name: "exec",
             arguments,
-            extra_content: None,
-            provider_specific_fields: None,
-            function_provider_specific_fields: None,
+            channel,
+            chat_id,
         }
     }
 
     #[test]
     fn preview_arguments_truncates_long_payloads() {
-        let mut arguments = HashMap::new();
-        arguments.insert(
-            "content".to_string(),
-            serde_json::Value::String("x".repeat(200)),
-        );
+        let arguments = serde_json::json!({"content": "x".repeat(200)});
         let preview = preview_arguments(&arguments);
         assert!(preview.ends_with("..."));
         assert!(preview.chars().count() <= ARG_PREVIEW_LIMIT + 3);
@@ -278,59 +233,29 @@ mod tests {
 
     #[test]
     fn preview_arguments_keeps_short_payloads() {
-        let mut arguments = HashMap::new();
-        arguments.insert("path".to_string(), serde_json::json!("/tmp/foo.txt"));
+        let arguments = serde_json::json!({"path": "/tmp/foo.txt"});
         assert_eq!(
             preview_arguments(&arguments),
             serde_json::to_string(&arguments).unwrap()
         );
     }
 
-    #[test]
-    fn decision_from_denied_ids_continue_when_empty() {
-        assert_eq!(
-            decision_from_denied_ids(Vec::new()),
-            ToolHookDecision::Continue
-        );
-    }
-
-    #[test]
-    fn decision_from_denied_ids_collects_only_declined_calls() {
-        assert_eq!(
-            decision_from_denied_ids(vec!["call_2".into(), "call_3".into()]),
-            ToolHookDecision::DenyCalls {
-                ids: vec!["call_2".into(), "call_3".into()],
-                reason: "User denied tool execution".into(),
-            }
-        );
-    }
-
     #[tokio::test]
-    async fn skips_prompts_when_stdin_is_not_a_terminal() {
+    async fn denies_when_stdin_is_not_a_terminal() {
         if std::io::stdin().is_terminal() {
             return;
         }
         let hook = CliAskHook::new(HerdrReporter::disabled_for_test());
-        let mut ctx = AgentHookContext::new(0, vec![]);
-        ctx.tool_calls.push(make_tool_call(
-            "call_1",
-            "read_file",
-            HashMap::from([("path".to_string(), serde_json::json!("/tmp/foo.txt"))]),
-        ));
-        let decision = hook.before_execute_tools(&mut ctx).await;
-        assert_eq!(decision, ToolHookDecision::Continue);
-        assert_eq!(ctx.tool_calls.len(), 1);
-    }
+        let arguments = serde_json::json!({"path": "/tmp/foo.txt"});
 
-    fn websocket_ctx(ids: &[&str]) -> AgentHookContext {
-        let mut ctx = AgentHookContext::new(0, vec![]);
-        ctx.channel = Some(WEBSOCKET_CHANNEL.to_string());
-        ctx.chat_id = Some("chat-1".to_string());
-        for id in ids {
-            ctx.tool_calls
-                .push(make_tool_call(id, "exec", HashMap::new()));
-        }
-        ctx
+        let decision = hook
+            .authorize_call(&request(&arguments, Some("cli"), Some("direct")))
+            .await;
+
+        let CallDecision::Deny { reason } = decision else {
+            panic!("a question nobody can answer must deny");
+        };
+        assert!(reason.contains("stdin is not a terminal"), "got {reason:?}");
     }
 
     fn websocket_hook(
@@ -342,17 +267,12 @@ mod tests {
         (Arc::new(hook), bus)
     }
 
-    /// Run the hook, answering the request it publishes with `answer`.
-    async fn run_with_answer(
-        ids: &[&str],
-        answer: Option<Vec<String>>,
-        timeout: Duration,
-    ) -> ToolHookDecision {
+    /// Run the hook for call `a`, answering the request it publishes with `answer`.
+    async fn run_with_answer(answer: Option<Vec<String>>, timeout: Duration) -> CallDecision {
         let broker = Arc::new(ToolApprovalBroker::new());
         let bus = Arc::new(MessageBus::new());
         let hook = WebsocketsAskHook::new(Arc::clone(&broker)).with_timeout(timeout);
         hook.set_bus(Arc::clone(&bus));
-        let mut ctx = websocket_ctx(ids);
         let responder = {
             let broker = Arc::clone(&broker);
             let bus = Arc::clone(&bus);
@@ -363,6 +283,8 @@ mod tests {
                 let Some(OutboundEvent::ToolApprovalRequest(event)) = msg.event else {
                     panic!("expected tool approval request");
                 };
+                assert_eq!(event.calls.len(), 1, "one request per call");
+                assert_eq!(event.calls[0].id, "a");
                 if let Some(approved) = answer {
                     broker
                         .resolve("chat-1", &event.request_id, approved)
@@ -370,53 +292,45 @@ mod tests {
                 }
             })
         };
-        let decision = hook.before_execute_tools(&mut ctx).await;
+        let arguments = serde_json::json!({});
+        let decision = hook
+            .authorize_call(&request(
+                &arguments,
+                Some(WEBSOCKET_CHANNEL),
+                Some("chat-1"),
+            ))
+            .await;
         responder.await.unwrap();
         assert!(broker.pending_for_chat("chat-1").is_empty());
         decision
     }
 
-    #[tokio::test]
-    async fn websocket_hook_continues_when_all_approved() {
-        let decision = run_with_answer(
-            &["a", "b"],
-            Some(vec!["a".into(), "b".into()]),
-            Duration::from_secs(5),
-        )
-        .await;
-        assert_eq!(decision, ToolHookDecision::Continue);
+    fn user_denied() -> CallDecision {
+        CallDecision::deny(USER_DENIED_REASON)
     }
 
     #[tokio::test]
-    async fn websocket_hook_denies_unapproved_calls() {
-        let decision =
-            run_with_answer(&["a", "b"], Some(vec!["b".into()]), Duration::from_secs(5)).await;
-        assert_eq!(
-            decision,
-            ToolHookDecision::DenyCalls {
-                ids: vec!["a".into()],
-                reason: "User denied tool execution".into(),
-            }
-        );
+    async fn websocket_hook_allows_an_approved_call() {
+        let decision = run_with_answer(Some(vec!["a".into()]), Duration::from_secs(5)).await;
+        assert_eq!(decision, CallDecision::Allow);
     }
 
     #[tokio::test]
-    async fn websocket_hook_denies_all_on_timeout() {
-        let decision = run_with_answer(&["a", "b"], None, Duration::from_millis(50)).await;
-        assert_eq!(
-            decision,
-            ToolHookDecision::DenyCalls {
-                ids: vec!["a".into(), "b".into()],
-                reason: "User denied tool execution".into(),
-            }
-        );
+    async fn websocket_hook_denies_a_call_missing_from_the_answer() {
+        let decision = run_with_answer(Some(vec!["b".into()]), Duration::from_secs(5)).await;
+        assert_eq!(decision, user_denied());
     }
 
     #[tokio::test]
-    async fn websocket_hook_denies_all_when_request_cancelled() {
+    async fn websocket_hook_denies_on_timeout() {
+        let decision = run_with_answer(None, Duration::from_millis(50)).await;
+        assert_eq!(decision, user_denied());
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_denies_when_request_cancelled() {
         let broker = Arc::new(ToolApprovalBroker::new());
         let (hook, bus) = websocket_hook(&broker);
-        let mut ctx = websocket_ctx(&["a"]);
         let canceller = {
             let broker = Arc::clone(&broker);
             tokio::spawn(async move {
@@ -427,21 +341,66 @@ mod tests {
                 broker.cancel(&event.request_id);
             })
         };
-        let decision = hook.before_execute_tools(&mut ctx).await;
+        let arguments = serde_json::json!({});
+        let decision = hook
+            .authorize_call(&request(
+                &arguments,
+                Some(WEBSOCKET_CHANNEL),
+                Some("chat-1"),
+            ))
+            .await;
         canceller.await.unwrap();
-        assert!(matches!(decision, ToolHookDecision::DenyCalls { .. }));
+        assert_eq!(decision, user_denied());
     }
 
     #[tokio::test]
-    async fn websocket_hook_skips_non_websocket_channels() {
+    async fn websocket_hook_denies_calls_of_channels_that_cannot_ask() {
         let broker = Arc::new(ToolApprovalBroker::new());
         let (hook, bus) = websocket_hook(&broker);
-        let mut ctx = websocket_ctx(&["a"]);
-        ctx.channel = Some("cli".into());
-        assert_eq!(
-            hook.before_execute_tools(&mut ctx).await,
-            ToolHookDecision::Continue
-        );
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&request(&arguments, Some("cli"), Some("chat-1")))
+            .await;
+
+        let CallDecision::Deny { reason } = decision else {
+            panic!("a channel that cannot ask must be denied, not waved through");
+        };
+        assert!(reason.contains("cannot ask for it"), "got {reason:?}");
         assert_eq!(bus.outbound_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_denies_a_websocket_turn_without_a_chat_id() {
+        let broker = Arc::new(ToolApprovalBroker::new());
+        let (hook, bus) = websocket_hook(&broker);
+        let arguments = serde_json::json!({});
+
+        for chat_id in [None, Some("")] {
+            let decision = hook
+                .authorize_call(&request(&arguments, Some(WEBSOCKET_CHANNEL), chat_id))
+                .await;
+            assert!(!decision.is_allowed());
+        }
+        assert_eq!(bus.outbound_size(), 0);
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_denies_when_no_bus_is_wired() {
+        let hook = WebsocketsAskHook::new(Arc::new(ToolApprovalBroker::new()));
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&request(
+                &arguments,
+                Some(WEBSOCKET_CHANNEL),
+                Some("chat-1"),
+            ))
+            .await;
+
+        let CallDecision::Deny { reason } = decision else {
+            panic!("no bus means nobody can be asked");
+        };
+        assert!(reason.contains("no bus is wired"), "got {reason:?}");
     }
 }
