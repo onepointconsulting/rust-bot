@@ -74,6 +74,11 @@ pub enum ToolHookDecision {
 /// [`AgentRunResult::stop_reason`] when a hook aborts tool execution.
 pub const HOOK_ABORT_STOP_REASON: &str = "hook_abort";
 
+/// Denial reason used when a `before_execute_tools` hook panics. The hook is a
+/// gate, so a panic fails closed instead of letting the tools run unchecked.
+pub const HOOK_PANIC_DENY_REASON: &str =
+    "A tool-approval hook panicked; tool calls were blocked for safety";
+
 impl ToolHookDecision {
     /// Fail-closed reduction used by composite / chained hooks.
     ///
@@ -282,12 +287,17 @@ impl AgentHook for CompositeHook {
                         return acc;
                     }
                 }
-                Err(e) => log::error!(
-                    "AgentHook.before_execute_tools panicked: {:?}",
-                    e.downcast_ref::<&str>()
-                        .copied()
-                        .unwrap_or("(non-string panic)")
-                ),
+                Err(e) => {
+                    log::error!(
+                        "AgentHook.before_execute_tools panicked: {:?}",
+                        e.downcast_ref::<&str>()
+                            .copied()
+                            .unwrap_or("(non-string panic)")
+                    );
+                    acc = acc.merge(ToolHookDecision::Deny {
+                        reason: HOOK_PANIC_DENY_REASON.into(),
+                    });
+                }
             }
         }
         acc
@@ -878,6 +888,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn test_composite_panicking_hook_fails_closed_before_execute_tools() {
+        let composite = CompositeHook::new(vec![Arc::new(PanickingHook)]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Deny {
+                reason: HOOK_PANIC_DENY_REASON.into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_composite_panicking_hook_still_runs_later_hooks_before_execute_tools() {
+        let later = Arc::new(Mutex::new(Vec::<String>::new()));
+        let composite = CompositeHook::new(vec![
+            Arc::new(PanickingHook),
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::Continue,
+                calls: Arc::clone(&later),
+            }),
+        ]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Deny {
+                reason: HOOK_PANIC_DENY_REASON.into()
+            }
+        );
+        assert_eq!(later.lock().unwrap().as_slice(), ["before_execute_tools"]);
+    }
+
+    #[tokio::test]
+    async fn test_composite_later_abort_overrides_panic_deny() {
+        let composite = CompositeHook::new(vec![
+            Arc::new(PanickingHook),
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::Abort {
+                    reason: "stop".into(),
+                },
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+        ]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Abort {
+                reason: "stop".into()
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn test_composite_panic_deny_dominates_later_deny_calls() {
+        let composite = CompositeHook::new(vec![
+            Arc::new(PanickingHook),
+            Arc::new(DecisionHook {
+                decision: ToolHookDecision::DenyCalls {
+                    ids: vec!["a".into()],
+                    reason: "one".into(),
+                },
+                calls: Arc::new(Mutex::new(Vec::new())),
+            }),
+        ]);
+        let mut ctx = make_ctx();
+        let decision = composite.before_execute_tools(&mut ctx).await;
+        assert_eq!(
+            decision,
+            ToolHookDecision::Deny {
+                reason: HOOK_PANIC_DENY_REASON.into()
+            }
+        );
+    }
+
+    #[tokio::test]
     async fn test_composite_panicking_hook_isolated_before_execute_tools() {
         let later = Arc::new(Mutex::new(Vec::<String>::new()));
         let composite = CompositeHook::new(vec![
@@ -891,10 +978,11 @@ mod tests {
         ]);
         let mut ctx = make_ctx();
         let decision = composite.before_execute_tools(&mut ctx).await;
+        // The panic's Deny is merged first, and the first Deny wins.
         assert_eq!(
             decision,
             ToolHookDecision::Deny {
-                reason: "blocked".into()
+                reason: HOOK_PANIC_DENY_REASON.into()
             }
         );
         assert_eq!(later.lock().unwrap().as_slice(), ["before_execute_tools"]);

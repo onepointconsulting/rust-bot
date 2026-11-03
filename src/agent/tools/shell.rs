@@ -12,6 +12,22 @@ use std::process::{Child, Command, Stdio};
 
 const IS_WINDOWS: bool = cfg!(target_os = "windows");
 
+/// Returns the error to report when a configured sandbox cannot be provided on
+/// this platform, or `None` when the sandbox can be applied.
+///
+/// A requested sandbox is a security contract, so the command must be rejected
+/// rather than silently executed unsandboxed. Users who really want
+/// unsandboxed execution have to clear `exec.sandbox`.
+fn sandbox_unavailable_error(sandbox: &str, is_windows: bool) -> Option<String> {
+    is_windows.then(|| {
+        format!(
+            "Error: sandbox '{sandbox}' is configured but is not supported on Windows; \
+             refusing to run the command unsandboxed. Clear the exec sandbox setting to \
+             allow unsandboxed execution."
+        )
+    })
+}
+
 /// Kills the process tree on drop unless [`Self::disarm`] was called.
 ///
 /// Mirrors Python's `except asyncio.CancelledError: await self._kill_process(process); raise`.
@@ -105,30 +121,26 @@ impl ShellTool {
         let mut effective_command = command.to_string();
 
         if let Some(sandbox) = &self.sandbox {
-            if IS_WINDOWS {
-                log::warn!(
-                    "Sandbox '{}' is not supported on Windows; running unsandboxed",
-                    sandbox
-                )
-            } else {
-                let workspace = tw
-                    .project_path
-                    .clone()
-                    .unwrap_or_else(|| std::env::current_dir().unwrap());
-                let command_result = wrap_command(
-                    sandbox,
-                    command,
-                    workspace.to_str().unwrap(),
-                    cwd.to_str().unwrap(),
-                    None,
-                );
-                if let Ok(command) = command_result {
-                    effective_command = command;
-                } else {
-                    return command_result.unwrap_err();
-                }
-                cwd = workspace;
+            if let Some(error) = sandbox_unavailable_error(sandbox, IS_WINDOWS) {
+                log::error!("{error}");
+                return error;
             }
+            let workspace = tw
+                .project_path
+                .clone()
+                .unwrap_or_else(|| std::env::current_dir().unwrap());
+            let command_result = wrap_command(
+                sandbox,
+                command,
+                workspace.to_str().unwrap(),
+                cwd.to_str().unwrap(),
+                None,
+            );
+            match command_result {
+                Ok(wrapped_command) => effective_command = wrapped_command,
+                Err(error) => return error,
+            }
+            cwd = workspace;
         }
         let effective_timeout = std::cmp::min(timeout.unwrap_or(self.timeout), Self::MAX_TIMEOUT);
         let mut env = Self::build_env();
@@ -619,7 +631,7 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::tools::shell::{IS_WINDOWS, ShellTool};
+    use crate::agent::tools::shell::{IS_WINDOWS, ShellTool, sandbox_unavailable_error};
     use crate::agent::workspace_context::{
         bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
     };
@@ -789,6 +801,43 @@ mod tests {
         let command = format!("cat {}", outside.display());
         let result = tool.guard_command(&command, dir.path().to_str().unwrap(), false);
         assert!(result.is_none());
+    }
+
+    #[test]
+    fn sandbox_unavailable_error_rejects_on_windows() {
+        let error = sandbox_unavailable_error("bwrap", true).expect("windows must reject");
+        assert!(error.starts_with("Error:"), "got: {error}");
+        assert!(error.contains("bwrap"), "got: {error}");
+        assert!(error.contains("unsandboxed"), "got: {error}");
+    }
+
+    #[test]
+    fn sandbox_unavailable_error_allows_other_platforms() {
+        assert!(sandbox_unavailable_error("bwrap", false).is_none());
+    }
+
+    /// On Windows a configured sandbox must block execution: the command's side
+    /// effect (creating a marker file) must not happen.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn execute_command_with_sandbox_is_rejected_on_windows() {
+        let dir = tempfile::tempdir().unwrap();
+        let marker = dir.path().join("marker.txt");
+        let tool = ShellTool::new(
+            10,
+            Some(dir.path().to_path_buf()),
+            None,
+            None,
+            false,
+            Some("bwrap".to_string()),
+            None,
+        );
+        let result = tool
+            .execute_command("echo hi > marker.txt", None, None)
+            .await;
+        assert!(result.starts_with("Error:"), "got: {result}");
+        assert!(result.contains("refusing to run"), "got: {result}");
+        assert!(!marker.exists(), "command must not have been executed");
     }
 
     #[tokio::test]
