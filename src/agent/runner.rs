@@ -3,6 +3,7 @@ use serde_json::Value;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use crate::agent::checkpoint_payload;
 use crate::agent::circuit_breaker::{
@@ -78,6 +79,9 @@ pub struct AgentRunSpec {
     /// Write-ahead journal of this turn; `None` (subagents, memory runs, tests)
     /// disables journaling entirely.
     pub journal: Option<TurnJournal>,
+    /// Longest one tool call may run; `None` (the default) means no limit.
+    /// Tools that report `exempt_from_execute_timeout` ignore it.
+    pub tool_timeout: Option<Duration>,
 }
 
 impl Default for AgentRunSpec {
@@ -106,6 +110,7 @@ impl Default for AgentRunSpec {
             progress_callback: None,
             checkpoint_callback: None,
             journal: None,
+            tool_timeout: None,
         }
     }
 }
@@ -1443,6 +1448,7 @@ impl AgentHook for NoopHook {}
 mod tests {
     use super::*;
     use crate::agent::tools::message::MessageTool;
+    use crate::agent::tools::test_support::ScriptedTool;
     use crate::bus::events::OutboundMessage;
     use crate::providers::base::{GenerationSettings, LLMProviderDyn, LLMResponse};
     use crate::providers::registry::ProviderSpec;
@@ -2472,31 +2478,6 @@ mod tests {
 
     const ERROR_HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
 
-    /// Tool that requires a `path` argument and answers with a fixed reply.
-    struct ScriptedTool {
-        reply: String,
-    }
-
-    #[async_trait::async_trait]
-    impl crate::agent::tools::base::Tool for ScriptedTool {
-        fn name(&self) -> String {
-            "scripted".into()
-        }
-        fn description(&self) -> String {
-            "scripted".into()
-        }
-        fn parameters(&self) -> serde_json::Value {
-            serde_json::json!({
-                "type": "object",
-                "properties": {"path": {"type": "string"}},
-                "required": ["path"]
-            })
-        }
-        async fn execute(&self, _: &serde_json::Value) -> String {
-            self.reply.clone()
-        }
-    }
-
     /// Spec holding one [`ScriptedTool`] that replies with `reply`.
     fn scripted_spec(reply: &str, fail_on_tool_error: bool) -> AgentRunSpec {
         AgentRunSpec {
@@ -3498,6 +3479,39 @@ mod tests {
     async fn runner_journal_error_result_is_journaled_as_error() {
         let fixture = journal_fixture("Error: boom", false);
         run_probe(&fixture.spec).await;
+        assert_eq!(
+            tool_statuses(&fixture.journal),
+            [ToolCallStatus::Intent, ToolCallStatus::Error]
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_journal_closes_a_panicking_call_as_error() {
+        use crate::agent::tools::test_support::PanickingTool;
+        let mut fixture = journal_fixture("fine", false);
+        fixture.spec.tools = registry_with(vec![Box::new(PanickingTool {
+            string_payload: false,
+        })]);
+        let (result, _, _) = run_named_tool(&fixture.spec, "panicky", &[]).await;
+        assert!(result.starts_with("Error: tool 'panicky' crashed: boom"));
+        assert_eq!(
+            tool_statuses(&fixture.journal),
+            [ToolCallStatus::Intent, ToolCallStatus::Error],
+            "an isolated panic must leave a terminal record, not an orphan intent"
+        );
+    }
+
+    #[tokio::test]
+    async fn runner_journal_closes_a_timed_out_call_as_error() {
+        use crate::agent::tools::test_support::SlowTool;
+        let mut fixture = journal_fixture("fine", false);
+        fixture.spec.tools = registry_with(vec![Box::new(SlowTool {
+            delay: Duration::from_secs(30),
+            exempt: false,
+        })]);
+        fixture.spec.tool_timeout = Some(Duration::from_millis(50));
+        let (result, _, _) = run_named_tool(&fixture.spec, "slow", &[]).await;
+        assert!(result.contains("timed out after 0.05s"), "got {result:?}");
         assert_eq!(
             tool_statuses(&fixture.journal),
             [ToolCallStatus::Intent, ToolCallStatus::Error]

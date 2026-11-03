@@ -1626,6 +1626,13 @@ pub struct ToolsConfig {
     #[garde(skip)]
     pub confirm_before_execute: bool,
 
+    /// Longest a single tool call may run, in seconds; `0` (the default) disables the limit.
+    /// A call that exceeds it fails with an error result. Tools that wait on the user or enforce
+    /// their own limit (`shell`, `question`, `run_agent`) are never cut short.
+    #[serde(alias = "execute_timeout_seconds")]
+    #[garde(skip)]
+    pub execute_timeout_seconds: u32,
+
     /// Named MCP server configurations, keyed by server name.
     #[serde(alias = "mcp_servers")]
     #[garde(dive)]
@@ -1686,6 +1693,7 @@ impl Default for ToolsConfig {
             disabled_tools: Vec::new(),
             deferred_tools: Vec::new(),
             confirm_before_execute: false,
+            execute_timeout_seconds: 0,
             mcp_servers: HashMap::new(),
             ssrf_whitelist: Vec::new(),
             gmail: GmailToolConfig::default(),
@@ -3401,6 +3409,10 @@ mod tests {
         assert!(cfg.exec.enable);
         assert!(!cfg.restrict_to_workspace);
         assert!(!cfg.confirm_before_execute);
+        assert_eq!(
+            cfg.execute_timeout_seconds, 0,
+            "the timeout is off by default"
+        );
         assert!(cfg.mcp_servers.is_empty());
         assert!(cfg.ssrf_whitelist.is_empty());
         assert!(cfg.validate().is_ok());
@@ -3420,6 +3432,18 @@ mod tests {
         let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
         assert!(cfg.confirm_before_execute);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_tools_config_execute_timeout_seconds_accepts_both_spellings() {
+        for json in [
+            r#"{"executeTimeoutSeconds": 90}"#,
+            r#"{"execute_timeout_seconds": 90}"#,
+        ] {
+            let cfg: ToolsConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.execute_timeout_seconds, 90);
+            assert!(cfg.validate().is_ok());
+        }
     }
 
     #[test]

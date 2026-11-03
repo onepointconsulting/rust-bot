@@ -15,7 +15,7 @@ tool failure is detected by the text `"Error"`, and nothing protects the turn fr
 | Phase | Branch | Status |
 |---|---|---|
 | 1. Structure (no behaviour change) | `feature/tool-pipeline-p1-structure` | built and committed 2026-11-03 |
-| 2. Robustness | `feature/tool-pipeline-p2-robustness` | not started |
+| 2. Robustness | `feature/tool-pipeline-p2-robustness` | built 2026-11-03, uncommitted |
 | 3. Per-call authorize with `Ask` | `feature/tool-pipeline-p3-authorize` | not started |
 | 4. Result model, post-hooks, observability | `feature/tool-pipeline-p4-results` | not started |
 
@@ -84,25 +84,30 @@ Risk: low. Files: `runner.rs`, `tool_pipeline.rs`, `tools/registry.rs`, `agent/m
 
 ## Phase 2: robustness
 
-A tool must not be able to hang or crash a turn.
+A tool must not be able to hang or crash a turn. Built 2026-11-03.
 
-- **Panic isolation.** Run `Tool::execute` under `catch_unwind` (or a spawned task) and turn a panic into
-  `ToolOutcome::error`. The journal gets a terminal `Error` record, so there are no orphaned intents. Note that
-  `InFlightToolCall` deliberately writes no terminal on unwinding (crash tests rely on it); the isolation must
-  catch the panic before it unwinds through the guard and finish the call explicitly.
-- **Execute timeout.** Per-tool timeout: a global default in config (off) and an optional per-tool override. A
-  timeout yields an error result and a journal terminal status of `timeout` (new `ToolCallStatus` variant; check
-  recovery and resume code for exhaustive matches). Follow the config conventions: config-gated flag, schemars
-  form on the Tools page, Herdr wiring if relevant. Retry is out of scope; if added later it applies only where
-  `replay_safe()` is true.
-- **Check first:** a timeout must also stop child processes spawned by `exec`-type tools, otherwise it only
-  abandons the future.
-- **Shared test fakes.** Extract the duplicated fake tools into `#[cfg(test)] pub(crate) mod test_support` under
-  `src/agent/tools/` (`ScriptedTool` currently lives in `runner.rs` tests) and add a slow tool and a panicking tool.
-- Tests: panicking tool gives an error result and a terminal journal record; slow tool with a short timeout gives
-  the timeout error and status; timeout off leaves long tools alone.
+- **Panic isolation.** The execute stage runs the tool under `catch_unwind`. A panic becomes
+  `Error: tool '<name>' crashed: <message>` (message capped at 200 chars), which is journaled as a terminal
+  `Error`, so there is no orphan intent. The crash points (`after_intent`, `before_terminal`) stay outside the
+  isolation, because they simulate a process kill and must still unwind.
+- **Execute timeout.** `tools.executeTimeoutSeconds` (`0` = off, the default; shown in the Tools page General
+  form). A call that exceeds it is cancelled by dropping its future and returns
+  `Error: tool '<name>' timed out after <n>s and was cancelled`. `AgentRunSpec::tool_timeout` carries it; only
+  the main agent loop sets it.
+- **Per-tool override** is a trait flag, `Tool::exempt_from_execute_timeout`, not a config map: tools that wait on
+  something other than computation opt out. Set for `shell` (own `tools.exec.timeout`), `question` (waits for the
+  user) and `run_agent` (a whole agent turn). MCP tools and the other built-ins are subject to the timeout.
+- **Journal status for a timeout is `Error`, not a new variant.** A new `ToolCallStatus` would be written into
+  journals that older binaries cannot deserialize, and recovery treats `Error` correctly already.
+- **Child processes:** answered. `shell` kills its process tree when its future is dropped
+  (`kill_process_tree_sync` guard), so a timeout does not leave orphans. Other tools with child processes (MCP
+  stdio servers) are not tied to the call and are unaffected.
+- **Shared test fakes** live in `src/agent/tools/test_support.rs` (`#[cfg(test)]`): `ScriptedTool`, `SlowTool`,
+  `PanickingTool`, `spec_with_tool`.
+- Retry stays out of scope; if added later it applies only where `replay_safe()` is true.
 
-Risk: medium.
+Risk: medium. Not covered: a tool that blocks a thread synchronously (no `.await`) cannot be cancelled by the
+timeout; it would need `spawn_blocking` at the tool.
 
 ## Phase 3: per-call authorize with `Ask`
 
@@ -147,5 +152,4 @@ Risk: medium. The `is_error` migration touches every tool; commit each sub-item 
 
 ## Open questions
 
-- Phase 2: does `exec` kill its child process when its future is dropped? Decides how the timeout is implemented.
 - Phase 3: does `AcpSessionHook` have a use for `Ask` beyond its current permission requests?

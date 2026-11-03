@@ -104,6 +104,15 @@ pub trait Tool: std::any::Any + Send + Sync {
         false
     }
 
+    /// Whether `tools.executeTimeoutSeconds` must not cut this tool short.
+    ///
+    /// True for tools that wait on something other than computation, or that
+    /// enforce their own limit: a question waiting for the user, a whole agent
+    /// run, a shell command with its own timeout. Defaults to `false`.
+    fn exempt_from_execute_timeout(&self) -> bool {
+        false
+    }
+
     /// Whether the tool is declared to the model on every request or only after
     /// `tool_search` loads it. Built-ins are deferred through the registry
     /// (`tools.deferredTools`), not here; MCP tools take it from their server config.

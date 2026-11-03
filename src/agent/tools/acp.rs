@@ -706,6 +706,11 @@ impl Tool for RunAgentTool {
         RUN_TOOL_NAME.to_string()
     }
 
+    /// Runs a whole agent turn, which legitimately takes minutes.
+    fn exempt_from_execute_timeout(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> String {
         "Send a prompt to an agent and get its reply. The agent remembers earlier \
          conversations with you and keeps its own long-term memory, so use the same agent \

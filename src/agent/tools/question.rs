@@ -343,6 +343,11 @@ impl Tool for QuestionTool {
         QUESTION_TOOL_NAME.to_string()
     }
 
+    /// Waits for the user's answer, which has no compute bound.
+    fn exempt_from_execute_timeout(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> String {
         "Pause and ask the user a clarifying multiple-choice question when a task is \
          ambiguous — do not guess. The user can pick one of your options or type a \

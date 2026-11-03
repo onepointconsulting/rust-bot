@@ -33,6 +33,7 @@ use crate::agent::resume::{self, ResumeAction, ResumePolicy};
 use crate::agent::runner::{AgentRunResult, AgentRunSpec, AgentRunner};
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
+use crate::agent::tool_pipeline::tool_timeout_from_seconds;
 use crate::agent::tool_progress::with_tool_progress;
 use crate::agent::tools::acp::{AcpToolsContext, register_acp_tools};
 use crate::agent::tools::cron::CronTool;
@@ -1470,6 +1471,7 @@ impl AgentLoop {
                 max_tokens: Some(runtime.max_tokens as usize),
                 reasoning_effort: runtime.reasoning_effort.clone(),
                 journal: turn_journal,
+                tool_timeout: tool_timeout_from_seconds(self.config.tools.execute_timeout_seconds),
             }),
         )
         .await;

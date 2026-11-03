@@ -803,12 +803,21 @@ mod tests {
             [
                 "restrictToWorkspace",
                 "confirmBeforeExecute",
+                "executeTimeoutSeconds",
                 "ssrfWhitelist"
             ]
         );
         assert_eq!(general.enabled, None);
         assert!(general.tool_names.is_empty());
         assert_eq!(field(general, "ssrfWhitelist").kind, FieldKind::StringList);
+    }
+
+    #[test]
+    fn the_execute_timeout_is_an_integer_setting_that_is_off_by_default() {
+        let overview = tool_settings_overview(&ToolsConfig::default());
+        let timeout = field(section(&overview, "general"), "executeTimeoutSeconds");
+        assert!(matches!(timeout.kind, FieldKind::Integer { .. }));
+        assert_eq!(timeout.value, Some(serde_json::json!(0)));
     }
 
     #[test]

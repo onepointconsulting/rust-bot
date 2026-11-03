@@ -15,6 +15,8 @@ pub mod sandbox;
 pub mod search;
 pub mod shell;
 pub mod spawn;
+#[cfg(test)]
+pub(crate) mod test_support;
 pub mod tool_ranker;
 pub mod tool_search;
 pub mod tool_settings_api;

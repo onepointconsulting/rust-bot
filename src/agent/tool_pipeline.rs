@@ -9,7 +9,8 @@
 //! | 1 | guard              | circuit breaker, repeated-lookup block, malformed args    |
 //! | 2 | resolve + validate | find the declared tool, cast and validate its arguments   |
 //! | 3 | journal            | write-ahead intent (may refuse the call in strict mode)   |
-//! | 4 | execute            | run the tool under the call identity                      |
+//! | 4 | execute            | run the tool under the call identity, isolating panics   |
+//! |   |                    | and enforcing the optional execute timeout                |
 //! | 5 | journal finish     | terminal record, `Done` or `Error`                        |
 //! | 6 | normalize          | classify the result, add the retry hint, build the detail |
 //! | 7 | observe            | map an error to a fatal one when `fail_on_tool_error` set |
@@ -18,9 +19,13 @@
 //! the pipeline with an error *result* (never a panic or an early `return` of a
 //! hand-built tuple), so the model always gets a tool message for the call.
 
+use std::any::Any;
 use std::collections::HashMap;
+use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
+use futures::FutureExt;
 use serde_json::Value;
 
 use crate::agent::circuit_breaker::{
@@ -48,6 +53,8 @@ const ARG_PARSE_RAW_KEY: &str = "__args_json_raw";
 const DETAIL_MAX_CHARS: usize = 120;
 /// Longest raw-arguments preview echoed back to the model on a parse error.
 const RAW_ARGUMENTS_PREVIEW_CHARS: usize = 200;
+/// Longest panic message echoed back to the model.
+const PANIC_REASON_PREVIEW_CHARS: usize = 200;
 
 /// Whether a tool result text denotes a failure.
 ///
@@ -384,7 +391,11 @@ fn journal_begin(
     }
 }
 
-/// Stage 4: run the tool, under the call identity when a journal is attached.
+/// Stage 4: run the tool and return its result text.
+///
+/// A tool that panics or exceeds the timeout yields an error result instead
+/// of unwinding through the turn, so the journal still gets a terminal record.
+/// The crash points stay outside the isolation: they simulate a process kill.
 async fn execute(
     spec: &AgentRunSpec,
     tool_call: &ToolCallRequest,
@@ -392,7 +403,29 @@ async fn execute(
     params: &Value,
 ) -> String {
     crash_point("after_intent");
-    let result = match &spec.journal {
+    let guarded =
+        AssertUnwindSafe(execute_under_identity(spec, tool_call, tool, params)).catch_unwind();
+    let result = match effective_timeout(spec.tool_timeout, tool) {
+        Some(limit) => match tokio::time::timeout(limit, guarded).await {
+            Ok(finished) => finished,
+            // Dropping `guarded` cancels the tool; `shell` kills its process tree on drop.
+            Err(_) => Ok(timeout_error(&tool_call.name, limit)),
+        },
+        None => guarded.await,
+    };
+    let result = result.unwrap_or_else(|payload| panic_error(&tool_call.name, payload.as_ref()));
+    crash_point("before_terminal");
+    result
+}
+
+/// Run `tool`, under the call identity when a journal is attached.
+async fn execute_under_identity(
+    spec: &AgentRunSpec,
+    tool_call: &ToolCallRequest,
+    tool: &dyn Tool,
+    params: &Value,
+) -> String {
+    match &spec.journal {
         Some(journal) => {
             let identity = ToolCallIdentity {
                 turn_id: journal.turn_id().to_string(),
@@ -401,9 +434,42 @@ async fn execute(
             with_tool_call(identity, tool.execute(params)).await
         }
         None => tool.execute(params).await,
-    };
-    crash_point("before_terminal");
-    result
+    }
+}
+
+/// The configured timeout as a duration; `0` means no limit.
+pub fn tool_timeout_from_seconds(seconds: u32) -> Option<Duration> {
+    (seconds > 0).then(|| Duration::from_secs(u64::from(seconds)))
+}
+
+/// The limit that applies to `tool`: none when the tool is exempt.
+fn effective_timeout(configured: Option<Duration>, tool: &dyn Tool) -> Option<Duration> {
+    configured.filter(|_| !tool.exempt_from_execute_timeout())
+}
+
+/// Result text for a call cut off by the execute timeout.
+fn timeout_error(tool_name: &str, limit: Duration) -> String {
+    let message = format!(
+        "Error: tool '{tool_name}' timed out after {}s and was cancelled",
+        limit.as_secs_f64()
+    );
+    log::error!("{message}");
+    message
+}
+
+/// Result text for a call whose tool panicked; `payload` is the panic payload.
+fn panic_error(tool_name: &str, payload: &(dyn Any + Send)) -> String {
+    let reason = payload
+        .downcast_ref::<&str>()
+        .map(|text| (*text).to_string())
+        .or_else(|| payload.downcast_ref::<String>().cloned())
+        .unwrap_or_else(|| "unknown panic".to_string());
+    let message = format!(
+        "Error: tool '{tool_name}' crashed: {}",
+        take_chars(&reason, PANIC_REASON_PREVIEW_CHARS)
+    );
+    log::error!("{message}");
+    message
 }
 
 /// Stage 5: write the terminal journal record (no-op without a journal).
@@ -423,6 +489,7 @@ fn journal_finish(spec: &AgentRunSpec, in_flight: Option<InFlightToolCall>, resu
 mod tests {
     use super::*;
     use crate::agent::circuit_breaker::{DEFAULT_N_IDENTICAL_MESSAGES, is_tripped_error};
+    use crate::agent::tools::test_support::{PanickingTool, SlowTool, spec_with_tool};
 
     fn call(name: &str, arguments: &[(&str, &str)]) -> ToolCallRequest {
         ToolCallRequest {
@@ -606,5 +673,121 @@ mod tests {
                 .starts_with("Error: Tool 'ghost' not found.")
         );
         assert!(outcome.content().ends_with(ERROR_HINT));
+    }
+
+    // ── execute stage: panic isolation and timeout ───────────────────────────
+
+    /// Run `request` through the whole pipeline with fresh guard state.
+    async fn run(spec: &AgentRunSpec, request: &ToolCallRequest) -> ToolOutcome {
+        run_tool_call(
+            spec,
+            request,
+            Arc::new(Mutex::new(HashMap::new())),
+            Arc::new(Mutex::new(MessageCircuitBreaker::new(
+                DEFAULT_N_IDENTICAL_MESSAGES,
+            ))),
+        )
+        .await
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_becomes_an_error_result() {
+        for string_payload in [false, true] {
+            let spec = spec_with_tool(PanickingTool { string_payload });
+            let outcome = run(&spec, &call("panicky", &[])).await;
+            assert_eq!(outcome.status(), ToolStatus::Error);
+            assert_eq!(
+                outcome.content(),
+                format!("Error: tool 'panicky' crashed: boom{ERROR_HINT}")
+            );
+            assert_eq!(outcome.fatal(), None);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_panicking_tool_is_fatal_when_fail_on_tool_error_is_set() {
+        let mut spec = spec_with_tool(PanickingTool {
+            string_payload: false,
+        });
+        spec.fail_on_tool_error = true;
+        let outcome = run(&spec, &call("panicky", &[])).await;
+        assert_eq!(outcome.fatal(), Some("Error: tool 'panicky' crashed: boom"));
+    }
+
+    #[test]
+    fn panic_error_handles_unknown_payloads_and_caps_long_messages() {
+        let unknown: Box<dyn Any + Send> = Box::new(42u8);
+        assert_eq!(
+            panic_error("t", unknown.as_ref()),
+            "Error: tool 't' crashed: unknown panic"
+        );
+        let long: Box<dyn Any + Send> = Box::new("z".repeat(500));
+        let message = panic_error("t", long.as_ref());
+        assert_eq!(
+            message,
+            format!("Error: tool 't' crashed: {}", "z".repeat(200))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_tool_that_exceeds_the_timeout_is_cancelled_with_an_error_result() {
+        let mut spec = spec_with_tool(SlowTool {
+            delay: Duration::from_secs(30),
+            exempt: false,
+        });
+        spec.tool_timeout = Some(Duration::from_millis(50));
+        let started = std::time::Instant::now();
+        let outcome = run(&spec, &call("slow", &[])).await;
+        assert!(started.elapsed() < Duration::from_secs(5), "must not wait");
+        assert_eq!(outcome.status(), ToolStatus::Error);
+        assert_eq!(
+            outcome.content(),
+            format!("Error: tool 'slow' timed out after 0.05s and was cancelled{ERROR_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn an_exempt_tool_ignores_the_timeout() {
+        let mut spec = spec_with_tool(SlowTool {
+            delay: Duration::from_millis(150),
+            exempt: true,
+        });
+        spec.tool_timeout = Some(Duration::from_millis(20));
+        let outcome = run(&spec, &call("slow", &[])).await;
+        assert_eq!(outcome.status(), ToolStatus::Ok);
+        assert_eq!(outcome.content(), "slow done");
+    }
+
+    #[tokio::test]
+    async fn without_a_timeout_a_slow_tool_just_finishes() {
+        let spec = spec_with_tool(SlowTool {
+            delay: Duration::from_millis(100),
+            exempt: false,
+        });
+        assert_eq!(spec.tool_timeout, None, "the timeout is off by default");
+        let outcome = run(&spec, &call("slow", &[])).await;
+        assert_eq!(outcome.content(), "slow done");
+    }
+
+    #[test]
+    fn effective_timeout_is_dropped_for_exempt_tools_only() {
+        let limit = Some(Duration::from_secs(5));
+        let exempt = SlowTool {
+            delay: Duration::ZERO,
+            exempt: true,
+        };
+        let bound = SlowTool {
+            delay: Duration::ZERO,
+            exempt: false,
+        };
+        assert_eq!(effective_timeout(limit, &exempt), None);
+        assert_eq!(effective_timeout(limit, &bound), limit);
+        assert_eq!(effective_timeout(None, &bound), None);
+    }
+
+    #[test]
+    fn configured_seconds_zero_means_no_timeout() {
+        assert_eq!(tool_timeout_from_seconds(0), None);
+        assert_eq!(tool_timeout_from_seconds(30), Some(Duration::from_secs(30)));
     }
 }

@@ -586,6 +586,11 @@ impl Tool for ShellTool {
         "shell".to_string()
     }
 
+    /// Enforces its own `tools.exec.timeout`, which kills the process tree.
+    fn exempt_from_execute_timeout(&self) -> bool {
+        true
+    }
+
     fn description(&self) -> String {
         r#"Execute a shell command and return its output.
 Prefer read_file/write_file/edit_file over cat/echo/sed, and grep/glob over shell find/grep. 
