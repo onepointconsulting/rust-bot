@@ -850,6 +850,25 @@ mod tests {
     }
 
     #[test]
+    fn the_execute_timeout_can_be_set_and_switched_off_again() {
+        let mut config = Config::default();
+        let set = change(&[("executeTimeoutSeconds", json!(120))]);
+        assert_eq!(apply_tool_settings(&mut config, "general", &set), Ok(true));
+        assert_eq!(config.tools.execute_timeout_seconds, 120);
+
+        let off = change(&[("executeTimeoutSeconds", json!(0))]);
+        assert_eq!(apply_tool_settings(&mut config, "general", &off), Ok(true));
+        assert_eq!(config.tools.execute_timeout_seconds, 0);
+
+        let negative = change(&[("executeTimeoutSeconds", json!(-5))]);
+        assert!(matches!(
+            apply_tool_settings(&mut config, "general", &negative),
+            Err(ToolSettingsError::InvalidValue(..))
+        ));
+        assert_eq!(config.tools.execute_timeout_seconds, 0);
+    }
+
+    #[test]
     fn general_section_rejects_other_fields_and_bad_cidr_ranges() {
         let mut config = Config::default();
         let other_field = change(&[("disabledTools", json!(["x"]))]);
