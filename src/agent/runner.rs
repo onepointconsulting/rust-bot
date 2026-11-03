@@ -1054,14 +1054,36 @@ impl AgentRunner {
         let tool = tool.expect("prepare_call returned no tool and no error");
         // Write-ahead: the intent is on disk before the tool starts, so a crash
         // during `execute` leaves an intent without a terminal record.
-        let in_flight = spec.journal.as_ref().map(|journal| {
+        // In strict durability mode a failed intent write refuses the call.
+        let in_flight = match spec.journal.as_ref().map(|journal| {
             journal.begin_tool_call(
                 &tool_call.id,
                 &tool_call.name,
                 &cast_params,
                 tool.replay_safe(),
             )
-        });
+        }) {
+            Some(Err(refusal)) => {
+                let err = format!("Error: {refusal}");
+                log::error!("{err}");
+                let event = HashMap::from([
+                    ("name".to_string(), tool_call.name.clone()),
+                    ("status".to_string(), "error".to_string()),
+                    (
+                        "detail".to_string(),
+                        "intent not journaled (strict durability mode)".to_string(),
+                    ),
+                ]);
+                let error = if spec.fail_on_tool_error {
+                    Some(err.clone())
+                } else {
+                    None
+                };
+                return (format!("{err}{HINT}"), event, error);
+            }
+            Some(Ok(in_flight)) => Some(in_flight),
+            None => None,
+        };
         crash_point("after_intent");
         let result = match &spec.journal {
             Some(journal) => {
@@ -3556,6 +3578,33 @@ mod tests {
             tool_statuses(&fixture.journal),
             [ToolCallStatus::Intent, ToolCallStatus::Error]
         );
+    }
+
+    /// Fixture whose journal directory cannot be created, so every append fails.
+    fn unwritable_journal_fixture(mode: crate::config::schema::JournalMode) -> JournalFixture {
+        let mut fixture = journal_fixture("fine", false);
+        let blocker = fixture._dir.path().join("blocker");
+        std::fs::write(&blocker, "x").unwrap();
+        let broken = RunJournal::new(FileJournalStore::shared(blocker.join("sessions")), "k");
+        fixture.spec.journal = Some(TurnJournal::new(broken, "turn-1").with_mode(mode));
+        fixture
+    }
+
+    #[tokio::test]
+    async fn runner_strict_mode_does_not_execute_a_call_whose_intent_cannot_be_journaled() {
+        let fixture = unwritable_journal_fixture(crate::config::schema::JournalMode::Strict);
+        let result = run_probe(&fixture.spec).await;
+
+        assert!(result.starts_with("Error:"), "got: {result}");
+        assert!(result.contains("strict"), "got: {result}");
+        // The probe tool would have replied "fine" had it run.
+        assert_ne!(result, "fine");
+    }
+
+    #[tokio::test]
+    async fn runner_best_effort_mode_executes_a_call_whose_intent_cannot_be_journaled() {
+        let fixture = unwritable_journal_fixture(crate::config::schema::JournalMode::BestEffort);
+        assert_eq!(run_probe(&fixture.spec).await, "fine");
     }
 
     #[tokio::test]

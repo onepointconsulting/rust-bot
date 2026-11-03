@@ -1539,7 +1539,8 @@ impl AgentLoop {
         let turn = TurnJournal::new(
             RunJournal::new(self.journal_store(), session_key),
             uuid::Uuid::new_v4().to_string(),
-        );
+        )
+        .with_mode(self.durability.journal_mode);
         let user_message = initial_messages
             .iter()
             .rev()
@@ -1860,7 +1861,7 @@ impl AgentLoop {
     ) {
         let journal = RunJournal::new(self.journal_store(), session_key);
         let states = recovery::tool_call_states(&journal.scan().entries);
-        let turn = TurnJournal::new(journal, turn_id);
+        let turn = TurnJournal::new(journal, turn_id).with_mode(self.durability.journal_mode);
         let scope = {
             let mut manager = self
                 .session_manager
@@ -1891,7 +1892,17 @@ impl AgentLoop {
                 state.tool_name
             );
             self.set_tool_context(channel, chat_id, None);
-            let in_flight = turn.begin_tool_call(&state.call_id, &state.tool_name, &args, true);
+            let in_flight =
+                match turn.begin_tool_call(&state.call_id, &state.tool_name, &args, true) {
+                    Ok(in_flight) => in_flight,
+                    Err(refusal) => {
+                        log::error!(
+                            "not replaying interrupted call {}: {refusal}",
+                            state.call_id
+                        );
+                        continue;
+                    }
+                };
             let identity = ToolCallIdentity {
                 turn_id: turn_id.to_string(),
                 call_id: state.call_id.clone(),

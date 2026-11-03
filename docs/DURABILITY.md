@@ -103,6 +103,7 @@ All keys live under `durability` in the config file and have defaults.
 
 | Key | Default | Meaning |
 |---|---|---|
+| `journalMode` | `"bestEffort"` | what a failed write of a tool call's intent does: `bestEffort` runs the call and marks the journal degraded, `strict` refuses the call (see below) |
 | `autoResume` | `true` | resume interrupted turns when the gateway starts |
 | `resumeMaxAgeSecs` | `86400` | older turns are not resumed (reported as stale) |
 | `maxResumeAttempts` | `2` | resume attempts before a turn is abandoned |
@@ -114,7 +115,14 @@ All keys live under `durability` in the config file and have defaults.
 
 * One rust-bot process per workspace (as before). Two processes appending to the
   same journal are not supported.
-* A journal that cannot be written (read-only or full disk) is logged and
-  flagged as degraded; the tool call and the turn still proceed without crash
-  safety.
+* With `journalMode: "bestEffort"` (default) a journal that cannot be written
+  (read-only or full disk) is logged and flagged as degraded; the tool call and
+  the turn still proceed without crash safety.
+* With `journalMode: "strict"` a tool call whose intent cannot be written is
+  **not executed**: the model receives an error naming the journal as the cause
+  (a `Blocked` record is attempted so the call does not look interrupted), and a
+  replay of an interrupted call is skipped. This applies to every tool, not only
+  side-effecting ones. Later calls try again, so the agent recovers once the
+  journal is writable. Terminal records and turn records stay best-effort, and
+  runs without a journal (such as subagents) are not affected.
 * Resumed turns are not registered as active tasks, so `/stop` cannot abort one.

@@ -2160,10 +2160,31 @@ fn default_ledger_max_entries() -> usize {
     1000
 }
 
+/// What a failed write of a tool call's intent record does to the call
+/// (`durability.journalMode` in the config file).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub enum JournalMode {
+    /// Availability over durability: the failure is logged and flagged as
+    /// degraded crash safety, and the tool call runs anyway.
+    #[default]
+    BestEffort,
+    /// Durability over availability: a tool call whose intent cannot be
+    /// persisted is not executed and fails with an error instead.
+    Strict,
+}
+
 /// Crash-recovery settings (`durability` in the config file).
 #[derive(Debug, Clone, Deserialize, Serialize, Validate)]
 #[serde(rename_all = "camelCase", default)]
 pub struct DurabilityConfig {
+    /// Whether tool calls still run when their intent cannot be journaled.
+    /// `bestEffort` (default) runs them and marks the journal degraded;
+    /// `strict` blocks them.
+    #[serde(default)]
+    #[garde(skip)]
+    pub journal_mode: JournalMode,
+
     /// Resume turns that a crash interrupted when the gateway or API starts.
     /// Default: `true`. When `false` an interrupted turn is only merged into
     /// the session transcript on the session's next message.
@@ -2203,6 +2224,7 @@ pub struct DurabilityConfig {
 impl Default for DurabilityConfig {
     fn default() -> Self {
         Self {
+            journal_mode: JournalMode::default(),
             auto_resume: default_true(),
             resume_max_age_secs: default_resume_max_age_secs(),
             max_resume_attempts: default_max_resume_attempts(),
@@ -2335,9 +2357,30 @@ mod tests {
             assert_eq!(durability.max_concurrent_resumes, 4);
             assert_eq!(durability.ledger_ttl_days, 14);
             assert_eq!(durability.ledger_max_entries, 1000);
+            assert_eq!(durability.journal_mode, JournalMode::BestEffort);
         }
         assert_eq!(absent.durability.max_resume_attempts, 2);
         assert_eq!(partial.durability.max_resume_attempts, 5);
+    }
+
+    #[test]
+    fn durability_journal_mode_parses_both_modes_and_round_trips() {
+        for (raw, expected) in [
+            ("bestEffort", JournalMode::BestEffort),
+            ("strict", JournalMode::Strict),
+        ] {
+            let json = format!(r#"{{"durability": {{"journalMode": "{raw}"}}}}"#);
+            let config: Config = serde_json::from_str(&json).unwrap();
+            assert_eq!(config.durability.journal_mode, expected);
+            let serialized = serde_json::to_value(&config.durability).unwrap();
+            assert_eq!(serialized["journalMode"], raw);
+        }
+    }
+
+    #[test]
+    fn durability_journal_mode_rejects_unknown_values() {
+        let result = serde_json::from_str::<Config>(r#"{"durability": {"journalMode": "loose"}}"#);
+        assert!(result.is_err());
     }
 
     use super::*;
