@@ -128,6 +128,85 @@ impl GrantsView {
     }
 }
 
+/// What several chats have pre-approved, in memory only: a restart forgets it on
+/// purpose. Shared by the web chat's [`ToolApprovalBroker`] and the CLI prompt.
+#[derive(Default)]
+pub struct ApprovalGrants {
+    by_chat: StdMutex<HashMap<String, ChatGrants>>,
+}
+
+impl ApprovalGrants {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a grant for `chat_id`. Returns whether anything was recorded: a
+    /// turn grant needs the `turn_id` it is pinned to.
+    pub fn add(
+        &self,
+        chat_id: &str,
+        grant: ApprovalGrant,
+        turn_id: Option<&str>,
+        tool_names: Vec<String>,
+    ) -> bool {
+        let mut by_chat = self.lock();
+        match grant {
+            ApprovalGrant::Turn => {
+                let Some(turn_id) = turn_id else {
+                    return false;
+                };
+                by_chat.entry(chat_id.to_string()).or_default().turn_id = Some(turn_id.to_string());
+            }
+            ApprovalGrant::Session => {
+                by_chat.entry(chat_id.to_string()).or_default().all_tools = true;
+            }
+            ApprovalGrant::SessionTool => {
+                by_chat
+                    .entry(chat_id.to_string())
+                    .or_default()
+                    .tools
+                    .extend(tool_names);
+            }
+        }
+        true
+    }
+
+    /// Whether `chat_id` already approved a call of `tool_name` made in the turn
+    /// `turn_id`.
+    pub fn is_granted(&self, chat_id: &str, turn_id: Option<&str>, tool_name: &str) -> bool {
+        let by_chat = self.lock();
+        let Some(grants) = by_chat.get(chat_id) else {
+            return false;
+        };
+        grants.all_tools
+            || grants.tools.contains(tool_name)
+            || (turn_id.is_some() && grants.turn_id.as_deref() == turn_id)
+    }
+
+    /// Forget every grant of `chat_id`. Returns whether there was any.
+    pub fn revoke(&self, chat_id: &str) -> bool {
+        self.lock().remove(chat_id).is_some()
+    }
+
+    /// What `chat_id` has pre-approved. The turn grant is only reported when
+    /// `include_turn` is set: nothing here knows whether its turn is still running.
+    pub fn view(&self, chat_id: &str, include_turn: bool) -> GrantsView {
+        let by_chat = self.lock();
+        let Some(grants) = by_chat.get(chat_id) else {
+            return GrantsView::default();
+        };
+        GrantsView {
+            session_all: grants.all_tools,
+            tools: grants.tools.iter().cloned().collect(),
+            turn: include_turn && grants.turn_id.is_some(),
+        }
+    }
+
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, ChatGrants>> {
+        self.by_chat.lock().unwrap_or_else(|e| e.into_inner())
+    }
+}
+
 /// A request still awaiting an answer, as needed to re-send it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PendingApprovalView {
@@ -138,8 +217,8 @@ pub struct PendingApprovalView {
 #[derive(Default)]
 pub struct ToolApprovalBroker {
     pending: StdMutex<HashMap<String, PendingApproval>>,
-    /// Grants per chat id. In memory only: a restart forgets them on purpose.
-    grants: StdMutex<HashMap<String, ChatGrants>>,
+    /// Grants per chat id.
+    grants: ApprovalGrants,
 }
 
 impl ToolApprovalBroker {
@@ -234,8 +313,7 @@ impl ToolApprovalBroker {
         Ok(granted)
     }
 
-    /// Record a grant for `chat_id`. Returns whether anything was recorded: a
-    /// turn grant needs the `turn_id` it is pinned to.
+    /// Record a grant for `chat_id`; see [`ApprovalGrants::add`].
     pub fn add_grant(
         &self,
         chat_id: &str,
@@ -243,57 +321,23 @@ impl ToolApprovalBroker {
         turn_id: Option<&str>,
         tool_names: Vec<String>,
     ) -> bool {
-        let mut grants = self.lock_grants();
-        match grant {
-            ApprovalGrant::Turn => {
-                let Some(turn_id) = turn_id else {
-                    return false;
-                };
-                grants.entry(chat_id.to_string()).or_default().turn_id = Some(turn_id.to_string());
-            }
-            ApprovalGrant::Session => {
-                grants.entry(chat_id.to_string()).or_default().all_tools = true;
-            }
-            ApprovalGrant::SessionTool => {
-                grants
-                    .entry(chat_id.to_string())
-                    .or_default()
-                    .tools
-                    .extend(tool_names);
-            }
-        }
-        true
+        self.grants.add(chat_id, grant, turn_id, tool_names)
     }
 
     /// Whether `chat_id` already approved a call of `tool_name` made in the turn
     /// `turn_id`.
     pub fn is_granted(&self, chat_id: &str, turn_id: Option<&str>, tool_name: &str) -> bool {
-        let grants = self.lock_grants();
-        let Some(grants) = grants.get(chat_id) else {
-            return false;
-        };
-        grants.all_tools
-            || grants.tools.contains(tool_name)
-            || (turn_id.is_some() && grants.turn_id.as_deref() == turn_id)
+        self.grants.is_granted(chat_id, turn_id, tool_name)
     }
 
     /// Forget every grant of `chat_id`. Returns whether there was any.
     pub fn revoke_grants(&self, chat_id: &str) -> bool {
-        self.lock_grants().remove(chat_id).is_some()
+        self.grants.revoke(chat_id)
     }
 
-    /// What `chat_id` has pre-approved. The turn grant is only reported when
-    /// `include_turn` is set: nothing here knows whether its turn is still running.
+    /// What `chat_id` has pre-approved; see [`ApprovalGrants::view`].
     pub fn grants_for_chat(&self, chat_id: &str, include_turn: bool) -> GrantsView {
-        let grants = self.lock_grants();
-        let Some(grants) = grants.get(chat_id) else {
-            return GrantsView::default();
-        };
-        GrantsView {
-            session_all: grants.all_tools,
-            tools: grants.tools.iter().cloned().collect(),
-            turn: include_turn && grants.turn_id.is_some(),
-        }
+        self.grants.view(chat_id, include_turn)
     }
 
     /// Forget a request without answering it (the waiter was cancelled).
@@ -314,10 +358,6 @@ impl ToolApprovalBroker {
 
     fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<String, PendingApproval>> {
         self.pending.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn lock_grants(&self) -> std::sync::MutexGuard<'_, HashMap<String, ChatGrants>> {
-        self.grants.lock().unwrap_or_else(|e| e.into_inner())
     }
 }
 

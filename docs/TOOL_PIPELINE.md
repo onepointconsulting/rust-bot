@@ -60,7 +60,7 @@ answer is a denial**: no terminal, no chat, no bus, a timeout, or a panicking ho
 
 | hook                | asks                                  | cannot ask when                              |
 |---------------------|---------------------------------------|----------------------------------------------|
-| `CliAskHook`        | a terminal prompt per call            | stdin is not a terminal                      |
+| `CliAskHook`        | a terminal menu per call (see below)  | stdin is not a terminal                      |
 | `WebsocketsAskHook` | an approval card in the web chat      | channel is not a websocket chat, no bus      |
 | `AcpSessionHook`    | `session/request_permission`          | the client refuses, errors or stays silent   |
 
@@ -104,6 +104,13 @@ A tool says whether a call failed with a flag, not a text convention. `Tool::exe
   flagged with `isError` is an error. Before, none of these were noticed (their texts do not start with "Error").
 
 The journal status, the telemetry status, the retry hint and `fail_on_tool_error` all follow the flag.
+
+The CLI menu offers the same three ways to remember an answer as the web chat card: **allow all calls for this
+turn**, **always allow `<tool>` this session**, and **allow everything this session**, next to "Run this call"
+and "Skip this call". Esc or Ctrl-C skips the call. The choices use the same grant store as the web chat
+(`ApprovalGrants`), kept in memory under the CLI's chat id, so they last until the CLI exits; a one-line note tells
+you what you just allowed. There is no revoke command in the CLI: quit to forget them. A grant is checked before the
+terminal check, so a granted call still runs when nobody could be asked.
 
 ## Failure handling
 

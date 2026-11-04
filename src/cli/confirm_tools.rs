@@ -4,10 +4,12 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use futures::lock::Mutex;
-use inquire::Confirm;
+use inquire::Select;
 
 use crate::agent::hook::{AgentHook, CallDecision, ToolCallAuthorization};
-use crate::agent::tool_approval::{self, ToolApprovalBroker, ToolApprovalCall};
+use crate::agent::tool_approval::{
+    self, ApprovalGrant, ApprovalGrants, ToolApprovalBroker, ToolApprovalCall,
+};
 use crate::bus::outbound_events::{
     OutboundEvent, ToolApprovalRequestEvent, outbound_message_for_event,
 };
@@ -23,10 +25,20 @@ const APPROVAL_TIMEOUT: Duration = Duration::from_secs(300);
 /// Reason shown to the model when the user declined (or never answered).
 const USER_DENIED_REASON: &str = "User denied tool execution";
 
+/// Chat id the CLI's grants are kept under when the turn names none.
+const CLI_CHAT_ID: &str = "cli";
+
+const MSG_RUN_THIS_CALL: &str = "Run this call";
+const MSG_SKIP_THIS_CALL: &str = "Skip this call";
+
 /// CLI-only hook that asks before each tool call when stdin is a terminal.
+///
+/// The prompt can also pre-approve later calls (for the turn, for one tool, or
+/// for everything). Those grants live in memory until the CLI exits.
 pub struct CliAskHook {
     renderer: StdMutex<Option<Arc<Mutex<StreamRenderer>>>>,
     herdr: Arc<HerdrReporter>,
+    grants: ApprovalGrants,
 }
 
 impl CliAskHook {
@@ -34,6 +46,7 @@ impl CliAskHook {
         Self {
             renderer: StdMutex::new(None),
             herdr,
+            grants: ApprovalGrants::new(),
         }
     }
 
@@ -68,21 +81,109 @@ fn unanswerable(why: &str) -> CallDecision {
     ))
 }
 
-fn prompt_for_tool(name: &str, args_preview: &str) -> Result<bool, inquire::InquireError> {
+/// What the user can answer at the terminal prompt.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum CliChoice {
+    /// Run this call only.
+    Run,
+    /// Do not run this call.
+    Skip,
+    /// Run this call and pre-approve later ones as far as the grant says. The
+    /// text is the label shown in the menu.
+    RunAndGrant(ApprovalGrant, String),
+}
+
+impl std::fmt::Display for CliChoice {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Run => f.write_str(MSG_RUN_THIS_CALL),
+            Self::Skip => f.write_str(MSG_SKIP_THIS_CALL),
+            Self::RunAndGrant(_, label) => f.write_str(label),
+        }
+    }
+}
+
+/// The menu for a call of `tool_name`. The turn choice is only offered when the
+/// turn is known, because a turn grant is pinned to it.
+fn cli_choices(tool_name: &str, turn_known: bool) -> Vec<CliChoice> {
+    let mut choices = vec![CliChoice::Run, CliChoice::Skip];
+    if turn_known {
+        choices.push(CliChoice::RunAndGrant(
+            ApprovalGrant::Turn,
+            "Run, and allow all calls for this turn".to_string(),
+        ));
+    }
+    choices.push(CliChoice::RunAndGrant(
+        ApprovalGrant::SessionTool,
+        format!("Run, and always allow `{tool_name}` this session"),
+    ));
+    choices.push(CliChoice::RunAndGrant(
+        ApprovalGrant::Session,
+        "Run, and allow everything this session".to_string(),
+    ));
+    choices
+}
+
+/// One line telling the user what a grant they just gave covers.
+fn grant_note(grant: ApprovalGrant, tool_name: &str) -> String {
+    match grant {
+        ApprovalGrant::Turn => "Allowing every tool call for the rest of this turn.".to_string(),
+        ApprovalGrant::SessionTool => {
+            format!("Allowing `{tool_name}` for the rest of this session (until you quit).")
+        }
+        ApprovalGrant::Session => {
+            "Allowing every tool call for the rest of this session (until you quit).".to_string()
+        }
+    }
+}
+
+/// Turn the user's answer into a decision, recording any grant it carries.
+///
+/// No answer (Esc, Ctrl-C, a failed prompt) skips the call: a question that
+/// was not answered is never a yes.
+fn apply_choice(
+    grants: &ApprovalGrants,
+    answer: Option<CliChoice>,
+    chat_id: &str,
+    turn_id: Option<&str>,
+    tool_name: &str,
+) -> CallDecision {
+    match answer {
+        Some(CliChoice::Run) => CallDecision::Allow,
+        Some(CliChoice::RunAndGrant(grant, _)) => {
+            grants.add(chat_id, grant, turn_id, vec![tool_name.to_string()]);
+            CallDecision::Allow
+        }
+        Some(CliChoice::Skip) | None => CallDecision::deny(USER_DENIED_REASON),
+    }
+}
+
+fn prompt_for_tool(
+    name: &str,
+    args_preview: &str,
+    choices: Vec<CliChoice>,
+) -> Result<CliChoice, inquire::InquireError> {
     let message = if args_preview == "{}" {
         format!("Execute tool `{name}`?")
     } else {
         format!("Execute tool `{name}` ({args_preview})?")
     };
-    Confirm::new(&message)
-        .with_default(true)
-        .with_help_message("y to run this call, n to skip it")
+    Select::new(&message, choices)
+        .with_help_message("up/down to move, enter to choose, esc to skip this call")
         .prompt()
 }
 
 #[async_trait]
 impl AgentHook for CliAskHook {
     async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
+        let chat_id = request.chat_id.unwrap_or(CLI_CHAT_ID);
+        if self
+            .grants
+            .is_granted(chat_id, request.turn_id, request.tool_name)
+        {
+            log::info!("tool '{}' approved by an earlier grant", request.tool_name);
+            return CallDecision::Allow;
+        }
         if !std::io::stdin().is_terminal() {
             return unanswerable("stdin is not a terminal");
         }
@@ -94,18 +195,28 @@ impl AgentHook for CliAskHook {
         let _pause = pause_for_prompt();
         let tool_name = request.tool_name.to_string();
         let arguments_preview = preview_arguments(request.arguments);
-        let approved =
-            tokio::task::spawn_blocking(move || prompt_for_tool(&tool_name, &arguments_preview))
-                .await;
+        let choices = cli_choices(request.tool_name, request.turn_id.is_some());
+        let answer = tokio::task::spawn_blocking(move || {
+            prompt_for_tool(&tool_name, &arguments_preview, choices)
+        })
+        .await
+        .ok()
+        .and_then(Result::ok);
+        if let Some(CliChoice::RunAndGrant(grant, _)) = &answer {
+            println!("{}", grant_note(*grant, request.tool_name));
+        }
         drop(_pause);
         self.herdr.report_working();
         if let Some(renderer) = self.renderer() {
             renderer.lock().await.resume_after_input();
         }
-        match approved {
-            Ok(Ok(true)) => CallDecision::Allow,
-            _ => CallDecision::deny(USER_DENIED_REASON),
-        }
+        apply_choice(
+            &self.grants,
+            answer,
+            chat_id,
+            request.turn_id,
+            request.tool_name,
+        )
     }
 }
 
@@ -536,5 +647,131 @@ mod tests {
         assert_eq!(decision, CallDecision::Allow);
         assert!(broker.is_granted("chat-1", Some("turn-42"), "exec"));
         assert!(!broker.is_granted("chat-1", Some("turn-43"), "exec"));
+    }
+
+    // ── CLI choices and grants ────────────────────────────────────────────────
+
+    #[test]
+    fn the_menu_offers_run_skip_and_three_ways_to_remember_the_answer() {
+        let labels: Vec<String> = cli_choices("shell", true)
+            .iter()
+            .map(ToString::to_string)
+            .collect();
+        assert_eq!(
+            labels,
+            [
+                MSG_RUN_THIS_CALL,
+                MSG_SKIP_THIS_CALL,
+                "Run, and allow all calls for this turn",
+                "Run, and always allow `shell` this session",
+                "Run, and allow everything this session",
+            ]
+        );
+    }
+
+    #[test]
+    fn the_turn_choice_is_left_out_when_the_turn_is_not_known() {
+        let choices = cli_choices("shell", false);
+        assert_eq!(choices.len(), 4);
+        assert!(
+            !choices
+                .iter()
+                .any(|c| matches!(c, CliChoice::RunAndGrant(ApprovalGrant::Turn, _)))
+        );
+    }
+
+    #[test]
+    fn running_or_skipping_records_no_grant() {
+        let grants = ApprovalGrants::new();
+        assert_eq!(
+            apply_choice(&grants, Some(CliChoice::Run), "cli", Some("t1"), "shell"),
+            CallDecision::Allow
+        );
+        assert_eq!(
+            apply_choice(&grants, Some(CliChoice::Skip), "cli", Some("t1"), "shell"),
+            user_denied()
+        );
+        assert!(!grants.is_granted("cli", Some("t1"), "shell"));
+    }
+
+    #[test]
+    fn no_answer_skips_the_call() {
+        let grants = ApprovalGrants::new();
+        assert_eq!(
+            apply_choice(&grants, None, "cli", Some("t1"), "shell"),
+            user_denied()
+        );
+    }
+
+    #[test]
+    fn a_tool_grant_covers_that_tool_only() {
+        let grants = ApprovalGrants::new();
+        let choice = CliChoice::RunAndGrant(ApprovalGrant::SessionTool, String::new());
+        assert_eq!(
+            apply_choice(&grants, Some(choice), "cli", Some("t1"), "read_file"),
+            CallDecision::Allow
+        );
+        assert!(grants.is_granted("cli", Some("t2"), "read_file"));
+        assert!(!grants.is_granted("cli", Some("t2"), "shell"));
+    }
+
+    #[test]
+    fn a_session_grant_covers_every_tool_and_a_turn_grant_only_its_turn() {
+        let grants = ApprovalGrants::new();
+        let session = CliChoice::RunAndGrant(ApprovalGrant::Session, String::new());
+        apply_choice(&grants, Some(session), "cli", Some("t1"), "shell");
+        assert!(grants.is_granted("cli", Some("t9"), "write_file"));
+
+        let turn_only = ApprovalGrants::new();
+        let turn = CliChoice::RunAndGrant(ApprovalGrant::Turn, String::new());
+        apply_choice(&turn_only, Some(turn), "cli", Some("t1"), "shell");
+        assert!(turn_only.is_granted("cli", Some("t1"), "write_file"));
+        assert!(!turn_only.is_granted("cli", Some("t2"), "write_file"));
+    }
+
+    #[test]
+    fn grant_notes_say_how_long_the_grant_lasts() {
+        assert!(grant_note(ApprovalGrant::Turn, "shell").contains("this turn"));
+        assert!(grant_note(ApprovalGrant::SessionTool, "shell").contains("`shell`"));
+        assert!(grant_note(ApprovalGrant::SessionTool, "shell").contains("until you quit"));
+        assert!(grant_note(ApprovalGrant::Session, "shell").contains("every tool call"));
+    }
+
+    #[tokio::test]
+    async fn a_granted_call_runs_without_asking_even_when_nobody_could_be_asked() {
+        let hook = CliAskHook::new(HerdrReporter::disabled_for_test());
+        hook.grants.add(
+            "direct",
+            ApprovalGrant::SessionTool,
+            None,
+            vec!["exec".into()],
+        );
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&request(&arguments, Some("cli"), Some("direct")))
+            .await;
+
+        assert_eq!(decision, CallDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn a_grant_of_one_chat_does_not_cover_another() {
+        if std::io::stdin().is_terminal() {
+            return;
+        }
+        let hook = CliAskHook::new(HerdrReporter::disabled_for_test());
+        hook.grants
+            .add("direct", ApprovalGrant::Session, None, vec![]);
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&request(&arguments, Some("cli"), Some("other")))
+            .await;
+
+        assert!(
+            !decision.is_allowed(),
+            "no terminal and no grant for this chat"
+        );
     }
 }

@@ -154,7 +154,8 @@ Added after Phase 3, because one card per call made long turns tedious. Built 20
   everything this session. A banner lists active grants with a **Revoke** button. See `docs/TOOL_PIPELINE.md`.
 - `ToolCallAuthorization` gained `turn_id` (from the journal's turn) so a turn grant expires with its turn.
 - Grants live in the broker, in memory, per chat; they are cleared by `clear_session`, `delete_chat` and revoke.
-- Not done: the CLI prompt has no grant choices, and ACP permission requests are unchanged.
+- The CLI prompt got the same choices afterwards (`feature/cli-approval-grants`), on a shared `ApprovalGrants`
+  store; they last until the CLI exits and there is no revoke command. ACP permission requests are unchanged.
 - Decided with Gil: per-tool grants and the revoke banner are part of the first version; a blanket session grant
   would otherwise switch confirmation off for the chat without any sign of it.
 
