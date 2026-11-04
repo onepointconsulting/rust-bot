@@ -1116,6 +1116,141 @@ fn is_assistant_transcript_row(row: &Value) -> bool {
     )
 }
 
+/// One assistant bubble of the history: what the model did in one round.
+///
+/// A round is reasoning, then the text the model wrote before calling tools
+/// (if any), then the tool hints of those calls, in that order. The live view
+/// shows each round as its own bubble, so history must too.
+struct AssistantBubble<'a> {
+    /// The first row of the bubble: stamps an entry that has no text of its own.
+    first_row: &'a Value,
+    /// The answer/narration row, when the round produced text.
+    text_row: Option<&'a Value>,
+    /// Reasoning blocks of the round, in order.
+    reasoning: Vec<String>,
+    /// `{kind, text}` activity (tool hints, progress notes) of the round.
+    activity: Vec<Value>,
+}
+
+impl<'a> AssistantBubble<'a> {
+    fn new(first_row: &'a Value) -> Self {
+        Self {
+            first_row,
+            text_row: None,
+            reasoning: Vec::new(),
+            activity: Vec::new(),
+        }
+    }
+
+    /// Whether the model has already moved past reasoning in this round, so the
+    /// next reasoning block or text row starts the next round.
+    fn is_past_reasoning(&self) -> bool {
+        self.text_row.is_some() || !self.activity.is_empty()
+    }
+}
+
+/// One entry of the history: a user message or an assistant bubble.
+enum HistoryItem<'a> {
+    User(&'a Value),
+    Assistant(AssistantBubble<'a>),
+}
+
+/// Whether `row` is a `user` row of the transcript.
+fn is_user_transcript_row(row: &Value) -> bool {
+    row.get("event").and_then(Value::as_str) == Some("user")
+        || row.get("role").and_then(Value::as_str) == Some("user")
+}
+
+/// Whether `row` is a tool hint or progress note.
+fn is_activity_transcript_row(row: &Value) -> bool {
+    matches!(
+        row.get("kind").and_then(Value::as_str),
+        Some("tool_hint") | Some("progress")
+    )
+}
+
+/// `send_reasoning_end` persists `{event: "reasoning_end", text, turn_phase:
+/// "reasoning"}` with no `kind`. Match either stamp so a row is not dropped
+/// just because one of them is missing.
+fn is_reasoning_transcript_row(row: &Value) -> bool {
+    row.get("event").and_then(Value::as_str) == Some("reasoning_end")
+        || row.get("turn_phase").and_then(Value::as_str) == Some("reasoning")
+}
+
+/// The non-blank `text` of `row`.
+fn non_blank_text(row: &Value) -> Option<&str> {
+    row.get("text")
+        .and_then(Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+/// Move the bubble being built, if any, into `items`.
+fn flush_bubble<'a>(current: &mut Option<AssistantBubble<'a>>, items: &mut Vec<HistoryItem<'a>>) {
+    if let Some(bubble) = current.take() {
+        items.push(HistoryItem::Assistant(bubble));
+    }
+}
+
+/// Group transcript rows into history items, one assistant bubble per model round.
+///
+/// Rows of a round arrive as reasoning, narration text, tool hints. A new round
+/// starts at the first reasoning block or text row that follows text or tool
+/// hints of the current one. A bubble never spans a user message or a
+/// `turn_end`, and one that never got an answer (the turn was stopped, or the
+/// gateway restarted) is kept: its tool hints and reasoning are still worth
+/// showing.
+fn group_transcript_rows(rows: &[Value]) -> Vec<HistoryItem<'_>> {
+    let mut items: Vec<HistoryItem<'_>> = Vec::new();
+    let mut current: Option<AssistantBubble<'_>> = None;
+
+    for row in rows {
+        if is_user_transcript_row(row) {
+            flush_bubble(&mut current, &mut items);
+            items.push(HistoryItem::User(row));
+        } else if row.get("event").and_then(Value::as_str) == Some("turn_end") {
+            flush_bubble(&mut current, &mut items);
+        } else if is_activity_transcript_row(row) {
+            let Some(text) = non_blank_text(row) else {
+                continue;
+            };
+            let kind = row
+                .get("kind")
+                .and_then(Value::as_str)
+                .unwrap_or("progress");
+            current
+                .get_or_insert_with(|| AssistantBubble::new(row))
+                .activity
+                .push(serde_json::json!({"kind": kind, "text": text}));
+        } else if is_reasoning_transcript_row(row) {
+            let Some(text) = non_blank_text(row) else {
+                continue;
+            };
+            if current
+                .as_ref()
+                .is_some_and(|bubble| bubble.is_past_reasoning())
+            {
+                flush_bubble(&mut current, &mut items);
+            }
+            current
+                .get_or_insert_with(|| AssistantBubble::new(row))
+                .reasoning
+                .push(text.to_string());
+        } else if is_assistant_transcript_row(row) && non_blank_text(row).is_some() {
+            if current
+                .as_ref()
+                .is_some_and(|bubble| bubble.is_past_reasoning())
+            {
+                flush_bubble(&mut current, &mut items);
+            }
+            current
+                .get_or_insert_with(|| AssistantBubble::new(row))
+                .text_row = Some(row);
+        }
+    }
+    flush_bubble(&mut current, &mut items);
+    items
+}
+
 /// Shape durable transcript rows for the WebSocket `attached` envelope's
 /// `history` field. Companion to `websocket_chat_history`
 /// (`channels/websocket/runtime.rs`): the same cap-from-the-end and
@@ -1123,28 +1258,21 @@ fn is_assistant_transcript_row(row: &Value) -> bool {
 /// `{role, content, timestamp?, reasoning_content?}` projection, but reading
 /// completed `user`/`message` transcript rows instead of `Session` messages.
 /// Used when a chat fork copies the JSONL transcript rather than the session
-/// file, since the new session key has no `Session` yet to read history
-/// from.
+/// file, and when a chat is attached.
 ///
 /// Unlike nanobot's `replay_transcript_to_ui_messages`, this does not fold
 /// `delta`/`reasoning_delta`/`file_edit` events into rich UI messages — those
 /// rows are simply skipped, since `attached.history` only ever carries plain
-/// `user`/`assistant` text (see `websocket_chat_history`'s doc comment)
-/// alongside the `activity` array and `reasoning_content` described below.
+/// `user`/`assistant` text alongside the `activity` array and
+/// `reasoning_content` described below.
 ///
-/// `tool_hint`/`progress` ("activity") rows and `reasoning_end` rows are
-/// not emitted as standalone history rows either — there is no `{role,
-/// content}` shape for them — but unlike the other skipped event kinds they
-/// aren't dropped outright: each is buffered and attached to the next answer
-/// row for the same turn (the simplest chronological pairing: "whatever
-/// hints/reasoning preceded this answer, describe it"). Activity lands as a
-/// plain `{"kind", "text"}` object on the answer's `activity` field;
-/// assembled reasoning text lands on `reasoning_content`, matching the
-/// session-file projection `websocket_chat_history` already sends. The
-/// buffers are discarded, not carried forward, when a `user` row starts a
-/// new turn before any answer arrived — an aborted turn's hints/reasoning
-/// have no answer of their own to describe and shouldn't leak onto the next
-/// turn's. Presentation (chip glyph/status, reasoning panel) is left
+/// Each model round of a turn is its own assistant entry, as in the live view:
+/// the reasoning of the round as `reasoning_content`, its narration text as
+/// `content` (empty when the round went straight to tool calls), and its tool
+/// hints and progress notes as `{"kind", "text"}` objects on `activity`. See
+/// [`group_transcript_rows`] for how rounds are told apart. A round that never
+/// got an answer is kept too, so a stopped or interrupted turn still shows
+/// what it did. Presentation (chip glyph/status, reasoning panel) is left
 /// entirely to the frontend, same as it already is for live
 /// `tool_hint`/`progress`/`reasoning_*` messages.
 fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
@@ -1152,149 +1280,99 @@ fn transcript_chat_history(rows: &[Value], max_messages: usize) -> Vec<Value> {
         return Vec::new();
     }
 
-    let is_user_row = |row: &Value| {
-        row.get("event").and_then(Value::as_str) == Some("user")
-            || row.get("role").and_then(Value::as_str) == Some("user")
-    };
-    let is_activity_row = |row: &Value| {
-        matches!(
-            row.get("kind").and_then(Value::as_str),
-            Some("tool_hint") | Some("progress")
-        )
-    };
-    // `send_reasoning_end` persists `{event: "reasoning_end", text, turn_phase:
-    // "reasoning"}` — no `kind` field. Match either stamp so a row is not
-    // dropped just because one of them is missing.
-    let is_reasoning_row = |row: &Value| {
-        row.get("event").and_then(Value::as_str) == Some("reasoning_end")
-            || row.get("turn_phase").and_then(Value::as_str) == Some("reasoning")
-    };
-
-    let mut pending_activity: Vec<Value> = Vec::new();
-    let mut pending_reasoning: Vec<String> = Vec::new();
-    let mut visible: Vec<(&Value, Vec<Value>, Vec<String>)> = Vec::new();
-    for row in rows {
-        if is_user_row(row) {
-            pending_activity.clear();
-            pending_reasoning.clear();
-            visible.push((row, Vec::new(), Vec::new()));
-            continue;
-        }
-        if is_activity_row(row) {
-            if let Some(text) = row
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|t| !t.trim().is_empty())
-            {
-                let kind = row
-                    .get("kind")
-                    .and_then(Value::as_str)
-                    .unwrap_or("progress");
-                pending_activity.push(serde_json::json!({"kind": kind, "text": text}));
-            }
-            continue;
-        }
-        if is_reasoning_row(row) {
-            if let Some(text) = row
-                .get("text")
-                .and_then(Value::as_str)
-                .filter(|t| !t.trim().is_empty())
-            {
-                pending_reasoning.push(text.to_string());
-            }
-            continue;
-        }
-        if is_assistant_transcript_row(row)
-            && !row
-                .get("text")
-                .and_then(Value::as_str)
-                .unwrap_or("")
-                .trim()
-                .is_empty()
-        {
-            visible.push((
-                row,
-                std::mem::take(&mut pending_activity),
-                std::mem::take(&mut pending_reasoning),
-            ));
-        }
-    }
-
+    let mut visible = group_transcript_rows(rows);
     if visible.len() > max_messages {
         visible = visible.split_off(visible.len() - max_messages);
     }
     // Don't open the transcript on a dangling assistant reply.
-    if let Some(start) = visible.iter().position(|(row, _, _)| is_user_row(row)) {
+    if let Some(start) = visible
+        .iter()
+        .position(|item| matches!(item, HistoryItem::User(_)))
+    {
         visible = visible.split_off(start);
     }
 
-    visible
-        .into_iter()
-        .map(|(row, activity, reasoning_parts)| {
-            let role = if is_user_row(row) {
-                "user"
-            } else {
-                "assistant"
-            };
-            let mut entry = serde_json::json!({
-                "role": role,
-                "content": row.get("text").and_then(Value::as_str).unwrap_or(""),
-            });
-            if let Some(timestamp) = row.get("timestamp").and_then(Value::as_str) {
-                entry["timestamp"] = serde_json::json!(timestamp);
-            } else if let Some(ms) = valid_created_at_ms(row.get("created_at_ms"))
-                && let Some(dt) = chrono::DateTime::from_timestamp_millis(ms)
-            {
-                entry["timestamp"] = serde_json::json!(dt.to_rfc3339());
-            }
-            // Prefer the folded `reasoning_end` text (how the WebUI transcript
-            // actually stores a completed trace). Fall back to a
-            // `reasoning_content`/`reasoning` field on the answer row itself,
-            // which is the session-file shape `websocket_chat_history` reads.
-            let reasoning = if reasoning_parts.is_empty() {
-                None
-            } else {
-                Some(reasoning_parts.join("\n\n"))
-            }
-            .or_else(|| {
-                row.get("reasoning_content")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
+    visible.iter().map(history_entry).collect()
+}
+
+/// The `attached.history` entry of one history item.
+fn history_entry(item: &HistoryItem<'_>) -> Value {
+    let (role, row, bubble) = match item {
+        HistoryItem::User(row) => ("user", *row, None),
+        HistoryItem::Assistant(bubble) => (
+            "assistant",
+            bubble.text_row.unwrap_or(bubble.first_row),
+            Some(bubble),
+        ),
+    };
+    let mut entry = serde_json::json!({
+        "role": role,
+        "content": if bubble.is_some_and(|b| b.text_row.is_none()) {
+            ""
+        } else {
+            row.get("text").and_then(Value::as_str).unwrap_or("")
+        },
+    });
+    if let Some(timestamp) = row.get("timestamp").and_then(Value::as_str) {
+        entry["timestamp"] = serde_json::json!(timestamp);
+    } else if let Some(ms) = valid_created_at_ms(row.get("created_at_ms"))
+        && let Some(dt) = chrono::DateTime::from_timestamp_millis(ms)
+    {
+        entry["timestamp"] = serde_json::json!(dt.to_rfc3339());
+    }
+    if let Some(bubble) = bubble {
+        // Prefer the `reasoning_end` text (how the WebUI transcript actually
+        // stores a completed trace). Fall back to a `reasoning_content`/
+        // `reasoning` field on the answer row itself, which is the
+        // session-file shape `websocket_chat_history` reads.
+        let reasoning = if bubble.reasoning.is_empty() {
+            None
+        } else {
+            Some(bubble.reasoning.join("\n\n"))
+        }
+        .or_else(|| {
+            bubble.text_row.and_then(|text_row| {
+                ["reasoning_content", "reasoning"].iter().find_map(|key| {
+                    text_row
+                        .get(*key)
+                        .and_then(Value::as_str)
+                        .filter(|s| !s.is_empty())
+                        .map(str::to_string)
+                })
             })
-            .or_else(|| {
-                row.get("reasoning")
-                    .and_then(Value::as_str)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-            });
-            if let Some(reasoning) = reasoning {
-                entry["reasoning_content"] = serde_json::json!(reasoning);
-            }
-            if !activity.is_empty() {
-                entry["activity"] = serde_json::json!(activity);
-            }
-            // Raw (unresolved) media refs: still the absolute on-disk paths
-            // recorded under `media_paths` on user rows (`build_user_transcript_event`)
-            // and assistant answer rows (outbound `send()`). Not yet turned
-            // into `/v1/media/...` URLs. Kept as a pure, filesystem-free
-            // projection here — path -> URL resolution (which needs to
-            // check the file still exists) happens once, afterward, in
-            // `channels::websocket::runtime::resolve_history_media`, so this
-            // function's own tests stay filesystem-free.
-            if let Some(media_paths) = row.get("media_paths").and_then(Value::as_array)
-                && !media_paths.is_empty()
-            {
-                entry["media"] = serde_json::json!(media_paths);
-            }
-            if role == "user"
-                && let Some(user_id) = user_id_from_row(row)
-            {
-                entry["user_id"] = serde_json::json!(user_id);
-            }
-            entry
-        })
-        .collect()
+        });
+        if let Some(reasoning) = reasoning {
+            entry["reasoning_content"] = serde_json::json!(reasoning);
+        }
+        if !bubble.activity.is_empty() {
+            entry["activity"] = serde_json::json!(bubble.activity);
+        }
+    }
+    // Raw (unresolved) media refs: still the absolute on-disk paths
+    // recorded under `media_paths` on user rows (`build_user_transcript_event`)
+    // and assistant answer rows (outbound `send()`). Not yet turned
+    // into `/v1/media/...` URLs. Kept as a pure, filesystem-free
+    // projection here — path -> URL resolution (which needs to
+    // check the file still exists) happens once, afterward, in
+    // `channels::websocket::runtime::resolve_history_media`, so this
+    // function's own tests stay filesystem-free.
+    let media_row = match bubble {
+        Some(bubble) => bubble.text_row,
+        None => Some(row),
+    };
+    if let Some(media_paths) = media_row
+        .and_then(|row| row.get("media_paths"))
+        .and_then(Value::as_array)
+        && !media_paths.is_empty()
+    {
+        entry["media"] = serde_json::json!(media_paths);
+    }
+    if role == "user"
+        && let Some(user_id) = user_id_from_row(row)
+    {
+        entry["user_id"] = serde_json::json!(user_id);
+    }
+    entry
 }
 
 #[cfg(test)]
@@ -2618,13 +2696,147 @@ mod tests {
         assert!(history[1].get("media").is_none());
     }
 
+    /// `{role, content}` pairs of a history, for readable assertions.
+    fn shape(history: &[Value]) -> Vec<(String, String)> {
+        history
+            .iter()
+            .map(|entry| {
+                (
+                    entry["role"].as_str().unwrap_or("").to_string(),
+                    entry["content"].as_str().unwrap_or("").to_string(),
+                )
+            })
+            .collect()
+    }
+
+    fn activity_texts(entry: &Value) -> Vec<String> {
+        entry["activity"]
+            .as_array()
+            .map(|items| {
+                items
+                    .iter()
+                    .map(|item| item["text"].as_str().unwrap_or("").to_string())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     #[test]
-    fn transcript_chat_history_drops_turn_end_and_fork_marker_rows_and_folds_activity() {
+    fn transcript_chat_history_keeps_turn_end_fork_marker_and_blank_rows_out_of_the_history() {
         let rows = vec![
             serde_json::json!({"event": "user", "text": "hi"}),
             serde_json::json!({"event": "turn_end"}),
             serde_json::json!({"event": WEBUI_FORK_MARKER_EVENT}),
             serde_json::json!({"event": "message", "text": ""}),
+            serde_json::json!({"event": "reasoning_end", "text": "   "}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": ""}),
+            serde_json::json!({"event": "message", "text": "answer"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(
+            shape(&history),
+            [
+                ("user".into(), "hi".into()),
+                ("assistant".into(), "answer".into())
+            ]
+        );
+        assert!(history[1].get("activity").is_none());
+        assert!(history[1].get("reasoning_content").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_shows_each_model_round_as_its_own_entry() {
+        // The shape of a real turn: round one reasons and calls a tool without
+        // writing any text, round two reasons and answers.
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "question"}),
+            serde_json::json!({"event": "reasoning_end", "text": "let me search"}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "search x"}),
+            serde_json::json!({"event": "reasoning_end", "text": "I have enough"}),
+            serde_json::json!({"event": "message", "text": "the answer"}),
+            serde_json::json!({"event": "turn_end"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(
+            shape(&history),
+            [
+                ("user".into(), "question".into()),
+                ("assistant".into(), "".into()),
+                ("assistant".into(), "the answer".into()),
+            ]
+        );
+        assert_eq!(history[1]["reasoning_content"], "let me search");
+        assert_eq!(activity_texts(&history[1]), ["search x"]);
+        assert_eq!(history[2]["reasoning_content"], "I have enough");
+        assert!(history[2].get("activity").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_keeps_tool_hints_with_the_narration_of_their_round() {
+        // Within a round the order is reasoning, narration, tool hints; the
+        // hints belong to that round's text, not to the next round's.
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "q"}),
+            serde_json::json!({"event": "reasoning_end", "text": "r1"}),
+            serde_json::json!({"event": "message", "text": "Let me check the docs:"}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "hint1"}),
+            serde_json::json!({"event": "reasoning_end", "text": "r2"}),
+            serde_json::json!({"event": "message", "text": "Let me try another page:"}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "hint2"}),
+            serde_json::json!({"event": "reasoning_end", "text": "r3"}),
+            serde_json::json!({"event": "message", "text": "final answer"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(
+            shape(&history),
+            [
+                ("user".into(), "q".into()),
+                ("assistant".into(), "Let me check the docs:".into()),
+                ("assistant".into(), "Let me try another page:".into()),
+                ("assistant".into(), "final answer".into()),
+            ]
+        );
+        assert_eq!(activity_texts(&history[1]), ["hint1"]);
+        assert_eq!(history[1]["reasoning_content"], "r1");
+        assert_eq!(activity_texts(&history[2]), ["hint2"]);
+        assert_eq!(history[2]["reasoning_content"], "r2");
+        assert!(history[3].get("activity").is_none());
+        assert_eq!(history[3]["reasoning_content"], "r3");
+    }
+
+    #[test]
+    fn transcript_chat_history_starts_a_new_round_at_text_that_follows_tool_hints() {
+        // No reasoning rows: text after tool hints is the next round.
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi"}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "round one hint"}),
+            serde_json::json!({"event": "message", "text": "round two answer"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(
+            shape(&history),
+            [
+                ("user".into(), "hi".into()),
+                ("assistant".into(), "".into()),
+                ("assistant".into(), "round two answer".into()),
+            ]
+        );
+        assert_eq!(activity_texts(&history[1]), ["round one hint"]);
+        assert!(history[2].get("activity").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_keeps_progress_notes_with_tool_hints_in_order() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "hi"}),
             serde_json::json!({"event": "message", "kind": "tool_hint", "text": "read foo.rs"}),
             serde_json::json!({"event": "message", "kind": "progress", "text": "thinking..."}),
             serde_json::json!({"event": "message", "text": "answer"}),
@@ -2632,12 +2844,6 @@ mod tests {
 
         let history = transcript_chat_history(&rows, 500);
 
-        // No standalone rows for turn_end/fork-marker/empty-text/activity rows —
-        // just the user row and the answer, with the two activity rows folded
-        // onto the answer instead of dropped.
-        assert_eq!(history.len(), 2);
-        assert_eq!(history[0]["content"], "hi");
-        assert_eq!(history[1]["content"], "answer");
         assert_eq!(
             history[1]["activity"],
             serde_json::json!([
@@ -2645,61 +2851,25 @@ mod tests {
                 {"kind": "progress", "text": "thinking..."},
             ])
         );
-        assert!(history[0].get("activity").is_none());
     }
 
     #[test]
-    fn transcript_chat_history_pairs_each_activity_run_with_its_own_chronological_answer() {
-        // Two rounds within one turn: activity1 must attach only to answer1,
-        // activity2 only to answer2 — not lumped together on either.
+    fn transcript_chat_history_joins_reasoning_blocks_of_one_round() {
+        // Two reasoning blocks with nothing between them are one round.
         let rows = vec![
             serde_json::json!({"event": "user", "text": "hi"}),
-            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "round one hint"}),
-            serde_json::json!({"event": "message", "text": "round one answer"}),
-            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "round two hint"}),
-            serde_json::json!({"event": "message", "text": "round two answer"}),
-        ];
-
-        let history = transcript_chat_history(&rows, 500);
-
-        assert_eq!(history.len(), 3);
-        assert!(history[0].get("activity").is_none());
-        assert_eq!(
-            history[1]["activity"],
-            serde_json::json!([{"kind": "tool_hint", "text": "round one hint"}])
-        );
-        assert_eq!(
-            history[2]["activity"],
-            serde_json::json!([{"kind": "tool_hint", "text": "round two hint"}])
-        );
-    }
-
-    #[test]
-    fn transcript_chat_history_folds_reasoning_end_onto_the_next_answer() {
-        // Exact persist shape from `send_reasoning_end`: event + assembled
-        // text + turn_phase, no `kind`. Must become `reasoning_content` on
-        // the answer, not a standalone history row or an activity chip.
-        let rows = vec![
-            serde_json::json!({"event": "user", "text": "hi"}),
-            serde_json::json!({
-                "event": "reasoning_end",
-                "text": "assembled reasoning",
-                "turn_phase": "reasoning",
-            }),
-            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "read foo.rs"}),
+            serde_json::json!({"event": "reasoning_end", "text": "first thought"}),
+            serde_json::json!({"event": "reasoning_end", "text": "second thought"}),
             serde_json::json!({"event": "message", "text": "answer"}),
         ];
 
         let history = transcript_chat_history(&rows, 500);
 
         assert_eq!(history.len(), 2);
-        assert_eq!(history[1]["content"], "answer");
-        assert_eq!(history[1]["reasoning_content"], "assembled reasoning");
         assert_eq!(
-            history[1]["activity"],
-            serde_json::json!([{"kind": "tool_hint", "text": "read foo.rs"}])
+            history[1]["reasoning_content"],
+            "first thought\n\nsecond thought"
         );
-        assert!(history[0].get("reasoning_content").is_none());
     }
 
     #[test]
@@ -2719,44 +2889,12 @@ mod tests {
     }
 
     #[test]
-    fn transcript_chat_history_pairs_each_reasoning_run_with_its_own_chronological_answer() {
-        let rows = vec![
-            serde_json::json!({"event": "user", "text": "hi"}),
-            serde_json::json!({"event": "reasoning_end", "text": "first thought"}),
-            serde_json::json!({"event": "message", "text": "round one"}),
-            serde_json::json!({"event": "reasoning_end", "text": "second thought"}),
-            serde_json::json!({"event": "message", "text": "round two"}),
-        ];
-
-        let history = transcript_chat_history(&rows, 500);
-
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[1]["reasoning_content"], "first thought");
-        assert_eq!(history[2]["reasoning_content"], "second thought");
-    }
-
-    #[test]
-    fn transcript_chat_history_discards_orphaned_reasoning_from_an_aborted_turn() {
+    fn transcript_chat_history_keeps_what_a_turn_did_when_it_never_reached_an_answer() {
+        // A stopped or interrupted turn: its reasoning and tool hints stay
+        // visible, and none of it leaks onto the next turn's answer.
         let rows = vec![
             serde_json::json!({"event": "user", "text": "first"}),
             serde_json::json!({"event": "reasoning_end", "text": "aborted thought"}),
-            serde_json::json!({"event": "user", "text": "second"}),
-            serde_json::json!({"event": "message", "text": "second answer"}),
-        ];
-
-        let history = transcript_chat_history(&rows, 500);
-
-        assert_eq!(history.len(), 3);
-        assert_eq!(history[2]["content"], "second answer");
-        assert!(history[2].get("reasoning_content").is_none());
-    }
-
-    #[test]
-    fn transcript_chat_history_discards_orphaned_activity_from_an_aborted_turn() {
-        // An aborted turn's tool hint never gets an answer of its own — it
-        // must not leak onto the next turn's unrelated answer.
-        let rows = vec![
-            serde_json::json!({"event": "user", "text": "first"}),
             serde_json::json!({"event": "message", "kind": "tool_hint", "text": "aborted hint"}),
             serde_json::json!({"event": "user", "text": "second"}),
             serde_json::json!({"event": "message", "text": "second answer"}),
@@ -2764,9 +2902,121 @@ mod tests {
 
         let history = transcript_chat_history(&rows, 500);
 
+        assert_eq!(
+            shape(&history),
+            [
+                ("user".into(), "first".into()),
+                ("assistant".into(), "".into()),
+                ("user".into(), "second".into()),
+                ("assistant".into(), "second answer".into()),
+            ]
+        );
+        assert_eq!(history[1]["reasoning_content"], "aborted thought");
+        assert_eq!(activity_texts(&history[1]), ["aborted hint"]);
+        assert!(history[3].get("reasoning_content").is_none());
+        assert!(history[3].get("activity").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_keeps_the_rounds_of_a_turn_that_is_still_running() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "q"}),
+            serde_json::json!({"event": "reasoning_end", "text": "thinking"}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "search x"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(history.len(), 2);
+        assert_eq!(activity_texts(&history[1]), ["search x"]);
+    }
+
+    #[test]
+    fn transcript_chat_history_never_lets_a_round_span_a_turn_end() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "q"}),
+            serde_json::json!({"event": "message", "kind": "tool_hint", "text": "hint"}),
+            serde_json::json!({"event": "turn_end"}),
+            serde_json::json!({"event": "message", "text": "late text"}),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
         assert_eq!(history.len(), 3);
-        assert_eq!(history[2]["content"], "second answer");
+        assert_eq!(activity_texts(&history[1]), ["hint"]);
         assert!(history[2].get("activity").is_none());
+    }
+
+    #[test]
+    fn transcript_chat_history_stamps_an_entry_without_text_with_its_first_row() {
+        let rows = vec![
+            serde_json::json!({"event": "user", "text": "q", "created_at_ms": 1_757_090_100_000i64}),
+            serde_json::json!({
+                "event": "message",
+                "kind": "tool_hint",
+                "text": "hint",
+                "created_at_ms": 1_757_090_165_000i64,
+            }),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        let stamped = history[1]["timestamp"].as_str().expect("stamp");
+        let parsed = chrono::DateTime::parse_from_rfc3339(stamped).expect("rfc3339");
+        assert_eq!(parsed.timestamp_millis(), 1_757_090_165_000);
+    }
+
+    #[test]
+    fn transcript_chat_history_rebuilds_the_reported_session_round_by_round() {
+        // The rows of a real chat: an interrupted first attempt, the same
+        // question asked again with a four-round answer, then a follow-up.
+        let user = |text: &str| serde_json::json!({"event": "user", "text": text});
+        let reasoning = |text: &str| serde_json::json!({"event": "reasoning_end", "text": text});
+        let hint =
+            |text: &str| serde_json::json!({"event": "message", "kind": "tool_hint", "text": text});
+        let answer = |text: &str| serde_json::json!({"event": "message", "text": text});
+        let end = || serde_json::json!({"event": "turn_end"});
+        let rows = vec![
+            user("results?"),
+            reasoning("search"),
+            hint("search A"),
+            user("results?"),
+            reasoning("retry"),
+            hint("search B"),
+            reasoning("polls"),
+            hint("search C"),
+            reasoning("enough"),
+            answer("Here is what happened"),
+            end(),
+            user("reactions?"),
+            reasoning("look up reactions"),
+            hint("search D x2"),
+            reasoning("good material"),
+            answer("Here are the reactions"),
+            end(),
+        ];
+
+        let history = transcript_chat_history(&rows, 500);
+
+        assert_eq!(
+            shape(&history),
+            [
+                ("user".into(), "results?".into()),
+                ("assistant".into(), "".into()), // the interrupted attempt keeps its search
+                ("user".into(), "results?".into()),
+                ("assistant".into(), "".into()),
+                ("assistant".into(), "".into()),
+                ("assistant".into(), "Here is what happened".into()),
+                ("user".into(), "reactions?".into()),
+                ("assistant".into(), "".into()),
+                ("assistant".into(), "Here are the reactions".into()),
+            ]
+        );
+        assert_eq!(activity_texts(&history[1]), ["search A"]);
+        assert_eq!(activity_texts(&history[7]), ["search D x2"]);
+        assert_eq!(history[7]["reasoning_content"], "look up reactions");
+        assert_eq!(history[8]["reasoning_content"], "good material");
+        assert!(history[8].get("activity").is_none());
     }
 
     #[test]
