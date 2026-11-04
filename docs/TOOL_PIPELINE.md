@@ -114,6 +114,14 @@ you what you just allowed. They last until you quit the CLI, start a new session
 button, so `/revoke` there explains that). A grant is checked before the terminal check, so a granted call still runs
 when nobody could be asked.
 
+## Known gaps
+
+The pipeline described above is the one the main agent loop uses. Subagents, Dream runs and ACP child agents do not
+get all of it (a subagent's tool calls are not confirmed, journaled or timed out), and some features are not built
+yet (a policy layer with per-tool and per-argument rules, an approval record in the journal, retry, the error flag
+for most tools). The open list, with notes on each, is in
+[`plans/tool-execution-pipeline.md`](plans/tool-execution-pipeline.md#known-gaps-found-2026-11-04-open).
+
 ## Failure handling
 
 - A tool that **panics** returns `Error: tool '<name>' crashed: <message>`.

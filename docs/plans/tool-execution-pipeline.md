@@ -185,6 +185,59 @@ Not done: a typed result for the other tools (they keep the prefix convention), 
 
 Risk: medium. Behaviour change to know about: MCP failures are now errors (hint, event status, journal status).
 
+## Known gaps (found 2026-11-04, open)
+
+Found by comparing the finished phases with the DeepSeek pipeline and with the run paths in the code. Roughly in
+the order to pick them up. Nothing here is started.
+
+### Coverage
+
+1. **Only the main agent loop gets the whole pipeline.** Subagents (`spawn`) run with `SubagentHook`, which only
+   logs: no authorize, no journal, no execute timeout, no post-execute hook. Dream/memory runs use a default run
+   spec with no hook at all. ACP child agents have their own permission policy. With `confirmBeforeExecute` on,
+   a subagent's tool calls run without confirmation, and a run spec with no hook allows everything, so "an
+   unanswerable question is a denial" only holds where a hook is attached.
+   *Needs a decision first:* subagents run in the background with nobody to ask. Options: deny outright (consistent
+   with the rule, but blocks every subagent tool when confirmation is on), inherit the parent's grants, or an
+   explicit, documented exemption. Dream needs the same decision. This is the only security gap on the list.
+
+### Missing features
+
+2. **No policy layer.** Confirmation is all-or-nothing plus grants. There are no per-tool rules (always allow,
+   always ask, never allow) and no rules on arguments (e.g. `shell` only for `git status`). DeepSeek has a separate
+   permission/sandbox step and guards that hooks cannot reorder; here there are hooks only, and `disabledTools`
+   (which removes a tool at registration). Needs a design conversation: rule syntax, where it lives in config,
+   how it combines with grants (a rule that says "never" must beat a grant).
+3. **No audit trail of approvals.** The journal records that a call ran, not whether a person clicked, a grant
+   covered it, or nothing was asked. A grant approval is only a `log::info!` line. Add an approval record (who or
+   what approved, which grant) to the journal intent or as its own record, and show it where the journal is read.
+4. **Execute stage is incomplete.** The timeout is off by default; there is no retry (DeepSeek wraps timeout, retry
+   and metrics around execute; ours has the timeout only). Retry would apply only where `replay_safe()` is true.
+   A tool that blocks a thread without awaiting cannot be cancelled by the timeout; it needs `spawn_blocking`
+   inside the tool.
+5. **`ToolResult` migration is partial.** Only `shell` and MCP tools return an explicit flag. The other tools
+   still use the "starts with Error" convention, so output that happens to begin that way is misread as a failure.
+   `web_fetch` is the likeliest case (a fetched page can start with "Error 404"); also check `web_search`,
+   `grep`/`glob`, `gmail`, `docx`, `ocr`, `spawn`. Migrate them one at a time with a test each.
+6. **Observability stops at the hooks.** `duration_ms` reaches `on_tool_result` hooks, but nothing displays or
+   records it: the CLI and the web chat still read the `name`/`status`/`detail` maps (`ToolEvent::to_map`), and
+   there is no metrics sink. Add `duration_ms` to the outbound tool events and show it in the tool activity chip.
+7. **The post-execute hook ships no policy.** The mechanism (replace, withhold, add context) exists; nothing uses
+   it and there is no config for it. A first built-in could redact secrets (API keys, tokens) from tool results.
+8. **Grants still have holes.** A typed `/new` in the web chat does not clear its grants (the web hook keeps no
+   grants through `AgentHook::revoke_grants`, because the banner has to be told; the gateway would have to
+   broadcast `tool_grants_updated` as `clear_session` does). ACP permission requests have no grant choices.
+
+### Documentation to add to `docs/TOOL_PIPELINE.md`
+
+- A table of run paths (main loop, subagents, dream, ACP) and which stages each one gets, including the rule that
+  a run spec without a hook skips authorization.
+- A config reference: `tools.confirmBeforeExecute` and `tools.executeTimeoutSeconds`, with defaults.
+- How strict journal mode and crash recovery interact with the stages (strict mode refuses a call whose intent
+  cannot be written; recovery replays only `replay_safe()` calls).
+- Which tools return an explicit error flag, and which still use the prefix convention.
+- A flow diagram of the stages.
+
 ## Cross-cutting
 
 - Docs: update `docs/DURABILITY.md` where the journal lifecycle changes; add `docs/TOOL_PIPELINE.md` (stage
