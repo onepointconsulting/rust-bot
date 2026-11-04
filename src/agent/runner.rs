@@ -12,7 +12,10 @@ use crate::agent::circuit_breaker::{
 };
 use crate::agent::crash_points::crash_point;
 use crate::agent::hook::{AgentHook, AgentHookContext};
-use crate::agent::tool_pipeline::{ToolOutcome, ToolStatus, complete_tool_call, prepare_tool_call};
+use crate::agent::tool_event::ToolStatus;
+use crate::agent::tool_pipeline::{
+    ToolOutcome, complete_tool_call, normalize_tool_result, prepare_tool_call,
+};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::turn_journal::TurnJournal;
 use crate::bus::outbound_events::ProgressKind;
@@ -21,15 +24,15 @@ use crate::providers::base::{
     ToolCallRequest, is_unsupported_image_input_error,
 };
 use crate::session::journal::{JournalRecord, StepKind};
+use crate::session::keys::HIDDEN_HISTORY_KEY;
 use crate::utils::helpers::{
     build_assistant_message, estimate_message_tokens, estimate_prompt_tokens,
-    find_legal_message_start, maybe_persist_tool_result, truncate_text,
+    find_legal_message_start,
 };
 
 use crate::utils::runtime::{
     EMPTY_FINAL_RESPONSE_MESSAGE, build_finalization_retry_message, build_length_recovery_message,
-    build_truncated_tool_call_recovery_message, coerce_tool_execute_result,
-    ensure_nonempty_tool_result, is_blank_text,
+    build_truncated_tool_call_recovery_message, coerce_tool_execute_result, is_blank_text,
 };
 
 const DEFAULT_ERROR_MESSAGE: &str = "Sorry, I encountered an error calling the AI model.";
@@ -263,8 +266,7 @@ impl AgentRunner {
         updated.unwrap_or_else(|| messages.to_vec())
     }
 
-    /// Normalise a raw tool result: ensure it is non-empty, optionally persist
-    /// large payloads to disk, and truncate anything that still exceeds the limit.
+    /// Normalise a raw tool result (see [`normalize_tool_result`]).
     fn normalize_tool_result(
         &self,
         spec: &AgentRunSpec,
@@ -272,23 +274,7 @@ impl AgentRunner {
         tool_name: &str,
         result: Value,
     ) -> Value {
-        let result = ensure_nonempty_tool_result(tool_name, result);
-
-        let content = maybe_persist_tool_result(
-            spec.workspace.as_deref(),
-            spec.session_key.as_deref(),
-            tool_call_id,
-            result,
-            spec.max_tool_result_chars,
-        );
-
-        if let Value::String(ref s) = content
-            && spec.max_tool_result_chars > 0
-            && s.len() > spec.max_tool_result_chars
-        {
-            return Value::String(truncate_text(s, spec.max_tool_result_chars));
-        }
-        content
+        normalize_tool_result(spec, tool_call_id, tool_name, result)
     }
 
     /// Apply the tool-result character budget across all tool messages.
@@ -700,13 +686,20 @@ impl AgentRunner {
     /// order, and then *executed*, concurrently when the batch allows it. Every
     /// call yields exactly one `(result, event)`, in the order of `tool_calls`.
     ///
-    /// Returns `(results, events, fatal_error)`.
+    /// Returns `(results, events, fatal_error, added_context)`; `added_context` is
+    /// what post-execute hooks want the model to get once the batch is done.
     async fn execute_tools(
         spec: &AgentRunSpec,
         tool_calls: &[ToolCallRequest],
         external_lookup_counts: Arc<Mutex<HashMap<String, usize>>>,
         message_circuit_breaker: Arc<Mutex<MessageCircuitBreaker>>,
-    ) -> (Vec<String>, Vec<HashMap<String, String>>, Option<String>) {
+    ) -> (
+        Vec<String>,
+        Vec<HashMap<String, String>>,
+        Option<String>,
+        Vec<String>,
+    ) {
+        let mut added_context: Vec<String> = Vec::new();
         let mut results: Vec<String> = Vec::with_capacity(tool_calls.len());
         let mut events: Vec<HashMap<String, String>> = Vec::with_capacity(tool_calls.len());
         let mut fatal_error: Option<String> = None;
@@ -727,20 +720,22 @@ impl AgentRunner {
 
             let outcomes: Vec<ToolOutcome> = if spec.concurrent_tools && batch.len() > 1 {
                 futures::future::join_all(
-                    prepared
-                        .into_iter()
-                        .map(|prepared| complete_tool_call(spec, prepared)),
+                    batch
+                        .iter()
+                        .zip(prepared)
+                        .map(|(tool_call, prepared)| complete_tool_call(spec, tool_call, prepared)),
                 )
                 .await
             } else {
                 let mut outcomes = Vec::with_capacity(prepared.len());
-                for prepared in prepared {
-                    outcomes.push(complete_tool_call(spec, prepared).await);
+                for (tool_call, prepared) in batch.iter().zip(prepared) {
+                    outcomes.push(complete_tool_call(spec, tool_call, prepared).await);
                 }
                 outcomes
             };
 
-            for (tool_call, outcome) in batch.iter().zip(outcomes) {
+            for (tool_call, mut outcome) in batch.iter().zip(outcomes) {
+                added_context.extend(outcome.take_added_context());
                 log::info!(
                     "Tool result: {}",
                     outcome.content().chars().take(100).collect::<String>()
@@ -754,7 +749,7 @@ impl AgentRunner {
             }
         }
 
-        (results, events, fatal_error)
+        (results, events, fatal_error, added_context)
     }
 
     /// Group tool calls into batches for (optionally concurrent) execution.
@@ -1065,7 +1060,7 @@ impl AgentRunner {
                 ctx.tool_calls = response.tool_calls.clone();
                 hook.on_tool_calls(&mut ctx).await;
 
-                let (results, events, fatal_error) = Self::execute_tools(
+                let (results, events, fatal_error, added_context) = Self::execute_tools(
                     &spec,
                     &response.tool_calls,
                     Arc::clone(&external_lookup_counts),
@@ -1104,22 +1099,28 @@ impl AgentRunner {
                     break 'outer;
                 }
 
-                // Append normalised tool result messages.
+                // Append the tool result messages. The pipeline already normalised
+                // each result, so the transcript and the journal hold the same text.
                 for (tc, result) in response.tool_calls.iter().zip(results) {
-                    let normalized = self.normalize_tool_result(
-                        &spec,
-                        &tc.id,
-                        &tc.name,
-                        coerce_tool_execute_result(result),
-                    );
                     let tool_msg = serde_json::json!({
                         "role": "tool",
                         "tool_call_id": tc.id,
                         "name": tc.name,
-                        "content": normalized,
+                        "content": coerce_tool_execute_result(result),
                     });
                     ctx.tool_results.push(tool_msg.clone());
                     messages.push(tool_msg);
+                }
+                // Only now, after every result of the batch, so each call keeps
+                // its result right behind it. Saved for the model, not shown as a chat turn.
+                if !added_context.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": added_context.join("
+
+"),
+                        HIDDEN_HISTORY_KEY: true,
+                    }));
                 }
 
                 if fatal_error.as_deref().is_some_and(is_tripped_error) {
@@ -3391,6 +3392,167 @@ mod tests {
             tool_statuses(&fixture.journal),
             [ToolCallStatus::Intent, ToolCallStatus::Error]
         );
+    }
+
+    #[tokio::test]
+    async fn runner_journal_follows_the_error_flag_not_the_text() {
+        use crate::agent::tools::test_support::FlaggedTool;
+        for (content, is_error, expected) in [
+            ("(server said no)", true, ToolCallStatus::Error),
+            ("Error: only output", false, ToolCallStatus::Done),
+        ] {
+            let mut fixture = journal_fixture("fine", false);
+            fixture.spec.tools = registry_with(vec![Box::new(FlaggedTool {
+                content: content.into(),
+                is_error,
+            })]);
+            run_named_tool(&fixture.spec, "flagged", &[]).await;
+            assert_eq!(
+                tool_statuses(&fixture.journal),
+                [ToolCallStatus::Intent, expected],
+                "content {content:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_journal_and_transcript_hold_the_same_normalized_text() {
+        for reply in ["", &"y".repeat(500)] {
+            let mut fixture = journal_fixture("unused", true);
+            fixture.spec.max_tool_result_chars = 60;
+            fixture.spec.tools = registry_with(vec![Box::new(
+                crate::agent::tools::test_support::ScriptedTool {
+                    reply: reply.to_string(),
+                },
+            )]);
+
+            let (content, _, _) = run_named_tool(&fixture.spec, "scripted", &[("path", "a")]).await;
+
+            let entries = fixture.journal.scan().entries;
+            let JournalRecord::ToolIntent { result, .. } = &entries[1].record else {
+                panic!("expected a tool record");
+            };
+            assert_eq!(
+                result.as_deref(),
+                Some(content.as_str()),
+                "reply of {} chars",
+                reply.len()
+            );
+        }
+    }
+
+    /// Hook that replaces every result with `replacement` and adds `context` once per call.
+    struct RewritingHook {
+        replacement: Option<String>,
+        context: Option<String>,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for RewritingHook {
+        async fn after_tool_call(
+            &self,
+            _: &crate::agent::hook::ToolCallResultView<'_>,
+        ) -> crate::agent::hook::PostCallDecision {
+            crate::agent::hook::PostCallDecision {
+                replacement: self.replacement.clone(),
+                block_reason: None,
+                added_context: self.context.clone().into_iter().collect(),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runner_journal_stores_the_text_a_hook_left_not_the_raw_result() {
+        let mut fixture = journal_fixture("password=hunter2", true);
+        fixture.spec.hook = Some(Arc::new(RewritingHook {
+            replacement: Some("password=[redacted]".into()),
+            context: None,
+        }));
+
+        let result = run_probe(&fixture.spec).await;
+
+        assert_eq!(result, "password=[redacted]");
+        let entries = fixture.journal.scan().entries;
+        let JournalRecord::ToolIntent { result, .. } = &entries[1].record else {
+            panic!("expected a tool record");
+        };
+        assert_eq!(result.as_deref(), Some("password=[redacted]"));
+    }
+
+    #[tokio::test]
+    async fn run_delivers_hook_context_once_after_every_result_of_the_batch() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let mut tools = ToolRegistry::new();
+        for name in ["tool_a", "tool_b"] {
+            tools.register(Box::new(CountingTool {
+                name: name.into(),
+                hits: Arc::clone(&hits),
+            }));
+        }
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![
+            tool_call_llm_response(vec![tc("tool_a"), tc("tool_b")]),
+            text_llm_response("done"),
+        ]));
+
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                tools,
+                model: "test".into(),
+                max_iterations: 3,
+                hook: Some(Arc::new(RewritingHook {
+                    replacement: None,
+                    context: Some("remember X".into()),
+                })),
+                ..Default::default()
+            })
+            .await;
+
+        let roles: Vec<&str> = result
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(
+            roles,
+            ["user", "assistant", "tool", "tool", "user", "assistant"],
+            "one hidden user message, after both results"
+        );
+        let context = &result.messages[4];
+        assert_eq!(context["content"], "remember X\n\nremember X");
+        assert_eq!(context[HIDDEN_HISTORY_KEY], serde_json::json!(true));
+        assert_eq!(result.stop_reason, "completed");
+    }
+
+    #[tokio::test]
+    async fn run_without_hook_context_adds_no_message() {
+        let hits = Arc::new(Mutex::new(0usize));
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(CountingTool {
+            name: "tool_a".into(),
+            hits,
+        }));
+        let runner = AgentRunner::new(ScriptedProvider::new_boxed(vec![
+            tool_call_llm_response(vec![tc("tool_a")]),
+            text_llm_response("done"),
+        ]));
+
+        let result = runner
+            .run(AgentRunSpec {
+                initial_messages: vec![serde_json::json!({"role": "user", "content": "go"})],
+                tools,
+                model: "test".into(),
+                max_iterations: 3,
+                ..Default::default()
+            })
+            .await;
+
+        let roles: Vec<&str> = result
+            .messages
+            .iter()
+            .map(|m| m["role"].as_str().unwrap_or(""))
+            .collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "assistant"]);
     }
 
     /// Fixture whose journal directory cannot be created, so every append fails.

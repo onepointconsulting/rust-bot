@@ -5,7 +5,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 
 use crate::agent::runner::AgentRunSpec;
-use crate::agent::tools::base::Tool;
+use crate::agent::tools::base::{Tool, ToolResult};
 use crate::agent::tools::registry::ToolRegistry;
 
 /// Tool `scripted` that requires a `path` argument and answers with a fixed reply.
@@ -82,6 +82,37 @@ impl Tool for PanickingTool {
             panic!("{}", String::from("boom"));
         }
         panic!("boom");
+    }
+}
+
+/// Tool `flagged` that answers `content` and says by flag whether it failed.
+///
+/// Its `execute` text deliberately disagrees with the flag's legacy reading
+/// only through `execute_result`, which is what the pipeline calls.
+pub(crate) struct FlaggedTool {
+    pub content: String,
+    pub is_error: bool,
+}
+
+#[async_trait]
+impl Tool for FlaggedTool {
+    fn name(&self) -> String {
+        "flagged".into()
+    }
+    fn description(&self) -> String {
+        "flagged".into()
+    }
+    fn parameters(&self) -> serde_json::Value {
+        serde_json::json!({"type": "object", "properties": {}})
+    }
+    async fn execute(&self, _: &serde_json::Value) -> String {
+        self.content.clone()
+    }
+    async fn execute_result(&self, _: &serde_json::Value) -> ToolResult {
+        ToolResult {
+            content: self.content.clone(),
+            is_error: self.is_error,
+        }
     }
 }
 

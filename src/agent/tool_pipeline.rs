@@ -15,9 +15,17 @@
 //! | 5 | journal            | execute | write-ahead intent (may refuse in strict mode)     |
 //! | 6 | execute            | execute | run under the call identity, isolate panics,       |
 //! |   |                    |         | enforce the optional timeout                       |
-//! | 7 | journal finish     | execute | terminal record, `Done` or `Error`                 |
-//! | 8 | normalize          | execute | classify the result, add the retry hint            |
-//! | 9 | observe            | both    | map an error to a fatal one if `fail_on_tool_error`|
+//! | 7 | post-execute       | execute | `AgentHook::after_tool_call`: redact, withhold or  |
+//! |   |                    |         | annotate the raw result                            |
+//! | 8 | normalize          | both    | make the text non-empty, persist an oversized one, |
+//! |   |                    |         | cut it to the budget; add the retry hint           |
+//! | 9 | journal finish     | execute | terminal record with the normalized text           |
+//! | 10| observe            | both    | map an error to a fatal one if `fail_on_tool_error`|
+//!
+//! The post-execute hook runs on the raw result, before normalizing, so a
+//! redaction also reaches the copy that an oversized result is persisted as and
+//! the journal. Normalizing before the terminal record means the journal and the
+//! transcript hold the same text, from one function and one budget.
 //!
 //! The state guards run after authorize on purpose: a call the user denied must
 //! not count towards the circuit breaker's streak or the repeated-lookup count.
@@ -26,11 +34,16 @@
 //! the pipeline with an error *result* (never a panic or an early `return` of a
 //! hand-built tuple), so the model always gets a tool message for the call.
 
+// Every stage fails with the finished `ToolOutcome` (a complete tool result, not
+// an error code), so the `Err` variant is the size of an outcome. The stages run
+// once per tool call, next to an LLM round trip, so boxing it would only add noise.
+#![allow(clippy::result_large_err)]
+
 use std::any::Any;
 use std::collections::HashMap;
 use std::panic::AssertUnwindSafe;
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use futures::FutureExt;
 use serde_json::Value;
@@ -39,16 +52,22 @@ use crate::agent::circuit_breaker::{
     CircuitDecision, MessageCircuitBreaker, tripped_error_message,
 };
 use crate::agent::crash_points::crash_point;
-use crate::agent::hook::{CallDecision, HOOK_PANIC_DENY_REASON, ToolCallAuthorization};
+use crate::agent::hook::{
+    CallDecision, HOOK_PANIC_DENY_REASON, HOOK_PANIC_RESULT_REASON, PostCallDecision,
+    ToolCallAuthorization, ToolCallResultView,
+};
 use crate::agent::runner::AgentRunSpec;
 use crate::agent::tool_call_context::{ToolCallIdentity, with_tool_call};
-use crate::agent::tools::base::Tool;
+use crate::agent::tool_event::{ToolEvent, ToolStatus};
+use crate::agent::tools::base::{Tool, ToolResult};
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::turn_journal::InFlightToolCall;
 use crate::providers::base::ToolCallRequest;
 use crate::session::journal::ToolCallStatus;
-use crate::utils::helpers::truncate_text;
-use crate::utils::runtime::repeated_external_lookup_error;
+use crate::utils::helpers::{maybe_persist_tool_result, truncate_text};
+use crate::utils::runtime::{
+    coerce_tool_execute_result, ensure_nonempty_tool_result, repeated_external_lookup_error,
+};
 
 /// Appended to every error result to nudge the model into self-correcting.
 pub const ERROR_HINT: &str = "\n\n[Analyze the error above and try a different approach.]";
@@ -64,33 +83,6 @@ const RAW_ARGUMENTS_PREVIEW_CHARS: usize = 200;
 /// Longest panic message echoed back to the model.
 const PANIC_REASON_PREVIEW_CHARS: usize = 200;
 
-/// Whether a tool result text denotes a failure.
-///
-/// Tools signal failure by returning text that starts with `"Error"`. This is
-/// the single place that convention is encoded.
-pub fn is_error_result(result: &str) -> bool {
-    result.starts_with("Error")
-}
-
-/// Telemetry status of a finished tool call (the `"status"` event field).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum ToolStatus {
-    Ok,
-    Error,
-    Blocked,
-}
-
-impl ToolStatus {
-    /// The wire string used in telemetry events.
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Ok => "ok",
-            Self::Error => "error",
-            Self::Blocked => "blocked",
-        }
-    }
-}
-
 /// Everything the pipeline produces for one tool call.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ToolOutcome {
@@ -103,6 +95,10 @@ pub struct ToolOutcome {
     error: Option<String>,
     /// Set when the agent loop must abort because of this call.
     fatal: Option<String>,
+    /// How long the call took once cleared to run; set by [`complete_tool_call`].
+    duration: Duration,
+    /// Texts a post-execute hook wants the model to get after the whole batch.
+    added_context: Vec<String>,
 }
 
 impl ToolOutcome {
@@ -115,6 +111,8 @@ impl ToolOutcome {
             detail,
             error: None,
             fatal: None,
+            duration: Duration::ZERO,
+            added_context: Vec::new(),
         }
     }
 
@@ -127,6 +125,8 @@ impl ToolOutcome {
             detail,
             error: Some(message),
             fatal: None,
+            duration: Duration::ZERO,
+            added_context: Vec::new(),
         }
     }
 
@@ -146,6 +146,8 @@ impl ToolOutcome {
             detail: "message circuit breaker tripped".to_string(),
             error: None,
             fatal: Some(message),
+            duration: Duration::ZERO,
+            added_context: Vec::new(),
         }
     }
 
@@ -157,17 +159,19 @@ impl ToolOutcome {
             detail: single_line_detail(reason),
             error: None,
             fatal: None,
+            duration: Duration::ZERO,
+            added_context: Vec::new(),
         }
     }
 
-    /// Classify the raw text a tool returned: an error result or a success.
-    pub fn from_tool_result(result: String) -> Self {
-        if !is_error_result(&result) {
-            return Self::ok(result);
+    /// The outcome of what a tool returned: an error result or a success.
+    pub fn from_tool_result(result: ToolResult) -> Self {
+        if !result.is_error {
+            return Self::ok(result.content);
         }
-        log::error!("Tool error: {result}");
-        let detail = single_line_detail(&result);
-        Self::error(result, detail)
+        log::error!("Tool error: {}", result.content);
+        let detail = single_line_detail(&result.content);
+        Self::error(result.content, detail)
     }
 
     /// Observe stage: with `fail_on_tool_error`, an ordinary error becomes fatal.
@@ -176,6 +180,52 @@ impl ToolOutcome {
             self.fatal = self.error.clone();
         }
         self
+    }
+
+    /// The text this outcome was built from, before the retry hint: the error
+    /// message of an error, otherwise the content.
+    fn raw_text(&self) -> &str {
+        self.error.as_deref().unwrap_or(&self.content)
+    }
+
+    /// Replace the model-facing text by its normalized form. An error keeps its
+    /// retry hint, which is appended after normalizing so a budget never cuts it.
+    fn with_normalized_content(mut self, normalized: String) -> Self {
+        self.content = if self.error.is_some() {
+            format!("{normalized}{ERROR_HINT}")
+        } else {
+            normalized
+        };
+        self
+    }
+
+    /// Attach the texts a post-execute hook wants the model to get.
+    fn with_added_context(mut self, added_context: Vec<String>) -> Self {
+        self.added_context = added_context;
+        self
+    }
+
+    /// Hand over the texts a post-execute hook wants the model to get after the
+    /// batch; the outcome keeps none.
+    pub fn take_added_context(&mut self) -> Vec<String> {
+        std::mem::take(&mut self.added_context)
+    }
+
+    /// Record how long the call took.
+    pub fn with_duration(mut self, duration: Duration) -> Self {
+        self.duration = duration;
+        self
+    }
+
+    /// The telemetry event of this outcome for the call `call_id` of `tool_name`.
+    pub fn event(&self, call_id: &str, tool_name: &str) -> ToolEvent {
+        ToolEvent {
+            call_id: call_id.to_string(),
+            tool_name: tool_name.to_string(),
+            status: self.status,
+            detail: self.detail.clone(),
+            duration_ms: u64::try_from(self.duration.as_millis()).unwrap_or(u64::MAX),
+        }
     }
 
     pub fn status(&self) -> ToolStatus {
@@ -194,11 +244,7 @@ impl ToolOutcome {
     ///
     /// The event map carries `"name"`, `"status"` and `"detail"`.
     pub fn into_triple(self, tool_name: &str) -> (String, HashMap<String, String>, Option<String>) {
-        let event = HashMap::from([
-            ("name".to_string(), tool_name.to_string()),
-            ("status".to_string(), self.status.as_str().to_string()),
-            ("detail".to_string(), self.detail),
-        ]);
+        let event = self.event("", tool_name).to_map();
         (self.content, event, self.fatal)
     }
 }
@@ -237,12 +283,52 @@ fn success_detail(result: &str) -> String {
     trimmed.to_string()
 }
 
-/// Tool result as stored in the journal, capped like the transcript copy.
-pub fn journaled_result(spec: &AgentRunSpec, result: &str) -> String {
-    if spec.max_tool_result_chars == 0 {
-        return result.to_string();
+/// Normalise a raw tool result: make it non-empty, persist an oversized payload
+/// to disk, and truncate what still exceeds the limit.
+///
+/// The one place the model-facing text of a tool result is shaped; the run loop
+/// applies it again to older results when it re-budgets the transcript.
+pub fn normalize_tool_result(
+    spec: &AgentRunSpec,
+    tool_call_id: &str,
+    tool_name: &str,
+    result: Value,
+) -> Value {
+    let result = ensure_nonempty_tool_result(tool_name, result);
+
+    let content = maybe_persist_tool_result(
+        spec.workspace.as_deref(),
+        spec.session_key.as_deref(),
+        tool_call_id,
+        result,
+        spec.max_tool_result_chars,
+    );
+
+    if let Value::String(ref s) = content
+        && spec.max_tool_result_chars > 0
+        && s.len() > spec.max_tool_result_chars
+    {
+        return Value::String(truncate_text(s, spec.max_tool_result_chars));
     }
-    truncate_text(result, spec.max_tool_result_chars)
+    content
+}
+
+/// [`normalize_tool_result`] for the text of a call.
+///
+/// A text that is a JSON array of content blocks (an image result) is normalized
+/// as the blocks it denotes, then written back as JSON, so it is never cut in
+/// the middle of its syntax.
+fn normalized_text(spec: &AgentRunSpec, tool_call: &ToolCallRequest, text: &str) -> String {
+    let normalized = normalize_tool_result(
+        spec,
+        &tool_call.id,
+        &tool_call.name,
+        coerce_tool_execute_result(text.to_string()),
+    );
+    match normalized {
+        Value::String(text) => text,
+        blocks => blocks.to_string(),
+    }
 }
 
 // ── pipeline ──────────────────────────────────────────────────────────────────
@@ -269,7 +355,7 @@ pub async fn run_tool_call(
         &message_circuit_breaker,
     )
     .await;
-    complete_tool_call(spec, prepared).await
+    complete_tool_call(spec, tool_call, prepared).await
 }
 
 /// Prepare phase (stages 1-4): everything that decides whether the call runs.
@@ -296,15 +382,46 @@ pub async fn prepare_tool_call<'a>(
 
 /// Execute phase (stages 5-9) for a prepared call, or the observe stage alone
 /// for a call that failed preparation.
+///
+/// The observe stage also tells the hook (`AgentHook::on_tool_result`) the
+/// moment the call finished, so a concurrent batch reports each call as it
+/// completes rather than all at the end.
 pub async fn complete_tool_call(
     spec: &AgentRunSpec,
+    tool_call: &ToolCallRequest,
     prepared: Result<PreparedCall<'_>, ToolOutcome>,
 ) -> ToolOutcome {
+    let started = Instant::now();
     let outcome = match prepared {
         Ok(prepared) => execute_prepared(spec, prepared).await,
-        Err(outcome) => outcome,
+        Err(outcome) => {
+            let normalized = normalized_text(spec, tool_call, outcome.raw_text());
+            outcome.with_normalized_content(normalized)
+        }
     };
-    outcome.observed(spec.fail_on_tool_error)
+    let outcome = outcome
+        .observed(spec.fail_on_tool_error)
+        .with_duration(started.elapsed());
+    notify_tool_result(spec, &outcome.event(&tool_call.id, &tool_call.name)).await;
+    outcome
+}
+
+/// Tell the hook about a finished call. An observer must not be able to break
+/// the turn, so a panic is logged and dropped.
+async fn notify_tool_result(spec: &AgentRunSpec, event: &ToolEvent) {
+    let Some(hook) = &spec.hook else {
+        return;
+    };
+    if AssertUnwindSafe(hook.on_tool_result(event))
+        .catch_unwind()
+        .await
+        .is_err()
+    {
+        log::error!(
+            "AgentHook.on_tool_result panicked for tool '{}'",
+            event.tool_name
+        );
+    }
 }
 
 /// Stages 5-8; the first failing stage short-circuits with its outcome.
@@ -319,8 +436,74 @@ async fn execute_prepared(spec: &AgentRunSpec, prepared: PreparedCall<'_>) -> To
         Err(outcome) => return outcome,
     };
     let result = execute(spec, tool_call, tool.as_ref(), &params).await;
-    journal_finish(spec, in_flight, &result);
+    let (result, added_context) = post_call(spec, tool_call, result).await;
+    let normalized = normalized_text(spec, tool_call, &result.content);
+    journal_finish(
+        in_flight,
+        &ToolResult {
+            content: normalized.clone(),
+            is_error: result.is_error,
+        },
+    );
+    // The telemetry detail still comes from what the tool returned, not from
+    // the placeholder or the cut-down form the model sees.
     ToolOutcome::from_tool_result(result)
+        .with_normalized_content(normalized)
+        .with_added_context(added_context)
+}
+
+/// Stage 7: let the hook redact, withhold or annotate the raw result.
+///
+/// Returns the result the rest of the pipeline works with, and the texts to give
+/// the model after the batch. A blocked result becomes an error naming the
+/// reason, since the call ran but its output may not be shown. Fails closed: a
+/// hook that panics blocks the result.
+async fn post_call(
+    spec: &AgentRunSpec,
+    tool_call: &ToolCallRequest,
+    result: ToolResult,
+) -> (ToolResult, Vec<String>) {
+    let Some(hook) = &spec.hook else {
+        return (result, Vec::new());
+    };
+    let view = ToolCallResultView {
+        call_id: &tool_call.id,
+        tool_name: &tool_call.name,
+        content: &result.content,
+        is_error: result.is_error,
+        channel: spec.channel.as_deref(),
+        chat_id: spec.chat_id.as_deref(),
+    };
+    let decision = match AssertUnwindSafe(hook.after_tool_call(&view))
+        .catch_unwind()
+        .await
+    {
+        Ok(decision) => decision,
+        Err(_) => {
+            log::error!(
+                "AgentHook.after_tool_call panicked for tool '{}'",
+                tool_call.name
+            );
+            PostCallDecision::block(HOOK_PANIC_RESULT_REASON)
+        }
+    };
+    let PostCallDecision {
+        replacement,
+        block_reason,
+        added_context,
+    } = decision;
+    if let Some(reason) = block_reason {
+        let blocked = ToolResult::error(format!("Error: tool result blocked by hook: {reason}"));
+        return (blocked, added_context);
+    }
+    let content = replacement.unwrap_or(result.content);
+    (
+        ToolResult {
+            content,
+            is_error: result.is_error,
+        },
+        added_context,
+    )
 }
 
 /// Stage 3: ask the hook whether the validated call may run.
@@ -473,7 +656,7 @@ fn journal_begin(
     }
 }
 
-/// Stage 6: run the tool and return its result text.
+/// Stage 6: run the tool and return its result.
 ///
 /// A tool that panics or exceeds the timeout yields an error result instead
 /// of unwinding through the turn, so the journal still gets a terminal record.
@@ -483,7 +666,7 @@ async fn execute(
     tool_call: &ToolCallRequest,
     tool: &dyn Tool,
     params: &Value,
-) -> String {
+) -> ToolResult {
     crash_point("after_intent");
     let guarded =
         AssertUnwindSafe(execute_under_identity(spec, tool_call, tool, params)).catch_unwind();
@@ -491,11 +674,13 @@ async fn execute(
         Some(limit) => match tokio::time::timeout(limit, guarded).await {
             Ok(finished) => finished,
             // Dropping `guarded` cancels the tool; `shell` kills its process tree on drop.
-            Err(_) => Ok(timeout_error(&tool_call.name, limit)),
+            Err(_) => Ok(ToolResult::error(timeout_error(&tool_call.name, limit))),
         },
         None => guarded.await,
     };
-    let result = result.unwrap_or_else(|payload| panic_error(&tool_call.name, payload.as_ref()));
+    let result = result.unwrap_or_else(|payload| {
+        ToolResult::error(panic_error(&tool_call.name, payload.as_ref()))
+    });
     crash_point("before_terminal");
     result
 }
@@ -506,16 +691,16 @@ async fn execute_under_identity(
     tool_call: &ToolCallRequest,
     tool: &dyn Tool,
     params: &Value,
-) -> String {
+) -> ToolResult {
     match &spec.journal {
         Some(journal) => {
             let identity = ToolCallIdentity {
                 turn_id: journal.turn_id().to_string(),
                 call_id: tool_call.id.clone(),
             };
-            with_tool_call(identity, tool.execute(params)).await
+            with_tool_call(identity, tool.execute_result(params)).await
         }
-        None => tool.execute(params).await,
+        None => tool.execute_result(params).await,
     }
 }
 
@@ -554,17 +739,17 @@ fn panic_error(tool_name: &str, payload: &(dyn Any + Send)) -> String {
     message
 }
 
-/// Stage 7: write the terminal journal record (no-op without a journal).
-fn journal_finish(spec: &AgentRunSpec, in_flight: Option<InFlightToolCall>, result: &str) {
+/// Stage 8: write the terminal journal record (no-op without a journal).
+fn journal_finish(in_flight: Option<InFlightToolCall>, result: &ToolResult) {
     let Some(in_flight) = in_flight else {
         return;
     };
-    let status = if is_error_result(result) {
+    let status = if result.is_error {
         ToolCallStatus::Error
     } else {
         ToolCallStatus::Done
     };
-    in_flight.finish(status, journaled_result(spec, result));
+    in_flight.finish(status, result.content.clone());
 }
 
 #[cfg(test)]
@@ -573,7 +758,7 @@ mod tests {
     use crate::agent::circuit_breaker::{DEFAULT_N_IDENTICAL_MESSAGES, is_tripped_error};
     use crate::agent::hook::AgentHook;
     use crate::agent::tools::test_support::{
-        NamedTool, PanickingTool, ScriptedTool, SlowTool, spec_with_tool,
+        FlaggedTool, NamedTool, PanickingTool, ScriptedTool, SlowTool, spec_with_tool,
     };
 
     fn call(name: &str, arguments: &[(&str, &str)]) -> ToolCallRequest {
@@ -590,15 +775,7 @@ mod tests {
         }
     }
 
-    // ── is_error_result / details ─────────────────────────────────────────────
-
-    #[test]
-    fn error_results_are_recognised_by_their_prefix() {
-        assert!(is_error_result("Error: boom"));
-        assert!(is_error_result("Error"));
-        assert!(!is_error_result("ok"));
-        assert!(!is_error_result(" Error: leading space"));
-    }
+    // ── details ───────────────────────────────────────────────────────────────
 
     #[test]
     fn success_detail_flattens_pads_empty_and_ellipsizes() {
@@ -685,15 +862,14 @@ mod tests {
     }
 
     #[test]
-    fn from_tool_result_classifies_by_prefix() {
+    fn from_tool_result_follows_the_flag_not_the_text() {
         assert_eq!(
-            ToolOutcome::from_tool_result("Error: no".into()).status(),
+            ToolOutcome::from_tool_result(ToolResult::error("(server said no)")).status(),
             ToolStatus::Error
         );
-        assert_eq!(
-            ToolOutcome::from_tool_result("fine".into()).status(),
-            ToolStatus::Ok
-        );
+        let output = ToolOutcome::from_tool_result(ToolResult::ok("Error: just output"));
+        assert_eq!(output.status(), ToolStatus::Ok);
+        assert_eq!(output.content(), "Error: just output");
     }
 
     // ── guards ────────────────────────────────────────────────────────────────
@@ -1026,5 +1202,379 @@ mod tests {
             );
         }
         assert!(is_tripped_error(last.unwrap().fatal().unwrap()));
+    }
+
+    // ── on_tool_result ────────────────────────────────────────────────────────
+
+    /// Hook that records every finished call it is told about.
+    struct EventHook {
+        events: Arc<Mutex<Vec<ToolEvent>>>,
+        decision: CallDecision,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for EventHook {
+        async fn authorize_call(&self, _: &ToolCallAuthorization<'_>) -> CallDecision {
+            self.decision.clone()
+        }
+        async fn on_tool_result(&self, event: &ToolEvent) {
+            self.events.lock().unwrap().push(event.clone());
+        }
+    }
+
+    fn spec_observed_by(
+        mut spec: AgentRunSpec,
+        decision: CallDecision,
+    ) -> (AgentRunSpec, Arc<Mutex<Vec<ToolEvent>>>) {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        spec.hook = Some(Arc::new(EventHook {
+            events: Arc::clone(&events),
+            decision,
+        }));
+        (spec, events)
+    }
+
+    #[tokio::test]
+    async fn the_hook_is_told_about_a_finished_call_with_its_duration() {
+        let (spec, events) = spec_observed_by(
+            spec_with_tool(SlowTool {
+                delay: Duration::from_millis(60),
+                exempt: false,
+            }),
+            CallDecision::Allow,
+        );
+
+        run(&spec, &call("slow", &[])).await;
+
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].call_id, "call-1");
+        assert_eq!(events[0].tool_name, "slow");
+        assert_eq!(events[0].status, ToolStatus::Ok);
+        assert!(events[0].duration_ms >= 50, "got {}", events[0].duration_ms);
+    }
+
+    #[tokio::test]
+    async fn rejected_and_denied_calls_are_reported_too() {
+        let (spec, events) = spec_observed_by(
+            spec_with_tool(ScriptedTool {
+                reply: "ran".into(),
+            }),
+            CallDecision::Allow,
+        );
+        run(&spec, &call("ghost", &[])).await;
+        run(&spec, &call("scripted", &[])).await; // `path` is required
+
+        let (denying, denied_events) = spec_observed_by(
+            spec_with_tool(ScriptedTool {
+                reply: "ran".into(),
+            }),
+            CallDecision::deny("no"),
+        );
+        run(&denying, &call("scripted", &[("path", "a")])).await;
+
+        let statuses: Vec<ToolStatus> = events.lock().unwrap().iter().map(|e| e.status).collect();
+        assert_eq!(statuses, [ToolStatus::Error, ToolStatus::Error]);
+        let denied = denied_events.lock().unwrap();
+        assert_eq!(denied.len(), 1);
+        assert_eq!(denied[0].status, ToolStatus::Blocked);
+        assert_eq!(denied[0].duration_ms, 0);
+    }
+
+    #[tokio::test]
+    async fn a_panicking_observer_cannot_change_the_result() {
+        struct PanickingObserver;
+        #[async_trait::async_trait]
+        impl AgentHook for PanickingObserver {
+            async fn on_tool_result(&self, _: &ToolEvent) {
+                panic!("deliberate panic");
+            }
+        }
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: "ran".into(),
+        });
+        spec.hook = Some(Arc::new(PanickingObserver));
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(outcome.content(), "ran");
+        assert_eq!(outcome.status(), ToolStatus::Ok);
+    }
+
+    #[test]
+    fn an_outcome_converts_to_the_event_of_its_call() {
+        let event = ToolOutcome::error("Error: boom".into(), "boom".into())
+            .with_duration(Duration::from_millis(1500))
+            .event("c9", "shell");
+        assert_eq!(event.call_id, "c9");
+        assert_eq!(event.tool_name, "shell");
+        assert_eq!(event.status, ToolStatus::Error);
+        assert_eq!(event.detail, "boom");
+        assert_eq!(event.duration_ms, 1500);
+    }
+
+    // ── the error flag ────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_error_without_the_error_prefix_is_still_an_error() {
+        let mut spec = spec_with_tool(FlaggedTool {
+            content: "(MCP tool call failed: connection reset)".into(),
+            is_error: true,
+        });
+        spec.fail_on_tool_error = true;
+
+        let outcome = run(&spec, &call("flagged", &[])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Error);
+        assert_eq!(
+            outcome.content(),
+            format!("(MCP tool call failed: connection reset){ERROR_HINT}")
+        );
+        assert_eq!(
+            outcome.fatal(),
+            Some("(MCP tool call failed: connection reset)")
+        );
+    }
+
+    #[tokio::test]
+    async fn output_starting_with_error_is_ok_when_the_tool_says_so() {
+        let spec = spec_with_tool(FlaggedTool {
+            content: "Error: 3 lines in the log".into(),
+            is_error: false,
+        });
+
+        let outcome = run(&spec, &call("flagged", &[])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Ok);
+        assert_eq!(
+            outcome.content(),
+            "Error: 3 lines in the log",
+            "no retry hint"
+        );
+        assert_eq!(outcome.fatal(), None);
+    }
+
+    // ── normalize stage ───────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn an_oversized_result_is_cut_to_the_budget_in_the_outcome() {
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: "x".repeat(200),
+        });
+        spec.max_tool_result_chars = 40;
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(outcome.content(), truncate_text(&"x".repeat(200), 40));
+        assert_eq!(outcome.status(), ToolStatus::Ok);
+    }
+
+    #[tokio::test]
+    async fn an_empty_result_gets_a_placeholder_but_the_detail_still_says_empty() {
+        let spec = spec_with_tool(ScriptedTool { reply: "".into() });
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(outcome.content(), "(scripted completed with no output)");
+        let (_, event, _) = outcome.into_triple("scripted");
+        assert_eq!(event["detail"], "(empty)");
+    }
+
+    #[tokio::test]
+    async fn the_retry_hint_survives_the_budget() {
+        let mut spec = spec_with_tool(FlaggedTool {
+            content: "z".repeat(200),
+            is_error: true,
+        });
+        spec.max_tool_result_chars = 40;
+
+        let outcome = run(&spec, &call("flagged", &[])).await;
+
+        assert_eq!(
+            outcome.content(),
+            format!("{}{ERROR_HINT}", truncate_text(&"z".repeat(200), 40))
+        );
+    }
+
+    #[tokio::test]
+    async fn a_call_rejected_before_it_ran_is_normalized_too() {
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: "ran".into(),
+        });
+        spec.max_tool_result_chars = 30;
+
+        let outcome = run(&spec, &call("a_tool_with_a_very_long_unknown_name", &[])).await;
+
+        assert!(outcome.content().contains("(truncated)"));
+        assert!(outcome.content().ends_with(ERROR_HINT));
+    }
+
+    #[tokio::test]
+    async fn an_image_result_is_never_cut_in_the_middle_of_its_json() {
+        let blocks = r#"[{"type":"text","text":"hi"},{"type":"image_url","image_url":{"url":"data:image/png;base64,AAAA"}}]"#;
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: blocks.into(),
+        });
+        spec.max_tool_result_chars = 20;
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        let parsed: Value =
+            serde_json::from_str(outcome.content()).expect("still valid JSON, not a cut string");
+        assert_eq!(parsed, serde_json::from_str::<Value>(blocks).unwrap());
+    }
+
+    // ── post-execute hook ─────────────────────────────────────────────────────
+
+    /// What a [`ResultPolicyHook`] saw: each result's content and error flag.
+    type SeenResults = Arc<Mutex<Vec<(String, bool)>>>;
+
+    /// Hook that answers every `after_tool_call` with `decision`, recording what it saw.
+    struct ResultPolicyHook {
+        decision: PostCallDecision,
+        seen: SeenResults,
+    }
+
+    #[async_trait::async_trait]
+    impl AgentHook for ResultPolicyHook {
+        async fn after_tool_call(&self, result: &ToolCallResultView<'_>) -> PostCallDecision {
+            self.seen
+                .lock()
+                .unwrap()
+                .push((result.content.to_string(), result.is_error));
+            self.decision.clone()
+        }
+    }
+
+    /// Hook whose `after_tool_call` panics.
+    struct PanickingResultHook;
+
+    #[async_trait::async_trait]
+    impl AgentHook for PanickingResultHook {
+        async fn after_tool_call(&self, _: &ToolCallResultView<'_>) -> PostCallDecision {
+            panic!("deliberate panic");
+        }
+    }
+
+    fn spec_with_result_hook(
+        reply: &str,
+        decision: PostCallDecision,
+    ) -> (AgentRunSpec, SeenResults) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: reply.into(),
+        });
+        spec.hook = Some(Arc::new(ResultPolicyHook {
+            decision,
+            seen: Arc::clone(&seen),
+        }));
+        (spec, seen)
+    }
+
+    #[tokio::test]
+    async fn a_hook_can_replace_the_result_the_model_sees() {
+        let (spec, seen) = spec_with_result_hook(
+            "password=hunter2",
+            PostCallDecision::replace("password=[redacted]"),
+        );
+
+        let mut outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [("password=hunter2".to_string(), false)]
+        );
+        assert_eq!(outcome.content(), "password=[redacted]");
+        assert_eq!(outcome.status(), ToolStatus::Ok);
+        assert!(outcome.take_added_context().is_empty());
+        let (_, event, _) = outcome.into_triple("scripted");
+        assert_eq!(
+            event["detail"], "password=[redacted]",
+            "the telemetry detail must not leak what was redacted"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_can_withhold_a_result_that_ran() {
+        let (spec, _) = spec_with_result_hook("secret", PostCallDecision::block("no secrets"));
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Error);
+        assert_eq!(
+            outcome.content(),
+            format!("Error: tool result blocked by hook: no secrets{ERROR_HINT}")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_hook_can_add_context_without_touching_the_result() {
+        let (spec, _) = spec_with_result_hook("ran", PostCallDecision::add_context("remember X"));
+
+        let mut outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(outcome.content(), "ran");
+        assert_eq!(outcome.take_added_context(), ["remember X"]);
+        assert!(outcome.take_added_context().is_empty(), "handed over once");
+    }
+
+    #[tokio::test]
+    async fn a_panicking_result_hook_withholds_the_result() {
+        let mut spec = spec_with_tool(ScriptedTool {
+            reply: "secret output".into(),
+        });
+        spec.hook = Some(Arc::new(PanickingResultHook));
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(outcome.status(), ToolStatus::Error);
+        assert!(outcome.content().contains(HOOK_PANIC_RESULT_REASON));
+        assert!(!outcome.content().contains("secret output"));
+    }
+
+    #[tokio::test]
+    async fn the_hook_sees_the_raw_result_and_its_replacement_is_still_budgeted() {
+        let (mut spec, seen) =
+            spec_with_result_hook(&"r".repeat(500), PostCallDecision::replace("s".repeat(300)));
+        spec.max_tool_result_chars = 60;
+
+        let outcome = run(&spec, &call("scripted", &[("path", "a")])).await;
+
+        assert_eq!(
+            seen.lock().unwrap()[0].0.len(),
+            500,
+            "before the budget cut it"
+        );
+        assert_eq!(outcome.content(), truncate_text(&"s".repeat(300), 60));
+    }
+
+    #[tokio::test]
+    async fn the_hook_is_not_asked_about_calls_that_never_ran() {
+        let (spec, seen) = spec_with_result_hook("ran", PostCallDecision::default());
+
+        run(&spec, &call("ghost", &[])).await; // unknown tool
+        run(&spec, &call("scripted", &[])).await; // `path` is required
+
+        assert!(seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn the_hook_is_told_when_the_tool_itself_failed() {
+        let mut spec = spec_with_tool(FlaggedTool {
+            content: "boom".into(),
+            is_error: true,
+        });
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        spec.hook = Some(Arc::new(ResultPolicyHook {
+            decision: PostCallDecision::default(),
+            seen: Arc::clone(&seen),
+        }));
+
+        run(&spec, &call("flagged", &[])).await;
+
+        assert_eq!(
+            seen.lock().unwrap().as_slice(),
+            [("boom".to_string(), true)]
+        );
     }
 }

@@ -1,4 +1,4 @@
-use crate::agent::tools::base::Tool;
+use crate::agent::tools::base::{Tool, ToolResult};
 use crate::agent::tools::sandbox::wrap_command;
 use crate::agent::workspace_context::current_tool_workspace;
 use crate::config::paths::get_media_dir;
@@ -98,12 +98,12 @@ impl ShellTool {
         }
     }
 
-    async fn execute_command(
+    async fn execute_command_result(
         &self,
         command: &str,
         working_dir: Option<PathBuf>,
         timeout: Option<u64>,
-    ) -> String {
+    ) -> ToolResult {
         let tw = current_tool_workspace(
             self.working_dir.clone(),
             self.restrict_to_workspace,
@@ -115,7 +115,7 @@ impl ShellTool {
         let guard_error =
             self.guard_command(command, cwd.to_str().unwrap(), tw.restrict_to_workspace);
         if let Some(error) = guard_error {
-            return error;
+            return ToolResult::error(error);
         }
 
         let mut effective_command = command.to_string();
@@ -123,7 +123,7 @@ impl ShellTool {
         if let Some(sandbox) = &self.sandbox {
             if let Some(error) = sandbox_unavailable_error(sandbox, IS_WINDOWS) {
                 log::error!("{error}");
-                return error;
+                return ToolResult::error(error);
             }
             let workspace = tw
                 .project_path
@@ -138,7 +138,7 @@ impl ShellTool {
             );
             match command_result {
                 Ok(wrapped_command) => effective_command = wrapped_command,
-                Err(error) => return error,
+                Err(error) => return ToolResult::error(error),
             }
             cwd = workspace;
         }
@@ -158,7 +158,7 @@ impl ShellTool {
         // ── Spawn ─────────────────────────────────────────────────────────────
         let child = match Self::spawn(&effective_command, cwd.to_str().unwrap_or("."), &env) {
             Ok(c) => c,
-            Err(e) => return format!("Error executing command: {e}"),
+            Err(e) => return ToolResult::error(format!("Error executing command: {e}")),
         };
 
         // ── Collect output with timeout ───────────────────────────────────────
@@ -184,7 +184,9 @@ impl ShellTool {
             if tokio::time::Instant::now() >= deadline {
                 Self::kill_process(&mut child).await;
                 guard.disarm();
-                return format!("Error: Command timed out after {effective_timeout} seconds");
+                return ToolResult::error(format!(
+                    "Error: Command timed out after {effective_timeout} seconds"
+                ));
             }
 
             match child.try_wait() {
@@ -194,7 +196,7 @@ impl ShellTool {
                 }
                 Err(e) => {
                     guard.disarm();
-                    return format!("Error executing command: {e}");
+                    return ToolResult::error(format!("Error executing command: {e}"));
                 }
             }
         };
@@ -202,13 +204,13 @@ impl ShellTool {
 
         let stdout = match stdout_handle.await {
             Ok(Ok(buf)) => buf,
-            Ok(Err(e)) => return format!("Error reading stdout: {e}"),
-            Err(e) => return format!("Error executing command: {e}"),
+            Ok(Err(e)) => return ToolResult::error(format!("Error reading stdout: {e}")),
+            Err(e) => return ToolResult::error(format!("Error executing command: {e}")),
         };
         let stderr = match stderr_handle.await {
             Ok(Ok(buf)) => buf,
-            Ok(Err(e)) => return format!("Error reading stderr: {e}"),
-            Err(e) => return format!("Error executing command: {e}"),
+            Ok(Err(e)) => return ToolResult::error(format!("Error reading stderr: {e}")),
+            Err(e) => return ToolResult::error(format!("Error executing command: {e}")),
         };
 
         let output = std::process::Output {
@@ -239,7 +241,20 @@ impl ShellTool {
             parts.join("\n")
         };
 
-        Self::truncate_output(&result)
+        ToolResult::ok(Self::truncate_output(&result))
+    }
+
+    /// The text of [`Self::execute_command_result`], whether or not the command failed.
+    #[cfg(test)]
+    async fn execute_command(
+        &self,
+        command: &str,
+        working_dir: Option<PathBuf>,
+        timeout: Option<u64>,
+    ) -> String {
+        self.execute_command_result(command, working_dir, timeout)
+            .await
+            .content
     }
 
     /// Keep the head and tail of oversized command output, cutting only on
@@ -618,9 +633,17 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
     }
 
     async fn execute(&self, params: &serde_json::Value) -> String {
+        self.execute_result(params).await.content
+    }
+
+    /// A command that ran is a successful call whatever it printed (its stdout
+    /// may well start with "Error"); only a command that could not be run, was
+    /// blocked or timed out is an error. A non-zero exit code is reported in the
+    /// text, not as a failed call.
+    async fn execute_result(&self, params: &serde_json::Value) -> ToolResult {
         let command = match params.get("command").and_then(|v| v.as_str()) {
             Some(c) => c,
-            None => return "Error: missing required parameter 'command'".to_string(),
+            None => return ToolResult::error("Error: missing required parameter 'command'"),
         };
 
         let working_dir = params
@@ -630,12 +653,14 @@ Output is truncated at 10 000 chars; timeout defaults to 60s."#
 
         let timeout = params.get("timeout").and_then(|v| v.as_u64());
 
-        self.execute_command(command, working_dir, timeout).await
+        self.execute_command_result(command, working_dir, timeout)
+            .await
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use crate::agent::tools::base::Tool;
     use crate::agent::tools::shell::{IS_WINDOWS, ShellTool, sandbox_unavailable_error};
     use crate::agent::workspace_context::{
         bind_workspace_scope, reset_workspace_scope, with_workspace_scope_stack,
@@ -747,6 +772,45 @@ mod tests {
         assert!(truncated.contains("chars truncated"));
         assert!(truncated.starts_with(&"a".repeat(4999)));
         assert!(truncated.ends_with(&"b".repeat(5000)));
+    }
+
+    #[tokio::test]
+    async fn output_that_starts_with_error_is_not_a_failed_call() {
+        let tool = ShellTool::new(60, None, None, None, false, None, None);
+
+        let result = tool
+            .execute_result(&serde_json::json!({"command": "echo Error: this is only output"}))
+            .await;
+
+        assert!(!result.is_error, "the command ran: {}", result.content);
+        assert!(result.content.contains("Error: this is only output"));
+        assert!(result.content.contains("Exit code: 0"));
+    }
+
+    #[tokio::test]
+    async fn a_missing_command_is_a_failed_call() {
+        let tool = ShellTool::new(60, None, None, None, false, None, None);
+
+        let result = tool.execute_result(&serde_json::json!({})).await;
+
+        assert!(result.is_error);
+        assert_eq!(
+            result.content,
+            "Error: missing required parameter 'command'"
+        );
+        assert_eq!(tool.execute(&serde_json::json!({})).await, result.content);
+    }
+
+    #[tokio::test]
+    async fn a_blocked_command_is_a_failed_call() {
+        let tool = ShellTool::new(60, None, None, None, false, None, None);
+
+        let result = tool
+            .execute_result(&serde_json::json!({"command": "echo hi > ~/x.txt && rm -rf ~/x.txt"}))
+            .await;
+
+        assert!(result.is_error);
+        assert!(result.content.contains("blocked by safety guard"));
     }
 
     #[test]

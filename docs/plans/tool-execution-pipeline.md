@@ -18,7 +18,7 @@ tool failure is detected by the text `"Error"`, and nothing protects the turn fr
 | 2. Robustness | `feature/tool-pipeline-p2-robustness` | committed 2026-11-03 |
 | 3. Per-call authorize | `feature/tool-pipeline-p3-authorize` | committed 2026-11-03 |
 | 3b. Approval grants (web chat) | `feature/tool-approval-grants` | built 2026-11-03, uncommitted |
-| 4. Result model, post-hooks, observability | `feature/tool-pipeline-p4-results` | not started |
+| 4. Result model, post-hooks, observability | `feature/tool-pipeline-p4-results` | built 2026-11-04, uncommitted |
 
 One branch per phase. Phase N+1 branches from Phase N until N is merged. Commit only when asked.
 
@@ -160,17 +160,29 @@ Added after Phase 3, because one card per call made long turns tedious. Built 20
 
 ## Phase 4: result model, post-hooks, observability
 
-- **`ToolResult { content, is_error }`** replaces the `"Error"` prefix. First `is_error_result` reads the flag and
-  falls back to the prefix; then migrate the tools gradually. Journal and event status derive from the flag.
-- **Post-execute hook** `after_tool_call(&ToolOutcome) -> PostDecision` (`Accept`, `Replace`, `Block`,
-  `AddContext`). `AddContext` text is queued and appended as one hidden user-role message after all tool results of
-  the batch, so call/result adjacency holds. Use cases: secret redaction, output policy.
-- **Typed `ToolEvent`** (`name`, `status`, `detail`, `duration_ms`) replacing `HashMap<String, String>`, plus an
-  `on_tool_result` hook that fires as each call finishes. Keep a `to_map()` adapter while consumers migrate.
-- **Normalize inside the pipeline**, so the journal copy and the transcript copy come from one function and one
-  budget (today they are truncated separately).
+Built 2026-11-04, in four parts. See `docs/TOOL_PIPELINE.md` for the result.
 
-Risk: medium. The `is_error` migration touches every tool; commit each sub-item separately.
+- **Typed events.** `ToolEvent { call_id, tool_name, status, detail, duration_ms }` (`agent/tool_event.rs`) and
+  `AgentHook::on_tool_result`, fired as each call completes. `ToolEvent::to_map` keeps the `name`/`status`/`detail`
+  maps that `ctx.tool_events` and the outbound events still carry, so no consumer changed; the duration reaches
+  hooks only. Adding a `duration_ms` key to those maps (and to the web chat's tool activity) is a follow-up.
+- **`ToolResult { content, is_error }`** replaces the prefix check. `Tool::execute_result` defaults to classifying
+  `execute`'s text, so only tools that need it migrated: `shell` (output starting with "Error" is not a failure)
+  and MCP tools (their failures were invisible: none started with "Error", and the server's `isError` was ignored).
+  Visible effect: MCP failures now get the retry hint, an `error` event and a journal `Error`.
+- **Normalize inside the pipeline.** `normalize_tool_result` moved from the runner to the pipeline and runs before
+  the journal's terminal record, so the journal and the transcript hold the same text from one budget. The retry
+  hint is added after normalizing, so a budget never cuts it. Results that are content-block arrays (images) are
+  normalized as blocks, never cut mid-JSON. The telemetry detail still comes from the raw result.
+- **Post-execute hook.** `AgentHook::after_tool_call(&ToolCallResultView) -> PostCallDecision { replacement,
+  block_reason, added_context }`. It runs on the raw result, before normalizing, so redaction also reaches the
+  copy persisted for oversized results and the journal. Added context is queued and appended as one hidden user
+  message (`_hidden_history`) after every tool result of the batch. A panicking hook withholds the result.
+
+Not done: a typed result for the other tools (they keep the prefix convention), a CLI/web-chat display of
+`duration_ms`, and any built-in hook that redacts or blocks (the mechanism exists; no policy ships with it).
+
+Risk: medium. Behaviour change to know about: MCP failures are now errors (hint, event status, journal status).
 
 ## Cross-cutting
 

@@ -1908,13 +1908,13 @@ impl AgentLoop {
                 turn_id: turn_id.to_string(),
                 call_id: state.call_id.clone(),
             };
-            let result = with_tool_call(identity, tool.execute(&args)).await;
-            let status = if result.starts_with("Error") {
+            let result = with_tool_call(identity, tool.execute_result(&args)).await;
+            let status = if result.is_error {
                 ToolCallStatus::Error
             } else {
                 ToolCallStatus::Done
             };
-            in_flight.finish(status, result);
+            in_flight.finish(status, result.content);
         }
         reset_workspace_scope(scope_token);
     }

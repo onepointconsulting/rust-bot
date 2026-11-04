@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use serde_json::{Map, Value, json};
 
-use crate::agent::tools::base::{Tool, ToolExposure};
+use crate::agent::tools::base::{Tool, ToolExposure, ToolResult};
 use crate::config::schema::{MCP_ALL_TOOLS, McpServerConfig, McpTransportType};
 use http::HeaderName;
-use rmcp::model::{CallToolRequestParams, RawContent, Tool as McpToolDef};
+use rmcp::model::{CallToolRequestParams, CallToolResult, RawContent, Tool as McpToolDef};
 use rmcp::service::ServiceError;
 use rmcp::transport::TokioChildProcess;
 use rmcp::transport::streamable_http_client::{
@@ -651,6 +651,32 @@ impl MCPToolWrapper {
     }
 }
 
+/// Turn what an MCP server answered into a [`ToolResult`]: the text blocks
+/// joined, and `is_error` set when the server flagged the call (`isError`).
+fn tool_result_from_call(result: CallToolResult) -> ToolResult {
+    let server_reported_error = result.is_error.unwrap_or(false);
+    let parts: Vec<String> = result
+        .content
+        .into_iter()
+        .map(|block| match block.raw {
+            RawContent::Text(t) => t.text,
+            other => format!("{other:?}"),
+        })
+        .collect();
+    let content = if parts.is_empty() {
+        "(no output)".to_string()
+    } else {
+        parts.join(
+            "
+",
+        )
+    };
+    ToolResult {
+        content,
+        is_error: server_reported_error,
+    }
+}
+
 #[async_trait]
 impl Tool for MCPToolWrapper {
     fn name(&self) -> String {
@@ -674,6 +700,14 @@ impl Tool for MCPToolWrapper {
     }
 
     async fn execute(&self, params: &serde_json::Value) -> String {
+        self.execute_result(params).await.content
+    }
+
+    /// A failed call is an error result: a file reference that could not be
+    /// expanded, a timeout, a transport failure, or a result the server itself
+    /// flagged with `isError`. Their texts do not start with "Error", so the
+    /// legacy prefix check never saw them.
+    async fn execute_result(&self, params: &serde_json::Value) -> ToolResult {
         // Substitute any `file://` / `$file` reference with the real file
         // content before dispatch, so binary payloads never have to be emitted
         // as tokens by the model. Failures are returned as tool output rather
@@ -691,7 +725,7 @@ impl Tool for MCPToolWrapper {
                 }
                 Err(e) => {
                     log::error!("MCP tool '{}' file reference failed: {}", self.name, e);
-                    return format!("(file reference error: {e})");
+                    return ToolResult::error(format!("(file reference error: {e})"));
                 }
             },
             _ => params,
@@ -713,32 +747,19 @@ impl Tool for MCPToolWrapper {
                         self.name,
                         self.tool_timeout.as_secs()
                     );
-                    return format!(
+                    return ToolResult::error(format!(
                         "(MCP tool call timed out after {}s)",
                         self.tool_timeout.as_secs()
-                    );
+                    ));
                 }
                 Ok(Err(e)) => {
                     log::error!("MCP tool '{}' failed: {}", self.name, e);
-                    return format!("(MCP tool call failed: {})", e);
+                    return ToolResult::error(format!("(MCP tool call failed: {})", e));
                 }
                 Ok(Ok(r)) => r,
             };
 
-        let parts: Vec<String> = result
-            .content
-            .into_iter()
-            .map(|block| match block.raw {
-                RawContent::Text(t) => t.text,
-                other => format!("{other:?}"),
-            })
-            .collect();
-
-        if parts.is_empty() {
-            "(no output)".to_string()
-        } else {
-            parts.join("\n")
-        }
+        tool_result_from_call(result)
     }
 
     /// MCP servers validate their own arguments and their advertised schemas are
@@ -1454,5 +1475,42 @@ mod tests {
                 ConnectMcpError::UnknownTransport
             )),
         ));
+    }
+
+    // ── tool_result_from_call ─────────────────────────────────────────────────
+
+    #[test]
+    fn a_result_the_server_flagged_as_an_error_is_an_error() {
+        let result =
+            tool_result_from_call(CallToolResult::error(vec![rmcp::model::Content::text(
+                "quota exceeded",
+            )]));
+        assert!(result.is_error);
+        assert_eq!(result.content, "quota exceeded");
+    }
+
+    #[test]
+    fn a_normal_result_is_ok_even_when_its_text_starts_with_error() {
+        let result =
+            tool_result_from_call(CallToolResult::success(vec![rmcp::model::Content::text(
+                "Error: this is a log line the tool fetched",
+            )]));
+        assert!(!result.is_error);
+    }
+
+    #[test]
+    fn text_blocks_are_joined_and_an_empty_result_says_so() {
+        let joined = tool_result_from_call(CallToolResult::success(vec![
+            rmcp::model::Content::text("a"),
+            rmcp::model::Content::text("b"),
+        ]));
+        assert_eq!(
+            joined.content,
+            "a
+b"
+        );
+        let empty = tool_result_from_call(CallToolResult::success(vec![]));
+        assert_eq!(empty.content, "(no output)");
+        assert!(!empty.is_error);
     }
 }

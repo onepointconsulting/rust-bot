@@ -323,11 +323,11 @@ impl ToolRegistry {
         }
 
         // prepare_call guarantees tool is Some when error is None
-        let result = tool.unwrap().as_ref().execute(&cast_params).await;
-        if result.starts_with("Error") {
-            result + ERROR_HINT
+        let result = tool.unwrap().as_ref().execute_result(&cast_params).await;
+        if result.is_error {
+            result.content + ERROR_HINT
         } else {
-            result
+            result.content
         }
     }
 

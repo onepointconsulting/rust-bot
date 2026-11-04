@@ -6,6 +6,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use futures::FutureExt;
 
+use crate::agent::tool_event::ToolEvent;
 use crate::providers::base::{LLMResponse, LLMUsage, ToolCallRequest};
 
 // ── AgentHookContext ──────────────────────────────────────────────────────────
@@ -96,6 +97,79 @@ impl CallDecision {
     }
 }
 
+/// A finished call's result as an [`AgentHook::after_tool_call`] hook sees it.
+///
+/// It is the result as the tool returned it: before it is shortened to the
+/// context budget, written to disk (an oversized one) or journaled, so a hook
+/// that redacts it redacts every copy.
+#[derive(Debug, Clone, Copy)]
+pub struct ToolCallResultView<'a> {
+    pub call_id: &'a str,
+    pub tool_name: &'a str,
+    pub content: &'a str,
+    pub is_error: bool,
+    /// Channel the turn came from (e.g. `"websocket"`), when known.
+    pub channel: Option<&'a str>,
+    /// Chat id within [`Self::channel`], when known.
+    pub chat_id: Option<&'a str>,
+}
+
+/// What an [`AgentHook::after_tool_call`] hook wants done with a result.
+///
+/// The default accepts the result as it is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct PostCallDecision {
+    /// Show the model this text instead, for redaction or rewriting.
+    pub replacement: Option<String>,
+    /// Withhold the result: the call ran, but the model gets an error naming
+    /// this reason instead of its output.
+    pub block_reason: Option<String>,
+    /// Text for the model, delivered once as a hidden message after the tool
+    /// results of the whole batch, so call and result stay adjacent.
+    pub added_context: Vec<String>,
+}
+
+impl PostCallDecision {
+    /// Show the model `content` in place of the result.
+    pub fn replace(content: impl Into<String>) -> Self {
+        Self {
+            replacement: Some(content.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Withhold the result, naming `reason`.
+    pub fn block(reason: impl Into<String>) -> Self {
+        Self {
+            block_reason: Some(reason.into()),
+            ..Self::default()
+        }
+    }
+
+    /// Keep the result and give the model `text` after the batch.
+    pub fn add_context(text: impl Into<String>) -> Self {
+        Self {
+            added_context: vec![text.into()],
+            ..Self::default()
+        }
+    }
+
+    /// Combine with the decision of a hook that ran after this one and saw the
+    /// result as this one left it: the first block stands, the later
+    /// replacement wins, and the added texts accumulate in order.
+    pub fn then(mut self, later: Self) -> Self {
+        self.block_reason = self.block_reason.or(later.block_reason);
+        self.replacement = later.replacement.or(self.replacement);
+        self.added_context.extend(later.added_context);
+        self
+    }
+}
+
+/// Reason given to the model when an `after_tool_call` hook panics. The hook
+/// may be what keeps a secret out of the result, so a panic withholds it.
+pub const HOOK_PANIC_RESULT_REASON: &str =
+    "A tool-result hook panicked; the result was withheld for safety";
+
 /// Denial reason used when an `authorize_call` hook panics. The hook is a gate,
 /// so a panic fails closed instead of letting the call run unchecked.
 pub const HOOK_PANIC_DENY_REASON: &str =
@@ -127,6 +201,22 @@ pub trait AgentHook: Send + Sync {
     /// veto a call (see [`Self::authorize_call`]), and calls may still be rejected
     /// as invalid or denied afterwards.
     async fn on_tool_calls(&self, _ctx: &mut AgentHookContext) {}
+
+    /// One call finished (it ran, failed, was rejected or was denied). Called as
+    /// each call completes, so a concurrent batch reports calls in completion
+    /// order. For observing only (metrics, logging, live progress); it cannot
+    /// change the result.
+    async fn on_tool_result(&self, _event: &ToolEvent) {}
+
+    /// A call ran and returned `result`; decide what the model sees of it.
+    ///
+    /// Called after the tool finished and before its result is shortened,
+    /// persisted or journaled, in call order for each call. Not called for a
+    /// call that was rejected or denied, since nothing ran. Accepts by default.
+    /// Implementors should fail closed: block when they cannot tell.
+    async fn after_tool_call(&self, _result: &ToolCallResultView<'_>) -> PostCallDecision {
+        PostCallDecision::default()
+    }
 
     /// Decide whether one validated call may run. Called per call, in order,
     /// after validation and before the call is journaled or executed. Allows by
@@ -278,6 +368,54 @@ impl AgentHook for CompositeHook {
         }
     }
 
+    async fn on_tool_result(&self, event: &ToolEvent) {
+        for hook in &self.hooks {
+            match AssertUnwindSafe(hook.on_tool_result(event))
+                .catch_unwind()
+                .await
+            {
+                Ok(()) => {}
+                Err(e) => log::error!(
+                    "AgentHook.on_tool_result panicked: {:?}",
+                    e.downcast_ref::<&str>()
+                        .copied()
+                        .unwrap_or("(non-string panic)")
+                ),
+            }
+        }
+    }
+
+    /// Runs the hooks in order, each seeing the result as the earlier ones left
+    /// it. The first block ends the chain; a panic blocks the result.
+    async fn after_tool_call(&self, result: &ToolCallResultView<'_>) -> PostCallDecision {
+        let mut decision = PostCallDecision::default();
+        for hook in &self.hooks {
+            let current = ToolCallResultView {
+                content: decision.replacement.as_deref().unwrap_or(result.content),
+                ..*result
+            };
+            match AssertUnwindSafe(hook.after_tool_call(&current))
+                .catch_unwind()
+                .await
+            {
+                Ok(next) => decision = decision.then(next),
+                Err(e) => {
+                    log::error!(
+                        "AgentHook.after_tool_call panicked: {:?}",
+                        e.downcast_ref::<&str>()
+                            .copied()
+                            .unwrap_or("(non-string panic)")
+                    );
+                    return decision.then(PostCallDecision::block(HOOK_PANIC_RESULT_REASON));
+                }
+            }
+            if decision.block_reason.is_some() {
+                break;
+            }
+        }
+        decision
+    }
+
     /// Asks the hooks in order and stops at the first denial, so nobody is
     /// asked about a call another hook already refused. A panic denies.
     async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
@@ -380,6 +518,24 @@ impl AgentHook for LoopHookChain {
     async fn on_tool_calls(&self, context: &mut AgentHookContext) {
         self.primary.on_tool_calls(context).await;
         self.extras.on_tool_calls(context).await;
+    }
+
+    async fn on_tool_result(&self, event: &ToolEvent) {
+        self.primary.on_tool_result(event).await;
+        self.extras.on_tool_result(event).await;
+    }
+
+    async fn after_tool_call(&self, result: &ToolCallResultView<'_>) -> PostCallDecision {
+        let primary = self.primary.after_tool_call(result).await;
+        if primary.block_reason.is_some() {
+            return primary;
+        }
+        let current = ToolCallResultView {
+            content: primary.replacement.as_deref().unwrap_or(result.content),
+            ..*result
+        };
+        let extras = self.extras.after_tool_call(&current).await;
+        primary.then(extras)
     }
 
     async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
@@ -492,6 +648,13 @@ mod tests {
             self.calls.lock().unwrap().push("on_tool_calls".into());
         }
 
+        async fn on_tool_result(&self, event: &ToolEvent) {
+            self.calls
+                .lock()
+                .unwrap()
+                .push(format!("on_tool_result({})", event.tool_name));
+        }
+
         async fn after_iteration(&self, _ctx: &mut AgentHookContext) {
             self.calls.lock().unwrap().push("after_iteration".into());
         }
@@ -524,6 +687,12 @@ mod tests {
             panic!("deliberate panic");
         }
         async fn authorize_call(&self, _request: &ToolCallAuthorization<'_>) -> CallDecision {
+            panic!("deliberate panic");
+        }
+        async fn on_tool_result(&self, _event: &ToolEvent) {
+            panic!("deliberate panic");
+        }
+        async fn after_tool_call(&self, _result: &ToolCallResultView<'_>) -> PostCallDecision {
             panic!("deliberate panic");
         }
         async fn after_iteration(&self, _ctx: &mut AgentHookContext) {
@@ -917,5 +1086,176 @@ mod tests {
 
         assert_eq!(primary.recorded(), ["on_tool_calls"]);
         assert_eq!(extra.recorded(), ["on_tool_calls"]);
+    }
+
+    // ── on_tool_result ────────────────────────────────────────────────────────
+
+    fn finished_event(tool_name: &str) -> ToolEvent {
+        ToolEvent {
+            call_id: "c1".into(),
+            tool_name: tool_name.into(),
+            status: crate::agent::tool_event::ToolStatus::Ok,
+            detail: "fine".into(),
+            duration_ms: 3,
+        }
+    }
+
+    #[tokio::test]
+    async fn test_composite_tells_every_hook_about_a_finished_call_despite_a_panic() {
+        let recorder = Arc::new(RecordingHook::new(false));
+        let composite = CompositeHook::new(vec![
+            Arc::new(PanickingHook),
+            Arc::clone(&recorder) as Arc<dyn AgentHook>,
+        ]);
+
+        composite.on_tool_result(&finished_event("shell")).await;
+
+        assert_eq!(recorder.recorded(), ["on_tool_result(shell)"]);
+    }
+
+    #[tokio::test]
+    async fn test_chain_tells_the_primary_then_the_extras_about_a_finished_call() {
+        let primary = Arc::new(RecordingHook::new(false));
+        let extra = Arc::new(RecordingHook::new(false));
+        let chain = LoopHookChain::new(
+            Arc::clone(&primary) as Arc<dyn AgentHook>,
+            vec![Arc::clone(&extra) as Arc<dyn AgentHook>],
+        );
+
+        chain.on_tool_result(&finished_event("read_file")).await;
+
+        assert_eq!(primary.recorded(), ["on_tool_result(read_file)"]);
+        assert_eq!(extra.recorded(), ["on_tool_result(read_file)"]);
+    }
+
+    // ── after_tool_call ───────────────────────────────────────────────────────
+
+    /// Hook that answers every `after_tool_call` with `decision` after recording
+    /// the content it was shown.
+    struct ResultHook {
+        decision: PostCallDecision,
+        seen: Arc<Mutex<Vec<String>>>,
+    }
+
+    impl ResultHook {
+        fn new(decision: PostCallDecision) -> (Arc<Self>, Arc<Mutex<Vec<String>>>) {
+            let seen = Arc::new(Mutex::new(Vec::new()));
+            let hook = Arc::new(Self {
+                decision,
+                seen: Arc::clone(&seen),
+            });
+            (hook, seen)
+        }
+    }
+
+    #[async_trait]
+    impl AgentHook for ResultHook {
+        async fn after_tool_call(&self, result: &ToolCallResultView<'_>) -> PostCallDecision {
+            self.seen.lock().unwrap().push(result.content.to_string());
+            self.decision.clone()
+        }
+    }
+
+    fn result_view(content: &str) -> ToolCallResultView<'_> {
+        ToolCallResultView {
+            call_id: "c1",
+            tool_name: "shell",
+            content,
+            is_error: false,
+            channel: None,
+            chat_id: None,
+        }
+    }
+
+    #[test]
+    fn test_post_decision_default_accepts() {
+        let decision = PostCallDecision::default();
+        assert_eq!(decision.replacement, None);
+        assert_eq!(decision.block_reason, None);
+        assert!(decision.added_context.is_empty());
+    }
+
+    #[test]
+    fn test_post_decision_then_keeps_the_first_block_the_later_replacement_and_all_context() {
+        let first = PostCallDecision {
+            replacement: Some("first".into()),
+            block_reason: Some("first block".into()),
+            added_context: vec!["a".into()],
+        };
+        let later = PostCallDecision {
+            replacement: Some("later".into()),
+            block_reason: Some("later block".into()),
+            added_context: vec!["b".into()],
+        };
+        let merged = first.then(later);
+        assert_eq!(merged.block_reason.as_deref(), Some("first block"));
+        assert_eq!(merged.replacement.as_deref(), Some("later"));
+        assert_eq!(merged.added_context, ["a", "b"]);
+    }
+
+    #[tokio::test]
+    async fn test_composite_hooks_see_the_result_as_earlier_hooks_left_it() {
+        let (redact, _) = ResultHook::new(PostCallDecision::replace("[redacted]"));
+        let (second, second_seen) = ResultHook::new(PostCallDecision::add_context("note"));
+        let composite = CompositeHook::new(vec![redact, second]);
+
+        let decision = composite
+            .after_tool_call(&result_view("password=hunter2"))
+            .await;
+
+        assert_eq!(second_seen.lock().unwrap().as_slice(), ["[redacted]"]);
+        assert_eq!(decision.replacement.as_deref(), Some("[redacted]"));
+        assert_eq!(decision.added_context, ["note"]);
+    }
+
+    #[tokio::test]
+    async fn test_composite_stops_at_the_first_block() {
+        let (blocking, _) = ResultHook::new(PostCallDecision::block("no secrets"));
+        let (later, later_seen) = ResultHook::new(PostCallDecision::default());
+        let composite = CompositeHook::new(vec![blocking, later]);
+
+        let decision = composite.after_tool_call(&result_view("x")).await;
+
+        assert_eq!(decision.block_reason.as_deref(), Some("no secrets"));
+        assert!(later_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_composite_panicking_result_hook_withholds_the_result() {
+        let (later, later_seen) = ResultHook::new(PostCallDecision::default());
+        let composite = CompositeHook::new(vec![Arc::new(PanickingHook), later]);
+
+        let decision = composite.after_tool_call(&result_view("secret")).await;
+
+        assert_eq!(
+            decision.block_reason.as_deref(),
+            Some(HOOK_PANIC_RESULT_REASON)
+        );
+        assert!(later_seen.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn test_chain_feeds_the_primary_replacement_to_the_extras() {
+        let (primary, _) = ResultHook::new(PostCallDecision::replace("primary text"));
+        let (extra, extra_seen) = ResultHook::new(PostCallDecision::add_context("extra note"));
+        let chain = LoopHookChain::new(primary, vec![extra]);
+
+        let decision = chain.after_tool_call(&result_view("raw")).await;
+
+        assert_eq!(extra_seen.lock().unwrap().as_slice(), ["primary text"]);
+        assert_eq!(decision.replacement.as_deref(), Some("primary text"));
+        assert_eq!(decision.added_context, ["extra note"]);
+    }
+
+    #[tokio::test]
+    async fn test_chain_skips_the_extras_when_the_primary_blocks() {
+        let (primary, _) = ResultHook::new(PostCallDecision::block("policy"));
+        let (extra, extra_seen) = ResultHook::new(PostCallDecision::default());
+        let chain = LoopHookChain::new(primary, vec![extra]);
+
+        let decision = chain.after_tool_call(&result_view("raw")).await;
+
+        assert_eq!(decision.block_reason.as_deref(), Some("policy"));
+        assert!(extra_seen.lock().unwrap().is_empty());
     }
 }

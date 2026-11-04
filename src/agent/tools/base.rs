@@ -47,6 +47,52 @@ pub fn json_type_map() -> HashMap<&'static str, &'static [&'static str]> {
     map
 }
 
+/// What a tool call returns: the text for the model and whether the call failed.
+///
+/// A flag, not a text convention: output that merely starts with the word
+/// "Error" (a log line, a command's stdout) is not a failed call, and a failure
+/// whose text does not start with it (an MCP server's error) still is one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ToolResult {
+    pub content: String,
+    pub is_error: bool,
+}
+
+impl ToolResult {
+    /// A call that worked.
+    pub fn ok(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: false,
+        }
+    }
+
+    /// A call that failed; `content` explains why to the model.
+    pub fn error(content: impl Into<String>) -> Self {
+        Self {
+            content: content.into(),
+            is_error: true,
+        }
+    }
+
+    /// Classify the text of a tool that has not moved to [`ToolResult`] yet:
+    /// it failed when it starts with `"Error"` (see [`is_error_text`]).
+    pub fn from_text(text: String) -> Self {
+        Self {
+            is_error: is_error_text(&text),
+            content: text,
+        }
+    }
+}
+
+/// Whether tool output that carries no explicit flag denotes a failure.
+///
+/// The legacy convention: a failure starts with `"Error"`. Tools that return a
+/// [`ToolResult`] do not depend on it.
+pub fn is_error_text(text: &str) -> bool {
+    text.starts_with("Error")
+}
+
 #[async_trait]
 pub trait Tool: std::any::Any + Send + Sync {
     /// Tool name used in function calls.
@@ -67,6 +113,16 @@ pub trait Tool: std::any::Any + Send + Sync {
             String result of the tool execution.
     */
     async fn execute(&self, params: &serde_json::Value) -> String;
+
+    /// Run the tool and say explicitly whether the call failed.
+    ///
+    /// The default classifies the text of [`Self::execute`] by the legacy
+    /// `"Error"` prefix, so a tool only overrides this when its output can start
+    /// with that word without being a failure, or when a failure does not.
+    /// A tool that overrides it implements `execute` as `execute_result().content`.
+    async fn execute_result(&self, params: &serde_json::Value) -> ToolResult {
+        ToolResult::from_text(self.execute(params).await)
+    }
 
     /// Whether this tool is side-effect free and safe to parallelize.
     /// Defaults to `false` so that existing tools are always executed
@@ -470,7 +526,7 @@ pub trait Tool: std::any::Any + Send + Sync {
 
 #[cfg(test)]
 mod tests {
-    use crate::agent::tools::base::Tool;
+    use crate::agent::tools::base::{Tool, ToolResult, is_error_text};
 
     struct SampleTool;
 
@@ -595,5 +651,28 @@ mod tests {
         let params = serde_json::json!({"query": "hi", "count": 2, "extra": "x"});
         let errors = tool.validate_params(&params);
         assert!(errors.is_empty());
+    }
+
+    // ── ToolResult ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn error_text_is_recognised_by_its_prefix() {
+        assert!(is_error_text("Error: boom"));
+        assert!(is_error_text("Error"));
+        assert!(!is_error_text("ok"));
+        assert!(!is_error_text(" Error: leading space"));
+    }
+
+    #[test]
+    fn constructors_set_the_flag_explicitly() {
+        assert!(!ToolResult::ok("Error: this is just output").is_error);
+        assert!(ToolResult::error("(server said no)").is_error);
+    }
+
+    #[test]
+    fn untyped_text_is_classified_by_the_legacy_prefix() {
+        assert!(ToolResult::from_text("Error: no".into()).is_error);
+        assert!(!ToolResult::from_text("fine".into()).is_error);
+        assert_eq!(ToolResult::from_text("fine".into()).content, "fine");
     }
 }
