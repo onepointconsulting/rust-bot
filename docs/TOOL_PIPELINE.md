@@ -109,8 +109,10 @@ The CLI menu offers the same three ways to remember an answer as the web chat ca
 turn**, **always allow `<tool>` this session**, and **allow everything this session**, next to "Run this call"
 and "Skip this call". Esc or Ctrl-C skips the call. The choices use the same grant store as the web chat
 (`ApprovalGrants`), kept in memory under the CLI's chat id, so they last until the CLI exits; a one-line note tells
-you what you just allowed. There is no revoke command in the CLI: quit to forget them. A grant is checked before the
-terminal check, so a granted call still runs when nobody could be asked.
+you what you just allowed. They last until you quit the CLI, start a new session with `/new`, or type `/revoke`
+(`AgentHook::revoke_grants`, which the command asks the loop's hooks to run; the web chat keeps its own Revoke
+button, so `/revoke` there explains that). A grant is checked before the terminal check, so a granted call still runs
+when nobody could be asked.
 
 ## Failure handling
 

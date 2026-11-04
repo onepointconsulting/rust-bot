@@ -53,6 +53,7 @@ pub enum ChatCommand {
     ExamplePrompts,
     #[serde(alias = "list-subagents")]
     Subagents,
+    Revoke,
 }
 
 impl std::str::FromStr for ChatCommand {
@@ -80,6 +81,7 @@ impl std::str::FromStr for ChatCommand {
             "cleanup" => Ok(ChatCommand::Cleanup),
             "list-sessions" => Ok(ChatCommand::ListSessions),
             "subagents" | "list-subagents" => Ok(ChatCommand::Subagents),
+            "revoke" => Ok(ChatCommand::Revoke),
             _ => Err(()),
         }
     }
@@ -107,6 +109,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::Cleanup => write!(f, "/cleanup"),
             ChatCommand::ListSessions => write!(f, "/list-sessions"),
             ChatCommand::ExamplePrompts => write!(f, "/example-prompts"),
+            ChatCommand::Revoke => write!(f, "/revoke"),
             ChatCommand::Subagents => write!(f, "/subagents"),
             ChatCommand::ModelPresets => write!(f, "/model-presets"),
         }

@@ -128,12 +128,12 @@ fn cli_choices(tool_name: &str, turn_known: bool) -> Vec<CliChoice> {
 fn grant_note(grant: ApprovalGrant, tool_name: &str) -> String {
     match grant {
         ApprovalGrant::Turn => "Allowing every tool call for the rest of this turn.".to_string(),
-        ApprovalGrant::SessionTool => {
-            format!("Allowing `{tool_name}` for the rest of this session (until you quit).")
-        }
-        ApprovalGrant::Session => {
-            "Allowing every tool call for the rest of this session (until you quit).".to_string()
-        }
+        ApprovalGrant::SessionTool => format!(
+            "Allowing `{tool_name}` for the rest of this session (until you quit, /new or /revoke)."
+        ),
+        ApprovalGrant::Session => "Allowing every tool call for the rest of this session \
+             (until you quit, /new or /revoke)."
+            .to_string(),
     }
 }
 
@@ -175,6 +175,10 @@ fn prompt_for_tool(
 
 #[async_trait]
 impl AgentHook for CliAskHook {
+    fn revoke_grants(&self, _channel: &str, chat_id: &str) -> Option<bool> {
+        Some(self.grants.revoke(chat_id))
+    }
+
     async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
         let chat_id = request.chat_id.unwrap_or(CLI_CHAT_ID);
         if self
@@ -730,10 +734,25 @@ mod tests {
     }
 
     #[test]
+    fn revoking_forgets_the_grants_of_that_chat_and_reports_whether_there_were_any() {
+        let hook = CliAskHook::new(HerdrReporter::disabled_for_test());
+        assert_eq!(hook.revoke_grants("cli", "direct"), Some(false));
+
+        hook.grants
+            .add("direct", ApprovalGrant::Session, None, vec![]);
+        hook.grants
+            .add("other", ApprovalGrant::Session, None, vec![]);
+        assert_eq!(hook.revoke_grants("cli", "direct"), Some(true));
+        assert!(!hook.grants.is_granted("direct", None, "shell"));
+        assert!(hook.grants.is_granted("other", None, "shell"));
+        assert_eq!(hook.revoke_grants("cli", "direct"), Some(false));
+    }
+
+    #[test]
     fn grant_notes_say_how_long_the_grant_lasts() {
         assert!(grant_note(ApprovalGrant::Turn, "shell").contains("this turn"));
         assert!(grant_note(ApprovalGrant::SessionTool, "shell").contains("`shell`"));
-        assert!(grant_note(ApprovalGrant::SessionTool, "shell").contains("until you quit"));
+        assert!(grant_note(ApprovalGrant::SessionTool, "shell").contains("/revoke"));
         assert!(grant_note(ApprovalGrant::Session, "shell").contains("every tool call"));
     }
 

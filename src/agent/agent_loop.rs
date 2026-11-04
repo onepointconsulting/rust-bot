@@ -21,7 +21,7 @@ use crate::agent::checkpoint_payload;
 use crate::agent::circuit_breaker::CIRCUIT_BREAKER_STOP_REASON;
 use crate::agent::context::{ContextBuilder, DEFAULT_CURRENT_ROLE};
 use crate::agent::crash_points::crash_point;
-use crate::agent::hook::{AgentHook, AgentHookContext, LoopHookChain};
+use crate::agent::hook::{AgentHook, AgentHookContext, LoopHookChain, combine_revocations};
 use crate::agent::memory::MessageBuilder;
 use crate::agent::memory::{Consolidator, Dream};
 use crate::agent::model_runtime::{
@@ -551,6 +551,17 @@ pub struct ResumeSummary {
 }
 
 impl AgentLoop {
+    /// Forget the tool calls pre-approved for `chat_id` by the loop's extra hooks
+    /// (see [`AgentHook::revoke_grants`]). `None` when no hook keeps grants for
+    /// this channel, e.g. when tool confirmation is off.
+    pub fn revoke_tool_grants(&self, channel: &str, chat_id: &str) -> Option<bool> {
+        combine_revocations(
+            self.extra_hooks
+                .iter()
+                .map(|hook| hook.revoke_grants(channel, chat_id)),
+        )
+    }
+
     pub fn new(
         bus: Arc<MessageBus>,
         provider: Arc<dyn LLMProviderDyn>,

@@ -175,7 +175,36 @@ impl CommandHandler for CmdNew {
             // Schedule background
         }
         session_manager.invalidate(&session_key);
+        // A fresh session starts from scratch: nothing stays pre-approved.
+        drop(session_manager);
+        agent_loop.revoke_tool_grants(&ctx.msg.channel, &ctx.msg.chat_id);
         reply(ctx, "New session started.")
+    }
+}
+
+struct CmdRevoke;
+
+/// What `/revoke` tells the user for what [`AgentLoop::revoke_tool_grants`] answered.
+fn revoke_reply(outcome: Option<bool>) -> &'static str {
+    match outcome {
+        Some(true) => "Tool approvals revoked: every tool call will ask for confirmation again.",
+        Some(false) => "Nothing to revoke: no tool calls are pre-approved.",
+        None => {
+            "Nothing to revoke here: tool confirmation is off, or this chat keeps its approvals \
+             on its own screen (the web chat has a Revoke button)."
+        }
+    }
+}
+
+/// Forget the tool calls the user pre-approved ("allow all for this turn/session").
+#[async_trait]
+impl CommandHandler for CmdRevoke {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/revoke");
+        };
+        let outcome = agent_loop.revoke_tool_grants(&ctx.msg.channel, &ctx.msg.chat_id);
+        reply(ctx, revoke_reply(outcome))
     }
 }
 
@@ -1329,6 +1358,7 @@ fn build_help_text() -> String {
         "/mcp-list — List available MCP servers",
         "/mcp-preset <list|info|enable|disable|test> [name] [key=value ...] — Manage MCP server presets (e.g. github, playwright); info shows the fields a preset needs; enable/disable require a restart to take effect",
         "/tools — List available tools",
+        "/revoke — Forget the tool calls you pre-approved (\"allow all for this turn/session\") so every call asks again",
         "/workspace — Show the session's workspace scope, or switch it: /workspace <path> [restricted|full], /workspace default to clear",
         "/goal <task> — Start a sustained goal for this session; /goal to check status, /goal cancel to clear it",
         "/cleanup — Remove stray files from the workspace (keeps memory, sessions, skills, etc.)",
@@ -1363,6 +1393,7 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(ChatCommand::McpList.to_string(), Arc::new(CmdMcpList));
     router.prefix(ChatCommand::McpPreset.to_string(), Arc::new(CmdMcpPreset));
     router.exact(ChatCommand::Tools.to_string(), Arc::new(CmdTools));
+    router.exact(ChatCommand::Revoke.to_string(), Arc::new(CmdRevoke));
     router.prefix(ChatCommand::Workspace.to_string(), Arc::new(CmdWorkspace));
     router.prefix(ChatCommand::Mode.to_string(), Arc::new(CmdMode));
     router.prefix(ChatCommand::Goal.to_string(), Arc::new(CmdGoal));
@@ -2707,5 +2738,125 @@ mod tests {
     #[test]
     fn help_lists_subagents() {
         assert!(build_help_text().contains("/subagents [spawn|acp|all]"));
+    }
+
+    // ── /revoke ───────────────────────────────────────────────────────────────
+
+    /// Hook that keeps pre-approved tool calls: `held` says whether any are active,
+    /// and `revocations` counts how often it was asked to forget them.
+    struct GrantKeepingHook {
+        held: std::sync::Mutex<bool>,
+        revocations: std::sync::atomic::AtomicUsize,
+    }
+
+    impl GrantKeepingHook {
+        fn new(held: bool) -> Arc<Self> {
+            Arc::new(Self {
+                held: std::sync::Mutex::new(held),
+                revocations: std::sync::atomic::AtomicUsize::new(0),
+            })
+        }
+    }
+
+    #[async_trait]
+    impl crate::agent::hook::AgentHook for GrantKeepingHook {
+        fn revoke_grants(&self, _channel: &str, _chat_id: &str) -> Option<bool> {
+            self.revocations
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Some(std::mem::replace(&mut *self.held.lock().unwrap(), false))
+        }
+    }
+
+    fn loop_with_hook(
+        hook: Option<Arc<dyn crate::agent::hook::AgentHook>>,
+    ) -> Arc<crate::agent::agent_loop::AgentLoop> {
+        let provider: Arc<dyn LLMProviderDyn> = Arc::new(ModelCmdTestProvider);
+        let mut config = crate::config::schema::Config::default();
+        config.agents.model = "claude-sonnet-5".into();
+        config.providers.anthropic.api_key = "test-key".to_string();
+        Arc::new(crate::agent::agent_loop::AgentLoop::new(
+            Arc::new(crate::bus::queue::MessageBus::new()),
+            provider,
+            std::env::temp_dir(),
+            config,
+            None,
+            None,
+            hook.map(|hook| vec![hook]),
+        ))
+    }
+
+    fn cli_command_ctx(
+        agent_loop: Arc<crate::agent::agent_loop::AgentLoop>,
+        text: &str,
+    ) -> CommandContext {
+        CommandContext::with_options(
+            InboundMessage {
+                channel: "cli".into(),
+                sender_id: "user".into(),
+                chat_id: "direct".into(),
+                content: text.to_string(),
+                timestamp: Utc::now(),
+                media: vec![],
+                metadata: Default::default(),
+                session_key_override: None,
+                request_id: None,
+            },
+            None,
+            "revoke-cmd-session",
+            text,
+            "",
+            Some(agent_loop),
+        )
+    }
+
+    #[test]
+    fn revoke_reply_says_what_happened() {
+        assert!(revoke_reply(Some(true)).contains("revoked"));
+        assert!(revoke_reply(Some(false)).contains("no tool calls are pre-approved"));
+        assert!(revoke_reply(None).contains("confirmation is off"));
+    }
+
+    #[tokio::test]
+    async fn revoke_forgets_the_hooks_grants_and_says_so() {
+        let hook = GrantKeepingHook::new(true);
+        let loop_ = loop_with_hook(Some(hook.clone()));
+
+        let first = CmdRevoke
+            .handle(&cli_command_ctx(loop_.clone(), "/revoke"))
+            .await;
+        let second = CmdRevoke.handle(&cli_command_ctx(loop_, "/revoke")).await;
+
+        assert_eq!(first.content, revoke_reply(Some(true)));
+        assert_eq!(second.content, revoke_reply(Some(false)));
+    }
+
+    #[tokio::test]
+    async fn revoke_without_a_confirmation_hook_explains_there_is_nothing_to_revoke() {
+        let loop_ = loop_with_hook(None);
+
+        let out = CmdRevoke.handle(&cli_command_ctx(loop_, "/revoke")).await;
+
+        assert_eq!(out.content, revoke_reply(None));
+    }
+
+    #[tokio::test]
+    async fn new_session_forgets_the_pre_approved_tool_calls() {
+        let hook = GrantKeepingHook::new(true);
+        let loop_ = loop_with_hook(Some(hook.clone()));
+
+        CmdNew.handle(&cli_command_ctx(loop_, "/new")).await;
+
+        assert_eq!(
+            hook.revocations.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        assert!(!*hook.held.lock().unwrap());
+    }
+
+    #[test]
+    fn revoke_is_a_known_command_with_its_slash_name() {
+        assert_eq!("revoke".parse::<ChatCommand>(), Ok(ChatCommand::Revoke));
+        assert_eq!(ChatCommand::Revoke.to_string(), "/revoke");
+        assert!(build_help_text().contains("/revoke"));
     }
 }

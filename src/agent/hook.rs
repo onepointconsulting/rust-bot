@@ -170,6 +170,19 @@ impl PostCallDecision {
 pub const HOOK_PANIC_RESULT_REASON: &str =
     "A tool-result hook panicked; the result was withheld for safety";
 
+/// Combine what several hooks answered to [`AgentHook::revoke_grants`]: `Some(true)`
+/// if any of them revoked something, else `Some(false)` if any of them holds
+/// grants for the chat but had none, else `None` (none of them keeps grants).
+pub fn combine_revocations(answers: impl IntoIterator<Item = Option<bool>>) -> Option<bool> {
+    answers
+        .into_iter()
+        .fold(None, |combined, answer| match (combined, answer) {
+            (Some(true), _) | (_, Some(true)) => Some(true),
+            (Some(false), _) | (_, Some(false)) => Some(false),
+            (None, None) => None,
+        })
+}
+
 /// Denial reason used when an `authorize_call` hook panics. The hook is a gate,
 /// so a panic fails closed instead of letting the call run unchecked.
 pub const HOOK_PANIC_DENY_REASON: &str =
@@ -216,6 +229,14 @@ pub trait AgentHook: Send + Sync {
     /// Implementors should fail closed: block when they cannot tell.
     async fn after_tool_call(&self, _result: &ToolCallResultView<'_>) -> PostCallDecision {
         PostCallDecision::default()
+    }
+
+    /// Forget the tool calls this hook pre-approved for `chat_id` (the user ran
+    /// `/revoke` or started a new session). Returns `Some(true)` when something was
+    /// revoked, `Some(false)` when the hook keeps grants for this chat but none
+    /// were active, and `None` when it keeps none for this channel. Defaults to `None`.
+    fn revoke_grants(&self, _channel: &str, _chat_id: &str) -> Option<bool> {
+        None
     }
 
     /// Decide whether one validated call may run. Called per call, in order,
@@ -385,6 +406,14 @@ impl AgentHook for CompositeHook {
         }
     }
 
+    fn revoke_grants(&self, channel: &str, chat_id: &str) -> Option<bool> {
+        combine_revocations(
+            self.hooks
+                .iter()
+                .map(|hook| hook.revoke_grants(channel, chat_id)),
+        )
+    }
+
     /// Runs the hooks in order, each seeing the result as the earlier ones left
     /// it. The first block ends the chain; a panic blocks the result.
     async fn after_tool_call(&self, result: &ToolCallResultView<'_>) -> PostCallDecision {
@@ -523,6 +552,13 @@ impl AgentHook for LoopHookChain {
     async fn on_tool_result(&self, event: &ToolEvent) {
         self.primary.on_tool_result(event).await;
         self.extras.on_tool_result(event).await;
+    }
+
+    fn revoke_grants(&self, channel: &str, chat_id: &str) -> Option<bool> {
+        combine_revocations([
+            self.primary.revoke_grants(channel, chat_id),
+            self.extras.revoke_grants(channel, chat_id),
+        ])
     }
 
     async fn after_tool_call(&self, result: &ToolCallResultView<'_>) -> PostCallDecision {
@@ -1257,5 +1293,47 @@ mod tests {
 
         assert_eq!(decision.block_reason.as_deref(), Some("policy"));
         assert!(extra_seen.lock().unwrap().is_empty());
+    }
+
+    // ── revoke_grants ─────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_combine_revocations_prefers_revoked_then_held_then_none() {
+        assert_eq!(combine_revocations([]), None);
+        assert_eq!(combine_revocations([None, None]), None);
+        assert_eq!(combine_revocations([None, Some(false)]), Some(false));
+        assert_eq!(combine_revocations([Some(false), Some(true)]), Some(true));
+        assert_eq!(
+            combine_revocations([Some(true), None, Some(false)]),
+            Some(true)
+        );
+    }
+
+    /// Hook that keeps grants for every chat and answers `revoke_grants` with `answer`.
+    struct GrantKeeper(Option<bool>);
+
+    #[async_trait]
+    impl AgentHook for GrantKeeper {
+        fn revoke_grants(&self, _channel: &str, _chat_id: &str) -> Option<bool> {
+            self.0
+        }
+    }
+
+    #[test]
+    fn test_hooks_keep_no_grants_by_default() {
+        assert_eq!(NoopHook.revoke_grants("cli", "direct"), None);
+    }
+
+    #[test]
+    fn test_composite_and_chain_combine_what_their_hooks_revoked() {
+        let composite =
+            CompositeHook::new(vec![Arc::new(GrantKeeper(Some(false))), Arc::new(NoopHook)]);
+        assert_eq!(composite.revoke_grants("cli", "direct"), Some(false));
+
+        let chain = LoopHookChain::new(Arc::new(NoopHook), vec![Arc::new(GrantKeeper(Some(true)))]);
+        assert_eq!(chain.revoke_grants("cli", "direct"), Some(true));
+
+        let none = LoopHookChain::new(Arc::new(NoopHook), vec![Arc::new(NoopHook)]);
+        assert_eq!(none.revoke_grants("cli", "direct"), None);
     }
 }

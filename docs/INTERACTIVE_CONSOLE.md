@@ -157,6 +157,7 @@ launchers documented under [Command line](COMMAND_LINE.md).
 | `/mcp-list`        | List connected MCP servers                                                      |
 | `/mcp-preset`      | Manage built-in MCP server presets — see [below](#mcp-preset)                   |
 | `/tools`           | List available tools                                                            |
+| `/revoke`          | Forget the tool calls you pre-approved ("allow all for this turn/session")      |
 | `/workspace`       | Show or switch the session's workspace scope                                    |
 | `/goal`            | Start/check/cancel a sustained session goal                                     |
 | `/cleanup`         | Remove stray files from the workspace                                           |
