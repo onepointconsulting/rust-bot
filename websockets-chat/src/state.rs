@@ -885,6 +885,60 @@ impl PendingApproval {
             .map(|entry| entry.call.id.clone())
             .collect()
     }
+
+    /// Names of the tools of the approved calls, each once, in call order. The
+    /// gateway grants exactly these for "always allow this tool".
+    pub fn approved_tool_names(&self) -> Vec<String> {
+        let mut names: Vec<String> = Vec::new();
+        for entry in self.calls.iter().filter(|entry| entry.approved) {
+            if !names.contains(&entry.call.name) {
+                names.push(entry.call.name.clone());
+            }
+        }
+        names
+    }
+}
+
+/// What the gateway says the active chat has pre-approved
+/// (`tool_grants_updated`): tool calls that run without asking.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ToolGrants {
+    /// Every tool, for the rest of the session.
+    pub session_all: bool,
+    /// These tools, for the rest of the session.
+    pub tools: Vec<String>,
+    /// Every tool, for the running turn.
+    pub turn: bool,
+}
+
+impl ToolGrants {
+    pub fn is_empty(&self) -> bool {
+        !self.session_all && !self.turn && self.tools.is_empty()
+    }
+
+    /// The same grants once the turn is over: a turn grant ends with its turn.
+    pub fn without_turn(mut self) -> Self {
+        self.turn = false;
+        self
+    }
+
+    /// One line per active grant, for the banner. A tool list is left out when
+    /// every tool is already approved for the session.
+    pub fn summary_lines(&self) -> Vec<String> {
+        let mut lines = Vec::new();
+        if self.turn {
+            lines.push("Every tool call is auto-approved for this turn.".to_string());
+        }
+        if self.session_all {
+            lines.push("Every tool call is auto-approved for this session.".to_string());
+        } else if !self.tools.is_empty() {
+            lines.push(format!(
+                "Auto-approved for this session: {}.",
+                self.tools.join(", ")
+            ));
+        }
+        lines
+    }
 }
 
 /// An open `question_request` awaiting an answer. Plain data on the parent's
@@ -2137,6 +2191,102 @@ mod tests {
             url,
             "ws://127.0.0.1:18790/ws?client_id=client-1&token=secret"
         );
+    }
+
+    // ── tool grants ───────────────────────────────────────────────────────────
+
+    fn approval_with(calls: &[(&str, &str, bool)]) -> PendingApproval {
+        let mut pending = PendingApproval::new(
+            "req-1".to_string(),
+            calls
+                .iter()
+                .map(|(id, name, _)| ToolApprovalCall {
+                    id: id.to_string(),
+                    name: name.to_string(),
+                    arguments_preview: "{}".to_string(),
+                })
+                .collect(),
+        );
+        for (id, _, approved) in calls {
+            if !approved {
+                pending.toggle_call(id);
+            }
+        }
+        pending
+    }
+
+    #[test]
+    fn approved_tool_names_lists_each_selected_tool_once_in_call_order() {
+        let pending = approval_with(&[
+            ("a", "shell", true),
+            ("b", "read_file", true),
+            ("c", "shell", true),
+            ("d", "write_file", false),
+        ]);
+        assert_eq!(pending.approved_tool_names(), ["shell", "read_file"]);
+    }
+
+    #[test]
+    fn approved_tool_names_is_empty_when_nothing_is_selected() {
+        let pending = approval_with(&[("a", "shell", false)]);
+        assert!(pending.approved_tool_names().is_empty());
+    }
+
+    #[test]
+    fn no_grants_means_nothing_to_show() {
+        assert!(ToolGrants::default().is_empty());
+        assert!(ToolGrants::default().summary_lines().is_empty());
+    }
+
+    #[test]
+    fn a_tool_grant_is_summarised_by_tool_name() {
+        let grants = ToolGrants {
+            tools: vec!["read_file".to_string(), "shell".to_string()],
+            ..ToolGrants::default()
+        };
+        assert!(!grants.is_empty());
+        assert_eq!(
+            grants.summary_lines(),
+            ["Auto-approved for this session: read_file, shell."]
+        );
+    }
+
+    #[test]
+    fn a_blanket_session_grant_hides_the_now_redundant_tool_list() {
+        let grants = ToolGrants {
+            session_all: true,
+            tools: vec!["shell".to_string()],
+            turn: false,
+        };
+        assert_eq!(
+            grants.summary_lines(),
+            ["Every tool call is auto-approved for this session."]
+        );
+    }
+
+    #[test]
+    fn a_turn_grant_is_listed_first_and_ends_with_the_turn() {
+        let grants = ToolGrants {
+            session_all: false,
+            tools: vec!["shell".to_string()],
+            turn: true,
+        };
+        assert_eq!(
+            grants.summary_lines(),
+            [
+                "Every tool call is auto-approved for this turn.",
+                "Auto-approved for this session: shell."
+            ]
+        );
+        let after_turn = grants.without_turn();
+        assert!(!after_turn.turn);
+        assert_eq!(after_turn.tools, ["shell"]);
+        assert!(ToolGrants {
+            turn: true,
+            ..ToolGrants::default()
+        }
+        .without_turn()
+        .is_empty());
     }
 }
 

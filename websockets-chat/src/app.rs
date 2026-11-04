@@ -456,6 +456,10 @@ struct WsContext {
     /// approval card above the composer. Cleared on `tool_approval_resolved`
     /// and wherever the turn itself ends (see [`clear_turn_prompts`]).
     pending_approval: RwSignal<Option<state::PendingApproval>>,
+    /// What the active chat has pre-approved, as the gateway last reported it
+    /// (`tool_grants_updated`). Shown as a banner with a revoke button. Reset
+    /// when the chat changes; the gateway re-sends it on `attach`.
+    tool_grants: RwSignal<state::ToolGrants>,
     /// Open `question_request` for the active chat, shown as the question
     /// card above the composer. Cleared on `question_resolved` and wherever
     /// the turn itself ends (see [`clear_turn_prompts`]).
@@ -467,6 +471,8 @@ struct WsContext {
 fn clear_turn_prompts(ctx: &WsContext) {
     ctx.pending_approval.set(None);
     ctx.pending_question.set(None);
+    // A turn-wide approval ends with its turn.
+    ctx.tool_grants.update(|grants| grants.turn = false);
 }
 
 /// Clone the current `entries`/`turn_index` out of their signals, apply a
@@ -1002,6 +1008,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // The gateway re-sends a non-zero count right after `attached`.
             ctx.background_agents.set(0);
             ctx.working_on_results.set(false);
+            ctx.tool_grants.set(state::ToolGrants::default());
             ctx.background_hint.set(None);
             ctx.turn_index.set(HashMap::new());
             ctx.active_turn_id.set(None);
@@ -1334,6 +1341,18 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             {
                 ctx.pending_approval.set(None);
             }
+        }
+        ServerEvent::ToolGrantsUpdated {
+            session_all,
+            tools,
+            turn,
+            ..
+        } => {
+            ctx.tool_grants.set(state::ToolGrants {
+                session_all,
+                tools,
+                turn,
+            });
         }
         ServerEvent::QuestionRequest {
             request_id,
@@ -2104,17 +2123,50 @@ fn request_abort_turn(ctx: &WsContext) {
 /// Answer the open approval card. Not optimistic, like
 /// [`request_abort_turn`]: the card closes when `tool_approval_resolved`
 /// comes back, so a rejected answer leaves it in place.
-fn request_tool_approval_response(ctx: &WsContext, approved_ids: Vec<String>) {
+///
+/// With a `grant` the gateway also pre-approves later calls as far as it says;
+/// the banner appears when its `tool_grants_updated` reply arrives.
+fn request_tool_approval_response(
+    ctx: &WsContext,
+    approved_ids: Vec<String>,
+    grant: Option<protocol::ToolApprovalGrant>,
+) {
     let Some(chat_id) = ctx.chat_id.get_untracked() else {
         return;
     };
     let Some(pending) = ctx.pending_approval.get_untracked() else {
         return;
     };
+    let envelope = match grant {
+        Some(grant) => protocol::ClientEnvelope::tool_approval_response_with_grant(
+            chat_id,
+            pending.request_id,
+            approved_ids,
+            grant,
+        ),
+        None => protocol::ClientEnvelope::tool_approval_response(
+            chat_id,
+            pending.request_id,
+            approved_ids,
+        ),
+    };
     send_client_envelope(
         *ctx,
-        protocol::ClientEnvelope::tool_approval_response(chat_id, pending.request_id, approved_ids),
+        envelope,
         "Failed to encode the tool approval response.",
+    );
+}
+
+/// Ask the gateway to forget everything the active chat pre-approved. Not
+/// optimistic: the banner goes away when `tool_grants_updated` comes back.
+fn request_revoke_tool_grants(ctx: &WsContext) {
+    let Some(chat_id) = ctx.chat_id.get_untracked() else {
+        return;
+    };
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::revoke_tool_grants(chat_id),
+        "Failed to encode the revoke request.",
     );
 }
 
@@ -2536,6 +2588,7 @@ pub fn App() -> impl IntoView {
     let summary_popup = RwSignal::new(None::<SessionSummaryPopup>);
     let workspace_popup = RwSignal::new(None::<WorkspaceDialogState>);
     let pending_approval = RwSignal::new(None::<state::PendingApproval>);
+    let tool_grants = RwSignal::new(state::ToolGrants::default());
     let pending_question = RwSignal::new(None::<state::PendingQuestion>);
 
     let ws_context = WsContext {
@@ -2589,6 +2642,7 @@ pub fn App() -> impl IntoView {
         summary_popup,
         workspace_popup,
         pending_approval,
+        tool_grants,
         pending_question,
     };
 
@@ -2652,6 +2706,7 @@ pub fn App() -> impl IntoView {
                     active_turn_id.set(None);
                     pending_approval.set(None);
                     pending_question.set(None);
+                    tool_grants.set(state::ToolGrants::default());
                     split_stream_on_next_delta.set(false);
                     reconnect_attempt.set(0);
                     reconnect_exhausted.set(false);
@@ -2691,6 +2746,7 @@ pub fn App() -> impl IntoView {
         active_turn_id.set(None);
         pending_approval.set(None);
         pending_question.set(None);
+        tool_grants.set(state::ToolGrants::default());
         split_stream_on_next_delta.set(false);
         composer_draft.set(String::new());
         chat_error.set(None);
@@ -2833,8 +2889,12 @@ pub fn App() -> impl IntoView {
         });
     };
     let on_answer_approval = move |approved_ids: Vec<String>| {
-        request_tool_approval_response(&ws_context, approved_ids);
+        request_tool_approval_response(&ws_context, approved_ids, None);
     };
+    let on_grant_approval = move |approved_ids: Vec<String>, grant: protocol::ToolApprovalGrant| {
+        request_tool_approval_response(&ws_context, approved_ids, Some(grant));
+    };
+    let on_revoke_tool_grants = move || request_revoke_tool_grants(&ws_context);
     let on_select_question_option = move |option_id: String| {
         request_question_response(&ws_context, Some(option_id), None);
     };
@@ -2955,6 +3015,9 @@ pub fn App() -> impl IntoView {
                     pending_approval=Signal::derive(move || pending_approval.get())
                     on_toggle_approval_call=on_toggle_approval_call
                     on_answer_approval=on_answer_approval
+                    on_grant_approval=on_grant_approval
+                    tool_grants=Signal::derive(move || tool_grants.get())
+                    on_revoke_tool_grants=on_revoke_tool_grants
                     pending_question=Signal::derive(move || pending_question.get())
                     on_select_question_option=on_select_question_option
                     on_answer_question_free_text=on_answer_question_free_text

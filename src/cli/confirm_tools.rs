@@ -163,12 +163,24 @@ impl AgentHook for WebsocketsAskHook {
                 return unanswerable(&format!("channel {channel:?} cannot ask for it"));
             }
         };
+        if self
+            .broker
+            .is_granted(&chat_id, request.turn_id, request.tool_name)
+        {
+            log::info!(
+                "tool '{}' approved by an earlier grant of chat {chat_id}",
+                request.tool_name
+            );
+            return CallDecision::Allow;
+        }
         let Some(bus) = self.bus() else {
             return unanswerable("no bus is wired to ask through");
         };
 
         let call = ToolApprovalCall::from_authorization(request);
-        let (request_id, rx) = self.broker.register(&chat_id, vec![call.clone()]);
+        let (request_id, rx) =
+            self.broker
+                .register_for_turn(&chat_id, vec![call.clone()], request.turn_id);
         let _guard = PendingGuard {
             broker: &self.broker,
             request_id: request_id.clone(),
@@ -220,6 +232,7 @@ mod tests {
             arguments,
             channel,
             chat_id,
+            turn_id: None,
         }
     }
 
@@ -402,5 +415,126 @@ mod tests {
             panic!("no bus means nobody can be asked");
         };
         assert!(reason.contains("no bus is wired"), "got {reason:?}");
+    }
+
+    // ── grants ────────────────────────────────────────────────────────────────
+
+    use crate::agent::tool_approval::ApprovalGrant;
+
+    /// A request for tool `exec` from `chat-1` made in `turn_id`.
+    fn websocket_request<'a>(
+        arguments: &'a serde_json::Value,
+        turn_id: Option<&'a str>,
+    ) -> ToolCallAuthorization<'a> {
+        ToolCallAuthorization {
+            turn_id,
+            ..request(arguments, Some(WEBSOCKET_CHANNEL), Some("chat-1"))
+        }
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_allows_a_granted_tool_without_asking() {
+        let broker = Arc::new(ToolApprovalBroker::new());
+        let (hook, bus) = websocket_hook(&broker);
+        broker.add_grant(
+            "chat-1",
+            ApprovalGrant::SessionTool,
+            None,
+            vec!["exec".into()],
+        );
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&websocket_request(&arguments, Some("t1")))
+            .await;
+
+        assert_eq!(decision, CallDecision::Allow);
+        assert_eq!(bus.outbound_size(), 0, "a grant means nobody is asked");
+        assert!(broker.pending_for_chat("chat-1").is_empty());
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_still_asks_about_tools_a_grant_does_not_name() {
+        let broker = Arc::new(ToolApprovalBroker::new());
+        let bus = Arc::new(MessageBus::new());
+        let hook =
+            WebsocketsAskHook::new(Arc::clone(&broker)).with_timeout(Duration::from_millis(50));
+        hook.set_bus(Arc::clone(&bus));
+        broker.add_grant(
+            "chat-1",
+            ApprovalGrant::SessionTool,
+            None,
+            vec!["read_file".into()],
+        );
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&websocket_request(&arguments, Some("t1")))
+            .await;
+
+        assert_eq!(
+            decision,
+            user_denied(),
+            "exec was not granted, so it asked and timed out"
+        );
+        assert_eq!(bus.outbound_size(), 1);
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_honours_a_turn_grant_only_in_that_turn() {
+        let broker = Arc::new(ToolApprovalBroker::new());
+        let bus = Arc::new(MessageBus::new());
+        let hook =
+            WebsocketsAskHook::new(Arc::clone(&broker)).with_timeout(Duration::from_millis(50));
+        hook.set_bus(Arc::clone(&bus));
+        broker.add_grant("chat-1", ApprovalGrant::Turn, Some("t1"), vec![]);
+        let arguments = serde_json::json!({});
+
+        let same_turn = hook
+            .authorize_call(&websocket_request(&arguments, Some("t1")))
+            .await;
+        let next_turn = hook
+            .authorize_call(&websocket_request(&arguments, Some("t2")))
+            .await;
+
+        assert_eq!(same_turn, CallDecision::Allow);
+        assert_eq!(next_turn, user_denied(), "the grant ended with turn t1");
+    }
+
+    #[tokio::test]
+    async fn websocket_hook_stores_the_asking_turn_with_its_request() {
+        let broker = Arc::new(ToolApprovalBroker::new());
+        let bus = Arc::new(MessageBus::new());
+        let hook = Arc::new(
+            WebsocketsAskHook::new(Arc::clone(&broker)).with_timeout(Duration::from_secs(5)),
+        );
+        hook.set_bus(Arc::clone(&bus));
+        let responder = {
+            let broker = Arc::clone(&broker);
+            tokio::spawn(async move {
+                let msg = bus.consume_outbound().await.expect("request published");
+                let Some(OutboundEvent::ToolApprovalRequest(event)) = msg.event else {
+                    panic!("expected tool approval request");
+                };
+                broker
+                    .resolve_with_grant(
+                        "chat-1",
+                        &event.request_id,
+                        vec!["a".into()],
+                        Some(ApprovalGrant::Turn),
+                    )
+                    .unwrap();
+            })
+        };
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&websocket_request(&arguments, Some("turn-42")))
+            .await;
+        responder.await.unwrap();
+
+        assert_eq!(decision, CallDecision::Allow);
+        assert!(broker.is_granted("chat-1", Some("turn-42"), "exec"));
+        assert!(!broker.is_granted("chat-1", Some("turn-43"), "exec"));
     }
 }

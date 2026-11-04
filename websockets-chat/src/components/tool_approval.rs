@@ -7,6 +7,7 @@
 
 use leptos::prelude::*;
 
+use crate::protocol::ToolApprovalGrant;
 use crate::state::PendingApproval;
 
 #[component]
@@ -14,6 +15,7 @@ pub fn ToolApprovalCard(
     #[prop(into)] approval: Signal<Option<PendingApproval>>,
     on_toggle: Callback<String>,
     on_answer: Callback<Vec<String>>,
+    on_grant: Callback<(Vec<String>, ToolApprovalGrant)>,
 ) -> impl IntoView {
     let calls = move || approval.get().map(|p| p.calls).unwrap_or_default();
     let approved_count = move || calls().iter().filter(|c| c.approved).count();
@@ -28,6 +30,19 @@ pub fn ToolApprovalCard(
         }
     };
     let deny_all = move |_| on_answer.run(Vec::new());
+    // Run the selected calls and remember the choice for later ones.
+    let run_and_remember = move |grant: ToolApprovalGrant| {
+        if let Some(pending) = approval.get_untracked() {
+            on_grant.run((pending.approved_ids(), grant));
+        }
+    };
+    let selected_tools = move || {
+        approval
+            .get()
+            .map(|pending| pending.approved_tool_names().join(", "))
+            .unwrap_or_default()
+    };
+    let nothing_selected = move || approved_count() == 0;
 
     view! {
         <Show when=move || approval.get().is_some()>
@@ -92,6 +107,33 @@ pub fn ToolApprovalCard(
                         on:click=run_selected
                     >
                         {move || format!("Run selected ({})", approved_count())}
+                    </button>
+                </div>
+                <div class="tool-approval__remember">
+                    <span class="tool-approval__remember-label">"Run the selected and:"</span>
+                    <button
+                        type="button"
+                        class="tool-approval__remember-button"
+                        disabled=nothing_selected
+                        on:click=move |_| run_and_remember(ToolApprovalGrant::Turn)
+                    >
+                        "allow all for this turn"
+                    </button>
+                    <button
+                        type="button"
+                        class="tool-approval__remember-button"
+                        disabled=nothing_selected
+                        on:click=move |_| run_and_remember(ToolApprovalGrant::SessionTool)
+                    >
+                        {move || format!("always allow {} this session", selected_tools())}
+                    </button>
+                    <button
+                        type="button"
+                        class="tool-approval__remember-button tool-approval__remember-button--wide"
+                        disabled=nothing_selected
+                        on:click=move |_| run_and_remember(ToolApprovalGrant::Session)
+                    >
+                        "allow everything this session"
                     </button>
                 </div>
             </div>

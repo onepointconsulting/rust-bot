@@ -56,6 +56,30 @@ answer is a denial**: no terminal, no chat, no bus, a timeout, or a panicking ho
 `tools.confirmBeforeExecute` turns the first two on. With it on, tool calls from channels that have no web chat
 (cron, email, WhatsApp, ...) are denied.
 
+## Approval grants (web chat)
+
+An approval card can do more than answer one call. The user can also pre-approve later calls:
+
+| choice                              | covers                                         | ends when                                  |
+|-------------------------------------|------------------------------------------------|--------------------------------------------|
+| Run selected                        | the selected calls only                        | -                                          |
+| allow all for this turn             | every tool                                     | the turn that asked ends                   |
+| always allow `<tool>` this session  | the tools of the approved calls                | the chat is cleared or deleted, or revoked |
+| allow everything this session       | every tool                                     | the chat is cleared or deleted, or revoked |
+
+- **The gateway owns the grants** (`ToolApprovalBroker`, in memory, keyed by chat). A restart forgets them on
+  purpose. The client only names the scope in the `grant` field of `tool_approval_response` (`turn`, `session`,
+  `session_tool`); the turn and the tool names come from the stored request, so an answer cannot widen what it was
+  shown.
+- A grant is only recorded when at least one call was approved. Denying with a grant attached grants nothing.
+- `WebsocketsAskHook` checks the grants before it publishes a card. A granted call is still journaled and executed
+  like any other, and the gateway logs that a grant approved it.
+- A grant never leaves its chat: other chats, cron and email turns are not affected. Calls that cannot be asked
+  about still deny.
+- The gateway sends `tool_grants_updated {chat_id, session_all, tools, turn}` to every tab whenever the grants
+  change, and replays it on `attach` (without the turn grant, since nothing there knows whether the turn still
+  runs). The web chat shows a banner with a **Revoke** button, which sends `revoke_tool_grants {chat_id}`.
+
 ## Failure handling
 
 - A tool that **panics** returns `Error: tool '<name>' crashed: <message>`.

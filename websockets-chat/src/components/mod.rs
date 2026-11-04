@@ -13,6 +13,7 @@ mod subagents_page;
 mod tool_activity;
 mod tool_approval;
 mod tool_config_form;
+mod tool_grants_banner;
 
 pub use add_mcp_server_panel::{success_message as add_server_success_message, ADD_BUSY_KEY};
 pub use ask_question::AskQuestionCard;
@@ -29,3 +30,4 @@ pub use subagents_page::SubagentsPage;
 pub use tool_activity::ToolActivity;
 pub use tool_approval::ToolApprovalCard;
 pub use tool_config_form::ToolConfigChange;
+pub use tool_grants_banner::ToolGrantsBanner;

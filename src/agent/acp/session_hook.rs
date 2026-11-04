@@ -364,6 +364,7 @@ mod tests {
                     arguments: &arguments,
                     channel: context.channel.as_deref(),
                     chat_id: context.chat_id.as_deref(),
+                    turn_id: None,
                 })
                 .await,
             );

@@ -16,7 +16,8 @@ tool failure is detected by the text `"Error"`, and nothing protects the turn fr
 |---|---|---|
 | 1. Structure (no behaviour change) | `feature/tool-pipeline-p1-structure` | built and committed 2026-11-03 |
 | 2. Robustness | `feature/tool-pipeline-p2-robustness` | committed 2026-11-03 |
-| 3. Per-call authorize | `feature/tool-pipeline-p3-authorize` | built 2026-11-03, uncommitted |
+| 3. Per-call authorize | `feature/tool-pipeline-p3-authorize` | committed 2026-11-03 |
+| 3b. Approval grants (web chat) | `feature/tool-approval-grants` | built 2026-11-03, uncommitted |
 | 4. Result model, post-hooks, observability | `feature/tool-pipeline-p4-results` | not started |
 
 One branch per phase. Phase N+1 branches from Phase N until N is merged. Commit only when asked.
@@ -144,6 +145,18 @@ Consequences to be aware of:
   with N calls. Batching the card again would need a batch-shaped `authorize_calls` over the validated calls.
 
 Risk: medium-high (three channels, ordering semantics). Needs a manual smoke test of the CLI and websockets-chat.
+
+## Phase 3b: approval grants (web chat)
+
+Added after Phase 3, because one card per call made long turns tedious. Built 2026-11-03.
+
+- Choices on the approval card: allow all for this turn, always allow the selected tools this session, allow
+  everything this session. A banner lists active grants with a **Revoke** button. See `docs/TOOL_PIPELINE.md`.
+- `ToolCallAuthorization` gained `turn_id` (from the journal's turn) so a turn grant expires with its turn.
+- Grants live in the broker, in memory, per chat; they are cleared by `clear_session`, `delete_chat` and revoke.
+- Not done: the CLI prompt has no grant choices, and ACP permission requests are unchanged.
+- Decided with Gil: per-tool grants and the revoke banner are part of the first version; a blanket session grant
+  would otherwise switch confirmation off for the chat without any sign of it.
 
 ## Phase 4: result model, post-hooks, observability
 

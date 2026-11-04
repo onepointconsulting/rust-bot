@@ -156,6 +156,10 @@ pub enum EnvelopeType {
     /// approved (`approved_ids`); every other call in the request is denied.
     /// Rust-side addition, no nanobot precedent.
     ToolApprovalResponse,
+    /// Forget every tool approval grant of a chat (the user pressed "revoke").
+    /// The reply is a `tool_grants_updated` fanned out to every tab on the chat.
+    /// Rust-side addition, no nanobot precedent.
+    RevokeToolGrants,
     /// Answer a pending `question_request` with either the id of the option
     /// the user picked or free text (or neither, if unanswered). Rust-side
     /// addition, no nanobot precedent.
@@ -209,6 +213,7 @@ impl From<&str> for EnvelopeType {
             "clear_session" => Self::ClearSession,
             "get_session_summary" => Self::GetSessionSummary,
             "tool_approval_response" => Self::ToolApprovalResponse,
+            "revoke_tool_grants" => Self::RevokeToolGrants,
             "question_response" => Self::QuestionResponse,
             other => Self::Unrecognized(other.to_string()),
         }
@@ -334,6 +339,9 @@ pub enum WsOutboundEvent {
     /// Fan-out after [`EnvelopeType::ToolApprovalResponse`] resolved a
     /// request, so every other tab closes its approval card.
     ToolApprovalResolved,
+    /// Fan-out of what the chat has pre-approved (`session_all`, `tools`, `turn`),
+    /// after a grant was recorded or revoked, and on `attach`.
+    ToolGrantsUpdated,
     /// Fan-out asking the chat's user a clarifying question with
     /// multiple-choice options (plus a free-text fallback).
     QuestionRequest,
@@ -387,6 +395,7 @@ impl WsOutboundEvent {
             Self::Directories => "directories",
             Self::ToolApprovalRequest => "tool_approval_request",
             Self::ToolApprovalResolved => "tool_approval_resolved",
+            Self::ToolGrantsUpdated => "tool_grants_updated",
             Self::QuestionRequest => "question_request",
             Self::QuestionResolved => "question_resolved",
         }
@@ -903,6 +912,10 @@ mod tests {
             EnvelopeType::ToolApprovalResponse
         );
         assert_eq!(
+            EnvelopeType::from("revoke_tool_grants"),
+            EnvelopeType::RevokeToolGrants
+        );
+        assert_eq!(
             EnvelopeType::from("question_response"),
             EnvelopeType::QuestionResponse
         );
@@ -917,6 +930,10 @@ mod tests {
         assert_eq!(
             WsOutboundEvent::ToolApprovalResolved.as_str(),
             "tool_approval_resolved"
+        );
+        assert_eq!(
+            WsOutboundEvent::ToolGrantsUpdated.as_str(),
+            "tool_grants_updated"
         );
     }
 

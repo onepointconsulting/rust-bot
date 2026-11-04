@@ -341,6 +341,7 @@ async fn authorize(
         arguments: params,
         channel: spec.channel.as_deref(),
         chat_id: spec.chat_id.as_deref(),
+        turn_id: spec.journal.as_ref().map(|journal| journal.turn_id()),
     };
     let decision = match AssertUnwindSafe(hook.authorize_call(&request))
         .catch_unwind()

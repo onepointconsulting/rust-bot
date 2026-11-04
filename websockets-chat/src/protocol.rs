@@ -80,6 +80,11 @@ pub struct ClientEnvelope {
     /// approved; every other call in the request is denied.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub approved_ids: Option<Vec<String>>,
+    /// Set only by [`Self::tool_approval_response_with_grant`] — how far the
+    /// approval reaches beyond the answered calls (`turn`, `session` or
+    /// `session_tool`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub grant: Option<&'static str>,
     /// Set only by [`Self::question_response`] — the id of the
     /// `question_request` option the user picked, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -139,6 +144,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -172,6 +178,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -204,6 +211,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -249,6 +257,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -279,6 +288,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -309,6 +319,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -523,6 +534,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -571,6 +583,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -604,6 +617,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -639,6 +653,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -672,6 +687,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -711,6 +727,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -744,6 +761,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -773,6 +791,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -805,6 +824,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -839,6 +859,7 @@ impl ClientEnvelope {
             access_mode,
             request_id: None,
             approved_ids: None,
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -848,6 +869,31 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             webui: true,
+        }
+    }
+
+    /// Answer a `tool_approval_request` like [`Self::tool_approval_response`],
+    /// and also pre-approve later calls as far as `grant` says. The gateway
+    /// pins a turn grant to the turn that asked and takes the tool names of a
+    /// tool grant from the approved calls, so the client only picks the scope.
+    pub fn tool_approval_response_with_grant(
+        chat_id: impl Into<String>,
+        request_id: impl Into<String>,
+        approved_ids: Vec<String>,
+        grant: ToolApprovalGrant,
+    ) -> Self {
+        Self {
+            grant: Some(grant.as_wire()),
+            ..Self::tool_approval_response(chat_id, request_id, approved_ids)
+        }
+    }
+
+    /// Forget everything `chat_id` pre-approved. The reply is a
+    /// `tool_grants_updated` fanned out to every tab on the chat.
+    pub fn revoke_tool_grants(chat_id: impl Into<String>) -> Self {
+        Self {
+            type_: "revoke_tool_grants",
+            ..Self::abort_turn(chat_id, None)
         }
     }
 
@@ -875,6 +921,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: Some(request_id.into()),
             approved_ids: Some(approved_ids),
+            grant: None,
             option_id: None,
             free_text: None,
             chat_about: false,
@@ -913,6 +960,7 @@ impl ClientEnvelope {
             access_mode: None,
             request_id: Some(request_id.into()),
             approved_ids: None,
+            grant: None,
             option_id,
             free_text,
             chat_about: false,
@@ -932,6 +980,29 @@ impl ClientEnvelope {
         Self {
             chat_about: true,
             ..Self::question_response(chat_id, request_id, None, None)
+        }
+    }
+}
+
+/// How far an approval reaches beyond the calls it answers. Mirrors the
+/// backend's `ApprovalGrant` (`src/agent/tool_approval.rs`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ToolApprovalGrant {
+    /// Every tool, until the turn that asked ends.
+    Turn,
+    /// Every tool, until the chat is cleared or the grants are revoked.
+    Session,
+    /// The tools of the approved calls, until the chat is cleared or revoked.
+    SessionTool,
+}
+
+impl ToolApprovalGrant {
+    /// The name the gateway expects in the `grant` field.
+    pub fn as_wire(self) -> &'static str {
+        match self {
+            Self::Turn => "turn",
+            Self::Session => "session",
+            Self::SessionTool => "session_tool",
         }
     }
 }
@@ -1335,6 +1406,15 @@ pub enum ServerEvent {
     },
     /// `request_id` was answered (possibly from another tab); close its card.
     ToolApprovalResolved { chat_id: String, request_id: String },
+    /// What the chat has pre-approved changed (a grant was given, revoked, or
+    /// the chat was cleared). Also sent after `attached` when there is
+    /// something to show. `turn` is only set while a turn grant is live.
+    ToolGrantsUpdated {
+        chat_id: String,
+        session_all: bool,
+        tools: Vec<String>,
+        turn: bool,
+    },
     /// The agent is waiting for the user to answer a clarifying question —
     /// pick one of `options` or type free text. Answer with
     /// [`ClientEnvelope::question_response`]. Also re-sent after `attached`
@@ -1382,6 +1462,7 @@ impl ServerEvent {
             | ServerEvent::ToolsList { chat_id, .. }
             | ServerEvent::ToolApprovalRequest { chat_id, .. }
             | ServerEvent::ToolApprovalResolved { chat_id, .. }
+            | ServerEvent::ToolGrantsUpdated { chat_id, .. }
             | ServerEvent::QuestionRequest { chat_id, .. }
             | ServerEvent::QuestionResolved { chat_id, .. } => Some(chat_id.as_str()),
             ServerEvent::Error { chat_id, .. } => chat_id.as_deref(),
@@ -1938,6 +2019,17 @@ struct ToolApprovalResolvedWire {
 }
 
 #[derive(Deserialize)]
+struct ToolGrantsUpdatedWire {
+    chat_id: String,
+    #[serde(default)]
+    session_all: bool,
+    #[serde(default)]
+    tools: Vec<String>,
+    #[serde(default)]
+    turn: bool,
+}
+
+#[derive(Deserialize)]
 struct QuestionRequestWire {
     chat_id: String,
     #[serde(default)]
@@ -2230,6 +2322,14 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             decode::<ToolApprovalResolvedWire>(&value).map(|w| ServerEvent::ToolApprovalResolved {
                 chat_id: w.chat_id,
                 request_id: w.request_id,
+            })
+        }
+        "tool_grants_updated" => {
+            decode::<ToolGrantsUpdatedWire>(&value).map(|w| ServerEvent::ToolGrantsUpdated {
+                chat_id: w.chat_id,
+                session_all: w.session_all,
+                tools: w.tools,
+                turn: w.turn,
             })
         }
         "question_request" => {
@@ -4370,6 +4470,87 @@ mod tests {
                 "chat_id": "chat-123",
                 "content": "hi",
                 "media": [{"url": "data:image/png;base64,AAAA"}],
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn parses_tool_grants_updated() {
+        let raw = r#"{"event":"tool_grants_updated","chat_id":"chat-1","session_all":false,"tools":["read_file","shell"],"turn":true}"#;
+        let event = parse_server_event(raw).expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ToolGrantsUpdated {
+                chat_id: "chat-1".to_string(),
+                session_all: false,
+                tools: vec!["read_file".to_string(), "shell".to_string()],
+                turn: true,
+            }
+        );
+        assert_eq!(event.chat_id(), Some("chat-1"));
+    }
+
+    #[test]
+    fn tool_grants_updated_defaults_missing_fields_to_nothing_granted() {
+        let raw = r#"{"event":"tool_grants_updated","chat_id":"chat-1"}"#;
+        assert_eq!(
+            parse_server_event(raw).expect("should parse"),
+            ServerEvent::ToolGrantsUpdated {
+                chat_id: "chat-1".to_string(),
+                session_all: false,
+                tools: Vec::new(),
+                turn: false,
+            }
+        );
+    }
+
+    #[test]
+    fn grant_wire_names_match_the_gateway() {
+        assert_eq!(ToolApprovalGrant::Turn.as_wire(), "turn");
+        assert_eq!(ToolApprovalGrant::Session.as_wire(), "session");
+        assert_eq!(ToolApprovalGrant::SessionTool.as_wire(), "session_tool");
+    }
+
+    #[test]
+    fn approval_response_with_a_grant_carries_the_grant_and_the_ids() {
+        let envelope = ClientEnvelope::tool_approval_response_with_grant(
+            "chat-1",
+            "req-1",
+            vec!["call_1".to_string()],
+            ToolApprovalGrant::SessionTool,
+        );
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "tool_approval_response",
+                "chat_id": "chat-1",
+                "request_id": "req-1",
+                "approved_ids": ["call_1"],
+                "grant": "session_tool",
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn a_plain_approval_response_sends_no_grant() {
+        let envelope =
+            ClientEnvelope::tool_approval_response("chat-1", "req-1", vec!["call_1".to_string()]);
+        let value = serde_json::to_value(&envelope).expect("should serialize");
+        assert!(value.get("grant").is_none());
+    }
+
+    #[test]
+    fn revoke_tool_grants_names_only_the_chat() {
+        let value = serde_json::to_value(ClientEnvelope::revoke_tool_grants("chat-1"))
+            .expect("should serialize");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "type": "revoke_tool_grants",
+                "chat_id": "chat-1",
                 "webui": true,
             })
         );

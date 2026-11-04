@@ -65,6 +65,9 @@ pub struct ToolCallAuthorization<'a> {
     pub channel: Option<&'a str>,
     /// Chat id within [`Self::channel`], when known.
     pub chat_id: Option<&'a str>,
+    /// Identifier of the agent turn the call belongs to, when known. It lets an
+    /// approval that covers "the rest of this turn" expire with the turn.
+    pub turn_id: Option<&'a str>,
 }
 
 /// Answer of [`AgentHook::authorize_call`].
@@ -425,6 +428,7 @@ mod tests {
             arguments,
             channel: None,
             chat_id: None,
+            turn_id: None,
         }
     }
 

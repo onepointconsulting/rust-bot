@@ -34,7 +34,7 @@ use crate::agent::skills::SkillsLoader;
 use crate::agent::subagent::{
     SpawnTaskSummary, SubagentManager, SubagentRecord, summarize_spawn_records,
 };
-use crate::agent::tool_approval::ToolApprovalCall;
+use crate::agent::tool_approval::{ApprovalGrant, GrantsView, ToolApprovalCall};
 use crate::agent::tools::mcp::mcp_presets_api::{
     self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
 };
@@ -732,6 +732,9 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         EnvelopeType::ToolApprovalResponse => {
             handle_envelope_tool_approval_response(envelope_dispatch_context).await;
         }
+        EnvelopeType::RevokeToolGrants => {
+            handle_envelope_revoke_tool_grants(envelope_dispatch_context).await;
+        }
         EnvelopeType::QuestionResponse => {
             handle_envelope_question_response(envelope_dispatch_context).await;
         }
@@ -1396,6 +1399,7 @@ async fn handle_envelope_attach<'a>(envelope_dispatch_context: EnvelopeDispatchC
 
     attach_chat(connection_id, cid, shared).await;
     resend_pending_tool_approvals(shared, connection_id, cid).await;
+    resend_tool_grants(shared, connection_id, cid).await;
     resend_pending_questions(shared, connection_id, cid).await;
 }
 
@@ -1974,21 +1978,45 @@ async fn handle_envelope_tool_approval_response<'a>(
         .await;
         return;
     };
-    if let Err(err) = broker.resolve(cid, request_id, approved_ids) {
-        send_event(
-            shared,
-            connection_id,
-            WsOutboundEvent::Error,
-            Some(&rejection_fields),
-            serde_json::json!({"detail": err.as_detail(), "request_id": request_id}),
-        )
-        .await;
-        return;
-    }
+    // An unknown or absent `grant` is "answer these calls only".
+    let grant = envelope_dispatch_context
+        .envelope
+        .get("grant")
+        .and_then(|v| v.as_str())
+        .and_then(ApprovalGrant::from_wire);
+    let grants_changed = match broker.resolve_with_grant(cid, request_id, approved_ids, grant) {
+        Ok(changed) => changed,
+        Err(err) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Error,
+                Some(&rejection_fields),
+                serde_json::json!({"detail": err.as_detail(), "request_id": request_id}),
+            )
+            .await;
+            return;
+        }
+    };
 
+    let raw = serde_json::json!({
+        "event": WsOutboundEvent::ToolApprovalResolved.as_str(),
+        "chat_id": cid,
+        "request_id": request_id,
+    })
+    .to_string();
+    fan_out_to_chat(shared, connection_id, cid, raw).await;
+    if grants_changed {
+        broadcast_tool_grants(shared, connection_id, cid, true).await;
+    }
+}
+
+/// Send `raw` to every tab attached to `chat_id`, and to `connection_id` even
+/// when it is not attached. A tab whose socket is gone is cleaned up.
+async fn fan_out_to_chat(shared: &WsShared, connection_id: &str, chat_id: &str, raw: String) {
     let recipients = {
         let connections = shared.connections.lock().await;
-        let mut recipients = connections.senders_for_chat(cid);
+        let mut recipients = connections.senders_for_chat(chat_id);
         if !recipients.iter().any(|(id, _)| id == connection_id)
             && let Some(sender) = connections.sender_for(connection_id)
         {
@@ -1996,12 +2024,6 @@ async fn handle_envelope_tool_approval_response<'a>(
         }
         recipients
     };
-    let raw = serde_json::json!({
-        "event": WsOutboundEvent::ToolApprovalResolved.as_str(),
-        "chat_id": cid,
-        "request_id": request_id,
-    })
-    .to_string();
     for (recipient_id, tx) in recipients {
         if tx.send(Message::text(raw.clone())).is_err() {
             shared
@@ -2011,6 +2033,93 @@ async fn handle_envelope_tool_approval_response<'a>(
                 .cleanup_connection(&recipient_id);
         }
     }
+}
+
+/// `tool_grants_updated` frame: what `chat_id` has pre-approved.
+fn tool_grants_payload(chat_id: &str, grants: &GrantsView) -> serde_json::Value {
+    serde_json::json!({
+        "event": WsOutboundEvent::ToolGrantsUpdated.as_str(),
+        "chat_id": chat_id,
+        "session_all": grants.session_all,
+        "tools": grants.tools,
+        "turn": grants.turn,
+    })
+}
+
+/// Tell every tab on `chat_id` what the chat has pre-approved now.
+async fn broadcast_tool_grants(
+    shared: &WsShared,
+    connection_id: &str,
+    chat_id: &str,
+    include_turn: bool,
+) {
+    let Some(broker) = shared.gateway_services.tool_approvals() else {
+        return;
+    };
+    let grants = broker.grants_for_chat(chat_id, include_turn);
+    let raw = tool_grants_payload(chat_id, &grants).to_string();
+    fan_out_to_chat(shared, connection_id, chat_id, raw).await;
+}
+
+/// Tell one connection what `chat_id` has pre-approved, so a reloaded or
+/// late-joining tab shows it. Says nothing when there is nothing to show. A
+/// turn grant is left out: nothing here knows whether its turn still runs.
+async fn resend_tool_grants(shared: &WsShared, connection_id: &str, chat_id: &str) {
+    let Some(broker) = shared.gateway_services.tool_approvals() else {
+        return;
+    };
+    let grants = broker.grants_for_chat(chat_id, false);
+    if grants.is_empty() {
+        return;
+    }
+    let Some(sender) = shared.connections.lock().await.sender_for(connection_id) else {
+        return;
+    };
+    let _ = sender.send(Message::text(
+        tool_grants_payload(chat_id, &grants).to_string(),
+    ));
+}
+
+/// Handle a `revoke_tool_grants` envelope `{chat_id}`: forget everything the
+/// chat pre-approved and tell every tab. Always replies, even when there was
+/// nothing to forget, so clients converge on the server's state.
+async fn handle_envelope_revoke_tool_grants<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+
+    let Some(cid) = require_valid_chat_id(&envelope_dispatch_context).await else {
+        return;
+    };
+    let rejection_fields = create_rejection_fields(cid);
+
+    if !sender_allowed(&shared.channels_config, client_id) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            Some(&rejection_fields),
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    if !check_owner_allows_access(
+        shared,
+        connection_id,
+        client_id,
+        &get_session_id(cid),
+        Some(&rejection_fields),
+    )
+    .await
+    {
+        return;
+    }
+
+    if let Some(broker) = shared.gateway_services.tool_approvals() {
+        broker.revoke_grants(cid);
+    }
+    broadcast_tool_grants(shared, connection_id, cid, true).await;
 }
 
 /// Re-send any approval still waiting on `chat_id` to one connection, so a
@@ -2515,6 +2624,12 @@ async fn handle_envelope_delete_chat<'a>(envelope_dispatch_context: EnvelopeDisp
     // `GatewayServices::set_work_canceller`.
     if let Some(canceller) = shared.gateway_services.work_canceller() {
         canceller.abort(CHANNEL_NAME, cid).await;
+    }
+    // A deleted chat keeps nothing pre-approved.
+    if let Some(broker) = shared.gateway_services.tool_approvals()
+        && broker.revoke_grants(cid)
+    {
+        broadcast_tool_grants(shared, connection_id, cid, true).await;
     }
     // The abort above may publish a `TurnEnd`, but that only clears the
     // *agent's* bookkeeping — also clear the WebSocket-side turn projection
@@ -5194,6 +5309,12 @@ async fn handle_envelope_clear_session<'a>(envelope_dispatch_context: EnvelopeDi
     // `AgentLoop` was wired in — see `GatewayServices::set_work_canceller`.
     if let Some(canceller) = shared.gateway_services.work_canceller() {
         canceller.abort(CHANNEL_NAME, cid).await;
+    }
+    // A cleared conversation starts from scratch: nothing stays pre-approved.
+    if let Some(broker) = shared.gateway_services.tool_approvals()
+        && broker.revoke_grants(cid)
+    {
+        broadcast_tool_grants(shared, connection_id, cid, true).await;
     }
     // The abort above may publish a `TurnEnd`, but that only clears the
     // *agent's* bookkeeping — also clear the WebSocket-side turn projection
@@ -10535,6 +10656,29 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn deleting_a_chat_forgets_its_grants() {
+        let (shared, broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+        broker.add_grant("chat-1", ApprovalGrant::Session, None, vec![]);
+        shared
+            .session_manager
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .save(Session::new("websocket:chat-1".to_string()))
+            .unwrap();
+
+        dispatch_delete(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        assert!(!broker.is_granted("chat-1", None, "exec"));
+        let frames = drain_json(&mut rx1);
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"] == "tool_grants_updated"),
+            "{frames:?}"
+        );
+    }
+
+    #[tokio::test]
     async fn handle_envelope_delete_chat_notifies_requester_even_when_not_subscribed() {
         // The requester's connection is attached to "chat-1" (its currently
         // active chat) but asks to delete "chat-2" — some other row in its
@@ -11491,6 +11635,238 @@ mod tests {
         dispatch_tool_approval_response(&shared, "conn-1", "chat-1", Some(&request_id), None).await;
 
         assert!(rx.await.unwrap().is_empty());
+    }
+
+    /// Dispatch an envelope made of `fields` (a JSON object) from `connection_id`.
+    async fn dispatch_fields(shared: &WsShared, connection_id: &str, fields: serde_json::Value) {
+        let envelope: Envelope = fields
+            .as_object()
+            .expect("fields must be an object")
+            .clone()
+            .into_iter()
+            .collect();
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id,
+            client_id: "client-1",
+            shared,
+            remote_addr: addr("127.0.0.1"),
+            auth: &AuthorizeResult::UNAUTHENTICATED,
+        };
+        tokio::time::timeout(std::time::Duration::from_secs(5), dispatch_envelope(ctx))
+            .await
+            .expect("the envelope must not hang");
+    }
+
+    /// A gateway with a broker, and two tabs (`conn-1`, `conn-2`) on `chat-1`.
+    async fn shared_with_two_tabs() -> (
+        WsShared,
+        Arc<ToolApprovalBroker>,
+        mpsc::UnboundedReceiver<Message>,
+        mpsc::UnboundedReceiver<Message>,
+    ) {
+        let shared = test_shared("browser");
+        let broker = Arc::new(ToolApprovalBroker::new());
+        shared
+            .gateway_services
+            .set_tool_approvals(Arc::clone(&broker));
+        let (tx1, rx1) = mpsc::unbounded_channel::<Message>();
+        let (tx2, rx2) = mpsc::unbounded_channel::<Message>();
+        {
+            let mut connections = shared.connections.lock().await;
+            connections.register("conn-1", "chat-1", tx1);
+            connections.attach("conn-2", "chat-1");
+            connections.register("conn-2", "chat-1", tx2);
+        }
+        (shared, broker, rx1, rx2)
+    }
+
+    #[tokio::test]
+    async fn an_approval_with_a_tool_grant_records_it_and_tells_every_tab() {
+        let (shared, broker, mut rx1, mut rx2) = shared_with_two_tabs().await;
+        let (request_id, rx) = broker.register("chat-1", vec![approval_call("a")]);
+
+        dispatch_fields(
+            &shared,
+            "conn-1",
+            serde_json::json!({
+                "type": "tool_approval_response",
+                "chat_id": "chat-1",
+                "request_id": request_id,
+                "approved_ids": ["a"],
+                "grant": "session_tool",
+            }),
+        )
+        .await;
+
+        assert_eq!(rx.await.unwrap(), vec!["a".to_string()]);
+        assert!(broker.is_granted("chat-1", None, "exec"));
+        for rx in [&mut rx1, &mut rx2] {
+            assert_eq!(recv_json(rx)["event"], "tool_approval_resolved");
+            let grants = recv_json(rx);
+            assert_eq!(grants["event"], "tool_grants_updated");
+            assert_eq!(grants["chat_id"], "chat-1");
+            assert_eq!(grants["tools"], serde_json::json!(["exec"]));
+            assert_eq!(grants["session_all"], false);
+            assert_eq!(grants["turn"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn a_turn_grant_is_reported_as_turn_and_pinned_to_the_asking_turn() {
+        let (shared, broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+        let (request_id, _rx) =
+            broker.register_for_turn("chat-1", vec![approval_call("a")], Some("turn-9"));
+
+        dispatch_fields(
+            &shared,
+            "conn-1",
+            serde_json::json!({
+                "type": "tool_approval_response",
+                "chat_id": "chat-1",
+                "request_id": request_id,
+                "approved_ids": ["a"],
+                "grant": "turn",
+            }),
+        )
+        .await;
+
+        let _resolved = recv_json(&mut rx1);
+        let grants = recv_json(&mut rx1);
+        assert_eq!(grants["turn"], true);
+        assert_eq!(grants["session_all"], false);
+        assert!(broker.is_granted("chat-1", Some("turn-9"), "anything"));
+        assert!(!broker.is_granted("chat-1", Some("turn-10"), "anything"));
+    }
+
+    #[tokio::test]
+    async fn an_unknown_grant_name_answers_the_calls_only() {
+        let (shared, broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+        let (request_id, rx) = broker.register("chat-1", vec![approval_call("a")]);
+
+        dispatch_fields(
+            &shared,
+            "conn-1",
+            serde_json::json!({
+                "type": "tool_approval_response",
+                "chat_id": "chat-1",
+                "request_id": request_id,
+                "approved_ids": ["a"],
+                "grant": "forever",
+            }),
+        )
+        .await;
+
+        assert_eq!(rx.await.unwrap(), vec!["a".to_string()]);
+        assert!(!broker.is_granted("chat-1", None, "exec"));
+        assert_eq!(recv_json(&mut rx1)["event"], "tool_approval_resolved");
+        assert!(rx1.try_recv().is_err(), "no grants event without a grant");
+    }
+
+    #[tokio::test]
+    async fn denying_with_a_grant_attached_grants_nothing() {
+        let (shared, broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+        let (request_id, rx) = broker.register("chat-1", vec![approval_call("a")]);
+
+        dispatch_fields(
+            &shared,
+            "conn-1",
+            serde_json::json!({
+                "type": "tool_approval_response",
+                "chat_id": "chat-1",
+                "request_id": request_id,
+                "approved_ids": [],
+                "grant": "session",
+            }),
+        )
+        .await;
+
+        assert!(rx.await.unwrap().is_empty());
+        assert!(!broker.is_granted("chat-1", None, "exec"));
+        assert_eq!(recv_json(&mut rx1)["event"], "tool_approval_resolved");
+        assert!(rx1.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn revoking_forgets_the_chats_grants_and_tells_every_tab() {
+        let (shared, broker, mut rx1, mut rx2) = shared_with_two_tabs().await;
+        broker.add_grant("chat-1", ApprovalGrant::Session, None, vec![]);
+        broker.add_grant("chat-2", ApprovalGrant::Session, None, vec![]);
+
+        dispatch_fields(
+            &shared,
+            "conn-1",
+            serde_json::json!({"type": "revoke_tool_grants", "chat_id": "chat-1"}),
+        )
+        .await;
+
+        assert!(!broker.is_granted("chat-1", None, "exec"));
+        assert!(
+            broker.is_granted("chat-2", None, "exec"),
+            "other chats keep theirs"
+        );
+        for rx in [&mut rx1, &mut rx2] {
+            let grants = recv_json(rx);
+            assert_eq!(grants["event"], "tool_grants_updated");
+            assert_eq!(grants["session_all"], false);
+            assert_eq!(grants["tools"], serde_json::json!([]));
+            assert_eq!(grants["turn"], false);
+        }
+    }
+
+    #[tokio::test]
+    async fn revoking_with_nothing_granted_still_replies() {
+        let (shared, _broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+
+        dispatch_fields(
+            &shared,
+            "conn-1",
+            serde_json::json!({"type": "revoke_tool_grants", "chat_id": "chat-1"}),
+        )
+        .await;
+
+        assert_eq!(recv_json(&mut rx1)["event"], "tool_grants_updated");
+    }
+
+    #[tokio::test]
+    async fn attaching_replays_the_session_grants_but_not_a_turn_grant() {
+        let (shared, broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+        resend_tool_grants(&shared, "conn-1", "chat-1").await;
+        assert!(rx1.try_recv().is_err(), "nothing to replay");
+
+        broker.add_grant(
+            "chat-1",
+            ApprovalGrant::SessionTool,
+            None,
+            vec!["read_file".into()],
+        );
+        broker.add_grant("chat-1", ApprovalGrant::Turn, Some("t1"), vec![]);
+        resend_tool_grants(&shared, "conn-1", "chat-1").await;
+
+        let grants = recv_json(&mut rx1);
+        assert_eq!(grants["event"], "tool_grants_updated");
+        assert_eq!(grants["tools"], serde_json::json!(["read_file"]));
+        assert_eq!(
+            grants["turn"], false,
+            "nothing here knows if the turn still runs"
+        );
+    }
+
+    #[tokio::test]
+    async fn clearing_the_session_forgets_its_grants() {
+        let (shared, broker, mut rx1, _rx2) = shared_with_two_tabs().await;
+        broker.add_grant("chat-1", ApprovalGrant::Session, None, vec![]);
+
+        dispatch_clear_session(&shared, "conn-1", Some(serde_json::json!("chat-1"))).await;
+
+        assert!(!broker.is_granted("chat-1", None, "exec"));
+        let frames = drain_json(&mut rx1);
+        assert!(
+            frames
+                .iter()
+                .any(|frame| frame["event"] == "tool_grants_updated"),
+            "the tab must learn the grants are gone: {frames:?}"
+        );
     }
 
     #[tokio::test]

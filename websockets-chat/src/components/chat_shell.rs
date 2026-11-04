@@ -9,10 +9,13 @@ use leptos::prelude::*;
 use crate::components::{
     AskQuestionCard, ConfigSavedNotice, McpChangeRequest, McpPresetsPage, MessageList,
     SettingsActions, SettingsDialog, SettingsPanel, SubagentsPage, ToolApprovalCard,
+    ToolGrantsBanner,
 };
+use crate::protocol::ToolApprovalGrant;
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
 use crate::state::{
-    background_banner, ConfigFileView, ConnectionStatus, MainView, PendingApproval, PendingQuestion,
+    background_banner, ConfigFileView, ConnectionStatus, MainView, PendingApproval,
+    PendingQuestion, ToolGrants,
 };
 
 /// Small dot + label in the header showing the gateway WebSocket's current
@@ -113,6 +116,9 @@ pub fn ChatShell(
     #[prop(into)] pending_approval: Signal<Option<PendingApproval>>,
     on_toggle_approval_call: impl Fn(String) + 'static + Send + Sync + Copy,
     on_answer_approval: impl Fn(Vec<String>) + 'static + Send + Sync + Copy,
+    on_grant_approval: impl Fn(Vec<String>, ToolApprovalGrant) + 'static + Send + Sync + Copy,
+    #[prop(into)] tool_grants: Signal<ToolGrants>,
+    on_revoke_tool_grants: impl Fn() + 'static + Send + Sync + Copy,
     #[prop(into)] pending_question: Signal<Option<PendingQuestion>>,
     on_select_question_option: impl Fn(String) + 'static + Send + Sync + Copy,
     on_answer_question_free_text: impl Fn(String) + 'static + Send + Sync + Copy,
@@ -309,10 +315,15 @@ pub fn ChatShell(
                         hint=background_hint
                         on_stop=Callback::new(move |()| on_abort_turn())
                     />
+                    <ToolGrantsBanner
+                        grants=tool_grants
+                        on_revoke=Callback::new(move |()| on_revoke_tool_grants())
+                    />
                     <ToolApprovalCard
                         approval=pending_approval
                         on_toggle=Callback::new(move |id| on_toggle_approval_call(id))
                         on_answer=Callback::new(move |ids| on_answer_approval(ids))
+                        on_grant=Callback::new(move |(ids, grant)| on_grant_approval(ids, grant))
                     />
                     <AskQuestionCard
                         question=pending_question
