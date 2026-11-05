@@ -14,6 +14,7 @@
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use crate::channels::websocket::CHANNEL_NAME as CHANNEL_WEBSOCKET;
 use crate::channels::websocket::types::WebSocketConfig;
@@ -22,6 +23,9 @@ use crate::cli::command_specifications::{
     DOCKER_INSTANCE_DIR_NAME, OnboardDockerOptions,
 };
 use crate::cli::commands::CliError;
+use crate::cli::docker_runtime::{
+    ContainerHealth, DockerAvailability, DockerCli, DockerRuntime, same_directory,
+};
 use crate::cli::instance_layout::InstanceLayout;
 use crate::cli::onboard::{
     ExistingConfigChoice, WebUiSetup, build_new_instance_config, extract_provider_secrets,
@@ -198,6 +202,20 @@ pub fn run_docker_onboard(options: &OnboardDockerOptions) -> Result<(), CliError
         display_path(&settings.instance_dir)
     );
 
+    let runtime = DockerCli;
+    // Before any question: a name or port clash would otherwise surface after all the answers.
+    let docker_ready = if settings.start {
+        let readiness = preflight(&runtime, &settings).map_err(CliError::Other)?;
+        if let Err(reason) = &readiness {
+            print_onboard_warning(format!(
+                "{reason}. The files are written anyway; start the instance later."
+            ));
+        }
+        readiness.is_ok()
+    } else {
+        false
+    };
+
     let config = collect_instance_config(&settings)?;
     let written = write_docker_instance(&settings, config, linux_container_user())?;
     for warning in &written.warnings {
@@ -208,13 +226,201 @@ pub fn run_docker_onboard(options: &OnboardDockerOptions) -> Result<(), CliError
         display_path(&settings.instance_dir.join(COMPOSE_FILE_NAME))
     ));
     print_onboard_ok(format!(
-        "Wrote {} ({} secret(s))",
+        "Wrote {} ({})",
         display_path(&settings.instance_dir.join(ENV_FILE_NAME)),
-        written.secret_count
+        secrets_summary(written.secret_count)
     ));
     print_onboard_ok(format!("Wrote {}", display_path(&settings.config_path())));
-    print_docker_next_steps(&settings);
-    Ok(())
+
+    if !docker_ready {
+        print_docker_next_steps(&settings);
+        return Ok(());
+    }
+    println!();
+    println!("Starting the container...");
+    match start_instance(
+        &runtime,
+        &settings,
+        &HealthWait::default(),
+        std::thread::sleep,
+    ) {
+        StartOutcome::Healthy => {
+            print_onboard_ok(format!(
+                "rust-bot is running at {} (log in with the user you created)",
+                settings.web_ui_url()
+            ));
+            for line in docker_management_lines(&settings) {
+                println!("{line}");
+            }
+            Ok(())
+        }
+        StartOutcome::Failed { reason, logs } => {
+            if let Some(logs) = logs {
+                println!();
+                println!("Last lines of the container log:");
+                println!("{logs}");
+            }
+            println!(
+                "If the log points at the config, check it with: cd \"{}\" && docker compose run --rm rust-bot check-config",
+                display_path(&settings.instance_dir)
+            );
+            Err(CliError::Other(format!(
+                "The container did not start: {reason}"
+            )))
+        }
+    }
+}
+
+/// How the `.env.docker` line of the summary describes the secrets written by this run.
+fn secrets_summary(new_secret_count: usize) -> String {
+    match new_secret_count {
+        0 => "existing secrets kept".to_string(),
+        1 => "1 secret".to_string(),
+        count => format!("{count} secrets"),
+    }
+}
+
+/// Check, before any question is asked, whether the instance can be started.
+///
+/// `Ok(Ok(()))`: Docker is ready and nothing is in the way. `Ok(Err(reason))`: Docker cannot be
+/// used (not installed, not running, no Compose v2); the files can still be written.
+///
+/// # Errors
+///
+/// The container name or the host port is taken by something else; the user must choose
+/// another `--name` / `--port` first.
+pub fn preflight(
+    runtime: &impl DockerRuntime,
+    settings: &DockerInstanceSettings,
+) -> Result<Result<(), String>, String> {
+    match runtime.availability() {
+        DockerAvailability::Ready => {}
+        DockerAvailability::NoCli => {
+            return Ok(Err(
+                "Docker is not installed (no `docker` on the PATH)".to_string()
+            ));
+        }
+        DockerAvailability::DaemonDown(detail) => {
+            return Ok(Err(format!(
+                "Docker is installed but not running; start Docker Desktop or the Docker service ({detail})"
+            )));
+        }
+        DockerAvailability::NoComposeV2 => {
+            return Ok(Err(
+                "Docker Compose v2 (`docker compose`) is missing; install the compose plugin"
+                    .to_string(),
+            ));
+        }
+    }
+
+    let own_container_exists = match runtime.existing_container_project_dir(&settings.project_name)
+    {
+        None => false,
+        Some(Some(project_dir)) if same_directory(&project_dir, &settings.instance_dir) => true,
+        Some(Some(project_dir)) => {
+            return Err(format!(
+                "A container named {:?} already belongs to {}; choose another name with --name",
+                settings.project_name,
+                project_dir.display()
+            ));
+        }
+        Some(None) => {
+            return Err(format!(
+                "A container named {:?} already exists (not created by Docker Compose); choose another name with --name",
+                settings.project_name
+            ));
+        }
+    };
+    // This instance's own running container holds the port; `up -d` recreates it.
+    if !own_container_exists && !runtime.host_port_free(settings.host_port) {
+        return Err(format!(
+            "Port {} on 127.0.0.1 is already in use; choose another with --port",
+            settings.host_port
+        ));
+    }
+    Ok(Ok(()))
+}
+
+/// How long [`start_instance`] waits for the container to become healthy.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HealthWait {
+    /// Pause between two checks.
+    pub interval: Duration,
+    /// Number of checks before giving up.
+    pub attempts: u32,
+}
+
+impl Default for HealthWait {
+    /// Every 2 s for up to 120 s: the image's healthcheck has a 20 s start period, and the
+    /// entrypoint runs `check-config` first.
+    fn default() -> Self {
+        Self {
+            interval: Duration::from_secs(2),
+            attempts: 60,
+        }
+    }
+}
+
+/// Number of log lines shown when the container fails to start.
+const FAILURE_LOG_LINES: usize = 50;
+
+/// Result of [`start_instance`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StartOutcome {
+    /// The container runs and its healthcheck passes (or it has none).
+    Healthy,
+    /// It did not come up; `logs` holds the tail of its log when it got as far as starting.
+    Failed {
+        reason: String,
+        logs: Option<String>,
+    },
+}
+
+/// Pull (or build) the image, `docker compose up -d`, and wait until the container is healthy.
+///
+/// `sleep` is called between health checks (`std::thread::sleep`; a no-op in tests).
+pub fn start_instance(
+    runtime: &impl DockerRuntime,
+    settings: &DockerInstanceSettings,
+    wait: &HealthWait,
+    sleep: impl Fn(Duration),
+) -> StartOutcome {
+    let instance_dir = &settings.instance_dir;
+    let fetched = match settings.image {
+        ImageSource::Pull(_) => runtime.pull(instance_dir),
+        ImageSource::Build(_) => runtime.build(instance_dir),
+    };
+    if let Err(reason) = fetched {
+        return StartOutcome::Failed { reason, logs: None };
+    }
+    let failed = |reason: String| StartOutcome::Failed {
+        reason,
+        logs: Some(runtime.logs_tail(instance_dir, FAILURE_LOG_LINES)),
+    };
+    if let Err(reason) = runtime.up(instance_dir) {
+        return failed(reason);
+    }
+    for attempt in 0..wait.attempts {
+        if attempt > 0 {
+            sleep(wait.interval);
+        }
+        match runtime.health(&settings.project_name) {
+            ContainerHealth::Healthy | ContainerHealth::RunningWithoutHealthcheck => {
+                return StartOutcome::Healthy;
+            }
+            ContainerHealth::Unhealthy => return failed("its healthcheck fails".to_string()),
+            ContainerHealth::Restarting => {
+                return failed("it exited and is being restarted".to_string());
+            }
+            ContainerHealth::NotRunning(status) => {
+                return failed(format!("it is not running ({status})"));
+            }
+            // Just after `up`, inspect can briefly fail; keep waiting.
+            ContainerHealth::Starting | ContainerHealth::Unknown(_) => {}
+        }
+    }
+    let waited = wait.interval * wait.attempts.saturating_sub(1);
+    failed(format!("it was not healthy after {} s", waited.as_secs()))
 }
 
 /// Ask the onboard questions for a new instance, or offer overwrite/refresh for an existing one.
@@ -493,7 +699,9 @@ pub fn render_compose_file(
         ),
         None => String::new(),
     };
+    // A Windows checkout (core.autocrlf) may have given the embedded template CRLF endings.
     COMPOSE_TEMPLATE
+        .replace("\r\n", "\n")
         .replace("{{PROJECT_NAME}}", &settings.project_name)
         .replace("{{IMAGE_SOURCE}}", &image_source)
         .replace("{{USER_LINE}}", &user_line)
@@ -529,13 +737,13 @@ fn print_docker_next_steps(settings: &DockerInstanceSettings) {
     }
 }
 
-/// Lines of [`print_docker_next_steps`].
+/// Lines of [`print_docker_next_steps`]: how to start the instance by hand.
 fn docker_next_steps_lines(settings: &DockerInstanceSettings) -> Vec<String> {
     let up = match settings.image {
         ImageSource::Pull(_) => "docker compose up -d",
         ImageSource::Build(_) => "docker compose up -d --build",
     };
-    vec![
+    let mut lines = vec![
         String::new(),
         "Next steps:".to_string(),
         format!("  cd \"{}\"", display_path(&settings.instance_dir)),
@@ -544,8 +752,17 @@ fn docker_next_steps_lines(settings: &DockerInstanceSettings) -> Vec<String> {
             "  Open {} and log in with the user you just created",
             settings.web_ui_url()
         ),
-        "  Logs: docker compose logs -f    Stop: docker compose down".to_string(),
-    ]
+    ];
+    lines.extend(docker_management_lines(settings));
+    lines
+}
+
+/// How to follow the logs of, and stop, a running instance.
+fn docker_management_lines(settings: &DockerInstanceSettings) -> Vec<String> {
+    vec![format!(
+        "  In {}: docker compose logs -f (logs), docker compose down (stop)",
+        display_path(&settings.instance_dir)
+    )]
 }
 
 #[cfg(test)]
@@ -673,6 +890,7 @@ mod tests {
         assert!(compose.contains("RUST_LOG: ${RUST_LOG:-info}"));
         assert!(!compose.contains("user:"));
         assert!(!compose.contains("build:"));
+        assert!(!compose.contains('\r'), "LF line endings only");
     }
 
     #[test]
@@ -812,6 +1030,275 @@ mod tests {
         assert!(env.contains("OPENROUTER_API_KEY=sk-or-secret\n"), "{env}");
         let saved = std::fs::read_to_string(settings.config_path()).unwrap();
         assert!(saved.contains("${OPENROUTER_API_KEY}"));
+    }
+
+    /// Scripted [`DockerRuntime`]: every answer is set up front; the calls made are recorded.
+    struct FakeDocker {
+        availability: DockerAvailability,
+        port_free: bool,
+        existing_container: Option<Option<PathBuf>>,
+        pull_result: Result<(), String>,
+        up_result: Result<(), String>,
+        /// Returned by successive `health` calls; the last one repeats.
+        health_sequence: Vec<ContainerHealth>,
+        calls: std::cell::RefCell<Vec<String>>,
+        health_calls: std::cell::Cell<usize>,
+    }
+
+    impl FakeDocker {
+        /// Docker is ready, nothing is in the way, and the container becomes healthy.
+        fn ready() -> Self {
+            Self {
+                availability: DockerAvailability::Ready,
+                port_free: true,
+                existing_container: None,
+                pull_result: Ok(()),
+                up_result: Ok(()),
+                health_sequence: vec![ContainerHealth::Starting, ContainerHealth::Healthy],
+                calls: std::cell::RefCell::new(Vec::new()),
+                health_calls: std::cell::Cell::new(0),
+            }
+        }
+
+        fn calls(&self) -> Vec<String> {
+            self.calls.borrow().clone()
+        }
+
+        fn record(&self, call: &str) {
+            self.calls.borrow_mut().push(call.to_string());
+        }
+    }
+
+    impl DockerRuntime for FakeDocker {
+        fn availability(&self) -> DockerAvailability {
+            self.availability.clone()
+        }
+        fn host_port_free(&self, _port: u16) -> bool {
+            self.port_free
+        }
+        fn existing_container_project_dir(&self, _name: &str) -> Option<Option<PathBuf>> {
+            self.existing_container.clone()
+        }
+        fn pull(&self, _dir: &Path) -> Result<(), String> {
+            self.record("pull");
+            self.pull_result.clone()
+        }
+        fn build(&self, _dir: &Path) -> Result<(), String> {
+            self.record("build");
+            Ok(())
+        }
+        fn up(&self, _dir: &Path) -> Result<(), String> {
+            self.record("up");
+            self.up_result.clone()
+        }
+        fn health(&self, _name: &str) -> ContainerHealth {
+            let index = self.health_calls.get();
+            self.health_calls.set(index + 1);
+            let last = self.health_sequence.len() - 1;
+            self.health_sequence[index.min(last)].clone()
+        }
+        fn logs_tail(&self, _dir: &Path, _lines: usize) -> String {
+            "[FATAL tini (7)] exec failed".to_string()
+        }
+    }
+
+    /// Few, instant health checks for the tests.
+    const QUICK_WAIT: HealthWait = HealthWait {
+        interval: Duration::from_secs(2),
+        attempts: 5,
+    };
+
+    fn no_sleep(_: Duration) {}
+
+    #[test]
+    fn preflight_passes_when_docker_is_ready_and_nothing_is_in_the_way() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        assert_eq!(preflight(&FakeDocker::ready(), &settings), Ok(Ok(())));
+    }
+
+    #[test]
+    fn preflight_reports_unusable_docker_without_failing() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        for (availability, expected) in [
+            (DockerAvailability::NoCli, "not installed"),
+            (
+                DockerAvailability::DaemonDown("pipe not found".to_string()),
+                "not running",
+            ),
+            (DockerAvailability::NoComposeV2, "Compose v2"),
+        ] {
+            let docker = FakeDocker {
+                availability,
+                ..FakeDocker::ready()
+            };
+            let reason = preflight(&docker, &settings).unwrap().unwrap_err();
+            assert!(reason.contains(expected), "{reason}");
+        }
+    }
+
+    #[test]
+    fn preflight_rejects_a_name_used_by_another_instance() {
+        let settings = settings_in(Path::new("/srv/bot-1"));
+        let docker = FakeDocker {
+            existing_container: Some(Some(PathBuf::from("/srv/bot-2"))),
+            ..FakeDocker::ready()
+        };
+        let error = preflight(&docker, &settings).unwrap_err();
+        assert!(
+            error.contains("--name") && error.contains("bot-2"),
+            "{error}"
+        );
+
+        let not_compose = FakeDocker {
+            existing_container: Some(None),
+            ..FakeDocker::ready()
+        };
+        assert!(preflight(&not_compose, &settings).is_err());
+    }
+
+    #[test]
+    fn preflight_rejects_a_busy_port_unless_this_instance_holds_it() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let busy = FakeDocker {
+            port_free: false,
+            ..FakeDocker::ready()
+        };
+        let error = preflight(&busy, &settings).unwrap_err();
+        assert!(error.contains("--port"), "{error}");
+
+        let busy_by_itself = FakeDocker {
+            port_free: false,
+            existing_container: Some(Some(PathBuf::from("/srv/bot/"))),
+            ..FakeDocker::ready()
+        };
+        assert_eq!(preflight(&busy_by_itself, &settings), Ok(Ok(())));
+    }
+
+    #[test]
+    fn start_pulls_starts_and_waits_until_healthy() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let docker = FakeDocker::ready();
+        let outcome = start_instance(&docker, &settings, &QUICK_WAIT, no_sleep);
+        assert_eq!(outcome, StartOutcome::Healthy);
+        assert_eq!(docker.calls(), ["pull", "up"]);
+        assert_eq!(docker.health_calls.get(), 2);
+    }
+
+    #[test]
+    fn start_builds_instead_of_pulling_with_build() {
+        let mut settings = settings_in(Path::new("/srv/bot"));
+        settings.image = ImageSource::Build(PathBuf::from("/src/rust-bot"));
+        let docker = FakeDocker::ready();
+        start_instance(&docker, &settings, &QUICK_WAIT, no_sleep);
+        assert_eq!(docker.calls(), ["build", "up"]);
+    }
+
+    #[test]
+    fn start_accepts_an_image_without_healthcheck() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let docker = FakeDocker {
+            health_sequence: vec![ContainerHealth::RunningWithoutHealthcheck],
+            ..FakeDocker::ready()
+        };
+        assert_eq!(
+            start_instance(&docker, &settings, &QUICK_WAIT, no_sleep),
+            StartOutcome::Healthy
+        );
+    }
+
+    #[test]
+    fn a_failed_pull_stops_before_up_and_has_no_logs() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let docker = FakeDocker {
+            pull_result: Err("manifest unknown".to_string()),
+            ..FakeDocker::ready()
+        };
+        let outcome = start_instance(&docker, &settings, &QUICK_WAIT, no_sleep);
+        assert_eq!(
+            outcome,
+            StartOutcome::Failed {
+                reason: "manifest unknown".to_string(),
+                logs: None
+            }
+        );
+        assert_eq!(docker.calls(), ["pull"]);
+    }
+
+    #[test]
+    fn a_failed_up_reports_the_logs() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let docker = FakeDocker {
+            up_result: Err("port is already allocated".to_string()),
+            ..FakeDocker::ready()
+        };
+        let StartOutcome::Failed { reason, logs } =
+            start_instance(&docker, &settings, &QUICK_WAIT, no_sleep)
+        else {
+            panic!("expected a failure");
+        };
+        assert!(reason.contains("already allocated"));
+        assert!(logs.is_some());
+    }
+
+    #[test]
+    fn a_crash_loop_fails_at_once_with_the_logs() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let docker = FakeDocker {
+            health_sequence: vec![ContainerHealth::Starting, ContainerHealth::Restarting],
+            ..FakeDocker::ready()
+        };
+        let StartOutcome::Failed { reason, logs } =
+            start_instance(&docker, &settings, &QUICK_WAIT, no_sleep)
+        else {
+            panic!("expected a failure");
+        };
+        assert!(reason.contains("restarted"), "{reason}");
+        assert!(logs.unwrap().contains("tini"));
+        assert_eq!(docker.health_calls.get(), 2, "no waiting after a crash");
+    }
+
+    #[test]
+    fn an_unhealthy_or_stopped_container_fails() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        for health in [
+            ContainerHealth::Unhealthy,
+            ContainerHealth::NotRunning("exited".to_string()),
+        ] {
+            let docker = FakeDocker {
+                health_sequence: vec![health],
+                ..FakeDocker::ready()
+            };
+            assert!(matches!(
+                start_instance(&docker, &settings, &QUICK_WAIT, no_sleep),
+                StartOutcome::Failed { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn waiting_gives_up_after_the_last_attempt() {
+        let settings = settings_in(Path::new("/srv/bot"));
+        let docker = FakeDocker {
+            health_sequence: vec![ContainerHealth::Starting],
+            ..FakeDocker::ready()
+        };
+        let slept = std::cell::Cell::new(0);
+        let outcome = start_instance(&docker, &settings, &QUICK_WAIT, |_| {
+            slept.set(slept.get() + 1)
+        });
+        let StartOutcome::Failed { reason, .. } = outcome else {
+            panic!("expected a timeout");
+        };
+        assert!(reason.contains("not healthy after 8 s"), "{reason}");
+        assert_eq!(docker.health_calls.get(), 5);
+        assert_eq!(slept.get(), 4);
+    }
+
+    #[test]
+    fn secrets_summary_says_when_nothing_new_was_written() {
+        assert_eq!(secrets_summary(0), "existing secrets kept");
+        assert_eq!(secrets_summary(1), "1 secret");
+        assert_eq!(secrets_summary(3), "3 secrets");
     }
 
     #[test]

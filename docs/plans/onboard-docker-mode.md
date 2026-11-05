@@ -23,8 +23,8 @@ All milestones are on one branch, `feature/docker-onboard`.
 |---|---|
 | M1. Publish the image | committed (`ba484ea`, `.github/workflows/docker-publish.yml`); `gilf/rust-bot:latest` already on Docker Hub (amd64 + arm64, pushed by Gil) |
 | M2. Onboard refactor (no behaviour change) | built 2026-11-05, uncommitted; all lib tests pass; manual interactive `onboard` check pending |
-| M3. `onboard --mode docker`: generate files | built 2026-11-05, uncommitted; all lib tests pass; interactive run pending. Until M4, it always prints the manual `docker compose up -d` steps |
-| M4. `onboard --mode docker`: start the container | not started |
+| M3. `onboard --mode docker`: generate files | built 2026-11-05, uncommitted; all lib tests pass; verified end to end on Windows with `gilf/rust-bot:0.4.5` (healthy, chat works, web UI settings save keeps `${VAR}` placeholders). Until M4, it always prints the manual `docker compose up -d` steps |
+| M4. `onboard --mode docker`: start the container | built 2026-11-05, uncommitted (`src/cli/docker_runtime.rs` + start flow in `onboard_docker.rs`); all lib tests pass; checked against real Docker Desktop: name clash, busy port, healthy start, crash loop (broken 0.4.4 image) |
 | M5. Docs and smoke tests | not started |
 
 M1 is independent of M2–M4. M3 builds on M2, and M4 on M3. Commit only when asked.
@@ -76,6 +76,14 @@ M1 is independent of M2–M4. M3 builds on M2, and M4 on M3. Commit only when as
 - **Overwrite on an existing Docker instance** asks every question again and **replaces the keypair**
   (`WebUiOptions::replace_existing_keys`). Users already in `users.json` are kept; the new user is added or
   updated. Refresh changes only what the container needs, and prints a note for every value it had to reset.
+- **The Docker checks run before the questions** (M4): a container name owned by another instance folder
+  (compose `working_dir` label) or a busy host port stops the run with a hint (`--name` / `--port`) before any
+  prompt. Docker being unusable (no CLI, daemon down, no Compose v2) only warns; the files are written and the
+  manual steps printed.
+- **A `restarting` container counts as crashed** and fails at once with the log tail, instead of waiting out the
+  120 s health timeout.
+- **The compose template's line endings are normalised to LF** when rendering, and `.gitattributes` keeps
+  `docker/*.yml` LF (a Windows checkout with `core.autocrlf` had made it CRLF).
 - Docker flags are `Option`s with the defaults applied in `resolve_docker_settings`, so `validate_onboard_args` can
   tell "given" from "default" without `ArgMatches`.
 - The instance folder gets a `.gitignore` ignoring everything, as `onboard --mode local` does. `.env.docker` and

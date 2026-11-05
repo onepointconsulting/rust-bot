@@ -863,6 +863,25 @@ pub fn config_model(
     let model = agents.model.clone();
     let selected_provider = agents.provider.as_str();
     let custom = &providers.custom;
+    let mut provider_map = HashMap::new();
+    provider_map.insert(
+        PROVIDER_TOGETHER,
+        (
+            "zai-org/GLM-5.3-Flash",
+            "e.g. deepseek-ai/DeepSeek-V4.1-Flash-1017",
+        ),
+    );
+    provider_map.insert(
+        PROVIDER_OPENAI,
+        ("gpt-6.1-terra", "e.g. gpt-6.1-sol, gpt-6-astra"),
+    );
+    provider_map.insert(
+        PROVIDER_ANTHROPIC,
+        (
+            "claude-haiku-5-5",
+            "e.g. claude-haiku-5-5, claude-sonnet-5-5",
+        ),
+    );
     let (default_model, help_message) = if let Some(api_base) = &custom.api_base
         && (api_base.contains("z.ai") || api_base.contains("xiaomi"))
     {
@@ -871,18 +890,14 @@ pub fn config_model(
         } else {
             ("mimo-v2.6-pro", "e.g. mimo-v2.6, mimo-v2.6-flash")
         }
-    } else if selected_provider == PROVIDER_TOGETHER {
-        (
-            "zai-org/GLM-5.3-Flash",
-            "e.g. deepseek-ai/DeepSeek-V4.1-Flash-1017",
-        )
-    } else if selected_provider == PROVIDER_OPENAI {
-        ("gpt-6.1-terra", "e.g. gpt-6.1-sol, gpt-6-astra")
     } else {
-        (
-            model.as_str(),
-            "e.g. anthropic/claude-opus-5 or openai/gpt-5.6",
-        )
+        provider_map
+            .get(selected_provider)
+            .unwrap_or(&(
+                model.as_str(),
+                "e.g. anthropic/claude-opus-5 or openai/gpt-5.6",
+            ))
+            .clone()
     };
     agents.model = Text::new("Model")
         .with_default(default_model)
