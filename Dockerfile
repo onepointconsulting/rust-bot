@@ -45,7 +45,9 @@ RUN useradd --create-home --uid 1000 rustbot \
 
 COPY --from=build /usr/local/bin/rust-bot /usr/local/bin/rust-bot
 COPY docker/config.template.json /usr/share/rust-bot/config.template.json
-COPY docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
+# --chmod: the executable bit is lost when the repository is checked out on Windows, and
+# without it tini fails with "Permission denied" (exit 126).
+COPY --chmod=0755 docker/entrypoint.sh /usr/local/bin/docker-entrypoint.sh
 
 # One volume holds the config and all runtime state (sessions, cron, logs, workspace).
 ENV RUST_BOT_CONFIG=/data/config.json \

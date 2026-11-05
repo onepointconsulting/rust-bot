@@ -43,6 +43,7 @@ use crate::cli::background_banner::{
 };
 use crate::cli::cancel::wait_for_escape_cancel;
 use crate::cli::confirm_tools::WebsocketsAskHook;
+use crate::cli::instance_layout::InstanceLayout;
 use crate::cli::onboard::run_onboard;
 use crate::cli::wizard::resolve_onboard_config_path;
 use crate::command::types::DREAM_JOB_NAME;
@@ -54,7 +55,7 @@ use crate::cron::compute_next_run;
 use crate::cron::service::now_ms;
 use crate::heartbeat::service::HeartbeatService;
 use crate::integrations::herdr::HerdrReporter;
-use crate::security::jwt::{JwtError, generate_jwt_keypair, generate_jwt_token};
+use crate::security::jwt::{GeneratedKeypair, JwtError, generate_jwt_keypair, generate_jwt_token};
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::history_visibility::is_hidden_history_message;
 use crate::session::keys::COMMAND_KEY;
@@ -140,7 +141,7 @@ pub(crate) fn resolve_onboard_targets(
 ) -> Result<OnboardTargets, String> {
     let config_path = match (mode, config) {
         (Some(mode), _) => mode
-            .instance_dir(current_dir, home_dir)?
+            .config_dir(current_dir, home_dir)?
             .join(CONFIG_FILE_NAME),
         (None, Some(config)) => config,
         (None, None) => default_config_path(),
@@ -369,7 +370,8 @@ fn run_generate_keypair(args: GenerateJwtKeypairArgs) -> Result<(), CliError> {
     let credentials_dir = args
         .credentials_dir
         .unwrap_or_else(|| default_credentials_dir(&args.config));
-    run_generate_keypair_with_config(&mut config, credentials_dir, args.force)?;
+    let layout = InstanceLayout::native(credentials_dir.clone());
+    run_generate_keypair_with_config(&mut config, &layout, credentials_dir, args.force)?;
 
     save_config(&config, Some(args.config.clone()))?;
 
@@ -377,22 +379,36 @@ fn run_generate_keypair(args: GenerateJwtKeypairArgs) -> Result<(), CliError> {
     Ok(())
 }
 
+/// Generate an Ed25519 keypair in `credentials_dir` (a directory on this machine) and record
+/// both key paths in `config.api.jwt`, mapped through `layout` (host paths for an ordinary
+/// instance, `/data/...` for a Docker instance).
+///
+/// Returns the host paths that were written; callers that sign with the key right away (such
+/// as creating the first web UI user) must use these, not the recorded config paths.
 pub fn run_generate_keypair_with_config(
     config: &mut Config,
+    layout: &InstanceLayout,
     credentials_dir: PathBuf,
     force: bool,
-) -> Result<(), CliError> {
+) -> Result<GeneratedKeypair, CliError> {
     let keys = generate_jwt_keypair(credentials_dir, force)?;
 
-    let private_key_path = path_for_config(keys.private_key_path);
-    let public_key_path = path_for_config(keys.public_key_path);
+    config.api.jwt.private_key_path = layout
+        .config_path_for_written(keys.private_key_path.clone())
+        .map_err(CliError::Other)?;
+    config.api.jwt.public_key_path = layout
+        .config_path_for_written(keys.public_key_path.clone())
+        .map_err(CliError::Other)?;
 
-    config.api.jwt.private_key_path = private_key_path.display().to_string();
-    config.api.jwt.public_key_path = public_key_path.display().to_string();
-
-    eprintln!("Wrote private key: {}", private_key_path.display());
-    eprintln!("Wrote public key:  {}", public_key_path.display());
-    Ok(())
+    eprintln!(
+        "Wrote private key: {}",
+        path_for_config(keys.private_key_path.clone()).display()
+    );
+    eprintln!(
+        "Wrote public key:  {}",
+        path_for_config(keys.public_key_path.clone()).display()
+    );
+    Ok(keys)
 }
 
 /// Resolves the `aud` claim for a minted token.

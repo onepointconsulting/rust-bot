@@ -594,6 +594,22 @@ impl ProvidersConfig {
             _ => None,
         }
     }
+
+    /// Every provider slot with its config key (`"openrouter"`, `"azureOpenai"`, ...), mutably.
+    ///
+    /// Keys are the camelCase names under `providers` in `config.json`.
+    pub fn named_slots_mut(&mut self) -> [(&'static str, &mut ProviderConfig); 8] {
+        [
+            ("custom", &mut self.custom),
+            ("azureOpenai", &mut self.azure_openai),
+            ("anthropic", &mut self.anthropic),
+            ("openai", &mut self.openai),
+            ("openrouter", &mut self.openrouter),
+            ("gemini", &mut self.gemini),
+            ("groq", &mut self.groq),
+            ("together", &mut self.together),
+        ]
+    }
 }
 
 // ── HeartbeatConfig ───────────────────────────────────────────────────────────
@@ -1937,47 +1953,60 @@ impl Config {
     /// on a freshly created config keeps those files next to the config file instead.
     /// Paths a user has already changed are left untouched.
     pub fn rebase_default_paths(&mut self, instance_dir: &Path) {
-        fn rebase(value: &mut String, built_in_default: String, new_location: PathBuf) {
+        self.rebase_default_paths_with(|relative_parts| {
+            relative_parts
+                .iter()
+                .fold(instance_dir.to_path_buf(), |path, part| path.join(part))
+                .display()
+                .to_string()
+        });
+    }
+
+    /// Like [`Self::rebase_default_paths`], but `location_of` decides the recorded value of each
+    /// instance file, given its parts relative to the instance root (e.g.
+    /// `["credentials", "private_key.pem"]`). A Docker instance uses this to record
+    /// container paths (`/data/...`) instead of host paths.
+    pub fn rebase_default_paths_with(&mut self, location_of: impl Fn(&[&str]) -> String) {
+        let rebase = |value: &mut String, built_in_default: String, relative_parts: &[&str]| {
             if *value == built_in_default {
-                *value = new_location.display().to_string();
+                *value = location_of(relative_parts);
             }
-        }
-        let credentials_dir = instance_dir.join("credentials");
+        };
 
         rebase(
             &mut self.agents.workspace,
             default_agent_workspace(),
-            instance_dir.join("workspace"),
+            &["workspace"],
         );
         rebase(
             &mut self.api.jwt.private_key_path,
             default_jwt_private_key_path(),
-            credentials_dir.join("private_key.pem"),
+            &["credentials", "private_key.pem"],
         );
         rebase(
             &mut self.api.jwt.public_key_path,
             default_jwt_public_key_path(),
-            credentials_dir.join("public_key.pem"),
+            &["credentials", "public_key.pem"],
         );
         rebase(
             &mut self.api.users_file,
             default_users_file(),
-            instance_dir.join("users.json"),
+            &["users.json"],
         );
         rebase(
             &mut self.tools.mcp_presets_path,
             default_mcp_presets_path(),
-            instance_dir.join("mcp_presets.json"),
+            &["mcp_presets.json"],
         );
         rebase(
             &mut self.tools.gmail.client_secret_path,
             default_gmail_client_secret_path(),
-            credentials_dir.join("client_secret.json"),
+            &["credentials", "client_secret.json"],
         );
         rebase(
             &mut self.tools.gmail.token_cache_path,
             default_gmail_token_cache_path(),
-            credentials_dir.join("token_cache.json"),
+            &["credentials", "token_cache.json"],
         );
     }
 
@@ -3845,6 +3874,52 @@ mod tests {
             config.tools.gmail.token_cache_path,
             credentials.join("token_cache.json").display().to_string()
         );
+    }
+
+    #[test]
+    fn rebase_default_paths_with_records_whatever_location_of_returns() {
+        let mut config = Config::default();
+        config.rebase_default_paths_with(|parts| format!("/data/{}", parts.join("/")));
+
+        assert_eq!(config.agents.workspace, "/data/workspace");
+        assert_eq!(
+            config.api.jwt.private_key_path,
+            "/data/credentials/private_key.pem"
+        );
+        assert_eq!(config.api.users_file, "/data/users.json");
+        assert_eq!(config.tools.mcp_presets_path, "/data/mcp_presets.json");
+        assert_eq!(
+            config.tools.gmail.token_cache_path,
+            "/data/credentials/token_cache.json"
+        );
+    }
+
+    #[test]
+    fn named_slots_cover_every_provider_field() {
+        let mut providers = ProvidersConfig::default();
+        for (index, (_, slot)) in providers.named_slots_mut().into_iter().enumerate() {
+            slot.api_key = format!("key-{index}");
+        }
+        let serialized = serde_json::to_value(&providers).unwrap();
+        let object = serialized.as_object().unwrap();
+        let mut names: Vec<&'static str> = providers
+            .named_slots_mut()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        names.sort_unstable();
+        let mut serialized_names: Vec<&str> = object.keys().map(String::as_str).collect();
+        serialized_names.sort_unstable();
+        assert_eq!(
+            names, serialized_names,
+            "a provider field is missing from named_slots_mut"
+        );
+        for (name, value) in object {
+            assert!(
+                value["apiKey"].as_str().unwrap().starts_with("key-"),
+                "{name} was not reached through named_slots_mut"
+            );
+        }
     }
 
     #[test]

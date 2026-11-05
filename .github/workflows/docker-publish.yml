@@ -117,6 +117,14 @@ jobs:
           cache-from: type=gha,scope=docker-${{ matrix.arch }}
           cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
 
+      # Runs through the entrypoint, so a broken entrypoint (not executable, CRLF line endings)
+      # fails here instead of in a user's restart loop.
+      - name: Smoke test the pushed image
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: docker run --rm "${IMAGE_NAME}@${DIGEST}" --version
+
       - name: Export digest
         shell: bash
         env:

@@ -1,5 +1,5 @@
 use std::collections::HashMap;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anstyle::Style;
 use inquire::validator::Validation;
@@ -8,7 +8,8 @@ use inquire::{Confirm, CustomType, Password, Select, Text};
 use crate::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_password};
 use crate::channels::websocket::CHANNEL_NAME as CHANNEL_WEBSOCKET;
 use crate::channels::websocket::types::WebSocketConfig;
-use crate::cli::commands::{path_for_config, run_generate_keypair_with_config};
+use crate::cli::commands::run_generate_keypair_with_config;
+use crate::cli::instance_layout::InstanceLayout;
 use crate::cli::onboard::create_env_file;
 use crate::config::schema::ProvidersConfig;
 use crate::providers::anthropic_provider::AnthropicProvider;
@@ -129,7 +130,10 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
                 choose_providers(&mut config, true)?;
             }
             CHAT_CHANNELS => {
-                configure_channels_menu(&mut config, config_path.clone())?;
+                configure_channels_menu(
+                    &mut config,
+                    &InstanceLayout::for_config_file(&config_path),
+                )?;
             }
             AGENT_SETTINGS => {
                 configure_agent_settings(&mut config)?;
@@ -359,14 +363,17 @@ pub fn apply_workspace_override(mut config: Config, workspace: PathBuf) -> Confi
     config
 }
 
-fn configure_channels_menu(config: &mut Config, config_path: PathBuf) -> Result<Config, CliError> {
+fn configure_channels_menu(
+    config: &mut Config,
+    layout: &InstanceLayout,
+) -> Result<Config, CliError> {
     let selected = Select::new("Channels menu", CHANNELS_MENU.to_vec()).prompt()?;
     match selected {
         CHANNEL_OPTIONS_CHOICE => {
             configure_channels_options(&mut config.channels)?;
         }
         CHANNELS => {
-            configure_chat_channels(config, config_path)?;
+            configure_chat_channels(config, layout)?;
         }
         _ => return Ok(config.clone()),
     }
@@ -439,7 +446,10 @@ fn configure_channels_options(channels: &mut ChannelsConfig) -> Result<(), CliEr
     Ok(())
 }
 
-fn configure_chat_channels(config: &mut Config, config_path: PathBuf) -> Result<Config, CliError> {
+fn configure_chat_channels(
+    config: &mut Config,
+    layout: &InstanceLayout,
+) -> Result<Config, CliError> {
     let channel =
         Select::new("Select a channel to configure", AVAILABLE_CHANNELS.to_vec()).prompt()?;
     match channel {
@@ -447,7 +457,7 @@ fn configure_chat_channels(config: &mut Config, config_path: PathBuf) -> Result<
             configure_mail_channel(config)?;
         }
         CHANNEL_WEBSOCKET => {
-            configure_websocket_channel(config, config_path, false)?;
+            configure_websocket_channel(config, layout, &WebUiOptions::interactive(false))?;
         }
         _ => return Ok(config.clone()),
     }
@@ -526,10 +536,44 @@ fn configure_mail_channel(config: &mut Config) -> Result<Config, CliError> {
     Ok(config.clone())
 }
 
+/// Which web UI answers [`configure_websocket_channel`] takes from the caller instead of asking.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WebUiOptions {
+    /// Bind address for the gateway and the WebSocket channel; `None` asks (default `127.0.0.1`).
+    pub fixed_bind_host: Option<String>,
+    /// Port the gateway listens on; `None` asks.
+    pub fixed_port: Option<u16>,
+    /// `true` enables JWT without asking; `false` asks, with [`Self::jwt_default`] preselected.
+    pub force_jwt: bool,
+    /// Preselected answer of the "Enable JWT authentication?" question.
+    pub jwt_default: bool,
+    /// `true` requires login without asking (no guest use); `false` asks.
+    pub force_login: bool,
+    /// `true` replaces an existing keypair in the instance's `credentials/`; `false` refuses to.
+    pub replace_existing_keys: bool,
+}
+
+impl WebUiOptions {
+    /// Ask every question, preselecting `jwt_default` for JWT (as `onboard` and the wizard do).
+    pub fn interactive(jwt_default: bool) -> Self {
+        Self {
+            fixed_bind_host: None,
+            fixed_port: None,
+            force_jwt: false,
+            jwt_default,
+            force_login: false,
+            replace_existing_keys: false,
+        }
+    }
+}
+
+/// Add the `websocket` channel (the gateway web UI) to `config`, asking only what `options`
+/// leaves open. With JWT on, a keypair and the first web UI user are created in the instance
+/// folder described by `layout`.
 pub fn configure_websocket_channel(
     config: &mut Config,
-    config_path: PathBuf,
-    jwt_default: bool,
+    layout: &InstanceLayout,
+    options: &WebUiOptions,
 ) -> Result<Config, CliError> {
     let mut websocket = WebSocketConfig::default();
     websocket.streaming = Confirm::new("Enable streaming?")
@@ -540,46 +584,59 @@ pub fn configure_websocket_channel(
     if websocket.streaming {
         config.channels.streaming = true;
     }
-    let websocket_host = Text::new("Enter WebSocket host")
-        .with_default("127.0.0.1")
-        .with_help_message("127.0.0.1")
-        .prompt()?;
+    let websocket_host = match &options.fixed_bind_host {
+        Some(host) => host.clone(),
+        None => Text::new("Enter WebSocket host")
+            .with_default("127.0.0.1")
+            .with_help_message("127.0.0.1")
+            .prompt()?,
+    };
     websocket.host = websocket_host.clone();
     config.gateway.host = websocket_host;
-    config.gateway.port = CustomType::<u16>::new("Enter WebSocket port")
-        .with_default(config.gateway.port)
-        .with_help_message("The port the gateway will listen on")
-        .prompt()?;
+    config.gateway.port = match options.fixed_port {
+        Some(port) => port,
+        None => CustomType::<u16>::new("Enter WebSocket port")
+            .with_default(config.gateway.port)
+            .with_help_message("The port the gateway will listen on")
+            .prompt()?,
+    };
     websocket.port = config.gateway.port;
-    let enable_jwt = Confirm::new("Enable JWT authentication?")
-        .with_default(jwt_default)
-        .with_help_message("Required for the gateway web UI login; generates an Ed25519 keypair")
-        .prompt()?;
-    websocket.jwt.enabled = enable_jwt;
-    if enable_jwt {
-        let require_login = Confirm::new("Require login for the web UI?")
-            .with_default(true)
+    let enable_jwt = options.force_jwt
+        || Confirm::new("Enable JWT authentication?")
+            .with_default(options.jwt_default)
             .with_help_message(
-                "No = allow guest use without signing in (login stays available for anyone who wants it)",
+                "Required for the gateway web UI login; generates an Ed25519 keypair",
             )
             .prompt()?;
+    websocket.jwt.enabled = enable_jwt;
+    if enable_jwt {
+        let require_login = options.force_login
+            || Confirm::new("Require login for the web UI?")
+                .with_default(true)
+                .with_help_message(
+                    "No = allow guest use without signing in (login stays available for anyone who wants it)",
+                )
+                .prompt()?;
         websocket.require_auth = require_login;
         websocket.jwt.aud = websocket.path.clone();
-        let Some(parent) = config_path.parent() else {
-            eprint_error("Could not determine credentials directory");
-            return Err(CliError::Inquire(
-                inquire::InquireError::InvalidConfiguration(String::from(
-                    "Could not determine credentials directory",
-                )),
-            ));
-        };
-        let credentials_dir = parent.join("credentials");
-        run_generate_keypair_with_config(config, credentials_dir, false)?;
+        let keys = run_generate_keypair_with_config(
+            config,
+            layout,
+            layout.host_path(&["credentials"]),
+            options.replace_existing_keys,
+        )?;
         // Minting uses api.jwt; the WebSocket channel validates with its own jwt key paths.
         websocket.jwt.private_key_path = config.api.jwt.private_key_path.clone();
         websocket.jwt.public_key_path = config.api.jwt.public_key_path.clone();
         websocket.jwt.iss = config.api.jwt.iss.clone();
-        create_users_file(config, config_path, &websocket)?;
+        let first_user = prompt_first_web_ui_user()?;
+        register_first_web_ui_user(
+            config,
+            layout,
+            &websocket,
+            &keys.private_key_path,
+            first_user,
+        )?;
     } else {
         websocket.require_auth = false;
     }
@@ -592,12 +649,16 @@ pub fn configure_websocket_channel(
     Ok(config.clone())
 }
 
-fn create_users_file(
-    config: &mut Config,
-    config_path: PathBuf,
-    websocket: &WebSocketConfig,
-) -> Result<(), CliError> {
-    let user_email = Text::new("Enter user email for login")
+/// Login details of the first web UI user, as entered during onboarding.
+pub struct WebUiUser {
+    pub email: String,
+    pub password: String,
+    pub role: UserRole,
+}
+
+/// Ask for the first web UI user's email, password (masked) and role.
+fn prompt_first_web_ui_user() -> Result<WebUiUser, CliError> {
+    let email = Text::new("Enter user email for login")
         .with_help_message("e.g. user@example.com")
         .with_validator(|email: &str| {
             if email.trim().is_empty() {
@@ -621,35 +682,52 @@ fn create_users_file(
             }
         })
         .prompt()?;
-    let user_role = prompt_user_role()?;
-    let parent = config_path
-        .parent()
-        .map(PathBuf::from)
-        .unwrap_or_else(|| PathBuf::from("."));
-    let users_file = parent.join("users.json");
+    let role = prompt_user_role()?;
+    Ok(WebUiUser {
+        email,
+        password,
+        role,
+    })
+}
 
+/// Mint a web UI token for `user`, store the user in `users.json` in the instance folder, and
+/// record that file in `config.api.users_file` (mapped through `layout`).
+///
+/// `private_key_host_path` is the signing key on this machine. It is passed separately because
+/// in a Docker instance `config.api.jwt.private_key_path` is a container path (`/data/...`)
+/// that does not exist here.
+pub(crate) fn register_first_web_ui_user(
+    config: &mut Config,
+    layout: &InstanceLayout,
+    websocket: &WebSocketConfig,
+    private_key_host_path: &Path,
+    user: WebUiUser,
+) -> Result<(), CliError> {
+    let users_file = layout.host_path(&["users.json"]);
     let minted = generate_jwt_token(
-        &config.api.jwt.private_key_path,
+        private_key_host_path,
         config.api.jwt.iss.clone(),
         websocket.jwt.aud.clone(),
         "webui",
         DEFAULT_EXPIRES_IN_MONTHS,
-        Some(user_email.clone()),
-        Some(user_role),
+        Some(user.email.clone()),
+        Some(user.role),
     )?;
 
     let mut registry = JsonUserRegistry::open(users_file.clone())?;
     registry
         .register_user(&User {
-            email: user_email,
-            password_hash: Some(hash_password(password)?),
+            email: user.email,
+            password_hash: Some(hash_password(user.password)?),
             token: minted.token,
-            role: user_role,
+            role: user.role,
         })
         .map_err(|e| CliError::Other(e.to_string()))?;
 
-    config.api.users_file = path_for_config(users_file).display().to_string();
-    eprintln!("Wrote users file: {}", config.api.users_file);
+    config.api.users_file = layout
+        .config_path_for_written(users_file.clone())
+        .map_err(CliError::Other)?;
+    eprintln!("Wrote users file: {}", users_file.display());
     Ok(())
 }
 
@@ -1747,6 +1825,87 @@ mod tests {
     fn workspace_override_is_stored_as_absolute_path() {
         let config = apply_workspace_override(Config::default(), PathBuf::from("./ws"));
         assert!(std::path::Path::new(&config.agents.workspace).is_absolute());
+    }
+
+    #[test]
+    fn container_instance_writes_keys_and_users_on_the_host_but_records_data_paths() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let layout = InstanceLayout::container(host_dir.path(), "/data");
+        let mut config = Config::default();
+        config.rebase_default_paths_with(|parts| layout.config_path(parts));
+
+        let keys = run_generate_keypair_with_config(
+            &mut config,
+            &layout,
+            layout.host_path(&["credentials"]),
+            false,
+        )
+        .unwrap();
+        assert!(keys.private_key_path.is_file());
+        assert_eq!(
+            config.api.jwt.private_key_path,
+            "/data/credentials/private_key.pem"
+        );
+        assert_eq!(
+            config.api.jwt.public_key_path,
+            "/data/credentials/public_key.pem"
+        );
+
+        // The token is minted with the host key: `/data/...` does not exist on this machine.
+        let websocket = WebSocketConfig::default();
+        register_first_web_ui_user(
+            &mut config,
+            &layout,
+            &websocket,
+            &keys.private_key_path,
+            WebUiUser {
+                email: "admin@example.com".to_string(),
+                password: "correct horse".to_string(),
+                role: UserRole::Admin,
+            },
+        )
+        .unwrap();
+
+        assert_eq!(config.api.users_file, "/data/users.json");
+        let users = std::fs::read_to_string(layout.host_path(&["users.json"])).unwrap();
+        assert!(users.contains("admin@example.com"), "{users}");
+        assert!(
+            !users.contains("correct horse"),
+            "the password must be hashed"
+        );
+    }
+
+    #[test]
+    fn native_instance_records_the_host_paths_it_wrote() {
+        let host_dir = tempfile::tempdir().unwrap();
+        let layout = InstanceLayout::native(host_dir.path());
+        let mut config = Config::default();
+
+        let keys = run_generate_keypair_with_config(
+            &mut config,
+            &layout,
+            layout.host_path(&["credentials"]),
+            false,
+        )
+        .unwrap();
+
+        assert_eq!(
+            config.api.jwt.private_key_path,
+            crate::cli::commands::path_for_config(keys.private_key_path)
+                .display()
+                .to_string()
+        );
+    }
+
+    #[test]
+    fn interactive_web_ui_options_fix_nothing() {
+        let options = WebUiOptions::interactive(true);
+        assert_eq!(options.fixed_bind_host, None);
+        assert_eq!(options.fixed_port, None);
+        assert!(!options.force_jwt);
+        assert!(options.jwt_default);
+        assert!(!options.force_login);
+        assert!(!options.replace_existing_keys);
     }
 
     #[test]

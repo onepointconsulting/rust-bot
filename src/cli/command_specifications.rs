@@ -231,6 +231,18 @@ pub struct ApiArgs {
 /// Directory name that holds a rust-bot instance (config, workspace, runtime data).
 const INSTANCE_DIR_NAME: &str = ".rust-bot";
 
+/// Directory name of a Docker instance (compose file, `.env.docker`, `data/`) in the current directory.
+pub const DOCKER_INSTANCE_DIR_NAME: &str = "rust-bot-docker";
+
+/// Folder inside a Docker instance that the container mounts as `/data` (config and all state).
+pub const DOCKER_DATA_DIR_NAME: &str = "data";
+
+/// Default compose project and container name of a Docker instance (`--name`).
+pub const DEFAULT_DOCKER_PROJECT_NAME: &str = "rust-bot";
+
+/// Default host port a Docker instance publishes the web UI on (`--port`).
+pub const DEFAULT_DOCKER_HOST_PORT: u16 = 18790;
+
 /// Where `rust-bot onboard` creates the instance directory.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
 pub enum OnboardMode {
@@ -238,10 +250,14 @@ pub enum OnboardMode {
     Local,
     /// Install for the current user: `~/.rust-bot/` (config and workspace).
     User,
+    /// Create a Docker instance: `./rust-bot-docker/` with a compose file, `.env.docker` and
+    /// `data/` (mounted as `/data`), then start it. The web UI and its login are always on.
+    Docker,
 }
 
 impl OnboardMode {
-    /// Instance directory for this mode: `current_dir/.rust-bot` or `home_dir/.rust-bot`.
+    /// Instance directory for this mode: `current_dir/.rust-bot`, `home_dir/.rust-bot`, or
+    /// `current_dir/rust-bot-docker`.
     ///
     /// # Errors
     ///
@@ -258,7 +274,22 @@ impl OnboardMode {
                 .ok_or_else(|| {
                     "Cannot resolve the home directory for `--mode user`; set HOME.".to_string()
                 }),
+            OnboardMode::Docker => Ok(current_dir.join(DOCKER_INSTANCE_DIR_NAME)),
         }
+    }
+
+    /// Directory of the config file within [`Self::instance_dir`]: the instance directory itself,
+    /// or its `data/` folder for a Docker instance.
+    pub(crate) fn config_dir(
+        self,
+        current_dir: &std::path::Path,
+        home_dir: Option<&std::path::Path>,
+    ) -> Result<PathBuf, String> {
+        let instance_dir = self.instance_dir(current_dir, home_dir)?;
+        Ok(match self {
+            OnboardMode::Docker => instance_dir.join(DOCKER_DATA_DIR_NAME),
+            OnboardMode::Local | OnboardMode::User => instance_dir,
+        })
     }
 }
 
@@ -307,6 +338,7 @@ pub struct OnboardArgs {
     /// Install location: `local` = `./.rust-bot/` in the current directory, `user` =
     /// `~/.rust-bot/`. Config and workspace are both placed there. Without it, an
     /// existing local or per-user config is reused, else `./.rust-bot/` is created.
+    /// `docker` = a Docker instance in `./rust-bot-docker/` (see the Docker options below).
     #[arg(long, value_enum, conflicts_with = "config")]
     pub mode: Option<OnboardMode>,
 
@@ -321,6 +353,88 @@ pub struct OnboardArgs {
     /// Use interactive setup wizard
     #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
     pub wizard: bool,
+
+    #[command(flatten)]
+    pub docker: OnboardDockerOptions,
+}
+
+/// Flags that only apply to `rust-bot onboard --mode docker`.
+///
+/// Every field is optional so [`validate_onboard_args`] can tell a flag that was given from one
+/// that was not; the defaults are applied when the Docker instance is set up.
+#[derive(Debug, Clone, Default, clap::Args)]
+#[command(next_help_heading = "Docker (with --mode docker)")]
+pub struct OnboardDockerOptions {
+    /// Instance folder for the compose file, `.env.docker` and `data/` [default: ./rust-bot-docker]
+    #[arg(long, value_name = "DIR")]
+    pub dir: Option<PathBuf>,
+
+    /// Compose project and container name [default: rust-bot]
+    #[arg(long, value_name = "NAME")]
+    pub name: Option<String>,
+
+    /// Host port the web UI is published on, on 127.0.0.1 only [default: 18790]
+    #[arg(long, value_name = "PORT")]
+    pub port: Option<u16>,
+
+    /// Image to run instead of gilf/rust-bot:<this version>
+    #[arg(long, value_name = "IMAGE", conflicts_with = "build")]
+    pub image: Option<String>,
+
+    /// Build the image from this rust-bot source checkout instead of pulling it
+    #[arg(long, value_name = "SOURCE_DIR")]
+    pub build: Option<PathBuf>,
+
+    /// Only write the files; do not pull or start anything
+    #[arg(long, default_value_t = false, action = clap::ArgAction::SetTrue)]
+    pub no_start: bool,
+}
+
+impl OnboardDockerOptions {
+    /// Command-line names of the Docker flags that were given.
+    fn given_flags(&self) -> Vec<&'static str> {
+        let given = [
+            ("--dir", self.dir.is_some()),
+            ("--name", self.name.is_some()),
+            ("--port", self.port.is_some()),
+            ("--image", self.image.is_some()),
+            ("--build", self.build.is_some()),
+            ("--no-start", self.no_start),
+        ];
+        given
+            .into_iter()
+            .filter_map(|(flag, is_given)| is_given.then_some(flag))
+            .collect()
+    }
+}
+
+/// Reject `onboard` flag combinations that clap cannot express: Docker flags without
+/// `--mode docker`, and `--mode docker` together with `--wizard` or `--workspace` (a Docker
+/// instance's workspace is always `/data/workspace`, and the wizard could undo the settings
+/// the container depends on).
+pub fn validate_onboard_args(args: &OnboardArgs) -> Result<(), String> {
+    let is_docker = args.mode == Some(OnboardMode::Docker);
+    if !is_docker {
+        let given = args.docker.given_flags();
+        if !given.is_empty() {
+            let verb = if given.len() == 1 { "applies" } else { "apply" };
+            return Err(format!(
+                "{} only {verb} with `--mode docker`",
+                given.join(", ")
+            ));
+        }
+        return Ok(());
+    }
+    if args.wizard {
+        return Err("`--mode docker` cannot be combined with `--wizard`".to_string());
+    }
+    if args.workspace.is_some() {
+        return Err(
+            "`--mode docker` cannot be combined with `--workspace`: the container's workspace is always /data/workspace"
+                .to_string(),
+        );
+    }
+    Ok(())
 }
 
 /// Arguments of `rust-bot login`.
@@ -496,6 +610,76 @@ mod tests {
                 .is_err()
         );
         assert!(Cli::try_parse_from(["rust-bot", "onboard", "--mode", "bogus"]).is_err());
+    }
+
+    /// Parse `rust-bot onboard <args>` and return the onboard arguments.
+    fn parse_onboard(args: &[&str]) -> OnboardArgs {
+        let argv = ["rust-bot", "onboard"].iter().chain(args).copied();
+        let Commands::Onboard(onboard) = Cli::try_parse_from(argv).unwrap().command else {
+            panic!("expected the onboard command");
+        };
+        onboard
+    }
+
+    #[test]
+    fn docker_mode_parses_with_its_flags() {
+        let args = parse_onboard(&[
+            "--mode",
+            "docker",
+            "--dir",
+            "bots/one",
+            "--name",
+            "bot-one",
+            "--port",
+            "18800",
+            "--no-start",
+        ]);
+        assert_eq!(args.mode, Some(OnboardMode::Docker));
+        assert_eq!(args.docker.dir, Some(PathBuf::from("bots/one")));
+        assert_eq!(args.docker.name.as_deref(), Some("bot-one"));
+        assert_eq!(args.docker.port, Some(18800));
+        assert!(args.docker.no_start);
+        assert_eq!(validate_onboard_args(&args), Ok(()));
+    }
+
+    #[test]
+    fn docker_image_and_build_conflict() {
+        let result = Cli::try_parse_from([
+            "rust-bot", "onboard", "--mode", "docker", "--image", "x:1", "--build", ".",
+        ]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn docker_flags_without_docker_mode_are_rejected() {
+        let error =
+            validate_onboard_args(&parse_onboard(&["--mode", "local", "--port", "1"])).unwrap_err();
+        assert!(error.contains("--port"), "{error}");
+        assert!(validate_onboard_args(&parse_onboard(&["--no-start"])).is_err());
+        assert_eq!(
+            validate_onboard_args(&parse_onboard(&["--mode", "local"])),
+            Ok(())
+        );
+        assert_eq!(validate_onboard_args(&parse_onboard(&[])), Ok(()));
+    }
+
+    #[test]
+    fn docker_mode_rejects_wizard_and_workspace() {
+        assert!(validate_onboard_args(&parse_onboard(&["--mode", "docker", "--wizard"])).is_err());
+        assert!(validate_onboard_args(&parse_onboard(&["--mode", "docker", "-w", "ws"])).is_err());
+    }
+
+    #[test]
+    fn docker_mode_keeps_its_config_in_the_data_folder() {
+        let cwd = std::path::Path::new("/project");
+        assert_eq!(
+            OnboardMode::Docker.config_dir(cwd, None).unwrap(),
+            cwd.join("rust-bot-docker").join("data")
+        );
+        assert_eq!(
+            OnboardMode::Local.config_dir(cwd, None).unwrap(),
+            cwd.join(".rust-bot")
+        );
     }
 
     #[test]
