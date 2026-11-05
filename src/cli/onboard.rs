@@ -6,7 +6,8 @@ use std::path::{Path, PathBuf};
 use anstyle::{AnsiColor, Color, Style};
 
 use crate::channels::websocket::CHANNEL_NAME;
-use crate::cli::commands::{CliError, OnboardArgs, OnboardMode, resolve_onboard_targets_from_env};
+use crate::cli::command_specifications::{OnboardArgs, OnboardMode};
+use crate::cli::commands::{CliError, resolve_onboard_targets_from_env};
 use crate::cli::wizard::{
     apply_workspace_override, choose_providers, config_model, configure_websocket_channel,
     resolve_onboard_config_path, wizard,

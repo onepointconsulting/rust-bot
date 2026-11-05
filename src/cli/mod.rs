@@ -1,6 +1,7 @@
 pub mod acp;
 mod background_banner;
 mod cancel;
+pub mod command_specifications;
 pub mod commands;
 mod confirm_tools;
 pub mod onboard;
@@ -11,8 +12,8 @@ pub mod stream;
 pub mod wizard;
 
 pub use cancel::{pause_for_prompt, wait_for_escape_cancel};
+pub use command_specifications::{AgentArgs, Cli, Commands};
 pub use commands::{
-    AgentArgs, Cli, CliError, Commands, eprint_error, print_agent_response,
-    print_agent_response_with_header, run,
+    CliError, eprint_error, print_agent_response, print_agent_response_with_header, run,
 };
 pub use stream::{StreamRenderer, ThinkingSpinner};

@@ -17,8 +17,7 @@ use crate::providers::registry::TOGETHER_API_BASE;
 use crate::security::{DEFAULT_EXPIRES_IN_MONTHS, UserRole, generate_jwt_token};
 use crate::{
     cli::{
-        CliError,
-        commands::{OnboardArgs, resolve_onboard_targets_from_env},
+        CliError, command_specifications::OnboardArgs, commands::resolve_onboard_targets_from_env,
         eprint_error,
     },
     config::{

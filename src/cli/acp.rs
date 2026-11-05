@@ -20,7 +20,6 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use agent_client_protocol::ByteStreams;
-use clap::Parser;
 
 use crate::agent::acp::HEADLESS_DISABLED_TOOLS;
 use crate::agent::acp::agent_mode::{serve, serve_startup_failure};
@@ -31,9 +30,10 @@ use crate::agent::acp::stdin_pump::{EofSignal, StdinPump, spawn_pump};
 use crate::agent::acp::workspace_lock::{DEFAULT_POLL_INTERVAL, WorkspaceLock, acquire};
 use crate::agent::agent_loop::AgentLoop;
 use crate::agent::hook::AgentHook;
+use crate::cli::command_specifications::AcpArgs;
 use crate::cli::commands::{
-    CliError, default_config_path, eprint_error, init_agent_loop_with_provider,
-    try_create_provider, try_load_runtime_config,
+    CliError, eprint_error, init_agent_loop_with_provider, try_create_provider,
+    try_load_runtime_config,
 };
 use crate::config::loader::set_config_path;
 use crate::config::log::init_protocol_logging;
@@ -47,44 +47,6 @@ use crate::utils::stdio_redirect::claim_protocol_stdout;
 /// Longest the process waits, after the client has gone, for background memory
 /// work and Dream to finish before exiting anyway.
 const SHUTDOWN_DRAIN_TIMEOUT: Duration = Duration::from_secs(180);
-
-/// Default for `--lock-wait-secs`.
-pub const DEFAULT_LOCK_WAIT_SECS: u64 = 30;
-
-#[derive(Debug, Parser)]
-pub struct AcpArgs {
-    /// JSON configuration file path. Use an absolute path when a client launches rust-bot.
-    #[arg(short, long, default_value_os_t = default_config_path())]
-    pub config: PathBuf,
-
-    /// Workspace directory (overrides the config)
-    #[arg(short, long)]
-    pub workspace: Option<PathBuf>,
-
-    /// Write rust-bot runtime logs to stderr (or to `RUST_LOG_FILE`). Never to stdout.
-    #[arg(long, default_value_t = false)]
-    pub logs: bool,
-
-    /// Run as a child of another rust-bot: `--config` is the parent's config and
-    /// this file is a JSON merge patch applied on top of it. Only a short
-    /// allowlist of settings may be overridden, and only towards less power (see
-    /// `config::overlay`). Repeat it for a child of a child: the overlays apply in
-    /// the order given, outermost first, each checked against the one before.
-    /// Needs `--workspace`: a child has its own home, it must never share its
-    /// parent's memory and sessions.
-    #[arg(long, requires = "workspace")]
-    pub overlay: Vec<PathBuf>,
-
-    /// How long to wait for another `rust-bot acp` process to release the workspace
-    /// before failing `initialize` with an error that names it.
-    #[arg(long, default_value_t = DEFAULT_LOCK_WAIT_SECS)]
-    pub lock_wait_secs: u64,
-
-    /// A folder the file tools must refuse, e.g. the parent's own home when the
-    /// project a child works on contains it. Repeatable. Set by a parent rust-bot.
-    #[arg(long = "deny-path")]
-    pub deny_path: Vec<PathBuf>,
-}
 
 /// Everything the agent role needs, built from the config.
 pub struct AcpRuntime {
@@ -373,25 +335,5 @@ mod tests {
         assert_eq!(panic_message(from_str.as_ref()), "static message");
         let from_string = std::panic::catch_unwind(|| panic!("formatted {}", 7)).unwrap_err();
         assert_eq!(panic_message(from_string.as_ref()), "formatted 7");
-    }
-
-    #[test]
-    fn acp_args_default_to_the_standard_config_path() {
-        let args = AcpArgs::try_parse_from(["acp"]).unwrap();
-        assert_eq!(args.config, default_config_path());
-        assert!(!args.logs);
-        assert!(args.workspace.is_none());
-        assert_eq!(args.lock_wait_secs, DEFAULT_LOCK_WAIT_SECS);
-        assert!(args.deny_path.is_empty());
-    }
-
-    #[test]
-    fn deny_path_can_be_repeated() {
-        let args =
-            AcpArgs::try_parse_from(["acp", "--deny-path", "/a", "--deny-path", "/b"]).unwrap();
-        assert_eq!(
-            args.deny_path,
-            vec![PathBuf::from("/a"), PathBuf::from("/b")]
-        );
     }
 }

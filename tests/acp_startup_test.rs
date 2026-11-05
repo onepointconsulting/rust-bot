@@ -9,7 +9,8 @@ use std::time::Duration;
 
 use rust_bot::agent::acp::stdin_pump::{EofSignal, spawn_pump};
 use rust_bot::agent::acp::workspace_lock::{acquire, lock_path};
-use rust_bot::cli::acp::{AcpArgs, Startup, start};
+use rust_bot::cli::acp::{Startup, start};
+use rust_bot::cli::command_specifications::AcpArgs;
 use serde_json::json;
 
 /// A config with a workspace inside `dir` and a provider that needs no network.
