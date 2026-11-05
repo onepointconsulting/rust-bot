@@ -1,0 +1,184 @@
+name: Docker image (Docker Hub)
+
+# Builds the gateway image from the repository's Dockerfile and publishes it to Docker Hub as
+# gilf/rust-bot:<version> and gilf/rust-bot:latest, for linux/amd64 and linux/arm64.
+#
+# Each architecture is built natively on its own runner (no QEMU: compiling trunk and
+# rust-bot under emulation takes hours), pushed by digest, and the digests are then merged
+# into one multi-arch manifest. A version that is already on Docker Hub is not rebuilt unless
+# the workflow is started by hand with "force" set.
+#
+# Required repository secrets: DOCKERHUB_USERNAME and DOCKERHUB_TOKEN (a Docker Hub access
+# token with read/write scope).
+
+on:
+  push:
+    branches:
+      - deployment
+  workflow_dispatch:
+    inputs:
+      force:
+        description: Rebuild and overwrite the tags even if this version is already published
+        type: boolean
+        default: false
+
+permissions:
+  contents: read
+
+env:
+  IMAGE_NAME: gilf/rust-bot
+
+jobs:
+  prepare:
+    name: Resolve version
+    runs-on: ubuntu-latest
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      publish: ${{ steps.published.outputs.publish }}
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Determine version from Cargo.toml
+        id: version
+        shell: bash
+        run: |
+          version=$(awk -F'"' '/^\[package\]/{found=1; next} /^\[/{found=0} found && /^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+          if [ -z "$version" ]; then
+            echo "Could not determine [package].version from Cargo.toml" >&2
+            exit 1
+          fi
+          echo "Resolved version: $version"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+
+      - name: Check whether this version is already published
+        id: published
+        shell: bash
+        env:
+          FORCE: ${{ github.event_name == 'workflow_dispatch' && inputs.force }}
+          VERSION: ${{ steps.version.outputs.version }}
+        run: |
+          if [ "$FORCE" = "true" ]; then
+            echo "Forced rebuild of ${IMAGE_NAME}:${VERSION}."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          elif docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}" >/dev/null 2>&1; then
+            echo "${IMAGE_NAME}:${VERSION} is already on Docker Hub; bump the version in Cargo.toml to publish a new image."
+            echo "publish=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "${IMAGE_NAME}:${VERSION} is not published yet; building it."
+            echo "publish=true" >> "$GITHUB_OUTPUT"
+          fi
+
+  build:
+    name: Build (${{ matrix.platform }})
+    needs: prepare
+    if: needs.prepare.outputs.publish == 'true'
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 120
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+            arch: amd64
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+            arch: arm64
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.IMAGE_NAME }}
+          labels: |
+            org.opencontainers.image.version=${{ needs.prepare.outputs.version }}
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          labels: ${{ steps.meta.outputs.labels }}
+          outputs: type=image,name=${{ env.IMAGE_NAME }},push-by-digest=true,name-canonical=true,push=true
+          cache-from: type=gha,scope=docker-${{ matrix.arch }}
+          cache-to: type=gha,scope=docker-${{ matrix.arch }},mode=max
+
+      - name: Export digest
+        shell: bash
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "${RUNNER_TEMP}/digests"
+          touch "${RUNNER_TEMP}/digests/${DIGEST#sha256:}"
+
+      - name: Upload digest
+        uses: actions/upload-artifact@v4
+        with:
+          name: digests-${{ matrix.arch }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  merge:
+    name: Publish multi-arch manifest
+    needs: [prepare, build]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download digests
+        uses: actions/download-artifact@v4
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digests-*
+          merge-multiple: true
+
+      - name: Log in to Docker Hub
+        uses: docker/login-action@v3
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Create and push the manifest (<version> and latest)
+        working-directory: ${{ runner.temp }}/digests
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          sources=()
+          for digest_file in *; do
+            sources+=("${IMAGE_NAME}@sha256:${digest_file}")
+          done
+          docker buildx imagetools create \
+            --tag "${IMAGE_NAME}:${VERSION}" \
+            --tag "${IMAGE_NAME}:latest" \
+            "${sources[@]}"
+
+      - name: Verify both platforms are in the manifest
+        shell: bash
+        env:
+          VERSION: ${{ needs.prepare.outputs.version }}
+        run: |
+          manifest=$(docker buildx imagetools inspect "${IMAGE_NAME}:${VERSION}")
+          echo "$manifest"
+          for platform in linux/amd64 linux/arm64; do
+            if ! grep -q "Platform:[[:space:]]*${platform}$" <<< "$manifest"; then
+              echo "error: ${platform} is missing from ${IMAGE_NAME}:${VERSION}" >&2
+              exit 1
+            fi
+          done
