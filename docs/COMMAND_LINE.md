@@ -33,6 +33,41 @@ cargo run -- agent --help
 | `--logs` / `--no-logs`         | `false`                   | Show runtime logs during chat                                                                |
 
 
+## `onboard` subcommand
+
+Create (or refresh) an instance: config, workspace and, optionally, the gateway web UI with a
+first login user. For the full option list:
+
+```
+cargo run -- onboard --help
+```
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--mode <MODE>` | *(see below)* | `local` = `./.rust-bot/`, `user` = `~/.rust-bot/`, `docker` = a Docker instance in `./rust-bot-docker/` |
+| `-w`, `--workspace` | `workspace/` next to the config | Workspace directory (not with `--mode docker`) |
+| `-c`, `--config` | | Config file path (not with `--mode`) |
+| `--wizard` | `false` | Interactive wizard with every setting (not with `--mode docker`) |
+
+Without `--mode`, onboard reuses an existing `./.rust-bot/`, then `~/.rust-bot/`, and otherwise
+creates `./.rust-bot/`.
+
+Flags that only apply with `--mode docker` (see [DOCKER.md](DOCKER.md#quick-start-rust-bot-onboard---mode-docker)):
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir <DIR>` | `./rust-bot-docker` | Instance folder (compose file, `.env.docker`, `data/`) |
+| `--name <NAME>` | `rust-bot` | Compose project and container name |
+| `--port <PORT>` | `18790` | Host port of the web UI, published on `127.0.0.1` |
+| `--image <IMAGE>` | `gilf/rust-bot:<version>` | Image to run (not with `--build`) |
+| `--build <SOURCE_DIR>` | | Build the image from a rust-bot source checkout |
+| `--no-start` | `false` | Write the files only; do not pull or start |
+
+```
+rust-bot onboard --mode local
+rust-bot onboard --mode docker --port 18791 --name bot-two --dir ./bot-two
+```
+
 ## JWT keypair and tokens
 
 JWT auth for the REST API and WebSocket gateway is configured through two

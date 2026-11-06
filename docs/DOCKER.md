@@ -4,13 +4,118 @@ The image runs `rust-bot gateway` (the WebUI plus channels) as an unprivileged u
 configuration is the same hierarchical `config.json` as everywhere else; it is **not**
 flattened into environment variables.
 
-## Quick start
+The image is published on Docker Hub as [`gilf/rust-bot`](https://hub.docker.com/r/gilf/rust-bot)
+for `linux/amd64` and `linux/arm64`, tagged with the rust-bot version and `latest`.
+
+## Quick start: `rust-bot onboard --mode docker`
+
+With rust-bot installed and Docker running:
+
+```bash
+rust-bot onboard --mode docker
+```
+
+This asks the usual onboard questions (provider, API key, model) and creates the first web UI
+user. Then it writes an instance folder, pulls the image, starts the container and waits until it
+is healthy:
+
+```
+✓ rust-bot is running at http://127.0.0.1:18790 (log in with the user you created)
+```
+
+### What it creates
+
+```
+rust-bot-docker/               (--dir; default ./rust-bot-docker)
+├── docker-compose.yml         image gilf/rust-bot:<version of your rust-bot>
+├── .env.docker                API keys (secrets); never commit it
+├── .gitignore                 "*": the folder holds secrets
+└── data/                      mounted as /data in the container
+    ├── config.json            paths under /data/..., API keys as ${VAR} placeholders
+    ├── credentials/           JWT key pair for the web UI login
+    └── users.json             the user you created (password stored as an Argon2id hash)
+```
+
+Workspace, sessions, memory and cron jobs are created in `data/` once the container runs.
+
+A Docker instance differs from `--mode local` / `--mode user` as follows:
+
+- **The web UI and its login are always on.** JWT is enabled and login is required, so guests
+  can't use it. The port is published on `127.0.0.1` only.
+- **The container settings are fixed:** the gateway binds `0.0.0.0:18790` inside the
+  container. `--port` only changes the host side of the mapping.
+- **API keys are not in `config.json`.** They are moved into `.env.docker`, and the config refers
+  to them as `${ANTHROPIC_API_KEY}`, `${OPENROUTER_API_KEY}`, ... A settings change in the web UI
+  keeps the placeholders.
+- **Logs go to the container's stdout:** `docker compose logs -f`. Set the level with
+  `RUST_LOG` (default `info`) in your shell or in a `.env` file next to `docker-compose.yml`.
+- **Linux:** the compose file runs the container as your user (`user: "<uid>:<gid>"`), so it
+  can write to the bind-mounted `data/` folder. Docker Desktop on Windows and macOS doesn't
+  need this.
+
+### Options
+
+| Flag | Default | Description |
+|------|---------|-------------|
+| `--dir <DIR>` | `./rust-bot-docker` | Instance folder |
+| `--name <NAME>` | `rust-bot` | Compose project and container name; lowercase letters, digits, `-`, `_` |
+| `--port <PORT>` | `18790` | Host port of the web UI (on `127.0.0.1`) |
+| `--image <IMAGE>` | `gilf/rust-bot:<version>` | Run another image, e.g. one with extra runtimes (see [Adding runtimes](#adding-runtimes)) |
+| `--build <SOURCE_DIR>` | | Build the image from a rust-bot source checkout instead of pulling it |
+| `--no-start` | | Only write the files; start later with `docker compose up -d` |
+
+`--mode docker` cannot be combined with `--wizard`, `--workspace` or `--config`.
+
+### Several instances
+
+Give each instance its own folder, name and port:
+
+```bash
+rust-bot onboard --mode docker --dir ./bot-sales   --name bot-sales   --port 18791
+rust-bot onboard --mode docker --dir ./bot-support --name bot-support --port 18792
+```
+
+The checks run **before** any question is asked. A container name that belongs to another
+instance folder, or a host port already in use, stops the command with a hint to pass `--name`
+or `--port`.
+
+### Re-running: refresh, overwrite, upgrade
+
+Running the command again on an existing folder asks:
+
+- **`N` (refresh, the default):** keeps the config, keys, users and secrets. It rewrites the
+  compose file and resets any setting the container depends on (bind address, port, JWT, login),
+  saying so for each one. Then it pulls and runs `docker compose up -d`, which recreates the
+  container only if the image or the compose file changed.
+- **`y` (overwrite):** asks every question again and replaces the config and the key pair.
+  Existing users stay in `users.json`.
+
+The compose file pins the image to the version of the rust-bot that wrote it. To **upgrade**,
+update rust-bot and refresh the instance:
+
+```bash
+rust-bot onboard --mode docker --dir ./rust-bot-docker      # answer N
+```
+
+### When Docker is not available
+
+If `docker` is not installed, the daemon is not running (start Docker Desktop), or Compose v2
+(`docker compose`) is missing, the command says so at the start. It still writes the files and
+then prints the commands to start the instance by hand. The exit code is 0.
+
+If the container does not come up, the command prints the last 50 lines of its log and exits with
+code 1. Examples: a healthcheck that keeps failing, or a crash that makes the container restart.
+
+## Manual setup from a source checkout
 
 ```bash
 cp .env.docker.example .env.docker      # fill in OPENAI_API_KEY, OPENAI_API_MODEL, ...
 docker compose up -d --build
 # WebUI: http://127.0.0.1:18790
 ```
+
+This uses the repository's own `docker-compose.yml` and builds the image locally. The rest of
+this page explains that setup; most of it applies to a `--mode docker` instance as well.
 
 ## How configuration reaches the container
 
@@ -111,8 +216,23 @@ docker compose run --rm rust-bot check-config
 
 ## Adding runtimes
 
-The slim image has `git` and `curl`. For MCP servers and skills that need Python or Node:
+The image is deliberately slim and has only `git` and `curl`. **MCP servers or skills that need
+Node (`npx`) or Python (`uvx`, `python3`) will not run in it.** To add those runtimes, build your
+own image:
 
 ```bash
-docker build --build-arg EXTRA_PACKAGES="python3 nodejs npm" -t rust-bot .
+docker build --build-arg EXTRA_PACKAGES="python3 nodejs npm" -t rust-bot-full .
 ```
+
+You can also derive one from the published image:
+
+```dockerfile
+FROM gilf/rust-bot:0.4.5
+USER root
+RUN apt-get update && apt-get install -y --no-install-recommends python3 nodejs npm \
+    && rm -rf /var/lib/apt/lists/*
+USER rustbot
+```
+
+Then point an instance at it: `rust-bot onboard --mode docker --image rust-bot-full`. For an
+existing instance, answer `N` to refresh it.

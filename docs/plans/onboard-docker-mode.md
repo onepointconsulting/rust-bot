@@ -25,7 +25,7 @@ All milestones are on one branch, `feature/docker-onboard`.
 | M2. Onboard refactor (no behaviour change) | built 2026-11-05, uncommitted; all lib tests pass; manual interactive `onboard` check pending |
 | M3. `onboard --mode docker`: generate files | built 2026-11-05, uncommitted; all lib tests pass; verified end to end on Windows with `gilf/rust-bot:0.4.5` (healthy, chat works, web UI settings save keeps `${VAR}` placeholders). Until M4, it always prints the manual `docker compose up -d` steps |
 | M4. `onboard --mode docker`: start the container | built 2026-11-05, uncommitted (`src/cli/docker_runtime.rs` + start flow in `onboard_docker.rs`); all lib tests pass; checked against real Docker Desktop: name clash, busy port, healthy start, crash loop (broken 0.4.4 image) |
-| M5. Docs and smoke tests | not started |
+| M5. Docs and smoke tests | docs written 2026-11-05, uncommitted (`DOCKER.md` quick start, `COMMAND_LINE.md` onboard section, README, `INSTALL.md`, repo `docker-compose.yml` header); smoke tests on native Linux (non-1000 uid) and arm64 still open |
 
 M1 is independent of M2–M4. M3 builds on M2, and M4 on M3. Commit only when asked.
 
@@ -339,8 +339,9 @@ unhealthy with logs).
 - `docs/DOCKER.md`: new "Quick start with `rust-bot onboard --mode docker`" section at the top, keeping the manual
   compose setup below it. `docs/COMMAND_LINE.md`: the new mode and its flags.
 - Note in `DOCKER.md`: the published image is the slim one (`git`, `curl`). **MCP servers or skills that need
-  Node or Python will not run in it.** Use `--build <src>` with `EXTRA_PACKAGES`, or a derived image. A
-  published `-full` variant is listed under "Later".
+  Node or Python will not run in it.** Build an image with `EXTRA_PACKAGES` or derive one from
+  `gilf/rust-bot`, then use `--image` (`--build` passes no build arguments). A published `-full` variant is
+  listed under "Later".
 - The repo's own `docker-compose.yml` (build from source, `.env.docker` in the repo) stays as the developer
   setup. Its comment points at `onboard --mode docker` for end users.
 - Manual smoke tests: Windows + Docker Desktop, Linux (native, non-1000 uid), and arm64 (Raspberry Pi / Apple

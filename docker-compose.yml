@@ -1,3 +1,6 @@
+# Developer setup: builds the image from this checkout. To run rust-bot in Docker as a user,
+# run `rust-bot onboard --mode docker` instead; see docs/DOCKER.md.
+#
 # rust-bot gateway. Copy .env.docker.example to .env.docker, fill in the secrets, then:
 #   docker compose up -d --build
 # The WebUI is then at http://127.0.0.1:18790

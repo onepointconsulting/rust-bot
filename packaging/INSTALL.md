@@ -66,11 +66,16 @@ credentials, users file, MCP presets, CLI history, WhatsApp bridge, and logs.
 |------|--------------------|------------|
 | `--mode local` | `./.rust-bot/` (current directory) | One bot per project; several instances on one machine |
 | `--mode user` | `~/.rust-bot/` (home directory) | One bot per user account, usable from any directory |
+| `--mode docker` | `./rust-bot-docker/` (current directory) | The bot runs in a Docker container; onboard also starts it |
 
 ```bash
 rust-bot onboard --mode local   # ./.rust-bot/config.json + ./.rust-bot/workspace
 rust-bot onboard --mode user    # ~/.rust-bot/config.json + ~/.rust-bot/workspace
+rust-bot onboard --mode docker  # ./rust-bot-docker/docker-compose.yml + data/, then starts it
 ```
+
+`--mode docker` needs Docker with Compose v2; see `docs/DOCKER.md` in the repository
+for its options (`--dir`, `--name`, `--port`, `--image`, `--build`, `--no-start`).
 
 - The one-line installers (`install.sh`, `install.ps1`) run `onboard --mode user`.
 - Without `--mode`, onboard reuses an existing `./.rust-bot/config.json`, then an
