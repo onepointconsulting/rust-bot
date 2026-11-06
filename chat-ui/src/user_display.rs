@@ -16,9 +16,18 @@ pub fn email_initial(email: &str) -> char {
         .unwrap_or('?')
 }
 
+/// The signed-in user's role as shown in the account menu (`"admin"`, `"user"`).
+///
+/// The gateway sends the role on the websocket `ready` frame. The value is
+/// trimmed and lowercased; `None` when it is blank, so the menu hides the row.
+pub fn role_label(role: &str) -> Option<String> {
+    let trimmed_role = role.trim();
+    (!trimmed_role.is_empty()).then(|| trimmed_role.to_lowercase())
+}
+
 #[cfg(test)]
 mod tests {
-    use super::email_initial;
+    use super::{email_initial, role_label};
 
     #[test]
     fn uses_first_alphanumeric_of_local_part() {
@@ -38,5 +47,23 @@ mod tests {
         assert_eq!(email_initial(""), '?');
         assert_eq!(email_initial("@nodomain"), '?');
         assert_eq!(email_initial("...@x.com"), '?');
+    }
+
+    #[test]
+    fn role_label_returns_the_known_roles() {
+        assert_eq!(role_label("admin"), Some("admin".to_string()));
+        assert_eq!(role_label("user"), Some("user".to_string()));
+    }
+
+    #[test]
+    fn role_label_trims_and_lowercases() {
+        assert_eq!(role_label("  Admin \n"), Some("admin".to_string()));
+        assert_eq!(role_label("USER"), Some("user".to_string()));
+    }
+
+    #[test]
+    fn role_label_hides_blank_roles() {
+        assert_eq!(role_label(""), None);
+        assert_eq!(role_label("   \t"), None);
     }
 }

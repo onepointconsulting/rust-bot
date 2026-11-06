@@ -410,9 +410,10 @@ struct WsContext {
     /// Presets changed since the page was loaded; they need a restart. Kept when the
     /// list closes, since the restart is still pending.
     mcp_changed: RwSignal<Vec<String>>,
-    /// Whether the signed-in user is an administrator, from the connection's `ready`
-    /// frame. Only decides whether the Settings button shows.
-    is_admin: RwSignal<bool>,
+    /// The signed-in user's role from the connection's `ready` frame (`None` until
+    /// it arrives, or on older gateways). Shown in the account menu; through
+    /// [`protocol::is_admin_role`] it also decides whether the Settings button shows.
+    user_role: RwSignal<Option<String>>,
     /// Whether the Settings dialog is open.
     settings_open: RwSignal<bool>,
     /// What the dialog's configuration file editor shows. Only filled while the
@@ -789,13 +790,13 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             chat_id,
             client_id,
             streaming,
-            is_admin,
+            role,
         } => {
             log::info!(
-                "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming} is_admin={is_admin}"
+                "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming} role={role:?}"
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
-            ctx.is_admin.set(is_admin);
+            ctx.user_role.set(role);
             settings_after_reconnect(ctx);
             ctx.token_streaming.set(streaming);
             // A fresh connection starts on the chat, never on a list page.
@@ -2578,7 +2579,7 @@ pub fn App() -> impl IntoView {
     let mcp_busy = RwSignal::new(None::<String>);
     let mcp_row_error = RwSignal::new(None::<(String, String)>);
     let mcp_changed = RwSignal::new(Vec::<String>::new());
-    let is_admin = RwSignal::new(false);
+    let user_role = RwSignal::new(None::<String>);
     let settings_open = RwSignal::new(false);
     let config_file = RwSignal::new(ConfigFileView::Closed);
     let config_saving = RwSignal::new(false);
@@ -2625,7 +2626,7 @@ pub fn App() -> impl IntoView {
         mcp_busy,
         mcp_row_error,
         mcp_changed,
-        is_admin,
+        user_role,
         settings_open,
         config_file,
         config_saving,
@@ -2764,7 +2765,7 @@ pub fn App() -> impl IntoView {
         close_main_view(&ws_context);
         mcp_changed.set(Vec::new());
         close_settings(&ws_context);
-        is_admin.set(false);
+        user_role.set(None);
         config_saved_notice.set(false);
         summary_popup.set(None);
         workspace_popup.set(None);
@@ -2981,6 +2982,7 @@ pub fn App() -> impl IntoView {
                     sidebar_open=Signal::derive(move || sidebar_open.get())
                     user_email=Signal::derive(move || user_email.get())
                     bot_version=Signal::derive(move || bot_version.get())
+                    user_role=Signal::derive(move || user_role.get())
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat
@@ -3051,7 +3053,7 @@ pub fn App() -> impl IntoView {
                     on_refresh_mcps=on_refresh_mcps
                     on_change_mcp=on_change_mcp
                     show_settings=token.get_untracked().is_some()
-                    is_admin=Signal::derive(move || is_admin.get())
+                    is_admin=Signal::derive(move || protocol::is_admin_role(user_role.get().as_deref()))
                     settings_open=Signal::derive(move || settings_open.get())
                     settings_panel=settings_panel
                     settings_actions=settings_actions

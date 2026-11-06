@@ -1082,10 +1082,11 @@ pub enum ServerEvent {
         chat_id: String,
         client_id: String,
         streaming: bool,
-        /// Whether the signed-in user is an administrator (`role == "admin"` on the
-        /// `ready` frame). `false` for plain users, guests and older gateways. Only
-        /// decides what the UI offers; the gateway enforces it on every request.
-        is_admin: bool,
+        /// The signed-in user's role as sent on the `ready` frame (`"admin"` /
+        /// `"user"`); `None` on older gateways. Shown in the account menu, and
+        /// [`is_admin_role`] derives the admin check from it. Only decides what the
+        /// UI offers; the gateway enforces it on every request.
+        role: Option<String>,
     },
     /// A server-side error, optionally scoped to one chat / in-flight turn.
     /// `chat_id` is omitted when the error is not attached to any chat yet
@@ -2062,6 +2063,14 @@ fn decode<T: serde::de::DeserializeOwned>(value: &serde_json::Value) -> Result<T
 /// known event names, produces `Ok(ServerEvent::Unknown(value))` rather than
 /// an error — only a *recognized* event name whose payload fails to
 /// deserialize into its expected shape produces `Err`.
+/// Whether a `ready`-frame role grants administrator rights (`"admin"`).
+///
+/// `false` for plain users, guests and older gateways that send no role. Keeps
+/// the admin rule in one place for every caller that only needs the bool.
+pub fn is_admin_role(role: Option<&str>) -> bool {
+    role == Some("admin")
+}
+
 pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
     let value: serde_json::Value = serde_json::from_str(raw)
         .map_err(|err| ProtocolError::new(format!("malformed JSON frame: {err}")))?;
@@ -2075,7 +2084,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             chat_id: w.chat_id,
             client_id: w.client_id,
             streaming: w.streaming,
-            is_admin: w.role.as_deref() == Some("admin"),
+            role: w.role,
         }),
         "error" => decode::<ErrorWire>(&value).map(|w| ServerEvent::Error {
             chat_id: w.chat_id,
@@ -2377,7 +2386,7 @@ mod tests {
                 chat_id: "11111111-1111-1111-1111-111111111111".to_string(),
                 client_id: "browser-abc".to_string(),
                 streaming: false,
-                is_admin: false,
+                role: None,
             }
         );
     }
@@ -2393,7 +2402,7 @@ mod tests {
                 chat_id: "chat-1".to_string(),
                 client_id: "browser-abc".to_string(),
                 streaming: true,
-                is_admin: false,
+                role: None,
             }
         );
     }
@@ -2401,15 +2410,22 @@ mod tests {
     #[test]
     fn parses_ready_with_the_admin_role() {
         let admin = r#"{"event":"ready","chat_id":"c","client_id":"b","role":"admin"}"#;
-        let Ok(ServerEvent::Ready { is_admin, .. }) = parse_server_event(admin) else {
+        let Ok(ServerEvent::Ready { role, .. }) = parse_server_event(admin) else {
             panic!("should parse");
         };
-        assert!(is_admin);
+        assert_eq!(role.as_deref(), Some("admin"));
         let user = r#"{"event":"ready","chat_id":"c","client_id":"b","role":"user"}"#;
-        let Ok(ServerEvent::Ready { is_admin, .. }) = parse_server_event(user) else {
+        let Ok(ServerEvent::Ready { role, .. }) = parse_server_event(user) else {
             panic!("should parse");
         };
-        assert!(!is_admin);
+        assert_eq!(role.as_deref(), Some("user"));
+    }
+
+    #[test]
+    fn is_admin_role_only_accepts_admin() {
+        assert!(is_admin_role(Some("admin")));
+        assert!(!is_admin_role(Some("user")));
+        assert!(!is_admin_role(None));
     }
 
     #[test]

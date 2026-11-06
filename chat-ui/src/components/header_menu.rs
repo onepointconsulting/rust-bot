@@ -124,6 +124,10 @@ pub fn ChatHeaderActions(
     #[prop(into)] expanded: Signal<bool>,
     #[prop(into)] email: Signal<Option<String>>,
     #[prop(into)] version: Signal<Option<String>>,
+    /// The signed-in user's role, shown in the account menu. Defaults to
+    /// `None` (row hidden) for frontends without a role source.
+    #[prop(into, default = Signal::stored(None))]
+    role: Signal<Option<String>>,
     on_new_chat: impl Fn() + 'static + Copy,
     on_logout: impl Fn() + 'static + Copy,
     on_minimize: impl Fn() + 'static + Copy,
@@ -263,6 +267,7 @@ pub fn ChatHeaderActions(
             <UserAccountMenu
                 email=email
                 version=version
+                role=role
                 on_logout=on_logout
                 show_logout=show_logout
             />

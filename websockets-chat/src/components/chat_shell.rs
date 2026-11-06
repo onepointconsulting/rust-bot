@@ -78,6 +78,9 @@ pub fn ChatShell(
     #[prop(into)] sidebar_open: Signal<bool>,
     #[prop(into)] user_email: Signal<Option<String>>,
     #[prop(into)] bot_version: Signal<Option<String>>,
+    /// The signed-in user's role from the `ready` frame, shown in the account menu.
+    #[prop(into)]
+    user_role: Signal<Option<String>>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Send + Sync + Copy,
@@ -261,6 +264,7 @@ pub fn ChatShell(
                             expanded=expanded
                             email=user_email
                             version=bot_version
+                            role=user_role
                             on_new_chat=on_new_chat_and_focus
                             show_new_chat=false
                             on_logout=on_logout
