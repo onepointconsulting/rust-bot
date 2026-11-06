@@ -52,7 +52,7 @@
       "pingTimeoutS": 30,
       "sslCertfile": "",
       "sslKeyfile": "",
-      "runtimeSurface": "browser"
+      "runtimeSurface": "native"
     },
     "allowFrom": [
       "*"

@@ -166,6 +166,21 @@ Two more things the config must get right in a container: `gateway.host` must be
 (with `127.0.0.1` the published port cannot reach the gateway) and `gateway.port` must match
 the container side of the port mapping (`18790`).
 
+The web UI channel also sets `channels.websocket.runtimeSurface` to `"native"` (both the image
+template and `onboard --mode docker` do this). With `"browser"`, the gateway allows
+configuration changes only from loopback clients. Inside the container, your browser's
+connection arrives from the Docker bridge gateway (for example `172.17.0.1`), not from
+`127.0.0.1`. The gateway would then treat you as remote and hide "+ Add MCP Server", the
+per-server settings forms and the MCP and tool on/off switches. This is safe because the port
+is published on the host's loopback only and these controls still need a signed-in admin. See
+[Security](#security) before you publish the port any wider.
+
+> **Upgrading an existing install:** the template only seeds `/data/config.json` on the first
+> start. If the Settings page shows no "+ Add MCP Server" and the switches are locked, change
+> `"runtimeSurface": "browser"` to `"native"` in the host folder's `config.json`, then restart
+> the container (`docker compose restart`). For an instance created with `onboard --mode docker`,
+> re-running it and answering `N` (refresh) makes this change for you.
+
 Notes:
 
 - Volume options are fixed when the volume is created. After changing `device`, remove the
@@ -210,6 +225,13 @@ docker compose run --rm rust-bot check-config
   tools, including the shell. `docker-compose.yml` therefore publishes the port on the
   host's loopback only. Put an authenticating reverse proxy in front of it, or enable
   `channels.websocket.jwt`, before exposing it.
+- **`runtimeSurface: "native"` trusts every client that can reach the port.** The Docker
+  config uses it because the port is published on `127.0.0.1` only (see
+  [Choosing the host folder](#choosing-the-host-folder-behind-data)). If you publish the port on
+  `0.0.0.0` or put it behind a reverse proxy, any signed-in admin who can reach it can change
+  the configuration (add MCP servers, switch tools on and off). Setting it back to `"browser"`
+  does not limit this to the host: in a container no client counts as loopback, so it turns
+  these controls off for everyone.
 - The container is the shell tool's sandbox. The template sets `tools.restrictToWorkspace`
   to `true`; mount only what the agent should be able to touch.
 - Never copy `credentials/` or `.env*` files into an image: `.dockerignore` excludes them.

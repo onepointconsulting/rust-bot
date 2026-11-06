@@ -46,6 +46,13 @@ pub const CONTAINER_GATEWAY_PORT: u16 = 18790;
 /// Bind address inside the container: with `127.0.0.1` the published port could not reach it.
 const CONTAINER_BIND_HOST: &str = "0.0.0.0";
 
+/// `channels.websocket.runtimeSurface` inside the container. The gateway sees browser
+/// connections coming from the Docker bridge gateway (e.g. `172.17.0.1`), not from loopback,
+/// so with `"browser"` it would treat the host's own browser as remote and hide the
+/// configuration controls (MCP/tool switches, "Add MCP Server"). The port is published on the
+/// host's loopback only, and those controls still require a signed-in admin.
+const CONTAINER_RUNTIME_SURFACE: &str = "native";
+
 /// Docker Hub repository of the published image; the tag is this binary's version.
 pub const DEFAULT_IMAGE_REPOSITORY: &str = "gilf/rust-bot";
 
@@ -528,7 +535,8 @@ fn restrict_to_owner(path: &Path) {
 }
 
 /// Set the values a container depends on: the gateway and the `websocket` channel bind
-/// `0.0.0.0:18790`, and JWT and login are on. Returns a note for every value that had to change
+/// `0.0.0.0:18790`, JWT and login are on, and the web UI runs as the `native` surface (see
+/// [`CONTAINER_RUNTIME_SURFACE`]). Returns a note for every value that had to change
 /// (a refreshed config may have been edited by hand).
 ///
 /// # Errors
@@ -589,6 +597,12 @@ pub fn enforce_container_invariants(config: &mut Config) -> Result<Vec<String>, 
         true.to_string(),
     );
     websocket.require_auth = true;
+    note(
+        &field("runtimeSurface"),
+        websocket.runtime_surface.clone(),
+        CONTAINER_RUNTIME_SURFACE.to_string(),
+    );
+    websocket.runtime_surface = CONTAINER_RUNTIME_SURFACE.to_string();
     let websocket_value = serde_json::to_value(&websocket)
         .map_err(|e| format!("Cannot write `channels.{CHANNEL_WEBSOCKET}`: {e}"))?;
     config
@@ -926,15 +940,34 @@ mod tests {
         assert_eq!(websocket.port, 18790);
         assert!(websocket.jwt.enabled);
         assert!(websocket.require_auth);
+        assert_eq!(websocket.runtime_surface, "native");
         assert!(
             changes
                 .iter()
                 .any(|change| change.starts_with("gateway.host")),
             "{changes:?}"
         );
+        assert!(
+            changes
+                .iter()
+                .any(|change| change.starts_with("channels.websocket.runtimeSurface")),
+            "{changes:?}"
+        );
 
         let again = enforce_container_invariants(&mut config).unwrap();
         assert!(again.is_empty(), "nothing left to change: {again:?}");
+    }
+
+    /// The image seeds `/data/config.json` from this template; it must use the same runtime
+    /// surface as `onboard --mode docker`, or the web UI hides its configuration controls.
+    #[test]
+    fn docker_config_template_uses_the_container_runtime_surface() {
+        let template: serde_json::Value =
+            serde_json::from_str(include_str!("../../docker/config.template.json")).unwrap();
+        assert_eq!(
+            template["channels"]["websocket"]["runtimeSurface"],
+            CONTAINER_RUNTIME_SURFACE
+        );
     }
 
     #[test]
