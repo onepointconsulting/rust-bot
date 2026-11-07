@@ -14,14 +14,18 @@
 //! The row ordering, filtering and labelling are plain functions so they are
 //! unit-testable on the host target without Leptos.
 
-use chat_ui::models::{McpServerSettingSummary, ToolConfigSummary, ToolSettingSummary};
+use std::collections::HashMap;
+
+use chat_ui::models::{
+    McpServerSettingSummary, ToolConfigSummary, ToolFieldSummary, ToolSettingSummary,
+};
 use leptos::prelude::*;
 
 use super::add_mcp_server_panel::{AddMcpServerButton, AddMcpServerPanel, ADD_BUSY_KEY};
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
-use super::tool_config_form::{ToolConfigChange, ToolConfigForm};
+use super::tool_config_form::{initial_drafts, ToolConfigChange, ToolConfigForm};
 
 /// Tooltip on the switch of a tool the gateway itself depends on.
 const PROTECTED_TOOL_HINT: &str = "Required by the gateway; it cannot be switched off.";
@@ -35,7 +39,7 @@ const OFFLINE_NOTICE: &str =
     "Reconnecting to the gateway… Changes can be saved again once it is back.";
 
 /// Which page of the Settings dialog's menu is showing.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SettingsPage {
     #[default]
     Tools,
@@ -316,6 +320,33 @@ pub fn after_reconnect(restart_was_under_way: bool, request_in_flight: bool) -> 
     }
 }
 
+/// Which row a settings form's drafts belong to: the page (a tool and an MCP server may
+/// share a name) and the row's name.
+pub type DraftKey = (SettingsPage, String);
+
+/// The unsaved drafts (setting name -> text) of one row's settings form.
+pub type FormDrafts = HashMap<String, String>;
+
+/// The drafts kept for the row `key`, created with `make_initial` on first use, so a
+/// form rebuilt for the same row continues where the user left off.
+pub fn drafts_for_row<V: Clone>(
+    store: &mut HashMap<DraftKey, V>,
+    key: DraftKey,
+    make_initial: impl FnOnce() -> V,
+) -> V {
+    store.entry(key).or_insert_with(make_initial).clone()
+}
+
+/// Drop the drafts of the row `key`: its form is rebuilt from the stored values next.
+pub fn forget_row_drafts<V>(store: &mut HashMap<DraftKey, V>, key: &DraftKey) {
+    store.remove(key);
+}
+
+/// Drop the drafts of every row on `page`, e.g. when its whole list was fetched again.
+pub fn forget_page_drafts<V>(store: &mut HashMap<DraftKey, V>, page: SettingsPage) {
+    store.retain(|(draft_page, _), _| *draft_page != page);
+}
+
 /// Everything the pages show, as signals owned by the app: which page is open, the two
 /// lists, and the state of the switch being changed.
 #[derive(Clone, Copy)]
@@ -350,6 +381,10 @@ pub struct SettingsPanel {
     pub add_error: RwSignal<Option<String>>,
     /// The success message of the last add, shown until the restart it asks for.
     pub added_notice: RwSignal<Option<String>>,
+    /// The unsaved drafts of each row's settings form. Kept here, not in the form, since
+    /// the list rebuilds its rows on every change (switch, save, search); reference
+    /// counted signals so a rebuilt row keeps editing the same drafts.
+    form_drafts: StoredValue<HashMap<DraftKey, ArcRwSignal<FormDrafts>>>,
 }
 
 impl SettingsPanel {
@@ -371,7 +406,36 @@ impl SettingsPanel {
             adding: RwSignal::new(false),
             add_error: RwSignal::new(None),
             added_notice: RwSignal::new(None),
+            form_drafts: StoredValue::new(HashMap::new()),
         }
+    }
+
+    /// The drafts of the settings form of row `name` on `page`, starting from what
+    /// `fields` show the first time the form is opened.
+    pub fn row_drafts(
+        &self,
+        page: SettingsPage,
+        name: &str,
+        fields: &[ToolFieldSummary],
+    ) -> ArcRwSignal<FormDrafts> {
+        let start_drafts = || ArcRwSignal::new(initial_drafts(fields));
+        self.form_drafts
+            .try_update_value(|store| drafts_for_row(store, (page, name.to_string()), start_drafts))
+            // Only when the panel was disposed: a form that keeps nothing still works.
+            .unwrap_or_else(start_drafts)
+    }
+
+    /// Forget the drafts of row `name` on `page` (its save succeeded).
+    pub fn forget_row_drafts(&self, page: SettingsPage, name: &str) {
+        let key = (page, name.to_string());
+        self.form_drafts
+            .update_value(|store| forget_row_drafts(store, &key));
+    }
+
+    /// Forget the drafts of every row on `page` (its list was fetched again).
+    pub fn forget_page_drafts(&self, page: SettingsPage) {
+        self.form_drafts
+            .update_value(|store| forget_page_drafts(store, page));
     }
 
     /// Close the "Add MCP Server" panel and forget its last error.
@@ -433,6 +497,7 @@ impl SettingsPanel {
         self.new_server_form.set(None);
         self.close_add_panel();
         self.added_notice.set(None);
+        self.form_drafts.update_value(HashMap::clear);
     }
 }
 
@@ -515,6 +580,29 @@ fn AddServerSection(panel: SettingsPanel, actions: SettingsActions) -> impl Into
                 },
             )
         }}
+    }
+}
+
+/// The opened settings form of a row on `page`, editing the drafts the panel keeps for
+/// it (created when the form is first opened). They are keyed by the form's name, which
+/// is the name the gateway's save confirmation carries.
+#[component]
+fn RowSettingsForm(
+    config: ToolConfigSummary,
+    page: SettingsPage,
+    panel: SettingsPanel,
+    #[prop(into)] busy: Signal<bool>,
+    on_save: Callback<ToolConfigChange>,
+) -> impl IntoView {
+    let drafts = RwSignal::from(panel.row_drafts(page, &config.name, &config.fields));
+    view! {
+        <ToolConfigForm
+            config=config
+            drafts=drafts
+            can_modify=Signal::derive(move || panel.can_change())
+            busy=busy
+            on_save=on_save
+        />
     }
 }
 
@@ -626,9 +714,10 @@ fn SettingRowView(
                             panel.expanded_tool.get().as_deref() == Some(name_for_open.as_str())
                         }>
                             <div class="mt-3">
-                                <ToolConfigForm
+                                <RowSettingsForm
                                     config=config.clone()
-                                    can_modify=Signal::derive(move || panel.can_change())
+                                    page=page
+                                    panel=panel
                                     busy=form_busy
                                     on_save=on_save_form
                                 />
@@ -1046,6 +1135,139 @@ mod tests {
         assert!(!panel.adding.get_untracked());
         assert!(panel.add_error.get_untracked().is_none());
         assert!(panel.added_notice.get_untracked().is_none());
+    }
+
+    /// A form with only a Tool timeout field, stored as `stored` (`None`: left out).
+    fn timeout_form(name: &str, stored: Option<i64>) -> ToolConfigSummary {
+        ToolConfigSummary {
+            fields: vec![ToolFieldSummary {
+                name: "toolTimeout".to_string(),
+                label: "Tool timeout".to_string(),
+                help: String::new(),
+                kind: chat_ui::models::ToolFieldKind::Integer {
+                    min: Some(1),
+                    max: None,
+                },
+                secret: false,
+                env_var: String::new(),
+                configured: stored.is_some(),
+                value: stored.map(serde_json::Value::from),
+                default: Some(serde_json::Value::from(30)),
+            }],
+            ..form(name)
+        }
+    }
+
+    /// Type `text` into the Tool timeout of row `name` on the MCP Servers page.
+    fn type_timeout(panel: &SettingsPanel, name: &str, text: &str) {
+        let fields = timeout_form(name, None).fields;
+        panel
+            .row_drafts(SettingsPage::McpServers, name, &fields)
+            .update(|drafts| {
+                drafts.insert("toolTimeout".to_string(), text.to_string());
+            });
+    }
+
+    /// The Tool timeout draft a rebuilt form of row `name` would show.
+    fn shown_timeout(panel: &SettingsPanel, name: &str, stored: Option<i64>) -> String {
+        let fields = timeout_form(name, stored).fields;
+        panel
+            .row_drafts(SettingsPage::McpServers, name, &fields)
+            .get_untracked()["toolTimeout"]
+            .clone()
+    }
+
+    #[test]
+    fn a_new_form_starts_from_the_stored_values() {
+        let panel = SettingsPanel::new();
+
+        assert_eq!(shown_timeout(&panel, "ems", None), "");
+        assert_eq!(shown_timeout(&panel, "files", Some(45)), "45");
+    }
+
+    #[test]
+    fn unsaved_drafts_survive_the_list_being_replaced() {
+        let panel = SettingsPanel::new();
+        panel
+            .mcp_servers
+            .set(vec![mcp_server("cms", false), mcp_server("ems", false)]);
+        type_timeout(&panel, "ems", "60");
+
+        // Flipping another row's switch replaces the list, which rebuilds every row.
+        panel
+            .mcp_servers
+            .update(|servers| apply_on_demand(servers, "cms", true));
+
+        assert_eq!(shown_timeout(&panel, "ems", None), "60");
+    }
+
+    #[test]
+    fn a_saved_row_starts_again_from_the_stored_values() {
+        let panel = SettingsPanel::new();
+        type_timeout(&panel, "ems", "60");
+        type_timeout(&panel, "cms", "90");
+
+        panel.forget_row_drafts(SettingsPage::McpServers, "ems");
+
+        assert_eq!(shown_timeout(&panel, "ems", Some(60)), "60");
+        assert_eq!(
+            shown_timeout(&panel, "ems", Some(45)),
+            "60",
+            "the rebuilt form's drafts are reused"
+        );
+        assert_eq!(
+            shown_timeout(&panel, "cms", None),
+            "90",
+            "other rows keep theirs"
+        );
+    }
+
+    #[test]
+    fn a_fetched_list_and_clearing_the_panel_drop_the_drafts() {
+        let panel = SettingsPanel::new();
+        type_timeout(&panel, "ems", "60");
+        panel.forget_page_drafts(SettingsPage::Tools);
+        assert_eq!(
+            shown_timeout(&panel, "ems", None),
+            "60",
+            "another page's list"
+        );
+
+        panel.forget_page_drafts(SettingsPage::McpServers);
+        assert_eq!(shown_timeout(&panel, "ems", None), "");
+
+        type_timeout(&panel, "ems", "60");
+        panel.clear();
+        assert_eq!(shown_timeout(&panel, "ems", None), "");
+    }
+
+    #[test]
+    fn drafts_are_kept_per_page_and_row() {
+        let mut store: HashMap<DraftKey, String> = HashMap::new();
+        let tools_gmail = (SettingsPage::Tools, "gmail".to_string());
+        let mcp_gmail = (SettingsPage::McpServers, "gmail".to_string());
+
+        assert_eq!(
+            drafts_for_row(&mut store, tools_gmail.clone(), || "tool".into()),
+            "tool"
+        );
+        assert_eq!(
+            drafts_for_row(&mut store, mcp_gmail.clone(), || "mcp".into()),
+            "mcp"
+        );
+        assert_eq!(
+            drafts_for_row(&mut store, tools_gmail.clone(), || "new".into()),
+            "tool"
+        );
+
+        forget_row_drafts(&mut store, &tools_gmail);
+        assert_eq!(
+            drafts_for_row(&mut store, tools_gmail.clone(), || "new".into()),
+            "new"
+        );
+
+        forget_page_drafts(&mut store, SettingsPage::McpServers);
+        assert!(!store.contains_key(&mcp_gmail) && store.contains_key(&tools_gmail));
     }
 
     #[test]

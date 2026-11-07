@@ -269,16 +269,20 @@ pub(super) fn FieldInput(
 }
 
 /// The inline settings form of one tool section: an input per setting and a Save button
-/// that stays off until something valid changed. Drafts live only in this component and
-/// are rebuilt from the gateway's reply after a save.
+/// that stays off until something valid changed.
+///
+/// `drafts` is owned by the caller (start it from [`initial_drafts`]) so unsaved edits
+/// outlive this component: the settings list rebuilds its rows whenever it changes (a
+/// switch is flipped, another row is saved, the search text changes), and drafts kept
+/// here would silently fall back to the stored values.
 #[component]
 pub fn ToolConfigForm(
     config: ToolConfigSummary,
+    drafts: RwSignal<HashMap<String, String>>,
     #[prop(into)] can_modify: Signal<bool>,
     #[prop(into)] busy: Signal<bool>,
     on_save: Callback<ToolConfigChange>,
 ) -> impl IntoView {
-    let drafts = RwSignal::new(initial_drafts(&config.fields));
     let fields_for_check = config.fields.clone();
     let fields_for_error = config.fields.clone();
     let fields_for_save = config.fields.clone();
@@ -439,6 +443,28 @@ mod tests {
             Err("n must be a whole number.".to_string())
         );
         assert!(!can_save(&fields, &edited));
+    }
+
+    #[test]
+    fn a_number_left_out_of_the_file_is_sent_once_typed_even_as_its_default() {
+        let mut timeout = field(
+            "toolTimeout",
+            ToolFieldKind::Integer {
+                min: Some(1),
+                max: None,
+            },
+            None,
+        );
+        timeout.default = Some(json!(30));
+        let fields = vec![timeout];
+
+        assert_eq!(initial_draft(&fields[0]), "");
+        assert_eq!(field_placeholder(&fields[0]), "30");
+        let changes = changed_values(&fields, &drafts(&[("toolTimeout", "30")])).unwrap();
+        assert_eq!(changes["toolTimeout"], json!(30));
+        assert!(changed_values(&fields, &drafts(&[("toolTimeout", "")]))
+            .unwrap()
+            .is_empty());
     }
 
     #[test]

@@ -1135,6 +1135,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
         ServerEvent::ToolSettings { tools, can_modify } => {
             // A reply that lands after the dialog closed must not leave data behind.
             if ctx.settings_open.get_untracked() {
+                // A fresh list: its forms start again from what is stored.
+                ctx.settings_panel.forget_page_drafts(SettingsPage::Tools);
                 ctx.settings_panel.tools.set(tools);
                 ctx.settings_panel.can_modify.set(can_modify);
                 ctx.settings_panel.tools_loaded.set(true);
@@ -1146,6 +1148,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             restart_required,
         } => {
             finish_setting_change(ctx, restart_required);
+            // Saved: the form shows the stored values again (drafts survive a refusal).
+            ctx.settings_panel
+                .forget_row_drafts(SettingsPage::Tools, &tool);
             if let Some(summary) = summary {
                 ctx.settings_panel
                     .tools
@@ -1171,6 +1176,9 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             new_server_form,
         } => {
             if ctx.settings_open.get_untracked() {
+                // A fresh list: its forms start again from what is stored.
+                ctx.settings_panel
+                    .forget_page_drafts(SettingsPage::McpServers);
                 ctx.settings_panel.mcp_servers.set(servers);
                 ctx.settings_panel.new_server_form.set(new_server_form);
                 ctx.settings_panel.can_modify.set(can_modify);
@@ -1225,11 +1233,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             }
         }
         ServerEvent::McpServerConfigSet {
-            name: _,
+            name,
             server,
             restart_required,
         } => {
             finish_setting_change(ctx, restart_required);
+            // Saved: the form shows the stored values again (drafts survive a refusal).
+            ctx.settings_panel
+                .forget_row_drafts(SettingsPage::McpServers, &name);
             if let Some(server) = server {
                 ctx.settings_panel
                     .mcp_servers

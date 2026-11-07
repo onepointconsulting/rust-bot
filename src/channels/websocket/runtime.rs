@@ -3414,6 +3414,14 @@ async fn send_setting_error(
     detail: &str,
     message: &str,
 ) {
+    // Only the kind, name and detail code: the message may quote submitted values, and
+    // those can be credentials.
+    log::info!(
+        "Setting change refused: kind={}, name='{}', detail={}",
+        kind.as_str(),
+        name,
+        detail
+    );
     send_event(
         shared,
         connection_id,

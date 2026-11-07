@@ -24,7 +24,7 @@ use super::config_toggles::{
     parse_root, render, tools_object_mut,
 };
 use crate::agent::tools::tool_settings_api::{
-    ToolSettingsSummary, check_value, field_kind, summarize_field,
+    FieldKind, ToolSettingsSummary, check_value, field_kind, summarize_field,
 };
 use crate::config::loader::referenced_env_vars;
 use crate::config::schema::McpServerConfig;
@@ -73,7 +73,7 @@ fn stored_value<'a>(server: &'a Map<String, Value>, name: &str) -> Option<&'a Va
 }
 
 /// The settings form of the MCP server `name` in the config `text`, showing what the
-/// file says (or the default for a setting it leaves out). Like a tool section's form,
+/// file says (see [`shown_value`] for a setting it leaves out). Like a tool section's form,
 /// `enabled` is the state of the row's switch (the server's `enabled` flag, `true` when
 /// absent); the flag is switched by its own request, not through the form.
 pub fn mcp_server_form(text: &str, name: &str) -> Result<ToolSettingsSummary, ToggleError> {
@@ -93,7 +93,8 @@ pub fn mcp_server_form(text: &str, name: &str) -> Result<ToolSettingsSummary, To
     })
 }
 
-/// The blank form for a server that does not exist yet: every setting at its default.
+/// The blank form for a server that does not exist yet: every setting at its default
+/// (numbers and text empty, with the default as placeholder; see [`shown_value`]).
 /// It has no name (the browser asks for one) and no switch.
 pub fn new_server_form() -> ToolSettingsSummary {
     ToolSettingsSummary {
@@ -106,21 +107,33 @@ pub fn new_server_form() -> ToolSettingsSummary {
     }
 }
 
-/// One form field per setting: what `server` stores for it, else the default.
+/// One form field per setting, showing [`shown_value`].
 fn form_fields(
     server: Option<&Map<String, Value>>,
 ) -> Vec<crate::agent::tools::tool_settings_api::ToolFieldSummary> {
     form_properties()
         .iter()
         .filter_map(|(setting, property)| {
-            let shown = server
-                .and_then(|server| stored_value(server, setting))
-                .or_else(|| property.get("default"))
-                .cloned()
-                .unwrap_or(Value::Null);
-            summarize_field(setting, property, &shown)
+            summarize_field(setting, property, &shown_value(server, setting, property))
         })
         .collect()
+}
+
+/// The value the form shows for `setting`: what `server` stores for it, else (for a
+/// server that leaves it out, or a server not added yet) the schema default.
+///
+/// A number or text the file leaves out is shown empty instead, so the browser displays
+/// the default as a placeholder: shown as a value, typing the default itself would look
+/// like "no change" and never be written. Lists, maps and choices keep their default
+/// (an empty `enabledTools` would read as "no tools"; choices label their default).
+fn shown_value(server: Option<&Map<String, Value>>, setting: &str, property: &Value) -> Value {
+    if let Some(stored) = server.and_then(|server| stored_value(server, setting)) {
+        return stored.clone();
+    }
+    match field_kind(property) {
+        Some(FieldKind::Integer { .. } | FieldKind::Text) => Value::Null,
+        _ => property.get("default").cloned().unwrap_or(Value::Null),
+    }
 }
 
 /// The MCP server rows of the config `text` (see [`mcp_server_setting_rows`]), each
@@ -322,7 +335,7 @@ fn with_mcp_server_added_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tools::tool_settings_api::{FieldKind, ToolFieldSummary};
+    use crate::agent::tools::tool_settings_api::ToolFieldSummary;
     use serde_json::json;
 
     const CONFIG: &str = r#"{
@@ -481,8 +494,30 @@ mod tests {
 
         assert_eq!(field(&form, "enabledTools").value, Some(json!(["*"])));
         assert_eq!(field(&form, "exposure").value, Some(json!("direct")));
-        assert_eq!(field(&form, "url").value, Some(json!("")));
         assert_eq!(field(&form, "transportType").value, Some(Value::Null));
+        assert_eq!(field(&form, "toolTimeout").value, Some(json!(45)), "stored");
+    }
+
+    #[test]
+    fn numbers_and_text_the_file_leaves_out_are_empty_with_the_default_as_placeholder() {
+        let cms = mcp_server_form(CONFIG, "cms").unwrap();
+
+        let timeout = field(&cms, "toolTimeout");
+        assert_eq!(timeout.value, Some(Value::Null));
+        assert_eq!(timeout.default, Some(json!(30)));
+        assert_eq!(field(&cms, "command").value, Some(Value::Null));
+        assert_eq!(field(&cms, "url").value, Some(json!("https://cms/mcp")));
+    }
+
+    #[test]
+    fn entering_the_default_timeout_writes_it() {
+        let changes = change(&[("toolTimeout", json!(30))]);
+
+        let updated = with_mcp_server_settings(CONFIG, "cms", &changes)
+            .unwrap()
+            .expect("an absent timeout set to its default is still a change");
+
+        assert_eq!(server(&updated, "cms")["toolTimeout"], 30);
     }
 
     #[test]
@@ -692,10 +727,12 @@ mod tests {
         assert_eq!(names.len(), 10);
         assert!(names.contains(&"command") && names.contains(&"headers"));
         assert!(form.name.is_empty() && form.enabled.is_none());
-        assert_eq!(field(&form, "toolTimeout").value, Some(json!(30)));
+        let timeout = field(&form, "toolTimeout");
+        assert_eq!(timeout.value, Some(Value::Null));
+        assert_eq!(timeout.default, Some(json!(30)));
         assert_eq!(field(&form, "enabledTools").value, Some(json!(["*"])));
         assert_eq!(field(&form, "exposure").value, Some(json!("direct")));
-        assert_eq!(field(&form, "command").value, Some(json!("")));
+        assert_eq!(field(&form, "command").value, Some(Value::Null));
     }
 
     #[test]
