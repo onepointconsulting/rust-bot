@@ -313,7 +313,12 @@ fn default_model_preset_provider() -> String {
 /// Reasoning-effort levels a model preset (or `agents.reasoningEffort`) can choose from,
 /// as offered by the setup wizard and the WebUI's Models page. `"none"` is how the
 /// choice lists show "no reasoning effort": it is stored as `null`, never as `"none"`.
-pub const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
+///
+/// `xhigh` and `max` are passed through as they are where the provider takes an effort
+/// level (OpenAI, Anthropic adaptive thinking); Anthropic's budget-based thinking treats
+/// them as `high`.
+pub const REASONING_EFFORT_CHOICES: [&str; 7] =
+    ["none", "low", "medium", "high", "xhigh", "max", "adaptive"];
 
 /// The choice that means "no reasoning effort" in [`REASONING_EFFORT_CHOICES`]; stored as `null`.
 pub const REASONING_EFFORT_NONE: &str = "none";

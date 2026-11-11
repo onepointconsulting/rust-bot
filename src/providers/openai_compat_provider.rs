@@ -32,6 +32,76 @@ pub(crate) fn body_preview(body: &str) -> String {
     preview
 }
 
+/// POST `body` as JSON to `url` and return the parsed JSON response. The body is
+/// parsed as a `Value` so unknown fields do not have to match a fixed schema.
+///
+/// Every failure is described in full (what failed, where, and the underlying
+/// cause), because the text ends up in front of the user. Shared by the Chat
+/// Completions and Responses providers.
+pub(crate) async fn post_json(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<serde_json::Value, String> {
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| format!("request to {url} failed: {}", describe_error_chain(&e)))?;
+
+    let status = response.status();
+    // The body is read as text first: decoding it straight to JSON would turn
+    // a gateway's non-JSON error page into an opaque "error decoding response body".
+    let text = response.text().await.map_err(|e| {
+        format!(
+            "failed to read the response body (HTTP {status}) from {url}: {}",
+            describe_error_chain(&e)
+        )
+    })?;
+    OpenAICompatProvider::parse_json_response_body(status, &text, url)
+}
+
+/// POST `body` as JSON to `url`, asking for a server-sent event stream.
+///
+/// Returns the response once its status is a success, ready for its byte stream to
+/// be read. A failed request or an error status becomes an error [`LLMResponse`]
+/// naming the HTTP status and the API's error message.
+pub(crate) async fn post_sse(
+    client: &reqwest::Client,
+    url: &str,
+    body: &serde_json::Value,
+) -> Result<reqwest::Response, LLMResponse> {
+    let response = client
+        .post(url)
+        .header("Content-Type", "application/json")
+        .header(reqwest::header::ACCEPT, "text/event-stream")
+        .json(body)
+        .send()
+        .await
+        .map_err(|e| {
+            LLMResponse::error(format!(
+                "request to {url} failed: {}",
+                describe_error_chain(&e)
+            ))
+        })?;
+
+    let status = response.status();
+    if status.is_success() {
+        return Ok(response);
+    }
+    let text = response.text().await.unwrap_or_default();
+    Err(LLMResponse::error(http_error_message(status, &text)))
+}
+
+/// `HTTP {status}: {message}` for an error response, where the message is the API's
+/// `error.message` when the body carries one, else the start of the body.
+fn http_error_message(status: reqwest::StatusCode, body: &str) -> String {
+    let message = OpenAICompatProvider::extract_api_error_message(body);
+    format!("HTTP {status}: {}", body_preview(&message))
+}
+
 pub struct OpenAICompatProvider {
     api_key: Option<String>,
     api_base: Option<String>,
@@ -97,7 +167,11 @@ impl OpenAICompatProvider {
             .collect()
     }
 
-    fn parse_tool_arguments(arguments_json: &str) -> HashMap<String, serde_json::Value> {
+    /// Parse a tool call's JSON `arguments` text. Malformed JSON does not fail the
+    /// call: the parse error and the start of the raw text are returned under
+    /// [`Self::ARG_PARSE_ERROR_KEY`] / [`Self::ARG_PARSE_RAW_KEY`] so the tool layer can
+    /// report them to the model.
+    pub(crate) fn parse_tool_arguments(arguments_json: &str) -> HashMap<String, serde_json::Value> {
         match serde_json::from_str(arguments_json) {
             Ok(args) => args,
             Err(err) => {
@@ -310,8 +384,16 @@ impl OpenAICompatProvider {
         header_map
     }
 
-    fn setup_env(&self, api_key_option: Option<String>, api_base: Option<String>) {
-        let spec_option = self.spec.as_ref();
+    /// Export the provider's API key (and `env_extras`) as environment variables, as
+    /// declared by its registry `spec`, for code that reads them from the environment.
+    /// An existing variable is kept unless the provider is a gateway.
+    ///
+    /// Shared with `OpenAIResponsesProvider`.
+    pub(crate) fn export_provider_env(
+        spec_option: Option<&ProviderSpec>,
+        api_key_option: Option<String>,
+        api_base: Option<String>,
+    ) {
         if spec_option.is_none() || spec_option.unwrap().env_key.is_empty() {
             return;
         }
@@ -644,11 +726,10 @@ impl OpenAICompatProvider {
             .filter_map(Self::map_request_message)
             .collect();
 
-        let is_direct_openai_api = self.is_direct_openai_api();
         let mut request = serde_json::json!({
             "model": model_name,
             "messages": chat_messages,
-            Self::max_tokens_key(is_direct_openai_api): max_tokens as u32,
+            "max_tokens": max_tokens as u32,
         });
         if let Some(temperature) = temperature {
             log::info!("temperature: {}", temperature);
@@ -663,15 +744,12 @@ impl OpenAICompatProvider {
             request["tools"] = serde_json::Value::Array(tool_list);
         }
 
-        // api.openai.com rejects function tools combined with any reasoning effort on
-        // /v1/chat/completions ("Function tools with reasoning_effort are not supported ...
-        // set reasoning_effort to 'none'"), so the configured effort is deliberately ignored.
+        // api.openai.com itself is served by `OpenAIResponsesProvider` (see
+        // `providers::factory`), so the configured effort always goes through unchanged.
         if let Some(tc) = tool_choice {
             request["tool_choice"] = tc.clone();
         }
-        if is_direct_openai_api {
-            request["reasoning_effort"] = serde_json::Value::String("none".to_string());
-        } else if let Some(effort) = reasoning_effort
+        if let Some(effort) = reasoning_effort
             && !effort.is_empty()
         {
             request["reasoning_effort"] = serde_json::Value::String(effort);
@@ -680,60 +758,19 @@ impl OpenAICompatProvider {
         request
     }
 
-    /// Whether requests go straight to api.openai.com.
-    ///
-    /// Judged from the resolved chat-completions URL rather than `api_base`, because that URL is
-    /// already trailing-slash-trimmed and falls back to api.openai.com when no base is configured.
-    fn is_direct_openai_api(&self) -> bool {
-        self.chat_completions_url == format!("{}/chat/completions", Self::DEFAULT_API_BASE)
-    }
-
-    /// Name of the output-token-limit field: api.openai.com requires `max_completion_tokens`
-    /// (newer models reject `max_tokens`); other OpenAI-compatible gateways expect `max_tokens`.
-    fn max_tokens_key(is_direct_openai_api: bool) -> &'static str {
-        if is_direct_openai_api {
-            "max_completion_tokens"
-        } else {
-            "max_tokens"
-        }
-    }
-
     fn apply_stream_flags(body: &mut serde_json::Value) {
         body["stream"] = serde_json::json!(true);
         body["stream_options"] = serde_json::json!({ "include_usage": true });
     }
 
-    /// POST the request as raw JSON. The body is parsed as a `Value` so
-    /// unknown gateway fields do not have to match a fixed response schema.
-    ///
-    /// Every failure is described in full (what failed, where, and the
-    /// underlying cause), because the text ends up in front of the user.
+    /// POST the request to the chat-completions endpoint (see [`post_json`]).
     async fn chat_raw(&self, request: &serde_json::Value) -> Result<serde_json::Value, String> {
-        let url = &self.chat_completions_url;
-        let resp = self
-            .http_client
-            .post(url)
-            .header("Content-Type", "application/json")
-            .json(request)
-            .send()
-            .await
-            .map_err(|e| format!("request to {url} failed: {}", describe_error_chain(&e)))?;
-
-        let status = resp.status();
-        // The body is read as text first: decoding it straight to JSON would turn
-        // a gateway's non-JSON error page into an opaque "error decoding response body".
-        let body = resp.text().await.map_err(|e| {
-            format!(
-                "failed to read the response body (HTTP {status}) from {url}: {}",
-                describe_error_chain(&e)
-            )
-        })?;
-        Self::parse_chat_response_body(status, &body, url)
+        post_json(&self.http_client, &self.chat_completions_url, request).await
     }
 
-    /// Turn a finished chat-completions response into its JSON, or into an error
-    /// that names the HTTP status, the endpoint and what the body looked like.
-    fn parse_chat_response_body(
+    /// Turn a finished response into its JSON, or into an error that names the HTTP
+    /// status, the endpoint and what the body looked like.
+    pub(crate) fn parse_json_response_body(
         status: reqwest::StatusCode,
         body: &str,
         url: &str,
@@ -762,7 +799,7 @@ impl OpenAICompatProvider {
         n.as_f64().or_else(|| n.as_u64().map(|n| n as f64))
     }
 
-    /// Map an OpenAI-compat `usage` object onto [`LLMUsage`].
+    /// Map an OpenAI `usage` object (Chat Completions or Responses) onto [`LLMUsage`].
     ///
     /// OpenAI `prompt_tokens` already includes cache hits. Those are stored as
     /// `cache_read_input_tokens` and subtracted from `input_tokens` so
@@ -773,7 +810,12 @@ impl OpenAICompatProvider {
         let output = Self::json_u32(usage, "completion_tokens")
             .or_else(|| Self::json_u32(usage, "output_tokens"));
 
-        let details = usage.get("prompt_tokens_details");
+        // Chat Completions names the breakdowns `prompt_tokens_details` /
+        // `completion_tokens_details`; the Responses API `input_tokens_details` /
+        // `output_tokens_details`.
+        let details = usage
+            .get("prompt_tokens_details")
+            .or_else(|| usage.get("input_tokens_details"));
         let cached = details
             .and_then(|d| Self::json_u32(d, "cached_tokens"))
             .or_else(|| Self::json_u32(usage, "cache_read_input_tokens"))
@@ -784,6 +826,7 @@ impl OpenAICompatProvider {
             .unwrap_or(0);
         let reasoning = usage
             .get("completion_tokens_details")
+            .or_else(|| usage.get("output_tokens_details"))
             .and_then(|d| Self::json_u32(d, "reasoning_tokens"))
             .filter(|&n| n > 0);
 
@@ -820,14 +863,7 @@ impl OpenAICompatProvider {
             .and_then(|c| c.as_array())
             .filter(|c| !c.is_empty())
         else {
-            return LLMResponse {
-                content: Some("Error: API returned empty choices.".to_string()),
-                finish_reason: "error".to_string(),
-                tool_calls: vec![],
-                usage: LLMUsage::new(),
-                reasoning_content: None,
-                thinking_blocks: None,
-            };
+            return LLMResponse::error("Error: API returned empty choices.");
         };
 
         let empty_map = serde_json::Map::new();
@@ -1061,7 +1097,7 @@ impl OpenAICompatProvider {
     ///
     /// OpenRouter (and similar gateways) often return
     /// `{"error":{"message":"...","code":404}}` as a stream event or HTTP body.
-    fn extract_api_error_message(raw: &str) -> String {
+    pub(crate) fn extract_api_error_message(raw: &str) -> String {
         if let Some(msg) = Self::api_error_message_from_json(raw) {
             return msg;
         }
@@ -1148,7 +1184,11 @@ impl LLMProvider for OpenAICompatProvider {
         };
 
         // Setup environment if appropriate.
-        provider.setup_env(provider.api_key.clone(), provider.api_base.clone());
+        Self::export_provider_env(
+            provider.spec.as_ref(),
+            provider.api_key.clone(),
+            provider.api_base.clone(),
+        );
 
         provider
     }
@@ -1204,14 +1244,7 @@ impl LLMProvider for OpenAICompatProvider {
         );
         match self.chat_raw(&request).await {
             Ok(response) => OpenAICompatProvider::parse_response(&response),
-            Err(e) => LLMResponse {
-                content: Some(e),
-                finish_reason: "error".to_string(),
-                tool_calls: Vec::new(),
-                usage: LLMUsage::new(),
-                reasoning_content: None,
-                thinking_blocks: None,
-            },
+            Err(e) => LLMResponse::error(e),
         }
     }
 
@@ -1243,49 +1276,10 @@ impl LLMProvider for OpenAICompatProvider {
         );
         Self::apply_stream_flags(&mut body);
 
-        let response = match self
-            .http_client
-            .post(&self.chat_completions_url)
-            .header("Content-Type", "application/json")
-            .header(reqwest::header::ACCEPT, "text/event-stream")
-            .json(&body)
-            .send()
-            .await
-        {
+        let response = match post_sse(&self.http_client, &self.chat_completions_url, &body).await {
             Ok(response) => response,
-            Err(e) => {
-                return LLMResponse {
-                    content: Some(format!(
-                        "request to {} failed: {}",
-                        self.chat_completions_url,
-                        describe_error_chain(&e)
-                    )),
-                    finish_reason: "error".to_string(),
-                    tool_calls: Vec::new(),
-                    usage: LLMUsage::new(),
-                    reasoning_content: None,
-                    thinking_blocks: None,
-                };
-            }
+            Err(error_response) => return error_response,
         };
-
-        if !response.status().is_success() {
-            let status = response.status();
-            let body = response.text().await.unwrap_or_default();
-            let message = Self::extract_api_error_message(&body);
-            return LLMResponse {
-                content: Some(if message.is_empty() {
-                    format!("HTTP {status}: {body}")
-                } else {
-                    message
-                }),
-                finish_reason: "error".to_string(),
-                tool_calls: Vec::new(),
-                usage: LLMUsage::new(),
-                reasoning_content: None,
-                thinking_blocks: None,
-            };
-        }
 
         let (idle_timeout, idle_timeout_s) =
             crate::providers::openai_compat_stream::stream_idle_timeout();
@@ -1893,7 +1887,7 @@ mod tests {
 
     #[test]
     fn a_json_success_body_is_parsed() {
-        let value = OpenAICompatProvider::parse_chat_response_body(
+        let value = OpenAICompatProvider::parse_json_response_body(
             reqwest::StatusCode::OK,
             r#"{"choices":[]}"#,
             TEST_URL,
@@ -1904,7 +1898,7 @@ mod tests {
 
     #[test]
     fn a_success_status_with_a_truncated_body_names_the_cause_and_the_body() {
-        let error = OpenAICompatProvider::parse_chat_response_body(
+        let error = OpenAICompatProvider::parse_json_response_body(
             reqwest::StatusCode::OK,
             r#"{"choices":[{"message":"#,
             TEST_URL,
@@ -1926,14 +1920,14 @@ mod tests {
     #[test]
     fn an_empty_success_body_is_reported_as_empty() {
         let error =
-            OpenAICompatProvider::parse_chat_response_body(reqwest::StatusCode::OK, "", TEST_URL)
+            OpenAICompatProvider::parse_json_response_body(reqwest::StatusCode::OK, "", TEST_URL)
                 .unwrap_err();
         assert!(error.contains("body starts: (empty)"), "{error}");
     }
 
     #[test]
     fn a_non_json_error_page_reports_the_status_instead_of_a_decode_error() {
-        let error = OpenAICompatProvider::parse_chat_response_body(
+        let error = OpenAICompatProvider::parse_json_response_body(
             reqwest::StatusCode::BAD_GATEWAY,
             "<html>\n<body>Bad   gateway</body>\n</html>",
             TEST_URL,
@@ -1947,7 +1941,7 @@ mod tests {
 
     #[test]
     fn a_json_error_body_reports_the_api_message() {
-        let error = OpenAICompatProvider::parse_chat_response_body(
+        let error = OpenAICompatProvider::parse_json_response_body(
             reqwest::StatusCode::TOO_MANY_REQUESTS,
             r#"{"error":{"message":"Rate limit reached","code":429}}"#,
             TEST_URL,
@@ -1959,7 +1953,7 @@ mod tests {
     #[test]
     fn body_errors_are_classified_as_transient_so_they_are_retried() {
         let truncated =
-            OpenAICompatProvider::parse_chat_response_body(reqwest::StatusCode::OK, "{", TEST_URL)
+            OpenAICompatProvider::parse_json_response_body(reqwest::StatusCode::OK, "{", TEST_URL)
                 .unwrap_err();
         assert!(OpenAICompatProvider::is_transient_error(Some(&truncated)));
         assert!(OpenAICompatProvider::is_transient_error(Some(
@@ -2310,35 +2304,71 @@ mod tests {
     }
 
     #[test]
-    fn direct_openai_uses_max_completion_tokens_and_forces_no_reasoning() {
+    fn requests_use_max_tokens_and_pass_effort_through() {
+        // api.openai.com included: it is routed to the Responses provider, but should it
+        // reach this one, nothing is rewritten any more.
         for api_base in [
+            Some("https://api.together.xyz/v1"),
             Some("https://api.openai.com/v1"),
-            Some("https://api.openai.com/v1/"),
             None,
         ] {
-            let provider = provider_with_base(api_base);
-            assert!(provider.is_direct_openai_api(), "{api_base:?}");
-            let request = request_with_effort(&provider, Some("high"));
-            assert_eq!(request["max_completion_tokens"], serde_json::json!(64));
-            assert!(request.get("max_tokens").is_none(), "{api_base:?}");
-            assert_eq!(request["reasoning_effort"], serde_json::json!("none"));
+            let request = request_with_effort(&provider_with_base(api_base), Some("high"));
+            assert_eq!(request["max_tokens"], serde_json::json!(64), "{api_base:?}");
+            assert!(
+                request.get("max_completion_tokens").is_none(),
+                "{api_base:?}"
+            );
+            assert_eq!(
+                request["reasoning_effort"],
+                serde_json::json!("high"),
+                "{api_base:?}"
+            );
         }
     }
 
+    /// History written by the Responses provider (or Anthropic) keeps its replay log in
+    /// `thinking_blocks`; Chat Completions has no such field, so it must not be sent.
     #[test]
-    fn direct_openai_forces_no_reasoning_even_without_configured_effort() {
-        let request = request_with_effort(&provider_with_base(None), None);
-        assert_eq!(request["reasoning_effort"], serde_json::json!("none"));
+    fn build_request_drops_thinking_blocks() {
+        let request = test_provider().build_request(
+            &[
+                serde_json::json!({ "role": "user", "content": "weather?" }),
+                serde_json::json!({
+                    "role": "assistant",
+                    "content": "Sunny.",
+                    "thinking_blocks": [{
+                        "type": "openai_responses_item",
+                        "model": "gpt-6-astra",
+                        "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "enc" }
+                    }]
+                }),
+            ],
+            None,
+            Some("gpt-test".to_string()),
+            16,
+            None,
+            None,
+            None,
+        );
+        assert_eq!(
+            request["messages"][1],
+            serde_json::json!({ "role": "assistant", "content": "Sunny." })
+        );
     }
 
     #[test]
-    fn other_gateways_use_max_tokens_and_pass_effort_through() {
-        let provider = provider_with_base(Some("https://api.together.xyz/v1"));
-        assert!(!provider.is_direct_openai_api());
-        let request = request_with_effort(&provider, Some("high"));
-        assert_eq!(request["max_tokens"], serde_json::json!(64));
-        assert!(request.get("max_completion_tokens").is_none());
-        assert_eq!(request["reasoning_effort"], serde_json::json!("high"));
+    fn parse_usage_reads_responses_api_token_details() {
+        let usage = serde_json::json!({
+            "input_tokens": 500,
+            "input_tokens_details": { "cached_tokens": 400 },
+            "output_tokens": 30,
+            "output_tokens_details": { "reasoning_tokens": 20 }
+        });
+        let result = OpenAICompatProvider::parse_usage(&usage);
+        assert_eq!(result.input_tokens, Some(100));
+        assert_eq!(result.cache_read_input_tokens, Some(400));
+        assert_eq!(result.output_tokens, Some(30));
+        assert_eq!(result.reasoning_tokens, Some(20));
     }
 
     #[test]
@@ -2354,14 +2384,5 @@ mod tests {
                 .get("reasoning_effort")
                 .is_none()
         );
-    }
-
-    #[test]
-    fn max_tokens_key_depends_on_the_endpoint() {
-        assert_eq!(
-            OpenAICompatProvider::max_tokens_key(true),
-            "max_completion_tokens"
-        );
-        assert_eq!(OpenAICompatProvider::max_tokens_key(false), "max_tokens");
     }
 }

@@ -5,6 +5,8 @@ pub mod factory;
 pub mod model_catalog;
 pub mod openai_compat_provider;
 pub mod openai_compat_stream;
+pub mod openai_responses_provider;
+pub mod openai_responses_stream;
 pub mod registry;
 pub mod sanitizer;
 pub mod transcription;

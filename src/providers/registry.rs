@@ -9,7 +9,9 @@ pub struct ProviderSpec {
     pub display_name: String,  // shown in `nanobot status`
 
     // which provider implementation to use
-    // "openai_compat" | "anthropic" | "azure_openai" | "openai_codex"
+    // "openai_compat" | "openai_responses" | "anthropic" | "azure_openai" | "openai_codex"
+    // (`providers::factory::select_backend` makes the final choice from the resolved base
+    // URL: api.openai.com is always served by the Responses API.)
     pub backend: String,
 
     // extra env vars, e.g. vec![("ZHIPUAI_API_KEY", "{api_key}")]
@@ -119,7 +121,7 @@ pub fn providers() -> Vec<ProviderSpec> {
             keywords: vec!["openai".to_string(), "gpt".to_string()],
             env_key: "OPENAI_API_KEY".to_string(),
             display_name: "OpenAI".to_string(),
-            backend: "openai_compat".to_string(),
+            backend: "openai_responses".to_string(),
             supports_max_completion_tokens: true,
             ..ProviderSpec::default()
         },
@@ -172,6 +174,11 @@ mod tests {
         assert_eq!(spec.name, "openai");
         let spec1 = find_by_name("azure-openai").unwrap();
         assert_eq!(spec1.name, "azure_openai");
+    }
+
+    #[test]
+    fn test_openai_is_served_by_the_responses_backend() {
+        assert_eq!(find_by_name("openai").unwrap().backend, "openai_responses");
     }
 
     #[test]

@@ -552,7 +552,15 @@ impl AnthropicProvider {
         } else if let Some(reasoning_effort) = reasoning_effort
             && thinking_enabled
         {
-            let budget_map = serde_json::json!({"low": 1024, "medium": 4096, "high": std::cmp::max(8192, max_tokens)});
+            // `xhigh` and `max` have no larger budget here than `high`.
+            let high_budget = std::cmp::max(8192, max_tokens);
+            let budget_map = serde_json::json!({
+                "low": 1024,
+                "medium": 4096,
+                "high": high_budget,
+                "xhigh": high_budget,
+                "max": high_budget,
+            });
             let budget_default = serde_json::Value::Number(serde_json::Number::from(4096u32));
             let budget = budget_map
                 .get(reasoning_effort.to_lowercase().as_str())
@@ -1423,6 +1431,34 @@ mod tests {
                 "thinking": "hmm",
                 "signature": "sig123"
             })
+        );
+    }
+
+    /// The OpenAI Responses replay log shares `thinking_blocks` with Anthropic
+    /// thinking; only the `"thinking"` blocks may be sent here.
+    #[test]
+    fn assistant_blocks_ignore_openai_responses_replay_items() {
+        let msg = json!({
+            "role": "assistant",
+            "content": "Hi",
+            "thinking_blocks": [
+                {
+                    "type": "openai_responses_item",
+                    "model": "gpt-6-astra",
+                    "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "enc" }
+                },
+                { "type": "thinking", "thinking": "hmm", "signature": "sig123" }
+            ]
+        });
+
+        let blocks = AnthropicProvider::assistant_blocks(&msg);
+
+        assert_eq!(
+            blocks,
+            json!([
+                { "type": "thinking", "thinking": "hmm", "signature": "sig123" },
+                { "type": "text", "text": "Hi" }
+            ])
         );
     }
 

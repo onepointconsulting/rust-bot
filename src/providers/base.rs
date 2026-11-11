@@ -233,6 +233,16 @@ impl LLMResponse {
         Self::default()
     }
 
+    /// A failed call: `message` becomes the content and `finish_reason` is `"error"`,
+    /// which is how every provider reports a request that did not produce a reply.
+    pub fn error(message: impl Into<String>) -> Self {
+        Self {
+            content: Some(message.into()),
+            finish_reason: "error".to_string(),
+            ..Self::default()
+        }
+    }
+
     /// Check if response contains tool calls.
     pub fn has_tool_calls(&self) -> bool {
         !self.tool_calls.is_empty()
@@ -281,6 +291,9 @@ const TRANSIENT_ERROR_MARKERS: &[&str] = &[
     "connection",
     "server error",
     "temporarily unavailable",
+    // OpenAI Responses `response.failed` error codes.
+    "server_error",
+    "rate_limit_exceeded",
     // A response cut off mid-body or not valid JSON: a gateway hiccup, not a bad request.
     "failed to read the response body",
     "invalid json response",

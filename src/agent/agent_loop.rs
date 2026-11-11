@@ -1429,10 +1429,14 @@ impl AgentLoop {
         // provider/model here; see `ModelRuntimeResolver`.
         let runtime = self.runtime_resolver.runtime_for_session(session.as_ref());
         log::info!(
-            "Running turn with model={} (preset={}), max_tokens={}",
+            "Running turn with model={} (preset={}), max_tokens={} reasoning_effort={}",
             runtime.model,
             runtime.preset_name,
-            runtime.max_tokens
+            runtime.max_tokens,
+            runtime
+                .reasoning_effort
+                .clone()
+                .unwrap_or("none".to_string())
         );
         let scope = self
             .workspace_scopes

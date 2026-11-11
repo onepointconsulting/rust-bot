@@ -196,8 +196,31 @@ pub(crate) fn take_sse_event(buffer: &mut Vec<u8>) -> Option<Result<SseData, Str
     parse_sse_data(&raw)
 }
 
+/// A stream protocol's state machine: folds decoded SSE `data:` payloads into a final
+/// [`LLMResponse`]. [`consume_sse_events`] owns the framing, timeouts and callbacks;
+/// implementors only interpret events.
+pub(crate) trait SseEventAccumulator {
+    /// Apply one decoded JSON event. Returns the text to forward to the callbacks, or
+    /// the error message that ends the stream.
+    fn apply_event(&mut self, data: &serde_json::Value) -> Result<StreamChunkDeltas, String>;
+
+    /// Build the final response once the stream is over (`[DONE]` or end of body).
+    fn finish(self) -> LLMResponse;
+}
+
+impl SseEventAccumulator for StreamAccumulator {
+    fn apply_event(&mut self, data: &serde_json::Value) -> Result<StreamChunkDeltas, String> {
+        self.apply_chunk(data)
+    }
+
+    fn finish(self) -> LLMResponse {
+        self.into_response()
+    }
+}
+
+/// Consume an OpenAI Chat Completions SSE byte stream. See [`consume_sse_events`].
 pub(crate) async fn consume_sse_byte_stream<S, B, F, Fut>(
-    mut byte_stream: S,
+    byte_stream: S,
     idle_timeout: Duration,
     idle_timeout_s: u64,
     on_content_delta: &Option<F>,
@@ -209,42 +232,54 @@ where
     F: Fn(String) -> Fut + Send + Sync,
     Fut: std::future::Future<Output = ()> + Send,
 {
+    consume_sse_events(
+        byte_stream,
+        StreamAccumulator::new(),
+        idle_timeout,
+        idle_timeout_s,
+        on_content_delta,
+        on_progress,
+    )
+    .await
+}
+
+/// Read SSE events from `byte_stream` into `accumulator` until `[DONE]` or the end of
+/// the body, forwarding content deltas to `on_content_delta` and reasoning deltas to
+/// `on_progress` (followed by one `ReasoningEnd` when any reasoning was streamed).
+///
+/// The stream fails with an error response when no bytes arrive for `idle_timeout`,
+/// when the buffer grows past [`MAX_SSE_BUFFER_BYTES`] without a complete event, or
+/// when the accumulator rejects an event.
+pub(crate) async fn consume_sse_events<S, B, A, F, Fut>(
+    mut byte_stream: S,
+    mut accumulator: A,
+    idle_timeout: Duration,
+    idle_timeout_s: u64,
+    on_content_delta: &Option<F>,
+    on_progress: &Option<crate::providers::base::BoxedProgressCallback>,
+) -> LLMResponse
+where
+    S: futures::Stream<Item = Result<B, reqwest::Error>> + Unpin,
+    B: AsRef<[u8]>,
+    A: SseEventAccumulator,
+    F: Fn(String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = ()> + Send,
+{
     let mut buffer = Vec::new();
-    let mut acc = StreamAccumulator::new();
-    let cb = on_content_delta.as_ref();
-    let progress = on_progress.as_ref();
+    let mut streamed_reasoning = false;
 
     loop {
         while let Some(event) = take_sse_event(&mut buffer) {
             match event {
                 Ok(SseData::Done) => {
-                    if !acc.reasoning.is_empty()
-                        && let Some(progress) = progress
-                    {
-                        progress(
-                            String::new(),
-                            crate::bus::outbound_events::ProgressKind::ReasoningEnd,
-                        )
-                        .await;
-                    }
-                    return acc.into_response();
+                    return finish_stream(accumulator, streamed_reasoning, on_progress).await;
                 }
-                Ok(SseData::Json(chunk)) => match acc.apply_chunk(&chunk) {
+                Ok(SseData::Json(data)) => match accumulator.apply_event(&data) {
                     Ok(deltas) => {
-                        if let (Some(cb), Some(content)) = (cb, deltas.content) {
-                            cb(content).await;
-                        }
-                        if let (Some(progress), Some(reasoning)) = (progress, deltas.reasoning) {
-                            progress(
-                                reasoning,
-                                crate::bus::outbound_events::ProgressKind::ReasoningDelta,
-                            )
-                            .await;
-                        }
+                        streamed_reasoning |=
+                            forward_deltas(deltas, on_content_delta, on_progress).await;
                     }
-                    Err(message) => {
-                        return stream_error(message);
-                    }
+                    Err(message) => return stream_error(message),
                 },
                 Err(message) => return stream_error(message),
             }
@@ -263,42 +298,26 @@ where
                 ));
             }
             Ok(None) => {
+                // A last event without its blank-line terminator is still an event.
                 if !buffer.iter().all(u8::is_ascii_whitespace) {
-                    buffer.extend_from_slice(b"\n\n");
-                    if let Some(event) = take_sse_event(&mut buffer) {
-                        match event {
-                            Ok(SseData::Json(chunk)) => match acc.apply_chunk(&chunk) {
-                                Ok(deltas) => {
-                                    if let (Some(cb), Some(content)) = (cb, deltas.content) {
-                                        cb(content).await;
-                                    }
-                                    if let (Some(progress), Some(reasoning)) =
-                                        (progress, deltas.reasoning)
-                                    {
-                                        progress(
-                                            reasoning,
-                                            crate::bus::outbound_events::ProgressKind::ReasoningDelta,
-                                        )
-                                        .await;
-                                    }
-                                }
-                                Err(message) => return stream_error(message),
-                            },
-                            Ok(SseData::Done) => {}
+                    buffer.extend_from_slice(
+                        b"
+
+",
+                    );
+                    match take_sse_event(&mut buffer) {
+                        Some(Ok(SseData::Json(data))) => match accumulator.apply_event(&data) {
+                            Ok(deltas) => {
+                                streamed_reasoning |=
+                                    forward_deltas(deltas, on_content_delta, on_progress).await;
+                            }
                             Err(message) => return stream_error(message),
-                        }
+                        },
+                        Some(Err(message)) => return stream_error(message),
+                        Some(Ok(SseData::Done)) | None => {}
                     }
                 }
-                if !acc.reasoning.is_empty()
-                    && let Some(progress) = progress
-                {
-                    progress(
-                        String::new(),
-                        crate::bus::outbound_events::ProgressKind::ReasoningEnd,
-                    )
-                    .await;
-                }
-                return acc.into_response();
+                return finish_stream(accumulator, streamed_reasoning, on_progress).await;
             }
             Ok(Some(Ok(chunk))) => buffer.extend_from_slice(chunk.as_ref()),
             Ok(Some(Err(e))) => return stream_error(format!("Error in HTTP stream: {e}")),
@@ -306,15 +325,50 @@ where
     }
 }
 
-fn stream_error(message: impl Into<String>) -> LLMResponse {
-    LLMResponse {
-        content: Some(message.into()),
-        finish_reason: "error".to_string(),
-        tool_calls: Vec::new(),
-        usage: LLMUsage::new(),
-        reasoning_content: None,
-        thinking_blocks: None,
+/// Send one event's deltas to the callbacks. Returns whether reasoning text was sent.
+async fn forward_deltas<F, Fut>(
+    deltas: StreamChunkDeltas,
+    on_content_delta: &Option<F>,
+    on_progress: &Option<crate::providers::base::BoxedProgressCallback>,
+) -> bool
+where
+    F: Fn(String) -> Fut + Send + Sync,
+    Fut: std::future::Future<Output = ()> + Send,
+{
+    if let (Some(callback), Some(content)) = (on_content_delta.as_ref(), deltas.content) {
+        callback(content).await;
     }
+    let Some(reasoning) = deltas.reasoning.filter(|text| !text.is_empty()) else {
+        return false;
+    };
+    if let Some(progress) = on_progress.as_ref() {
+        progress(
+            reasoning,
+            crate::bus::outbound_events::ProgressKind::ReasoningDelta,
+        )
+        .await;
+    }
+    true
+}
+
+/// Close the reasoning progress stream (when reasoning was sent) and build the response.
+async fn finish_stream<A: SseEventAccumulator>(
+    accumulator: A,
+    streamed_reasoning: bool,
+    on_progress: &Option<crate::providers::base::BoxedProgressCallback>,
+) -> LLMResponse {
+    if streamed_reasoning && let Some(progress) = on_progress.as_ref() {
+        progress(
+            String::new(),
+            crate::bus::outbound_events::ProgressKind::ReasoningEnd,
+        )
+        .await;
+    }
+    accumulator.finish()
+}
+
+fn stream_error(message: impl Into<String>) -> LLMResponse {
+    LLMResponse::error(message)
 }
 
 pub(crate) fn stream_idle_timeout() -> (Duration, u64) {

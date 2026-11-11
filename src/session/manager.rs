@@ -639,7 +639,15 @@ impl Session {
                 "content": content,
                 "timestamp": message.get("timestamp").and_then(|v| v.as_str()).unwrap_or(""),
             });
-            for key in ["tool_calls", "tool_call_id", "name", "reasoning_content"] {
+            // `thinking_blocks` carries signed / encrypted reasoning (Anthropic thinking,
+            // OpenAI Responses replay log) so it survives into later user turns.
+            for key in [
+                "tool_calls",
+                "tool_call_id",
+                "name",
+                "reasoning_content",
+                "thinking_blocks",
+            ] {
                 if message.get(key).is_some() {
                     entry[key] = message.get(key).unwrap().clone();
                 }
@@ -1808,6 +1816,30 @@ Channel: websocket"
         let history = session.get_history(None);
 
         assert_eq!(history[1]["content"], json!("Two batches left."));
+    }
+
+    /// Signed / encrypted reasoning must reach the next user turn: Anthropic thinking
+    /// signatures and the OpenAI Responses replay log both live in `thinking_blocks`.
+    #[test]
+    fn get_history_keeps_thinking_blocks() {
+        let thinking_blocks = json!([
+            { "type": "thinking", "thinking": "hmm", "signature": "sig" },
+            {
+                "type": "openai_responses_item",
+                "model": "gpt-6-astra",
+                "item": { "type": "reasoning", "id": "rs_1", "encrypted_content": "enc" }
+            }
+        ]);
+        let mut assistant = fixture_message("assistant", "Done.");
+        assistant["thinking_blocks"] = thinking_blocks.clone();
+        let mut session = Session::new("s1".into());
+        session.messages.push(fixture_message("user", "go"));
+        session.messages.push(assistant);
+
+        let history = session.get_history(None);
+
+        assert_eq!(history[1]["thinking_blocks"], thinking_blocks);
+        assert!(history[0].get("thinking_blocks").is_none());
     }
 
     #[test]

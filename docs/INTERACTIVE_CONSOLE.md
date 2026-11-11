@@ -187,9 +187,17 @@ A model preset is a named bundle under `modelPresets` in `config.json`:
 ```
 
 - `provider`: `auto` (the first provider with an API key: openai, openrouter, custom, anthropic, together), `openai`, `anthropic`, `openrouter`, `together` or `custom`. API keys live under `providers.<name>`.
-- `temperature`: 0.0 to 1.0.
-- `reasoningEffort`: `low`, `medium`, `high`, `adaptive`, or `null` for none.
+- `temperature`: 0.0 to 1.0. Ignored for OpenAI (see below).
+- `reasoningEffort`: `low`, `medium`, `high`, `xhigh`, `max`, `adaptive`, or `null` for none. `xhigh` and `max` go to the provider as they are where it takes an effort level (OpenAI, Anthropic adaptive thinking); Anthropic's budget-based thinking treats them as `high`. For OpenAI, `null` and `adaptive` both leave the effort to the model's default.
 - The name `default` is reserved: it means the flat `agents.model` / `agents.provider` / … settings.
+
+**OpenAI uses the Responses API.** Any preset whose requests go to api.openai.com (`openai` with its default base, `auto` resolving to `openai`, or `custom` pointed at `https://api.openai.com/v1`) is sent to `POST /v1/responses` instead of `/v1/chat/completions`, because Chat Completions cannot combine tools with reasoning on the GPT-6 family. What changes:
+
+- Tools and any `reasoningEffort` work together, and the reasoning summary streams like other providers' reasoning.
+- `temperature` is not sent: OpenAI's reasoning models reject it.
+- Requests stay stateless (`store: false`). The model's encrypted reasoning is kept in the session and sent back on later turns, including later user turns. It is only sent back to the model that wrote it: after switching presets, earlier replies are sent without it.
+
+OpenRouter, Together, other `custom` gateways and an `openai` slot pointed at another base URL still use Chat Completions.
 
 There are two ways to choose a preset:
 

@@ -101,7 +101,8 @@ pub struct ModelListingRequest {
 /// The listing protocol of a registry provider, keyed on its `backend`.
 pub fn listing_protocol_for(spec: &ProviderSpec) -> ModelListingProtocol {
     match spec.backend.as_str() {
-        "openai_compat" => ModelListingProtocol::OpenAiCompatible,
+        // The Responses API shares `GET /models` with Chat Completions.
+        "openai_compat" | "openai_responses" => ModelListingProtocol::OpenAiCompatible,
         "anthropic" => ModelListingProtocol::Anthropic,
         _ => ModelListingProtocol::Unsupported,
     }

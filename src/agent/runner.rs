@@ -564,7 +564,11 @@ impl AgentRunner {
         hook: Arc<dyn AgentHook>,
         context: &mut AgentHookContext,
     ) -> LLMResponse {
-        log::info!("Using model: {}", spec.model);
+        log::info!(
+            "Using model: {} reasoning effort: {}",
+            spec.model,
+            spec.reasoning_effort.clone().unwrap_or("none".to_string())
+        );
         let tools = spec.tools.get_definitions();
         let tools_opt = if tools.is_empty() { None } else { Some(tools) };
 
