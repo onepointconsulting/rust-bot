@@ -26,8 +26,8 @@ use crate::{
         loader::{load_config, save_config, set_config_path},
         schema::{
             AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType,
-            ModelPresetConfig, OcrProvider, ProviderRetryMode, RESERVED_MODEL_PRESET_NAME,
-            ToolsConfig, WebSearchProvider,
+            ModelPresetConfig, OcrProvider, ProviderRetryMode, REASONING_EFFORT_CHOICES,
+            REASONING_EFFORT_NONE, RESERVED_MODEL_PRESET_NAME, ToolsConfig, WebSearchProvider,
         },
     },
     providers::registry::providers,
@@ -76,7 +76,6 @@ const WIZARD_OPTIONS: [&str; 11] = [
 const CREATE_MODEL_PRESET: &str = "Create model preset";
 const SET_DEFAULT_MODEL_PRESET: &str = "Set default model preset";
 const MODEL_PRESETS_MENU: [&str; 2] = [CREATE_MODEL_PRESET, SET_DEFAULT_MODEL_PRESET];
-const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
 
 const CHANNEL_EMAIL: &str = "email";
 const CHANNEL_OPTIONS_CHOICE: &str = "Channel Options";
@@ -830,7 +829,10 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         _ => ProviderRetryMode::Standard,
     };
 
-    let current_effort = agents.reasoning_effort.as_deref().unwrap_or("none");
+    let current_effort = agents
+        .reasoning_effort
+        .as_deref()
+        .unwrap_or(REASONING_EFFORT_NONE);
     let effort_idx = REASONING_EFFORT_CHOICES
         .iter()
         .position(|e| *e == current_effort)
@@ -839,7 +841,7 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         .with_starting_cursor(effort_idx)
         .with_help_message("Provider-specific thinking mode; none disables it")
         .prompt()?;
-    agents.reasoning_effort = if effort == "none" {
+    agents.reasoning_effort = if effort == REASONING_EFFORT_NONE {
         None
     } else {
         Some(effort.to_string())
@@ -1067,7 +1069,10 @@ fn create_model_presets(config: &mut Config) -> Result<(), CliError> {
             })
             .prompt()?;
 
-        let current_effort = preset.reasoning_effort.as_deref().unwrap_or("none");
+        let current_effort = preset
+            .reasoning_effort
+            .as_deref()
+            .unwrap_or(REASONING_EFFORT_NONE);
         let effort_idx = REASONING_EFFORT_CHOICES
             .iter()
             .position(|e| *e == current_effort)
@@ -1076,7 +1081,7 @@ fn create_model_presets(config: &mut Config) -> Result<(), CliError> {
             .with_starting_cursor(effort_idx)
             .with_help_message("Provider-specific thinking mode; none disables it")
             .prompt()?;
-        preset.reasoning_effort = if effort == "none" {
+        preset.reasoning_effort = if effort == REASONING_EFFORT_NONE {
             None
         } else {
             Some(effort.to_string())

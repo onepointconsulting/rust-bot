@@ -47,6 +47,7 @@ use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::config_file;
 use crate::channels::websocket::config_toggles;
 use crate::channels::websocket::mcp_server_form;
+use crate::channels::websocket::model_preset_form;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     AuthorizeResult, ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType,
@@ -60,6 +61,7 @@ use crate::channels::websocket::webui::transcript::{client_turn_metadata, user_i
 use crate::channels::websocket::{CHANNEL_NAME, get_session_id};
 use crate::command::normalize_command_text;
 use crate::command::types::{ChatCommand, CommandLifecycle};
+use crate::providers::model_catalog::{ProviderModelInfo, list_provider_models};
 use crate::runtime_context::{RUNTIME_CONTEXT_INPUT_META, webui_quote_runtime_context};
 use crate::security::{
     UserRole, WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope,
@@ -713,6 +715,24 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::AddMcpServer => {
             handle_add_mcp_server(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListModelPresets => {
+            handle_list_model_presets(envelope_dispatch_context).await;
+        }
+        EnvelopeType::AddModelPreset => {
+            handle_add_model_preset(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetModelPresetConfig => {
+            handle_set_model_preset_config(envelope_dispatch_context).await;
+        }
+        EnvelopeType::DeleteModelPreset => {
+            handle_delete_model_preset(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetDefaultModelPreset => {
+            handle_set_default_model_preset(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListProviderModels => {
+            handle_list_provider_models(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -2963,7 +2983,7 @@ async fn handle_list_mcp_presets<'a>(envelope_dispatch_context: EnvelopeDispatch
 
 /// Serializes the load-modify-save cycles the WebUI makes on `config.json`, so two
 /// browser tabs changing presets at once cannot overwrite each other's change.
-static MCP_CONFIG_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
+static CONFIG_WRITE_LOCK: StdMutex<()> = StdMutex::new(());
 
 /// `detail` code of a configuration write refused because the token is not an admin's.
 const ADMIN_REQUIRED_DETAIL: &str = "admin_required";
@@ -3263,9 +3283,7 @@ async fn handle_save_config_file<'a>(envelope_dispatch_context: EnvelopeDispatch
     };
     let result = {
         // Shares the lock with the MCP preset changes: both rewrite the whole file.
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         config_file::save_config_text(&get_config_path(), content)
     };
     match result {
@@ -3357,6 +3375,14 @@ enum SettingKind {
     McpServerConfig,
     /// Adding a new MCP server.
     McpServerAdd,
+    /// Adding a model preset (Models page).
+    ModelPresetAdd,
+    /// The settings form of a model preset.
+    ModelPresetConfig,
+    /// Deleting a model preset.
+    ModelPresetDelete,
+    /// Making a model preset the gateway's default.
+    ModelPresetActivate,
 }
 
 impl SettingKind {
@@ -3368,6 +3394,22 @@ impl SettingKind {
             Self::McpServerExposure => "mcp_server_exposure",
             Self::McpServerConfig => "mcp_server_config",
             Self::McpServerAdd => "mcp_server_add",
+            Self::ModelPresetAdd => "model_preset_add",
+            Self::ModelPresetConfig => "model_preset_config",
+            Self::ModelPresetDelete => "model_preset_delete",
+            Self::ModelPresetActivate => "model_preset_activate",
+        }
+    }
+
+    /// The `changed.action` of the `model_presets` reply to a successful write of this
+    /// kind; `None` for kinds that are not model preset writes.
+    fn model_preset_action(self) -> Option<&'static str> {
+        match self {
+            Self::ModelPresetAdd => Some("added"),
+            Self::ModelPresetConfig => Some("updated"),
+            Self::ModelPresetDelete => Some("deleted"),
+            Self::ModelPresetActivate => Some("activated"),
+            _ => None,
         }
     }
 
@@ -3379,6 +3421,10 @@ impl SettingKind {
             Self::McpServerExposure => WsOutboundEvent::McpServerExposureSet,
             Self::McpServerConfig => WsOutboundEvent::McpServerConfigSet,
             Self::McpServerAdd => WsOutboundEvent::McpServerAdded,
+            Self::ModelPresetAdd
+            | Self::ModelPresetConfig
+            | Self::ModelPresetDelete
+            | Self::ModelPresetActivate => WsOutboundEvent::ModelPresets,
         }
     }
 
@@ -3396,10 +3442,15 @@ impl SettingKind {
             Self::McpServerExposure => {
                 config_toggles::with_mcp_server_deferred(text, name, enabled)
             }
-            // Settings forms have no on/off switch of their own.
-            Self::McpServerConfig | Self::McpServerAdd => Err(
-                config_toggles::ToggleError::UnknownField("enabled".to_string()),
-            ),
+            // Settings forms and model presets have no on/off switch of their own.
+            Self::McpServerConfig
+            | Self::McpServerAdd
+            | Self::ModelPresetAdd
+            | Self::ModelPresetConfig
+            | Self::ModelPresetDelete
+            | Self::ModelPresetActivate => Err(config_toggles::ToggleError::UnknownField(
+                "enabled".to_string(),
+            )),
         }
     }
 }
@@ -3649,9 +3700,7 @@ async fn handle_toggle_setting<'a>(
 
     let result = {
         // Shares the lock with the other writers: each one rewrites the whole file.
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         config_toggles::apply_edit(&get_config_path(), |text| kind.edit(text, &name, enabled))
     };
 
@@ -3728,9 +3777,7 @@ async fn handle_set_section_enabled<'a>(envelope_dispatch_context: EnvelopeDispa
         return;
     };
     let result = {
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = load_config(None);
         tool_settings_api::set_section_enabled(&mut config, &name, enabled)
             .map_err(|e| (tool_config_error_detail(&e), e.to_string()))
@@ -3821,9 +3868,7 @@ async fn handle_add_mcp_server<'a>(envelope_dispatch_context: EnvelopeDispatchCo
 
     let result = {
         // Shares the lock with the other writers: each one rewrites the whole file.
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         config_toggles::apply_edit(&get_config_path(), |text| {
             mcp_server_form::with_mcp_server_added(text, &name, &values).map(Some)
         })
@@ -3892,9 +3937,7 @@ async fn handle_set_mcp_server_config<'a>(envelope_dispatch_context: EnvelopeDis
 
     let result = {
         // Shares the lock with the other writers: each one rewrites the whole file.
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         config_toggles::apply_edit(&get_config_path(), |text| {
             mcp_server_form::with_mcp_server_settings(text, &name, &values)
         })
@@ -3978,9 +4021,7 @@ async fn handle_set_mcp_preset<'a>(envelope_dispatch_context: EnvelopeDispatchCo
 
     let result = {
         // Held across load + save only; no `.await` while it is held.
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = load_config(None);
         match mcp_presets_api::load_mcp_presets(&config.tools.mcp_presets_path) {
             Err(e) => Err(format!("Error loading MCP presets: {e}")),
@@ -4038,6 +4079,345 @@ async fn handle_set_mcp_preset<'a>(envelope_dispatch_context: EnvelopeDispatchCo
                 .await;
         }
     }
+}
+
+/// `detail` of the `setting_error` sent when a model preset change was saved to
+/// `config.json` but the running process could not switch to it (a restart applies it).
+const SAVED_RELOAD_FAILED_DETAIL: &str = "saved_reload_failed";
+
+/// The trimmed `name` of a Models page envelope, empty when missing.
+fn envelope_preset_name(envelope: &Envelope) -> String {
+    envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// The fields of a `model_presets` event: the page's rows, the active preset, whether
+/// the connection may change them, the blank add form (only for those that may), the
+/// providers without an API key and, after a write, what changed (`{action, name}`).
+fn model_presets_event_body(
+    overview: &model_preset_form::ModelPresetsOverview,
+    can_modify: bool,
+    changed: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "presets": overview.presets,
+        "active": overview.active,
+        "can_modify": can_modify,
+        "providers_without_key": overview.providers_without_key,
+    });
+    if let Some(form) = &overview.new_preset_form {
+        body["new_preset_form"] = serde_json::json!(form);
+    }
+    if let Some((action, name)) = changed {
+        body["changed"] = serde_json::json!({"action": action, "name": name});
+    }
+    body
+}
+
+/// Read `config.json` and send the requester a `model_presets` event (forms only when
+/// `can_modify`), or a `setting_error` of `kind` when the file cannot be read.
+async fn send_model_presets(
+    shared: &WsShared,
+    connection_id: &str,
+    kind: SettingKind,
+    can_modify: bool,
+    changed: Option<(&str, &str)>,
+) {
+    let overview = read_config_for_settings().and_then(|text| {
+        model_preset_form::model_presets_overview(&text, can_modify).map_err(|e| e.message())
+    });
+    match overview {
+        Ok(overview) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::ModelPresets,
+                None,
+                model_presets_event_body(&overview, can_modify, changed),
+            )
+            .await;
+        }
+        Err(message) => {
+            let name = changed.map(|(_, name)| name).unwrap_or_default();
+            send_setting_error(shared, connection_id, kind, name, "config_error", &message).await;
+        }
+    }
+}
+
+/// Switch the running process to the model presets of the saved config `text`: replace
+/// the resolver's preset catalog and make `agents.modelPreset` the default. Chats with
+/// their own preset keep it. Errs with a message for the user when the text cannot be
+/// used live (the file itself is already saved).
+fn reload_model_presets_from_text(
+    resolver: &ModelRuntimeResolver,
+    text: &str,
+) -> Result<(), String> {
+    let live = model_preset_form::live_model_presets(text)?;
+    let runtime = resolver.reload_presets(live.presets, live.default_name.as_deref())?;
+    log::info!(
+        "Default model is now preset '{}' ({} via {})",
+        runtime.preset_name,
+        runtime.model,
+        runtime.provider_name
+    );
+    Ok(())
+}
+
+/// Handle a `list_model_presets` envelope: reply with a `model_presets` event listing
+/// the built-in `default` row and every preset of `config.json`, the active one marked.
+/// Connections that may change the configuration also get the forms. Authenticated
+/// connections only. Rust-side addition with no nanobot precedent.
+async fn handle_list_model_presets<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
+    send_model_presets(
+        shared,
+        connection_id,
+        SettingKind::ModelPresetConfig,
+        can_modify,
+        None,
+    )
+    .await;
+}
+
+/// Why a `list_provider_models` request was refused, for the user, when the connection
+/// may not change the configuration (it spends the configured provider credentials).
+const PROVIDER_MODELS_LOCALITY_MESSAGE: &str =
+    "Provider models can only be listed from a signed-in browser on the gateway machine.";
+
+/// The `provider_models` reply body: `{provider, models}` on success, `{provider, detail,
+/// error}` otherwise. `error` never quotes the configuration file or its credentials.
+fn provider_models_event_body(
+    provider: &str,
+    listing: Result<Vec<ProviderModelInfo>, (&str, String)>,
+) -> serde_json::Value {
+    match listing {
+        Ok(models) => serde_json::json!({"provider": provider, "models": models}),
+        Err((detail, error)) => {
+            serde_json::json!({"provider": provider, "detail": detail, "error": error})
+        }
+    }
+}
+
+/// List the models `provider` offers with the credentials of the saved `config.json`;
+/// failures as `(detail, message)` for [`provider_models_event_body`].
+async fn list_models_of_configured_provider(
+    provider: &str,
+) -> Result<Vec<ProviderModelInfo>, (&'static str, String)> {
+    let config = read_config_for_settings()
+        .and_then(|text| model_preset_form::typed_config(&text).map_err(|e| e.message()))
+        .map_err(|message| ("config_error", message))?;
+    list_provider_models(&config, provider)
+        .await
+        .map_err(|message| ("listing_failed", message))
+}
+
+/// Handle a `list_provider_models` envelope (`{provider}`): ask that provider's API which
+/// models it offers and reply with a `provider_models` event, so a preset's `model` can
+/// be picked from a list. Same access rules as the model preset writes, since it uses
+/// the configured credentials. Rust-side addition with no nanobot precedent.
+async fn handle_list_provider_models<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let provider = envelope_dispatch_context
+        .envelope
+        .get("provider")
+        .and_then(|value| value.as_str())
+        .map(str::trim)
+        .unwrap_or_default()
+        .to_string();
+
+    let listing = if let Some(detail) = mcp_write_denial(
+        shared,
+        envelope_dispatch_context.remote_addr,
+        envelope_dispatch_context.auth,
+        overlay_is_active(),
+    ) {
+        Err((
+            detail,
+            write_denial_message(detail, PROVIDER_MODELS_LOCALITY_MESSAGE).to_string(),
+        ))
+    } else if provider.is_empty() {
+        Err(("missing_provider", "No provider was named.".to_string()))
+    } else {
+        list_models_of_configured_provider(&provider).await
+    };
+
+    match &listing {
+        Ok(models) => log::info!("Listed {} models of provider '{provider}'", models.len()),
+        Err((detail, _)) => log::info!("Listing models of provider '{provider}' failed: {detail}"),
+    }
+    send_event(
+        shared,
+        connection_id,
+        WsOutboundEvent::ProviderModels,
+        None,
+        provider_models_event_body(&provider, listing),
+    )
+    .await;
+}
+
+/// The shared path of every Models page write: refuse connections that may not change
+/// the configuration, apply `edit` to `config.json` under the config write lock
+/// (validated, previous file backed up), switch the running process to the saved
+/// presets, and reply with the fresh `model_presets` list naming what changed.
+/// Failures become a `setting_error` of `kind`; a save whose live switch failed is
+/// reported as [`SAVED_RELOAD_FAILED_DETAIL`] (followed by the list, which shows the
+/// saved state). Submitted values are never logged or echoed in errors.
+async fn apply_model_preset_edit<'a>(
+    envelope_dispatch_context: &EnvelopeDispatchContext<'a>,
+    kind: SettingKind,
+    name: &str,
+    edit: impl FnOnce(&str) -> Result<Option<String>, config_toggles::ToggleError>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    if let Some((detail, message)) = setting_write_denial(shared, envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, name, detail, message).await;
+        return;
+    }
+
+    let result = {
+        // Shares the lock with the other writers: each one rewrites the whole file. The
+        // live switch happens under it too, so two writes cannot switch out of order.
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        config_toggles::apply_edit(&get_config_path(), edit).map(|outcome| {
+            let reload = if outcome.changed {
+                read_config_for_settings().and_then(|text| {
+                    reload_model_presets_from_text(&shared.runtime_resolver, &text)
+                })
+            } else {
+                Ok(())
+            };
+            (outcome, reload)
+        })
+    };
+
+    let action = kind.model_preset_action().unwrap_or_default();
+    match result {
+        Ok((outcome, reload)) => {
+            if outcome.changed {
+                log::info!(
+                    "Model preset '{name}' {action} from the WebUI (client '{client_id}'); previous config kept as {:?}",
+                    outcome.backup,
+                );
+            }
+            if let Err(reason) = reload {
+                log::warn!("Model preset '{name}' saved but not applied live: {reason}");
+                let message = format!(
+                    "Saved to config.json, but the running agent could not switch to it ({reason}). Restart rust-bot to apply it."
+                );
+                send_setting_error(
+                    shared,
+                    connection_id,
+                    kind,
+                    name,
+                    SAVED_RELOAD_FAILED_DETAIL,
+                    &message,
+                )
+                .await;
+            }
+            send_model_presets(shared, connection_id, kind, true, Some((action, name))).await;
+        }
+        Err(error) => {
+            send_apply_error(shared, connection_id, kind, name, error).await;
+        }
+    }
+}
+
+/// Handle an `add_model_preset` envelope `{name, values}`: add the preset `name` with the
+/// submitted settings (and the defaults of the rest) to `config.json`; see
+/// [`apply_model_preset_edit`]. Refused when the name is reserved or already used.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_add_model_preset<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    handle_model_preset_values_edit(envelope_dispatch_context, SettingKind::ModelPresetAdd).await;
+}
+
+/// Handle a `set_model_preset_config` envelope `{name, values}`: change the submitted
+/// settings of the preset `name`; see [`apply_model_preset_edit`]. An edit of the active
+/// preset applies to the next turn of every chat that uses the default. Rust-side
+/// addition with no nanobot precedent.
+async fn handle_set_model_preset_config<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    handle_model_preset_values_edit(envelope_dispatch_context, SettingKind::ModelPresetConfig)
+        .await;
+}
+
+/// The add and edit envelopes `{name, values}`: check `values` is an object, then apply
+/// the add (`ModelPresetAdd`) or the edit (`ModelPresetConfig`).
+async fn handle_model_preset_values_edit<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+    kind: SettingKind,
+) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let Some(values) = parse_tool_config_values(envelope_dispatch_context.envelope) else {
+        // Refuse a connection that may not write before saying anything about the request.
+        let (detail, message) = setting_write_denial(shared, &envelope_dispatch_context)
+            .unwrap_or(("invalid_request", "The request was malformed."));
+        send_setting_error(shared, connection_id, kind, &name, detail, message).await;
+        return;
+    };
+    let edit_name = name.clone();
+    if kind == SettingKind::ModelPresetAdd {
+        apply_model_preset_edit(&envelope_dispatch_context, kind, &name, move |text| {
+            model_preset_form::with_model_preset_added(text, &edit_name, &values).map(Some)
+        })
+        .await;
+    } else {
+        apply_model_preset_edit(&envelope_dispatch_context, kind, &name, move |text| {
+            model_preset_form::with_model_preset_settings(text, &edit_name, &values)
+        })
+        .await;
+    }
+}
+
+/// Handle a `delete_model_preset` envelope `{name}`: remove the preset from
+/// `config.json`; see [`apply_model_preset_edit`]. Refused for the active preset and for
+/// Dream's preset. Chats that had picked it fall back to the default. Rust-side addition
+/// with no nanobot precedent.
+async fn handle_delete_model_preset<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let edit_name = name.clone();
+    apply_model_preset_edit(
+        &envelope_dispatch_context,
+        SettingKind::ModelPresetDelete,
+        &name,
+        move |text| model_preset_form::without_model_preset(text, &edit_name).map(Some),
+    )
+    .await;
+}
+
+/// Handle a `set_default_model_preset` envelope `{name}`: make the preset (`default`: the
+/// flat `agents.*` settings) the gateway's default, in `config.json` and in the running
+/// process; see [`apply_model_preset_edit`]. Chats with their own preset keep it.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_set_default_model_preset<'a>(
+    envelope_dispatch_context: EnvelopeDispatchContext<'a>,
+) {
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let edit_name = name.clone();
+    apply_model_preset_edit(
+        &envelope_dispatch_context,
+        SettingKind::ModelPresetActivate,
+        &name,
+        move |text| model_preset_form::with_default_model_preset(text, &edit_name),
+    )
+    .await;
 }
 
 /// Read the `values` object of a `set_tool_config` envelope (`property -> value`). A
@@ -4116,9 +4496,7 @@ async fn handle_set_tool_config<'a>(envelope_dispatch_context: EnvelopeDispatchC
 
     let result = {
         // Held across load + save only; no `.await` while it is held.
-        let _write_guard = MCP_CONFIG_WRITE_LOCK
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let mut config = load_config(None);
         match tool_settings_api::apply_tool_settings(&mut config, &tool, &values) {
             Err(error) => Ok(Err(error)),
@@ -9655,7 +10033,11 @@ mod tests {
     #[tokio::test]
     async fn setting_lists_deny_anonymous_connections() {
         let shared = test_shared("browser");
-        for envelope_type in ["list_tool_settings", "list_mcp_servers"] {
+        for envelope_type in [
+            "list_tool_settings",
+            "list_mcp_servers",
+            "list_model_presets",
+        ] {
             let body = dispatch_setting_envelope(
                 &shared,
                 &AuthorizeResult::UNAUTHENTICATED,
@@ -9678,6 +10060,10 @@ mod tests {
             "set_mcp_server_deferred",
             "set_mcp_server_config",
             "add_mcp_server",
+            "add_model_preset",
+            "set_model_preset_config",
+            "delete_model_preset",
+            "set_default_model_preset",
         ] {
             let anonymous = dispatch_setting_envelope(
                 &shared,
@@ -9794,6 +10180,202 @@ mod tests {
         )
         .await;
         assert_eq!(added["kind"], "mcp_server_add");
+
+        for (envelope_type, kind) in [
+            ("add_model_preset", "model_preset_add"),
+            ("set_model_preset_config", "model_preset_config"),
+            ("delete_model_preset", "model_preset_delete"),
+            ("set_default_model_preset", "model_preset_activate"),
+        ] {
+            let body = dispatch_setting_envelope(
+                &shared,
+                &AuthorizeResult::UNAUTHENTICATED,
+                "127.0.0.1",
+                envelope_type,
+            )
+            .await;
+            assert_eq!(body["kind"], kind, "{envelope_type}");
+        }
+    }
+
+    /// Dispatch one `list_provider_models` envelope naming `provider` (omitted when
+    /// `None`) and return the reply frame.
+    async fn dispatch_list_provider_models(
+        shared: &WsShared,
+        auth: &AuthorizeResult,
+        remote: &str,
+        provider: Option<&str>,
+    ) -> serde_json::Value {
+        let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+        shared
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "initial-chat", tx);
+        let mut envelope: Envelope = HashMap::new();
+        envelope.insert(
+            "type".to_string(),
+            serde_json::json!("list_provider_models"),
+        );
+        if let Some(provider) = provider {
+            envelope.insert("provider".to_string(), serde_json::json!(provider));
+        }
+        let ctx = EnvelopeDispatchContext {
+            envelope: &envelope,
+            connection_id: "conn-1",
+            client_id: "client-1",
+            shared,
+            remote_addr: addr(remote),
+            auth,
+        };
+        dispatch_envelope(ctx).await;
+        let frame = rx.try_recv().expect("expected a reply frame");
+        serde_json::from_str(&frame.into_text().unwrap()).unwrap()
+    }
+
+    #[tokio::test]
+    async fn list_provider_models_is_refused_like_model_preset_writes() {
+        let shared = test_shared("browser");
+        for (auth, remote, expected_detail) in [
+            (
+                AuthorizeResult::UNAUTHENTICATED,
+                "127.0.0.1",
+                "access_denied",
+            ),
+            (authenticated(), "203.0.113.5", "access_denied"),
+            (plain_user(), "127.0.0.1", "admin_required"),
+        ] {
+            let body = dispatch_list_provider_models(&shared, &auth, remote, Some("openai")).await;
+            assert_eq!(body["event"], "provider_models");
+            assert_eq!(body["provider"], "openai");
+            assert_eq!(body["detail"], expected_detail, "{remote}");
+            assert!(body.get("models").is_none());
+            assert!(!body["error"].as_str().unwrap().is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn list_provider_models_needs_a_provider() {
+        let shared = test_shared("browser");
+        for provider in [None, Some("  ")] {
+            let body =
+                dispatch_list_provider_models(&shared, &authenticated(), "127.0.0.1", provider)
+                    .await;
+            assert_eq!(body["event"], "provider_models");
+            assert_eq!(body["detail"], "missing_provider", "{provider:?}");
+        }
+    }
+
+    #[test]
+    fn provider_models_body_carries_models_or_an_error() {
+        let models = vec![ProviderModelInfo {
+            id: "gpt-x".to_string(),
+            display_name: Some("GPT X".to_string()),
+            context_length: Some(1000),
+            model_type: None,
+        }];
+        let ok = provider_models_event_body("openai", Ok(models));
+        assert_eq!(ok["provider"], "openai");
+        assert_eq!(ok["models"][0]["id"], "gpt-x");
+        assert_eq!(ok["models"][0]["display_name"], "GPT X");
+        assert_eq!(ok["models"][0]["context_length"], 1000);
+        assert!(ok.get("error").is_none());
+
+        let failed =
+            provider_models_event_body("anthropic", Err(("listing_failed", "HTTP 401".into())));
+        assert_eq!(failed["detail"], "listing_failed");
+        assert_eq!(failed["error"], "HTTP 401");
+        assert!(failed.get("models").is_none());
+    }
+
+    #[test]
+    fn model_preset_writes_reply_with_the_model_presets_event_and_their_action() {
+        for (kind, action) in [
+            (SettingKind::ModelPresetAdd, "added"),
+            (SettingKind::ModelPresetConfig, "updated"),
+            (SettingKind::ModelPresetDelete, "deleted"),
+            (SettingKind::ModelPresetActivate, "activated"),
+        ] {
+            assert_eq!(kind.saved_event(), WsOutboundEvent::ModelPresets);
+            assert_eq!(kind.model_preset_action(), Some(action));
+        }
+        assert_eq!(SettingKind::McpServerAdd.model_preset_action(), None);
+    }
+
+    const MODEL_PRESETS_CONFIG: &str = r#"{
+  "agents": {"provider": "anthropic", "modelPreset": "fast"},
+  "providers": {"anthropic": {"apiKey": "test-key"}},
+  "modelPresets": {
+    "fast": {"model": "claude-haiku", "provider": "anthropic"},
+    "terra": {"model": "gpt-6.1-terra", "provider": "anthropic"}
+  }
+}"#;
+
+    #[test]
+    fn the_model_presets_list_hides_forms_from_read_only_connections() {
+        let read_only =
+            model_preset_form::model_presets_overview(MODEL_PRESETS_CONFIG, false).unwrap();
+        let body = model_presets_event_body(&read_only, false, None);
+
+        assert_eq!(body["can_modify"], false);
+        assert_eq!(body["active"], "fast");
+        assert!(body.get("new_preset_form").is_none());
+        assert!(
+            body.get("changed").is_none(),
+            "a plain list says nothing changed"
+        );
+        let presets = body["presets"].as_array().unwrap();
+        assert_eq!(presets.len(), 3);
+        assert!(presets.iter().all(|row| row.get("form").is_none()));
+
+        let modifiable =
+            model_preset_form::model_presets_overview(MODEL_PRESETS_CONFIG, true).unwrap();
+        let body = model_presets_event_body(&modifiable, true, Some(("activated", "terra")));
+        assert!(body["new_preset_form"]["fields"].is_array());
+        assert!(body["presets"][1]["form"]["fields"].is_array());
+        assert_eq!(
+            body["changed"],
+            serde_json::json!({"action": "activated", "name": "terra"})
+        );
+    }
+
+    #[test]
+    fn activating_a_preset_switches_the_running_default_without_a_restart() {
+        let resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        let mut session = Session::new("websocket:chat-1".to_string());
+        session.metadata.insert(
+            SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+            serde_json::json!("fast"),
+        );
+        let activated = model_preset_form::with_default_model_preset(MODEL_PRESETS_CONFIG, "terra")
+            .unwrap()
+            .unwrap();
+
+        reload_model_presets_from_text(&resolver, &activated).unwrap();
+
+        assert_eq!(resolver.current_default().model, "gpt-6.1-terra");
+        assert_eq!(resolver.current_default().preset_name, "terra");
+        assert_eq!(
+            resolver.runtime_for_session(Some(&session)).model,
+            "claude-haiku",
+            "a chat with its own preset keeps it"
+        );
+        assert!(
+            resolver
+                .available_preset_names()
+                .contains(&"terra".to_string())
+        );
+    }
+
+    #[test]
+    fn a_reload_that_cannot_be_applied_reports_why() {
+        let resolver = test_runtime_resolver_with_preset("fast", "claude-haiku");
+        let unresolvable = r#"{"modelPresets": {"p": {"model": "${RUST_BOT_SURELY_UNSET_VARIABLE_4711}"}}, "agents": {"modelPreset": "p"}}"#;
+
+        let error = reload_model_presets_from_text(&resolver, unresolvable).unwrap_err();
+
+        assert!(error.contains("RUST_BOT_SURELY_UNSET_VARIABLE_4711"));
+        assert_eq!(resolver.current_default().preset_name, "default");
     }
 
     #[tokio::test]

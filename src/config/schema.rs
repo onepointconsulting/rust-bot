@@ -310,6 +310,26 @@ fn default_model_preset_provider() -> String {
     "auto".to_string()
 }
 
+/// Reasoning-effort levels a model preset (or `agents.reasoningEffort`) can choose from,
+/// as offered by the setup wizard and the WebUI's Models page. `"none"` is how the
+/// choice lists show "no reasoning effort": it is stored as `null`, never as `"none"`.
+pub const REASONING_EFFORT_CHOICES: [&str; 5] = ["none", "low", "medium", "high", "adaptive"];
+
+/// The choice that means "no reasoning effort" in [`REASONING_EFFORT_CHOICES`]; stored as `null`.
+pub const REASONING_EFFORT_NONE: &str = "none";
+
+/// Providers a model preset may name on the WebUI's Models page: exactly the names
+/// `providers::factory::create_provider_for` can build (`"auto"` picks the first provider
+/// that has an API key). Kept in sync with the factory by a unit test.
+pub const MODEL_PRESET_PROVIDER_CHOICES: [&str; 6] = [
+    "auto",
+    "openai",
+    "anthropic",
+    "openrouter",
+    "together",
+    "custom",
+];
+
 /// A named, reusable bundle of model + provider + generation settings.
 ///
 /// Selected as the process-wide default via `AgentsConfig::model_preset`, or
@@ -318,44 +338,59 @@ fn default_model_preset_provider() -> String {
 /// `model`/`provider`/... fields," for backward compatibility with configs
 /// that predate presets, and must not be defined as an entry in
 /// `Config::model_presets` (enforced by `validate_model_presets`).
-#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+///
+/// The field doc comments are the help texts of the WebUI's model preset form
+/// (generated from this struct's JSON Schema).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 pub struct ModelPresetConfig {
-    /// Optional human-readable display label.
+    /// Name shown for this preset in the model pickers. Empty: the preset's name is shown.
     #[serde(alias = "label")]
     #[garde(skip)]
     pub label: Option<String>,
 
-    /// Model identifier, e.g. `"anthropic/claude-opus-4-6"`. Emptiness is
-    /// checked by `validate_model_presets` rather than by garde, since the
-    /// container-level `#[serde(default)]` attribute silently produces an
-    /// empty string for a missing key rather than failing to parse.
+    /// Model identifier sent to the provider, e.g. `anthropic/claude-opus-4-6` or
+    /// `gpt-6.1-terra`. Required.
+    // Emptiness is checked by `validate_model_presets` rather than by garde, since the
+    // container-level `#[serde(default)]` attribute silently produces an empty string
+    // for a missing key rather than failing to parse.
     #[serde(alias = "model")]
     #[garde(skip)]
     pub model: String,
 
-    /// Provider name (e.g. `"anthropic"`, `"openrouter"`) or `"auto"`.
+    /// Provider that serves the model. `auto` picks the first provider with an API key
+    /// (openai, openrouter, custom, anthropic, together). API keys are set per provider
+    /// in the configuration file. Default: `auto`.
     #[serde(alias = "provider", default = "default_model_preset_provider")]
     #[garde(skip)]
+    #[schemars(extend("x-choices" = MODEL_PRESET_PROVIDER_CHOICES))]
     pub provider: String,
 
+    /// Maximum completion tokens per response. Default: 32768.
     #[serde(alias = "max_tokens", default = "default_agent_max_tokens")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub max_tokens: u32,
 
+    /// Total context window of the model, in tokens. Default: 131072.
     #[serde(
         alias = "context_window_tokens",
         default = "default_agent_context_window_tokens"
     )]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1))]
     pub context_window_tokens: u64,
 
+    /// Sampling temperature from 0.0 (deterministic) to 1.0 (more creative). Default: 0.1.
     #[serde(alias = "temperature", default = "default_agent_temperature")]
     #[garde(range(min = 0.0, max = 1.0))]
+    #[schemars(range(min = 0.0, max = 1.0), extend("default" = 0.1))]
     pub temperature: f32,
 
+    /// Provider-specific thinking mode. `none` disables it. Default: `none`.
     #[serde(alias = "reasoning_effort", default = "default_agent_reasoning_effort")]
     #[garde(skip)]
+    #[schemars(extend("x-choices" = REASONING_EFFORT_CHOICES))]
     pub reasoning_effort: Option<String>,
 }
 
@@ -3665,6 +3700,52 @@ mod tests {
         assert_eq!(cfg.temperature, default_agent_temperature());
         assert_eq!(cfg.reasoning_effort, None);
         assert_eq!(cfg.label, None);
+    }
+
+    /// The Models page form takes its drop-downs and bounds from the preset schema, so
+    /// they must be the shared lists and the garde ranges.
+    #[test]
+    fn model_preset_schema_offers_the_shared_choices_and_ranges() {
+        let schema = serde_json::to_value(schemars::schema_for!(ModelPresetConfig)).unwrap();
+        let properties = &schema["properties"];
+        assert_eq!(
+            properties["provider"]["x-choices"],
+            serde_json::json!(MODEL_PRESET_PROVIDER_CHOICES)
+        );
+        assert_eq!(
+            properties["reasoningEffort"]["x-choices"],
+            serde_json::json!(REASONING_EFFORT_CHOICES)
+        );
+        assert_eq!(properties["maxTokens"]["minimum"], 1);
+        assert_eq!(properties["contextWindowTokens"]["minimum"], 1);
+        assert_eq!(properties["temperature"]["minimum"], 0.0);
+        assert_eq!(properties["temperature"]["maximum"], 1.0);
+        assert_eq!(properties["temperature"]["default"], 0.1);
+        let names: Vec<&String> = properties.as_object().unwrap().keys().collect();
+        assert_eq!(
+            names,
+            [
+                "label",
+                "model",
+                "provider",
+                "maxTokens",
+                "contextWindowTokens",
+                "temperature",
+                "reasoningEffort"
+            ]
+        );
+    }
+
+    /// Every provider the Models page offers must be one the factory can build.
+    #[test]
+    fn every_model_preset_provider_choice_can_be_built_by_the_factory() {
+        let mut config = Config::default();
+        config.providers.openai.api_key = "test-key".to_string();
+        for provider in MODEL_PRESET_PROVIDER_CHOICES {
+            let built =
+                crate::providers::factory::create_provider_for(&config, "some-model", provider);
+            assert!(built.is_ok(), "{provider}: {:?}", built.err());
+        }
     }
 
     #[test]

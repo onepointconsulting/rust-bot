@@ -20,8 +20,9 @@ use std::collections::HashMap;
 
 use chat_ui::models::{
     AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
-    McpServerSettingSummary, Role, SessionTokenUsage, SkillSummary, SpawnTaskSummary,
-    ToolConfigSummary, ToolEvent, ToolSettingSummary, ToolSummary,
+    McpServerSettingSummary, ModelPresetChange, ModelPresetSummary, ProviderModelSummary, Role,
+    SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolConfigSummary, ToolEvent,
+    ToolSettingSummary, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -110,6 +111,9 @@ pub struct ClientEnvelope {
     /// field name to value (API keys, tokens). Secret: never logged or echoed.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub fields: Option<HashMap<String, String>>,
+    /// Set only by [`Self::list_provider_models`] — the provider whose models to list.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub provider: Option<String>,
     /// Set only by [`Self::set_tool_config`] — tool setting name to its new value.
     /// May hold secrets: never logged or echoed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -153,6 +157,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -187,6 +192,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -220,6 +226,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -266,6 +273,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -297,6 +305,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -328,6 +337,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -487,6 +497,80 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway for the model presets (the built-in `default` row first) with the
+    /// active one marked. Authenticated connections only. The reply is a `model_presets`
+    /// event (see [`ServerEvent::ModelPresets`]).
+    pub fn list_model_presets() -> Self {
+        Self {
+            type_: "list_model_presets",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to add the model preset `name` with the given settings (model,
+    /// provider, temperature, ...). Same access rules as [`Self::set_mcp_server_enabled`].
+    /// The reply is a `model_presets` event naming the change, or a `setting_error` event
+    /// of kind `model_preset_add`.
+    pub fn add_model_preset(
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "add_model_preset",
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to change settings of the model preset `name`. The reply is a
+    /// `model_presets` event or a `setting_error` of kind `model_preset_config`.
+    pub fn set_model_preset_config(
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "set_model_preset_config",
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to delete the model preset `name`. The reply is a `model_presets`
+    /// event or a `setting_error` of kind `model_preset_delete`.
+    pub fn delete_model_preset(name: impl Into<String>) -> Self {
+        Self {
+            type_: "delete_model_preset",
+            name: Some(name.into()),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to make the model preset `name` (`default`: the agent settings)
+    /// the default model of every chat without its own preset, at once. Not the same as
+    /// [`Self::set_model_preset`], which changes one chat. The reply is a `model_presets`
+    /// event or a `setting_error` of kind `model_preset_activate`.
+    pub fn set_default_model_preset(name: impl Into<String>) -> Self {
+        Self {
+            type_: "set_default_model_preset",
+            name: Some(name.into()),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway which models `provider` offers (`auto`: the provider it would pick),
+    /// using the credentials in its `config.json`. Same access rules as
+    /// [`Self::add_model_preset`]. The reply is a `provider_models` event (see
+    /// [`ServerEvent::ProviderModels`]) carrying the models or an error.
+    pub fn list_provider_models(provider: impl Into<String>) -> Self {
+        Self {
+            type_: "list_provider_models",
+            provider: Some(provider.into()),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway to change settings of the configured MCP server `name` (command,
     /// URL, environment, ...). `values` maps setting names to new values. Same access
     /// rules as [`Self::set_mcp_server_enabled`]. The reply is an `mcp_server_config_set`
@@ -543,6 +627,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -592,6 +677,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -626,6 +712,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -662,6 +749,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -696,6 +784,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -736,6 +825,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -770,6 +860,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -800,6 +891,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -833,6 +925,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -868,6 +961,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -930,6 +1024,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -969,6 +1064,7 @@ impl ClientEnvelope {
             pinned: None,
             fields: None,
             values: None,
+            provider: None,
             webui: true,
         }
     }
@@ -1281,6 +1377,29 @@ pub enum ServerEvent {
         server: Option<McpServerSettingSummary>,
         restart_required: bool,
     },
+    /// Reply to [`ClientEnvelope::list_model_presets`] and to every successful model
+    /// preset write: all rows (the built-in `default` first), the active preset's name,
+    /// the blank add form (only when `can_modify`), the providers without an API key and,
+    /// after a write, what changed. Not scoped to any one `chat_id`.
+    ModelPresets {
+        presets: Vec<ModelPresetSummary>,
+        active: String,
+        can_modify: bool,
+        new_preset_form: Option<ToolConfigSummary>,
+        providers_without_key: Vec<String>,
+        changed: Option<ModelPresetChange>,
+    },
+    /// Reply to [`ClientEnvelope::list_provider_models`]: the provider's models sorted by
+    /// id, or — when refused or failed — an empty list with `detail` (a stable code:
+    /// `access_denied`, `admin_required`, `missing_provider`, `config_error`,
+    /// `listing_failed`, ...) and `error` (a message for the user). Not scoped to any one
+    /// `chat_id`.
+    ProviderModels {
+        provider: String,
+        models: Vec<ProviderModelSummary>,
+        detail: Option<String>,
+        error: Option<String>,
+    },
     /// Reply to a refused or failed tool or MCP server toggle (or list). `kind` is
     /// `tool` or `mcp_server`; `detail` is a stable code (`access_denied`,
     /// `child_agent_config`, `protected_tool`, `unknown_server`, `config_error`, ...).
@@ -1489,6 +1608,8 @@ impl ServerEvent {
             | ServerEvent::McpServerExposureSet { .. }
             | ServerEvent::McpServerConfigSet { .. }
             | ServerEvent::McpServerAdded { .. }
+            | ServerEvent::ModelPresets { .. }
+            | ServerEvent::ProviderModels { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
             | ServerEvent::ConfigFileSaved { .. }
@@ -1897,6 +2018,34 @@ struct SettingSetWire {
 }
 
 #[derive(Deserialize)]
+struct ModelPresetsWire {
+    #[serde(default)]
+    presets: Vec<ModelPresetSummary>,
+    #[serde(default)]
+    active: String,
+    #[serde(default)]
+    can_modify: bool,
+    #[serde(default)]
+    new_preset_form: Option<ToolConfigSummary>,
+    #[serde(default)]
+    providers_without_key: Vec<String>,
+    #[serde(default)]
+    changed: Option<ModelPresetChange>,
+}
+
+#[derive(Deserialize)]
+struct ProviderModelsWire {
+    #[serde(default)]
+    provider: String,
+    #[serde(default)]
+    models: Vec<ProviderModelSummary>,
+    #[serde(default)]
+    detail: Option<String>,
+    #[serde(default)]
+    error: Option<String>,
+}
+
+#[derive(Deserialize)]
 struct SettingErrorWire {
     #[serde(default)]
     kind: String,
@@ -2241,6 +2390,22 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
                 name: w.name,
                 server: w.server,
                 restart_required: w.restart_required,
+            })
+        }
+        "model_presets" => decode::<ModelPresetsWire>(&value).map(|w| ServerEvent::ModelPresets {
+            presets: w.presets,
+            active: w.active,
+            can_modify: w.can_modify,
+            new_preset_form: w.new_preset_form,
+            providers_without_key: w.providers_without_key,
+            changed: w.changed,
+        }),
+        "provider_models" => {
+            decode::<ProviderModelsWire>(&value).map(|w| ServerEvent::ProviderModels {
+                provider: w.provider,
+                models: w.models,
+                detail: w.detail,
+                error: w.error,
             })
         }
         "setting_error" => decode::<SettingErrorWire>(&value).map(|w| ServerEvent::SettingError {
@@ -3684,6 +3849,174 @@ mod tests {
         };
         assert_eq!(name, "cms");
         assert!(restart_required && server.is_some_and(|s| !s.active));
+    }
+
+    #[test]
+    fn client_envelopes_of_the_models_page_serialize_their_name_and_values() {
+        let values = HashMap::from([("temperature".to_string(), serde_json::json!(0.7))]);
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::add_model_preset("terra", values.clone()))
+                .unwrap(),
+            serde_json::json!({
+                "type": "add_model_preset",
+                "name": "terra",
+                "values": {"temperature": 0.7},
+                "webui": true,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_model_preset_config("terra", values)).unwrap()
+                ["type"],
+            "set_model_preset_config"
+        );
+        for (envelope, type_) in [
+            (ClientEnvelope::list_model_presets(), "list_model_presets"),
+            (
+                ClientEnvelope::delete_model_preset("terra"),
+                "delete_model_preset",
+            ),
+            (
+                ClientEnvelope::set_default_model_preset("terra"),
+                "set_default_model_preset",
+            ),
+        ] {
+            let value = serde_json::to_value(envelope).unwrap();
+            assert_eq!(value["type"], type_);
+            assert!(value.get("values").is_none(), "{type_}");
+        }
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::delete_model_preset("terra")).unwrap()["name"],
+            "terra"
+        );
+    }
+
+    #[test]
+    fn list_provider_models_envelope_names_only_the_provider() {
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::list_provider_models("openai")).unwrap(),
+            serde_json::json!({
+                "type": "list_provider_models",
+                "provider": "openai",
+                "webui": true,
+            })
+        );
+        // Every other envelope leaves `provider` out.
+        assert!(serde_json::to_value(ClientEnvelope::list_model_presets())
+            .unwrap()
+            .get("provider")
+            .is_none());
+    }
+
+    #[test]
+    fn provider_models_decodes_the_listed_models() {
+        let event = parse_server_event(
+            r#"{"event":"provider_models","provider":"together","models":[
+                {"id":"BAAI/bge","display_name":"BGE","context_length":null,"model_type":"embedding"},
+                {"id":"meta/llama","context_length":131072}
+            ]}"#,
+        )
+        .expect("should parse");
+        assert_eq!(
+            event,
+            ServerEvent::ProviderModels {
+                provider: "together".to_string(),
+                models: vec![
+                    ProviderModelSummary {
+                        id: "BAAI/bge".to_string(),
+                        display_name: Some("BGE".to_string()),
+                        context_length: None,
+                        model_type: Some("embedding".to_string()),
+                    },
+                    ProviderModelSummary {
+                        id: "meta/llama".to_string(),
+                        display_name: None,
+                        context_length: Some(131_072),
+                        model_type: None,
+                    },
+                ],
+                detail: None,
+                error: None,
+            }
+        );
+        assert_eq!(event.chat_id(), None);
+    }
+
+    #[test]
+    fn provider_models_decodes_a_refusal() {
+        let event = parse_server_event(
+            r#"{"event":"provider_models","provider":"openai","detail":"admin_required","error":"Admins only."}"#,
+        )
+        .expect("should parse");
+        let ServerEvent::ProviderModels {
+            models,
+            detail,
+            error,
+            ..
+        } = event
+        else {
+            panic!("expected ProviderModels");
+        };
+        assert!(models.is_empty());
+        assert_eq!(detail.as_deref(), Some("admin_required"));
+        assert_eq!(error.as_deref(), Some("Admins only."));
+    }
+
+    #[test]
+    fn model_presets_decodes_rows_forms_and_the_change() {
+        let event = parse_server_event(
+            r#"{"event":"model_presets","active":"terra","can_modify":true,
+                "providers_without_key":["together"],
+                "changed":{"action":"activated","name":"terra"},
+                "presets":[
+                  {"name":"default","label":"Default (agent settings)","model":"m","provider":"auto",
+                   "active":false,"built_in":true,"deletable":false,"delete_blocked_reason":"x","missing_api_key":false},
+                  {"name":"terra","label":null,"model":"gpt-6.1-terra","provider":"openai",
+                   "active":true,"built_in":false,"deletable":false,"delete_blocked_reason":"active","missing_api_key":true,
+                   "form":{"name":"terra","fields":[{"name":"temperature","label":"Temperature","help":"",
+                     "kind":"number","min":0.0,"max":1.0,"secret":false,"env_var":"","configured":true,"value":1.0,"default":0.1}]}}
+                ],
+                "new_preset_form":{"name":"","fields":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.chat_id(), None);
+        let ServerEvent::ModelPresets {
+            presets,
+            active,
+            can_modify,
+            new_preset_form,
+            providers_without_key,
+            changed,
+        } = event
+        else {
+            panic!("expected ModelPresets");
+        };
+        assert_eq!(active, "terra");
+        assert!(can_modify && new_preset_form.is_some());
+        assert_eq!(providers_without_key, ["together"]);
+        assert_eq!(changed.unwrap().action, "activated");
+        assert!(presets[0].built_in && presets[0].form.is_none());
+        assert!(presets[1].active && presets[1].missing_api_key);
+        let temperature = &presets[1].form.as_ref().unwrap().fields[0];
+        assert!(matches!(
+            temperature.kind,
+            chat_ui::models::ToolFieldKind::Number {
+                min: Some(_),
+                max: Some(_)
+            }
+        ));
+
+        let plain =
+            parse_server_event(r#"{"event":"model_presets","presets":[],"active":"default"}"#)
+                .unwrap();
+        let ServerEvent::ModelPresets {
+            changed,
+            can_modify,
+            ..
+        } = plain
+        else {
+            panic!("expected ModelPresets");
+        };
+        assert!(changed.is_none() && !can_modify);
     }
 
     #[test]

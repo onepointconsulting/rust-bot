@@ -53,16 +53,21 @@ impl AnthropicProvider {
     pub const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
     const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 
-    fn build_request_headers(api_key: &str, extra_headers: &HashMap<String, String>) -> HeaderMap {
+    /// The headers every Anthropic API request carries: JSON content negotiation, the
+    /// `x-api-key` credential, the pinned `anthropic-version`, then `extra_headers` (which
+    /// may override any of them). Errs naming the offending header instead of panicking,
+    /// so callers outside provider construction (e.g. model listing) can recover.
+    pub(crate) fn try_build_request_headers(
+        api_key: &str,
+        extra_headers: &HashMap<String, String>,
+    ) -> Result<HeaderMap, String> {
         let mut headers = HeaderMap::new();
         headers.insert(CONTENT_TYPE, HeaderValue::from_static("application/json"));
         headers.insert(ACCEPT, HeaderValue::from_static("application/json"));
         headers.insert(
             HeaderName::from_static("x-api-key"),
-            HeaderValue::from_str(api_key).unwrap_or_else(|e| {
-                log::error!("Invalid Anthropic API key header value: {e}");
-                panic!("Invalid Anthropic API key header value: {e}");
-            }),
+            HeaderValue::from_str(api_key)
+                .map_err(|e| format!("Invalid Anthropic API key header value: {e}"))?,
         );
         headers.insert(
             HeaderName::from_static("anthropic-version"),
@@ -70,18 +75,23 @@ impl AnthropicProvider {
         );
 
         for (key, value) in extra_headers {
-            let header_name = HeaderName::from_bytes(key.as_bytes()).unwrap_or_else(|e| {
-                log::error!("Invalid HTTP header name '{key}': {e}");
-                panic!("Invalid HTTP header name '{key}': {e}");
-            });
-            let header_value = HeaderValue::from_str(value).unwrap_or_else(|e| {
-                log::error!("Invalid HTTP header value for '{key}': {e}");
-                panic!("Invalid HTTP header value for '{key}': {e}");
-            });
+            let header_name = HeaderName::from_bytes(key.as_bytes())
+                .map_err(|e| format!("Invalid HTTP header name '{key}': {e}"))?;
+            let header_value = HeaderValue::from_str(value)
+                .map_err(|e| format!("Invalid HTTP header value for '{key}': {e}"))?;
             headers.insert(header_name, header_value);
         }
 
-        headers
+        Ok(headers)
+    }
+
+    /// [`Self::try_build_request_headers`] for provider construction, where an invalid
+    /// header is a configuration error that must stop the run.
+    fn build_request_headers(api_key: &str, extra_headers: &HashMap<String, String>) -> HeaderMap {
+        Self::try_build_request_headers(api_key, extra_headers).unwrap_or_else(|message| {
+            log::error!("{message}");
+            panic!("{message}");
+        })
     }
 
     fn build_http_client(

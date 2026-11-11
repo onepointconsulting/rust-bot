@@ -16,8 +16,17 @@ use chat_ui::models::{ToolConfigSummary, ToolFieldKind, ToolFieldSummary};
 use leptos::prelude::*;
 use serde_json::{Map, Value};
 
+use super::model_picker::{ModelCatalog, ModelPicker, MODEL_FIELD};
+
 /// What the form reports when saved: the tool section's name and the changed settings.
 pub type ToolConfigChange = (String, HashMap<String, Value>);
+
+/// Increment of the arrows of a decimal number input (e.g. a temperature).
+pub const NUMBER_STEP: &str = "0.1";
+
+/// The note at the top of a form whose changes only apply after a restart.
+pub const RESTART_FORM_NOTE: &str =
+    "Stored in config.json on this machine. Changes apply after a restart.";
 
 /// Text shown in the input before the user touches it: the stored value, or nothing for
 /// secrets (which the gateway never sends).
@@ -104,6 +113,13 @@ pub fn draft_to_value(field: &ToolFieldSummary, draft: &str) -> Result<Value, St
             .parse::<i64>()
             .map(Value::from)
             .map_err(|_| format!("{} must be a whole number.", field.label)),
+        ToolFieldKind::Number { .. } => draft
+            .trim()
+            .parse::<f64>()
+            .ok()
+            .and_then(serde_json::Number::from_f64)
+            .map(Value::Number)
+            .ok_or_else(|| format!("{} must be a number.", field.label)),
         ToolFieldKind::Text | ToolFieldKind::Choice { .. } => {
             Ok(Value::String(draft.trim().to_string()))
         }
@@ -175,11 +191,13 @@ pub fn field_placeholder(field: &ToolFieldSummary) -> String {
     }
 }
 
-/// One input for `field`, bound to its entry in `drafts`.
+/// One input for `field`, bound to its entry in `drafts`. With a `model_catalog`, the
+/// `model` field gets the drop-down of the chosen provider's models under its input.
 #[component]
 pub(super) fn FieldInput(
     field: ToolFieldSummary,
     drafts: RwSignal<HashMap<String, String>>,
+    #[prop(optional_no_strip)] model_catalog: Option<ModelCatalog>,
 ) -> impl IntoView {
     let name = field.name.clone();
     let name_for_read = name.clone();
@@ -245,6 +263,19 @@ pub(super) fn FieldInput(
             />
         }
         .into_any(),
+        ToolFieldKind::Number { min, max } => view! {
+            <input
+                type="number"
+                step=NUMBER_STEP
+                class=input_class
+                min=min.map(|min| min.to_string())
+                max=max.map(|max| max.to_string())
+                placeholder=placeholder.clone()
+                prop:value=draft
+                on:input=move |event| set_draft(event_target_value(&event))
+            />
+        }
+        .into_any(),
         ToolFieldKind::Text => view! {
             <input
                 type=if field.secret { "password" } else { "text" }
@@ -259,17 +290,22 @@ pub(super) fn FieldInput(
         .into_any(),
     };
     let note = field_note(&field);
+    let model_picker = model_catalog
+        .filter(|_| field.name == MODEL_FIELD)
+        .map(|catalog| view! { <ModelPicker catalog=catalog drafts=drafts /> });
     view! {
         <label class="mb-3 block text-sm text-slate-700">
             <span class="mb-1 block font-medium">{field.label.clone()}</span>
             {input}
+            {model_picker}
             {(!note.is_empty()).then(|| view! { <span class="mt-1 block text-xs text-slate-500">{note}</span> })}
         </label>
     }
 }
 
 /// The inline settings form of one tool section: an input per setting and a Save button
-/// that stays off until something valid changed.
+/// that stays off until something valid changed. `note` is the line above the inputs
+/// (by default [`RESTART_FORM_NOTE`]).
 ///
 /// `drafts` is owned by the caller (start it from [`initial_drafts`]) so unsaved edits
 /// outlive this component: the settings list rebuilds its rows whenever it changes (a
@@ -282,7 +318,12 @@ pub fn ToolConfigForm(
     #[prop(into)] can_modify: Signal<bool>,
     #[prop(into)] busy: Signal<bool>,
     on_save: Callback<ToolConfigChange>,
+    #[prop(optional, into)] note: Option<String>,
+    /// Offers the provider's models under the `model` input (model preset forms).
+    #[prop(optional_no_strip)]
+    model_catalog: Option<ModelCatalog>,
 ) -> impl IntoView {
+    let note = note.unwrap_or_else(|| RESTART_FORM_NOTE.to_string());
     let fields_for_check = config.fields.clone();
     let fields_for_error = config.fields.clone();
     let fields_for_save = config.fields.clone();
@@ -297,13 +338,13 @@ pub fn ToolConfigForm(
     };
     view! {
         <div class="mb-3 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:ml-16">
-            <p class="mb-3 text-xs text-slate-500">
-                "Stored in config.json on this machine. Changes apply after a restart."
-            </p>
+            <p class="mb-3 text-xs text-slate-500">{note}</p>
             {config
                 .fields
                 .into_iter()
-                .map(|field| view! { <FieldInput field=field drafts=drafts /> })
+                .map(|field| {
+                    view! { <FieldInput field=field drafts=drafts model_catalog=model_catalog /> }
+                })
                 .collect_view()}
             {move || draft_error().map(|message| view! { <p class="mb-2 text-xs text-red-600">{message}</p> })}
             <button
@@ -425,6 +466,28 @@ mod tests {
             .is_empty());
         let changes = changed_values(&fields, &drafts(&[("apiKey", "sk-1")])).unwrap();
         assert_eq!(changes["apiKey"], json!("sk-1"));
+    }
+
+    #[test]
+    fn a_decimal_draft_becomes_a_json_number() {
+        let temperature = field(
+            "temperature",
+            ToolFieldKind::Number {
+                min: serde_json::Number::from_f64(0.0),
+                max: serde_json::Number::from_f64(1.0),
+            },
+            Some(json!(0.1)),
+        );
+
+        assert_eq!(initial_draft(&temperature), "0.1");
+        assert_eq!(draft_to_value(&temperature, " 0.7 "), Ok(json!(0.7)));
+        assert_eq!(draft_to_value(&temperature, "1"), Ok(json!(1.0)));
+        assert_eq!(
+            draft_to_value(&temperature, "warm"),
+            Err("temperature must be a number.".to_string())
+        );
+        let changes = changed_values(&[temperature], &drafts(&[("temperature", "0.5")])).unwrap();
+        assert_eq!(changes["temperature"], json!(0.5));
     }
 
     #[test]

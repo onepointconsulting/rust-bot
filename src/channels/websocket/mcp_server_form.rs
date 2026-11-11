@@ -15,7 +15,6 @@
 
 use std::collections::{HashMap, HashSet};
 
-use schemars::schema_for;
 use serde_json::{Map, Value};
 
 use super::config_toggles::{
@@ -23,15 +22,16 @@ use super::config_toggles::{
     existing_or_default_key, is_valid_name, mcp_server_object_mut, mcp_server_setting_rows,
     parse_root, render, tools_object_mut,
 };
-use crate::agent::tools::tool_settings_api::{
-    FieldKind, ToolSettingsSummary, check_value, field_kind, summarize_field,
+use super::settings_form::{
+    SettingSpellings, check_placeholders, form_fields, process_env_is_set, remove_value,
+    schema_properties, store_value, stored_value,
 };
-use crate::config::loader::referenced_env_vars;
+use crate::agent::tools::tool_settings_api::{ToolSettingsSummary, check_value, field_kind};
 use crate::config::schema::McpServerConfig;
 
 /// Setting names (as the form calls them) with every spelling the configuration accepts,
 /// the form's own name first. Settings not listed have a single spelling.
-const SETTING_SPELLINGS: &[&[&str]] = &[
+const SETTING_SPELLINGS: SettingSpellings = &[
     &["transportType", "type"],
     &["toolTimeout", "tool_timeout"],
     &["enabledTools", "enabled_tools"],
@@ -46,30 +46,10 @@ const ENABLED: &str = "enabled";
 /// The `exposure` value that is the default, so it is stored by removing the key.
 const MCP_EXPOSURE_DIRECT: &str = "direct";
 
-/// Every spelling of the setting `name`, the form's own name first.
-fn spellings(name: &str) -> Vec<String> {
-    match SETTING_SPELLINGS
-        .iter()
-        .find(|spellings| spellings[0] == name)
-    {
-        Some(spellings) => spellings.iter().map(|s| s.to_string()).collect(),
-        None => vec![name.to_string()],
-    }
-}
-
 /// The schema properties the form edits, in declaration order (`enabled` is the row
 /// switch and is not part of the schema).
 fn form_properties() -> Map<String, Value> {
-    let schema = serde_json::to_value(schema_for!(McpServerConfig)).unwrap_or(Value::Null);
-    schema["properties"]
-        .as_object()
-        .cloned()
-        .unwrap_or_default()
-}
-
-/// The value the server entry stores for the setting `name` under any of its spellings.
-fn stored_value<'a>(server: &'a Map<String, Value>, name: &str) -> Option<&'a Value> {
-    spellings(name).iter().find_map(|key| server.get(key))
+    schema_properties::<McpServerConfig>()
 }
 
 /// The settings form of the MCP server `name` in the config `text`, showing what the
@@ -89,12 +69,13 @@ pub fn mcp_server_form(text: &str, name: &str) -> Result<ToolSettingsSummary, To
         description: String::new(),
         enabled: Some(enabled),
         tool_names: Vec::new(),
-        fields: form_fields(Some(server)),
+        fields: server_form_fields(Some(server)),
     })
 }
 
 /// The blank form for a server that does not exist yet: every setting at its default
-/// (numbers and text empty, with the default as placeholder; see [`shown_value`]).
+/// (numbers and text empty, with the default as placeholder; see
+/// [`super::settings_form::shown_value`]).
 /// It has no name (the browser asks for one) and no switch.
 pub fn new_server_form() -> ToolSettingsSummary {
     ToolSettingsSummary {
@@ -103,37 +84,15 @@ pub fn new_server_form() -> ToolSettingsSummary {
         description: String::new(),
         enabled: None,
         tool_names: Vec::new(),
-        fields: form_fields(None),
+        fields: server_form_fields(None),
     }
 }
 
-/// One form field per setting, showing [`shown_value`].
-fn form_fields(
+/// One form field per setting of `server` (`None`: a server not added yet).
+fn server_form_fields(
     server: Option<&Map<String, Value>>,
 ) -> Vec<crate::agent::tools::tool_settings_api::ToolFieldSummary> {
-    form_properties()
-        .iter()
-        .filter_map(|(setting, property)| {
-            summarize_field(setting, property, &shown_value(server, setting, property))
-        })
-        .collect()
-}
-
-/// The value the form shows for `setting`: what `server` stores for it, else (for a
-/// server that leaves it out, or a server not added yet) the schema default.
-///
-/// A number or text the file leaves out is shown empty instead, so the browser displays
-/// the default as a placeholder: shown as a value, typing the default itself would look
-/// like "no change" and never be written. Lists, maps and choices keep their default
-/// (an empty `enabledTools` would read as "no tools"; choices label their default).
-fn shown_value(server: Option<&Map<String, Value>>, setting: &str, property: &Value) -> Value {
-    if let Some(stored) = server.and_then(|server| stored_value(server, setting)) {
-        return stored.clone();
-    }
-    match field_kind(property) {
-        Some(FieldKind::Integer { .. } | FieldKind::Text) => Value::Null,
-        _ => property.get("default").cloned().unwrap_or(Value::Null),
-    }
+    form_fields(&form_properties(), SETTING_SPELLINGS, server)
 }
 
 /// The MCP server rows of the config `text` (see [`mcp_server_setting_rows`]), each
@@ -165,24 +124,16 @@ fn is_stored_as_absent(setting: &str, value: &Value) -> bool {
 /// Write `value` for `setting` into the server entry, under the spelling the file already
 /// uses (the form's own name otherwise), or remove it when the value means "default".
 fn store_setting(server: &mut Map<String, Value>, setting: &str, value: Value) {
-    let spellings = spellings(setting);
     if is_stored_as_absent(setting, &value) {
-        for key in &spellings {
-            server.remove(key);
-        }
-        return;
+        remove_value(SETTING_SPELLINGS, server, setting);
+    } else {
+        store_value(SETTING_SPELLINGS, server, setting, value);
     }
-    let key = spellings
-        .iter()
-        .find(|key| server.contains_key(key.as_str()))
-        .unwrap_or(&spellings[0])
-        .clone();
-    server.insert(key, value);
 }
 
 /// The text the server entry stores for `setting`, empty when absent or not text.
 fn stored_text<'a>(server: &'a Map<String, Value>, setting: &str) -> &'a str {
-    stored_value(server, setting)
+    stored_value(SETTING_SPELLINGS, server, setting)
         .and_then(Value::as_str)
         .unwrap_or_default()
         .trim()
@@ -208,34 +159,10 @@ fn check_connection_target(server: &Map<String, Value>) -> Result<(), ToggleErro
     }
 }
 
-/// Whether the environment variable `name` is set on this machine.
-fn process_env_is_set(name: &str) -> bool {
-    std::env::var_os(name).is_some()
-}
-
 /// Why an unset `${VAR}` is refused, and what to do instead. Shown after the variable's
 /// name. People often expect the server's Env field to define variables for `${NAME}`;
 /// it does not (it only feeds the launched command), so the message says so.
 const UNSET_VARIABLE_EXPLANATION: &str = "which is not set in the environment of the process running rust-bot. ${NAME} is read from that environment, not from this server's Env field: set the variable there before starting rust-bot, or write the value here directly.";
-
-/// Refuse a submitted value naming a `${VAR}` placeholder whose variable is not set.
-/// The message names the variable, never the value.
-fn check_placeholders(
-    setting: &str,
-    value: &Value,
-    env_is_set: &dyn Fn(&str) -> bool,
-) -> Result<(), ToggleError> {
-    match referenced_env_vars(value)
-        .into_iter()
-        .find(|variable| !env_is_set(variable))
-    {
-        Some(variable) => Err(ToggleError::InvalidValue(
-            setting.to_string(),
-            format!("uses ${{{variable}}}, {UNSET_VARIABLE_EXPLANATION}"),
-        )),
-        None => Ok(()),
-    }
-}
 
 /// Check every submitted `changes` entry against the schema and the environment, write
 /// them into `server`, then check the result can connect. `server` may be left half
@@ -253,7 +180,7 @@ fn apply_settings(
             .ok_or_else(|| ToggleError::UnknownField(setting.clone()))?;
         let checked = check_value(&kind, value)
             .map_err(|reason| ToggleError::InvalidValue(setting.clone(), reason))?;
-        check_placeholders(setting, &checked, env_is_set)?;
+        check_placeholders(setting, &checked, env_is_set, UNSET_VARIABLE_EXPLANATION)?;
         store_setting(server, setting, checked);
     }
     check_connection_target(server)
@@ -335,7 +262,7 @@ fn with_mcp_server_added_in(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::agent::tools::tool_settings_api::ToolFieldSummary;
+    use crate::agent::tools::tool_settings_api::{FieldKind, ToolFieldSummary};
     use serde_json::json;
 
     const CONFIG: &str = r#"{

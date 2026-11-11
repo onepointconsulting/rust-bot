@@ -50,6 +50,14 @@ pub enum ToggleError {
     /// A submitted setting has a value it cannot take: `(setting, reason)`. The reason
     /// never repeats the value.
     InvalidValue(String, String),
+    /// No model preset with that name is configured.
+    UnknownPreset,
+    /// A model preset with that name is already configured; adding never overwrites.
+    PresetExists,
+    /// The name is reserved (`default` stands for the flat `agents.*` settings).
+    ReservedName,
+    /// The model preset cannot be deleted because something uses it: `(why)`.
+    PresetInUse(String),
 }
 
 impl ToggleError {
@@ -63,6 +71,10 @@ impl ToggleError {
             Self::ServerExists => "server_exists",
             Self::UnknownField(_) => "unknown_field",
             Self::InvalidValue(..) => "invalid_value",
+            Self::UnknownPreset => "unknown_preset",
+            Self::PresetExists => "preset_exists",
+            Self::ReservedName => "reserved_name",
+            Self::PresetInUse(_) => "preset_in_use",
         }
     }
 
@@ -76,8 +88,14 @@ impl ToggleError {
             }
             Self::UnknownServer => "No MCP server with that name is configured.".to_string(),
             Self::ServerExists => "An MCP server with that name already exists.".to_string(),
-            Self::UnknownField(field) => format!("'{field}' is not an MCP server setting."),
+            Self::UnknownField(field) => format!("'{field}' is not a setting of this form."),
             Self::InvalidValue(field, reason) => format!("Invalid value for '{field}': {reason}"),
+            Self::UnknownPreset => "No model preset with that name is configured.".to_string(),
+            Self::PresetExists => "A model preset with that name already exists.".to_string(),
+            Self::ReservedName => {
+                "'default' is reserved for the agent settings; choose another name.".to_string()
+            }
+            Self::PresetInUse(why) => format!("This model preset cannot be deleted: {why}"),
         }
     }
 }
@@ -139,11 +157,22 @@ pub(super) fn existing_or_default_key<'a>(
 /// `root.tools` as a mutable object, created when missing.
 pub(super) fn tools_object_mut(root: &mut Value) -> Result<&mut Map<String, Value>, ToggleError> {
     let root_object = root.as_object_mut().expect("parse_root checked this");
-    root_object
-        .entry("tools")
+    child_object_mut(root_object, &["tools"])
+}
+
+/// The object `parent.<key>` as a mutable object, created (under the first of `keys`)
+/// when none of the accepted spellings `keys` is present. Refused when the value there is
+/// not an object.
+pub(super) fn child_object_mut<'a>(
+    parent: &'a mut Map<String, Value>,
+    keys: &[&str],
+) -> Result<&'a mut Map<String, Value>, ToggleError> {
+    let key = existing_or_default_key(parent, keys).to_string();
+    parent
+        .entry(key.clone())
         .or_insert_with(|| Value::Object(Map::new()))
         .as_object_mut()
-        .ok_or_else(|| ToggleError::InvalidConfig("\"tools\" is not an object.".to_string()))
+        .ok_or_else(|| ToggleError::InvalidConfig(format!("\"{key}\" is not an object.")))
 }
 
 /// Serialize `root` the way the file was written: pretty-printed, with the trailing

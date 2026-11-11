@@ -168,6 +168,34 @@ launchers documented under [Command line](COMMAND_LINE.md).
 
 
 
+### Model presets
+
+A model preset is a named bundle under `modelPresets` in `config.json`:
+
+```json
+"modelPresets": {
+  "openai-gpt-6.1-terra": {
+    "label": null,
+    "model": "gpt-6.1-terra",
+    "provider": "openai",
+    "maxTokens": 32768,
+    "contextWindowTokens": 131072,
+    "temperature": 1.0,
+    "reasoningEffort": "medium"
+  }
+}
+```
+
+- `provider`: `auto` (the first provider with an API key: openai, openrouter, custom, anthropic, together), `openai`, `anthropic`, `openrouter`, `together` or `custom`. API keys live under `providers.<name>`.
+- `temperature`: 0.0 to 1.0.
+- `reasoningEffort`: `low`, `medium`, `high`, `adaptive`, or `null` for none.
+- The name `default` is reserved: it means the flat `agents.model` / `agents.provider` / … settings.
+
+There are two ways to choose a preset:
+
+- **For one chat**: `/model-preset <name>` here, or the preset picker in the web chat's input. Only that chat changes.
+- **For the whole gateway**: `agents.modelPreset` in `config.json` (the setup wizard's "Set default model preset"), or **Activate** on the web UI's Settings → Models page, which also switches the running gateway without a restart. Chats that chose their own preset keep it. The Models page can also add, edit and delete presets; see [Websockets chat UI](WEBSOCKETS_CHAT.md#settings--models).
+
 ### `/mcp-preset`
 
 Enable, disable, test, or list built-in MCP server presets (GitHub, Playwright,

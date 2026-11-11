@@ -1,8 +1,10 @@
 pub mod config_file;
 pub mod config_toggles;
 pub mod mcp_server_form;
+pub mod model_preset_form;
 pub mod registry;
 pub mod runtime;
+mod settings_form;
 pub mod types;
 pub mod webui;
 

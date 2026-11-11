@@ -9,9 +9,9 @@
 //! holding a provider/model captured once at process startup.
 
 use std::collections::HashMap;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, RwLock};
 
-use crate::config::schema::{Config, RESERVED_MODEL_PRESET_NAME};
+use crate::config::schema::{Config, ModelPresetConfig, RESERVED_MODEL_PRESET_NAME};
 use crate::providers::base::LLMProviderDyn;
 use crate::providers::factory::{create_provider_for, resolve_concrete_provider_name};
 use crate::session::manager::{Session, SessionManager};
@@ -44,9 +44,23 @@ pub struct ModelRuntime {
 /// differ between them. This is safe because those fields are already
 /// per-call overrides on [`LLMProviderDyn::chat_with_retry`], not baked into
 /// the provider at construction.
+///
+/// The preset catalog can be replaced while the process runs
+/// ([`Self::reload_presets`], used by the WebUI's Models page); provider
+/// settings (`providers.*`) and the flat `agents.*` fields stay as they were
+/// at startup, so cached providers stay valid.
 pub struct ModelRuntimeResolver {
+    /// Startup configuration: provider credentials and the flat `agents.*`
+    /// fields. Its `model_presets` is not read after construction; the live
+    /// catalog is `presets`.
     config: Config,
+    /// The live preset catalog (`model_presets`), replaced by [`Self::reload_presets`].
+    presets: RwLock<HashMap<String, ModelPresetConfig>>,
     provider_cache: Mutex<HashMap<String, Arc<dyn LLMProviderDyn>>>,
+    /// The implicit `"default"` runtime built at startup from the flat
+    /// `agents.*` fields and the startup provider; restored exactly when
+    /// `"default"` is made the process-wide default again.
+    flat_default: ModelRuntime,
     default_runtime: Mutex<ModelRuntime>,
 }
 
@@ -81,34 +95,67 @@ impl ModelRuntimeResolver {
         // `create_provider_for` — callers may have built it through means the
         // config alone can't reproduce (e.g. a test double, or an OAuth/login
         // flow), so re-deriving it here must never be a hard requirement.
+        let presets = config.model_presets.clone();
         let default_name = config.agents.model_preset.clone();
         let default_runtime = match default_name {
             Some(name) if name != RESERVED_MODEL_PRESET_NAME => {
-                Self::resolve_preset_with(&config, &cache, &name).unwrap_or_else(|e| {
+                Self::resolve_preset_with(&config, &presets, &cache, &name).unwrap_or_else(|e| {
                     log::warn!(
                         "agents.modelPreset '{name}' failed to resolve at startup ({e}); \
                          falling back to agents.* fields"
                     );
-                    flat_default
+                    flat_default.clone()
                 })
             }
-            _ => flat_default,
+            _ => flat_default.clone(),
         };
 
         Self {
             config,
+            presets: RwLock::new(presets),
             provider_cache: cache,
+            flat_default,
             default_runtime: Mutex::new(default_runtime),
         }
     }
 
     /// Resolve a preset name to a runtime, without changing the process-wide default.
     pub fn resolve_preset(&self, name: &str) -> Result<ModelRuntime, String> {
-        Self::resolve_preset_with(&self.config, &self.provider_cache, name)
+        let presets = self.presets.read().unwrap_or_else(|e| e.into_inner());
+        Self::resolve_preset_with(&self.config, &presets, &self.provider_cache, name)
+    }
+
+    /// Replace the preset catalog with `presets` and make `default_name` the
+    /// process-wide default (`None` or `"default"`: the flat `agents.*`
+    /// fields with the startup provider, exactly as at startup).
+    ///
+    /// Sessions with their own preset override keep it and resolve it
+    /// against the new catalog on their next turn; an override naming a
+    /// preset that no longer exists falls back to the default, as always.
+    ///
+    /// The catalog is replaced even when the new default fails to resolve
+    /// (e.g. an unknown provider); the previous default is then kept and the
+    /// error returned, so the caller can report that a restart is needed.
+    pub fn reload_presets(
+        &self,
+        presets: HashMap<String, ModelPresetConfig>,
+        default_name: Option<&str>,
+    ) -> Result<ModelRuntime, String> {
+        *self.presets.write().unwrap_or_else(|e| e.into_inner()) = presets;
+        let runtime = match default_name {
+            Some(name) if name != RESERVED_MODEL_PRESET_NAME => self.resolve_preset(name)?,
+            _ => self.flat_default.clone(),
+        };
+        *self
+            .default_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = runtime.clone();
+        Ok(runtime)
     }
 
     fn resolve_preset_with(
         config: &Config,
+        presets: &HashMap<String, ModelPresetConfig>,
         provider_cache: &Mutex<HashMap<String, Arc<dyn LLMProviderDyn>>>,
         name: &str,
     ) -> Result<ModelRuntime, String> {
@@ -130,8 +177,7 @@ impl ModelRuntimeResolver {
                 a.reasoning_effort.clone(),
             )
         } else {
-            let preset = config
-                .model_presets
+            let preset = presets
                 .get(name)
                 .ok_or_else(|| format!("Unknown model preset '{name}'"))?;
             (
@@ -232,7 +278,13 @@ impl ModelRuntimeResolver {
 
     /// Names available for `/model <name>`: `"default"` plus every configured preset, sorted.
     pub fn available_preset_names(&self) -> Vec<String> {
-        let mut names: Vec<String> = self.config.model_presets.keys().cloned().collect();
+        let mut names: Vec<String> = self
+            .presets
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .keys()
+            .cloned()
+            .collect();
         names.sort();
         names.insert(0, RESERVED_MODEL_PRESET_NAME.to_string());
         names
@@ -519,6 +571,134 @@ mod tests {
 
         let runtime = resolver.runtime_for_session(Some(&session));
         assert_eq!(runtime.preset_name, "default");
+    }
+
+    fn anthropic_preset(model: &str) -> crate::config::schema::ModelPresetConfig {
+        crate::config::schema::ModelPresetConfig {
+            model: model.to_string(),
+            provider: "anthropic".to_string(),
+            ..Default::default()
+        }
+    }
+
+    fn session_with_override(name: &str) -> Session {
+        let mut session = Session::new("s1".to_string());
+        session.metadata.insert(
+            SESSION_MODEL_PRESET_METADATA_KEY.to_string(),
+            serde_json::Value::String(name.to_string()),
+        );
+        session
+    }
+
+    #[test]
+    fn reload_adds_presets_that_can_then_be_resolved_and_listed() {
+        let resolver = build_resolver(config_with_anthropic_preset("fast", "claude-haiku"));
+        assert!(resolver.resolve_preset("terra").is_err());
+
+        let presets = HashMap::from([
+            ("fast".to_string(), anthropic_preset("claude-haiku")),
+            ("terra".to_string(), anthropic_preset("gpt-6.1-terra")),
+        ]);
+        resolver.reload_presets(presets, None).unwrap();
+
+        assert_eq!(
+            resolver.resolve_preset("terra").unwrap().model,
+            "gpt-6.1-terra"
+        );
+        assert_eq!(
+            resolver.available_preset_names(),
+            ["default", "fast", "terra"]
+        );
+    }
+
+    #[test]
+    fn reload_with_a_new_default_changes_the_process_default() {
+        let resolver = build_resolver(config_with_anthropic_preset("fast", "claude-haiku"));
+
+        let presets = HashMap::from([("terra".to_string(), anthropic_preset("gpt-6.1-terra"))]);
+        let runtime = resolver.reload_presets(presets, Some("terra")).unwrap();
+
+        assert_eq!(runtime.preset_name, "terra");
+        assert_eq!(resolver.current_default().model, "gpt-6.1-terra");
+        assert_eq!(resolver.runtime_for_session(None).model, "gpt-6.1-terra");
+    }
+
+    #[test]
+    fn reload_picks_up_edits_to_the_active_preset() {
+        let mut config = config_with_anthropic_preset("fast", "claude-haiku");
+        config.agents.model_preset = Some("fast".to_string());
+        let resolver = build_resolver(config);
+        assert_eq!(resolver.current_default().model, "claude-haiku");
+
+        let mut edited = anthropic_preset("claude-haiku-2");
+        edited.temperature = 0.7;
+        let presets = HashMap::from([("fast".to_string(), edited)]);
+        resolver.reload_presets(presets, Some("fast")).unwrap();
+
+        assert_eq!(resolver.current_default().model, "claude-haiku-2");
+        assert_eq!(resolver.current_default().temperature, 0.7);
+    }
+
+    #[test]
+    fn a_session_override_survives_a_reload_of_the_default() {
+        let resolver = build_resolver(config_with_anthropic_preset("fast", "claude-haiku"));
+        let session = session_with_override("fast");
+
+        let presets = HashMap::from([
+            ("fast".to_string(), anthropic_preset("claude-haiku")),
+            ("terra".to_string(), anthropic_preset("gpt-6.1-terra")),
+        ]);
+        resolver.reload_presets(presets, Some("terra")).unwrap();
+
+        assert_eq!(
+            resolver.runtime_for_session(Some(&session)).model,
+            "claude-haiku"
+        );
+        assert_eq!(resolver.runtime_for_session(None).model, "gpt-6.1-terra");
+    }
+
+    #[test]
+    fn an_override_naming_a_deleted_preset_falls_back_to_the_new_default() {
+        let resolver = build_resolver(config_with_anthropic_preset("fast", "claude-haiku"));
+        let session = session_with_override("fast");
+
+        let presets = HashMap::from([("terra".to_string(), anthropic_preset("gpt-6.1-terra"))]);
+        resolver.reload_presets(presets, Some("terra")).unwrap();
+
+        let runtime = resolver.runtime_for_session(Some(&session));
+        assert_eq!(runtime.preset_name, "terra");
+        assert_eq!(runtime.model, "gpt-6.1-terra");
+    }
+
+    #[test]
+    fn reloading_with_default_restores_the_startup_flat_runtime() {
+        let resolver = build_resolver(config_with_anthropic_preset("fast", "claude-haiku"));
+        let startup = resolver.current_default();
+        resolver.select_preset("fast").unwrap();
+
+        let presets = HashMap::from([("fast".to_string(), anthropic_preset("claude-haiku"))]);
+        let runtime = resolver
+            .reload_presets(presets, Some(RESERVED_MODEL_PRESET_NAME))
+            .unwrap();
+
+        assert_eq!(runtime.preset_name, RESERVED_MODEL_PRESET_NAME);
+        assert_eq!(runtime.model, startup.model);
+        assert!(Arc::ptr_eq(&runtime.provider, &startup.provider));
+        assert_eq!(resolver.current_default().model, startup.model);
+    }
+
+    #[test]
+    fn a_failed_reload_keeps_the_previous_default_but_installs_the_catalog() {
+        let resolver = build_resolver(config_with_anthropic_preset("fast", "claude-haiku"));
+        let before = resolver.current_default();
+        let mut broken = anthropic_preset("x");
+        broken.provider = "not-a-provider".to_string();
+        let presets = HashMap::from([("broken".to_string(), broken)]);
+
+        assert!(resolver.reload_presets(presets, Some("broken")).is_err());
+
+        assert_eq!(resolver.current_default().model, before.model);
+        assert_eq!(resolver.available_preset_names(), ["default", "broken"]);
     }
 
     #[test]

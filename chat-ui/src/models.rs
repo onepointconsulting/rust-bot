@@ -207,6 +207,14 @@ pub enum ToolFieldKind {
         #[serde(default)]
         max: Option<i64>,
     },
+    /// A decimal number (e.g. a temperature). The bounds stay JSON numbers so the kind
+    /// keeps deriving `Eq`.
+    Number {
+        #[serde(default)]
+        min: Option<serde_json::Number>,
+        #[serde(default)]
+        max: Option<serde_json::Number>,
+    },
     Text,
     Choice {
         choices: Vec<String>,
@@ -284,6 +292,68 @@ pub struct McpServerSettingSummary {
     /// connections that may change the configuration.
     #[serde(default)]
     pub config: Option<ToolConfigSummary>,
+}
+
+/// One row of the Settings dialog's Models page, as surfaced by the gateway's
+/// `model_presets` event.
+///
+/// Mirrors the backend's `ModelPresetRow` (`src/channels/websocket/model_preset_form.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPresetSummary {
+    /// The preset's key in `modelPresets`, or `default` for the built-in row.
+    pub name: String,
+    /// The display label, when the preset has one.
+    #[serde(default)]
+    pub label: Option<String>,
+    #[serde(default)]
+    pub model: String,
+    #[serde(default)]
+    pub provider: String,
+    /// Whether this is the gateway's default (`agents.modelPreset`).
+    #[serde(default)]
+    pub active: bool,
+    /// Whether this is the built-in `default` row (the flat agent settings): it can be
+    /// activated but not edited or deleted.
+    #[serde(default)]
+    pub built_in: bool,
+    /// Whether Delete is allowed (not the active preset, not Dream's preset).
+    #[serde(default)]
+    pub deletable: bool,
+    /// Why Delete is not allowed, empty when it is.
+    #[serde(default)]
+    pub delete_blocked_reason: String,
+    /// Whether the preset's provider has no API key configured.
+    #[serde(default)]
+    pub missing_api_key: bool,
+    /// The settings form. Only sent to connections that may change the configuration.
+    #[serde(default)]
+    pub form: Option<ToolConfigSummary>,
+}
+
+/// One model a provider offers, as listed by the gateway's `provider_models` event.
+///
+/// Mirrors the backend's `ProviderModelInfo` (`src/providers/model_catalog.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderModelSummary {
+    /// The id to put in a preset's `model` field.
+    pub id: String,
+    /// Human-readable name, when the provider reports one.
+    #[serde(default)]
+    pub display_name: Option<String>,
+    /// Context window in tokens, when the provider reports one.
+    #[serde(default)]
+    pub context_length: Option<u64>,
+    /// `chat`, `embedding`, `image`, ... when the provider says.
+    #[serde(default)]
+    pub model_type: Option<String>,
+}
+
+/// What a model preset write changed, as named by the gateway's `model_presets` reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelPresetChange {
+    /// `added`, `updated`, `deleted` or `activated`.
+    pub action: String,
+    pub name: String,
 }
 
 /// Setup state of one field a preset needs, as surfaced by the gateway's `mcp_presets`

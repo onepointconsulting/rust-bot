@@ -77,6 +77,12 @@ pub enum FieldKind {
         min: Option<i64>,
         max: Option<i64>,
     },
+    /// A decimal number (e.g. a temperature). The bounds are kept as JSON numbers, not
+    /// `f64`, so the summaries can keep deriving `Eq`.
+    Number {
+        min: Option<serde_json::Number>,
+        max: Option<serde_json::Number>,
+    },
     Text,
     Choice {
         choices: Vec<String>,
@@ -245,6 +251,10 @@ pub(crate) fn field_kind(property: &Value) -> Option<FieldKind> {
             min: property["minimum"].as_i64(),
             max: property["maximum"].as_i64(),
         }),
+        "number" => Some(FieldKind::Number {
+            min: number_bound(property, "minimum"),
+            max: number_bound(property, "maximum"),
+        }),
         "string" => Some(FieldKind::Text),
         "array" if property["items"]["type"] == "string" => Some(FieldKind::StringList),
         "object" if property["additionalProperties"]["type"] == "string" => {
@@ -252,6 +262,27 @@ pub(crate) fn field_kind(property: &Value) -> Option<FieldKind> {
         }
         _ => None,
     }
+}
+
+/// The numeric bound `key` (`minimum` / `maximum`) of a property, if it has one.
+fn number_bound(property: &Value, key: &str) -> Option<serde_json::Number> {
+    property[key].as_number().cloned()
+}
+
+/// Check a decimal `number` against the optional bounds of a [`FieldKind::Number`].
+fn check_number_range(
+    number: &serde_json::Number,
+    min: Option<&serde_json::Number>,
+    max: Option<&serde_json::Number>,
+) -> Result<(), String> {
+    let value = number.as_f64().ok_or("must be a number")?;
+    if let Some(min) = min.filter(|min| min.as_f64().is_some_and(|min| value < min)) {
+        return Err(format!("must be at least {min}"));
+    }
+    if let Some(max) = max.filter(|max| max.as_f64().is_some_and(|max| value > max)) {
+        return Err(format!("must be at most {max}"));
+    }
+    Ok(())
 }
 
 /// Whether the environment variable `name` is set to a non-empty value.
@@ -352,6 +383,10 @@ pub(crate) fn check_value(kind: &FieldKind, value: &Value) -> Result<Value, Stri
             if max.is_some_and(|max| integer > max) {
                 return Err(format!("must be at most {}", max.unwrap_or_default()));
             }
+            Ok(value.clone())
+        }
+        (FieldKind::Number { min, max }, Value::Number(number)) => {
+            check_number_range(number, min.as_ref(), max.as_ref())?;
             Ok(value.clone())
         }
         (FieldKind::Text, Value::String(text)) => Ok(Value::String(text.trim().to_string())),
@@ -932,6 +967,52 @@ mod tests {
 
         assert_eq!(field_kind(&map), Some(FieldKind::StringMap));
         assert_eq!(field_kind(&map_of_objects), None);
+    }
+
+    #[test]
+    fn a_decimal_property_is_a_number_field_with_its_bounds() {
+        let temperature = json!({"type": "number", "minimum": 0.0, "maximum": 1.0});
+        let unbounded = json!({"type": ["number", "null"]});
+
+        assert_eq!(
+            field_kind(&temperature),
+            Some(FieldKind::Number {
+                min: serde_json::Number::from_f64(0.0),
+                max: serde_json::Number::from_f64(1.0),
+            })
+        );
+        assert_eq!(
+            field_kind(&unbounded),
+            Some(FieldKind::Number {
+                min: None,
+                max: None
+            })
+        );
+    }
+
+    #[test]
+    fn number_values_are_checked_against_their_bounds() {
+        let kind = FieldKind::Number {
+            min: serde_json::Number::from_f64(0.0),
+            max: serde_json::Number::from_f64(1.0),
+        };
+
+        assert_eq!(check_value(&kind, &json!(0.7)), Ok(json!(0.7)));
+        assert_eq!(
+            check_value(&kind, &json!(1)),
+            Ok(json!(1)),
+            "whole numbers too"
+        );
+        assert_eq!(check_value(&kind, &json!(0.0)), Ok(json!(0.0)));
+        assert_eq!(
+            check_value(&kind, &json!(1.5)),
+            Err("must be at most 1.0".to_string())
+        );
+        assert_eq!(
+            check_value(&kind, &json!(-0.1)),
+            Err("must be at least 0.0".to_string())
+        );
+        assert!(check_value(&kind, &json!("0.5")).is_err());
     }
 
     #[test]

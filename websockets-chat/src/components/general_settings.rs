@@ -12,7 +12,9 @@ use chat_ui::models::{ToolConfigSummary, ToolFieldKind, ToolFieldSummary};
 use leptos::prelude::*;
 
 use super::mcp_presets_page::{switch_hint, ToggleSwitch};
-use super::tool_config_form::{draft_to_value, field_note, initial_draft, ToolConfigChange};
+use super::tool_config_form::{
+    draft_to_value, field_note, initial_draft, ToolConfigChange, NUMBER_STEP,
+};
 
 /// Tailwind classes shared by the text-like controls.
 const CONTROL_CLASS: &str =
@@ -129,6 +131,19 @@ fn GeneralFieldRow(
         ToolFieldKind::Integer { min, max } => view! {
             <input
                 type="number"
+                class=CONTROL_CLASS
+                min=min.map(|min| min.to_string())
+                max=max.map(|max| max.to_string())
+                disabled=move || disabled.get()
+                prop:value=move || draft.get()
+                on:change=move |event| on_text(event_target_value(&event))
+            />
+        }
+        .into_any(),
+        ToolFieldKind::Number { min, max } => view! {
+            <input
+                type="number"
+                step=NUMBER_STEP
                 class=CONTROL_CLASS
                 min=min.map(|min| min.to_string())
                 max=max.map(|max| max.to_string())

@@ -32,8 +32,9 @@ use chat_ui::models::{
 use crate::api::{self, WsSender};
 use crate::components::{
     add_server_success_message, after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand,
-    apply_tool_config, insert_mcp_server, ChatShell, McpChangeRequest, SettingsActions,
-    SettingsPage, SettingsPanel, ToggleRequest, ToolConfigChange, ADD_BUSY_KEY,
+    apply_tool_config, insert_mcp_server, model_preset_notice, model_preset_picker_names,
+    ChatShell, McpChangeRequest, ProviderModelsState, SettingsActions, SettingsPage, SettingsPanel,
+    ToggleRequest, ToolConfigChange, ADD_BUSY_KEY, MODEL_PRESET_ADD_BUSY_KEY,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -1247,6 +1248,50 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                     .update(|servers| apply_mcp_server(servers, server));
             }
         }
+        ServerEvent::ModelPresets {
+            presets,
+            active: _,
+            can_modify,
+            new_preset_form,
+            providers_without_key,
+            changed,
+        } => {
+            // The chat input's preset picker follows the catalog, dialog open or not.
+            ctx.model_presets.set(model_preset_picker_names(&presets));
+            // A reply that lands after the dialog closed must not leave data behind.
+            if !ctx.settings_open.get_untracked() {
+                return;
+            }
+            let panel = ctx.settings_panel;
+            panel.busy.set(None);
+            match &changed {
+                Some(change) => {
+                    // Requests clear the error first: one present now came with this
+                    // change (saved, but not applied live) and must not be contradicted.
+                    if panel.error.get_untracked().is_none() {
+                        panel
+                            .model_notice
+                            .set(Some(model_preset_notice(change, &presets)));
+                    }
+                    match change.action.as_str() {
+                        "added" => panel.close_add_panel(),
+                        "updated" => {
+                            // Saved: the form shows the stored values again.
+                            panel.forget_row_drafts(SettingsPage::Models, &change.name);
+                            panel.editing_preset.set(None);
+                        }
+                        _ => {}
+                    }
+                }
+                // A fresh list: its forms start again from what is stored.
+                None => panel.forget_page_drafts(SettingsPage::Models),
+            }
+            panel.model_presets.set(presets);
+            panel.new_preset_form.set(new_preset_form);
+            panel.providers_without_key.set(providers_without_key);
+            panel.can_modify.set(can_modify);
+            panel.model_presets_loaded.set(true);
+        }
         ServerEvent::SettingError {
             kind,
             name,
@@ -1259,8 +1304,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             if matches!(detail.as_str(), "access_denied" | "child_agent_config") {
                 panel.can_modify.set(false);
             }
+            // Saved, but the running agent could not switch: a page-wide message, since
+            // the fresh list that follows closes panels and forms.
+            if detail == SAVED_RELOAD_FAILED_DETAIL {
+                panel.error.set(Some((String::new(), message)));
+                return;
+            }
             // A refused add is reported in the panel, which stays open.
-            if kind == "mcp_server_add" {
+            if matches!(kind.as_str(), "mcp_server_add" | "model_preset_add") {
                 panel.add_error.set(Some(message));
                 return;
             }
@@ -1268,6 +1319,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             if name.is_empty() {
                 if kind == "tool" {
                     panel.tools_loaded.set(true);
+                } else if kind.starts_with(MODEL_PRESET_SETTING_KIND_PREFIX) {
+                    panel.model_presets_loaded.set(true);
                 } else {
                     panel.mcp_servers_loaded.set(true);
                 }
@@ -1384,6 +1437,21 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             {
                 ctx.pending_question.set(None);
             }
+        }
+        ServerEvent::ProviderModels {
+            provider,
+            models,
+            detail,
+            error,
+        } => {
+            // A reply that lands after the dialog closed must not leave data behind.
+            if !ctx.settings_open.get_untracked() {
+                return;
+            }
+            let state = ProviderModelsState::from_reply(models, detail, error);
+            ctx.settings_panel.provider_models.update(|cache| {
+                cache.insert(provider, state);
+            });
         }
         ServerEvent::Unknown(value) => log::info!("unrecognized gateway event, ignoring: {value}"),
     }
@@ -1679,13 +1747,13 @@ fn clear_subagents_data(ctx: &WsContext) {
     ctx.subagents_acp_enabled.set(false);
 }
 
-/// Open the Settings dialog on its Tools page (no configuration editor yet) and fetch
+/// Open the Settings dialog on its first page (no configuration editor yet) and fetch
 /// the page's list. Fetched on demand, never on connect.
 fn open_settings(ctx: &WsContext) {
     ctx.config_error.set(None);
     ctx.config_file.set(ConfigFileView::Closed);
     ctx.settings_open.set(true);
-    select_settings_page(ctx, SettingsPage::Tools);
+    select_settings_page(ctx, SettingsPage::default());
 }
 
 /// Close the Settings dialog and drop the configuration text and lists it held.
@@ -1699,6 +1767,7 @@ fn close_settings(ctx: &WsContext) {
 /// panel (see the `ToolSettings` and `McpServers` arms of the event handler).
 fn request_settings_list(ctx: &WsContext, page: SettingsPage) {
     let envelope = match page {
+        SettingsPage::Models => protocol::ClientEnvelope::list_model_presets(),
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::list_tool_settings()
         }
@@ -1718,7 +1787,11 @@ fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
     panel.error.set(None);
     panel.busy.set(None);
     panel.close_add_panel();
+    panel.editing_preset.set(None);
+    panel.confirm_delete_preset.set(None);
+    panel.model_notice.set(None);
     match page {
+        SettingsPage::Models => panel.model_presets_loaded.set(false),
         SettingsPage::Tools | SettingsPage::ToolSafety => panel.tools_loaded.set(false),
         SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
     }
@@ -1736,6 +1809,8 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
     ctx.settings_panel.error.set(None);
     ctx.settings_panel.busy.set(Some(name.clone()));
     let envelope = match page {
+        // The Models page has no switches; nothing sends one for it.
+        SettingsPage::Models => return,
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::set_tool_enabled(name, enabled)
         }
@@ -1781,6 +1856,81 @@ fn request_add_mcp_server(ctx: &WsContext, (name, values): ToolConfigChange) {
         *ctx,
         protocol::ClientEnvelope::add_mcp_server(name, values),
         "Failed to encode the add MCP server request.",
+    );
+}
+
+/// `detail` of a `setting_error` for a model preset change that was saved to
+/// `config.json` but could not be applied to the running agent.
+const SAVED_RELOAD_FAILED_DETAIL: &str = "saved_reload_failed";
+
+/// Start of the `kind` of every `setting_error` about the Models page.
+const MODEL_PRESET_SETTING_KIND_PREFIX: &str = "model_preset";
+
+/// Mark a Models page request as in flight for `busy_key` and drop the previous error
+/// and notice, so the reply's outcome is the only one shown.
+fn start_model_preset_request(ctx: &WsContext, busy_key: String) {
+    let panel = ctx.settings_panel;
+    panel.error.set(None);
+    panel.model_notice.set(None);
+    panel.busy.set(Some(busy_key));
+}
+
+/// Ask the gateway to add the model preset `name` with the given settings. The reply is
+/// a `model_presets` event naming the change, or a `setting_error` of kind
+/// `model_preset_add` (shown in the add panel).
+fn request_add_model_preset(ctx: &WsContext, (name, values): ToolConfigChange) {
+    ctx.settings_panel.add_error.set(None);
+    start_model_preset_request(ctx, MODEL_PRESET_ADD_BUSY_KEY.to_string());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::add_model_preset(name, values),
+        "Failed to encode the add model preset request.",
+    );
+}
+
+/// Ask the gateway to save changed settings of one model preset. The reply is a
+/// `model_presets` event or a `setting_error` of kind `model_preset_config`.
+fn request_save_model_preset(ctx: &WsContext, (name, values): ToolConfigChange) {
+    start_model_preset_request(ctx, name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_model_preset_config(name, values),
+        "Failed to encode the model preset settings request.",
+    );
+}
+
+/// Ask the gateway to delete one model preset. The reply is a `model_presets` event or a
+/// `setting_error` of kind `model_preset_delete`.
+fn request_delete_model_preset(ctx: &WsContext, name: String) {
+    start_model_preset_request(ctx, name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::delete_model_preset(name),
+        "Failed to encode the delete model preset request.",
+    );
+}
+
+/// Ask the gateway to make one model preset the default model, live. The reply is a
+/// `model_presets` event or a `setting_error` of kind `model_preset_activate`.
+fn request_activate_model_preset(ctx: &WsContext, name: String) {
+    start_model_preset_request(ctx, name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_default_model_preset(name),
+        "Failed to encode the activate model preset request.",
+    );
+}
+
+/// Ask the gateway which models `provider` offers, for the model drop-down of the preset
+/// forms; its list shows as loading until the `provider_models` reply lands.
+fn request_provider_models(ctx: &WsContext, provider: String) {
+    ctx.settings_panel.provider_models.update(|cache| {
+        cache.insert(provider.clone(), ProviderModelsState::Loading);
+    });
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::list_provider_models(provider),
+        "Failed to encode the provider models request.",
     );
 }
 
@@ -2937,6 +3087,21 @@ pub fn App() -> impl IntoView {
             request_set_mcp_server_config(&ws_context, change)
         }),
         on_add_mcp_server: Callback::new(move |change| request_add_mcp_server(&ws_context, change)),
+        on_add_model_preset: Callback::new(move |change| {
+            request_add_model_preset(&ws_context, change)
+        }),
+        on_save_model_preset: Callback::new(move |change| {
+            request_save_model_preset(&ws_context, change)
+        }),
+        on_delete_model_preset: Callback::new(move |name| {
+            request_delete_model_preset(&ws_context, name)
+        }),
+        on_activate_model_preset: Callback::new(move |name| {
+            request_activate_model_preset(&ws_context, name)
+        }),
+        on_list_provider_models: Callback::new(move |provider| {
+            request_provider_models(&ws_context, provider)
+        }),
         on_restart: Callback::new(move |()| request_restart(&ws_context)),
     };
     let on_change_mcp = move |(name, enabled, fields): McpChangeRequest| {

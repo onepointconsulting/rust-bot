@@ -111,6 +111,33 @@ pub enum EnvelopeType {
     /// configured. Rust-side addition with no nanobot precedent. Same access rules as
     /// [`Self::SetMcpServerEnabled`].
     AddMcpServer,
+    /// List the model presets of `config.json` (plus the built-in `default` row for the
+    /// flat `agents.*` settings) with the active one marked, for the Settings dialog's
+    /// Models page. Rust-side addition with no nanobot precedent. Authenticated
+    /// connections only; forms only for connections that may change the configuration.
+    ListModelPresets,
+    /// Add a model preset to `config.json` (`{name, values}`, `values` mapping setting
+    /// names such as `model` or `temperature` to their values) and make it resolvable
+    /// at once. Rust-side addition with no nanobot precedent. Same access rules as
+    /// [`Self::SetMcpServerEnabled`].
+    AddModelPreset,
+    /// Change the settings of one model preset (`{name, values}`) in `config.json`; an
+    /// edit of the active preset applies to the next turn of every chat that uses the
+    /// default. Same access rules as [`Self::AddModelPreset`].
+    SetModelPresetConfig,
+    /// Delete one model preset (`{name}`) from `config.json`. Refused for the active
+    /// preset and for Dream's preset. Same access rules as [`Self::AddModelPreset`].
+    DeleteModelPreset,
+    /// Make one model preset (`{name}`, `default` for the flat `agents.*` settings) the
+    /// gateway's default: written to `agents.modelPreset` and applied to the running
+    /// process without a restart. Unlike [`Self::SetModelPreset`], which overrides one
+    /// chat. Same access rules as [`Self::AddModelPreset`].
+    SetDefaultModelPreset,
+    /// List the models one configured provider offers (`{provider}`, `auto` meaning the
+    /// provider it would pick), so a preset's `model` can be picked from a list. The
+    /// gateway asks the provider's API with the configured credentials. Rust-side
+    /// addition with no nanobot precedent. Same access rules as [`Self::AddModelPreset`].
+    ListProviderModels,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -207,6 +234,12 @@ impl From<&str> for EnvelopeType {
             "set_mcp_server_deferred" => Self::SetMcpServerDeferred,
             "set_mcp_server_config" => Self::SetMcpServerConfig,
             "add_mcp_server" => Self::AddMcpServer,
+            "list_model_presets" => Self::ListModelPresets,
+            "add_model_preset" => Self::AddModelPreset,
+            "set_model_preset_config" => Self::SetModelPresetConfig,
+            "delete_model_preset" => Self::DeleteModelPreset,
+            "set_default_model_preset" => Self::SetDefaultModelPreset,
+            "list_provider_models" => Self::ListProviderModels,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -292,6 +325,15 @@ pub enum WsOutboundEvent {
     /// Reply to a successful [`EnvelopeType::AddMcpServer`] — `{name, server,
     /// restart_required}`, `server` being the new server's row with its form.
     McpServerAdded,
+    /// Reply to [`EnvelopeType::ListModelPresets`] and to every successful model preset
+    /// write — `{presets, active, can_modify, new_preset_form?, providers_without_key,
+    /// changed?}`, `changed` being `{action, name}` (`action`: `added`, `updated`,
+    /// `deleted` or `activated`) and absent on a plain list.
+    ModelPresets,
+    /// Reply to [`EnvelopeType::ListProviderModels`] — `{provider, models}` on success
+    /// (`models`: `[{id, display_name?, context_length?, model_type?}]`, sorted by id) or
+    /// `{provider, detail, error}` when refused or failed.
+    ProviderModels,
     /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
     /// message}`. Never carries any of the file's content.
     SettingError,
@@ -380,6 +422,8 @@ impl WsOutboundEvent {
             Self::McpServerExposureSet => "mcp_server_exposure_set",
             Self::McpServerConfigSet => "mcp_server_config_set",
             Self::McpServerAdded => "mcp_server_added",
+            Self::ModelPresets => "model_presets",
+            Self::ProviderModels => "provider_models",
             Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
@@ -946,6 +990,36 @@ mod tests {
         assert_eq!(
             WsOutboundEvent::QuestionResolved.as_str(),
             "question_resolved"
+        );
+    }
+
+    #[test]
+    fn model_preset_settings_envelopes_and_event_have_their_wire_names() {
+        for (wire_name, envelope_type) in [
+            ("list_model_presets", EnvelopeType::ListModelPresets),
+            ("add_model_preset", EnvelopeType::AddModelPreset),
+            (
+                "set_model_preset_config",
+                EnvelopeType::SetModelPresetConfig,
+            ),
+            ("delete_model_preset", EnvelopeType::DeleteModelPreset),
+            (
+                "set_default_model_preset",
+                EnvelopeType::SetDefaultModelPreset,
+            ),
+        ] {
+            assert_eq!(EnvelopeType::from(wire_name), envelope_type, "{wire_name}");
+        }
+        assert_eq!(WsOutboundEvent::ModelPresets.as_str(), "model_presets");
+        assert_eq!(
+            EnvelopeType::from("list_provider_models"),
+            EnvelopeType::ListProviderModels
+        );
+        assert_eq!(WsOutboundEvent::ProviderModels.as_str(), "provider_models");
+        // The per-chat switch keeps its own name and meaning.
+        assert_eq!(
+            EnvelopeType::from("set_model_preset"),
+            EnvelopeType::SetModelPreset
         );
     }
 

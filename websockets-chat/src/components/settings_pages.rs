@@ -1,4 +1,5 @@
-//! The "Tools" and "MCP Servers" pages of the Settings dialog: every built-in tool, and
+//! The pages of the Settings dialog: "Models" (the model presets, see
+//! [`super::model_presets_page`]), and "Tools" and "MCP Servers": every built-in tool, and
 //! every MCP server in `config.json`, each with a switch that turns it on or off globally.
 //!
 //! Switching writes `config.json` on the gateway (which backs the old file up) but the
@@ -17,14 +18,18 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    McpServerSettingSummary, ToolConfigSummary, ToolFieldSummary, ToolSettingSummary,
+    McpServerSettingSummary, ModelPresetSummary, ToolConfigSummary, ToolFieldSummary,
+    ToolSettingSummary,
 };
 use leptos::prelude::*;
 
-use super::add_mcp_server_panel::{AddMcpServerButton, AddMcpServerPanel, ADD_BUSY_KEY};
+use super::add_item_panel::{AddItemButton, AddItemPanel};
+use super::add_mcp_server_panel::{ADD_BUSY_KEY, ADD_BUTTON_LABEL, ADD_PANEL_TITLE, NAME_HINT};
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
+use super::model_picker::ProviderModelsState;
+use super::model_presets_page::ModelPresetsSection;
 use super::tool_config_form::{initial_drafts, ToolConfigChange, ToolConfigForm};
 
 /// Tooltip on the switch of a tool the gateway itself depends on.
@@ -41,7 +46,9 @@ const OFFLINE_NOTICE: &str =
 /// Which page of the Settings dialog's menu is showing.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Hash)]
 pub enum SettingsPage {
+    /// The model presets: which model the agent uses, and the presets to choose from.
     #[default]
+    Models,
     Tools,
     /// The settings that apply to every tool (workspace restriction, confirmation, SSRF
     /// whitelist), kept apart from the long tool list.
@@ -51,7 +58,8 @@ pub enum SettingsPage {
 
 impl SettingsPage {
     /// All pages, in menu order.
-    pub const ALL: [SettingsPage; 3] = [
+    pub const ALL: [SettingsPage; 4] = [
+        SettingsPage::Models,
         SettingsPage::Tools,
         SettingsPage::ToolSafety,
         SettingsPage::McpServers,
@@ -60,6 +68,7 @@ impl SettingsPage {
     /// Menu entry and page heading.
     pub fn title(self) -> &'static str {
         match self {
+            Self::Models => "Models",
             Self::Tools => "Tools",
             Self::ToolSafety => "Tool Safety",
             Self::McpServers => "MCP Servers",
@@ -69,6 +78,7 @@ impl SettingsPage {
     /// One line under the heading.
     pub fn subtitle(self) -> &'static str {
         match self {
+            Self::Models => "Create model presets and choose which one the agent uses. API keys are set per provider in the configuration file.",
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
             Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
             Self::McpServers => "Switch the configured MCP servers on or off, or change how they are started under Settings. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
@@ -78,6 +88,7 @@ impl SettingsPage {
     /// Plural noun used in the search box and the count line.
     pub fn noun(self) -> &'static str {
         match self {
+            Self::Models => "model presets",
             Self::Tools => "tools",
             Self::ToolSafety => "settings",
             Self::McpServers => "MCP servers",
@@ -381,6 +392,23 @@ pub struct SettingsPanel {
     pub add_error: RwSignal<Option<String>>,
     /// The success message of the last add, shown until the restart it asks for.
     pub added_notice: RwSignal<Option<String>>,
+    /// The rows of the Models page: the built-in default first, then every preset.
+    pub model_presets: RwSignal<Vec<ModelPresetSummary>>,
+    pub model_presets_loaded: RwSignal<bool>,
+    /// The blank settings form of a new model preset; only sent to connections that may
+    /// change the configuration.
+    pub new_preset_form: RwSignal<Option<ToolConfigSummary>>,
+    /// Providers the preset form offers that have no API key configured.
+    pub providers_without_key: RwSignal<Vec<String>>,
+    /// The model preset whose settings form is open, if any.
+    pub editing_preset: RwSignal<Option<String>>,
+    /// The model preset whose "Delete …?" question is showing, if any.
+    pub confirm_delete_preset: RwSignal<Option<String>>,
+    /// What the last model preset change did (no restart needed for those).
+    pub model_notice: RwSignal<Option<String>>,
+    /// The model lists asked for by the preset forms, by provider (see
+    /// [`super::model_picker`]); kept while the dialog is open.
+    pub provider_models: RwSignal<HashMap<String, ProviderModelsState>>,
     /// The unsaved drafts of each row's settings form. Kept here, not in the form, since
     /// the list rebuilds its rows on every change (switch, save, search); reference
     /// counted signals so a rebuilt row keeps editing the same drafts.
@@ -406,6 +434,14 @@ impl SettingsPanel {
             adding: RwSignal::new(false),
             add_error: RwSignal::new(None),
             added_notice: RwSignal::new(None),
+            model_presets: RwSignal::new(Vec::new()),
+            model_presets_loaded: RwSignal::new(false),
+            new_preset_form: RwSignal::new(None),
+            providers_without_key: RwSignal::new(Vec::new()),
+            editing_preset: RwSignal::new(None),
+            confirm_delete_preset: RwSignal::new(None),
+            model_notice: RwSignal::new(None),
+            provider_models: RwSignal::new(HashMap::new()),
             form_drafts: StoredValue::new(HashMap::new()),
         }
     }
@@ -438,7 +474,7 @@ impl SettingsPanel {
             .update_value(|store| forget_page_drafts(store, page));
     }
 
-    /// Close the "Add MCP Server" panel and forget its last error.
+    /// Close the "Add …" panel of the open page and forget its last error.
     pub fn close_add_panel(&self) {
         self.adding.set(false);
         self.add_error.set(None);
@@ -457,6 +493,8 @@ impl SettingsPanel {
     /// The rows of the open page.
     fn open_rows(&self) -> Vec<SettingRow> {
         match self.page.get() {
+            // The model presets have their own rows.
+            SettingsPage::Models => Vec::new(),
             // The general settings have their own page.
             SettingsPage::Tools => self
                 .tools
@@ -478,6 +516,7 @@ impl SettingsPanel {
     /// Whether the open page's list has arrived.
     fn open_page_loaded(&self) -> bool {
         match self.page.get() {
+            SettingsPage::Models => self.model_presets_loaded.get(),
             SettingsPage::Tools | SettingsPage::ToolSafety => self.tools_loaded.get(),
             SettingsPage::McpServers => self.mcp_servers_loaded.get(),
         }
@@ -497,6 +536,14 @@ impl SettingsPanel {
         self.new_server_form.set(None);
         self.close_add_panel();
         self.added_notice.set(None);
+        self.model_presets.set(Vec::new());
+        self.model_presets_loaded.set(false);
+        self.new_preset_form.set(None);
+        self.providers_without_key.set(Vec::new());
+        self.editing_preset.set(None);
+        self.confirm_delete_preset.set(None);
+        self.model_notice.set(None);
+        self.provider_models.set(HashMap::new());
         self.form_drafts.update_value(HashMap::clear);
     }
 }
@@ -524,6 +571,16 @@ pub struct SettingsActions {
     pub on_save_mcp_config: Callback<ToolConfigChange>,
     /// Add a new MCP server: `(name, settings)`.
     pub on_add_mcp_server: Callback<ToolConfigChange>,
+    /// Add a new model preset: `(name, settings)`.
+    pub on_add_model_preset: Callback<ToolConfigChange>,
+    /// Save the changed settings of one model preset.
+    pub on_save_model_preset: Callback<ToolConfigChange>,
+    /// Delete one model preset (by name).
+    pub on_delete_model_preset: Callback<String>,
+    /// Make one model preset (by name; `default` for the agent settings) the default.
+    pub on_activate_model_preset: Callback<String>,
+    /// Ask which models one provider offers (by provider name), for the preset forms.
+    pub on_list_provider_models: Callback<String>,
     /// Restart the whole bot process so the saved changes take effect.
     pub on_restart: Callback<()>,
 }
@@ -541,6 +598,7 @@ pub fn restart_button_label(restarting: bool) -> &'static str {
 /// section settings are different requests.
 fn save_callback_for(page: SettingsPage, actions: SettingsActions) -> Callback<ToolConfigChange> {
     match page {
+        SettingsPage::Models => actions.on_save_model_preset,
         SettingsPage::McpServers => actions.on_save_mcp_config,
         SettingsPage::Tools | SettingsPage::ToolSafety => actions.on_save_config,
     }
@@ -556,7 +614,9 @@ fn AddServerSection(panel: SettingsPanel, actions: SettingsActions) -> impl Into
             Some(
                 if panel.adding.get() {
                     view! {
-                        <AddMcpServerPanel
+                        <AddItemPanel
+                            title=ADD_PANEL_TITLE
+                            name_hint=NAME_HINT
                             form=form
                             can_change=Signal::derive(move || panel.can_change())
                             busy=Signal::derive(move || is_busy(&panel.busy.get(), ADD_BUSY_KEY))
@@ -568,7 +628,8 @@ fn AddServerSection(panel: SettingsPanel, actions: SettingsActions) -> impl Into
                         .into_any()
                 } else {
                     view! {
-                        <AddMcpServerButton
+                        <AddItemButton
+                            label=ADD_BUTTON_LABEL
                             disabled=Signal::derive(move || !panel.can_change())
                             on_click=Callback::new(move |()| {
                                 panel.add_error.set(None);
@@ -853,7 +914,10 @@ pub fn SettingsPageView(
                     }}
                 </div>
             </Show>
-            <Show when=move || page() != SettingsPage::ToolSafety>
+            <Show when=move || page() == SettingsPage::Models>
+                <ModelPresetsSection panel=panel actions=actions />
+            </Show>
+            <Show when=move || !matches!(page(), SettingsPage::ToolSafety | SettingsPage::Models)>
             <input
                 type="search"
                 aria-label=move || format!("Search {}", page().noun())
@@ -1271,6 +1335,24 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_panel_drops_the_models_page_state() {
+        let panel = SettingsPanel::new();
+        panel.model_presets_loaded.set(true);
+        panel.new_preset_form.set(Some(form("")));
+        panel.editing_preset.set(Some("terra".to_string()));
+        panel.confirm_delete_preset.set(Some("terra".to_string()));
+        panel.model_notice.set(Some("saved".to_string()));
+
+        panel.clear();
+
+        assert!(!panel.model_presets_loaded.get_untracked());
+        assert!(panel.new_preset_form.get_untracked().is_none());
+        assert!(panel.editing_preset.get_untracked().is_none());
+        assert!(panel.confirm_delete_preset.get_untracked().is_none());
+        assert!(panel.model_notice.get_untracked().is_none());
+    }
+
+    #[test]
     fn closing_the_add_panel_keeps_the_success_message_of_an_earlier_add() {
         let panel = SettingsPanel::new();
         panel.adding.set(true);
@@ -1384,8 +1466,12 @@ mod tests {
     #[test]
     fn pages_have_titles_in_menu_order() {
         let titles: Vec<&str> = SettingsPage::ALL.iter().map(|p| p.title()).collect();
-        assert_eq!(titles, vec!["Tools", "Tool Safety", "MCP Servers"]);
-        assert_eq!(SettingsPage::default(), SettingsPage::Tools);
+        assert_eq!(
+            titles,
+            vec!["Models", "Tools", "Tool Safety", "MCP Servers"]
+        );
+        assert_eq!(SettingsPage::default(), SettingsPage::Models);
+        assert!(SettingsPage::Models.subtitle().contains("API keys"));
     }
 
     #[test]

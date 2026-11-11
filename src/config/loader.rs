@@ -128,7 +128,18 @@ fn collect_env_var_names(value: &serde_json::Value, names: &mut BTreeSet<String>
 /// Only `String` values are affected; numbers, booleans, and nulls pass through
 /// unchanged. Returns `Err` if any referenced variable is not set.
 pub fn resolve_config_env_vars(config: &Config) -> Result<Config, String> {
-    let data = serde_json::to_value(config).map_err(|e| e.to_string())?;
+    resolve_env_vars_in(config)
+}
+
+/// Return a copy of any serializable configuration part (e.g. the `model_presets`
+/// map alone) with every `${VAR}` placeholder in its string values replaced by the
+/// corresponding environment variable. Same rules as [`resolve_config_env_vars`],
+/// but only variables the part itself references must be set.
+pub fn resolve_env_vars_in<T>(part: &T) -> Result<T, String>
+where
+    T: serde::Serialize + serde::de::DeserializeOwned,
+{
+    let data = serde_json::to_value(part).map_err(|e| e.to_string())?;
     let resolved = resolve_env_vars_in_value(data)?;
     serde_json::from_value(resolved).map_err(|e| e.to_string())
 }

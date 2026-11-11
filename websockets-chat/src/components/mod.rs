@@ -1,3 +1,4 @@
+mod add_item_panel;
 mod add_mcp_server_panel;
 mod ask_question;
 mod chat_shell;
@@ -6,6 +7,8 @@ mod json_editor;
 mod list_page;
 mod mcp_presets_page;
 mod message_list;
+mod model_picker;
+mod model_presets_page;
 mod reasoning_panel;
 mod settings_dialog;
 mod settings_pages;
@@ -20,6 +23,11 @@ pub use ask_question::AskQuestionCard;
 pub use chat_shell::ChatShell;
 pub use mcp_presets_page::{McpChangeRequest, McpPresetsPage};
 pub use message_list::MessageList;
+pub use model_picker::ProviderModelsState;
+pub use model_presets_page::{
+    notice_for as model_preset_notice, picker_names as model_preset_picker_names,
+    ADD_BUSY_KEY as MODEL_PRESET_ADD_BUSY_KEY,
+};
 pub use reasoning_panel::ReasoningPanel;
 pub use settings_dialog::{ConfigSavedNotice, SettingsDialog};
 pub use settings_pages::{

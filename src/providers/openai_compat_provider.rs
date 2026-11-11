@@ -20,7 +20,7 @@ const BODY_PREVIEW_MAX_CHARS: usize = 300;
 
 /// The start of `body` on one line, for an error message: whitespace runs
 /// collapsed, cut at [`BODY_PREVIEW_MAX_CHARS`], `(empty)` for a blank body.
-fn body_preview(body: &str) -> String {
+pub(crate) fn body_preview(body: &str) -> String {
     let one_line = body.split_whitespace().collect::<Vec<_>>().join(" ");
     if one_line.is_empty() {
         return "(empty)".to_string();
@@ -262,6 +262,52 @@ impl OpenAICompatProvider {
             return base.to_lowercase().contains("openrouter");
         }
         false
+    }
+
+    /// The headers every request to an OpenAI-compatible API carries: `Authorization:
+    /// Bearer {api_key}` when a key is given, the rust-bot attribution headers for
+    /// OpenRouter (see [`Self::uses_openrouter_attribution`]), then `extra_headers`, which
+    /// override any of them. Header names or values that are not valid HTTP are skipped
+    /// rather than failing, as provider construction always has.
+    ///
+    /// Shared by chat requests and model listing (`providers::model_catalog`).
+    pub(crate) fn build_request_headers(
+        api_key: Option<&str>,
+        spec: Option<&ProviderSpec>,
+        effective_base: Option<&str>,
+        extra_headers: &HashMap<String, String>,
+    ) -> reqwest::header::HeaderMap {
+        use reqwest::header::{AUTHORIZATION, HeaderMap, HeaderName, HeaderValue};
+
+        let mut header_map = HeaderMap::new();
+        if let Some(key) = api_key
+            && let Ok(value) = HeaderValue::from_str(&format!("Bearer {key}"))
+        {
+            header_map.insert(AUTHORIZATION, value);
+        }
+
+        let mut named_headers: Vec<(String, String)> = Vec::new();
+        if Self::uses_openrouter_attribution(spec, effective_base) {
+            named_headers.extend(
+                Self::default_openrouter_headers()
+                    .into_iter()
+                    .map(|(name, value)| (name.to_string(), value.to_string())),
+            );
+        }
+        named_headers.extend(
+            extra_headers
+                .iter()
+                .map(|(name, value)| (name.clone(), value.clone())),
+        );
+        for (name, value) in named_headers {
+            if let (Ok(header_name), Ok(header_value)) = (
+                HeaderName::from_bytes(name.as_bytes()),
+                HeaderValue::from_str(&value),
+            ) {
+                header_map.insert(header_name, header_value);
+            }
+        }
+        header_map
     }
 
     fn setup_env(&self, api_key_option: Option<String>, api_base: Option<String>) {
@@ -620,6 +666,9 @@ impl OpenAICompatProvider {
         // api.openai.com rejects function tools combined with any reasoning effort on
         // /v1/chat/completions ("Function tools with reasoning_effort are not supported ...
         // set reasoning_effort to 'none'"), so the configured effort is deliberately ignored.
+        if let Some(tc) = tool_choice {
+            request["tool_choice"] = tc.clone();
+        }
         if is_direct_openai_api {
             request["reasoning_effort"] = serde_json::Value::String("none".to_string());
         } else if let Some(effort) = reasoning_effort
@@ -627,10 +676,7 @@ impl OpenAICompatProvider {
         {
             request["reasoning_effort"] = serde_json::Value::String(effort);
         }
-        if let Some(tc) = tool_choice {
-            request["tool_choice"] = tc;
-        }
-
+        log::info!("Set reasoning_effort to {}", request["reasoning_effort"]);
         request
     }
 
@@ -1062,42 +1108,20 @@ impl LLMProvider for OpenAICompatProvider {
             .or_else(|| spec.as_ref().and_then(|s| s.default_api_base.clone()))
             .or(None);
 
-        // Default headers.
-        use uuid::Uuid;
-        let mut default_headers: std::collections::HashMap<String, String> =
-            std::collections::HashMap::new();
-        default_headers.insert(
-            "x-session-affinity".to_string(),
-            Uuid::new_v4().simple().to_string(),
+        let mut header_map = Self::build_request_headers(
+            api_key.as_deref(),
+            spec.as_ref(),
+            effective_base.as_deref(),
+            &extra_headers,
         );
-
-        if Self::uses_openrouter_attribution(spec.as_ref(), effective_base.as_deref()) {
-            // _DEFAULT_OPENROUTER_HEADERS must be defined on struct
-            for (k, v) in Self::default_openrouter_headers() {
-                default_headers.insert(k.to_string(), v.to_string());
-            }
-        }
-
-        // Merge extra_headers if any
-        for (k, v) in extra_headers.iter() {
-            default_headers.insert(k.clone(), v.clone());
-        }
-
-        let mut header_map = reqwest::header::HeaderMap::new();
-        if let Some(ref key) = api_key {
-            use reqwest::header::{AUTHORIZATION, HeaderValue};
-            if let Ok(val) = HeaderValue::from_str(&format!("Bearer {key}")) {
-                header_map.insert(AUTHORIZATION, val);
-            }
-        }
-        for (k, v) in &default_headers {
-            use reqwest::header::{HeaderName, HeaderValue};
-            if let (Ok(name), Ok(val)) = (
-                HeaderName::from_bytes(k.as_bytes()),
-                HeaderValue::from_str(v),
-            ) {
-                header_map.insert(name, val);
-            }
+        // Per-instance routing hint; `extra_headers` may still pin their own value.
+        let session_affinity_header =
+            reqwest::header::HeaderName::from_static("x-session-affinity");
+        if !header_map.contains_key(&session_affinity_header)
+            && let Ok(value) =
+                reqwest::header::HeaderValue::from_str(&uuid::Uuid::new_v4().simple().to_string())
+        {
+            header_map.insert(session_affinity_header, value);
         }
         let http_client = reqwest::Client::builder()
             .default_headers(header_map)
