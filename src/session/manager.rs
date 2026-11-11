@@ -1619,7 +1619,7 @@ fn listed_session_owner_client_id(metadata_line: &Value) -> String {
         .to_string()
 }
 
-fn parse_session_timestamp(s: &str) -> Option<DateTime<Utc>> {
+pub(crate) fn parse_session_timestamp(s: &str) -> Option<DateTime<Utc>> {
     if let Ok(dt) = DateTime::parse_from_rfc3339(s) {
         return Some(dt.with_timezone(&Utc));
     }

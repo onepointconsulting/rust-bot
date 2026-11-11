@@ -57,9 +57,7 @@ use crate::heartbeat::service::HeartbeatService;
 use crate::integrations::herdr::HerdrReporter;
 use crate::security::jwt::{GeneratedKeypair, JwtError, generate_jwt_keypair, generate_jwt_token};
 use crate::security::workspace_requests::WorkspaceRequestHandler;
-use crate::session::history_visibility::is_hidden_history_message;
-use crate::session::keys::COMMAND_KEY;
-use crate::session::manager::SessionManager;
+use crate::session::manager::{RenameSessionError, SessionManager};
 use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
 use crate::utils::evaluator::evaluate_response;
 
@@ -87,6 +85,11 @@ use crate::cli::paste_edit_mode::{
     PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
 };
 use crate::cli::progress::{ProgressType, create_on_progress, print_cli_progress_line};
+use crate::cli::session_listing::{
+    ResumeResolution, recent_cli_transcript, resolve_resume_query, resumable_cli_sessions,
+    session_preview,
+};
+use crate::cli::session_picker::{PREVIEW_TURN_COUNT, SessionPickOutcome, run_session_picker};
 use crate::cli::stream::{StreamRenderer, stream_callbacks};
 use crate::config::loader::{load_config, resolve_config_env_vars, save_config, set_config_path};
 use crate::config::log::init_runtime_logging;
@@ -605,12 +608,15 @@ pub(crate) fn init_agent_loop_with_provider(
 }
 
 async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
-    let session_id = args.session.clone();
     let markdown = args.markdown;
     let logs = args.logs;
     init_runtime_logging(logs, None);
 
-    let (config, workspace) = prepare_workspace(args.config, args.workspace);
+    let (config, workspace) = prepare_workspace(args.config.clone(), args.workspace.clone());
+    // Resolved before Herdr starts: it reports the session id.
+    let Some(session_id) = resolve_agent_session_id(&args, &config)? else {
+        return Ok(());
+    };
     let herdr = HerdrReporter::from_env(&session_id, &config.workspace_path());
     herdr.report_session(if args.message.as_deref().is_some_and(|m| !m.is_empty()) {
         "cli-message"
@@ -643,7 +649,7 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     }
 
     if let Some(restart_notice) = consume_restart_notice_from_env()
-        && should_show_cli_restart_notice(restart_notice.clone(), args.session.as_str())
+        && should_show_cli_restart_notice(restart_notice.clone(), session_id.as_str())
     {
         print_agent_response(
             &format_restart_completed_message(&restart_notice.started_at_raw),
@@ -698,6 +704,72 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     // agent like this one has exited, leaving a stale entry in the agent pane.
     herdr.shutdown().await;
     result
+}
+
+/// Session `rust-bot agent` should use: `-s` (or its default) unless
+/// `-r/--resume` was given, in which case the query is resolved against the
+/// stored CLI sessions or the session picker is shown.
+///
+/// Returns `None` when the user cancels the picker or there is nothing to
+/// resume (a message has already been printed); the caller then exits.
+fn resolve_agent_session_id(args: &AgentArgs, config: &Config) -> Result<Option<String>, CliError> {
+    let Some(query) = args.resume.as_deref() else {
+        return Ok(Some(args.session.clone()));
+    };
+    // A throwaway manager: it only reads metadata lines (and writes a title on
+    // rename), and is dropped before the agent loop opens its own.
+    let session_manager =
+        SessionManager::from_agents_config(config.workspace_path(), &config.agents);
+    let sessions = resumable_cli_sessions(&session_manager);
+    if sessions.is_empty() {
+        println!("No CLI sessions to resume.");
+        return Ok(None);
+    }
+    if let ResumeResolution::Unique(key) = resolve_resume_query(&sessions, query) {
+        return Ok(Some(key));
+    }
+    if !is_interactive_terminal() {
+        return Err(CliError::Other(
+            "--resume needs an interactive terminal; use -s <key>".to_string(),
+        ));
+    }
+
+    let session_manager = StdMutex::new(session_manager);
+    let outcome = tokio::task::block_in_place(|| {
+        run_session_picker(
+            sessions,
+            query,
+            |key| {
+                let manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
+                session_preview(&manager, key, PREVIEW_TURN_COUNT)
+            },
+            |key, title| {
+                let mut manager = session_manager.lock().unwrap_or_else(|e| e.into_inner());
+                manager
+                    .rename_session(key, title)
+                    .map_err(|error| match error {
+                        RenameSessionError::NotFound => "session not found".to_string(),
+                        RenameSessionError::Save(io_error) => io_error.to_string(),
+                    })
+            },
+        )
+    })
+    .map_err(|error| CliError::Other(format!("Session picker failed: {error}")))?;
+
+    match outcome {
+        SessionPickOutcome::Selected(key) => Ok(Some(key)),
+        SessionPickOutcome::Cancelled => {
+            println!("No session selected.");
+            Ok(None)
+        }
+    }
+}
+
+/// True when both stdin and stdout are terminals, so a picker can be drawn
+/// and read from.
+fn is_interactive_terminal() -> bool {
+    use std::io::IsTerminal;
+    std::io::stdin().is_terminal() && std::io::stdout().is_terminal()
 }
 
 /// Lightweight non-interactive config bootstrap (wizard mode not yet implemented).
@@ -2146,62 +2218,6 @@ fn print_previous_messages(agent_loop: &AgentLoop, session_id: &str, markdown: b
     }
 }
 
-/// Last `max_messages` displayable turns: `user`/`assistant` only, skipping
-/// slash commands, hidden/automation rows, and empty text. The window starts
-/// on a user turn when one exists, so a replay does not open mid-reply.
-fn recent_cli_transcript(messages: &[Value], max_messages: usize) -> Vec<(String, String)> {
-    if max_messages == 0 {
-        return Vec::new();
-    }
-    let mut visible: Vec<(String, String)> = messages
-        .iter()
-        .filter(|message| {
-            let role = message.get("role").and_then(Value::as_str).unwrap_or("");
-            (role == "user" || role == "assistant")
-                && message.get(COMMAND_KEY).is_none()
-                && !is_hidden_history_message(message)
-        })
-        .filter_map(|message| {
-            let role = message.get("role").and_then(Value::as_str)?;
-            let text = persisted_message_text(message.get("content"));
-            if text.is_empty() {
-                None
-            } else {
-                Some((role.to_string(), text))
-            }
-        })
-        .collect();
-
-    if visible.len() > max_messages {
-        let start = visible.len() - max_messages;
-        visible = visible.split_off(start);
-    }
-    if let Some(start) = visible.iter().position(|(role, _)| role == "user")
-        && start > 0
-    {
-        visible = visible.split_off(start);
-    }
-    visible
-}
-
-/// Flatten a persisted `content` field. Image turns are stored as a block
-/// array, so `as_str()` would print them blank. Placeholders such as
-/// `[image: path]` stay in the text — the CLI has no thumbnail to show instead.
-fn persisted_message_text(content: Option<&Value>) -> String {
-    match content {
-        Some(Value::String(text)) => text.trim().to_string(),
-        Some(Value::Array(blocks)) => blocks
-            .iter()
-            .filter(|block| block.get("type").and_then(Value::as_str) == Some("text"))
-            .filter_map(|block| block.get("text").and_then(Value::as_str))
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-            .collect::<Vec<_>>()
-            .join("\n"),
-        _ => String::new(),
-    }
-}
-
 fn interactive_welcome_text(markdown: bool) -> String {
     if markdown {
         format!(
@@ -2323,7 +2339,6 @@ mod tests {
         channels::websocket::types::DEFAULT_AUD,
         utils::clipboard::{format_image_paste_sentinel, format_text_paste_sentinel},
     };
-    use serde_json::json;
 
     #[test]
     fn onboard_local_mode_puts_config_and_workspace_in_current_dir() {
@@ -2507,64 +2522,6 @@ mod tests {
         let captures = vec!["content".to_string()];
         let text = replace_text_sentinels(&line, &captures);
         assert_eq!(text, "a content b");
-    }
-
-    #[test]
-    fn recent_cli_transcript_keeps_the_tail_and_starts_on_a_user_turn() {
-        let messages = vec![
-            json!({"role": "user", "content": "oldest"}),
-            json!({"role": "assistant", "content": "old reply"}),
-            json!({"role": "assistant", "content": "dangling"}),
-            json!({"role": "user", "content": "latest question"}),
-            json!({"role": "assistant", "content": "latest answer"}),
-        ];
-        let recent = recent_cli_transcript(&messages, 3);
-        assert_eq!(
-            recent,
-            vec![
-                ("user".to_string(), "latest question".to_string()),
-                ("assistant".to_string(), "latest answer".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn recent_cli_transcript_skips_tools_commands_hidden_and_empty() {
-        let messages = vec![
-            json!({"role": "user", "content": "hi"}),
-            json!({"role": "assistant", "content": "", "tool_calls": [{"id": "c1"}]}),
-            json!({"role": "tool", "content": "tool output"}),
-            json!({"role": "user", "content": "/help", "_command": true}),
-            json!({"role": "assistant", "content": "help text", "_command": true}),
-            json!({"role": "user", "content": "cron", "_hidden_history": true}),
-            json!({
-                "role": "user",
-                "content": [
-                    {"type": "text", "text": "see this"},
-                    {"type": "text", "text": "[image: /tmp/shot.png]"},
-                ],
-            }),
-            json!({"role": "assistant", "content": "saw it"}),
-        ];
-        let recent = recent_cli_transcript(&messages, 10);
-        assert_eq!(
-            recent,
-            vec![
-                ("user".to_string(), "hi".to_string()),
-                (
-                    "user".to_string(),
-                    "see this\n[image: /tmp/shot.png]".to_string()
-                ),
-                ("assistant".to_string(), "saw it".to_string()),
-            ]
-        );
-    }
-
-    #[test]
-    fn recent_cli_transcript_empty_when_nothing_is_visible() {
-        assert!(recent_cli_transcript(&[], 10).is_empty());
-        assert!(recent_cli_transcript(&[json!({"role": "tool", "content": "x"})], 10).is_empty());
-        assert!(recent_cli_transcript(&[json!({"role": "user", "content": "hi"})], 0).is_empty());
     }
 
     // --- resolve_websocket_channel ---

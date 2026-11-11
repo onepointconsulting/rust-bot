@@ -173,6 +173,18 @@ pub struct AgentArgs {
     #[arg(short, long, default_value = "cli:direct")]
     pub session: String,
 
+    /// Pick a previous CLI session to resume; optional search text (an exact
+    /// key or a single match resumes directly)
+    #[arg(
+        short = 'r',
+        long = "resume",
+        value_name = "QUERY",
+        num_args = 0..=1,
+        default_missing_value = "",
+        conflicts_with = "session"
+    )]
+    pub resume: Option<String>,
+
     /// Workspace directory
     #[arg(short, long)]
     pub workspace: Option<PathBuf>,
@@ -696,6 +708,38 @@ mod tests {
             panic!("expected the subagents command");
         };
         assert_eq!(args.workspace, Some(PathBuf::from("some/dir")));
+    }
+
+    /// Parse `rust-bot agent <args>` into its [`AgentArgs`].
+    fn parse_agent(args: &[&str]) -> Result<AgentArgs, clap::Error> {
+        let argv = ["rust-bot", "agent"].iter().chain(args).copied();
+        let Commands::Agent(agent) = Cli::try_parse_from(argv)?.command else {
+            panic!("expected the agent command");
+        };
+        Ok(agent)
+    }
+
+    #[test]
+    fn agent_resume_flag_takes_an_optional_query() {
+        assert_eq!(parse_agent(&[]).unwrap().resume, None);
+        assert_eq!(parse_agent(&["-r"]).unwrap().resume.as_deref(), Some(""));
+        assert_eq!(
+            parse_agent(&["--resume", "foo"]).unwrap().resume.as_deref(),
+            Some("foo")
+        );
+        assert_eq!(
+            parse_agent(&["-r", "foo"]).unwrap().resume.as_deref(),
+            Some("foo")
+        );
+        let with_message = parse_agent(&["-r", "-m", "hi"]).unwrap();
+        assert_eq!(with_message.resume.as_deref(), Some(""));
+        assert_eq!(with_message.message.as_deref(), Some("hi"));
+    }
+
+    #[test]
+    fn agent_resume_conflicts_with_session() {
+        let error = parse_agent(&["-r", "-s", "x"]).unwrap_err();
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
     }
 
     #[test]

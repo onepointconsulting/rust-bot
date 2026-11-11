@@ -27,11 +27,56 @@ cargo run -- agent --help
 | ------------------------------ | ------------------------- | -------------------------------------------------------------------------------------------- |
 | `-m`, `--message`              | *(none)*                  | Message to send to the agent. Omit to enter the [interactive console](INTERACTIVE_CONSOLE.md). |
 | `-s`, `--session`              | `cli:direct`              | Session ID                                                                                   |
+| `-r`, `--resume [query]`       | *(none)*                  | Pick a previous CLI session to resume (see [Resuming a session](#resuming-a-session)). Cannot be combined with `-s`. |
 | `-w`, `--workspace`            | `~/.rust-bot/workspace`   | Workspace directory                                                                          |
 | `-c`, `--config`               | `~/.rust-bot/config.json` | Config file path                                                                             |
 | `--markdown` / `--no-markdown` | `true`                    | Render assistant output as Markdown                                                          |
 | `--logs` / `--no-logs`         | `false`                   | Show runtime logs during chat                                                                |
 
+
+### Resuming a session
+
+`rust-bot agent -r` opens a searchable list of earlier CLI sessions, newest first. Each row shows
+the session title (or its key when it has no title), how long ago it was last used, its key and
+the size of its session file:
+
+```
+Resume session
+╭──────────────────────────────────────────────╮
+│ ⌕ Search…                                     │
+╰──────────────────────────────────────────────╯
+❯ HMRC R&D evidence report for chatbot engine
+  1 week ago · ems · 678.5KB
+
+  Rust-bot-side-bar plan review
+  2 weeks ago · cli:direct · 1.2MB
+
+Space to preview · Ctrl+R to rename · Type to search · Esc to cancel
+```
+
+| Key                 | Action                                                                                  |
+| ------------------- | --------------------------------------------------------------------------------------- |
+| ↑ / ↓               | Move the cursor (wraps around)                                                          |
+| PgUp / PgDn, Home / End | Move a page at a time, or to the first / last session                               |
+| Enter               | Resume the highlighted session                                                          |
+| Esc / Ctrl+C        | Leave without resuming ("No session selected.")                                         |
+| Typing              | Filter: every word must appear (case-insensitively) in the title or key                 |
+| Backspace / Ctrl+U  | Delete a character / clear the search                                                   |
+| Space               | With an empty search, show or hide the last few turns of the highlighted session; otherwise it types a space |
+| Ctrl+R              | Rename the highlighted session (Enter saves, Esc stops renaming)                        |
+
+`rust-bot agent -r <query>` resumes directly when the query is an exact session key or matches
+exactly one session; otherwise the picker opens with the search already filled in. `-r` combines
+with `-m`, so `rust-bot agent -r -m "hi"` picks a session and sends one message to it. Without an
+interactive terminal (e.g. piped input), `--resume` only works when the query resolves to a
+single session; use `-s <key>` instead.
+
+The list only contains CLI sessions (`cli:*` keys and names given with `-s`). Websocket, ACP,
+cron, API, heartbeat and other channel sessions are left out on purpose: they live in the same
+`sessions/` folder, but the process that owns them (usually the gateway) caches them in memory
+and rewrites the whole file on each save, and nothing locks the files. Continuing them from the
+CLI would lose turns or overwrite the gateway's, and the turns would not show up in the web UI's
+transcript.
 
 ## `onboard` subcommand
 

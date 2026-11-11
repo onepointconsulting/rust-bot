@@ -8,11 +8,13 @@
 
 use std::io::{self, Write};
 
-use crossterm::cursor::{Hide, MoveToColumn, MoveUp, Show};
+use crossterm::cursor::Hide;
 use crossterm::event::{self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use crossterm::execute;
 use crossterm::style::Stylize;
-use crossterm::terminal::{self, Clear, ClearType};
-use crossterm::{execute, queue};
+use crossterm::terminal;
+
+use crate::cli::terminal_draw::{RawGuard, clear_drawn, redraw, wrap, wrap_hard};
 
 const POINTER: &str = "❯";
 const FREE_TEXT_PLACEHOLDER: &str = "Type something.";
@@ -73,34 +75,6 @@ pub fn run_question_prompt(question: &str, choices: &[PromptChoice]) -> io::Resu
     write!(out, "{} {} {}\r\n", "?".green(), question.bold(), summary)?;
     out.flush()?;
     Ok(outcome)
-}
-
-struct RawGuard;
-
-impl Drop for RawGuard {
-    fn drop(&mut self) {
-        let _ = execute!(io::stdout(), Show);
-        let _ = terminal::disable_raw_mode();
-    }
-}
-
-/// Move back to the top of the previously drawn block and clear it.
-fn clear_drawn(out: &mut impl Write, drawn: usize) -> io::Result<()> {
-    queue!(out, MoveToColumn(0))?;
-    if drawn > 1 {
-        queue!(out, MoveUp((drawn - 1) as u16))?;
-    }
-    queue!(out, Clear(ClearType::FromCursorDown))
-}
-
-/// Lines are joined with explicit `\r\n` because raw mode on Unix clears
-/// `OPOST`, so a bare `\n` would not return to column 0.
-fn redraw(out: &mut impl Write, drawn: usize, lines: &[String]) -> io::Result<()> {
-    if drawn > 0 {
-        clear_drawn(out, drawn)?;
-    }
-    write!(out, "{}", lines.join("\r\n"))?;
-    out.flush()
 }
 
 struct PickerState {
@@ -301,60 +275,10 @@ fn row_prefix(number: usize, number_width: usize, selected: bool) -> String {
     }
 }
 
-/// Word-wrap on whitespace, hard-breaking words longer than `width`.
-fn wrap(text: &str, width: usize) -> Vec<String> {
-    let width = width.max(1);
-    let mut lines = Vec::new();
-    for paragraph in text.lines() {
-        let mut current = String::new();
-        let mut current_len = 0;
-        for word in paragraph.split_whitespace() {
-            let word_len = word.chars().count();
-            if current_len > 0 && current_len + 1 + word_len > width {
-                lines.push(std::mem::take(&mut current));
-                current_len = 0;
-            }
-            if word_len > width {
-                let mut chunks = wrap_hard(word, width);
-                let last = chunks.pop().unwrap_or_default();
-                if current_len > 0 {
-                    lines.push(std::mem::take(&mut current));
-                }
-                lines.extend(chunks);
-                current_len = last.chars().count();
-                current = last;
-                continue;
-            }
-            if current_len > 0 {
-                current.push(' ');
-                current_len += 1;
-            }
-            current.push_str(word);
-            current_len += word_len;
-        }
-        lines.push(current);
-    }
-    if lines.is_empty() {
-        lines.push(String::new());
-    }
-    lines
-}
-
-/// Break every `width` characters, ignoring word boundaries.
-fn wrap_hard(text: &str, width: usize) -> Vec<String> {
-    let chars: Vec<char> = text.chars().collect();
-    if chars.is_empty() {
-        return vec![String::new()];
-    }
-    chars
-        .chunks(width.max(1))
-        .map(|chunk| chunk.iter().collect())
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cli::terminal_draw::strip_ansi;
 
     fn key(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
@@ -514,29 +438,5 @@ mod tests {
                 "Enter or number to select · ↑/↓ to navigate · Esc to cancel",
             ]
         );
-    }
-
-    #[test]
-    fn wrap_breaks_on_words_and_long_tokens() {
-        assert_eq!(wrap("aa bb cc", 5), vec!["aa bb", "cc"]);
-        assert_eq!(wrap("abcdefg", 3), vec!["abc", "def", "g"]);
-        assert_eq!(wrap("", 5), vec![""]);
-    }
-
-    fn strip_ansi(s: &str) -> String {
-        let mut out = String::new();
-        let mut chars = s.chars();
-        while let Some(c) = chars.next() {
-            if c == '\x1b' {
-                for c in chars.by_ref() {
-                    if c.is_ascii_alphabetic() {
-                        break;
-                    }
-                }
-            } else {
-                out.push(c);
-            }
-        }
-        out
     }
 }
