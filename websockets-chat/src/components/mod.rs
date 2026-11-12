@@ -4,12 +4,15 @@ mod ask_question;
 mod chat_shell;
 mod general_settings;
 mod json_editor;
+mod key_value_rows;
 mod list_page;
 mod mcp_presets_page;
 mod message_list;
 mod model_picker;
 mod model_presets_page;
+mod providers_page;
 mod reasoning_panel;
+mod segmented_toggle;
 mod settings_dialog;
 mod settings_pages;
 mod subagents_page;
@@ -27,6 +30,10 @@ pub use model_picker::ProviderModelsState;
 pub use model_presets_page::{
     notice_for as model_preset_notice, picker_names as model_preset_picker_names,
     ADD_BUSY_KEY as MODEL_PRESET_ADD_BUSY_KEY,
+};
+pub use providers_page::{
+    notice_for as provider_notice, ProviderAddRequest, ProviderExtras,
+    ADD_BUSY_KEY as PROVIDER_ADD_BUSY_KEY,
 };
 pub use reasoning_panel::ReasoningPanel;
 pub use settings_dialog::{ConfigSavedNotice, SettingsDialog};

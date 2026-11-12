@@ -26,9 +26,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::config::loader::resolve_env_vars_in;
-use crate::config::schema::{Config, ProviderConfig};
+use crate::config::schema::{Config, ProviderBackend, ProviderConfig};
 use crate::providers::anthropic_provider::AnthropicProvider;
-use crate::providers::factory::resolve_concrete_provider_name;
+use crate::providers::factory::{configured_or_env_api_key, resolve_concrete_provider_name};
 use crate::providers::openai_compat_provider::{OpenAICompatProvider, body_preview};
 use crate::providers::registry::{ProviderSpec, find_by_name};
 
@@ -106,6 +106,37 @@ pub fn listing_protocol_for(spec: &ProviderSpec) -> ModelListingProtocol {
         "anthropic" => ModelListingProtocol::Anthropic,
         _ => ModelListingProtocol::Unsupported,
     }
+}
+
+/// The listing protocol of a provider implementation.
+pub fn listing_protocol_for_backend(backend: ProviderBackend) -> ModelListingProtocol {
+    match backend {
+        // The Responses API shares `GET /models` with Chat Completions.
+        ProviderBackend::OpenAiCompat | ProviderBackend::OpenAiResponses => {
+            ModelListingProtocol::OpenAiCompatible
+        }
+        ProviderBackend::Anthropic => ModelListingProtocol::Anthropic,
+    }
+}
+
+/// The listing protocol of a configured provider: that of its `providerBackEnd` when
+/// set, so the models come from the API its requests go to; else its registry default.
+pub fn configured_listing_protocol(
+    spec: &ProviderSpec,
+    provider_config: &ProviderConfig,
+) -> ModelListingProtocol {
+    provider_config
+        .provider_back_end
+        .map(listing_protocol_for_backend)
+        .unwrap_or_else(|| listing_protocol_for(spec))
+}
+
+/// The base URL requests of the registry provider `spec` go to when the configuration
+/// sets none: its registry default, else the default of its API.
+pub fn default_api_base_of(spec: &ProviderSpec) -> Option<String> {
+    spec.default_api_base
+        .clone()
+        .or_else(|| protocol_default_api_base(listing_protocol_for(spec)).map(str::to_string))
 }
 
 /// The base URL a provider's own client falls back to when neither the configuration
@@ -223,25 +254,6 @@ pub fn parse_model_listing(body: &Value) -> Result<ModelListingPage, String> {
     })
 }
 
-/// The configured API key when not blank, else the provider's environment variable
-/// (`spec.env_key`) when set and not blank.
-fn configured_or_env_api_key(
-    provider_config: &ProviderConfig,
-    spec: &ProviderSpec,
-) -> Option<String> {
-    let configured = provider_config.api_key.trim();
-    if !configured.is_empty() {
-        return Some(configured.to_string());
-    }
-    if spec.env_key.is_empty() {
-        return None;
-    }
-    std::env::var(&spec.env_key)
-        .ok()
-        .map(|key| key.trim().to_string())
-        .filter(|key| !key.is_empty())
-}
-
 /// The headers for listing `spec`'s models — the same ones its chat client sends, minus
 /// per-request routing hints. Anthropic requires a key (resolved like its chat client
 /// does, `file://` indirection included); OpenAI-compatible servers are asked without
@@ -287,15 +299,26 @@ pub fn build_model_listing_request(
     provider_name: &str,
 ) -> Result<ModelListingRequest, String> {
     let concrete_name = resolve_concrete_provider_name(config, provider_name)?;
-    let spec = find_by_name(&concrete_name)
+    // A named custom provider has no registry entry: it is listed like the `custom` slot.
+    let registry_spec = find_by_name(&concrete_name);
+    let is_named_custom = registry_spec.is_none()
+        && config
+            .providers
+            .custom_providers
+            .contains_key(&concrete_name);
+    let mut spec = registry_spec
+        .or_else(|| find_by_name("custom").filter(|_| is_named_custom))
         .ok_or_else(|| format!("Unknown provider '{concrete_name}'."))?;
+    if is_named_custom {
+        spec.name = concrete_name.clone();
+    }
     let configured_slot = config
         .providers
         .get_by_name(&spec.name)
         .ok_or_else(|| format!("Provider '{}' has no configuration slot.", spec.name))?;
     let provider_config = &resolve_env_vars_in(configured_slot)
         .map_err(|e| format!("Settings of provider '{}': {e}", spec.name))?;
-    let protocol = listing_protocol_for(&spec);
+    let protocol = configured_listing_protocol(&spec, provider_config);
     let api_base = effective_api_base(provider_config, &spec, protocol)
         .ok_or_else(|| unsupported_message(&spec))?;
     let endpoint_url =
@@ -303,7 +326,7 @@ pub fn build_model_listing_request(
     let headers = listing_headers(
         protocol,
         &spec,
-        configured_or_env_api_key(provider_config, &spec),
+        configured_or_env_api_key(provider_config, Some(&spec)),
         &api_base,
         &provider_config.extra_headers.clone().unwrap_or_default(),
     )?;
@@ -823,6 +846,41 @@ mod tests {
         assert!(!request.headers.contains_key("x-session-affinity"));
     }
 
+    /// A custom provider served by the Anthropic implementation lists its models the
+    /// Anthropic way: `/v1/models` with `x-api-key`.
+    #[test]
+    fn a_configured_backend_decides_the_listing_protocol() {
+        let mut config = Config::default();
+        config.providers.custom.api_key = "c-key".to_string();
+        config.providers.custom.api_base = Some("https://gw.example/anthropic".to_string());
+        config.providers.custom.provider_back_end = Some(ProviderBackend::Anthropic);
+        let request = build_model_listing_request(&config, "custom").unwrap();
+        assert_eq!(request.protocol, ModelListingProtocol::Anthropic);
+        assert_eq!(request.headers.get("x-api-key").unwrap(), "c-key");
+
+        config.providers.custom.provider_back_end = Some(ProviderBackend::OpenAiResponses);
+        let request = build_model_listing_request(&config, "custom").unwrap();
+        assert_eq!(request.protocol, ModelListingProtocol::OpenAiCompatible);
+        assert_eq!(request.endpoint_url, "https://gw.example/anthropic/models");
+    }
+
+    #[test]
+    fn every_backend_has_a_listing_protocol() {
+        assert_eq!(
+            listing_protocol_for_backend(ProviderBackend::Anthropic),
+            ModelListingProtocol::Anthropic
+        );
+        for backend in [
+            ProviderBackend::OpenAiCompat,
+            ProviderBackend::OpenAiResponses,
+        ] {
+            assert_eq!(
+                listing_protocol_for_backend(backend),
+                ModelListingProtocol::OpenAiCompatible
+            );
+        }
+    }
+
     // ── list_provider_models against a local mock server ─────────────────────
 
     /// A canned HTTP response the mock server sends for one request.
@@ -992,5 +1050,24 @@ mod tests {
             .await
             .unwrap_err();
         assert_eq!(error, "Unknown provider 'nonesuch'.");
+    }
+
+    #[test]
+    fn a_named_custom_provider_is_listed_with_its_configured_protocol() {
+        let mut config = Config::default();
+        config.providers.custom_providers.insert(
+            "my-relay".to_string(),
+            ProviderConfig {
+                api_key: "relay-key".to_string(),
+                api_base: Some("https://gateway.example/v1".to_string()),
+                provider_back_end: Some(ProviderBackend::Anthropic),
+                ..ProviderConfig::default()
+            },
+        );
+        let request = build_model_listing_request(&config, "my-relay").unwrap();
+        assert_eq!(request.provider_name, "my-relay");
+        assert_eq!(request.protocol, ModelListingProtocol::Anthropic);
+        assert!(request.endpoint_url.starts_with("https://gateway.example/"));
+        assert!(build_model_listing_request(&config, "other-relay").is_err());
     }
 }

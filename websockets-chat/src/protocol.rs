@@ -19,8 +19,9 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    AcpAgentSummary, ChatEntry, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
-    McpServerSettingSummary, ModelPresetChange, ModelPresetSummary, ProviderModelSummary, Role,
+    AcpAgentSummary, BackendChoice, ChatEntry, DedicatedProviderChoice, ImageAttachment,
+    McpCustomServerSummary, McpPresetSummary, McpServerSettingSummary, ModelPresetChange,
+    ModelPresetSummary, ProviderChange, ProviderModelSummary, ProviderSummary, Role,
     SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolConfigSummary, ToolEvent,
     ToolSettingSummary, ToolSummary,
 };
@@ -114,6 +115,9 @@ pub struct ClientEnvelope {
     /// Set only by [`Self::list_provider_models`] — the provider whose models to list.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider: Option<String>,
+    /// Set only by [`Self::add_provider`] — `dedicated` or `custom`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub kind: Option<&'static str>,
     /// Set only by [`Self::set_tool_config`] — tool setting name to its new value.
     /// May hold secrets: never logged or echoed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -158,6 +162,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -193,6 +198,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -227,6 +233,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -274,6 +281,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -306,6 +314,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -338,6 +347,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -559,6 +569,72 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway for the configured LLM providers (never their API keys).
+    /// Authenticated connections only. The reply is a `providers` event (see
+    /// [`ServerEvent::Providers`]).
+    pub fn list_providers() -> Self {
+        Self {
+            type_: "list_providers",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to add a provider: `kind` is `dedicated` (a built-in slot, `name`
+    /// being its name) or `custom` (a new named endpoint). `values` holds `apiKey`,
+    /// `apiBase`, `extraHeaders` and `providerBackEnd`; they may hold secrets and are
+    /// never logged or echoed. Same access rules as [`Self::add_model_preset`]. The
+    /// reply is a `providers` event naming the change, or a `setting_error` event of
+    /// kind `provider_add`.
+    pub fn add_provider(
+        kind: &'static str,
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "add_provider",
+            kind: Some(kind),
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to change settings of the provider `name`; a blank `apiKey` keeps
+    /// the stored one. The reply is a `providers` event or a `setting_error` of kind
+    /// `provider_config`.
+    pub fn set_provider_config(
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "set_provider_config",
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to clear the stored API key of the provider `name`. The reply is a
+    /// `providers` event or a `setting_error` of kind `provider_config`.
+    pub fn forget_provider_key(name: impl Into<String>) -> Self {
+        Self {
+            type_: "forget_provider_key",
+            name: Some(name.into()),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to delete the provider `name` (a custom one is removed, a
+    /// dedicated one reset). The reply is a `providers` event or a `setting_error` of kind
+    /// `provider_delete`.
+    pub fn delete_provider(name: impl Into<String>) -> Self {
+        Self {
+            type_: "delete_provider",
+            name: Some(name.into()),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway which models `provider` offers (`auto`: the provider it would pick),
     /// using the credentials in its `config.json`. Same access rules as
     /// [`Self::add_model_preset`]. The reply is a `provider_models` event (see
@@ -628,6 +704,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -678,6 +755,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -713,6 +791,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -750,6 +829,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -785,6 +865,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -826,6 +907,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -861,6 +943,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -892,6 +975,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -926,6 +1010,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -962,6 +1047,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -1025,6 +1111,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -1065,6 +1152,7 @@ impl ClientEnvelope {
             fields: None,
             values: None,
             provider: None,
+            kind: None,
             webui: true,
         }
     }
@@ -1389,6 +1477,18 @@ pub enum ServerEvent {
         providers_without_key: Vec<String>,
         changed: Option<ModelPresetChange>,
     },
+    /// Reply to [`ClientEnvelope::list_providers`] and to every successful provider
+    /// write: the rows, the add panel's choices, the blank add form (only when
+    /// `can_modify`) and, after a write, what changed. Never carries an API key. Not
+    /// scoped to any one `chat_id`.
+    Providers {
+        providers: Vec<ProviderSummary>,
+        dedicated_choices: Vec<DedicatedProviderChoice>,
+        backend_choices: Vec<BackendChoice>,
+        can_modify: bool,
+        new_provider_form: Option<ToolConfigSummary>,
+        changed: Option<ProviderChange>,
+    },
     /// Reply to [`ClientEnvelope::list_provider_models`]: the provider's models sorted by
     /// id, or — when refused or failed — an empty list with `detail` (a stable code:
     /// `access_denied`, `admin_required`, `missing_provider`, `config_error`,
@@ -1609,6 +1709,7 @@ impl ServerEvent {
             | ServerEvent::McpServerConfigSet { .. }
             | ServerEvent::McpServerAdded { .. }
             | ServerEvent::ModelPresets { .. }
+            | ServerEvent::Providers { .. }
             | ServerEvent::ProviderModels { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
@@ -2034,6 +2135,22 @@ struct ModelPresetsWire {
 }
 
 #[derive(Deserialize)]
+struct ProvidersWire {
+    #[serde(default)]
+    providers: Vec<ProviderSummary>,
+    #[serde(default)]
+    dedicated_choices: Vec<DedicatedProviderChoice>,
+    #[serde(default)]
+    backend_choices: Vec<BackendChoice>,
+    #[serde(default)]
+    can_modify: bool,
+    #[serde(default)]
+    new_provider_form: Option<ToolConfigSummary>,
+    #[serde(default)]
+    changed: Option<ProviderChange>,
+}
+
+#[derive(Deserialize)]
 struct ProviderModelsWire {
     #[serde(default)]
     provider: String,
@@ -2398,6 +2515,14 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             can_modify: w.can_modify,
             new_preset_form: w.new_preset_form,
             providers_without_key: w.providers_without_key,
+            changed: w.changed,
+        }),
+        "providers" => decode::<ProvidersWire>(&value).map(|w| ServerEvent::Providers {
+            providers: w.providers,
+            dedicated_choices: w.dedicated_choices,
+            backend_choices: w.backend_choices,
+            can_modify: w.can_modify,
+            new_provider_form: w.new_provider_form,
             changed: w.changed,
         }),
         "provider_models" => {
@@ -3888,6 +4013,105 @@ mod tests {
             serde_json::to_value(ClientEnvelope::delete_model_preset("terra")).unwrap()["name"],
             "terra"
         );
+    }
+
+    #[test]
+    fn client_envelopes_of_the_providers_page_serialize_their_fields() {
+        let values = HashMap::from([("apiKey".to_string(), serde_json::json!("sk-x"))]);
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::add_provider(
+                "custom",
+                "my-relay",
+                values.clone()
+            ))
+            .unwrap(),
+            serde_json::json!({
+                "type": "add_provider",
+                "kind": "custom",
+                "name": "my-relay",
+                "values": {"apiKey": "sk-x"},
+                "webui": true,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_provider_config("my-relay", values)).unwrap()
+                ["type"],
+            "set_provider_config"
+        );
+        for (envelope, type_) in [
+            (ClientEnvelope::list_providers(), "list_providers"),
+            (
+                ClientEnvelope::forget_provider_key("my-relay"),
+                "forget_provider_key",
+            ),
+            (
+                ClientEnvelope::delete_provider("my-relay"),
+                "delete_provider",
+            ),
+        ] {
+            let value = serde_json::to_value(envelope).unwrap();
+            assert_eq!(value["type"], type_);
+            assert!(value.get("values").is_none(), "{type_}");
+            assert!(value.get("kind").is_none(), "{type_}");
+        }
+    }
+
+    #[test]
+    fn providers_decodes_rows_choices_forms_and_the_change() {
+        let event = parse_server_event(
+            r#"{"event":"providers","can_modify":true,
+                "changed":{"action":"added","name":"my-relay"},
+                "providers":[
+                  {"name":"anthropic","kind":"dedicated","label":"Anthropic","api_base":null,
+                   "default_api_base":"https://api.anthropic.com","backend":null,
+                   "backend_default":"anthropic","api_key_configured":false,
+                   "env_var":"ANTHROPIC_API_KEY","env_var_set":false,"used_by":["agents.provider"],
+                   "deletable":false,"delete_blocked_reason":"it is used by agents.provider."},
+                  {"name":"my-relay","kind":"custom","label":"my-relay",
+                   "api_base":"https://g/v1","backend":"openai_responses",
+                   "backend_default":"openai_compat","api_key_configured":true,
+                   "env_var":null,"env_var_set":false,"used_by":[],"deletable":true,
+                   "delete_blocked_reason":"",
+                   "form":{"name":"my-relay","fields":[]}}
+                ],
+                "dedicated_choices":[{"name":"openai","label":"OpenAI","env_var":"OPENAI_API_KEY",
+                   "env_var_set":true,"default_api_base":null,"configured":false}],
+                "backend_choices":[{"value":"","label":"Automatic"}],
+                "new_provider_form":{"name":"","fields":[]}}"#,
+        )
+        .unwrap();
+        assert_eq!(event.chat_id(), None);
+        let ServerEvent::Providers {
+            providers,
+            dedicated_choices,
+            backend_choices,
+            can_modify,
+            new_provider_form,
+            changed,
+        } = event
+        else {
+            panic!("expected Providers");
+        };
+        assert!(can_modify && new_provider_form.is_some());
+        assert_eq!(changed.unwrap().action, "added");
+        assert_eq!(providers[0].env_var.as_deref(), Some("ANTHROPIC_API_KEY"));
+        assert!(!providers[0].deletable && providers[0].form.is_none());
+        assert_eq!(providers[1].backend.as_deref(), Some("openai_responses"));
+        assert!(providers[1].api_key_configured && providers[1].form.is_some());
+        assert!(dedicated_choices[0].env_var_set);
+        assert_eq!(backend_choices[0].label, "Automatic");
+
+        let plain = parse_server_event(r#"{"event":"providers"}"#).unwrap();
+        let ServerEvent::Providers {
+            providers,
+            changed,
+            can_modify,
+            ..
+        } = plain
+        else {
+            panic!("expected Providers");
+        };
+        assert!(providers.is_empty() && changed.is_none() && !can_modify);
     }
 
     #[test]

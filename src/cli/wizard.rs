@@ -26,8 +26,9 @@ use crate::{
         loader::{load_config, save_config, set_config_path},
         schema::{
             AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType,
-            ModelPresetConfig, OcrProvider, ProviderRetryMode, REASONING_EFFORT_CHOICES,
-            REASONING_EFFORT_NONE, RESERVED_MODEL_PRESET_NAME, ToolsConfig, WebSearchProvider,
+            ModelPresetConfig, OcrProvider, ProviderBackend, ProviderConfig, ProviderRetryMode,
+            REASONING_EFFORT_CHOICES, REASONING_EFFORT_NONE, RESERVED_MODEL_PRESET_NAME,
+            ToolsConfig, WebSearchProvider,
         },
     },
     providers::registry::providers,
@@ -201,6 +202,7 @@ pub fn choose_providers(config: &mut Config, advanced: bool) -> Result<Config, C
             configure_api_base(config, provider)?;
             if advanced {
                 configure_extra_headers(config, provider)?;
+                configure_provider_back_end(config, provider)?;
             }
             if let Some(slot) = provider_config_slot(provider) {
                 config.agents.provider = slot.to_string();
@@ -227,6 +229,21 @@ fn provider_config_slot(provider_name: &str) -> Option<&'static str> {
     }
 }
 
+/// The `providers.*` slot that stores the settings of a wizard LLM-provider choice.
+fn provider_config_mut<'a>(
+    config: &'a mut Config,
+    provider_name: &str,
+) -> Option<&'a mut ProviderConfig> {
+    match provider_config_slot(provider_name)? {
+        PROVIDER_OPENROUTER => Some(&mut config.providers.openrouter),
+        PROVIDER_ANTHROPIC => Some(&mut config.providers.anthropic),
+        PROVIDER_TOGETHER => Some(&mut config.providers.together),
+        PROVIDER_OPENAI => Some(&mut config.providers.openai),
+        "custom" => Some(&mut config.providers.custom),
+        _ => None,
+    }
+}
+
 fn invalid_provider_error() -> CliError {
     eprint_error("Invalid provider");
     CliError::Inquire(inquire::InquireError::InvalidConfiguration(String::from(
@@ -236,14 +253,9 @@ fn invalid_provider_error() -> CliError {
 
 pub fn configure_provider(config: &mut Config, provider_name: &str) -> Result<Config, CliError> {
     let api_key = Text::new("Enter API key").prompt()?;
-    match provider_config_slot(provider_name) {
-        Some("openrouter") => config.providers.openrouter.api_key = api_key,
-        Some(PROVIDER_ANTHROPIC) => config.providers.anthropic.api_key = api_key,
-        Some(PROVIDER_TOGETHER) => config.providers.together.api_key = api_key,
-        Some(PROVIDER_OPENAI) => config.providers.openai.api_key = api_key,
-        Some("custom") => config.providers.custom.api_key = api_key,
-        _ => return Err(invalid_provider_error()),
-    }
+    provider_config_mut(config, provider_name)
+        .ok_or_else(invalid_provider_error)?
+        .api_key = api_key;
     Ok(config.clone())
 }
 
@@ -269,14 +281,9 @@ pub fn configure_api_base(config: &mut Config, provider_name: &str) -> Result<Co
         .with_default(default)
         .with_help_message(default)
         .prompt()?;
-    match provider_config_slot(provider_name) {
-        Some(PROVIDER_OPENROUTER) => config.providers.openrouter.api_base = Some(endpoint),
-        Some(PROVIDER_ANTHROPIC) => config.providers.anthropic.api_base = Some(endpoint),
-        Some(PROVIDER_TOGETHER) => config.providers.together.api_base = Some(endpoint),
-        Some(PROVIDER_OPENAI) => config.providers.openai.api_base = Some(endpoint),
-        Some("custom") => config.providers.custom.api_base = Some(endpoint),
-        _ => return Err(invalid_provider_error()),
-    }
+    provider_config_mut(config, provider_name)
+        .ok_or_else(invalid_provider_error)?
+        .api_base = Some(endpoint);
     Ok(config.clone())
 }
 
@@ -310,14 +317,54 @@ pub fn configure_extra_headers(
         return Ok(config.clone());
     }
 
-    let headers = Some(headers);
-    match provider_config_slot(provider_name) {
-        Some("openrouter") => config.providers.openrouter.extra_headers = headers,
-        Some("anthropic") => config.providers.anthropic.extra_headers = headers,
-        Some("together") => config.providers.together.extra_headers = headers,
-        Some("custom") => config.providers.custom.extra_headers = headers,
-        _ => return Err(invalid_provider_error()),
-    }
+    provider_config_mut(config, provider_name)
+        .ok_or_else(invalid_provider_error)?
+        .extra_headers = Some(headers);
+    Ok(config.clone())
+}
+
+/// The choices of the "Provider API" prompt: automatic first, then every
+/// [`ProviderBackend`] in [`ProviderBackend::ALL`] order.
+fn provider_back_end_choices() -> Vec<String> {
+    std::iter::once("automatic: chosen from the provider and its endpoint".to_string())
+        .chain(
+            ProviderBackend::ALL
+                .iter()
+                .map(|backend| format!("{}: {}", backend.config_name(), backend.description())),
+        )
+        .collect()
+}
+
+/// The backend of the choice at `choice_index` in [`provider_back_end_choices`];
+/// `None` for "automatic".
+fn provider_back_end_for_choice(choice_index: usize) -> Option<ProviderBackend> {
+    choice_index
+        .checked_sub(1)
+        .and_then(|index| ProviderBackend::ALL.get(index).copied())
+}
+
+/// The position of `backend` in [`provider_back_end_choices`].
+fn provider_back_end_choice_index(backend: Option<ProviderBackend>) -> usize {
+    backend
+        .and_then(|backend| ProviderBackend::ALL.iter().position(|b| *b == backend))
+        .map_or(0, |index| index + 1)
+}
+
+/// Ask which API the provider's requests use (`providerBackEnd`), e.g. OpenRouter
+/// through the OpenAI Responses API. "automatic" leaves it unset.
+pub fn configure_provider_back_end(
+    config: &mut Config,
+    provider_name: &str,
+) -> Result<Config, CliError> {
+    let provider_config =
+        provider_config_mut(config, provider_name).ok_or_else(invalid_provider_error)?;
+    let choice = Select::new("Provider API", provider_back_end_choices())
+        .with_starting_cursor(provider_back_end_choice_index(
+            provider_config.provider_back_end,
+        ))
+        .with_help_message("Which API requests to this provider use; automatic keeps the default")
+        .raw_prompt()?;
+    provider_config.provider_back_end = provider_back_end_for_choice(choice.index);
     Ok(config.clone())
 }
 
@@ -1939,6 +1986,35 @@ mod tests {
             assert_eq!(provider_config_slot(provider), Some(provider));
         }
         assert_eq!(provider_config_slot("not-a-provider"), None);
+    }
+
+    #[test]
+    fn provider_config_mut_points_at_the_slot_of_the_choice() {
+        let mut config = Config::default();
+        provider_config_mut(&mut config, PROVIDER_REQUESTY)
+            .unwrap()
+            .api_key = "custom-key".to_string();
+        provider_config_mut(&mut config, PROVIDER_OPENAI)
+            .unwrap()
+            .api_key = "openai-key".to_string();
+        assert_eq!(config.providers.custom.api_key, "custom-key");
+        assert_eq!(config.providers.openai.api_key, "openai-key");
+        assert!(provider_config_mut(&mut config, "not-a-provider").is_none());
+    }
+
+    #[test]
+    fn provider_back_end_choices_start_with_automatic_and_map_back() {
+        let choices = provider_back_end_choices();
+        assert_eq!(choices.len(), ProviderBackend::ALL.len() + 1);
+        assert!(choices[0].starts_with("automatic"));
+        assert_eq!(provider_back_end_for_choice(0), None);
+        assert_eq!(provider_back_end_choice_index(None), 0);
+        for (index, backend) in ProviderBackend::ALL.into_iter().enumerate() {
+            assert!(choices[index + 1].starts_with(backend.config_name()));
+            assert_eq!(provider_back_end_for_choice(index + 1), Some(backend));
+            assert_eq!(provider_back_end_choice_index(Some(backend)), index + 1);
+        }
+        assert_eq!(provider_back_end_for_choice(choices.len()), None);
     }
 
     #[test]

@@ -11,7 +11,9 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex, RwLock};
 
-use crate::config::schema::{Config, ModelPresetConfig, RESERVED_MODEL_PRESET_NAME};
+use crate::config::schema::{
+    Config, ModelPresetConfig, ProvidersConfig, RESERVED_MODEL_PRESET_NAME,
+};
 use crate::providers::base::LLMProviderDyn;
 use crate::providers::factory::{create_provider_for, resolve_concrete_provider_name};
 use crate::session::manager::{Session, SessionManager};
@@ -46,21 +48,22 @@ pub struct ModelRuntime {
 /// the provider at construction.
 ///
 /// The preset catalog can be replaced while the process runs
-/// ([`Self::reload_presets`], used by the WebUI's Models page); provider
-/// settings (`providers.*`) and the flat `agents.*` fields stay as they were
-/// at startup, so cached providers stay valid.
+/// ([`Self::reload_presets`], used by the WebUI's Models page), and so can the
+/// provider settings ([`Self::reload_providers`], used by its Providers page,
+/// which also drops the cached providers). The flat `agents.*` fields stay as
+/// they were at startup.
 pub struct ModelRuntimeResolver {
-    /// Startup configuration: provider credentials and the flat `agents.*`
-    /// fields. Its `model_presets` is not read after construction; the live
-    /// catalog is `presets`.
-    config: Config,
+    /// Startup configuration with the live `providers.*`: provider credentials
+    /// and the flat `agents.*` fields. Its `model_presets` is not read after
+    /// construction; the live catalog is `presets`.
+    config: RwLock<Config>,
     /// The live preset catalog (`model_presets`), replaced by [`Self::reload_presets`].
     presets: RwLock<HashMap<String, ModelPresetConfig>>,
     provider_cache: Mutex<HashMap<String, Arc<dyn LLMProviderDyn>>>,
     /// The implicit `"default"` runtime built at startup from the flat
     /// `agents.*` fields and the startup provider; restored exactly when
     /// `"default"` is made the process-wide default again.
-    flat_default: ModelRuntime,
+    flat_default: RwLock<ModelRuntime>,
     default_runtime: Mutex<ModelRuntime>,
 }
 
@@ -111,18 +114,19 @@ impl ModelRuntimeResolver {
         };
 
         Self {
-            config,
+            config: RwLock::new(config),
             presets: RwLock::new(presets),
             provider_cache: cache,
-            flat_default,
+            flat_default: RwLock::new(flat_default),
             default_runtime: Mutex::new(default_runtime),
         }
     }
 
     /// Resolve a preset name to a runtime, without changing the process-wide default.
     pub fn resolve_preset(&self, name: &str) -> Result<ModelRuntime, String> {
+        let config = self.config.read().unwrap_or_else(|e| e.into_inner());
         let presets = self.presets.read().unwrap_or_else(|e| e.into_inner());
-        Self::resolve_preset_with(&self.config, &presets, &self.provider_cache, name)
+        Self::resolve_preset_with(&config, &presets, &self.provider_cache, name)
     }
 
     /// Replace the preset catalog with `presets` and make `default_name` the
@@ -144,13 +148,93 @@ impl ModelRuntimeResolver {
         *self.presets.write().unwrap_or_else(|e| e.into_inner()) = presets;
         let runtime = match default_name {
             Some(name) if name != RESERVED_MODEL_PRESET_NAME => self.resolve_preset(name)?,
-            _ => self.flat_default.clone(),
+            _ => self
+                .flat_default
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .clone(),
         };
         *self
             .default_runtime
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = runtime.clone();
         Ok(runtime)
+    }
+
+    /// Replace the provider settings (`providers.*`) with `providers` and apply
+    /// them to the running process.
+    ///
+    /// 1. The new settings are swapped in and every cached provider dropped, so
+    ///    the next resolution of a preset builds its provider from them.
+    /// 2. The flat `agents.*` provider is rebuilt. When that fails the previous
+    ///    one is kept and the error is returned (after steps 3 and 4).
+    /// 3. The current process-wide default is resolved again.
+    ///
+    /// Turns in progress keep the provider they started with; their next turn
+    /// resolves a new one. A default that cannot be resolved with the new
+    /// settings is kept as it was and its error returned.
+    pub fn reload_providers(&self, providers: ProvidersConfig) -> Result<ModelRuntime, String> {
+        let (flat_provider_name, flat_rebuild) = {
+            let mut config = self.config.write().unwrap_or_else(|e| e.into_inner());
+            config.providers = providers;
+            let flat_model = self
+                .flat_default
+                .read()
+                .unwrap_or_else(|e| e.into_inner())
+                .model
+                .clone();
+            let flat_provider_name =
+                resolve_concrete_provider_name(&config, &config.agents.provider)
+                    .unwrap_or_else(|_| config.agents.provider.clone());
+            let flat_rebuild = create_provider_for(&config, &flat_model, &config.agents.provider);
+            (flat_provider_name, flat_rebuild)
+        };
+        let mut cache = self
+            .provider_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        cache.clear();
+        let flat_error = {
+            let mut flat_default = self.flat_default.write().unwrap_or_else(|e| e.into_inner());
+            match flat_rebuild {
+                Ok(provider) => {
+                    flat_default.provider = provider;
+                    flat_default.provider_name = flat_provider_name;
+                    None
+                }
+                Err(error) => Some(error),
+            }
+        };
+        let flat_default = self
+            .flat_default
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone();
+        cache.insert(
+            flat_default.provider_name.clone(),
+            flat_default.provider.clone(),
+        );
+        drop(cache);
+
+        let current = self.current_default();
+        let runtime = if current.preset_name == RESERVED_MODEL_PRESET_NAME {
+            // Keep a model chosen with `select_model` and the like; only the provider is new.
+            ModelRuntime {
+                provider: flat_default.provider,
+                provider_name: flat_default.provider_name,
+                ..current
+            }
+        } else {
+            self.resolve_preset(&current.preset_name)?
+        };
+        *self
+            .default_runtime
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = runtime.clone();
+        match flat_error {
+            Some(error) => Err(error),
+            None => Ok(runtime),
+        }
     }
 
     fn resolve_preset_with(
@@ -708,5 +792,78 @@ mod tests {
         let names = resolver.available_preset_names();
         assert_eq!(names[0], "default");
         assert!(names.contains(&"fast".to_string()));
+    }
+
+    // ── reload_providers ──────────────────────────────────────────────────────
+
+    fn providers_with_anthropic(api_key: &str, api_base: Option<&str>) -> ProvidersConfig {
+        let mut providers = ProvidersConfig::default();
+        providers.anthropic.api_key = api_key.to_string();
+        providers.anthropic.api_base = api_base.map(str::to_string);
+        providers
+    }
+
+    #[test]
+    fn reload_providers_resolves_presets_with_the_new_key_and_base() {
+        let mut config = config_with_anthropic_preset("fast", "claude-haiku");
+        config.agents.provider = "anthropic".to_string();
+        let resolver = build_resolver(config);
+        assert_eq!(
+            resolver.resolve_preset("fast").unwrap().provider.api_key(),
+            Some("test-key".to_string())
+        );
+
+        resolver
+            .reload_providers(providers_with_anthropic(
+                "new-key",
+                Some("https://relay.example"),
+            ))
+            .unwrap();
+
+        let provider = resolver.resolve_preset("fast").unwrap().provider;
+        assert_eq!(provider.api_key(), Some("new-key".to_string()));
+        assert_eq!(
+            provider.api_base(),
+            Some("https://relay.example".to_string())
+        );
+        let default = resolver.current_default();
+        assert_eq!(default.provider.api_key(), Some("new-key".to_string()));
+    }
+
+    #[test]
+    fn reload_providers_drops_the_cached_providers() {
+        let mut config = config_with_anthropic_preset("fast", "claude-haiku");
+        config.agents.provider = "anthropic".to_string();
+        let resolver = build_resolver(config);
+        let before = resolver.resolve_preset("fast").unwrap().provider;
+
+        resolver
+            .reload_providers(providers_with_anthropic("test-key", None))
+            .unwrap();
+
+        let after = resolver.resolve_preset("fast").unwrap().provider;
+        assert!(!Arc::ptr_eq(&before, &after));
+        // Resolved again, the provider is cached again.
+        let again = resolver.resolve_preset("fast").unwrap().provider;
+        assert!(Arc::ptr_eq(&after, &again));
+    }
+
+    #[test]
+    fn a_failing_flat_default_rebuild_keeps_the_old_provider_and_reports_the_error() {
+        let mut config = config_with_anthropic_preset("fast", "claude-haiku");
+        config.agents.provider = "anthropic".to_string();
+        let resolver = build_resolver(config);
+        let old_provider = resolver.current_default().provider;
+
+        // The flat provider names an unknown provider: it cannot be rebuilt.
+        resolver.config.write().unwrap().agents.provider = "nonesuch".to_string();
+        let failing = ProvidersConfig::default();
+        let outcome = resolver.reload_providers(failing);
+
+        assert!(outcome.is_err());
+        assert!(Arc::ptr_eq(
+            &old_provider,
+            &resolver.current_default().provider
+        ));
     }
 }

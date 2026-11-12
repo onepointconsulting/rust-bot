@@ -1,5 +1,5 @@
 use std::{
-    collections::HashMap,
+    collections::{BTreeMap, HashMap},
     path::{Path, PathBuf},
 };
 
@@ -19,26 +19,90 @@ use crate::{
 
 // ── ProviderConfig ────────────────────────────────────────────────────────────
 
+/// The `providerBackEnd` choices of the WebUI's provider form: `""` (automatic: the
+/// provider decides) followed by every [`ProviderBackend`] in wizard order.
+pub const PROVIDER_BACKEND_CHOICES: [&str; 4] =
+    ["", "openai_compat", "openai_responses", "anthropic"];
+
 /// LLM provider configuration.
-#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+///
+/// The field doc comments are the help texts of the WebUI's provider form (generated
+/// from this struct's JSON Schema).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
 #[derive(Default)]
 pub struct ProviderConfig {
-    /// API key for the provider. Defaults to an empty string so it can be
-    /// supplied via an environment variable at runtime instead.
+    /// API key for the provider. Leave it blank to use the provider's environment
+    /// variable instead.
     #[serde(alias = "api_key")]
     #[garde(skip)]
+    #[schemars(extend("x-secret" = true, "x-label" = "API key"))]
     pub api_key: String,
 
-    /// Base URL override for the provider API endpoint.
+    /// Base URL of the provider's API. Leave it blank for the provider's default.
     #[serde(alias = "api_base")]
     #[garde(skip)]
+    #[schemars(extend("x-label" = "Base URL"))]
     pub api_base: Option<String>,
 
     /// Custom HTTP headers forwarded with every request (e.g. `APP-Code` for AiHubMix).
     #[serde(alias = "extra_headers")]
     #[garde(skip)]
+    #[schemars(extend("x-label" = "Extra headers"))]
     pub extra_headers: Option<HashMap<String, String>>,
+
+    /// The API the provider speaks. Automatic picks it from the provider and Base URL.
+    #[serde(alias = "provider_back_end", skip_serializing_if = "Option::is_none")]
+    #[garde(skip)]
+    #[schemars(
+        with = "Option<String>",
+        extend("x-label" = "API protocol", "x-choices" = PROVIDER_BACKEND_CHOICES)
+    )]
+    pub provider_back_end: Option<ProviderBackend>,
+}
+
+/// Which provider implementation serves a provider. The serialized names match the
+/// `backend` strings of the provider registry (`providers::registry`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize, JsonSchema)]
+pub enum ProviderBackend {
+    /// [`AnthropicProvider`]: the Messages API.
+    #[serde(rename = "anthropic")]
+    Anthropic,
+    /// [`crate::providers::openai_responses_provider::OpenAIResponsesProvider`]:
+    /// api.openai.com's Responses API.
+    #[serde(rename = "openai_responses")]
+    OpenAiResponses,
+    /// [`crate::providers::openai_compat_provider::OpenAICompatProvider`]: any other
+    /// Chat Completions endpoint.
+    #[serde(rename = "openai_compat")]
+    OpenAiCompat,
+}
+
+impl ProviderBackend {
+    /// Every implementation, in the order the setup wizard offers them.
+    pub const ALL: [ProviderBackend; 3] = [
+        ProviderBackend::OpenAiCompat,
+        ProviderBackend::OpenAiResponses,
+        ProviderBackend::Anthropic,
+    ];
+
+    /// The name `config.json` uses for this implementation (`providerBackEnd`).
+    pub fn config_name(self) -> &'static str {
+        match self {
+            ProviderBackend::Anthropic => "anthropic",
+            ProviderBackend::OpenAiResponses => "openai_responses",
+            ProviderBackend::OpenAiCompat => "openai_compat",
+        }
+    }
+
+    /// The API this implementation speaks, for prompts and messages.
+    pub fn description(self) -> &'static str {
+        match self {
+            ProviderBackend::Anthropic => "Anthropic Messages API",
+            ProviderBackend::OpenAiResponses => "OpenAI Responses API",
+            ProviderBackend::OpenAiCompat => "OpenAI Chat Completions API",
+        }
+    }
 }
 
 // ── ChannelsConfig ────────────────────────────────────────────────────────────
@@ -616,6 +680,17 @@ pub struct ProvidersConfig {
     #[serde(alias = "together")]
     #[garde(dive)]
     pub together: ProviderConfig,
+
+    /// Named OpenAI-compatible, Responses or Anthropic endpoints added from the
+    /// WebUI's Providers page. Model presets select one by its name. Names are
+    /// checked by [`validate_custom_provider_names`].
+    #[serde(
+        alias = "custom_providers",
+        default,
+        skip_serializing_if = "BTreeMap::is_empty"
+    )]
+    #[garde(dive)]
+    pub custom_providers: BTreeMap<String, ProviderConfig>,
 }
 
 impl ProvidersConfig {
@@ -630,8 +705,25 @@ impl ProvidersConfig {
             "openai" => Some(&self.openai),
             "openrouter" => Some(&self.openrouter),
             "gemini" => Some(&self.gemini),
+            "groq" => Some(&self.groq),
             "together" => Some(&self.together),
-            _ => None,
+            other => self.custom_providers.get(other),
+        }
+    }
+
+    /// Mutable counterpart of [`ProvidersConfig::get_by_name`], with the same lookup
+    /// order: built-in slots first, then the named custom providers.
+    pub fn get_by_name_mut(&mut self, name: &str) -> Option<&mut ProviderConfig> {
+        match name {
+            "custom" => Some(&mut self.custom),
+            "azure_openai" => Some(&mut self.azure_openai),
+            "anthropic" => Some(&mut self.anthropic),
+            "openai" => Some(&mut self.openai),
+            "openrouter" => Some(&mut self.openrouter),
+            "gemini" => Some(&mut self.gemini),
+            "groq" => Some(&mut self.groq),
+            "together" => Some(&mut self.together),
+            other => self.custom_providers.get_mut(other),
         }
     }
 
@@ -2369,6 +2461,33 @@ pub fn validate_model_presets(config: &Config) -> Result<(), String> {
     Ok(())
 }
 
+/// Check the names of `config.providers.custom_providers`: each must be a valid name
+/// (letters, digits, `_`, `-`, `.`, spaces) and must not shadow `auto`, `default` or a
+/// provider of the registry (compared as [`find_by_name`] does, so `Open-AI`-style
+/// spellings of a registry name are refused too).
+pub fn validate_custom_provider_names(config: &Config) -> Result<(), String> {
+    for name in config.providers.custom_providers.keys() {
+        if !crate::channels::websocket::config_toggles::is_valid_name(name) {
+            return Err(format!(
+                "providers.customProviders: '{name}' is not a valid provider name"
+            ));
+        }
+        if is_reserved_provider_name(name) {
+            return Err(format!(
+                "providers.customProviders: the name '{name}' is reserved"
+            ));
+        }
+    }
+    Ok(())
+}
+
+/// Whether `name` may not be used for a custom provider: `auto`, `default`, or the
+/// name of a registry provider (after [`find_by_name`]'s normalisation).
+pub fn is_reserved_provider_name(name: &str) -> bool {
+    let normalised = name.replace('-', "_").to_lowercase();
+    matches!(normalised.as_str(), "auto" | "default") || find_by_name(name).is_some()
+}
+
 /// Default agent configuration.
 #[derive(Debug, Clone)]
 pub struct AgentDefaults {
@@ -2708,6 +2827,54 @@ mod tests {
         assert_eq!(cfg.api_key, String::new());
         assert_eq!(cfg.api_base, None);
         assert_eq!(cfg.extra_headers, None);
+        assert_eq!(cfg.provider_back_end, None);
+    }
+
+    #[test]
+    fn test_provider_config_reads_the_provider_back_end_in_both_spellings() {
+        for (json, expected) in [
+            (
+                r#"{"providerBackEnd": "anthropic"}"#,
+                ProviderBackend::Anthropic,
+            ),
+            (
+                r#"{"providerBackEnd": "openai_compat"}"#,
+                ProviderBackend::OpenAiCompat,
+            ),
+            (
+                r#"{"provider_back_end": "openai_responses"}"#,
+                ProviderBackend::OpenAiResponses,
+            ),
+        ] {
+            let cfg: ProviderConfig = serde_json::from_str(json).unwrap();
+            assert_eq!(cfg.provider_back_end, Some(expected), "{json}");
+        }
+        assert!(
+            serde_json::from_str::<ProviderConfig>(r#"{"providerBackEnd": "gemini"}"#).is_err()
+        );
+    }
+
+    #[test]
+    fn test_provider_backend_config_names_match_serde() {
+        for backend in ProviderBackend::ALL {
+            assert_eq!(
+                serde_json::to_value(backend).unwrap(),
+                backend.config_name(),
+                "{backend:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn test_provider_config_writes_the_provider_back_end_only_when_set() {
+        let unset = serde_json::to_value(ProviderConfig::default()).unwrap();
+        assert!(unset.get("providerBackEnd").is_none(), "{unset}");
+        let set = serde_json::to_value(ProviderConfig {
+            provider_back_end: Some(ProviderBackend::OpenAiResponses),
+            ..ProviderConfig::default()
+        })
+        .unwrap();
+        assert_eq!(set["providerBackEnd"], "openai_responses");
     }
 
     #[test]
@@ -4070,5 +4237,101 @@ mod tests {
 
         cfg.tools.deferred_tools = vec!["docx".to_string()];
         assert!(cfg.validate().is_ok());
+    }
+
+    // ── custom providers ──────────────────────────────────────────────────────
+
+    #[test]
+    fn custom_providers_round_trip_and_are_not_written_when_empty() {
+        let json = r#"{"customProviders": {"my-relay": {"apiKey": "k", "apiBase": "https://g/v1", "providerBackEnd": "openai_responses"}}}"#;
+        let cfg: ProvidersConfig = serde_json::from_str(json).unwrap();
+        let relay = &cfg.custom_providers["my-relay"];
+        assert_eq!(relay.api_key, "k");
+        assert_eq!(
+            relay.provider_back_end,
+            Some(ProviderBackend::OpenAiResponses)
+        );
+        let written = serde_json::to_value(&cfg).unwrap();
+        assert_eq!(
+            written["customProviders"]["my-relay"]["apiBase"],
+            "https://g/v1"
+        );
+
+        let empty = serde_json::to_value(ProvidersConfig::default()).unwrap();
+        assert!(empty.get("customProviders").is_none());
+    }
+
+    #[test]
+    fn custom_providers_accept_the_snake_case_alias() {
+        let cfg: ProvidersConfig =
+            serde_json::from_str(r#"{"custom_providers": {"x": {"apiKey": "k"}}}"#).unwrap();
+        assert!(cfg.custom_providers.contains_key("x"));
+    }
+
+    #[test]
+    fn get_by_name_resolves_groq_and_custom_names_with_built_ins_first() {
+        let mut cfg = ProvidersConfig::default();
+        cfg.groq.api_key = "groq-key".to_string();
+        cfg.custom_providers
+            .insert("relay".to_string(), ProviderConfig::default());
+        assert_eq!(cfg.get_by_name("groq").unwrap().api_key, "groq-key");
+        assert!(cfg.get_by_name("relay").is_some());
+        assert!(cfg.get_by_name("nonesuch").is_none());
+
+        cfg.get_by_name_mut("relay").unwrap().api_key = "new".to_string();
+        assert_eq!(cfg.custom_providers["relay"].api_key, "new");
+        cfg.get_by_name_mut("openai").unwrap().api_key = "oa".to_string();
+        assert_eq!(cfg.openai.api_key, "oa");
+        assert!(cfg.get_by_name_mut("nonesuch").is_none());
+    }
+
+    #[test]
+    fn custom_provider_names_must_be_valid_and_not_reserved() {
+        let config_with = |name: &str| {
+            let mut config = Config::default();
+            config
+                .providers
+                .custom_providers
+                .insert(name.to_string(), ProviderConfig::default());
+            config
+        };
+        assert!(validate_custom_provider_names(&config_with("my-relay")).is_ok());
+        for reserved in [
+            "auto",
+            "default",
+            "openai",
+            "OpenAI",
+            "azure-openai",
+            "custom",
+        ] {
+            assert!(
+                validate_custom_provider_names(&config_with(reserved)).is_err(),
+                "{reserved} should be reserved"
+            );
+        }
+        for invalid in ["", "a/b", "../x", "a\nb"] {
+            assert!(
+                validate_custom_provider_names(&config_with(invalid)).is_err(),
+                "{invalid:?} should be invalid"
+            );
+        }
+    }
+
+    #[test]
+    fn provider_form_schema_marks_the_key_secret_and_lists_the_backends() {
+        let schema = serde_json::to_value(schemars::schema_for!(ProviderConfig)).unwrap();
+        let properties = &schema["properties"];
+        assert_eq!(properties["apiKey"]["x-secret"], true);
+        assert_eq!(properties["apiBase"]["x-label"], "Base URL");
+        assert_eq!(properties["extraHeaders"]["x-label"], "Extra headers");
+        assert_eq!(
+            properties["providerBackEnd"]["x-choices"],
+            serde_json::json!(PROVIDER_BACKEND_CHOICES)
+        );
+        let named: Vec<&str> = ProviderBackend::ALL
+            .iter()
+            .map(|b| b.config_name())
+            .collect();
+        assert_eq!(&PROVIDER_BACKEND_CHOICES[1..], named.as_slice());
     }
 }

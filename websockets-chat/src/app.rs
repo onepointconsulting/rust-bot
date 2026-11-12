@@ -33,8 +33,9 @@ use crate::api::{self, WsSender};
 use crate::components::{
     add_server_success_message, after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand,
     apply_tool_config, insert_mcp_server, model_preset_notice, model_preset_picker_names,
-    ChatShell, McpChangeRequest, ProviderModelsState, SettingsActions, SettingsPage, SettingsPanel,
-    ToggleRequest, ToolConfigChange, ADD_BUSY_KEY, MODEL_PRESET_ADD_BUSY_KEY,
+    provider_notice, ChatShell, McpChangeRequest, ProviderAddRequest, ProviderExtras,
+    ProviderModelsState, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
+    ToolConfigChange, ADD_BUSY_KEY, MODEL_PRESET_ADD_BUSY_KEY, PROVIDER_ADD_BUSY_KEY,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -1292,6 +1293,60 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             panel.can_modify.set(can_modify);
             panel.model_presets_loaded.set(true);
         }
+        ServerEvent::Providers {
+            providers,
+            dedicated_choices,
+            backend_choices,
+            can_modify,
+            new_provider_form,
+            changed,
+        } => {
+            // A reply that lands after the dialog closed must not leave data behind.
+            if !ctx.settings_open.get_untracked() {
+                return;
+            }
+            let panel = ctx.settings_panel;
+            panel.busy.set(None);
+            match &changed {
+                Some(change) => {
+                    // Requests clear the error first: one present now came with this
+                    // change (saved, but not applied live) and must not be contradicted.
+                    if panel.error.get_untracked().is_none() {
+                        panel
+                            .provider_notice
+                            .set(Some(provider_notice(change, &providers)));
+                    }
+                    match change.action.as_str() {
+                        "added" => panel.close_add_panel(),
+                        "updated" | "key_forgotten" => {
+                            // Saved: the form shows the stored values again.
+                            panel.forget_row_drafts(SettingsPage::Providers, &change.name);
+                            if change.action == "updated" {
+                                panel.editing_provider.set(None);
+                            }
+                        }
+                        _ => {}
+                    }
+                    // The Models page's missing-key flags and provider choices follow
+                    // the providers.
+                    send_client_envelope(
+                        *ctx,
+                        protocol::ClientEnvelope::list_model_presets(),
+                        "Failed to encode the model presets request.",
+                    );
+                }
+                // A fresh list: its forms start again from what is stored.
+                None => panel.forget_page_drafts(SettingsPage::Providers),
+            }
+            panel.providers.set(providers);
+            panel.provider_overview_extras.set(ProviderExtras {
+                dedicated_choices,
+                backend_choices,
+                new_form: new_provider_form,
+            });
+            panel.can_modify.set(can_modify);
+            panel.providers_loaded.set(true);
+        }
         ServerEvent::SettingError {
             kind,
             name,
@@ -1311,7 +1366,10 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                 return;
             }
             // A refused add is reported in the panel, which stays open.
-            if matches!(kind.as_str(), "mcp_server_add" | "model_preset_add") {
+            if matches!(
+                kind.as_str(),
+                "mcp_server_add" | "model_preset_add" | "provider_add"
+            ) {
                 panel.add_error.set(Some(message));
                 return;
             }
@@ -1321,6 +1379,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                     panel.tools_loaded.set(true);
                 } else if kind.starts_with(MODEL_PRESET_SETTING_KIND_PREFIX) {
                     panel.model_presets_loaded.set(true);
+                } else if kind.starts_with(PROVIDER_SETTING_KIND_PREFIX) {
+                    panel.providers_loaded.set(true);
                 } else {
                     panel.mcp_servers_loaded.set(true);
                 }
@@ -1768,6 +1828,7 @@ fn close_settings(ctx: &WsContext) {
 fn request_settings_list(ctx: &WsContext, page: SettingsPage) {
     let envelope = match page {
         SettingsPage::Models => protocol::ClientEnvelope::list_model_presets(),
+        SettingsPage::Providers => protocol::ClientEnvelope::list_providers(),
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::list_tool_settings()
         }
@@ -1790,8 +1851,12 @@ fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
     panel.editing_preset.set(None);
     panel.confirm_delete_preset.set(None);
     panel.model_notice.set(None);
+    panel.editing_provider.set(None);
+    panel.confirm_delete_provider.set(None);
+    panel.provider_notice.set(None);
     match page {
         SettingsPage::Models => panel.model_presets_loaded.set(false),
+        SettingsPage::Providers => panel.providers_loaded.set(false),
         SettingsPage::Tools | SettingsPage::ToolSafety => panel.tools_loaded.set(false),
         SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
     }
@@ -1809,8 +1874,8 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
     ctx.settings_panel.error.set(None);
     ctx.settings_panel.busy.set(Some(name.clone()));
     let envelope = match page {
-        // The Models page has no switches; nothing sends one for it.
-        SettingsPage::Models => return,
+        // The Models and Providers pages have no switches; nothing sends one for them.
+        SettingsPage::Models | SettingsPage::Providers => return,
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::set_tool_enabled(name, enabled)
         }
@@ -1918,6 +1983,64 @@ fn request_activate_model_preset(ctx: &WsContext, name: String) {
         *ctx,
         protocol::ClientEnvelope::set_default_model_preset(name),
         "Failed to encode the activate model preset request.",
+    );
+}
+
+/// Start of the `kind` of every `setting_error` about the Providers page.
+const PROVIDER_SETTING_KIND_PREFIX: &str = "provider_";
+
+/// Mark a Providers page request as in flight for `busy_key` and drop the previous error
+/// and notice, so the reply's outcome is the only one shown.
+fn start_provider_request(ctx: &WsContext, busy_key: String) {
+    let panel = ctx.settings_panel;
+    panel.error.set(None);
+    panel.provider_notice.set(None);
+    panel.busy.set(Some(busy_key));
+}
+
+/// Ask the gateway to add a provider: `(kind, name, settings)`. The reply is a
+/// `providers` event naming the change, or a `setting_error` of kind `provider_add`
+/// (shown in the add panel). The settings may hold an API key: they are only sent.
+fn request_add_provider(ctx: &WsContext, (kind, name, values): ProviderAddRequest) {
+    ctx.settings_panel.add_error.set(None);
+    start_provider_request(ctx, PROVIDER_ADD_BUSY_KEY.to_string());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::add_provider(kind, name, values),
+        "Failed to encode the add provider request.",
+    );
+}
+
+/// Ask the gateway to save changed settings of one provider. The reply is a `providers`
+/// event or a `setting_error` of kind `provider_config`.
+fn request_save_provider(ctx: &WsContext, (name, values): ToolConfigChange) {
+    start_provider_request(ctx, name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_provider_config(name, values),
+        "Failed to encode the provider settings request.",
+    );
+}
+
+/// Ask the gateway to clear the stored API key of one provider. The reply is a
+/// `providers` event or a `setting_error` of kind `provider_config`.
+fn request_forget_provider_key(ctx: &WsContext, name: String) {
+    start_provider_request(ctx, name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::forget_provider_key(name),
+        "Failed to encode the forget provider key request.",
+    );
+}
+
+/// Ask the gateway to delete one provider. The reply is a `providers` event or a
+/// `setting_error` of kind `provider_delete`.
+fn request_delete_provider(ctx: &WsContext, name: String) {
+    start_provider_request(ctx, name.clone());
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::delete_provider(name),
+        "Failed to encode the delete provider request.",
     );
 }
 
@@ -3099,6 +3222,12 @@ pub fn App() -> impl IntoView {
         on_activate_model_preset: Callback::new(move |name| {
             request_activate_model_preset(&ws_context, name)
         }),
+        on_add_provider: Callback::new(move |request| request_add_provider(&ws_context, request)),
+        on_save_provider: Callback::new(move |change| request_save_provider(&ws_context, change)),
+        on_forget_provider_key: Callback::new(move |name| {
+            request_forget_provider_key(&ws_context, name)
+        }),
+        on_delete_provider: Callback::new(move |name| request_delete_provider(&ws_context, name)),
         on_list_provider_models: Callback::new(move |provider| {
             request_provider_models(&ws_context, provider)
         }),

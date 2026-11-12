@@ -22,7 +22,7 @@
 use std::collections::HashMap;
 
 use serde::Serialize;
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 
 use super::config_file::validate_config_text;
 use super::config_toggles::{
@@ -38,7 +38,10 @@ use crate::config::schema::{
     Config, MODEL_PRESET_PROVIDER_CHOICES, ModelPresetConfig, REASONING_EFFORT_NONE,
     RESERVED_MODEL_PRESET_NAME,
 };
-use crate::providers::factory::try_auto_provider_selection;
+use crate::providers::factory::{
+    configured_or_env_api_key, custom_provider_names, try_auto_provider_selection,
+};
+use crate::providers::registry::find_by_name;
 
 /// Spellings the configuration accepts for the top-level `modelPresets` map.
 const MODEL_PRESETS_KEYS: &[&str] = &["modelPresets", "model_presets"];
@@ -56,6 +59,7 @@ const SETTING_SPELLINGS: SettingSpellings = &[
 
 const LABEL: &str = "label";
 const MODEL: &str = "model";
+const PROVIDER: &str = "provider";
 const REASONING_EFFORT: &str = "reasoningEffort";
 
 /// Label of the read-only row that stands for the flat `agents.*` settings.
@@ -113,9 +117,25 @@ pub struct ModelPresetsOverview {
     pub providers_without_key: Vec<String>,
 }
 
-/// The schema properties the form edits, in declaration order.
-fn form_properties() -> Map<String, Value> {
-    schema_properties::<ModelPresetConfig>()
+/// The providers a preset may name in `config`: the built-in choices followed by the
+/// named custom providers (`providers.customProviders`).
+pub fn provider_choices(config: &Config) -> Vec<String> {
+    MODEL_PRESET_PROVIDER_CHOICES
+        .iter()
+        .map(|provider| provider.to_string())
+        .chain(custom_provider_names(config))
+        .collect()
+}
+
+/// The schema properties the form edits, in declaration order, with the `provider`
+/// field's choices replaced by `provider_choices` (the static schema only knows the
+/// built-in providers).
+fn form_properties(provider_choices: &[String]) -> Map<String, Value> {
+    let mut properties = schema_properties::<ModelPresetConfig>();
+    if let Some(Value::Object(provider)) = properties.get_mut(PROVIDER) {
+        provider.insert("x-choices".to_string(), json!(provider_choices));
+    }
+    properties
 }
 
 /// Parse `text` into the typed configuration (no environment resolution), for reading
@@ -140,10 +160,9 @@ pub fn provider_lacks_api_key(config: &Config, provider: &str) -> bool {
     if provider == "auto" {
         return try_auto_provider_selection(config).is_err();
     }
-    config
-        .providers
-        .get_by_name(provider)
-        .is_none_or(|slot| slot.api_key.trim().is_empty())
+    config.providers.get_by_name(provider).is_none_or(|slot| {
+        configured_or_env_api_key(slot, find_by_name(provider).as_ref()).is_none()
+    })
 }
 
 /// Why the preset `name` cannot be deleted, if it cannot.
@@ -184,8 +203,12 @@ fn preset_object_mut<'a>(
 
 /// The settings form of a preset whose stored entry is `entry` (`None`: a preset not
 /// added yet). A `reasoningEffort` of `null` is shown as the `none` choice.
-fn preset_form(name: &str, entry: Option<&Map<String, Value>>) -> ToolSettingsSummary {
-    let mut fields = form_fields(&form_properties(), SETTING_SPELLINGS, entry);
+fn preset_form(
+    name: &str,
+    entry: Option<&Map<String, Value>>,
+    provider_choices: &[String],
+) -> ToolSettingsSummary {
+    let mut fields = form_fields(&form_properties(provider_choices), SETTING_SPELLINGS, entry);
     for field in fields
         .iter_mut()
         .filter(|field| field.name == REASONING_EFFORT)
@@ -208,8 +231,8 @@ fn preset_form(name: &str, entry: Option<&Map<String, Value>>) -> ToolSettingsSu
 /// The blank form for "+ Add model preset": numbers and text empty with the default as
 /// placeholder, the provider `auto` and the reasoning effort `none`. It has no name (the
 /// browser asks for one).
-pub fn new_model_preset_form() -> ToolSettingsSummary {
-    preset_form("", None)
+pub fn new_model_preset_form(provider_choices: &[String]) -> ToolSettingsSummary {
+    preset_form("", None, provider_choices)
 }
 
 /// The built-in row for the flat `agents.*` settings.
@@ -234,7 +257,7 @@ fn preset_row(
     name: &str,
     preset: &ModelPresetConfig,
     entry: Option<&Map<String, Value>>,
-    with_forms: bool,
+    with_forms: Option<&[String]>,
 ) -> ModelPresetRow {
     let blocked = delete_blocked_reason(config, name);
     ModelPresetRow {
@@ -250,7 +273,7 @@ fn preset_row(
         deletable: blocked.is_none(),
         delete_blocked_reason: blocked.unwrap_or_default().to_string(),
         missing_api_key: provider_lacks_api_key(config, &preset.provider),
-        form: with_forms.then(|| preset_form(name, entry)),
+        form: with_forms.map(|choices| preset_form(name, entry, choices)),
     }
 }
 
@@ -264,6 +287,8 @@ pub fn model_presets_overview(
     let root = parse_root(text)?;
     let config = typed_config(text)?;
     let raw_presets = presets_object(&root);
+    let provider_choices = provider_choices(&config);
+    let forms_choices = with_forms.then_some(provider_choices.as_slice());
     let mut names: Vec<&String> = config.model_presets.keys().collect();
     names.sort_by_key(|name| name.to_lowercase());
 
@@ -277,17 +302,17 @@ pub fn model_presets_overview(
             name,
             &config.model_presets[name],
             entry,
-            with_forms,
+            forms_choices,
         )
     }));
     Ok(ModelPresetsOverview {
         presets,
         active: active_preset_name(&config),
-        new_preset_form: with_forms.then(new_model_preset_form),
-        providers_without_key: MODEL_PRESET_PROVIDER_CHOICES
+        new_preset_form: forms_choices.map(new_model_preset_form),
+        providers_without_key: provider_choices
             .iter()
             .filter(|provider| provider_lacks_api_key(&config, provider))
-            .map(|provider| provider.to_string())
+            .cloned()
             .collect(),
     })
 }
@@ -333,9 +358,10 @@ fn stored_form_value(setting: &str, checked: Value) -> Value {
 fn apply_settings(
     entry: &mut Map<String, Value>,
     changes: &HashMap<String, Value>,
+    provider_choices: &[String],
     env_is_set: &dyn Fn(&str) -> bool,
 ) -> Result<(), ToggleError> {
-    let properties = form_properties();
+    let properties = form_properties(provider_choices);
     for (setting, value) in changes {
         let kind = properties
             .get(setting)
@@ -372,7 +398,7 @@ fn check_model_is_set(entry: &Map<String, Value>) -> Result<(), ToggleError> {
 /// value where there is one and the schema default otherwise (so the file shows the whole
 /// preset, as the setup wizard writes it).
 fn complete_entry(submitted: &Map<String, Value>) -> Map<String, Value> {
-    form_properties()
+    form_properties(&[])
         .iter()
         .map(|(setting, property)| {
             let value = submitted
@@ -396,7 +422,7 @@ fn check_new_name(name: &str) -> Result<(), ToggleError> {
 }
 
 /// Render `root` like `original` and check the bot could start with the result.
-fn rendered_and_checked(root: &Value, original: &str) -> Result<String, ToggleError> {
+pub(super) fn rendered_and_checked(root: &Value, original: &str) -> Result<String, ToggleError> {
     let text = render(root, original);
     validate_config_text(&text).map_err(ToggleError::InvalidConfig)?;
     Ok(text)
@@ -428,7 +454,8 @@ fn with_model_preset_added_in(
         return Err(ToggleError::PresetExists);
     }
     let mut submitted = Map::new();
-    apply_settings(&mut submitted, values, env_is_set)?;
+    let choices = provider_choices(&typed_config(text)?);
+    apply_settings(&mut submitted, values, &choices, env_is_set)?;
     presets.insert(name.to_string(), Value::Object(complete_entry(&submitted)));
     rendered_and_checked(&root, text)
 }
@@ -455,10 +482,11 @@ fn with_model_preset_settings_in(
     if !is_valid_name(name) {
         return Err(ToggleError::InvalidName);
     }
+    let choices = provider_choices(&typed_config(text)?);
     let mut root = parse_root(text)?;
     let entry = preset_object_mut(&mut root, name)?;
     let before = entry.clone();
-    apply_settings(entry, changes, env_is_set)?;
+    apply_settings(entry, changes, &choices, env_is_set)?;
     if *entry == before {
         return Ok(None);
     }
@@ -586,7 +614,7 @@ mod tests {
 
     #[test]
     fn the_form_lists_the_seven_preset_settings_with_their_input_kinds() {
-        let form = new_model_preset_form();
+        let form = new_model_preset_form(&provider_choices(&Config::default()));
 
         let names: Vec<&str> = form.fields.iter().map(|f| f.name.as_str()).collect();
         assert_eq!(
@@ -697,11 +725,15 @@ mod tests {
             !row("fast").missing_api_key,
             "a placeholder counts as a key"
         );
-        assert!(row("Spare").missing_api_key, "openai has no key");
-        assert!(
+        // An exported OPENAI_API_KEY also counts as a key.
+        let openai_env_key_is_set =
+            std::env::var("OPENAI_API_KEY").is_ok_and(|k| !k.trim().is_empty());
+        assert_eq!(row("Spare").missing_api_key, !openai_env_key_is_set);
+        assert_eq!(
             overview
                 .providers_without_key
-                .contains(&"openai".to_string())
+                .contains(&"openai".to_string()),
+            !openai_env_key_is_set
         );
         assert!(
             !overview
@@ -1036,5 +1068,37 @@ mod tests {
             super::with_model_preset_added(CONFIG, "fresh", &values),
             Err(ToggleError::InvalidValue(..))
         ));
+    }
+
+    const RELAY_CONFIG: &str = r#"{
+  "providers": {"customProviders": {"my-relay": {"apiKey": "k", "apiBase": "https://g/v1"}}}
+}
+"#;
+
+    #[test]
+    fn a_custom_provider_is_offered_and_accepted_by_the_preset_form() {
+        let overview = model_presets_overview(RELAY_CONFIG, true).unwrap();
+        let form = overview.new_preset_form.unwrap();
+        let FieldKind::Choice { choices } = &field(&form, "provider").kind else {
+            panic!("the provider is a choice field");
+        };
+        assert!(choices.iter().any(|choice| choice == "my-relay"));
+
+        let values = change(&[("model", json!("m")), ("provider", json!("my-relay"))]);
+        let saved = with_model_preset_added(RELAY_CONFIG, "relayed", &values).unwrap();
+        assert_eq!(preset(&saved, "relayed")["provider"], "my-relay");
+    }
+
+    #[test]
+    fn an_unknown_provider_is_refused_by_the_preset_form() {
+        let values = change(&[("model", json!("m")), ("provider", json!("nonesuch"))]);
+        assert!(with_model_preset_added(RELAY_CONFIG, "relayed", &values).is_err());
+    }
+
+    #[test]
+    fn a_custom_provider_with_a_stored_key_is_not_missing_one() {
+        let config = typed_config(RELAY_CONFIG).unwrap();
+        assert!(!provider_lacks_api_key(&config, "my-relay"));
+        assert!(provider_lacks_api_key(&config, "nonesuch"));
     }
 }

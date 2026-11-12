@@ -10,8 +10,9 @@ pub struct ProviderSpec {
 
     // which provider implementation to use
     // "openai_compat" | "openai_responses" | "anthropic" | "azure_openai" | "openai_codex"
-    // (`providers::factory::select_backend` makes the final choice from the resolved base
-    // URL: api.openai.com is always served by the Responses API.)
+    // This is the registry default. `providers::factory::select_backend` makes the final
+    // choice: `providers.<name>.providerBackEnd` when configured, else from the resolved
+    // base URL (api.openai.com is served by the Responses API).
     pub backend: String,
 
     // extra env vars, e.g. vec![("ZHIPUAI_API_KEY", "{api_key}")]

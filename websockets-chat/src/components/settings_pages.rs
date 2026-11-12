@@ -18,8 +18,8 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    McpServerSettingSummary, ModelPresetSummary, ToolConfigSummary, ToolFieldSummary,
-    ToolSettingSummary,
+    McpServerSettingSummary, ModelPresetSummary, ProviderSummary, ToolConfigSummary,
+    ToolFieldSummary, ToolSettingSummary,
 };
 use leptos::prelude::*;
 
@@ -30,6 +30,7 @@ use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
 use super::model_picker::ProviderModelsState;
 use super::model_presets_page::ModelPresetsSection;
+use super::providers_page::{ProviderAddRequest, ProviderExtras, ProvidersSection};
 use super::tool_config_form::{initial_drafts, ToolConfigChange, ToolConfigForm};
 
 /// Tooltip on the switch of a tool the gateway itself depends on.
@@ -49,6 +50,8 @@ pub enum SettingsPage {
     /// The model presets: which model the agent uses, and the presets to choose from.
     #[default]
     Models,
+    /// The LLM providers: API keys, endpoints and protocols.
+    Providers,
     Tools,
     /// The settings that apply to every tool (workspace restriction, confirmation, SSRF
     /// whitelist), kept apart from the long tool list.
@@ -58,8 +61,9 @@ pub enum SettingsPage {
 
 impl SettingsPage {
     /// All pages, in menu order.
-    pub const ALL: [SettingsPage; 4] = [
+    pub const ALL: [SettingsPage; 5] = [
         SettingsPage::Models,
+        SettingsPage::Providers,
         SettingsPage::Tools,
         SettingsPage::ToolSafety,
         SettingsPage::McpServers,
@@ -69,6 +73,7 @@ impl SettingsPage {
     pub fn title(self) -> &'static str {
         match self {
             Self::Models => "Models",
+            Self::Providers => "Providers",
             Self::Tools => "Tools",
             Self::ToolSafety => "Tool Safety",
             Self::McpServers => "MCP Servers",
@@ -78,7 +83,8 @@ impl SettingsPage {
     /// One line under the heading.
     pub fn subtitle(self) -> &'static str {
         match self {
-            Self::Models => "Create model presets and choose which one the agent uses. API keys are set per provider in the configuration file.",
+            Self::Models => "Create model presets and choose which one the agent uses. API keys are set per provider on the Providers page.",
+            Self::Providers => "API keys, endpoints and protocols of the LLM providers",
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
             Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
             Self::McpServers => "Switch the configured MCP servers on or off, or change how they are started under Settings. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
@@ -89,6 +95,7 @@ impl SettingsPage {
     pub fn noun(self) -> &'static str {
         match self {
             Self::Models => "model presets",
+            Self::Providers => "providers",
             Self::Tools => "tools",
             Self::ToolSafety => "settings",
             Self::McpServers => "MCP servers",
@@ -402,6 +409,19 @@ pub struct SettingsPanel {
     pub providers_without_key: RwSignal<Vec<String>>,
     /// The model preset whose settings form is open, if any.
     pub editing_preset: RwSignal<Option<String>>,
+    /// The rows of the Providers page.
+    pub providers: RwSignal<Vec<ProviderSummary>>,
+    pub providers_loaded: RwSignal<bool>,
+    /// What the gateway sent besides the provider rows: the add panel's choices and form.
+    pub provider_overview_extras: RwSignal<ProviderExtras>,
+    /// The provider whose settings form is open, if any.
+    pub editing_provider: RwSignal<Option<String>>,
+    /// The provider whose "Delete …?" question is showing, if any.
+    pub confirm_delete_provider: RwSignal<Option<String>>,
+    /// What the last provider change did (no restart needed for those).
+    pub provider_notice: RwSignal<Option<String>>,
+    /// The tab of the add provider panel: 0 dedicated, 1 custom.
+    pub add_provider_kind: RwSignal<usize>,
     /// The model preset whose "Delete …?" question is showing, if any.
     pub confirm_delete_preset: RwSignal<Option<String>>,
     /// What the last model preset change did (no restart needed for those).
@@ -439,6 +459,13 @@ impl SettingsPanel {
             new_preset_form: RwSignal::new(None),
             providers_without_key: RwSignal::new(Vec::new()),
             editing_preset: RwSignal::new(None),
+            providers: RwSignal::new(Vec::new()),
+            providers_loaded: RwSignal::new(false),
+            provider_overview_extras: RwSignal::new(ProviderExtras::default()),
+            editing_provider: RwSignal::new(None),
+            confirm_delete_provider: RwSignal::new(None),
+            provider_notice: RwSignal::new(None),
+            add_provider_kind: RwSignal::new(0),
             confirm_delete_preset: RwSignal::new(None),
             model_notice: RwSignal::new(None),
             provider_models: RwSignal::new(HashMap::new()),
@@ -478,6 +505,7 @@ impl SettingsPanel {
     pub fn close_add_panel(&self) {
         self.adding.set(false);
         self.add_error.set(None);
+        self.add_provider_kind.set(0);
     }
 
     /// Whether switches and forms accept changes right now (see [`changes_allowed`]).
@@ -494,7 +522,7 @@ impl SettingsPanel {
     fn open_rows(&self) -> Vec<SettingRow> {
         match self.page.get() {
             // The model presets have their own rows.
-            SettingsPage::Models => Vec::new(),
+            SettingsPage::Models | SettingsPage::Providers => Vec::new(),
             // The general settings have their own page.
             SettingsPage::Tools => self
                 .tools
@@ -517,6 +545,7 @@ impl SettingsPanel {
     fn open_page_loaded(&self) -> bool {
         match self.page.get() {
             SettingsPage::Models => self.model_presets_loaded.get(),
+            SettingsPage::Providers => self.providers_loaded.get(),
             SettingsPage::Tools | SettingsPage::ToolSafety => self.tools_loaded.get(),
             SettingsPage::McpServers => self.mcp_servers_loaded.get(),
         }
@@ -543,6 +572,12 @@ impl SettingsPanel {
         self.editing_preset.set(None);
         self.confirm_delete_preset.set(None);
         self.model_notice.set(None);
+        self.providers.set(Vec::new());
+        self.providers_loaded.set(false);
+        self.provider_overview_extras.set(ProviderExtras::default());
+        self.editing_provider.set(None);
+        self.confirm_delete_provider.set(None);
+        self.provider_notice.set(None);
         self.provider_models.set(HashMap::new());
         self.form_drafts.update_value(HashMap::clear);
     }
@@ -579,6 +614,14 @@ pub struct SettingsActions {
     pub on_delete_model_preset: Callback<String>,
     /// Make one model preset (by name; `default` for the agent settings) the default.
     pub on_activate_model_preset: Callback<String>,
+    /// Add a provider: `(kind, name, settings)`.
+    pub on_add_provider: Callback<ProviderAddRequest>,
+    /// Save the changed settings of one provider.
+    pub on_save_provider: Callback<ToolConfigChange>,
+    /// Clear the stored API key of one provider (by name).
+    pub on_forget_provider_key: Callback<String>,
+    /// Delete one provider (by name).
+    pub on_delete_provider: Callback<String>,
     /// Ask which models one provider offers (by provider name), for the preset forms.
     pub on_list_provider_models: Callback<String>,
     /// Restart the whole bot process so the saved changes take effect.
@@ -599,6 +642,7 @@ pub fn restart_button_label(restarting: bool) -> &'static str {
 fn save_callback_for(page: SettingsPage, actions: SettingsActions) -> Callback<ToolConfigChange> {
     match page {
         SettingsPage::Models => actions.on_save_model_preset,
+        SettingsPage::Providers => actions.on_save_provider,
         SettingsPage::McpServers => actions.on_save_mcp_config,
         SettingsPage::Tools | SettingsPage::ToolSafety => actions.on_save_config,
     }
@@ -917,7 +961,15 @@ pub fn SettingsPageView(
             <Show when=move || page() == SettingsPage::Models>
                 <ModelPresetsSection panel=panel actions=actions />
             </Show>
-            <Show when=move || !matches!(page(), SettingsPage::ToolSafety | SettingsPage::Models)>
+            <Show when=move || page() == SettingsPage::Providers>
+                <ProvidersSection panel=panel actions=actions />
+            </Show>
+            <Show when=move || {
+                !matches!(
+                    page(),
+                    SettingsPage::ToolSafety | SettingsPage::Models | SettingsPage::Providers
+                )
+            }>
             <input
                 type="search"
                 aria-label=move || format!("Search {}", page().noun())
@@ -1353,6 +1405,34 @@ mod tests {
     }
 
     #[test]
+    fn clearing_the_panel_drops_the_providers_page_state() {
+        let panel = SettingsPanel::new();
+        panel.providers_loaded.set(true);
+        panel.editing_provider.set(Some("my-relay".to_string()));
+        panel
+            .confirm_delete_provider
+            .set(Some("my-relay".to_string()));
+        panel.provider_notice.set(Some("saved".to_string()));
+        panel.add_provider_kind.set(1);
+        panel
+            .provider_overview_extras
+            .update(|extras| extras.new_form = Some(form("")));
+
+        panel.clear();
+
+        assert!(!panel.providers_loaded.get_untracked());
+        assert!(panel.editing_provider.get_untracked().is_none());
+        assert!(panel.confirm_delete_provider.get_untracked().is_none());
+        assert!(panel.provider_notice.get_untracked().is_none());
+        assert_eq!(panel.add_provider_kind.get_untracked(), 0);
+        assert!(panel
+            .provider_overview_extras
+            .get_untracked()
+            .new_form
+            .is_none());
+    }
+
+    #[test]
     fn closing_the_add_panel_keeps_the_success_message_of_an_earlier_add() {
         let panel = SettingsPanel::new();
         panel.adding.set(true);
@@ -1468,7 +1548,7 @@ mod tests {
         let titles: Vec<&str> = SettingsPage::ALL.iter().map(|p| p.title()).collect();
         assert_eq!(
             titles,
-            vec!["Models", "Tools", "Tool Safety", "MCP Servers"]
+            vec!["Models", "Providers", "Tools", "Tool Safety", "MCP Servers"]
         );
         assert_eq!(SettingsPage::default(), SettingsPage::Models);
         assert!(SettingsPage::Models.subtitle().contains("API keys"));

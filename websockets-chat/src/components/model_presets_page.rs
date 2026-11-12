@@ -126,7 +126,7 @@ pub fn missing_key_note(providers_without_key: &[String]) -> Option<String> {
         .collect();
     (!named.is_empty()).then(|| {
         format!(
-            "No API key is configured for: {}. A preset using one of them will fail until its key is set under providers in config.json.",
+            "No API key is configured for: {}. A preset using one of them will fail until its key is set on the Providers page.",
             named.join(", ")
         )
     })

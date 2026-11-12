@@ -12,7 +12,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
-use crate::config::schema::{Config, validate_model_presets};
+use crate::config::schema::{Config, validate_custom_provider_names, validate_model_presets};
 use crate::utils::fs::write_atomic;
 
 /// Largest configuration text the dialog will save. A real `config.json` is a few
@@ -44,7 +44,9 @@ pub fn validate_config_text(text: &str) -> Result<(), String> {
         serde_json::from_str(text).map_err(|e| format!("Invalid JSON: {e}"))?;
     let config: Config =
         serde_json::from_value(json).map_err(|e| format!("Invalid configuration: {e}"))?;
-    validate_model_presets(&config).map_err(|e| format!("Invalid configuration: {e}"))
+    validate_model_presets(&config)
+        .and_then(|()| validate_custom_provider_names(&config))
+        .map_err(|e| format!("Invalid configuration: {e}"))
 }
 
 /// Path of the backup for the file at `path`, taken at `now`: the same folder, named

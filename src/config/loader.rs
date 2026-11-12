@@ -8,7 +8,7 @@ use std::sync::{LazyLock, OnceLock};
 use regex::Regex;
 
 use crate::cli::CliError;
-use crate::config::schema::{Config, validate_model_presets};
+use crate::config::schema::{Config, validate_custom_provider_names, validate_model_presets};
 use crate::security::network::configure_ssrf_whitelist;
 use crate::utils::fs::write_atomic;
 use crate::utils::helpers::expand_tilde_path;
@@ -51,7 +51,9 @@ pub fn load_config(path_option: Option<PathBuf>) -> Config {
             panic!("Failed to parse config file '{}': {e}", path.display());
         });
     }
-    if let Err(e) = validate_model_presets(&config) {
+    if let Err(e) =
+        validate_model_presets(&config).and_then(|()| validate_custom_provider_names(&config))
+    {
         panic!("Invalid config file '{}': {e}", path.display());
     }
     // Apply ssrf whitelist

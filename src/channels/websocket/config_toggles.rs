@@ -58,6 +58,12 @@ pub enum ToggleError {
     ReservedName,
     /// The model preset cannot be deleted because something uses it: `(why)`.
     PresetInUse(String),
+    /// No provider with that name is configured (or offered by the form).
+    UnknownProvider,
+    /// A provider with that name is already configured; adding never overwrites.
+    ProviderExists,
+    /// The provider cannot be deleted because something uses it: `(why)`.
+    ProviderInUse(String),
 }
 
 impl ToggleError {
@@ -75,6 +81,9 @@ impl ToggleError {
             Self::PresetExists => "preset_exists",
             Self::ReservedName => "reserved_name",
             Self::PresetInUse(_) => "preset_in_use",
+            Self::UnknownProvider => "unknown_provider",
+            Self::ProviderExists => "provider_exists",
+            Self::ProviderInUse(_) => "provider_in_use",
         }
     }
 
@@ -92,10 +101,11 @@ impl ToggleError {
             Self::InvalidValue(field, reason) => format!("Invalid value for '{field}': {reason}"),
             Self::UnknownPreset => "No model preset with that name is configured.".to_string(),
             Self::PresetExists => "A model preset with that name already exists.".to_string(),
-            Self::ReservedName => {
-                "'default' is reserved for the agent settings; choose another name.".to_string()
-            }
+            Self::ReservedName => "That name is reserved; choose another name.".to_string(),
             Self::PresetInUse(why) => format!("This model preset cannot be deleted: {why}"),
+            Self::UnknownProvider => "No provider with that name is configured.".to_string(),
+            Self::ProviderExists => "A provider with that name already exists.".to_string(),
+            Self::ProviderInUse(why) => format!("This provider cannot be deleted: {why}"),
         }
     }
 }

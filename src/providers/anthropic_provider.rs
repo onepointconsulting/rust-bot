@@ -25,8 +25,13 @@ const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz01234
 /// a complete `\n\n`-terminated event from growing memory without bound.
 const MAX_SSE_BUFFER_BYTES: usize = 1024 * 1024;
 
-/// Claude 5 models reject legacy `temperature` and `thinking.type.enabled`.
-const CLAUDE_5_MODEL_PREFIXES: &[&str] = &["claude-sonnet-5", "claude-opus-5", "claude-haiku-5"];
+/// Claude 5 models and fable reject legacy `temperature` and `thinking.type.enabled`.
+const CLAUDE_5_MODEL_PREFIXES: &[&str] = &[
+    "claude-sonnet-5",
+    "claude-opus-5",
+    "claude-haiku-5",
+    "claude-fable",
+];
 
 fn gen_tool_id() -> String {
     let mut rng = rand::rng();
@@ -49,7 +54,7 @@ pub struct AnthropicProvider {
 }
 
 impl AnthropicProvider {
-    pub const DEFAULT_MODEL: &str = "claude-sonnet-4-6";
+    pub const DEFAULT_MODEL: &str = "claude-sonnet-5-5";
     pub const DEFAULT_API_BASE: &str = "https://api.anthropic.com";
     const ANTHROPIC_API_VERSION: &str = "2023-06-01";
 

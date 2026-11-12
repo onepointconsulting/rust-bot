@@ -9,7 +9,7 @@
 use serde_json::Value;
 
 use crate::config::loader::referenced_env_vars;
-use crate::config::schema::{Config, validate_model_presets};
+use crate::config::schema::{Config, validate_custom_provider_names, validate_model_presets};
 
 /// JSON pointer to the flag that turns on login for the WebUI websocket.
 const WEBSOCKET_JWT_ENABLED_POINTER: &str = "/channels/websocket/jwt/enabled";
@@ -57,6 +57,9 @@ pub fn check_config_text(text: &str, env_is_set: impl Fn(&str) -> bool) -> Confi
     match serde_json::from_value::<Config>(value.clone()) {
         Ok(config) => {
             if let Err(error) = validate_model_presets(&config) {
+                report.errors.push(error);
+            }
+            if let Err(error) = validate_custom_provider_names(&config) {
                 report.errors.push(error);
             }
             report.warnings.extend(exposure_warning(&config, &value));

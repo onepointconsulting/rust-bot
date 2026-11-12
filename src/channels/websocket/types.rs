@@ -138,6 +138,26 @@ pub enum EnvelopeType {
     /// gateway asks the provider's API with the configured credentials. Rust-side
     /// addition with no nanobot precedent. Same access rules as [`Self::AddModelPreset`].
     ListProviderModels,
+    /// List the LLM providers of `config.json` (dedicated slots and named custom
+    /// providers) for the Settings dialog's Providers page. Never carries API keys.
+    /// Rust-side addition with no nanobot precedent. Authenticated connections only;
+    /// forms only for connections that may change the configuration.
+    ListProviders,
+    /// Add a provider (`{kind, name, values}`; `kind` is `dedicated` or `custom`,
+    /// `values` maps `apiKey`, `apiBase`, `extraHeaders` and `providerBackEnd` to their
+    /// values) to `config.json` and apply it to the running process. Same access rules as
+    /// [`Self::AddModelPreset`].
+    AddProvider,
+    /// Change the settings of one provider (`{name, values}`); a blank `apiKey` keeps the
+    /// stored key. Applied live. Same access rules as [`Self::AddModelPreset`].
+    SetProviderConfig,
+    /// Clear the stored API key of one provider (`{name}`). Same access rules as
+    /// [`Self::AddModelPreset`].
+    ForgetProviderKey,
+    /// Delete one provider (`{name}`): a custom entry is removed, a dedicated slot reset.
+    /// Refused while `agents.provider` or a model preset uses it. Same access rules as
+    /// [`Self::AddModelPreset`].
+    DeleteProvider,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -240,6 +260,11 @@ impl From<&str> for EnvelopeType {
             "delete_model_preset" => Self::DeleteModelPreset,
             "set_default_model_preset" => Self::SetDefaultModelPreset,
             "list_provider_models" => Self::ListProviderModels,
+            "list_providers" => Self::ListProviders,
+            "add_provider" => Self::AddProvider,
+            "set_provider_config" => Self::SetProviderConfig,
+            "forget_provider_key" => Self::ForgetProviderKey,
+            "delete_provider" => Self::DeleteProvider,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -334,6 +359,11 @@ pub enum WsOutboundEvent {
     /// (`models`: `[{id, display_name?, context_length?, model_type?}]`, sorted by id) or
     /// `{provider, detail, error}` when refused or failed.
     ProviderModels,
+    /// Reply to [`EnvelopeType::ListProviders`] and to every successful provider write —
+    /// `{providers, dedicated_choices, backend_choices, can_modify, new_provider_form?,
+    /// changed?}`, `changed` being `{action, name}` (`action`: `added`, `updated`,
+    /// `deleted` or `key_forgotten`) and absent on a plain list. Never carries API keys.
+    Providers,
     /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
     /// message}`. Never carries any of the file's content.
     SettingError,
@@ -424,6 +454,7 @@ impl WsOutboundEvent {
             Self::McpServerAdded => "mcp_server_added",
             Self::ModelPresets => "model_presets",
             Self::ProviderModels => "provider_models",
+            Self::Providers => "providers",
             Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
@@ -1016,6 +1047,16 @@ mod tests {
             EnvelopeType::ListProviderModels
         );
         assert_eq!(WsOutboundEvent::ProviderModels.as_str(), "provider_models");
+        for (wire_name, envelope_type) in [
+            ("list_providers", EnvelopeType::ListProviders),
+            ("add_provider", EnvelopeType::AddProvider),
+            ("set_provider_config", EnvelopeType::SetProviderConfig),
+            ("forget_provider_key", EnvelopeType::ForgetProviderKey),
+            ("delete_provider", EnvelopeType::DeleteProvider),
+        ] {
+            assert_eq!(EnvelopeType::from(wire_name), envelope_type, "{wire_name}");
+        }
+        assert_eq!(WsOutboundEvent::Providers.as_str(), "providers");
         // The per-chat switch keeps its own name and meaning.
         assert_eq!(
             EnvelopeType::from("set_model_preset"),

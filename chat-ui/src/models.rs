@@ -330,6 +330,89 @@ pub struct ModelPresetSummary {
     pub form: Option<ToolConfigSummary>,
 }
 
+/// One row of the Settings dialog's Providers page, as surfaced by the gateway's
+/// `providers` event. Never carries an API key: only whether one is stored.
+///
+/// Mirrors the backend's `ProviderRow` (`src/channels/websocket/provider_form.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderSummary {
+    /// The slot name (`anthropic`) or the key in `customProviders`.
+    pub name: String,
+    /// `dedicated` (a built-in slot) or `custom` (a named endpoint).
+    #[serde(default)]
+    pub kind: String,
+    /// The name shown for the row.
+    #[serde(default)]
+    pub label: String,
+    /// The configured Base URL, when one is set.
+    #[serde(default)]
+    pub api_base: Option<String>,
+    /// The Base URL used when none is set.
+    #[serde(default)]
+    pub default_api_base: Option<String>,
+    /// The configured API protocol (`openai_responses`, ...); none means automatic.
+    #[serde(default)]
+    pub backend: Option<String>,
+    /// The API protocol used when none is configured.
+    #[serde(default)]
+    pub backend_default: String,
+    /// Whether an API key is stored.
+    #[serde(default)]
+    pub api_key_configured: bool,
+    /// The environment variable that supplies the key when none is stored.
+    #[serde(default)]
+    pub env_var: Option<String>,
+    /// Whether that variable is set.
+    #[serde(default)]
+    pub env_var_set: bool,
+    /// What uses the provider (`agents.provider`, model presets).
+    #[serde(default)]
+    pub used_by: Vec<String>,
+    /// Whether Delete is allowed (nothing uses the provider).
+    #[serde(default)]
+    pub deletable: bool,
+    /// Why Delete is not allowed, empty when it is.
+    #[serde(default)]
+    pub delete_blocked_reason: String,
+    /// The settings form. Only sent to connections that may change the configuration.
+    #[serde(default)]
+    pub form: Option<ToolConfigSummary>,
+}
+
+/// One provider of the add panel's "Dedicated model provider" drop-down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct DedicatedProviderChoice {
+    pub name: String,
+    #[serde(default)]
+    pub label: String,
+    /// The environment variable that supplies its key.
+    #[serde(default)]
+    pub env_var: String,
+    #[serde(default)]
+    pub env_var_set: bool,
+    #[serde(default)]
+    pub default_api_base: Option<String>,
+    /// Whether it already has a row (it cannot be added twice).
+    #[serde(default)]
+    pub configured: bool,
+}
+
+/// One entry of the API protocol drop-down.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BackendChoice {
+    /// The `providerBackEnd` value; empty means automatic.
+    pub value: String,
+    pub label: String,
+}
+
+/// What a provider write changed, as named by the gateway's `providers` reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProviderChange {
+    /// `added`, `updated`, `deleted` or `key_forgotten`.
+    pub action: String,
+    pub name: String,
+}
+
 /// One model a provider offers, as listed by the gateway's `provider_models` event.
 ///
 /// Mirrors the backend's `ProviderModelInfo` (`src/providers/model_catalog.rs`).

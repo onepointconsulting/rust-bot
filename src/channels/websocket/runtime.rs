@@ -48,6 +48,7 @@ use crate::channels::websocket::config_file;
 use crate::channels::websocket::config_toggles;
 use crate::channels::websocket::mcp_server_form;
 use crate::channels::websocket::model_preset_form;
+use crate::channels::websocket::provider_form;
 use crate::channels::websocket::registry::ConnectionRegistry;
 use crate::channels::websocket::types::{
     AuthorizeResult, ConnectionRegistryHandle, Envelope, EnvelopeDispatchContext, EnvelopeType,
@@ -733,6 +734,21 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::ListProviderModels => {
             handle_list_provider_models(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListProviders => {
+            handle_list_providers(envelope_dispatch_context).await;
+        }
+        EnvelopeType::AddProvider => {
+            handle_add_provider(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetProviderConfig => {
+            handle_set_provider_config(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ForgetProviderKey => {
+            handle_forget_provider_key(envelope_dispatch_context).await;
+        }
+        EnvelopeType::DeleteProvider => {
+            handle_delete_provider(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -3383,6 +3399,12 @@ enum SettingKind {
     ModelPresetDelete,
     /// Making a model preset the gateway's default.
     ModelPresetActivate,
+    /// Adding a provider (Providers page).
+    ProviderAdd,
+    /// The settings of a provider, and forgetting its stored key.
+    ProviderConfig,
+    /// Deleting a provider.
+    ProviderDelete,
 }
 
 impl SettingKind {
@@ -3398,6 +3420,9 @@ impl SettingKind {
             Self::ModelPresetConfig => "model_preset_config",
             Self::ModelPresetDelete => "model_preset_delete",
             Self::ModelPresetActivate => "model_preset_activate",
+            Self::ProviderAdd => "provider_add",
+            Self::ProviderConfig => "provider_config",
+            Self::ProviderDelete => "provider_delete",
         }
     }
 
@@ -3425,6 +3450,9 @@ impl SettingKind {
             | Self::ModelPresetConfig
             | Self::ModelPresetDelete
             | Self::ModelPresetActivate => WsOutboundEvent::ModelPresets,
+            Self::ProviderAdd | Self::ProviderConfig | Self::ProviderDelete => {
+                WsOutboundEvent::Providers
+            }
         }
     }
 
@@ -3448,7 +3476,10 @@ impl SettingKind {
             | Self::ModelPresetAdd
             | Self::ModelPresetConfig
             | Self::ModelPresetDelete
-            | Self::ModelPresetActivate => Err(config_toggles::ToggleError::UnknownField(
+            | Self::ModelPresetActivate
+            | Self::ProviderAdd
+            | Self::ProviderConfig
+            | Self::ProviderDelete => Err(config_toggles::ToggleError::UnknownField(
                 "enabled".to_string(),
             )),
         }
@@ -4416,6 +4447,279 @@ async fn handle_set_default_model_preset<'a>(
         SettingKind::ModelPresetActivate,
         &name,
         move |text| model_preset_form::with_default_model_preset(text, &edit_name),
+    )
+    .await;
+}
+
+// ── Providers page ───────────────────────────────────────────────────────────
+
+/// The fields of a `providers` event: the page's rows, the choices of the add panel,
+/// whether the connection may change them, the blank add form (only for those that may)
+/// and, after a write, what changed (`{action, name}`). Never carries an API key.
+fn providers_event_body(
+    overview: &provider_form::ProvidersOverview,
+    can_modify: bool,
+    changed: Option<(&str, &str)>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "providers": overview.rows,
+        "dedicated_choices": overview.dedicated_choices,
+        "backend_choices": overview.backend_choices,
+        "can_modify": can_modify,
+    });
+    if let Some(form) = &overview.new_provider_form {
+        body["new_provider_form"] = serde_json::json!(form);
+    }
+    if let Some((action, name)) = changed {
+        body["changed"] = serde_json::json!({"action": action, "name": name});
+    }
+    body
+}
+
+/// Read `config.json` and send the requester a `providers` event (forms only when
+/// `can_modify`), or a `setting_error` of `kind` when the file cannot be read.
+async fn send_providers(
+    shared: &WsShared,
+    connection_id: &str,
+    kind: SettingKind,
+    can_modify: bool,
+    changed: Option<(&str, &str)>,
+) {
+    let overview = read_config_for_settings().and_then(|text| {
+        provider_form::providers_overview_for_process(&text, can_modify).map_err(|e| e.message())
+    });
+    match overview {
+        Ok(overview) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Providers,
+                None,
+                providers_event_body(&overview, can_modify, changed),
+            )
+            .await;
+        }
+        Err(message) => {
+            let name = changed.map(|(_, name)| name).unwrap_or_default();
+            send_setting_error(shared, connection_id, kind, name, "config_error", &message).await;
+        }
+    }
+}
+
+/// Switch the running process to the providers of the saved config `text`: replace the
+/// resolver's provider settings and cached providers, then reload the model presets
+/// (their choices and keys may have changed with them). Both steps are tried; the first
+/// error is returned, for the user (the file itself is already saved).
+fn reload_providers_from_text(resolver: &ModelRuntimeResolver, text: &str) -> Result<(), String> {
+    let providers_result = provider_form::live_providers(text)
+        .and_then(|providers| resolver.reload_providers(providers))
+        .map(|runtime| {
+            log::info!(
+                "Providers reloaded; the default is preset '{}' ({} via {})",
+                runtime.preset_name,
+                runtime.model,
+                runtime.provider_name
+            );
+        });
+    let presets_result = reload_model_presets_from_text(resolver, text);
+    providers_result.and(presets_result)
+}
+
+/// Handle a `list_providers` envelope: reply with a `providers` event listing the
+/// configured providers (never their API keys). Connections that may change the
+/// configuration also get the forms. Authenticated connections only. Rust-side
+/// addition with no nanobot precedent.
+async fn handle_list_providers<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
+    send_providers(
+        shared,
+        connection_id,
+        SettingKind::ProviderConfig,
+        can_modify,
+        None,
+    )
+    .await;
+}
+
+/// The shared path of every Providers page write: refuse connections that may not change
+/// the configuration, apply `edit` to `config.json` under the config write lock
+/// (validated, previous file backed up), switch the running process to the saved
+/// providers, and reply with the fresh `providers` list naming what changed (`action`).
+/// Failures become a `setting_error` of `kind`; a save whose live switch failed is
+/// reported as [`SAVED_RELOAD_FAILED_DETAIL`] (followed by the list, which shows the
+/// saved state). Submitted values are never logged or echoed in errors.
+async fn apply_provider_edit<'a>(
+    envelope_dispatch_context: &EnvelopeDispatchContext<'a>,
+    kind: SettingKind,
+    action: &str,
+    name: &str,
+    edit: impl FnOnce(&str) -> Result<Option<String>, config_toggles::ToggleError>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    if let Some((detail, message)) = setting_write_denial(shared, envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, name, detail, message).await;
+        return;
+    }
+
+    let result = {
+        // Shares the lock with the other writers: each one rewrites the whole file. The
+        // live switch happens under it too, so two writes cannot switch out of order.
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        config_toggles::apply_edit(&get_config_path(), edit).map(|outcome| {
+            let reload = if outcome.changed {
+                read_config_for_settings()
+                    .and_then(|text| reload_providers_from_text(&shared.runtime_resolver, &text))
+            } else {
+                Ok(())
+            };
+            (outcome, reload)
+        })
+    };
+
+    match result {
+        Ok((outcome, reload)) => {
+            if outcome.changed {
+                log::info!(
+                    "Provider '{name}' {action} from the WebUI (client '{client_id}'); previous config kept as {:?}",
+                    outcome.backup,
+                );
+            }
+            if let Err(reason) = reload {
+                log::warn!("Provider '{name}' saved but not applied live: {reason}");
+                let message = format!(
+                    "Saved to config.json, but the running agent could not switch to it ({reason}). Restart rust-bot to apply it."
+                );
+                send_setting_error(
+                    shared,
+                    connection_id,
+                    kind,
+                    name,
+                    SAVED_RELOAD_FAILED_DETAIL,
+                    &message,
+                )
+                .await;
+            }
+            send_providers(shared, connection_id, kind, true, Some((action, name))).await;
+        }
+        Err(error) => {
+            send_apply_error(shared, connection_id, kind, name, error).await;
+        }
+    }
+}
+
+/// Handle an `add_provider` envelope `{kind, name, values}`: add a dedicated or custom
+/// provider to `config.json`; see [`apply_provider_edit`]. Refused when the name is
+/// reserved, invalid or already used. Rust-side addition with no nanobot precedent.
+async fn handle_add_provider<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let provider_kind = envelope_dispatch_context
+        .envelope
+        .get("kind")
+        .and_then(|value| value.as_str())
+        .and_then(provider_form::ProviderKind::parse);
+    let (Some(provider_kind), Some(values)) = (
+        provider_kind,
+        parse_tool_config_values(envelope_dispatch_context.envelope),
+    ) else {
+        // Refuse a connection that may not write before saying anything about the request.
+        let (detail, message) = setting_write_denial(shared, &envelope_dispatch_context)
+            .unwrap_or(("invalid_request", "The request was malformed."));
+        send_setting_error(
+            shared,
+            connection_id,
+            SettingKind::ProviderAdd,
+            &name,
+            detail,
+            message,
+        )
+        .await;
+        return;
+    };
+    let edit_name = name.clone();
+    apply_provider_edit(
+        &envelope_dispatch_context,
+        SettingKind::ProviderAdd,
+        "added",
+        &name,
+        move |text| {
+            provider_form::with_provider_added(text, provider_kind, &edit_name, &values).map(Some)
+        },
+    )
+    .await;
+}
+
+/// Handle a `set_provider_config` envelope `{name, values}`: change the submitted
+/// settings of the provider `name`; see [`apply_provider_edit`]. A blank `apiKey` keeps
+/// the stored key. Applies to the next turn of every chat. Rust-side addition with no
+/// nanobot precedent.
+async fn handle_set_provider_config<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let Some(values) = parse_tool_config_values(envelope_dispatch_context.envelope) else {
+        let (detail, message) = setting_write_denial(shared, &envelope_dispatch_context)
+            .unwrap_or(("invalid_request", "The request was malformed."));
+        send_setting_error(
+            shared,
+            connection_id,
+            SettingKind::ProviderConfig,
+            &name,
+            detail,
+            message,
+        )
+        .await;
+        return;
+    };
+    let edit_name = name.clone();
+    apply_provider_edit(
+        &envelope_dispatch_context,
+        SettingKind::ProviderConfig,
+        "updated",
+        &name,
+        move |text| provider_form::with_provider_settings(text, &edit_name, &values),
+    )
+    .await;
+}
+
+/// Handle a `forget_provider_key` envelope `{name}`: clear the stored API key of the
+/// provider, so its environment variable applies again; see [`apply_provider_edit`].
+async fn handle_forget_provider_key<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let edit_name = name.clone();
+    apply_provider_edit(
+        &envelope_dispatch_context,
+        SettingKind::ProviderConfig,
+        "key_forgotten",
+        &name,
+        move |text| provider_form::with_provider_key_forgotten(text, &edit_name),
+    )
+    .await;
+}
+
+/// Handle a `delete_provider` envelope `{name}`: remove a custom provider or reset a
+/// dedicated one; see [`apply_provider_edit`]. Refused while `agents.provider` or a
+/// model preset uses it.
+async fn handle_delete_provider<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let name = envelope_preset_name(envelope_dispatch_context.envelope);
+    let edit_name = name.clone();
+    apply_provider_edit(
+        &envelope_dispatch_context,
+        SettingKind::ProviderDelete,
+        "deleted",
+        &name,
+        move |text| provider_form::without_provider(text, &edit_name).map(Some),
     )
     .await;
 }
@@ -10037,6 +10341,7 @@ mod tests {
             "list_tool_settings",
             "list_mcp_servers",
             "list_model_presets",
+            "list_providers",
         ] {
             let body = dispatch_setting_envelope(
                 &shared,
@@ -10064,6 +10369,10 @@ mod tests {
             "set_model_preset_config",
             "delete_model_preset",
             "set_default_model_preset",
+            "add_provider",
+            "set_provider_config",
+            "forget_provider_key",
+            "delete_provider",
         ] {
             let anonymous = dispatch_setting_envelope(
                 &shared,
@@ -10186,6 +10495,10 @@ mod tests {
             ("set_model_preset_config", "model_preset_config"),
             ("delete_model_preset", "model_preset_delete"),
             ("set_default_model_preset", "model_preset_activate"),
+            ("add_provider", "provider_add"),
+            ("set_provider_config", "provider_config"),
+            ("forget_provider_key", "provider_config"),
+            ("delete_provider", "provider_delete"),
         ] {
             let body = dispatch_setting_envelope(
                 &shared,
@@ -10300,6 +10613,39 @@ mod tests {
             assert_eq!(kind.model_preset_action(), Some(action));
         }
         assert_eq!(SettingKind::McpServerAdd.model_preset_action(), None);
+    }
+
+    #[test]
+    fn provider_writes_reply_with_the_providers_event() {
+        for kind in [
+            SettingKind::ProviderAdd,
+            SettingKind::ProviderConfig,
+            SettingKind::ProviderDelete,
+        ] {
+            assert_eq!(kind.saved_event(), WsOutboundEvent::Providers);
+            assert_eq!(kind.model_preset_action(), None);
+        }
+        assert_eq!(SettingKind::ProviderAdd.as_str(), "provider_add");
+    }
+
+    #[test]
+    fn the_providers_event_body_carries_no_key_and_names_the_change() {
+        let text = r#"{"providers": {"anthropic": {"apiKey": "sk-ant-SECRET"}}}"#;
+        let overview = provider_form::providers_overview(text, true, &|_| false).unwrap();
+        let body = providers_event_body(&overview, true, Some(("added", "anthropic")));
+        assert_eq!(
+            body["changed"],
+            serde_json::json!({"action": "added", "name": "anthropic"})
+        );
+        assert_eq!(body["providers"][0]["name"], "anthropic");
+        assert_eq!(body["can_modify"], true);
+        assert!(body.get("new_provider_form").is_some());
+        assert!(!body.to_string().contains("SECRET"));
+
+        let read_only = provider_form::providers_overview(text, false, &|_| false).unwrap();
+        let body = providers_event_body(&read_only, false, None);
+        assert!(body.get("new_provider_form").is_none());
+        assert!(body.get("changed").is_none());
     }
 
     const MODEL_PRESETS_CONFIG: &str = r#"{
