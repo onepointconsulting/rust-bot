@@ -8,6 +8,7 @@
 
 use serde_json::Value;
 
+use crate::config::channels::validate_channel_configs;
 use crate::config::loader::referenced_env_vars;
 use crate::config::schema::{Config, validate_custom_provider_names, validate_model_presets};
 
@@ -60,6 +61,9 @@ pub fn check_config_text(text: &str, env_is_set: impl Fn(&str) -> bool) -> Confi
                 report.errors.push(error);
             }
             if let Err(error) = validate_custom_provider_names(&config) {
+                report.errors.push(error);
+            }
+            if let Err(error) = validate_channel_configs(&config) {
                 report.errors.push(error);
             }
             report.warnings.extend(exposure_warning(&config, &value));
@@ -133,6 +137,17 @@ mod tests {
     fn an_unknown_model_preset_reference_is_an_error() {
         let report = check_config_text(r#"{"agents": {"modelPreset": "nope"}}"#, all_set);
         assert!(!report.is_ok());
+    }
+
+    #[test]
+    fn a_malformed_email_channel_is_an_error() {
+        let report = check_config_text(r#"{"channels": {"email": {"smtpPort": "x"}}}"#, all_set);
+        assert!(!report.is_ok());
+        assert!(
+            report.errors[0].contains("channels.email"),
+            "{:?}",
+            report.errors
+        );
     }
 
     #[test]

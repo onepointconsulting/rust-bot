@@ -303,9 +303,27 @@ pub(super) fn FieldInput(
     }
 }
 
+/// The fields of a form split into runs of consecutive fields that share a heading
+/// (their `group`), in order. A form without groups is one run with an empty heading;
+/// fields of a group that comes back later start a new run.
+pub fn group_fields(fields: &[ToolFieldSummary]) -> Vec<(String, Vec<ToolFieldSummary>)> {
+    let mut groups: Vec<(String, Vec<ToolFieldSummary>)> = Vec::new();
+    for field in fields {
+        match groups.last_mut() {
+            Some((heading, members)) if *heading == field.group => members.push(field.clone()),
+            _ => groups.push((field.group.clone(), vec![field.clone()])),
+        }
+    }
+    groups
+}
+
+/// Label of the form's submit button when the caller gives none.
+const DEFAULT_SUBMIT_LABEL: &str = "Save";
+
 /// The inline settings form of one tool section: an input per setting and a Save button
 /// that stays off until something valid changed. `note` is the line above the inputs
-/// (by default [`RESTART_FORM_NOTE`]).
+/// (by default [`RESTART_FORM_NOTE`]). Fields with a `group` are shown under a small
+/// heading per group (see [`group_fields`]).
 ///
 /// `drafts` is owned by the caller (start it from [`initial_drafts`]) so unsaved edits
 /// outlive this component: the settings list rebuilds its rows whenever it changes (a
@@ -322,8 +340,15 @@ pub fn ToolConfigForm(
     /// Offers the provider's models under the `model` input (model preset forms).
     #[prop(optional_no_strip)]
     model_catalog: Option<ModelCatalog>,
+    /// Label of the submit button (default "Save").
+    #[prop(optional, into)]
+    submit_label: Option<String>,
+    /// Shows a Cancel button next to the submit button that runs this.
+    #[prop(optional_no_strip)]
+    on_cancel: Option<Callback<()>>,
 ) -> impl IntoView {
     let note = note.unwrap_or_else(|| RESTART_FORM_NOTE.to_string());
+    let submit_label = submit_label.unwrap_or_else(|| DEFAULT_SUBMIT_LABEL.to_string());
     let fields_for_check = config.fields.clone();
     let fields_for_error = config.fields.clone();
     let fields_for_save = config.fields.clone();
@@ -339,22 +364,50 @@ pub fn ToolConfigForm(
     view! {
         <div class="mb-3 rounded-xl border border-slate-200 bg-slate-50 p-4 sm:ml-16">
             <p class="mb-3 text-xs text-slate-500">{note}</p>
-            {config
-                .fields
+            {group_fields(&config.fields)
                 .into_iter()
-                .map(|field| {
-                    view! { <FieldInput field=field drafts=drafts model_catalog=model_catalog /> }
+                .map(|(heading, fields)| {
+                    view! {
+                        {(!heading.is_empty())
+                            .then(|| {
+                                view! {
+                                    <h5 class="mb-2 mt-4 border-b border-slate-200 pb-1 text-xs font-semibold uppercase tracking-wide text-slate-500 first:mt-0">
+                                        {heading}
+                                    </h5>
+                                }
+                            })}
+                        {fields
+                            .into_iter()
+                            .map(|field| {
+                                view! { <FieldInput field=field drafts=drafts model_catalog=model_catalog /> }
+                            })
+                            .collect_view()}
+                    }
                 })
                 .collect_view()}
             {move || draft_error().map(|message| view! { <p class="mb-2 text-xs text-red-600">{message}</p> })}
-            <button
-                type="button"
-                class="rounded-full bg-slate-900 px-4 py-1.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
-                disabled=move || !save_ready()
-                on:click=save
-            >
-                "Save"
-            </button>
+            <div class="flex flex-wrap items-center gap-2">
+                <button
+                    type="button"
+                    class="rounded-full bg-slate-900 px-4 py-1.5 text-sm font-medium text-white disabled:cursor-not-allowed disabled:opacity-40"
+                    disabled=move || !save_ready()
+                    on:click=save
+                >
+                    {submit_label}
+                </button>
+                {on_cancel
+                    .map(|on_cancel| {
+                        view! {
+                            <button
+                                type="button"
+                                class="rounded-full border border-slate-300 bg-white px-4 py-1.5 text-sm text-slate-700 hover:bg-slate-100"
+                                on:click=move |_| on_cancel.run(())
+                            >
+                                "Cancel"
+                            </button>
+                        }
+                    })}
+            </div>
         </div>
     }
 }
@@ -375,6 +428,7 @@ mod tests {
             configured: value.is_some(),
             value,
             default: None,
+            group: String::new(),
         }
     }
 
@@ -391,6 +445,61 @@ mod tests {
             .iter()
             .map(|(name, text)| (name.to_string(), text.to_string()))
             .collect()
+    }
+
+    fn grouped(name: &str, group: &str) -> ToolFieldSummary {
+        ToolFieldSummary {
+            group: group.to_string(),
+            ..field(name, ToolFieldKind::Text, None)
+        }
+    }
+
+    fn group_names(groups: &[(String, Vec<ToolFieldSummary>)]) -> Vec<(String, Vec<String>)> {
+        groups
+            .iter()
+            .map(|(heading, fields)| {
+                (
+                    heading.clone(),
+                    fields.iter().map(|field| field.name.clone()).collect(),
+                )
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_form_without_groups_is_one_run_without_a_heading() {
+        let fields = vec![
+            field("a", ToolFieldKind::Text, None),
+            field("b", ToolFieldKind::Bool, None),
+        ];
+
+        let groups = group_fields(&fields);
+
+        assert_eq!(
+            group_names(&groups),
+            vec![(String::new(), vec!["a".to_string(), "b".to_string()])]
+        );
+        assert!(group_fields(&[]).is_empty());
+    }
+
+    #[test]
+    fn consecutive_fields_of_a_group_share_one_heading_in_order() {
+        let fields = vec![
+            grouped("enabled", "General"),
+            grouped("imapHost", "IMAP"),
+            grouped("imapPort", "IMAP"),
+            grouped("smtpHost", "SMTP"),
+            grouped("note", "IMAP"),
+        ];
+
+        let groups = group_names(&group_fields(&fields));
+
+        let headings: Vec<&str> = groups.iter().map(|(heading, _)| heading.as_str()).collect();
+        assert_eq!(headings, vec!["General", "IMAP", "SMTP", "IMAP"]);
+        assert_eq!(
+            groups[1].1,
+            vec!["imapHost".to_string(), "imapPort".to_string()]
+        );
     }
 
     #[test]

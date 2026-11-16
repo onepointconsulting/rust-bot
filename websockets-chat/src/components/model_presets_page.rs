@@ -14,6 +14,7 @@ use chat_ui::models::{ModelPresetChange, ModelPresetSummary, ToolConfigSummary};
 use leptos::prelude::*;
 
 use super::add_item_panel::{AddItemButton, AddItemPanel};
+use super::delete_confirmation::DeleteConfirmation;
 use super::list_page::Tile;
 use super::mcp_presets_page::is_busy;
 use super::model_picker::{provider_before_model, ModelCatalog};
@@ -194,39 +195,6 @@ fn PresetSettingsForm(
     }
 }
 
-/// The inline "Delete …?" question with its Delete and Cancel buttons.
-#[component]
-fn DeleteConfirmation(
-    name: String,
-    panel: SettingsPanel,
-    actions: SettingsActions,
-) -> impl IntoView {
-    let question = delete_question(&name);
-    view! {
-        <div class="mt-3 flex flex-wrap items-center gap-2 rounded-lg bg-red-50 px-3 py-2 text-sm text-red-800">
-            <span class="flex-1">{question}</span>
-            <button
-                type="button"
-                class="rounded-full border border-slate-300 bg-white px-3 py-1 text-sm text-slate-700 hover:bg-slate-100"
-                on:click=move |_| panel.confirm_delete_preset.set(None)
-            >
-                "Cancel"
-            </button>
-            <button
-                type="button"
-                class="rounded-full bg-red-600 px-3 py-1 text-sm font-medium text-white hover:bg-red-700 disabled:opacity-40"
-                disabled=move || !panel.can_change()
-                on:click=move |_| {
-                    panel.confirm_delete_preset.set(None);
-                    actions.on_delete_model_preset.run(name.clone());
-                }
-            >
-                "Delete"
-            </button>
-        </div>
-    }
-}
-
 /// One preset row: tile, title with the Active badge, `model · provider`, warnings, the
 /// buttons, and the open form, delete question and error underneath.
 #[component]
@@ -347,11 +315,16 @@ fn ModelPresetRowView(
             {move || {
                 (panel.confirm_delete_preset.get().as_deref() == Some(name_for_question.as_str()))
                     .then(|| {
+                        let name = name_for_question.clone();
                         view! {
                             <DeleteConfirmation
-                                name=name_for_question.clone()
-                                panel=panel
-                                actions=actions
+                                question=delete_question(&name)
+                                disabled=Signal::derive(move || !panel.can_change())
+                                on_cancel=Callback::new(move |()| panel.confirm_delete_preset.set(None))
+                                on_confirm=Callback::new(move |()| {
+                                    panel.confirm_delete_preset.set(None);
+                                    actions.on_delete_model_preset.run(name.clone());
+                                })
                             />
                         }
                     })

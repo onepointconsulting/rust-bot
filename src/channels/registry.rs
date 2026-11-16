@@ -43,7 +43,15 @@ pub fn discover_all(
                     .extra
                     .get(CHANNEL_EMAIL)
                     .cloned()
-                    .and_then(|v| serde_json::from_value::<EmailConfig>(v).ok())
+                    .and_then(|v| {
+                        serde_json::from_value::<EmailConfig>(v)
+                            .inspect_err(|error| {
+                                log::warn!(
+                                    "Ignoring channels.{CHANNEL_EMAIL}: it is not a valid email channel configuration: {error}"
+                                );
+                            })
+                            .ok()
+                    })
                     .unwrap_or_default();
                 if !email_cfg.enabled {
                     continue;

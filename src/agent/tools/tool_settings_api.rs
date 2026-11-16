@@ -109,6 +109,10 @@ pub struct ToolFieldSummary {
     /// Current value; always `None` for secrets.
     pub value: Option<Value>,
     pub default: Option<Value>,
+    /// Heading the form shows this field under (the `x-group` extension); empty when the
+    /// form is not grouped.
+    #[serde(skip_serializing_if = "String::is_empty")]
+    pub group: String,
 }
 
 /// One tool: its switch state and its settings.
@@ -327,6 +331,7 @@ pub(crate) fn summarize_field(
         configured,
         value: (!secret).then(|| current.clone()),
         default: property.get("default").cloned(),
+        group: property["x-group"].as_str().unwrap_or_default().to_string(),
     })
 }
 
@@ -594,6 +599,24 @@ mod tests {
         assert_eq!(
             help_text("Empty means omit.\nSecond line. Default: `\"\"`."),
             "Empty means omit. Second line."
+        );
+    }
+
+    #[test]
+    fn a_field_takes_its_group_from_x_group_and_omits_it_when_ungrouped() {
+        let grouped = json!({"type": "string", "x-group": "Outgoing mail (SMTP)"});
+        let ungrouped = json!({"type": "string"});
+
+        let grouped_field = summarize_field("smtpHost", &grouped, &json!("smtp")).unwrap();
+        let ungrouped_field = summarize_field("command", &ungrouped, &json!("x")).unwrap();
+
+        assert_eq!(grouped_field.group, "Outgoing mail (SMTP)");
+        assert_eq!(ungrouped_field.group, "");
+        let wire = serde_json::to_value(&ungrouped_field).unwrap();
+        assert!(wire.get("group").is_none(), "no group, no key");
+        assert_eq!(
+            serde_json::to_value(&grouped_field).unwrap()["group"],
+            "Outgoing mail (SMTP)"
         );
     }
 

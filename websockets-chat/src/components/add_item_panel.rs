@@ -36,7 +36,7 @@ pub fn apply_ready(
 /// The dashed button that opens the panel, labelled `label` (e.g. "+ Add MCP Server").
 #[component]
 pub fn AddItemButton(
-    label: &'static str,
+    #[prop(into)] label: String,
     #[prop(into)] disabled: Signal<bool>,
     on_click: Callback<()>,
 ) -> impl IntoView {
@@ -167,6 +167,7 @@ mod tests {
             configured: false,
             value: Some(json!(default)),
             default: Some(json!(default)),
+            group: String::new(),
         }
     }
 

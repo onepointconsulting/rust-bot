@@ -64,6 +64,12 @@ pub enum ToggleError {
     ProviderExists,
     /// The provider cannot be deleted because something uses it: `(why)`.
     ProviderInUse(String),
+    /// The channel type is not one the Channels page knows (`email`, ...).
+    UnknownChannelType,
+    /// A channel of that type is already configured; adding never overwrites.
+    ChannelExists,
+    /// No channel of that type is configured.
+    ChannelNotConfigured,
 }
 
 impl ToggleError {
@@ -84,6 +90,9 @@ impl ToggleError {
             Self::UnknownProvider => "unknown_provider",
             Self::ProviderExists => "provider_exists",
             Self::ProviderInUse(_) => "provider_in_use",
+            Self::UnknownChannelType => "unknown_channel_type",
+            Self::ChannelExists => "channel_exists",
+            Self::ChannelNotConfigured => "channel_not_configured",
         }
     }
 
@@ -106,6 +115,9 @@ impl ToggleError {
             Self::UnknownProvider => "No provider with that name is configured.".to_string(),
             Self::ProviderExists => "A provider with that name already exists.".to_string(),
             Self::ProviderInUse(why) => format!("This provider cannot be deleted: {why}"),
+            Self::UnknownChannelType => "Unknown channel type.".to_string(),
+            Self::ChannelExists => "A channel of this type is already set up.".to_string(),
+            Self::ChannelNotConfigured => "No channel of this type is set up.".to_string(),
         }
     }
 }

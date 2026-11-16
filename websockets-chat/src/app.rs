@@ -1347,6 +1347,31 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             panel.can_modify.set(can_modify);
             panel.providers_loaded.set(true);
         }
+        ServerEvent::Channels {
+            channels,
+            can_modify,
+            changed,
+            restart_required,
+        } => {
+            // A reply that lands after the dialog closed must not leave data behind.
+            if !ctx.settings_open.get_untracked() {
+                return;
+            }
+            let panel = ctx.settings_panel;
+            if changed.is_some() {
+                // Saved: the forms close and show the stored values again.
+                finish_setting_change(ctx, restart_required);
+                panel.close_add_panel();
+                panel.close_channel_panels();
+            } else {
+                panel.busy.set(None);
+            }
+            // A fresh list: its forms start again from what is stored.
+            panel.forget_page_drafts(SettingsPage::Channels);
+            panel.can_modify.set(can_modify);
+            panel.channels.set(channels);
+            panel.channels_loaded.set(true);
+        }
         ServerEvent::SettingError {
             kind,
             name,
@@ -1368,7 +1393,7 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             // A refused add is reported in the panel, which stays open.
             if matches!(
                 kind.as_str(),
-                "mcp_server_add" | "model_preset_add" | "provider_add"
+                "mcp_server_add" | "model_preset_add" | "provider_add" | "channel_add"
             ) {
                 panel.add_error.set(Some(message));
                 return;
@@ -1381,6 +1406,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                     panel.model_presets_loaded.set(true);
                 } else if kind.starts_with(PROVIDER_SETTING_KIND_PREFIX) {
                     panel.providers_loaded.set(true);
+                } else if kind.starts_with(CHANNEL_SETTING_KIND_PREFIX) {
+                    panel.channels_loaded.set(true);
                 } else {
                     panel.mcp_servers_loaded.set(true);
                 }
@@ -1829,6 +1856,7 @@ fn request_settings_list(ctx: &WsContext, page: SettingsPage) {
     let envelope = match page {
         SettingsPage::Models => protocol::ClientEnvelope::list_model_presets(),
         SettingsPage::Providers => protocol::ClientEnvelope::list_providers(),
+        SettingsPage::Channels => protocol::ClientEnvelope::list_channels(),
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::list_tool_settings()
         }
@@ -1854,9 +1882,11 @@ fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
     panel.editing_provider.set(None);
     panel.confirm_delete_provider.set(None);
     panel.provider_notice.set(None);
+    panel.close_channel_panels();
     match page {
         SettingsPage::Models => panel.model_presets_loaded.set(false),
         SettingsPage::Providers => panel.providers_loaded.set(false),
+        SettingsPage::Channels => panel.channels_loaded.set(false),
         SettingsPage::Tools | SettingsPage::ToolSafety => panel.tools_loaded.set(false),
         SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
     }
@@ -1874,8 +1904,9 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
     ctx.settings_panel.error.set(None);
     ctx.settings_panel.busy.set(Some(name.clone()));
     let envelope = match page {
-        // The Models and Providers pages have no switches; nothing sends one for them.
-        SettingsPage::Models | SettingsPage::Providers => return,
+        // The Models, Providers and Channels pages have no switches; nothing sends one
+        // for them.
+        SettingsPage::Models | SettingsPage::Providers | SettingsPage::Channels => return,
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::set_tool_enabled(name, enabled)
         }
@@ -2041,6 +2072,52 @@ fn request_delete_provider(ctx: &WsContext, name: String) {
         *ctx,
         protocol::ClientEnvelope::delete_provider(name),
         "Failed to encode the delete provider request.",
+    );
+}
+
+/// Start of the `kind` of every `setting_error` about the Channels page.
+const CHANNEL_SETTING_KIND_PREFIX: &str = "channel_";
+
+/// Mark a Channels page request for `channel_type` as in flight and drop the previous
+/// error, so the reply's outcome is the only one shown.
+fn start_channel_request(ctx: &WsContext, channel_type: &str) {
+    let panel = ctx.settings_panel;
+    panel.error.set(None);
+    panel.add_error.set(None);
+    panel.busy.set(Some(channel_type.to_string()));
+}
+
+/// Ask the gateway to set up a channel: `(channel type, settings)`. The reply is a
+/// `channels` event naming the change, or a `setting_error` of kind `channel_add` (shown
+/// in the create form). The settings may hold passwords: they are only sent.
+fn request_add_channel(ctx: &WsContext, (channel_type, values): ToolConfigChange) {
+    start_channel_request(ctx, &channel_type);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::add_channel(channel_type, values),
+        "Failed to encode the create channel request.",
+    );
+}
+
+/// Ask the gateway to save changed settings of one channel. The reply is a `channels`
+/// event or a `setting_error` of kind `channel_config`.
+fn request_save_channel(ctx: &WsContext, (channel_type, values): ToolConfigChange) {
+    start_channel_request(ctx, &channel_type);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_channel_config(channel_type, values),
+        "Failed to encode the channel settings request.",
+    );
+}
+
+/// Ask the gateway to delete one channel. The reply is a `channels` event or a
+/// `setting_error` of kind `channel_delete`.
+fn request_delete_channel(ctx: &WsContext, channel_type: String) {
+    start_channel_request(ctx, &channel_type);
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::delete_channel(channel_type),
+        "Failed to encode the delete channel request.",
     );
 }
 
@@ -3230,6 +3307,11 @@ pub fn App() -> impl IntoView {
         on_delete_provider: Callback::new(move |name| request_delete_provider(&ws_context, name)),
         on_list_provider_models: Callback::new(move |provider| {
             request_provider_models(&ws_context, provider)
+        }),
+        on_add_channel: Callback::new(move |change| request_add_channel(&ws_context, change)),
+        on_save_channel: Callback::new(move |change| request_save_channel(&ws_context, change)),
+        on_delete_channel: Callback::new(move |channel_type| {
+            request_delete_channel(&ws_context, channel_type)
         }),
         on_restart: Callback::new(move |()| request_restart(&ws_context)),
     };

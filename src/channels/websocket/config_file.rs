@@ -12,6 +12,7 @@ use std::path::{Path, PathBuf};
 
 use chrono::{DateTime, Utc};
 
+use crate::config::channels::validate_channel_configs;
 use crate::config::schema::{Config, validate_custom_provider_names, validate_model_presets};
 use crate::utils::fs::write_atomic;
 
@@ -46,6 +47,7 @@ pub fn validate_config_text(text: &str) -> Result<(), String> {
         serde_json::from_value(json).map_err(|e| format!("Invalid configuration: {e}"))?;
     validate_model_presets(&config)
         .and_then(|()| validate_custom_provider_names(&config))
+        .and_then(|()| validate_channel_configs(&config))
         .map_err(|e| format!("Invalid configuration: {e}"))
 }
 
@@ -128,6 +130,13 @@ mod tests {
     fn validate_rejects_a_value_of_the_wrong_shape() {
         let error = validate_config_text("[1, 2]").unwrap_err();
         assert!(error.starts_with("Invalid configuration"), "{error}");
+    }
+
+    #[test]
+    fn validate_rejects_a_malformed_email_channel() {
+        let error =
+            validate_config_text(r#"{"channels": {"email": {"allowFrom": "a@b"}}}"#).unwrap_err();
+        assert!(error.contains("channels.email"), "{error}");
     }
 
     #[test]

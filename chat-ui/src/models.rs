@@ -248,6 +248,9 @@ pub struct ToolFieldSummary {
     pub value: Option<serde_json::Value>,
     #[serde(default)]
     pub default: Option<serde_json::Value>,
+    /// Heading the form shows the field under; empty for forms without groups.
+    #[serde(default)]
+    pub group: String,
 }
 
 /// The settings form of one tool section. Mirrors the backend's `ToolSettingsSummary`.
@@ -403,6 +406,47 @@ pub struct BackendChoice {
     /// The `providerBackEnd` value; empty means automatic.
     pub value: String,
     pub label: String,
+}
+
+/// One section of the Settings → Channels page: a channel type and, when set up, its
+/// channel. Mirrors the backend's `ChannelRow` (`channel_form.rs`); never carries a
+/// password.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelSummary {
+    /// The type's key (`email`), also its entry under `channels` in `config.json`.
+    pub channel_type: String,
+    /// The section heading (`Email`).
+    #[serde(default)]
+    pub title: String,
+    /// Whether a channel of this type is set up.
+    #[serde(default)]
+    pub configured: bool,
+    /// Whether the channel is switched on.
+    #[serde(default)]
+    pub enabled: bool,
+    /// One line about the channel, e.g. `bot@example.com · imap.example.com`.
+    #[serde(default)]
+    pub summary: String,
+    /// Warnings, e.g. that the channel will not start.
+    #[serde(default)]
+    pub notes: Vec<String>,
+    /// The edit form of a set-up channel. Only sent to connections that may change the
+    /// configuration.
+    #[serde(default)]
+    pub form: Option<ToolConfigSummary>,
+    /// The blank form of a type that is not set up yet. Only sent to connections that
+    /// may change the configuration.
+    #[serde(default)]
+    pub new_form: Option<ToolConfigSummary>,
+}
+
+/// What a channel write changed, as named by the gateway's `channels` reply.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ChannelChange {
+    /// `added`, `updated` or `deleted`.
+    pub action: String,
+    #[serde(rename = "channelType")]
+    pub channel_type: String,
 }
 
 /// What a provider write changed, as named by the gateway's `providers` reply.

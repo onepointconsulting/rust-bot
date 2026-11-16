@@ -1,6 +1,7 @@
 //! Helpers shared by the Settings dialog forms that edit one JSON object of `config.json`
-//! in place: an MCP server entry ([`super::mcp_server_form`]) and a model preset
-//! ([`super::model_preset_form`]).
+//! in place: an MCP server entry ([`super::mcp_server_form`]), a model preset
+//! ([`super::model_preset_form`]), a provider ([`super::provider_form`]) and a channel
+//! ([`super::channel_form`]).
 //!
 //! A form is generated from the JSON Schema of the entry's config struct, with the same
 //! field helpers as the tool section forms
@@ -111,6 +112,31 @@ pub(super) fn form_fields(
             )
         })
         .collect()
+}
+
+/// What to do about a `${VAR}` placeholder whose variable is not set; shown after its
+/// name by [`check_placeholders`].
+pub(super) const UNSET_VARIABLE_EXPLANATION: &str = "which is not set in the environment of the process running rust-bot. Set the variable there before starting rust-bot, or write the value here directly.";
+
+/// A blank stand-in for a `null` submitted value, by field kind: what the form would
+/// have sent for an emptied input.
+pub(super) fn blank_value(kind: &FieldKind) -> Value {
+    match kind {
+        FieldKind::StringMap => Value::Object(Map::new()),
+        FieldKind::StringList => Value::Array(Vec::new()),
+        _ => Value::String(String::new()),
+    }
+}
+
+/// Whether `value` (already checked) is what a form sends for "nothing here".
+pub(super) fn is_blank(value: &Value) -> bool {
+    match value {
+        Value::Null => true,
+        Value::String(text) => text.trim().is_empty(),
+        Value::Object(entries) => entries.is_empty(),
+        Value::Array(items) => items.is_empty(),
+        _ => false,
+    }
 }
 
 /// Whether the environment variable `name` is set on this machine.

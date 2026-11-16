@@ -24,11 +24,11 @@ use super::config_file::validate_config_text;
 use super::config_toggles::{ToggleError, child_object_mut, is_valid_name, parse_root};
 use super::model_preset_form::{rendered_and_checked, typed_config};
 use super::settings_form::{
-    SettingSpellings, check_placeholders, form_fields, process_env_is_set, remove_value,
-    schema_properties, store_value, stored_value,
+    SettingSpellings, UNSET_VARIABLE_EXPLANATION, blank_value, check_placeholders, form_fields,
+    is_blank, process_env_is_set, remove_value, schema_properties, store_value, stored_value,
 };
 use crate::agent::tools::tool_settings_api::{
-    FieldKind, ToolFieldSummary, ToolSettingsSummary, check_value, field_kind,
+    ToolFieldSummary, ToolSettingsSummary, check_value, field_kind,
 };
 use crate::config::loader::resolve_env_vars_in;
 use crate::config::schema::{
@@ -62,9 +62,6 @@ const API_KEY: &str = "apiKey";
 const API_BASE: &str = "apiBase";
 const EXTRA_HEADERS: &str = "extraHeaders";
 const PROVIDER_BACK_END: &str = "providerBackEnd";
-
-/// What to do about a `${VAR}` placeholder whose variable is not set; shown after its name.
-const UNSET_VARIABLE_EXPLANATION: &str = "which is not set in the environment of the process running rust-bot. Set the variable there before starting rust-bot, or write the value here directly.";
 
 /// Which tab of the add panel a provider comes from.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
@@ -432,26 +429,6 @@ pub fn live_providers(text: &str) -> Result<ProvidersConfig, String> {
     resolve_env_vars_in(&config.providers)
 }
 
-/// A blank stand-in for a `null` or missing submitted value, by field kind.
-fn blank_value(kind: &FieldKind) -> Value {
-    match kind {
-        FieldKind::StringMap => Value::Object(Map::new()),
-        FieldKind::StringList => Value::Array(Vec::new()),
-        _ => Value::String(String::new()),
-    }
-}
-
-/// Whether `value` (already checked) is what a form sends for "nothing here".
-fn is_blank(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(text) => text.trim().is_empty(),
-        Value::Object(entries) => entries.is_empty(),
-        Value::Array(items) => items.is_empty(),
-        _ => false,
-    }
-}
-
 /// Check every submitted `changes` entry against the schema and the environment and
 /// write it into `entry`. A blank API key is never written (the stored key is kept); a
 /// blank Base URL, header map or protocol removes the setting (the default applies).
@@ -729,6 +706,7 @@ pub fn with_provider_key_forgotten(text: &str, name: &str) -> Result<Option<Stri
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::agent::tools::tool_settings_api::FieldKind;
     use serde_json::json;
 
     const CONFIG: &str = r#"{

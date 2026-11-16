@@ -224,26 +224,10 @@ impl EmailChannel {
         }
     }
 
+    /// Whether every setting the channel needs to connect is set; logs the missing ones
+    /// (see [`EmailConfig::missing_required_settings`]) when not.
     fn validate_config(&self) -> bool {
-        let mut missing = Vec::new();
-        if self.config.imap_host.trim().is_empty() {
-            missing.push("imap_host".to_string());
-        }
-        if self.config.imap_username.trim().is_empty() {
-            missing.push("imap_username".to_string());
-        }
-        if self.config.imap_password.trim().is_empty() {
-            missing.push("imap_password".to_string());
-        }
-        if self.config.smtp_host.trim().is_empty() {
-            missing.push("smtp_host".to_string());
-        }
-        if self.config.smtp_username.trim().is_empty() {
-            missing.push("smtp_username".to_string());
-        }
-        if self.config.smtp_password.trim().is_empty() {
-            missing.push("smtp_password".to_string());
-        }
+        let missing = self.config.missing_required_settings();
         if !missing.is_empty() {
             log::error!(
                 "Email channel config missing required fields: {}",

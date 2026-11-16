@@ -158,6 +158,22 @@ pub enum EnvelopeType {
     /// Refused while `agents.provider` or a model preset uses it. Same access rules as
     /// [`Self::AddModelPreset`].
     DeleteProvider,
+    /// List the chat channels of `config.json` for the Settings dialog's Channels page:
+    /// one section per channel type (`email`, ...), set up or not. Never carries
+    /// passwords. Rust-side addition with no nanobot precedent. Authenticated connections
+    /// only; forms only for connections that may change the configuration.
+    ListChannels,
+    /// Set up a channel (`{channelType, values}`, `values` mapping the form's setting
+    /// names to their values) in `config.json`. Applies after a restart. Same access rules
+    /// as [`Self::AddModelPreset`].
+    AddChannel,
+    /// Change the settings of one channel (`{channelType, values}`); a blank password
+    /// keeps the stored one. Applies after a restart. Same access rules as
+    /// [`Self::AddModelPreset`].
+    SetChannelConfig,
+    /// Remove one channel (`{channelType}`) with all its settings. Applies after a
+    /// restart. Same access rules as [`Self::AddModelPreset`].
+    DeleteChannel,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -265,6 +281,10 @@ impl From<&str> for EnvelopeType {
             "set_provider_config" => Self::SetProviderConfig,
             "forget_provider_key" => Self::ForgetProviderKey,
             "delete_provider" => Self::DeleteProvider,
+            "list_channels" => Self::ListChannels,
+            "add_channel" => Self::AddChannel,
+            "set_channel_config" => Self::SetChannelConfig,
+            "delete_channel" => Self::DeleteChannel,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -364,6 +384,11 @@ pub enum WsOutboundEvent {
     /// changed?}`, `changed` being `{action, name}` (`action`: `added`, `updated`,
     /// `deleted` or `key_forgotten`) and absent on a plain list. Never carries API keys.
     Providers,
+    /// Reply to [`EnvelopeType::ListChannels`] and to every successful channel write —
+    /// `{channels, can_modify, changed?, restart_required?}`, `changed` being
+    /// `{action, channelType}` (`action`: `added`, `updated` or `deleted`) and absent on
+    /// a plain list. Never carries passwords.
+    Channels,
     /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
     /// message}`. Never carries any of the file's content.
     SettingError,
@@ -455,6 +480,7 @@ impl WsOutboundEvent {
             Self::ModelPresets => "model_presets",
             Self::ProviderModels => "provider_models",
             Self::Providers => "providers",
+            Self::Channels => "channels",
             Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
@@ -1057,6 +1083,15 @@ mod tests {
             assert_eq!(EnvelopeType::from(wire_name), envelope_type, "{wire_name}");
         }
         assert_eq!(WsOutboundEvent::Providers.as_str(), "providers");
+        for (wire_name, envelope_type) in [
+            ("list_channels", EnvelopeType::ListChannels),
+            ("add_channel", EnvelopeType::AddChannel),
+            ("set_channel_config", EnvelopeType::SetChannelConfig),
+            ("delete_channel", EnvelopeType::DeleteChannel),
+        ] {
+            assert_eq!(EnvelopeType::from(wire_name), envelope_type, "{wire_name}");
+        }
+        assert_eq!(WsOutboundEvent::Channels.as_str(), "channels");
         // The per-chat switch keeps its own name and meaning.
         assert_eq!(
             EnvelopeType::from("set_model_preset"),

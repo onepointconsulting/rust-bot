@@ -1,7 +1,9 @@
 mod add_item_panel;
 mod add_mcp_server_panel;
 mod ask_question;
+mod channels_page;
 mod chat_shell;
+mod delete_confirmation;
 mod general_settings;
 mod json_editor;
 mod key_value_rows;

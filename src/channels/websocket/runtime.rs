@@ -44,6 +44,7 @@ use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
+use crate::channels::websocket::channel_form;
 use crate::channels::websocket::config_file;
 use crate::channels::websocket::config_toggles;
 use crate::channels::websocket::mcp_server_form;
@@ -749,6 +750,18 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::DeleteProvider => {
             handle_delete_provider(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListChannels => {
+            handle_list_channels(envelope_dispatch_context).await;
+        }
+        EnvelopeType::AddChannel => {
+            handle_add_channel(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetChannelConfig => {
+            handle_set_channel_config(envelope_dispatch_context).await;
+        }
+        EnvelopeType::DeleteChannel => {
+            handle_delete_channel(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -3405,6 +3418,12 @@ enum SettingKind {
     ProviderConfig,
     /// Deleting a provider.
     ProviderDelete,
+    /// Setting up a channel (Channels page).
+    ChannelAdd,
+    /// The settings form of a channel.
+    ChannelConfig,
+    /// Removing a channel.
+    ChannelDelete,
 }
 
 impl SettingKind {
@@ -3423,6 +3442,9 @@ impl SettingKind {
             Self::ProviderAdd => "provider_add",
             Self::ProviderConfig => "provider_config",
             Self::ProviderDelete => "provider_delete",
+            Self::ChannelAdd => "channel_add",
+            Self::ChannelConfig => "channel_config",
+            Self::ChannelDelete => "channel_delete",
         }
     }
 
@@ -3453,6 +3475,9 @@ impl SettingKind {
             Self::ProviderAdd | Self::ProviderConfig | Self::ProviderDelete => {
                 WsOutboundEvent::Providers
             }
+            Self::ChannelAdd | Self::ChannelConfig | Self::ChannelDelete => {
+                WsOutboundEvent::Channels
+            }
         }
     }
 
@@ -3479,7 +3504,10 @@ impl SettingKind {
             | Self::ModelPresetActivate
             | Self::ProviderAdd
             | Self::ProviderConfig
-            | Self::ProviderDelete => Err(config_toggles::ToggleError::UnknownField(
+            | Self::ProviderDelete
+            | Self::ChannelAdd
+            | Self::ChannelConfig
+            | Self::ChannelDelete => Err(config_toggles::ToggleError::UnknownField(
                 "enabled".to_string(),
             )),
         }
@@ -4720,6 +4748,241 @@ async fn handle_delete_provider<'a>(envelope_dispatch_context: EnvelopeDispatchC
         "deleted",
         &name,
         move |text| provider_form::without_provider(text, &edit_name).map(Some),
+    )
+    .await;
+}
+
+// ── Channels page ────────────────────────────────────────────────────────────
+
+/// A saved Channels page write, for the `channels` reply.
+#[derive(Debug, Clone, Copy)]
+struct ChannelWrite<'a> {
+    /// `added`, `updated` or `deleted`.
+    action: &'a str,
+    /// The channel type's key (`email`).
+    channel_type: &'a str,
+    /// Whether the file changed, so a restart is needed to apply it.
+    restart_required: bool,
+}
+
+/// The fields of a `channels` event: one row per channel type, whether the connection
+/// may change them and, after a write, what changed (`{action, channelType}`) and whether
+/// a restart is needed to apply it. Never carries a password.
+fn channels_event_body(
+    rows: &[channel_form::ChannelRow],
+    can_modify: bool,
+    write: Option<ChannelWrite<'_>>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "channels": rows,
+        "can_modify": can_modify,
+    });
+    if let Some(write) = write {
+        body["changed"] =
+            serde_json::json!({"action": write.action, "channelType": write.channel_type});
+        body["restart_required"] = serde_json::json!(write.restart_required);
+    }
+    body
+}
+
+/// Read `config.json` and send the requester a `channels` event (forms only when
+/// `can_modify`), or a `setting_error` of `kind` when the file cannot be read.
+async fn send_channels(
+    shared: &WsShared,
+    connection_id: &str,
+    kind: SettingKind,
+    can_modify: bool,
+    write: Option<ChannelWrite<'_>>,
+) {
+    let rows = read_config_for_settings().and_then(|text| {
+        channel_form::channels_overview(&text, can_modify).map_err(|e| e.message())
+    });
+    match rows {
+        Ok(rows) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::Channels,
+                None,
+                channels_event_body(&rows, can_modify, write),
+            )
+            .await;
+        }
+        Err(message) => {
+            let channel_type = write.map(|write| write.channel_type).unwrap_or_default();
+            send_setting_error(
+                shared,
+                connection_id,
+                kind,
+                channel_type,
+                "config_error",
+                &message,
+            )
+            .await;
+        }
+    }
+}
+
+/// The `channelType` of a Channels page envelope, trimmed; empty when missing.
+fn envelope_channel_type(envelope: &Envelope) -> String {
+    envelope
+        .get("channelType")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string()
+}
+
+/// Handle a `list_channels` envelope: reply with a `channels` event with one section per
+/// channel type (never a password). Connections that may change the configuration also
+/// get the forms. Authenticated connections only. Rust-side addition with no nanobot
+/// precedent.
+async fn handle_list_channels<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
+    send_channels(
+        shared,
+        connection_id,
+        SettingKind::ChannelConfig,
+        can_modify,
+        None,
+    )
+    .await;
+}
+
+/// The shared path of every Channels page write: refuse connections that may not change
+/// the configuration, apply `edit` to `config.json` under the config write lock
+/// (validated, previous file backed up) and reply with the fresh `channels` list naming
+/// what changed (`action`). Channels are built once at startup, so nothing is applied
+/// live: the reply says a restart is required when the file changed. Failures become a
+/// `setting_error` of `kind`. Submitted values are never logged or echoed in errors.
+async fn apply_channel_edit<'a>(
+    envelope_dispatch_context: &EnvelopeDispatchContext<'a>,
+    kind: SettingKind,
+    action: &str,
+    channel_type: &str,
+    edit: impl FnOnce(&str) -> Result<Option<String>, config_toggles::ToggleError>,
+) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    if let Some((detail, message)) = setting_write_denial(shared, envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, channel_type, detail, message).await;
+        return;
+    }
+
+    let result = {
+        // Shares the lock with the other writers: each one rewrites the whole file.
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        config_toggles::apply_edit(&get_config_path(), edit)
+    };
+
+    match result {
+        Ok(outcome) => {
+            if outcome.changed {
+                log::info!(
+                    "Channel '{channel_type}' {action} from the WebUI (client '{client_id}'); previous config kept as {:?}",
+                    outcome.backup,
+                );
+            }
+            let write = ChannelWrite {
+                action,
+                channel_type,
+                restart_required: outcome.changed,
+            };
+            send_channels(shared, connection_id, kind, true, Some(write)).await;
+        }
+        Err(error) => {
+            send_apply_error(shared, connection_id, kind, channel_type, error).await;
+        }
+    }
+}
+
+/// Refuse a Channels page write whose `values` are malformed; a connection that may not
+/// write is told that instead, so the request itself is not judged for it.
+async fn refuse_malformed_channel_request(
+    envelope_dispatch_context: &EnvelopeDispatchContext<'_>,
+    kind: SettingKind,
+    channel_type: &str,
+) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    let (detail, message) = setting_write_denial(shared, envelope_dispatch_context)
+        .unwrap_or(("invalid_request", "The request was malformed."));
+    send_setting_error(shared, connection_id, kind, channel_type, detail, message).await;
+}
+
+/// Handle an `add_channel` envelope `{channelType, values}`: set up a channel of that
+/// type in `config.json`; see [`apply_channel_edit`]. Refused when one is already set up,
+/// the type is unknown or the channel could not start with the values. Rust-side
+/// addition with no nanobot precedent.
+async fn handle_add_channel<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let kind = SettingKind::ChannelAdd;
+    let channel_type = envelope_channel_type(envelope_dispatch_context.envelope);
+    let Some(values) = parse_tool_config_values(envelope_dispatch_context.envelope) else {
+        refuse_malformed_channel_request(&envelope_dispatch_context, kind, &channel_type).await;
+        return;
+    };
+    let edit_type = channel_type.clone();
+    apply_channel_edit(
+        &envelope_dispatch_context,
+        kind,
+        "added",
+        &channel_type,
+        move |text| {
+            let channel_type = channel_form::SettingsChannelType::parse(&edit_type)?;
+            channel_form::with_channel_added(text, channel_type, &values).map(Some)
+        },
+    )
+    .await;
+}
+
+/// Handle a `set_channel_config` envelope `{channelType, values}`: change the submitted
+/// settings of the channel; see [`apply_channel_edit`]. A blank password keeps the stored
+/// one. Rust-side addition with no nanobot precedent.
+async fn handle_set_channel_config<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let kind = SettingKind::ChannelConfig;
+    let channel_type = envelope_channel_type(envelope_dispatch_context.envelope);
+    let Some(values) = parse_tool_config_values(envelope_dispatch_context.envelope) else {
+        refuse_malformed_channel_request(&envelope_dispatch_context, kind, &channel_type).await;
+        return;
+    };
+    let edit_type = channel_type.clone();
+    apply_channel_edit(
+        &envelope_dispatch_context,
+        kind,
+        "updated",
+        &channel_type,
+        move |text| {
+            let channel_type = channel_form::SettingsChannelType::parse(&edit_type)?;
+            channel_form::with_channel_settings(text, channel_type, &values)
+        },
+    )
+    .await;
+}
+
+/// Handle a `delete_channel` envelope `{channelType}`: remove the channel with all its
+/// settings; see [`apply_channel_edit`]. Rust-side addition with no nanobot precedent.
+async fn handle_delete_channel<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let channel_type = envelope_channel_type(envelope_dispatch_context.envelope);
+    let edit_type = channel_type.clone();
+    apply_channel_edit(
+        &envelope_dispatch_context,
+        SettingKind::ChannelDelete,
+        "deleted",
+        &channel_type,
+        move |text| {
+            let channel_type = channel_form::SettingsChannelType::parse(&edit_type)?;
+            channel_form::without_channel(text, channel_type).map(Some)
+        },
     )
     .await;
 }
@@ -10320,6 +10583,7 @@ mod tests {
         let mut envelope: Envelope = HashMap::new();
         envelope.insert("type".to_string(), serde_json::json!(envelope_type));
         envelope.insert("name".to_string(), serde_json::json!("grep"));
+        envelope.insert("channelType".to_string(), serde_json::json!("email"));
         envelope.insert("enabled".to_string(), serde_json::json!(false));
         let ctx = EnvelopeDispatchContext {
             envelope: &envelope,
@@ -10342,6 +10606,7 @@ mod tests {
             "list_mcp_servers",
             "list_model_presets",
             "list_providers",
+            "list_channels",
         ] {
             let body = dispatch_setting_envelope(
                 &shared,
@@ -10391,6 +10656,82 @@ mod tests {
                 assert_eq!(body["name"], "grep", "{envelope_type}");
             }
         }
+    }
+
+    #[tokio::test]
+    async fn channel_writes_are_refused_for_anonymous_and_remote_connections() {
+        let shared = test_shared("browser");
+        for (envelope_type, kind) in [
+            ("add_channel", "channel_add"),
+            ("set_channel_config", "channel_config"),
+            ("delete_channel", "channel_delete"),
+        ] {
+            let anonymous = dispatch_setting_envelope(
+                &shared,
+                &AuthorizeResult::UNAUTHENTICATED,
+                "127.0.0.1",
+                envelope_type,
+            )
+            .await;
+            let remote =
+                dispatch_setting_envelope(&shared, &authenticated(), "203.0.113.5", envelope_type)
+                    .await;
+
+            for body in [anonymous, remote] {
+                assert_eq!(body["event"], "setting_error", "{envelope_type}");
+                assert_eq!(body["detail"], "access_denied", "{envelope_type}");
+                assert_eq!(body["kind"], kind, "{envelope_type}");
+                assert_eq!(body["name"], "email", "{envelope_type}");
+            }
+        }
+    }
+
+    #[test]
+    fn channel_writes_reply_with_the_channels_event() {
+        for kind in [
+            SettingKind::ChannelAdd,
+            SettingKind::ChannelConfig,
+            SettingKind::ChannelDelete,
+        ] {
+            assert_eq!(kind.saved_event(), WsOutboundEvent::Channels);
+            assert_eq!(kind.model_preset_action(), None);
+        }
+    }
+
+    #[test]
+    fn the_channels_event_body_carries_no_password_and_names_the_change() {
+        let text = r#"{"channels": {"email": {"imapHost": "imap.x", "imapPassword": "imap-SECRET", "smtpPassword": "smtp-SECRET"}}}"#;
+        let rows = channel_form::channels_overview(text, true).unwrap();
+        let write = ChannelWrite {
+            action: "updated",
+            channel_type: "email",
+            restart_required: true,
+        };
+
+        let body = channels_event_body(&rows, true, Some(write));
+
+        assert_eq!(
+            body["changed"],
+            serde_json::json!({"action": "updated", "channelType": "email"})
+        );
+        assert_eq!(body["restart_required"], true);
+        assert_eq!(body["channels"][0]["channel_type"], "email");
+        assert!(body["channels"][0].get("form").is_some());
+        assert!(!body.to_string().contains("SECRET"));
+
+        let read_only = channel_form::channels_overview(text, false).unwrap();
+        let body = channels_event_body(&read_only, false, None);
+        assert!(body["channels"][0].get("form").is_none());
+        assert!(body.get("changed").is_none() && body.get("restart_required").is_none());
+        assert!(!body.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn the_channel_type_of_an_envelope_is_trimmed() {
+        let mut envelope: Envelope = HashMap::new();
+        assert_eq!(envelope_channel_type(&envelope), "");
+        envelope.insert("channelType".to_string(), serde_json::json!(" email "));
+        assert_eq!(envelope_channel_type(&envelope), "email");
     }
 
     #[tokio::test]

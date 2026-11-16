@@ -19,11 +19,11 @@
 use std::collections::HashMap;
 
 use chat_ui::models::{
-    AcpAgentSummary, BackendChoice, ChatEntry, DedicatedProviderChoice, ImageAttachment,
-    McpCustomServerSummary, McpPresetSummary, McpServerSettingSummary, ModelPresetChange,
-    ModelPresetSummary, ProviderChange, ProviderModelSummary, ProviderSummary, Role,
-    SessionTokenUsage, SkillSummary, SpawnTaskSummary, ToolConfigSummary, ToolEvent,
-    ToolSettingSummary, ToolSummary,
+    AcpAgentSummary, BackendChoice, ChannelChange, ChannelSummary, ChatEntry,
+    DedicatedProviderChoice, ImageAttachment, McpCustomServerSummary, McpPresetSummary,
+    McpServerSettingSummary, ModelPresetChange, ModelPresetSummary, ProviderChange,
+    ProviderModelSummary, ProviderSummary, Role, SessionTokenUsage, SkillSummary, SpawnTaskSummary,
+    ToolConfigSummary, ToolEvent, ToolSettingSummary, ToolSummary,
 };
 use serde::{Deserialize, Serialize};
 
@@ -118,6 +118,10 @@ pub struct ClientEnvelope {
     /// Set only by [`Self::add_provider`] — `dedicated` or `custom`.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub kind: Option<&'static str>,
+    /// Set only by the Channels page requests ([`Self::add_channel`], ...) — the
+    /// channel type's key (`email`).
+    #[serde(rename = "channelType", skip_serializing_if = "Option::is_none")]
+    pub channel_type: Option<String>,
     /// Set only by [`Self::set_tool_config`] — tool setting name to its new value.
     /// May hold secrets: never logged or echoed.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -163,6 +167,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -199,6 +204,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -234,6 +240,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -282,6 +289,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -315,6 +323,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -348,6 +357,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -635,6 +645,58 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway for the chat channels: one section per channel type, set up or
+    /// not (never a password). Authenticated connections only. The reply is a `channels`
+    /// event (see [`ServerEvent::Channels`]).
+    pub fn list_channels() -> Self {
+        Self {
+            type_: "list_channels",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to set up a channel of `channel_type` (`email`) with `values`
+    /// (setting name to value; they may hold passwords and are never logged or echoed).
+    /// Applies after a restart. Same access rules as [`Self::add_model_preset`]. The
+    /// reply is a `channels` event naming the change, or a `setting_error` event of kind
+    /// `channel_add`.
+    pub fn add_channel(
+        channel_type: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "add_channel",
+            channel_type: Some(channel_type.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to change settings of the channel of `channel_type`; a blank
+    /// password keeps the stored one. The reply is a `channels` event or a
+    /// `setting_error` of kind `channel_config`.
+    pub fn set_channel_config(
+        channel_type: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "set_channel_config",
+            channel_type: Some(channel_type.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to remove the channel of `channel_type` with all its settings.
+    /// The reply is a `channels` event or a `setting_error` of kind `channel_delete`.
+    pub fn delete_channel(channel_type: impl Into<String>) -> Self {
+        Self {
+            type_: "delete_channel",
+            channel_type: Some(channel_type.into()),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway which models `provider` offers (`auto`: the provider it would pick),
     /// using the credentials in its `config.json`. Same access rules as
     /// [`Self::add_model_preset`]. The reply is a `provider_models` event (see
@@ -705,6 +767,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -756,6 +819,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -792,6 +856,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -830,6 +895,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -866,6 +932,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -908,6 +975,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -944,6 +1012,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -976,6 +1045,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -1011,6 +1081,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -1048,6 +1119,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -1112,6 +1184,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -1153,6 +1226,7 @@ impl ClientEnvelope {
             values: None,
             provider: None,
             kind: None,
+            channel_type: None,
             webui: true,
         }
     }
@@ -1489,6 +1563,16 @@ pub enum ServerEvent {
         new_provider_form: Option<ToolConfigSummary>,
         changed: Option<ProviderChange>,
     },
+    /// Reply to [`ClientEnvelope::list_channels`] and to every successful channel write:
+    /// one section per channel type (forms only when `can_modify`) and, after a write,
+    /// what changed and whether a restart is needed to apply it. Never carries a
+    /// password. Not scoped to any one `chat_id`.
+    Channels {
+        channels: Vec<ChannelSummary>,
+        can_modify: bool,
+        changed: Option<ChannelChange>,
+        restart_required: bool,
+    },
     /// Reply to [`ClientEnvelope::list_provider_models`]: the provider's models sorted by
     /// id, or — when refused or failed — an empty list with `detail` (a stable code:
     /// `access_denied`, `admin_required`, `missing_provider`, `config_error`,
@@ -1710,6 +1794,7 @@ impl ServerEvent {
             | ServerEvent::McpServerAdded { .. }
             | ServerEvent::ModelPresets { .. }
             | ServerEvent::Providers { .. }
+            | ServerEvent::Channels { .. }
             | ServerEvent::ProviderModels { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
@@ -2151,6 +2236,18 @@ struct ProvidersWire {
 }
 
 #[derive(Deserialize)]
+struct ChannelsWire {
+    #[serde(default)]
+    channels: Vec<ChannelSummary>,
+    #[serde(default)]
+    can_modify: bool,
+    #[serde(default)]
+    changed: Option<ChannelChange>,
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
 struct ProviderModelsWire {
     #[serde(default)]
     provider: String,
@@ -2524,6 +2621,12 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             can_modify: w.can_modify,
             new_provider_form: w.new_provider_form,
             changed: w.changed,
+        }),
+        "channels" => decode::<ChannelsWire>(&value).map(|w| ServerEvent::Channels {
+            channels: w.channels,
+            can_modify: w.can_modify,
+            changed: w.changed,
+            restart_required: w.restart_required,
         }),
         "provider_models" => {
             decode::<ProviderModelsWire>(&value).map(|w| ServerEvent::ProviderModels {
@@ -4054,6 +4157,88 @@ mod tests {
             assert!(value.get("values").is_none(), "{type_}");
             assert!(value.get("kind").is_none(), "{type_}");
         }
+    }
+
+    #[test]
+    fn client_envelopes_of_the_channels_page_serialize_their_fields() {
+        let values = HashMap::from([("imapHost".to_string(), serde_json::json!("imap.x"))]);
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::add_channel("email", values.clone())).unwrap(),
+            serde_json::json!({
+                "type": "add_channel",
+                "channelType": "email",
+                "values": {"imapHost": "imap.x"},
+                "webui": true,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_channel_config("email", values)).unwrap(),
+            serde_json::json!({
+                "type": "set_channel_config",
+                "channelType": "email",
+                "values": {"imapHost": "imap.x"},
+                "webui": true,
+            })
+        );
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::delete_channel("email")).unwrap(),
+            serde_json::json!({"type": "delete_channel", "channelType": "email", "webui": true})
+        );
+        let list = serde_json::to_value(ClientEnvelope::list_channels()).unwrap();
+        assert_eq!(
+            list,
+            serde_json::json!({"type": "list_channels", "webui": true})
+        );
+    }
+
+    #[test]
+    fn channels_decodes_sections_forms_and_the_change() {
+        let event = parse_server_event(
+            r#"{"event":"channels","can_modify":true,"restart_required":true,
+                "changed":{"action":"added","channelType":"email"},
+                "channels":[
+                  {"channel_type":"email","title":"Email","configured":true,"enabled":true,
+                   "summary":"bot@example.com · imap.example.com",
+                   "notes":["Consent not granted: the channel will not start."],
+                   "form":{"name":"email","fields":[
+                     {"name":"imapHost","label":"IMAP host","kind":"text","secret":false,
+                      "value":"imap.example.com","group":"Incoming mail (IMAP)"}]}}
+                ]}"#,
+        )
+        .unwrap();
+        assert_eq!(event.chat_id(), None);
+        let ServerEvent::Channels {
+            channels,
+            can_modify,
+            changed,
+            restart_required,
+        } = event
+        else {
+            panic!("expected Channels");
+        };
+        assert!(can_modify && restart_required);
+        let changed = changed.unwrap();
+        assert_eq!(
+            (changed.action.as_str(), changed.channel_type.as_str()),
+            ("added", "email")
+        );
+        let email = &channels[0];
+        assert!(email.configured && email.enabled && email.new_form.is_none());
+        assert_eq!(email.notes.len(), 1);
+        let form = email.form.as_ref().unwrap();
+        assert_eq!(form.fields[0].group, "Incoming mail (IMAP)");
+
+        let plain = parse_server_event(r#"{"event":"channels"}"#).unwrap();
+        let ServerEvent::Channels {
+            channels,
+            changed,
+            can_modify,
+            restart_required,
+        } = plain
+        else {
+            panic!("expected Channels");
+        };
+        assert!(channels.is_empty() && changed.is_none() && !can_modify && !restart_required);
     }
 
     #[test]

@@ -350,6 +350,7 @@ mod tests {
             configured: false,
             value: None,
             default: None,
+            group: String::new(),
         }
     }
 

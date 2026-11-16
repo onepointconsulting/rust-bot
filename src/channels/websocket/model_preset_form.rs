@@ -29,8 +29,8 @@ use super::config_toggles::{
     ToggleError, child_object_mut, existing_or_default_key, is_valid_name, parse_root, render,
 };
 use super::settings_form::{
-    SettingSpellings, check_placeholders, form_fields, process_env_is_set, schema_properties,
-    store_value, stored_value,
+    SettingSpellings, UNSET_VARIABLE_EXPLANATION, check_placeholders, form_fields,
+    process_env_is_set, schema_properties, store_value, stored_value,
 };
 use crate::agent::tools::tool_settings_api::{ToolSettingsSummary, check_value, field_kind};
 use crate::config::loader::resolve_env_vars_in;
@@ -64,9 +64,6 @@ const REASONING_EFFORT: &str = "reasoningEffort";
 
 /// Label of the read-only row that stands for the flat `agents.*` settings.
 pub const DEFAULT_PRESET_LABEL: &str = "Default (agent settings)";
-
-/// What to do about a `${VAR}` placeholder whose variable is not set; shown after its name.
-const UNSET_VARIABLE_EXPLANATION: &str = "which is not set in the environment of the process running rust-bot. Set the variable there before starting rust-bot, or write the value here directly.";
 
 /// Why the active preset cannot be deleted.
 const ACTIVE_PRESET_IN_USE: &str = "it is the active preset. Activate another one first.";

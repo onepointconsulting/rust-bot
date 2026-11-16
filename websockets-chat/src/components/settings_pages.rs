@@ -1,5 +1,6 @@
 //! The pages of the Settings dialog: "Models" (the model presets, see
-//! [`super::model_presets_page`]), and "Tools" and "MCP Servers": every built-in tool, and
+//! [`super::model_presets_page`]), "Providers" ([`super::providers_page`]), "Channels"
+//! ([`super::channels_page`]), and "Tools" and "MCP Servers": every built-in tool, and
 //! every MCP server in `config.json`, each with a switch that turns it on or off globally.
 //!
 //! Switching writes `config.json` on the gateway (which backs the old file up) but the
@@ -15,16 +16,17 @@
 //! The row ordering, filtering and labelling are plain functions so they are
 //! unit-testable on the host target without Leptos.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use chat_ui::models::{
-    McpServerSettingSummary, ModelPresetSummary, ProviderSummary, ToolConfigSummary,
-    ToolFieldSummary, ToolSettingSummary,
+    ChannelSummary, McpServerSettingSummary, ModelPresetSummary, ProviderSummary,
+    ToolConfigSummary, ToolFieldSummary, ToolSettingSummary,
 };
 use leptos::prelude::*;
 
 use super::add_item_panel::{AddItemButton, AddItemPanel};
 use super::add_mcp_server_panel::{ADD_BUSY_KEY, ADD_BUTTON_LABEL, ADD_PANEL_TITLE, NAME_HINT};
+use super::channels_page::ChannelsSection;
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
@@ -52,6 +54,8 @@ pub enum SettingsPage {
     Models,
     /// The LLM providers: API keys, endpoints and protocols.
     Providers,
+    /// The chat channels the bot can be reached through (email, ...).
+    Channels,
     Tools,
     /// The settings that apply to every tool (workspace restriction, confirmation, SSRF
     /// whitelist), kept apart from the long tool list.
@@ -61,9 +65,10 @@ pub enum SettingsPage {
 
 impl SettingsPage {
     /// All pages, in menu order.
-    pub const ALL: [SettingsPage; 5] = [
+    pub const ALL: [SettingsPage; 6] = [
         SettingsPage::Models,
         SettingsPage::Providers,
+        SettingsPage::Channels,
         SettingsPage::Tools,
         SettingsPage::ToolSafety,
         SettingsPage::McpServers,
@@ -74,6 +79,7 @@ impl SettingsPage {
         match self {
             Self::Models => "Models",
             Self::Providers => "Providers",
+            Self::Channels => "Channels",
             Self::Tools => "Tools",
             Self::ToolSafety => "Tool Safety",
             Self::McpServers => "MCP Servers",
@@ -85,6 +91,7 @@ impl SettingsPage {
         match self {
             Self::Models => "Create model presets and choose which one the agent uses. API keys are set per provider on the Providers page.",
             Self::Providers => "API keys, endpoints and protocols of the LLM providers",
+            Self::Channels => "The channels the bot can be reached through besides this chat. Changes apply after a restart.",
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
             Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
             Self::McpServers => "Switch the configured MCP servers on or off, or change how they are started under Settings. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
@@ -96,6 +103,7 @@ impl SettingsPage {
         match self {
             Self::Models => "model presets",
             Self::Providers => "providers",
+            Self::Channels => "channels",
             Self::Tools => "tools",
             Self::ToolSafety => "settings",
             Self::McpServers => "MCP servers",
@@ -429,6 +437,17 @@ pub struct SettingsPanel {
     /// The model lists asked for by the preset forms, by provider (see
     /// [`super::model_picker`]); kept while the dialog is open.
     pub provider_models: RwSignal<HashMap<String, ProviderModelsState>>,
+    /// The sections of the Channels page, one per channel type.
+    pub channels: RwSignal<Vec<ChannelSummary>>,
+    pub channels_loaded: RwSignal<bool>,
+    /// The channel type whose edit form is open, if any.
+    pub editing_channel: RwSignal<Option<String>>,
+    /// The channel type whose create form is open (in place of its button), if any.
+    pub adding_channel: RwSignal<Option<String>>,
+    /// The channel type whose "Delete …?" question is showing, if any.
+    pub confirm_delete_channel: RwSignal<Option<String>>,
+    /// The channel types whose section is collapsed; every section starts expanded.
+    pub collapsed_channel_sections: RwSignal<HashSet<String>>,
     /// The unsaved drafts of each row's settings form. Kept here, not in the form, since
     /// the list rebuilds its rows on every change (switch, save, search); reference
     /// counted signals so a rebuilt row keeps editing the same drafts.
@@ -469,6 +488,12 @@ impl SettingsPanel {
             confirm_delete_preset: RwSignal::new(None),
             model_notice: RwSignal::new(None),
             provider_models: RwSignal::new(HashMap::new()),
+            channels: RwSignal::new(Vec::new()),
+            channels_loaded: RwSignal::new(false),
+            editing_channel: RwSignal::new(None),
+            adding_channel: RwSignal::new(None),
+            confirm_delete_channel: RwSignal::new(None),
+            collapsed_channel_sections: RwSignal::new(HashSet::new()),
             form_drafts: StoredValue::new(HashMap::new()),
         }
     }
@@ -504,8 +529,15 @@ impl SettingsPanel {
     /// Close the "Add …" panel of the open page and forget its last error.
     pub fn close_add_panel(&self) {
         self.adding.set(false);
+        self.adding_channel.set(None);
         self.add_error.set(None);
         self.add_provider_kind.set(0);
+    }
+
+    /// Close the edit form and the delete question of the Channels page.
+    pub fn close_channel_panels(&self) {
+        self.editing_channel.set(None);
+        self.confirm_delete_channel.set(None);
     }
 
     /// Whether switches and forms accept changes right now (see [`changes_allowed`]).
@@ -522,7 +554,7 @@ impl SettingsPanel {
     fn open_rows(&self) -> Vec<SettingRow> {
         match self.page.get() {
             // The model presets have their own rows.
-            SettingsPage::Models | SettingsPage::Providers => Vec::new(),
+            SettingsPage::Models | SettingsPage::Providers | SettingsPage::Channels => Vec::new(),
             // The general settings have their own page.
             SettingsPage::Tools => self
                 .tools
@@ -546,6 +578,7 @@ impl SettingsPanel {
         match self.page.get() {
             SettingsPage::Models => self.model_presets_loaded.get(),
             SettingsPage::Providers => self.providers_loaded.get(),
+            SettingsPage::Channels => self.channels_loaded.get(),
             SettingsPage::Tools | SettingsPage::ToolSafety => self.tools_loaded.get(),
             SettingsPage::McpServers => self.mcp_servers_loaded.get(),
         }
@@ -579,6 +612,9 @@ impl SettingsPanel {
         self.confirm_delete_provider.set(None);
         self.provider_notice.set(None);
         self.provider_models.set(HashMap::new());
+        self.channels.set(Vec::new());
+        self.channels_loaded.set(false);
+        self.close_channel_panels();
         self.form_drafts.update_value(HashMap::clear);
     }
 }
@@ -624,6 +660,12 @@ pub struct SettingsActions {
     pub on_delete_provider: Callback<String>,
     /// Ask which models one provider offers (by provider name), for the preset forms.
     pub on_list_provider_models: Callback<String>,
+    /// Set up a channel: `(channel type, settings)`.
+    pub on_add_channel: Callback<ToolConfigChange>,
+    /// Save the changed settings of one channel: `(channel type, settings)`.
+    pub on_save_channel: Callback<ToolConfigChange>,
+    /// Delete one channel (by channel type).
+    pub on_delete_channel: Callback<String>,
     /// Restart the whole bot process so the saved changes take effect.
     pub on_restart: Callback<()>,
 }
@@ -643,6 +685,7 @@ fn save_callback_for(page: SettingsPage, actions: SettingsActions) -> Callback<T
     match page {
         SettingsPage::Models => actions.on_save_model_preset,
         SettingsPage::Providers => actions.on_save_provider,
+        SettingsPage::Channels => actions.on_save_channel,
         SettingsPage::McpServers => actions.on_save_mcp_config,
         SettingsPage::Tools | SettingsPage::ToolSafety => actions.on_save_config,
     }
@@ -964,10 +1007,16 @@ pub fn SettingsPageView(
             <Show when=move || page() == SettingsPage::Providers>
                 <ProvidersSection panel=panel actions=actions />
             </Show>
+            <Show when=move || page() == SettingsPage::Channels>
+                <ChannelsSection panel=panel actions=actions />
+            </Show>
             <Show when=move || {
                 !matches!(
                     page(),
-                    SettingsPage::ToolSafety | SettingsPage::Models | SettingsPage::Providers
+                    SettingsPage::ToolSafety
+                        | SettingsPage::Models
+                        | SettingsPage::Providers
+                        | SettingsPage::Channels
                 )
             }>
             <input
@@ -1269,6 +1318,7 @@ mod tests {
                 configured: stored.is_some(),
                 value: stored.map(serde_json::Value::from),
                 default: Some(serde_json::Value::from(30)),
+                group: String::new(),
             }],
             ..form(name)
         }
@@ -1402,6 +1452,30 @@ mod tests {
         assert!(panel.editing_preset.get_untracked().is_none());
         assert!(panel.confirm_delete_preset.get_untracked().is_none());
         assert!(panel.model_notice.get_untracked().is_none());
+    }
+
+    #[test]
+    fn clearing_the_panel_drops_the_channels_page_state_but_keeps_collapsed_sections() {
+        let panel = SettingsPanel::new();
+        panel.channels_loaded.set(true);
+        panel.editing_channel.set(Some("email".to_string()));
+        panel.adding_channel.set(Some("email".to_string()));
+        panel.confirm_delete_channel.set(Some("email".to_string()));
+        panel
+            .collapsed_channel_sections
+            .update(|collapsed| _ = collapsed.insert("email".to_string()));
+
+        panel.clear();
+
+        assert!(!panel.channels_loaded.get_untracked());
+        assert!(panel.channels.get_untracked().is_empty());
+        assert!(panel.editing_channel.get_untracked().is_none());
+        assert!(panel.adding_channel.get_untracked().is_none());
+        assert!(panel.confirm_delete_channel.get_untracked().is_none());
+        assert!(panel
+            .collapsed_channel_sections
+            .get_untracked()
+            .contains("email"));
     }
 
     #[test]
@@ -1548,8 +1622,17 @@ mod tests {
         let titles: Vec<&str> = SettingsPage::ALL.iter().map(|p| p.title()).collect();
         assert_eq!(
             titles,
-            vec!["Models", "Providers", "Tools", "Tool Safety", "MCP Servers"]
+            vec![
+                "Models",
+                "Providers",
+                "Channels",
+                "Tools",
+                "Tool Safety",
+                "MCP Servers"
+            ]
         );
+        assert_eq!(SettingsPage::Channels.noun(), "channels");
+        assert!(SettingsPage::Channels.subtitle().contains("restart"));
         assert_eq!(SettingsPage::default(), SettingsPage::Models);
         assert!(SettingsPage::Models.subtitle().contains("API keys"));
     }

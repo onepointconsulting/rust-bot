@@ -239,6 +239,7 @@ mod tests {
             configured: true,
             value: Some(value),
             default: None,
+            group: String::new(),
         }
     }
 

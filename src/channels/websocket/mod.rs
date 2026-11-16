@@ -1,3 +1,4 @@
+pub mod channel_form;
 pub mod config_file;
 pub mod config_toggles;
 pub mod mcp_server_form;
