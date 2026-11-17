@@ -323,6 +323,64 @@ mod tests {
         assert_eq!(claims.role, UserRole::Admin);
     }
 
+    /// Validation options matching the ones the tests mint tokens with.
+    fn test_validation_opts() -> JwtValidationOpts {
+        JwtValidationOpts {
+            iss: "rust-bot".to_string(),
+            aud: String::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn login_uses_role_edited_on_disk() {
+        use crate::api::user_registry::{User, hash_password};
+
+        let dir = tempfile::tempdir().unwrap();
+        let keys = generate_jwt_keypair(dir.path(), false).unwrap();
+        let users_path = dir.path().join("users.json");
+        let mut registry = JsonUserRegistry::open(&users_path).unwrap();
+        registry
+            .register_user(&User {
+                email: "a@b.com".to_string(),
+                password_hash: Some(hash_password("correct horse".to_string()).unwrap()),
+                token: String::new(),
+                role: UserRole::User,
+            })
+            .unwrap();
+        let state = Arc::new(LoginState {
+            jwt_auth: Some(JwtAuthState {
+                public_key_pem: Arc::new(std::fs::read(&keys.public_key_path).unwrap()),
+                private_key_path: keys.private_key_path.display().to_string(),
+                opts: test_validation_opts(),
+            }),
+            user_registry: Arc::new(Mutex::new(registry)),
+            token_purpose: "webui".to_string(),
+            strapi_url: None,
+        });
+
+        // Operator promotes the user by editing the file while the gateway runs.
+        let mut document: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&users_path).unwrap()).unwrap();
+        document["a@b.com"]["role"] = serde_json::Value::String("admin".to_string());
+        std::fs::write(&users_path, document.to_string()).unwrap();
+
+        let response = login(State(state), Json(request("a@b.com", "correct horse")))
+            .await
+            .unwrap();
+
+        let claims = crate::security::jwt::validate_jwt_token_from_path(
+            &response.token,
+            &keys.public_key_path,
+            &test_validation_opts(),
+        )
+        .unwrap();
+        assert_eq!(claims.role, UserRole::Admin);
+        let reopened = JsonUserRegistry::open(&users_path).unwrap();
+        let stored = reopened.get_user_by_email("a@b.com").unwrap();
+        assert_eq!(stored.role, UserRole::Admin);
+        assert_eq!(stored.token, response.token);
+    }
+
     #[tokio::test]
     async fn auth_config_includes_package_version() {
         let response = auth_config(State(AuthConfigResponse {

@@ -6,11 +6,17 @@
 //! credentials. Tokens are minted by `rust-bot generate-jwt-token` at
 //! registration time and refreshed on each successful `/v1/login`. An
 //! Argon2id password hash is stored alongside the token for login.
+//!
+//! The JSON file is the source of truth: [`JsonUserRegistry`] re-reads it on
+//! every operation, so an operator may edit it by hand (for example to promote
+//! a user to `"role": "admin"`) while the gateway is running. Writes re-read the
+//! file first and only replace the affected entry, then save atomically, so a
+//! hand edit is neither ignored nor overwritten by the next sign-in.
 
 use std::collections::HashMap;
 use std::fmt;
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use argon2::Argon2;
 use argon2::password_hash::{PasswordHash, PasswordHasher, PasswordVerifier, SaltString};
@@ -18,6 +24,7 @@ use rand_core::OsRng;
 use serde::{Deserialize, Serialize};
 
 use crate::security::jwt::UserRole;
+use crate::utils::fs::write_atomic;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct User {
@@ -123,12 +130,21 @@ pub trait UserRegistry {
 /// `{ "email": { "token": "...", "password_hash": "...", "role": "admin" } }`. `password_hash`
 /// is omitted when absent (legacy entries registered before a password was
 /// required).
+///
+/// The file is re-read on every lookup and before every write, so changes made
+/// to it by hand while the process runs take effect immediately and are kept.
+/// A registry built with [`JsonUserRegistry::empty`] has no file and lives
+/// purely in memory.
 pub struct JsonUserRegistry {
+    /// Location of the JSON file; empty for the in-memory [`JsonUserRegistry::empty`] registry.
     path: PathBuf,
+    /// Working copy of the registry. For a file-backed registry it is reloaded
+    /// from disk before each write; it is only authoritative for the in-memory registry.
     users: HashMap<String, StoredUser>,
 }
 
 impl JsonUserRegistry {
+    /// Create an in-memory registry that is not backed by any file.
     pub fn empty() -> Self {
         Self {
             path: PathBuf::new(),
@@ -140,26 +156,61 @@ impl JsonUserRegistry {
     /// exists. A missing file is treated as an empty registry.
     pub fn open(path: impl Into<PathBuf>) -> Result<Self, UserRegistryError> {
         let path = path.into();
-        let users = match fs::read_to_string(&path) {
-            Ok(contents) => serde_json::from_str(&contents)?,
-            Err(err) if err.kind() == std::io::ErrorKind::NotFound => HashMap::new(),
-            Err(err) => return Err(err.into()),
-        };
+        let users = load_users_from_disk(&path)?;
         Ok(Self { path, users })
     }
 
-    fn save(&self) -> Result<(), UserRegistryError> {
-        if let Some(parent) = self.path.parent()
-            && !parent.as_os_str().is_empty()
-        {
-            fs::create_dir_all(parent)?;
+    /// Whether this registry has no backing file (see [`JsonUserRegistry::empty`]).
+    fn is_in_memory(&self) -> bool {
+        self.path.as_os_str().is_empty()
+    }
+
+    /// The current set of users: read fresh from disk for a file-backed
+    /// registry, or a copy of the in-memory map otherwise.
+    fn current_users(&self) -> Result<HashMap<String, StoredUser>, UserRegistryError> {
+        if self.is_in_memory() {
+            Ok(self.users.clone())
+        } else {
+            load_users_from_disk(&self.path)
         }
+    }
+
+    /// Replace the working copy with the current on-disk contents, so a
+    /// following write only changes the entry it targets.
+    fn refresh(&mut self) -> Result<(), UserRegistryError> {
+        self.users = self.current_users()?;
+        Ok(())
+    }
+
+    /// Write the working copy to the backing file atomically (see
+    /// [`write_atomic`]), so readers and editors never see a half-written
+    /// file and a private (`0600`) file keeps its permissions.
+    fn save(&self) -> Result<(), UserRegistryError> {
         let contents = serde_json::to_string_pretty(&self.users)?;
-        fs::write(&self.path, contents)?;
+        write_atomic(&self.path, contents.as_bytes())?;
         Ok(())
     }
 }
 
+/// Parse the user map stored at `path`. A missing file yields an empty map.
+fn load_users_from_disk(path: &Path) -> Result<HashMap<String, StoredUser>, UserRegistryError> {
+    match fs::read_to_string(path) {
+        Ok(contents) => Ok(serde_json::from_str(&contents)?),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(HashMap::new()),
+        Err(err) => Err(err.into()),
+    }
+}
+
+/// Convert a public [`User`] into its on-disk entry (the email is the map key).
+fn to_stored_user(user: &User) -> StoredUser {
+    StoredUser {
+        token: user.token.clone(),
+        password_hash: user.password_hash.clone(),
+        role: user.role,
+    }
+}
+
+/// Convert an on-disk entry keyed by `email` into the public [`User`] shape.
 fn to_user(email: &str, stored: &StoredUser) -> User {
     User {
         email: email.to_string(),
@@ -171,25 +222,19 @@ fn to_user(email: &str, stored: &StoredUser) -> User {
 
 impl UserRegistry for JsonUserRegistry {
     fn register_user(&mut self, user: &User) -> Result<(), Box<dyn std::error::Error>> {
+        self.refresh()?;
         if self.users.contains_key(&user.email) {
             return Err(Box::new(UserRegistryError::AlreadyExists(
                 user.email.clone(),
             )));
         }
-        self.users.insert(
-            user.email.clone(),
-            StoredUser {
-                token: user.token.clone(),
-                password_hash: user.password_hash.clone(),
-                role: user.role,
-            },
-        );
+        self.users.insert(user.email.clone(), to_stored_user(user));
         self.save()?;
         Ok(())
     }
 
     fn get_user_by_email(&self, user_email: &str) -> Result<User, Box<dyn std::error::Error>> {
-        self.users
+        self.current_users()?
             .get(user_email)
             .map(|stored| to_user(user_email, stored))
             .ok_or_else(|| {
@@ -200,13 +245,14 @@ impl UserRegistry for JsonUserRegistry {
 
     fn get_all_users(&self) -> Result<Vec<User>, Box<dyn std::error::Error>> {
         Ok(self
-            .users
+            .current_users()?
             .iter()
             .map(|(email, stored)| to_user(email, stored))
             .collect())
     }
 
     fn delete_user(&mut self, user_email: &str) -> Result<(), Box<dyn std::error::Error>> {
+        self.refresh()?;
         if self.users.remove(user_email).is_none() {
             return Err(Box::new(UserRegistryError::NotFound(
                 user_email.to_string(),
@@ -221,20 +267,13 @@ impl UserRegistry for JsonUserRegistry {
         user_email: &str,
         user: &User,
     ) -> Result<(), Box<dyn std::error::Error>> {
-        if !self.users.contains_key(user_email) {
+        self.refresh()?;
+        if self.users.remove(user_email).is_none() {
             return Err(Box::new(UserRegistryError::NotFound(
                 user_email.to_string(),
             )));
         }
-        self.users.remove(user_email);
-        self.users.insert(
-            user.email.clone(),
-            StoredUser {
-                token: user.token.clone(),
-                password_hash: user.password_hash.clone(),
-                role: user.role,
-            },
-        );
+        self.users.insert(user.email.clone(), to_stored_user(user));
         self.save()?;
         Ok(())
     }
@@ -459,5 +498,127 @@ mod tests {
         let reopened = JsonUserRegistry::open(&path).unwrap();
         let fetched = reopened.get_user_by_email("bob@example.com").unwrap();
         assert_eq!(fetched.password_hash, None);
+    }
+
+    /// Rewrite the role of `email` directly in the JSON file, as an operator
+    /// editing `users.json` by hand would.
+    fn edit_role_on_disk(path: &Path, email: &str, role: &str) {
+        let mut document: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(path).unwrap()).unwrap();
+        document[email]["role"] = serde_json::Value::String(role.to_string());
+        fs::write(path, serde_json::to_string_pretty(&document).unwrap()).unwrap();
+    }
+
+    /// A password-less, non-admin user with the given email and token.
+    fn plain_user(email: &str, token: &str) -> User {
+        User {
+            email: email.to_string(),
+            password_hash: None,
+            token: token.to_string(),
+            role: UserRole::User,
+        }
+    }
+
+    #[test]
+    fn external_role_edit_is_seen_by_get_user_by_email() {
+        let dir = tempdir().unwrap();
+        let path = registry_path(&dir);
+        let mut registry = JsonUserRegistry::open(&path).unwrap();
+        registry
+            .register_user(&plain_user("alice@example.com", "token-abc"))
+            .unwrap();
+
+        edit_role_on_disk(&path, "alice@example.com", "admin");
+
+        let fetched = registry.get_user_by_email("alice@example.com").unwrap();
+        assert_eq!(fetched.role, UserRole::Admin);
+        let all = registry.get_all_users().unwrap();
+        assert_eq!(all[0].role, UserRole::Admin);
+    }
+
+    #[test]
+    fn update_user_preserves_external_edits_to_other_entries() {
+        let dir = tempdir().unwrap();
+        let path = registry_path(&dir);
+        let mut registry = JsonUserRegistry::open(&path).unwrap();
+        registry
+            .register_user(&plain_user("alice@example.com", "token-a"))
+            .unwrap();
+        registry
+            .register_user(&plain_user("bob@example.com", "token-b"))
+            .unwrap();
+
+        edit_role_on_disk(&path, "bob@example.com", "admin");
+        registry
+            .update_user(
+                "alice@example.com",
+                &plain_user("alice@example.com", "token-a2"),
+            )
+            .unwrap();
+
+        let reopened = JsonUserRegistry::open(&path).unwrap();
+        assert_eq!(
+            reopened.get_user_by_email("bob@example.com").unwrap().role,
+            UserRole::Admin
+        );
+        assert_eq!(
+            reopened
+                .get_user_by_email("alice@example.com")
+                .unwrap()
+                .token,
+            "token-a2"
+        );
+    }
+
+    #[test]
+    fn register_user_sees_entries_added_on_disk() {
+        let dir = tempdir().unwrap();
+        let path = registry_path(&dir);
+        let mut registry = JsonUserRegistry::open(&path).unwrap();
+        fs::write(&path, r#"{"carol@example.com": {"token": "t"}}"#).unwrap();
+
+        let err = registry
+            .register_user(&plain_user("carol@example.com", "other"))
+            .unwrap_err();
+        assert!(err.to_string().contains("already registered"));
+    }
+
+    #[test]
+    fn save_leaves_no_temporary_file_behind() {
+        let dir = tempdir().unwrap();
+        let path = registry_path(&dir);
+        let mut registry = JsonUserRegistry::open(&path).unwrap();
+        registry
+            .register_user(&plain_user("alice@example.com", "token-abc"))
+            .unwrap();
+        registry
+            .update_user(
+                "alice@example.com",
+                &plain_user("alice@example.com", "token-xyz"),
+            )
+            .unwrap();
+
+        let file_names: Vec<_> = fs::read_dir(dir.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(file_names, vec![std::ffi::OsString::from("users.json")]);
+    }
+
+    #[test]
+    fn in_memory_registry_works_without_a_file() {
+        let mut registry = JsonUserRegistry::empty();
+        assert!(registry.get_all_users().unwrap().is_empty());
+        registry.users.insert(
+            "alice@example.com".to_string(),
+            to_stored_user(&plain_user("alice@example.com", "token-abc")),
+        );
+        assert_eq!(
+            registry
+                .get_user_by_email("alice@example.com")
+                .unwrap()
+                .token,
+            "token-abc"
+        );
     }
 }
