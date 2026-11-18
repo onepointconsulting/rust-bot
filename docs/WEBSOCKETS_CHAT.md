@@ -109,7 +109,7 @@ The Settings dialog opens on its **Models** page. It lists the model presets of 
 - **Delete** a preset. Refused for the active preset and for the one Dream uses (`agents.dream.dreamModelPreset`).
 - **+ Add model preset** with a name and the same form. Settings left blank get their defaults, so the file shows the whole preset.
 
-API keys are not edited here; they stay under `providers.<name>` in the configuration file. A row whose provider has no key is flagged. Read-only connections (remote, anonymous or non-admin) see the rows without buttons or forms.
+API keys are set on the [Providers page](#settings--providers). A row whose provider has no key (stored or in its environment variable) is flagged. Read-only connections (remote, anonymous or non-admin) see the rows without buttons or forms.
 
 Every change is validated like `check-config` before it is written, and the previous file is backed up next to it as `config_<timestamp>.json.bck`.
 
@@ -155,9 +155,95 @@ Every successful write, and the list, is answered with one event:
 | `anthropic` | `GET {apiBase}/v1/models` with `x-api-key` and `anthropic-version`, every page followed |
 | `azure_openai` | Not listable: presets name deployments, so type the name. |
 
+A provider with `providerBackEnd` set is listed the way that API lists models: `anthropic` like the `anthropic` row, `openai_compat` and `openai_responses` like the first row.
+
 ```json
 {"event": "provider_models", "provider": "together",
  "models": [{"id": "meta-llama/Llama-4-70B", "display_name": "Llama 4 70B", "context_length": 131072, "model_type": "chat"}]}
 ```
 
 `models` is sorted by `id` without duplicates; `display_name`, `context_length` and `model_type` (`chat`, `embedding`, `image`, …) are `null` when the provider does not report them, and Gemini's `models/` prefix is dropped. When refused or failed, the reply is `{"event": "provider_models", "provider": "…", "detail": "…", "error": "…"}` with `detail` `access_denied`, `admin_required`, `child_agent_config`, `missing_provider`, `config_error` or `listing_failed` (unknown provider, unset `${VAR}`, timeout after 15 s, non-2xx answer: `error` includes the status and the provider's message).
+
+## Settings → Providers
+
+The **Providers** page (after Models) lists every LLM provider of `config.json`: the dedicated ones (`providers.openai`, `anthropic`, `openrouter`, `together`; the legacy `providers.custom` slot shows as a custom provider named `custom`) and the named custom ones (`providers.customProviders.<name>`), with **Edit** and **Delete** per row. A signed-in, local administrator can:
+
+- **+ Add provider**, with a two-way toggle:
+  - **Dedicated model provider.** Pick OpenAI, Anthropic, OpenRouter or Together AI and enter the API key. A blank key means "use the provider's environment variable" (`OPENAI_API_KEY`, `ANTHROPIC_API_KEY`, …); an orange warning shows while that variable is not set. A collapsible **Customized settings** section holds the Base URL (the default is the placeholder), the API protocol and extra headers. A provider added with nothing entered gets its default Base URL written, so that it has a row.
+  - **Custom model provider.** A name, the Base URL (required), the API protocol (OpenAI Chat Completions, OpenAI Responses or Anthropic Messages), the API key and extra headers. **Create provider** adds it under `providers.customProviders`. Model presets select it by that name in their provider list; its models are listed with the protocol chosen here. Names follow the rules of preset names and may not be `auto`, `default` or the name of a built-in provider.
+- **Edit** a provider: the same fields with the name fixed. **Forget stored key** clears the stored key so the environment variable applies again.
+- **Delete** a provider. A custom provider is removed; a dedicated slot is reset to an empty key. Refused while `agents.provider` or a model preset names the provider; the message lists who uses it.
+
+**Keys never reach the browser.** The rows and forms say only whether a key is stored; a blank key field keeps the stored one, and the gateway never logs submitted values. Extra headers are sent in clear, like MCP server headers, and only to local administrators. Read-only connections (remote, anonymous or non-admin) see the rows without buttons, forms or header values.
+
+Changes **apply live**. The gateway validates and saves `config.json` (the previous file is backed up as `config_<timestamp>.json.bck`), then rebuilds its providers: the next message of every chat uses the new key, Base URL, headers and protocol. A turn already running finishes with the settings it started with. If the file was saved but the live switch failed (for example a `${VAR}` that is not set), the `setting_error` has `detail` `saved_reload_failed`: restart rust-bot to apply it. Three things are read only at startup and still need a restart: the transcription key (`channels/manager.rs`), the environment forwarded to child agents and the secrets extracted for Docker.
+
+`auto` is unchanged: it picks the first of openai, openrouter, custom, anthropic, together that has a *stored* key, and ignores custom providers and keys that are only in the environment. Name the provider in the preset to use those.
+
+### Protocol
+
+| Client envelope | Fields | Effect |
+|---|---|---|
+| `list_providers` | – | Reply with `providers`. |
+| `add_provider` | `kind` (`dedicated` or `custom`), `name`, `values` | Add the provider. A dedicated `name` is one of the four and not yet configured; a custom one is new, valid and not reserved. |
+| `set_provider_config` | `name`, `values` | Change the submitted settings. A blank `apiKey` keeps the stored key; a blank `apiBase`, empty `extraHeaders` or `providerBackEnd: ""` (automatic) removes the setting. |
+| `forget_provider_key` | `name` | Clear the stored key. |
+| `delete_provider` | `name` | Remove or reset the provider; refused while in use. |
+
+`values` maps `apiKey`, `apiBase`, `extraHeaders` (a name -> value map) and `providerBackEnd` (`openai_compat`, `openai_responses`, `anthropic` or empty) to values. Every success, and the list, is answered with one event:
+
+```json
+{"event": "providers",
+ "providers": [{"name": "anthropic", "kind": "dedicated", "label": "Anthropic", "api_base": null,
+                "default_api_base": "https://api.anthropic.com", "backend": null, "backend_default": "anthropic",
+                "api_key_configured": false, "env_var": "ANTHROPIC_API_KEY", "env_var_set": false,
+                "used_by": ["agents.provider"], "deletable": false, "delete_blocked_reason": "…",
+                "form": {"…": "…"}}],
+ "dedicated_choices": [{"name": "openai", "label": "OpenAI", "env_var": "OPENAI_API_KEY", "env_var_set": true,
+                        "default_api_base": "https://api.openai.com/v1", "configured": false}],
+ "backend_choices": [{"value": "", "label": "Automatic"}],
+ "can_modify": true,
+ "new_provider_form": {"…": "…"},
+ "changed": {"action": "added", "name": "my-relay"}}
+```
+
+`changed` (`action`: `added`, `updated`, `deleted` or `key_forgotten`) is absent on a plain list; `form` and `new_provider_form` only go to connections that may change the configuration. A refused write is a `setting_error` with `kind` `provider_add`, `provider_config` or `provider_delete`. After a provider change the page also asks for `list_model_presets`, so the Models page's missing-key flags and provider list follow.
+
+## Settings → Channels
+
+The **Channels** page (after Providers) has one section per channel type; today only **Email** (`channels.email`, IMAP in and SMTP out, see [EMAIL_CHANNEL.md](EMAIL_CHANNEL.md)). A section's header shows the type and a badge (**Enabled**, **Disabled** or **Not set up**); clicking it collapses or expands the section. Every section starts expanded. A signed-in, local administrator can:
+
+- **+ Create email channel** when none is set up. It opens the email form with Cancel and **Create channel**; there is no name to enter, as there is one email channel at most.
+- **Edit** the channel: the same form, filled in.
+- **Delete** the channel, after an inline question. The whole `channels.email` entry goes, including any per-channel overrides such as `sendProgress`.
+
+The form is grouped under headings: General, Incoming mail (IMAP), Outgoing mail (SMTP), Behaviour, Security and Attachments. A set-up channel shows `sender · IMAP host` and warnings such as "Consent not granted: the channel will not start".
+
+A save is refused when the channel could not start: when the IMAP or SMTP host, username or password is blank, or when it is enabled without `consentGranted`. A `${VAR}` placeholder must name a variable that is set for the gateway process. Keys the form does not know are kept.
+
+**Passwords never reach the browser.** They are secret fields: the form only says that one is stored, a blank password keeps it, and the gateway never logs submitted values. Read-only connections (remote, anonymous or non-admin) see the sections without forms or buttons.
+
+Changes **apply after a restart**: channels are built once when the gateway starts. A save writes `config.json` (the previous file is backed up as `config_<timestamp>.json.bck`) and shows the amber "Restart now" banner.
+
+### Protocol
+
+| Client envelope | Fields | Effect |
+|---|---|---|
+| `list_channels` | – | Reply with `channels`. |
+| `add_channel` | `channelType`, `values` | Set up a channel of that type; refused when one exists. |
+| `set_channel_config` | `channelType`, `values` | Change the submitted settings. A blank password keeps the stored one. |
+| `delete_channel` | `channelType` | Remove the channel with all its settings. |
+
+`channelType` is `email`. `values` maps the form's setting names (`imapHost`, `pollIntervalSeconds`, `allowFrom`, …) to values. Every success, and the list, is answered with one event:
+
+```json
+{"event": "channels",
+ "channels": [{"channel_type": "email", "title": "Email", "configured": true, "enabled": true,
+               "summary": "bot@example.com · imap.example.com", "notes": [],
+               "form": {"…": "…"}}],
+ "can_modify": true,
+ "changed": {"action": "updated", "channelType": "email"},
+ "restart_required": true}
+```
+
+A type that is not set up has `configured: false` and a blank `new_form` instead of `form`. `form` and `new_form` only go to connections that may change the configuration. `changed` (`action`: `added`, `updated` or `deleted`) and `restart_required` (whether the file changed) are absent on a plain list. A refused write is a `setting_error` with `kind` `channel_add`, `channel_config` or `channel_delete`, `name` the channel type and `detail` such as `invalid_value`, `channel_exists`, `channel_not_configured` or `unknown_channel_type`.

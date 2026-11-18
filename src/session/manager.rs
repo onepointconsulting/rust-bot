@@ -16,7 +16,10 @@ use crate::{
     agent::model_runtime::ModelRuntime,
     config::paths::get_legacy_sessions_dir,
     providers::base::{LLMResponse, LLMUsage},
-    runtime_context::{RUNTIME_CONTEXT_HISTORY_META, strip_leaked_runtime_context},
+    runtime_context::{
+        RUNTIME_CONTEXT_HISTORY_META, RUNTIME_CONTEXT_PREFIX_KEY, prepend_runtime_context,
+        strip_leaked_runtime_context,
+    },
     session::{
         GOAL_STATE_KEY, SESSION_PINNED_METADATA_KEY, SESSION_TITLE_METADATA_KEY,
         SESSION_TOKEN_USAGE_KEY, SESSION_WEBSOCKET_OWNER_CLIENT_ID_KEY,
@@ -634,6 +637,7 @@ impl Session {
             if role == "assistant" {
                 content = strip_leaked_runtime_context(content);
             }
+            let content = Self::replayed_content(&message, role, content);
             let mut entry = json!({
                 "role": role,
                 "content": content,
@@ -655,6 +659,25 @@ impl Session {
             out.push(entry);
         }
         out
+    }
+
+    /// The `content` a history message is replayed with: a user message whose
+    /// runtime-context prefix `save_turn` stored under
+    /// [`RUNTIME_CONTEXT_PREFIX_KEY`] gets it back in front, so the model sees
+    /// exactly the text it was sent (signed thinking blocks after it stay valid
+    /// and the prompt cache stays warm). Every other message is replayed as is.
+    fn replayed_content(message: &Value, role: &str, content: &str) -> String {
+        match message
+            .get(RUNTIME_CONTEXT_PREFIX_KEY)
+            .and_then(Value::as_str)
+        {
+            Some(runtime_context)
+                if role == "user" && message.get("content").is_some_and(Value::is_string) =>
+            {
+                prepend_runtime_context(runtime_context, content)
+            }
+            _ => content.to_string(),
+        }
     }
 
     /// Number of leading messages that are already consolidated, clamped to the
@@ -1840,6 +1863,44 @@ Channel: websocket"
 
         assert_eq!(history[1]["thinking_blocks"], thinking_blocks);
         assert!(history[0].get("thinking_blocks").is_none());
+    }
+
+    /// A runtime-context prefix `save_turn` stored on a user message goes back in
+    /// front of `content`, so the model is replayed exactly what it was sent.
+    #[test]
+    fn get_history_prepends_stored_runtime_context_to_user_content() {
+        use crate::runtime_context::RUNTIME_CONTEXT_TAG;
+        let runtime_context = format!("{RUNTIME_CONTEXT_TAG}\nCurrent Time: 2026-11-17 15:27");
+        let mut user = fixture_message("user", "research this");
+        user[RUNTIME_CONTEXT_PREFIX_KEY] = json!(runtime_context);
+        let mut session = Session::new("s1".into());
+        session.messages.push(user);
+
+        let history = session.get_history(None);
+
+        assert_eq!(
+            history[0]["content"],
+            json!(format!("{runtime_context}\n\nresearch this"))
+        );
+        assert!(history[0].get(RUNTIME_CONTEXT_PREFIX_KEY).is_none());
+    }
+
+    /// Messages saved before the field existed are replayed unchanged, and the
+    /// field is only honoured on user messages.
+    #[test]
+    fn get_history_without_stored_runtime_context_is_unchanged() {
+        let mut assistant = fixture_message("assistant", "answer");
+        assistant[RUNTIME_CONTEXT_PREFIX_KEY] = json!("[ignored]");
+        let mut session = Session::new("s1".into());
+        session
+            .messages
+            .push(fixture_message("user", "old question"));
+        session.messages.push(assistant);
+
+        let history = session.get_history(None);
+
+        assert_eq!(history[0]["content"], json!("old question"));
+        assert_eq!(history[1]["content"], json!("answer"));
     }
 
     #[test]

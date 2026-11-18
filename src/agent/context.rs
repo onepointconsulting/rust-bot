@@ -436,7 +436,10 @@ impl MessageBuilder for ContextBuilder {
         // Merge runtime context block and user content into a single value so
         // we never produce two consecutive messages with the same role.
         let mut merged: serde_json::Value = if let Some(text) = user_content.as_str() {
-            serde_json::Value::String(format!("{runtime_ctx}\n\n{text}"))
+            serde_json::Value::String(crate::runtime_context::prepend_runtime_context(
+                &runtime_ctx,
+                text,
+            ))
         } else {
             // user_content is already an array of blocks; prepend the runtime tag block
             let mut blocks = vec![serde_json::json!({"type": "text", "text": runtime_ctx})];

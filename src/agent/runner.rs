@@ -221,16 +221,30 @@ impl AgentRunner {
     /// keeps the most recent `MICROCOMPACT_KEEP_RECENT` intact and collapses any
     /// older ones that exceed `MICROCOMPACT_MIN_CHARS` down to a single
     /// placeholder line.
+    ///
+    /// Results at or before the last assistant message carrying a signed
+    /// Anthropic thinking block (see [`Self::last_bound_thinking_index`]) are
+    /// never collapsed either. That block's signature binds it to the exact
+    /// prefix it was produced with (system, tools and every earlier message);
+    /// Anthropic's preserved-thinking check rejects the request with a 400
+    /// ("bound to a different conversation") if any of it changes later. The
+    /// keep-recent window slides as results accumulate, so collapsing an old
+    /// result on a later turn would rewrite history a block is bound to.
+    /// Sessions without signed thinking (GPT, mimo, …) are unaffected.
     fn microcompact(messages: &[Value]) -> Vec<Value> {
         let current_turn_start = messages
             .iter()
             .rposition(|msg| msg.get("role").and_then(Value::as_str) == Some("user"));
+        let bound_prefix_end = Self::last_bound_thinking_index(messages);
 
         let compactable_indices: Vec<usize> = messages
             .iter()
             .enumerate()
             .filter(|(idx, msg)| {
                 if current_turn_start.is_some_and(|start| *idx > start) {
+                    return false;
+                }
+                if bound_prefix_end.is_some_and(|bound_end| *idx <= bound_end) {
                     return false;
                 }
                 msg.get("role").and_then(Value::as_str) == Some("tool")
@@ -264,6 +278,32 @@ impl AgentRunner {
         }
 
         updated.unwrap_or_else(|| messages.to_vec())
+    }
+
+    /// Index of the last assistant message whose `thinking_blocks` hold a
+    /// signed Anthropic `thinking` block (non-empty `signature`), or `None`.
+    ///
+    /// Everything up to that index is the prefix the signature is bound to and
+    /// must be replayed unchanged. Other entries in `thinking_blocks` (e.g. the
+    /// OpenAI Responses replay log, `openai_responses_item`) are not bound to a
+    /// prefix and do not count.
+    fn last_bound_thinking_index(messages: &[Value]) -> Option<usize> {
+        messages.iter().rposition(|msg| {
+            msg.get("role").and_then(Value::as_str) == Some("assistant")
+                && msg
+                    .get("thinking_blocks")
+                    .and_then(Value::as_array)
+                    .is_some_and(|blocks| blocks.iter().any(Self::is_signed_thinking_block))
+        })
+    }
+
+    /// Whether `block` is an Anthropic `thinking` block with a non-empty signature.
+    fn is_signed_thinking_block(block: &Value) -> bool {
+        block.get("type").and_then(Value::as_str) == Some("thinking")
+            && block
+                .get("signature")
+                .and_then(Value::as_str)
+                .is_some_and(|signature| !signature.is_empty())
     }
 
     /// Normalise a raw tool result (see [`normalize_tool_result`]).
@@ -1790,6 +1830,87 @@ mod tests {
             &result[current_turn_start..],
             &messages[current_turn_start..]
         );
+    }
+
+    /// An assistant reply carrying a signed Anthropic thinking block.
+    fn signed_thinking_reply() -> Value {
+        serde_json::json!({
+            "role": "assistant",
+            "content": "answer",
+            "thinking_blocks": [{"type": "thinking", "thinking": "", "signature": "sig"}],
+        })
+    }
+
+    #[test]
+    fn test_microcompact_keeps_results_before_signed_thinking() {
+        // Stale results that precede a signed thinking block belong to the
+        // prefix it is bound to; collapsing them would trigger a 400.
+        let large_content = "x".repeat(MICROCOMPACT_MIN_CHARS + 1);
+        let tool =
+            serde_json::json!({"role": "tool", "name": "web_search", "content": large_content});
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "q1"})];
+        messages.extend((0..MICROCOMPACT_KEEP_RECENT + 2).map(|_| tool.clone()));
+        messages.push(signed_thinking_reply());
+        messages.push(serde_json::json!({"role": "user", "content": "q2"}));
+
+        let result = AgentRunner::microcompact(&messages);
+
+        assert_eq!(result, messages);
+    }
+
+    #[test]
+    fn test_microcompact_collapses_results_after_last_signed_thinking() {
+        // Results after the last signed block are not bound yet, so the usual
+        // keep-recent rule still applies to them.
+        let large_content = "x".repeat(MICROCOMPACT_MIN_CHARS + 1);
+        let tool =
+            serde_json::json!({"role": "tool", "name": "web_search", "content": large_content});
+        let omitted = "[web_search result omitted from context]";
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "q1"}),
+            tool.clone(),
+            signed_thinking_reply(),
+            serde_json::json!({"role": "user", "content": "q2"}),
+        ];
+        let unbound_start = messages.len();
+        messages.extend((0..MICROCOMPACT_KEEP_RECENT + 2).map(|_| tool.clone()));
+        messages.push(serde_json::json!({"role": "assistant", "content": "plain"}));
+        messages.push(serde_json::json!({"role": "user", "content": "q3"}));
+
+        let result = AgentRunner::microcompact(&messages);
+
+        assert_eq!(&result[..unbound_start], &messages[..unbound_start]);
+        assert_eq!(result[unbound_start]["content"], omitted);
+        assert_eq!(result[unbound_start + 1]["content"], omitted);
+        assert_eq!(result[unbound_start + 2]["content"], large_content.as_str());
+    }
+
+    #[test]
+    fn test_microcompact_ignores_unsigned_reasoning_items() {
+        // The OpenAI Responses replay log is not bound to a prefix, so it must
+        // not freeze compaction (and neither does an unsigned thinking block).
+        let large_content = "x".repeat(MICROCOMPACT_MIN_CHARS + 1);
+        let tool =
+            serde_json::json!({"role": "tool", "name": "read_file", "content": large_content});
+        let mut messages = vec![serde_json::json!({"role": "user", "content": "q1"})];
+        messages.extend((0..MICROCOMPACT_KEEP_RECENT + 1).map(|_| tool.clone()));
+        messages.push(serde_json::json!({
+            "role": "assistant",
+            "content": "answer",
+            "thinking_blocks": [
+                {"type": "openai_responses_item", "item": {"type": "reasoning", "encrypted_content": "enc"}},
+                {"type": "thinking", "thinking": "hmm", "signature": ""},
+            ],
+        }));
+        messages.push(serde_json::json!({"role": "user", "content": "q2"}));
+
+        let result = AgentRunner::microcompact(&messages);
+
+        assert_eq!(
+            result[1]["content"],
+            "[read_file result omitted from context]"
+        );
+        assert_eq!(result[2]["content"], large_content.as_str());
     }
 
     // ── normalize_tool_result ─────────────────────────────────────────────────

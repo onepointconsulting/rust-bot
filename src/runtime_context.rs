@@ -154,9 +154,76 @@ pub fn strip_leaked_runtime_context(text: &str) -> &str {
     }
 }
 
+/// Session-message field that keeps the runtime-context prefix (current time,
+/// channel, chat id, goal) stripped from a persisted user message's `content`.
+///
+/// `content` stays clean for the UI, titles and consolidation, while
+/// `Session::get_history` uses this field to replay the message exactly as the
+/// model saw it. Anthropic's preserved-thinking check binds each signed
+/// thinking block to the byte-exact prefix it was produced with, so a replayed
+/// user message that lost its runtime context invalidates every later block
+/// (and breaks the prompt cache for every provider).
+pub const RUNTIME_CONTEXT_PREFIX_KEY: &str = "runtime_context";
+
+/// Separator between the runtime-context prefix and the user's own text.
+const RUNTIME_CONTEXT_PREFIX_SEPARATOR: &str = "\n\n";
+
+/// Put `runtime_context` in front of the user's `text`, in the one format the
+/// model sees it in. [`split_runtime_context_prefix`] is the inverse.
+pub fn prepend_runtime_context(runtime_context: &str, text: &str) -> String {
+    format!("{runtime_context}{RUNTIME_CONTEXT_PREFIX_SEPARATOR}{text}")
+}
+
+/// Split user content built by [`prepend_runtime_context`] back into
+/// `(runtime_context, text)`, or `None` when `content` does not start with
+/// [`RUNTIME_CONTEXT_TAG`] or has no separator.
+///
+/// The split is at the first separator, so joining the two halves with
+/// [`prepend_runtime_context`] always reproduces `content` byte for byte.
+pub fn split_runtime_context_prefix(content: &str) -> Option<(&str, &str)> {
+    if !content.starts_with(RUNTIME_CONTEXT_TAG) {
+        return None;
+    }
+    content.split_once(RUNTIME_CONTEXT_PREFIX_SEPARATOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // --- prepend_runtime_context / split_runtime_context_prefix ---
+
+    #[test]
+    fn prepend_runtime_context_puts_context_before_text() {
+        assert_eq!(
+            prepend_runtime_context("[ctx]\nCurrent Time: now", "hello"),
+            "[ctx]\nCurrent Time: now\n\nhello"
+        );
+    }
+
+    #[test]
+    fn split_runtime_context_prefix_round_trips_exactly() {
+        let runtime_context = format!("{RUNTIME_CONTEXT_TAG}\nCurrent Time: now\nChannel: ws");
+        let text = "first paragraph\n\nsecond paragraph";
+        let content = prepend_runtime_context(&runtime_context, text);
+
+        let (split_context, split_text) = split_runtime_context_prefix(&content).unwrap();
+
+        assert_eq!(split_context, runtime_context);
+        assert_eq!(split_text, text);
+        assert_eq!(prepend_runtime_context(split_context, split_text), content);
+    }
+
+    #[test]
+    fn split_runtime_context_prefix_ignores_content_without_the_tag() {
+        assert!(split_runtime_context_prefix("plain\n\ntext").is_none());
+    }
+
+    #[test]
+    fn split_runtime_context_prefix_needs_a_separator() {
+        let content = format!("{RUNTIME_CONTEXT_TAG}\nCurrent Time: now");
+        assert!(split_runtime_context_prefix(&content).is_none());
+    }
 
     // --- strip_leaked_runtime_context ---
 

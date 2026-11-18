@@ -70,7 +70,10 @@ use crate::config::schema::{
 };
 use crate::cron::CronService;
 use crate::providers::base::{LLMProviderDyn, LLMUsage};
-use crate::runtime_context::{RUNTIME_CONTEXT_TAG, strip_leaked_runtime_context};
+use crate::runtime_context::{
+    RUNTIME_CONTEXT_PREFIX_KEY, RUNTIME_CONTEXT_TAG, split_runtime_context_prefix,
+    strip_leaked_runtime_context,
+};
 use crate::security::workspace_access::{
     WORKSPACE_SCOPE_METADATA_KEY, WorkspaceAccessMode, WorkspaceScope, WorkspaceScopeError,
     WorkspaceScopeResolver, validate_workspace_scope_payload,
@@ -2690,13 +2693,21 @@ impl AgentLoop {
             } else if role == "user" {
                 match entry.get("content") {
                     Some(Value::String(content)) if content.starts_with(RUNTIME_CONTEXT_TAG) => {
-                        // Strip the runtime-context prefix, keep only the user text.
-                        let parts = content.splitn(2, "\n\n").collect::<Vec<&str>>();
-                        if parts.len() > 1 && !parts[1].trim().is_empty() {
-                            entry.insert("content".into(), Value::String(parts[1].to_string()));
-                        } else {
+                        // Keep only the user text in `content`, but store the
+                        // runtime-context prefix so `get_history` can replay the
+                        // message byte for byte (see `RUNTIME_CONTEXT_PREFIX_KEY`).
+                        let Some((runtime_context, user_text)) =
+                            split_runtime_context_prefix(content)
+                                .filter(|(_, user_text)| !user_text.trim().is_empty())
+                                .map(|(rc, text)| (rc.to_string(), text.to_string()))
+                        else {
                             continue;
-                        }
+                        };
+                        entry.insert("content".into(), Value::String(user_text));
+                        entry.insert(
+                            RUNTIME_CONTEXT_PREFIX_KEY.into(),
+                            Value::String(runtime_context),
+                        );
                     }
                     Some(Value::Array(blocks)) => {
                         let filtered =
@@ -4739,6 +4750,82 @@ mod tests {
         }
 
         assert!(session.updated_at >= before);
+    }
+
+    #[test]
+    fn test_save_turn_stores_runtime_context_beside_clean_content() {
+        let loop_ = make_save_turn_loop(1000);
+        let mut session = Session::new("test:save_turn_runtime_context".into());
+        let runtime_context = format!("{RUNTIME_CONTEXT_TAG}\nCurrent Time: 2026-11-17 15:27");
+        let messages = vec![
+            json!({"role": "system", "content": "prompt"}),
+            json!({"role": "user", "content": format!("{runtime_context}\n\nhello user")}),
+            json!({"role": "user", "content": "plain user"}),
+        ];
+
+        loop_.save_turn(&mut session, &messages, 1);
+
+        assert_eq!(saved_content(&session.messages[0]), Some("hello user"));
+        assert_eq!(
+            session.messages[0][RUNTIME_CONTEXT_PREFIX_KEY],
+            json!(runtime_context)
+        );
+        assert!(
+            session.messages[1]
+                .get(RUNTIME_CONTEXT_PREFIX_KEY)
+                .is_none(),
+            "a user message without injected context stores no prefix"
+        );
+    }
+
+    /// The three-step check in miniature: the messages of turn 2 must begin
+    /// with the messages turn 1 sent (system prompt aside), or Anthropic's
+    /// preserved-thinking check rejects the signed thinking block of turn 1.
+    #[test]
+    fn test_next_turn_replays_previous_turn_messages_unchanged() {
+        let loop_ = make_save_turn_loop(1000);
+        let mut session = Session::new("test:replay_prefix".into());
+        let build_turn = |history: &[Value], question: &str| {
+            loop_.context.build_messages(
+                history,
+                question,
+                None,
+                None,
+                Some("websocket"),
+                Some("chat-1"),
+                None,
+                None,
+                DEFAULT_CURRENT_ROLE,
+                None,
+            )
+        };
+
+        let mut turn_one = build_turn(&session.get_history(None), "first question");
+        turn_one.push(json!({
+            "role": "assistant",
+            "content": "first answer",
+            "thinking_blocks": [{"type": "thinking", "thinking": "", "signature": "sig-1"}],
+        }));
+        loop_.save_turn(&mut session, &turn_one, 1);
+
+        let turn_two = build_turn(&session.get_history(None), "second question");
+
+        // `timestamp` is session bookkeeping that no provider converter sends.
+        let without_timestamp = |messages: &[Value]| -> Vec<Value> {
+            messages
+                .iter()
+                .cloned()
+                .map(|mut message| {
+                    if let Some(object) = message.as_object_mut() {
+                        object.remove("timestamp");
+                    }
+                    message
+                })
+                .collect()
+        };
+        let sent_in_turn_one = without_timestamp(&turn_one[1..]);
+        let replayed_in_turn_two = without_timestamp(&turn_two[1..turn_one.len()]);
+        assert_eq!(replayed_in_turn_two, sent_in_turn_one);
     }
 
     fn command_reply(content: &str) -> OutboundMessage {

@@ -199,6 +199,45 @@ A model preset is a named bundle under `modelPresets` in `config.json`:
 
 OpenRouter, Together, other `custom` gateways and an `openai` slot pointed at another base URL still use Chat Completions.
 
+**Choosing the API per provider.** `providerBackEnd` under `providers.<name>` overrides this choice for one provider, for example to use OpenRouter through the Responses API or a `custom` gateway that speaks the Anthropic Messages API:
+
+```json
+"providers": {
+  "openrouter": {
+    "apiKey": "sk-or-…",
+    "providerBackEnd": "openai_responses"
+  },
+  "custom": {
+    "apiKey": "…",
+    "apiBase": "https://gateway.example/anthropic",
+    "providerBackEnd": "anthropic"
+  }
+}
+```
+
+The values are `openai_compat` (Chat Completions), `openai_responses` (Responses API) and `anthropic` (Messages API). Without `providerBackEnd` the API is chosen as described above, so existing configurations behave as before. The setup wizard asks for it in **LLM Provider** (after the extra headers), and the web UI's model list for that provider uses the same API.
+
+**Several custom providers.** `providers.custom` is a single slot. For more endpoints, add named entries under `providers.customProviders` (or use Settings → Providers in the web UI) and name one in a preset's `provider`:
+
+```json
+"providers": {
+  "customProviders": {
+    "my-relay": {
+      "apiKey": "${RELAY_KEY}",
+      "apiBase": "https://gateway.example/v1",
+      "providerBackEnd": "openai_responses"
+    }
+  }
+},
+"modelPresets": {
+  "relayed": {"model": "gpt-6.1-terra", "provider": "my-relay"}
+}
+```
+
+A custom provider is built like `custom`: no default base (`apiBase` is required), no prompt caching, Chat Completions unless `providerBackEnd` says otherwise. Names follow the preset name rules and may not be `auto`, `default` or the name of a built-in provider. `auto` ignores them.
+
+**Blank keys fall back to the environment.** A provider named explicitly (`provider: "anthropic"`, not `auto`) whose `apiKey` is blank uses its environment variable (`ANTHROPIC_API_KEY`, `OPENAI_API_KEY`, `OPENROUTER_API_KEY`, `TOGETHER_API_KEY`). `auto` still looks at stored keys only, so existing configurations keep picking the same provider.
+
 There are two ways to choose a preset:
 
 - **For one chat**: `/model-preset <name>` here, or the preset picker in the web chat's input. Only that chat changes.

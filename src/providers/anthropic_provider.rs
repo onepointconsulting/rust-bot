@@ -33,6 +33,26 @@ const CLAUDE_5_MODEL_PREFIXES: &[&str] = &[
     "claude-fable",
 ];
 
+/// Beta that lets a request set `thinking.block_binding` (sending the field
+/// without it is a 400) and adds `input_transformations` to every response.
+const THINKING_BINDING_BETA: &str = "thinking-binding-controls-2026-08-01";
+
+/// Header that carries comma-separated Anthropic beta names.
+const ANTHROPIC_BETA_HEADER: &str = "anthropic-beta";
+
+/// Header naming the history edit behind a preserved-thinking 400, when present.
+const THINKING_PREFIX_MISMATCH_HEADER: &str = "anthropic-thinking-prefix-mismatch";
+
+/// One entry of a response's top-level `input_transformations` array: a
+/// replayed thinking block the API dropped (`thinking_dropped`) or let through
+/// despite a failed check (`thinking_mismatch_allowed`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InputTransformation {
+    kind: String,
+    path: String,
+    reason: String,
+}
+
 fn gen_tool_id() -> String {
     let mut rng = rand::rng();
     let suffix: String = (0..22)
@@ -526,23 +546,17 @@ impl AnthropicProvider {
         }
 
         if Self::uses_adaptive_thinking(&model_name) {
-            if thinking_enabled {
-                args.insert(
-                    "thinking".to_string(),
-                    serde_json::json!({"type": "adaptive"}),
-                );
-                if let Some(reasoning_effort) = reasoning_effort.as_ref()
-                    && reasoning_effort != "adaptive"
-                {
-                    args.insert(
-                        "output_config".to_string(),
-                        serde_json::json!({"effort": reasoning_effort}),
-                    );
-                }
-            } else if let Some(temperature) = temperature
-                && Self::supports_temperature(&model_name)
+            // Thinking is always on for these models (omitting `thinking` runs
+            // adaptive), so sending it explicitly only adds `block_binding`.
+            args.insert("thinking".to_string(), Self::adaptive_thinking_config());
+            if thinking_enabled
+                && let Some(reasoning_effort) = reasoning_effort.as_ref()
+                && reasoning_effort != "adaptive"
             {
-                args.insert("temperature".to_string(), serde_json::json!(temperature));
+                args.insert(
+                    "output_config".to_string(),
+                    serde_json::json!({"effort": reasoning_effort}),
+                );
             }
         } else if let Some(reasoning_effort) = reasoning_effort.clone()
             && reasoning_effort == "adaptive"
@@ -598,7 +612,10 @@ impl AnthropicProvider {
                 "tools".to_string(),
                 serde_json::Value::Array(anthropic_tools),
             );
-            let tc = Self::convert_tool_choice(tool_choice, thinking_enabled);
+            // Claude 5 models always think, and forced tool use is rejected
+            // alongside thinking, so they only ever get `auto`.
+            let thinking_on = thinking_enabled || Self::uses_adaptive_thinking(&model_name);
+            let tc = Self::convert_tool_choice(tool_choice, thinking_on);
             if let Some(tc) = tc {
                 args.insert("tool_choice".to_string(), tc);
             }
@@ -632,6 +649,125 @@ impl AnthropicProvider {
 
     fn uses_adaptive_thinking(model: &str) -> bool {
         Self::is_claude_5_family(model)
+    }
+
+    /// `thinking` for Claude 5 models: adaptive, with replayed thinking blocks
+    /// whose bound prefix changed dropped (and reported in
+    /// `input_transformations`) instead of failing the request with a 400.
+    ///
+    /// Safety net for history rewrites rust-bot still makes between turns
+    /// (system prompt rebuilds, `snip_history`, idle compaction). Requires
+    /// [`THINKING_BINDING_BETA`], which [`Self::messages_request`] adds.
+    fn adaptive_thinking_config() -> serde_json::Value {
+        json!({
+            "type": "adaptive",
+            "block_binding": {"prefix_mismatch_behavior": "drop_block"},
+        })
+    }
+
+    /// Whether `body` sets `thinking.block_binding`, which the API only accepts
+    /// together with the [`THINKING_BINDING_BETA`] header.
+    fn uses_block_binding(body: &HashMap<String, serde_json::Value>) -> bool {
+        body.get("thinking")
+            .and_then(|thinking| thinking.get("block_binding"))
+            .is_some()
+    }
+
+    /// The `anthropic-beta` value carrying `beta`, joined with commas onto any
+    /// `anthropic-beta` value set in `extra_headers` (matched case-insensitively)
+    /// instead of replacing it. `beta` is not repeated if already present.
+    fn merged_anthropic_beta_header(extra_headers: &HashMap<String, String>, beta: &str) -> String {
+        let existing_betas: Vec<&str> = extra_headers
+            .iter()
+            .filter(|(name, _)| name.eq_ignore_ascii_case(ANTHROPIC_BETA_HEADER))
+            .flat_map(|(_, value)| value.split(','))
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .collect();
+        if existing_betas.contains(&beta) {
+            return existing_betas.join(",");
+        }
+        existing_betas
+            .into_iter()
+            .chain(std::iter::once(beta))
+            .collect::<Vec<_>>()
+            .join(",")
+    }
+
+    /// A `POST /v1/messages` request for `body`, with the
+    /// [`THINKING_BINDING_BETA`] header when `body` uses `block_binding`.
+    /// A header set on the request replaces the client's default of the same
+    /// name, so the merged value keeps the user's own betas.
+    fn messages_request(
+        &self,
+        body: &HashMap<String, serde_json::Value>,
+    ) -> reqwest::RequestBuilder {
+        let request = self.http_client.post(&self.messages_url);
+        if Self::uses_block_binding(body) {
+            request.header(
+                ANTHROPIC_BETA_HEADER,
+                Self::merged_anthropic_beta_header(&self.extra_headers, THINKING_BINDING_BETA),
+            )
+        } else {
+            request
+        }
+    }
+
+    /// The `input_transformations` entries of a response `message` (empty when
+    /// the field is absent). Entries without a string `type` are skipped.
+    fn input_transformations(message: &serde_json::Value) -> Vec<InputTransformation> {
+        let field = |entry: &serde_json::Value, key: &str| {
+            entry
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string()
+        };
+        message
+            .get("input_transformations")
+            .and_then(serde_json::Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter(|entry| {
+                entry
+                    .get("type")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some()
+            })
+            .map(|entry| InputTransformation {
+                kind: field(entry, "type"),
+                path: field(entry, "path"),
+                reason: field(entry, "reason"),
+            })
+            .collect()
+    }
+
+    /// Warn about every replayed thinking block the API dropped or flagged, so
+    /// remaining history rewrites (system prompt, snip, idle compaction) show
+    /// up in the logs. `message` is a response body or a `message_start` message.
+    fn log_input_transformations(message: &serde_json::Value) {
+        for transformation in Self::input_transformations(message) {
+            log::warn!(
+                "Anthropic {} at {}: {}",
+                transformation.kind,
+                transformation.path,
+                transformation.reason
+            );
+        }
+    }
+
+    /// [`Self::log_input_transformations`] for a raw SSE `data` payload, which
+    /// carries the array on `message` in the `message_start` event.
+    fn log_stream_input_transformations(data: &str) {
+        if !data.contains("\"message_start\"") {
+            return;
+        }
+        if let Ok(event) = serde_json::from_str::<serde_json::Value>(data)
+            && event.get("type").and_then(serde_json::Value::as_str) == Some("message_start")
+            && let Some(message) = event.get("message")
+        {
+            Self::log_input_transformations(message);
+        }
     }
 
     fn format_api_error(status: u16, body: &str) -> String {
@@ -846,6 +982,13 @@ impl AnthropicProvider {
             Ok(response) => {
                 let status = response.status();
                 if !status.is_success() {
+                    if let Some(diagnosis) = response
+                        .headers()
+                        .get(THINKING_PREFIX_MISMATCH_HEADER)
+                        .and_then(|value| value.to_str().ok())
+                    {
+                        log::warn!("Anthropic thinking prefix mismatch: {diagnosis}");
+                    }
                     let body = response.text().await.unwrap_or_default();
                     log::error!(
                         "Anthropic API request failed ({}): {}",
@@ -855,7 +998,10 @@ impl AnthropicProvider {
                     return Self::handle_error(Self::format_api_error(status.as_u16(), &body));
                 }
                 match response.json::<serde_json::Value>().await {
-                    Ok(content) => Self::parse_json_response(content),
+                    Ok(content) => {
+                        Self::log_input_transformations(&content);
+                        Self::parse_json_response(content)
+                    }
                     Err(e) => Self::handle_error(format!(
                         "Anthropic API response parse error ({}): {e}",
                         e.status()
@@ -923,6 +1069,7 @@ impl AnthropicProvider {
             return Some(Ok(MessageStreamEvent::Ping));
         }
 
+        Self::log_stream_input_transformations(&data);
         Some(serde_json::from_str::<MessageStreamEvent>(&data).map_err(AdkError::from))
     }
 
@@ -1101,12 +1248,7 @@ impl LLMProvider for AnthropicProvider {
         );
         let mut body = args;
         body.remove("extra_headers");
-        let response = self
-            .http_client
-            .post(&self.messages_url)
-            .json(&body)
-            .send()
-            .await;
+        let response = self.messages_request(&body).json(&body).send().await;
         Self::parse_response(response).await
     }
 
@@ -1147,8 +1289,7 @@ impl LLMProvider for AnthropicProvider {
         body.insert("stream".to_string(), json!(true));
 
         let response = match self
-            .http_client
-            .post(&self.messages_url)
+            .messages_request(&body)
             .header(ACCEPT, "text/event-stream")
             .json(&serde_json::Value::Object(body.into_iter().collect()))
             .send()
@@ -2187,6 +2328,180 @@ mod tests {
             tools
                 .iter()
                 .all(|tool| tool.get(CACHE_BOUNDARY_KEY).is_none())
+        );
+    }
+}
+
+#[cfg(test)]
+mod thinking_binding_tests {
+    use super::*;
+
+    fn provider() -> AnthropicProvider {
+        AnthropicProvider::new(Some("sk-ant-test".to_string()), None, None, None, None)
+    }
+
+    fn args_for(model: &str, reasoning_effort: Option<&str>) -> HashMap<String, serde_json::Value> {
+        provider().build_args(
+            &[json!({ "role": "user", "content": "hi" })],
+            None,
+            Some(model.to_string()),
+            1024,
+            None,
+            reasoning_effort.map(str::to_string),
+            None,
+            true,
+        )
+    }
+
+    const DROP_BLOCK_THINKING: &str =
+        r#"{"type":"adaptive","block_binding":{"prefix_mismatch_behavior":"drop_block"}}"#;
+
+    fn drop_block_thinking() -> serde_json::Value {
+        serde_json::from_str(DROP_BLOCK_THINKING).unwrap()
+    }
+
+    #[test]
+    fn fable_sends_drop_block_binding_without_reasoning_effort() {
+        let args = args_for("claude-fable-5-2", None);
+
+        assert_eq!(args["thinking"], drop_block_thinking());
+        assert!(!args.contains_key("output_config"));
+        assert!(AnthropicProvider::uses_block_binding(&args));
+    }
+
+    #[test]
+    fn fable_sends_drop_block_binding_with_reasoning_effort() {
+        let args = args_for("claude-fable-5-2", Some("high"));
+
+        assert_eq!(args["thinking"], drop_block_thinking());
+        assert_eq!(args["output_config"], json!({"effort": "high"}));
+    }
+
+    #[test]
+    fn non_claude_5_models_get_no_block_binding() {
+        let with_effort = args_for("claude-sonnet-4-6", Some("high"));
+        let without_effort = args_for("claude-sonnet-4-6", None);
+
+        assert!(with_effort["thinking"].get("block_binding").is_none());
+        assert!(!AnthropicProvider::uses_block_binding(&with_effort));
+        assert!(!AnthropicProvider::uses_block_binding(&without_effort));
+    }
+
+    #[test]
+    fn claude_5_models_never_force_a_tool() {
+        let args = provider().build_args(
+            &[json!({ "role": "user", "content": "hi" })],
+            Some(vec![json!({
+                "type": "function",
+                "function": {"name": "read", "description": "Read", "parameters": {"type": "object"}}
+            })]),
+            Some("claude-opus-5".to_string()),
+            1024,
+            None,
+            None,
+            Some(json!("required")),
+            false,
+        );
+
+        assert_eq!(args["tool_choice"], json!({"type": "auto"}));
+    }
+
+    #[test]
+    fn beta_header_is_the_binding_beta_without_extra_headers() {
+        assert_eq!(
+            AnthropicProvider::merged_anthropic_beta_header(&HashMap::new(), THINKING_BINDING_BETA),
+            THINKING_BINDING_BETA
+        );
+    }
+
+    #[test]
+    fn beta_header_merges_with_a_user_set_anthropic_beta() {
+        let extra_headers = HashMap::from([
+            (
+                "Anthropic-Beta".to_string(),
+                "context-1m, fast-mode".to_string(),
+            ),
+            ("x-other".to_string(), "ignored".to_string()),
+        ]);
+
+        assert_eq!(
+            AnthropicProvider::merged_anthropic_beta_header(&extra_headers, THINKING_BINDING_BETA),
+            format!("context-1m,fast-mode,{THINKING_BINDING_BETA}")
+        );
+    }
+
+    #[test]
+    fn beta_header_does_not_repeat_a_beta_already_set() {
+        let extra_headers = HashMap::from([(
+            "anthropic-beta".to_string(),
+            THINKING_BINDING_BETA.to_string(),
+        )]);
+
+        assert_eq!(
+            AnthropicProvider::merged_anthropic_beta_header(&extra_headers, THINKING_BINDING_BETA),
+            THINKING_BINDING_BETA
+        );
+    }
+
+    fn message_start_data() -> String {
+        json!({
+            "type": "message_start",
+            "message": {
+                "id": "msg_1",
+                "type": "message",
+                "role": "assistant",
+                "content": [],
+                "model": "claude-fable-5-2",
+                "stop_reason": null,
+                "stop_sequence": null,
+                "usage": {"input_tokens": 10, "output_tokens": 1},
+                "input_transformations": [
+                    {"type": "thinking_dropped", "path": "messages.29.content.0", "reason": "prefix_binding_mismatch"},
+                    {"type": "thinking_dropped", "path": "messages.33.content.0", "reason": "prefix_binding_mismatch"},
+                    {"path": "messages.40.content.0"}
+                ]
+            }
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn input_transformations_are_read_from_a_message_start_sample() {
+        let event: serde_json::Value = serde_json::from_str(&message_start_data()).unwrap();
+
+        let transformations = AnthropicProvider::input_transformations(&event["message"]);
+
+        assert_eq!(
+            transformations,
+            vec![
+                InputTransformation {
+                    kind: "thinking_dropped".to_string(),
+                    path: "messages.29.content.0".to_string(),
+                    reason: "prefix_binding_mismatch".to_string(),
+                },
+                InputTransformation {
+                    kind: "thinking_dropped".to_string(),
+                    path: "messages.33.content.0".to_string(),
+                    reason: "prefix_binding_mismatch".to_string(),
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn input_transformations_are_empty_when_absent() {
+        assert!(AnthropicProvider::input_transformations(&json!({"content": []})).is_empty());
+    }
+
+    #[test]
+    fn message_start_with_input_transformations_still_parses() {
+        let raw = format!("event: message_start\ndata: {}\n", message_start_data());
+
+        let event = AnthropicProvider::parse_sse_event(&raw).unwrap();
+
+        assert!(
+            matches!(event, Ok(MessageStreamEvent::MessageStart(_))),
+            "unexpected event: {event:?}"
         );
     }
 }
