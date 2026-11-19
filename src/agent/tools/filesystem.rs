@@ -186,6 +186,12 @@ fn _is_under(path: &Path, directory: &Path) -> bool {
     resolved_path.starts_with(&resolved_dir)
 }
 
+/// Whether `path` lies inside `directory` once both are resolved: `..` is
+/// collapsed and existing symlinks are followed, so neither can escape.
+pub(crate) fn is_path_under(path: &Path, directory: &Path) -> bool {
+    _is_under(path, directory)
+}
+
 fn _resolve_path(
     path: &str,
     workspace: Option<PathBuf>,
@@ -422,49 +428,115 @@ impl EditFileTool {
             fs: FsToolConfig::new(workspace, allowed_dir, extra_allowed_dirs),
         }
     }
+}
 
-    fn _not_found_msg(&self, old_text: &str, content: &str, path: &str) -> String {
-        let lines: Vec<&str> = content.lines().collect();
-        let old_lines: Vec<&str> = old_text.lines().collect();
-        let window = old_lines.len();
+/// The error message for a find-and-replace whose `old_text` (called
+/// `old_param_name` in the tool's parameters) is not in `content` of the file
+/// labelled `target_label`. When a window of `content` is more than 50% similar,
+/// the message shows it as a unified diff so the model can correct its text.
+fn not_found_message(
+    old_text: &str,
+    content: &str,
+    target_label: &str,
+    old_param_name: &str,
+) -> String {
+    let lines: Vec<&str> = content.lines().collect();
+    let old_lines: Vec<&str> = old_text.lines().collect();
+    let window = old_lines.len();
 
-        let mut best_ratio = 0.0_f32;
-        let mut best_start = 0_usize;
+    let mut best_ratio = 0.0_f32;
+    let mut best_start = 0_usize;
 
-        let iterations = (lines.len() + 1).saturating_sub(window).max(1);
-        for i in 0..iterations {
-            let candidate = lines[i..(i + window).min(lines.len())].join("\n");
-            let ratio = TextDiff::from_lines(old_text, &candidate).ratio();
-            if ratio > best_ratio {
-                best_ratio = ratio;
-                best_start = i;
-            }
+    let iterations = (lines.len() + 1).saturating_sub(window).max(1);
+    for i in 0..iterations {
+        let candidate = lines[i..(i + window).min(lines.len())].join("\n");
+        let ratio = TextDiff::from_lines(old_text, &candidate).ratio();
+        if ratio > best_ratio {
+            best_ratio = ratio;
+            best_start = i;
         }
-
-        if best_ratio > 0.5 {
-            let actual_window =
-                lines[best_start..(best_start + window).min(lines.len())].join("\n");
-            let diff = TextDiff::from_lines(old_text, &actual_window);
-            let unified = diff
-                .unified_diff()
-                .header(
-                    "old_text (provided)",
-                    &format!("{} (actual, line {})", path, best_start + 1),
-                )
-                .to_string();
-            return format!(
-                "Error: old_text not found in {}.\nBest match ({:.0}% similar) at line {}:\n{}",
-                path,
-                best_ratio * 100.0,
-                best_start + 1,
-                unified,
-            );
-        }
-        format!(
-            "Error: old_text not found in {}. No similar text found. Verify the file content.",
-            path
-        )
     }
+
+    if best_ratio > 0.5 {
+        let actual_window = lines[best_start..(best_start + window).min(lines.len())].join("\n");
+        let diff = TextDiff::from_lines(old_text, &actual_window);
+        let unified = diff
+            .unified_diff()
+            .header(
+                &format!("{old_param_name} (provided)"),
+                &format!("{} (actual, line {})", target_label, best_start + 1),
+            )
+            .to_string();
+        return format!(
+            "Error: {} not found in {}.\nBest match ({:.0}% similar) at line {}:\n{}",
+            old_param_name,
+            target_label,
+            best_ratio * 100.0,
+            best_start + 1,
+            unified,
+        );
+    }
+    format!(
+        "Error: {old_param_name} not found in {target_label}. No similar text found. Verify the file content."
+    )
+}
+
+/// The text after a successful [`find_and_replace`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct Replacement {
+    /// The whole new text, with the line endings of the original.
+    pub text: String,
+    /// How many places were replaced.
+    pub count: usize,
+}
+
+/// Replace `old_text` with `new_text` in `content`, the shared engine of
+/// `edit_file` and `skill_manage`'s patch.
+///
+/// Line endings are compared as `\n` and the original's CRLF style is kept. An
+/// exact match is tried first, then a whitespace-trimmed line window (see
+/// [`_find_match`]). Several matches are an error unless `replace_all`.
+///
+/// `target_label` names the edited file and `old_param_name` the tool parameter
+/// holding `old_text`; both only appear in the error message, which is ready to
+/// be returned to the model.
+pub(crate) fn find_and_replace(
+    content: &str,
+    old_text: &str,
+    new_text: &str,
+    replace_all: bool,
+    target_label: &str,
+    old_param_name: &str,
+) -> Result<Replacement, String> {
+    let uses_crlf = content.contains("\r\n");
+    let content = content.replace("\r\n", "\n");
+    let normalized_old = old_text.replace("\r\n", "\n");
+    let (matched, match_count) = _find_match(&content, &normalized_old);
+    let Some(matched) = matched else {
+        return Err(not_found_message(
+            old_text,
+            &content,
+            target_label,
+            old_param_name,
+        ));
+    };
+    if match_count > 1 && !replace_all {
+        return Err(format!(
+            "Warning: {old_param_name} appears {match_count} times. \
+             Provide more context to make it unique, or set replace_all=true."
+        ));
+    }
+
+    let normalized_new = new_text.replace("\r\n", "\n");
+    let (mut text, count) = if replace_all {
+        (content.replace(&matched, &normalized_new), match_count)
+    } else {
+        (content.replacen(&matched, &normalized_new, 1), 1)
+    };
+    if uses_crlf {
+        text = text.replace('\n', "\r\n");
+    }
+    Ok(Replacement { text, count })
 }
 
 #[async_trait]
@@ -731,48 +803,16 @@ impl Tool for EditFileTool {
             Err(e) => return format!("Error editing file: {}", e),
         };
 
-        let uses_crlf = raw.windows(2).any(|w| w == b"\r\n");
-
         let content = match String::from_utf8(raw) {
             Ok(s) => s,
             Err(e) => return format!("Error editing file: {}", e),
         };
-        let content = content.replace("\r\n", "\n");
 
-        let norm_old = old_text.replace("\r\n", "\n");
-        let (matched, count) = _find_match(&content, &norm_old);
-
-        let matched = match matched {
-            Some(m) => m,
-            None => return self._not_found_msg(old_text, &content, path),
-        };
-
-        if count > 1 && !replace_all {
-            return format!(
-                "Warning: old_text appears {} times. \
-                 Provide more context to make it unique, or set replace_all=true.",
-                count
-            );
-        }
-
-        let norm_new = new_text.replace("\r\n", "\n");
-        let mut new_content = if replace_all {
-            content.replace(&matched, &norm_new)
-        } else {
-            match content.find(&matched) {
-                Some(pos) => {
-                    let mut s = content[..pos].to_string();
-                    s.push_str(&norm_new);
-                    s.push_str(&content[pos + matched.len()..]);
-                    s
-                }
-                None => content,
-            }
-        };
-
-        if uses_crlf {
-            new_content = new_content.replace('\n', "\r\n");
-        }
+        let new_content =
+            match find_and_replace(&content, old_text, new_text, replace_all, path, "old_text") {
+                Ok(replacement) => replacement.text,
+                Err(message) => return message,
+            };
 
         match std::fs::write(&fp, new_content.as_bytes()) {
             Ok(_) => format!("Successfully edited {}", fp.display()),
@@ -1185,6 +1225,67 @@ mod tests {
         let (matched_fragment, count) = _find_match(content, old_text);
         assert!(matched_fragment.is_some());
         assert!(count == 1);
+    }
+
+    #[test]
+    fn find_and_replace_replaces_a_unique_match() {
+        let replacement = find_and_replace(
+            "alpha\nbeta\ngamma",
+            "beta",
+            "BETA",
+            false,
+            "f.md",
+            "old_string",
+        )
+        .unwrap();
+        assert_eq!(replacement.text, "alpha\nBETA\ngamma");
+        assert_eq!(replacement.count, 1);
+    }
+
+    #[test]
+    fn find_and_replace_refuses_an_ambiguous_match_unless_replace_all() {
+        let error = find_and_replace("x\nx", "x", "y", false, "f.md", "old_string").unwrap_err();
+        assert!(error.contains("old_string appears 2 times"), "{error}");
+
+        let replacement = find_and_replace("x\nx", "x", "y", true, "f.md", "old_string").unwrap();
+        assert_eq!(replacement.text, "y\ny");
+        assert_eq!(replacement.count, 2);
+    }
+
+    #[test]
+    fn find_and_replace_names_the_target_and_parameter_when_not_found() {
+        // The hint compares whole lines: two of the three lines match.
+        let error = find_and_replace(
+            "## Steps\nrun cargo build\nrun cargo test\ncopy the binary\n",
+            "run cargo build\nrun cargo test\ncopy the binaries",
+            "x",
+            false,
+            "SKILL.md",
+            "old_string",
+        )
+        .unwrap_err();
+        assert!(
+            error.starts_with("Error: old_string not found in SKILL.md"),
+            "{error}"
+        );
+        assert!(
+            error.contains("Best match"),
+            "close text gets a diff hint: {error}"
+        );
+    }
+
+    #[test]
+    fn find_and_replace_keeps_crlf_line_endings() {
+        let replacement =
+            find_and_replace("one\r\ntwo\r\n", "one\ntwo", "1\n2", false, "f", "old_text").unwrap();
+        assert_eq!(replacement.text, "1\r\n2\r\n");
+    }
+
+    #[test]
+    fn find_and_replace_matches_whitespace_trimmed_lines() {
+        let replacement =
+            find_and_replace("  a  \n  b  \n", "a\nb", "c", false, "f", "old_text").unwrap();
+        assert_eq!(replacement.text, "c\n");
     }
 
     #[tokio::test]

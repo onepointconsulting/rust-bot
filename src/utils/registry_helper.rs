@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use crate::{
     agent::{
+        skill_store::{SkillLimits, SkillStore},
         skills::BUILTIN_SKILLS_DIR,
         tools::{
             base::Tool,
@@ -15,13 +16,14 @@ use crate::{
             question::QuestionTool,
             registry::ToolRegistry,
             search::{GlobTool, GrepTool},
+            skill_manage::SkillManageTool,
             web::{WebFetchTool, WebSearchTool},
         },
     },
     bus::queue::MessageBus,
     config::schema::{
         DocxToolConfig, GmailToolConfig, ImageGenerationToolConfig, OcrToolConfig,
-        QuestionToolConfig, WebToolsConfig,
+        QuestionToolConfig, SkillsToolConfig, WebToolsConfig,
     },
 };
 
@@ -179,6 +181,21 @@ pub fn register_question_tool(
     tools.register(Box::new(question_tool_from_config(question_config, bus)));
 }
 
+/// Register `skill_manage` when `tools.skills.enabled`. Skills are written to
+/// `<workspace>/skills`, the folder the skills loader reads first.
+pub fn register_skill_manage_tool(
+    skills_config: &SkillsToolConfig,
+    workspace: &Path,
+    tools: &mut ToolRegistry,
+) {
+    if !skills_config.enabled {
+        return;
+    }
+    log::debug!("Registering skill_manage tool");
+    let store = SkillStore::new(workspace, None, SkillLimits::from(skills_config));
+    tools.register(Box::new(SkillManageTool::new(Arc::new(store))));
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -191,6 +208,28 @@ mod tests {
         };
         let tool = question_tool_from_config(&config, Arc::new(MessageBus::new()));
         assert_eq!(tool.timeout(), Duration::from_secs(1800));
+    }
+
+    #[test]
+    fn skill_manage_is_not_registered_while_skills_are_disabled() {
+        let mut tools = ToolRegistry::new();
+        register_skill_manage_tool(
+            &SkillsToolConfig::default(),
+            Path::new("workspace"),
+            &mut tools,
+        );
+        assert!(!tools.has("skill_manage"));
+    }
+
+    #[test]
+    fn skill_manage_is_registered_when_skills_are_enabled() {
+        let mut tools = ToolRegistry::new();
+        let config = SkillsToolConfig {
+            enabled: true,
+            ..SkillsToolConfig::default()
+        };
+        register_skill_manage_tool(&config, Path::new("workspace"), &mut tools);
+        assert!(tools.has("skill_manage"));
     }
 
     #[test]

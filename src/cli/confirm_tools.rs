@@ -6,10 +6,11 @@ use async_trait::async_trait;
 use futures::lock::Mutex;
 use inquire::Select;
 
-use crate::agent::hook::{AgentHook, CallDecision, ToolCallAuthorization};
+use crate::agent::hook::{AgentHook, CallDecision, ToolCallAuthorization, ToolScopedHook};
 use crate::agent::tool_approval::{
     self, ApprovalGrant, ApprovalGrants, ToolApprovalBroker, ToolApprovalCall,
 };
+use crate::agent::tools::skill_manage::SKILL_MANAGE_TOOL_NAME;
 use crate::bus::outbound_events::{
     OutboundEvent, ToolApprovalRequestEvent, outbound_message_for_event,
 };
@@ -17,6 +18,7 @@ use crate::bus::queue::MessageBus;
 use crate::channels::websocket::CHANNEL_NAME as WEBSOCKET_CHANNEL;
 use crate::cli::cancel::pause_for_prompt;
 use crate::cli::stream::StreamRenderer;
+use crate::config::schema::ToolsConfig;
 use crate::integrations::herdr::HerdrReporter;
 
 const ARG_PREVIEW_LIMIT: usize = 120;
@@ -331,9 +333,98 @@ impl AgentHook for WebsocketsAskHook {
     }
 }
 
+/// Whether `tools` makes any tool call ask the user: every call with
+/// `confirmBeforeExecute`, or only `skill_manage` with `skills.requireApproval`.
+pub fn asks_for_tool_approval(tools: &ToolsConfig) -> bool {
+    tools.confirm_before_execute
+        || tools
+            .skills
+            .needs_scoped_approval(tools.confirm_before_execute)
+}
+
+/// The approval hook to install for `tools`: `ask_hook` itself when every call
+/// asks, or `ask_hook` scoped to `skill_manage` when only skill writes ask.
+pub fn approval_hook_for(tools: &ToolsConfig, ask_hook: Arc<dyn AgentHook>) -> Arc<dyn AgentHook> {
+    if tools.confirm_before_execute {
+        ask_hook
+    } else {
+        Arc::new(ToolScopedHook::new(ask_hook, [SKILL_MANAGE_TOOL_NAME]))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config::schema::SkillsToolConfig;
+
+    /// Tools config with the given approval switches and skills turned on.
+    fn approval_config(confirm_before_execute: bool, require_approval: bool) -> ToolsConfig {
+        ToolsConfig {
+            confirm_before_execute,
+            skills: SkillsToolConfig {
+                enabled: true,
+                require_approval,
+                ..SkillsToolConfig::default()
+            },
+            ..ToolsConfig::default()
+        }
+    }
+
+    /// An ask hook that denies everything, so a test can see who reached it.
+    struct DenyAll;
+
+    #[async_trait]
+    impl AgentHook for DenyAll {
+        async fn authorize_call(&self, _request: &ToolCallAuthorization<'_>) -> CallDecision {
+            CallDecision::deny("asked")
+        }
+    }
+
+    async fn decision_for(hook: &Arc<dyn AgentHook>, tool_name: &str) -> CallDecision {
+        let arguments = serde_json::json!({});
+        hook.authorize_call(&ToolCallAuthorization {
+            call_id: "a",
+            tool_name,
+            arguments: &arguments,
+            channel: None,
+            chat_id: None,
+            turn_id: None,
+        })
+        .await
+    }
+
+    #[test]
+    fn no_approval_is_asked_by_default() {
+        assert!(!asks_for_tool_approval(&ToolsConfig::default()));
+        assert!(!asks_for_tool_approval(&approval_config(false, false)));
+    }
+
+    #[test]
+    fn approval_is_asked_with_either_switch() {
+        assert!(asks_for_tool_approval(&approval_config(true, false)));
+        assert!(asks_for_tool_approval(&approval_config(false, true)));
+    }
+
+    #[test]
+    fn require_approval_has_no_effect_while_skills_are_off() {
+        let mut tools = approval_config(false, true);
+        tools.skills.enabled = false;
+        assert!(!asks_for_tool_approval(&tools));
+    }
+
+    #[tokio::test]
+    async fn skills_approval_only_asks_about_skill_manage() {
+        let hook = approval_hook_for(&approval_config(false, true), Arc::new(DenyAll));
+        assert!(decision_for(&hook, "read_file").await.is_allowed());
+        assert!(!decision_for(&hook, "skill_manage").await.is_allowed());
+    }
+
+    #[tokio::test]
+    async fn confirm_before_execute_asks_about_every_tool() {
+        let hook = approval_hook_for(&approval_config(true, true), Arc::new(DenyAll));
+        assert!(!decision_for(&hook, "read_file").await.is_allowed());
+        assert!(!decision_for(&hook, "skill_manage").await.is_allowed());
+    }
 
     /// An authorization request for call `call_id` of tool `exec` in `channel`/`chat_id`.
     fn request<'a>(

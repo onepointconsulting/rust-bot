@@ -34,3 +34,11 @@ This file documents non-obvious constraints and usage patterns.
 ## cron — Scheduled Reminders
 
 - Please refer to cron skill for usage.
+
+## skill_manage — Self-learnt Skills (when enabled)
+
+- Only present when `tools.skills.enabled` is on
+- Writes to `<workspace>/skills/<name>/`; bundled skills are copied there before a change
+- Prefer `patch` (old_string/new_string) over a full rewrite; read the skill first
+- The frontmatter `name` must equal the skill name; supporting files go under `references/`, `templates/`, `scripts/` or `assets/`
+- A new or changed skill appears in the skill index from the next turn; `read_file` it to use it now

@@ -80,7 +80,7 @@ use utoipa_swagger_ui::SwaggerUi;
 use crate::agent::agent_loop::{AgentLoop, ProgressCallback, enabled_mcp_servers};
 use crate::agent::hook::AgentHook;
 use crate::bus::queue::MessageBus;
-use crate::cli::confirm_tools::CliAskHook;
+use crate::cli::confirm_tools::{CliAskHook, approval_hook_for, asks_for_tool_approval};
 use crate::cli::paste_edit_mode::{
     PasteCapturingEmacs, prepare_image_paste_insert, prepare_text_paste_insert,
 };
@@ -627,14 +627,13 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
     // the session identity above and at least one state update — session
     // identity alone leaves the pane absent from `herdr agent list`.
     herdr.report_idle();
-    let confirm_hook = if config.tools.confirm_before_execute {
-        Some(Arc::new(CliAskHook::new(Arc::clone(&herdr))))
-    } else {
-        None
-    };
+    // Asks before every call with `confirmBeforeExecute`, or before `skill_manage`
+    // calls only with `tools.skills.requireApproval`.
+    let confirm_hook = asks_for_tool_approval(&config.tools)
+        .then(|| Arc::new(CliAskHook::new(Arc::clone(&herdr))));
     let hooks = confirm_hook
         .clone()
-        .map(|hook| vec![hook as Arc<dyn AgentHook>]);
+        .map(|hook| vec![approval_hook_for(&config.tools, hook)]);
     let agent_loop = init_agent_loop(&config, workspace, hooks);
 
     // This mode does not resume on its own (a different invocation than the
@@ -1155,15 +1154,18 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
     // `tools.acp.permissionPolicy` is `escalate`, so it exists for that too.
     let escalates_child_permissions = config.tools.acp.enabled
         && config.tools.acp.permission_policy == AcpPermissionPolicy::Escalate;
-    let tool_approvals = (config.tools.confirm_before_execute || escalates_child_permissions)
+    let asks_for_approval = asks_for_tool_approval(&config.tools);
+    let tool_approvals = (asks_for_approval || escalates_child_permissions)
         .then(|| Arc::new(ToolApprovalBroker::new()));
     let confirm_hook = tool_approvals
         .as_ref()
-        .filter(|_| config.tools.confirm_before_execute)
+        .filter(|_| asks_for_approval)
         .map(|broker| Arc::new(WebsocketsAskHook::new(Arc::clone(broker))));
+    // Every call asks with `confirmBeforeExecute`; only `skill_manage` with
+    // `tools.skills.requireApproval`.
     let hooks = confirm_hook
         .clone()
-        .map(|hook| vec![hook as Arc<dyn AgentHook>]);
+        .map(|hook| vec![approval_hook_for(&config.tools, hook)]);
 
     let agent_loop = Arc::new(init_agent_loop(&config, workspace.clone(), hooks));
     if let Some(hook) = &confirm_hook {

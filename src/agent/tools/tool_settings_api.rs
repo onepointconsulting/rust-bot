@@ -25,7 +25,7 @@ use serde_json::{Map, Value};
 
 use crate::config::schema::{
     AcpConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig,
-    OcrToolConfig, QuestionToolConfig, ToolsConfig, WebToolsConfig,
+    OcrToolConfig, QuestionToolConfig, SkillsToolConfig, ToolsConfig, WebToolsConfig,
 };
 
 /// Names of the toggle property of a tool section; shown as the switch, not a field.
@@ -59,6 +59,7 @@ fn editable_sections() -> Vec<Section> {
         section_of::<OcrToolConfig>("ocr"),
         section_of::<DocxToolConfig>("docx"),
         section_of::<QuestionToolConfig>("question"),
+        section_of::<SkillsToolConfig>("skills"),
         section_of::<ExecToolConfig>("exec"),
         section_of::<WebToolsConfig>("web"),
         section_of::<AcpConfig>("acp"),
@@ -633,6 +634,7 @@ mod tests {
                 "ocr",
                 "docx",
                 "question",
+                "skills",
                 "exec",
                 "web",
                 "acp"

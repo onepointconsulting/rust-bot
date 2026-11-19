@@ -1366,6 +1366,83 @@ impl Default for QuestionToolConfig {
     }
 }
 
+// ── SkillsToolConfig ─────────────────────────────────────────────────────────
+
+/// Smallest accepted `maxSkillChars`: room for frontmatter plus a useful body.
+pub const MIN_SKILL_CHARS: usize = 1_000;
+
+/// Smallest accepted `maxDescriptionChars`: room for one short trigger sentence.
+pub const MIN_SKILL_DESCRIPTION_CHARS: usize = 16;
+
+/// Default size limit of a skill's `SKILL.md` and of each supporting file
+/// (~36k tokens).
+fn default_max_skill_chars() -> usize {
+    100_000
+}
+
+/// Default size limit of a skill's frontmatter `description`.
+fn default_max_skill_description_chars() -> usize {
+    1_024
+}
+
+/// Self-learnt skills: the `skill_manage` tool and the guidance telling the
+/// agent when to record what it learnt as a skill.
+#[derive(Debug, Clone, Deserialize, Serialize, Validate, JsonSchema)]
+#[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-editable" = true, "x-title" = "Skills", "x-tools" = ["skill_manage"]))]
+pub struct SkillsToolConfig {
+    /// Let the agent create and update its own skills while it works (registers
+    /// `skill_manage` and adds the learning guidance to the system prompt).
+    /// Default: `false`.
+    #[serde(alias = "enable")]
+    #[garde(skip)]
+    pub enabled: bool,
+
+    /// Ask the user before every `skill_manage` call, even when
+    /// `confirmBeforeExecute` is off. A call nobody can be asked about (e.g. a
+    /// turn from email) is denied. Default: `false`.
+    #[serde(alias = "require_approval")]
+    #[garde(skip)]
+    pub require_approval: bool,
+
+    /// Size limit, in characters, of a `SKILL.md` and of each supporting file.
+    /// Must be ≥ 1000. Default: 100000.
+    #[serde(alias = "max_skill_chars", default = "default_max_skill_chars")]
+    #[garde(range(min = MIN_SKILL_CHARS))]
+    #[schemars(range(min = 1000), extend("x-label" = "Max skill characters"))]
+    pub max_skill_chars: usize,
+
+    /// Size limit, in characters, of a skill's frontmatter `description`.
+    /// Must be ≥ 16. Default: 1024.
+    #[serde(
+        alias = "max_description_chars",
+        default = "default_max_skill_description_chars"
+    )]
+    #[garde(range(min = MIN_SKILL_DESCRIPTION_CHARS))]
+    #[schemars(range(min = 16), extend("x-label" = "Max description characters"))]
+    pub max_description_chars: usize,
+}
+
+impl Default for SkillsToolConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            require_approval: false,
+            max_skill_chars: default_max_skill_chars(),
+            max_description_chars: default_max_skill_description_chars(),
+        }
+    }
+}
+
+impl SkillsToolConfig {
+    /// Whether `skill_manage` calls need their own approval prompt: the feature
+    /// is on, approval is requested, and `confirmBeforeExecute` does not already
+    /// ask for every tool.
+    pub fn needs_scoped_approval(&self, confirm_before_execute: bool) -> bool {
+        self.enabled && self.require_approval && !confirm_before_execute
+    }
+}
+
 // ── ImageGenerationToolConfig ───────────────────────────────────────────────────────────
 
 fn default_image_generation_tool_enable() -> bool {
@@ -1827,6 +1904,12 @@ pub struct ToolsConfig {
     #[schemars(skip)]
     pub question: QuestionToolConfig,
 
+    /// Self-learnt skills (`skill_manage` tool).
+    #[serde(alias = "skills")]
+    #[garde(dive)]
+    #[schemars(skip)]
+    pub skills: SkillsToolConfig,
+
     /// Driving child agents over ACP (`acp_*` tools).
     #[serde(alias = "acp")]
     #[garde(dive)]
@@ -1851,6 +1934,7 @@ impl Default for ToolsConfig {
             ocr: OcrToolConfig::default(),
             image_generation: ImageGenerationToolConfig::default(),
             question: QuestionToolConfig::default(),
+            skills: SkillsToolConfig::default(),
             acp: AcpConfig::default(),
             mcp_presets_path: default_mcp_presets_path(),
         }
@@ -3481,6 +3565,95 @@ mod tests {
         let json = r#"{"enable": false}"#;
         let cfg: QuestionToolConfig = serde_json::from_str(json).unwrap();
         assert!(!cfg.enabled);
+    }
+
+    // ── SkillsToolConfig ──────────────────────────────────────────────────────
+
+    #[test]
+    fn test_skills_tool_defaults_to_off() {
+        let cfg = SkillsToolConfig::default();
+        assert!(!cfg.enabled);
+        assert!(!cfg.require_approval);
+        assert_eq!(cfg.max_skill_chars, 100_000);
+        assert_eq!(cfg.max_description_chars, 1_024);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_skills_tool_empty_object_takes_defaults() {
+        let cfg: SkillsToolConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.enabled);
+        assert_eq!(cfg.max_skill_chars, 100_000);
+        assert_eq!(cfg.max_description_chars, 1_024);
+    }
+
+    #[test]
+    fn test_skills_tool_deserializes_camel_case() {
+        let json = r#"{"enabled": true, "requireApproval": true,
+                       "maxSkillChars": 2000, "maxDescriptionChars": 40}"#;
+        let cfg: SkillsToolConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.require_approval);
+        assert_eq!(cfg.max_skill_chars, 2000);
+        assert_eq!(cfg.max_description_chars, 40);
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_skills_tool_deserializes_snake_case_and_enable_alias() {
+        let json = r#"{"enable": true, "require_approval": true,
+                       "max_skill_chars": 3000, "max_description_chars": 50}"#;
+        let cfg: SkillsToolConfig = serde_json::from_str(json).unwrap();
+        assert!(cfg.enabled);
+        assert!(cfg.require_approval);
+        assert_eq!(cfg.max_skill_chars, 3000);
+        assert_eq!(cfg.max_description_chars, 50);
+    }
+
+    #[test]
+    fn test_skills_tool_limits_below_minimum_are_invalid() {
+        let too_small_skill: SkillsToolConfig =
+            serde_json::from_str(r#"{"maxSkillChars": 500}"#).unwrap();
+        assert!(too_small_skill.validate().is_err());
+        let too_small_description: SkillsToolConfig =
+            serde_json::from_str(r#"{"maxDescriptionChars": 8}"#).unwrap();
+        assert!(too_small_description.validate().is_err());
+    }
+
+    #[test]
+    fn test_skills_tool_config_lives_under_tools_skills() {
+        let json = r#"{"skills": {"enabled": true}}"#;
+        let tools: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(tools.skills.enabled);
+        assert!(!ToolsConfig::default().skills.enabled);
+    }
+
+    #[test]
+    fn test_skills_tool_invalid_limit_fails_tools_validation() {
+        let json = r#"{"skills": {"maxSkillChars": 10}}"#;
+        let tools: ToolsConfig = serde_json::from_str(json).unwrap();
+        assert!(tools.validate().is_err());
+    }
+
+    #[test]
+    fn test_skills_tool_scoped_approval_only_when_not_already_confirming() {
+        let config = SkillsToolConfig {
+            enabled: true,
+            require_approval: true,
+            ..SkillsToolConfig::default()
+        };
+        assert!(config.needs_scoped_approval(false));
+        assert!(!config.needs_scoped_approval(true));
+        let not_requested = SkillsToolConfig {
+            enabled: true,
+            ..SkillsToolConfig::default()
+        };
+        assert!(!not_requested.needs_scoped_approval(false));
+        let disabled = SkillsToolConfig {
+            require_approval: true,
+            ..SkillsToolConfig::default()
+        };
+        assert!(!disabled.needs_scoped_approval(false));
     }
 
     #[test]

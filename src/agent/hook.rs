@@ -596,12 +596,124 @@ impl AgentHook for LoopHookChain {
     }
 }
 
+// ── ToolScopedHook ────────────────────────────────────────────────────────────
+
+/// Applies an approval hook to a few named tools only.
+///
+/// Calls of the tools in `tool_names` are authorized by `inner` (which may ask
+/// the user); every other call is allowed without asking. Used when approval is
+/// wanted for one sensitive tool (e.g. `skill_manage` with
+/// `tools.skills.requireApproval`) but not for every tool, as
+/// `tools.confirmBeforeExecute` would.
+pub struct ToolScopedHook {
+    inner: Arc<dyn AgentHook>,
+    tool_names: std::collections::HashSet<String>,
+}
+
+impl ToolScopedHook {
+    /// Scope `inner` to the tools called one of `tool_names`.
+    pub fn new(
+        inner: Arc<dyn AgentHook>,
+        tool_names: impl IntoIterator<Item = impl Into<String>>,
+    ) -> Self {
+        Self {
+            inner,
+            tool_names: tool_names.into_iter().map(Into::into).collect(),
+        }
+    }
+
+    /// Whether calls of `tool_name` go to the inner hook.
+    pub fn covers(&self, tool_name: &str) -> bool {
+        self.tool_names.contains(tool_name)
+    }
+}
+
+#[async_trait]
+impl AgentHook for ToolScopedHook {
+    fn revoke_grants(&self, channel: &str, chat_id: &str) -> Option<bool> {
+        self.inner.revoke_grants(channel, chat_id)
+    }
+
+    async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
+        if self.covers(request.tool_name) {
+            self.inner.authorize_call(request).await
+        } else {
+            CallDecision::Allow
+        }
+    }
+}
+
 // ── tests ─────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::{Arc, Mutex};
+
+    // ── ToolScopedHook ────────────────────────────────────────────────────────
+
+    /// Denies every call it is asked about and remembers the tool names.
+    #[derive(Default)]
+    struct DenyingHook {
+        asked_about: Mutex<Vec<String>>,
+    }
+
+    #[async_trait]
+    impl AgentHook for DenyingHook {
+        fn revoke_grants(&self, _channel: &str, _chat_id: &str) -> Option<bool> {
+            Some(true)
+        }
+
+        async fn authorize_call(&self, request: &ToolCallAuthorization<'_>) -> CallDecision {
+            self.asked_about
+                .lock()
+                .unwrap()
+                .push(request.tool_name.to_string());
+            CallDecision::deny("no")
+        }
+    }
+
+    fn call_of<'a>(
+        tool_name: &'a str,
+        arguments: &'a serde_json::Value,
+    ) -> ToolCallAuthorization<'a> {
+        ToolCallAuthorization {
+            tool_name,
+            ..authorization("call-1", arguments)
+        }
+    }
+
+    #[tokio::test]
+    async fn scoped_hook_allows_other_tools_without_asking() {
+        let inner = Arc::new(DenyingHook::default());
+        let hook = ToolScopedHook::new(inner.clone(), ["skill_manage"]);
+        let arguments = serde_json::json!({});
+
+        let decision = hook.authorize_call(&call_of("read_file", &arguments)).await;
+
+        assert!(decision.is_allowed());
+        assert!(inner.asked_about.lock().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn scoped_hook_hands_its_tools_to_the_inner_hook() {
+        let inner = Arc::new(DenyingHook::default());
+        let hook = ToolScopedHook::new(inner.clone(), ["skill_manage"]);
+        let arguments = serde_json::json!({});
+
+        let decision = hook
+            .authorize_call(&call_of("skill_manage", &arguments))
+            .await;
+
+        assert_eq!(decision, CallDecision::deny("no"));
+        assert_eq!(*inner.asked_about.lock().unwrap(), ["skill_manage"]);
+    }
+
+    #[test]
+    fn scoped_hook_passes_revocations_through() {
+        let hook = ToolScopedHook::new(Arc::new(DenyingHook::default()), ["skill_manage"]);
+        assert_eq!(hook.revoke_grants("cli", "direct"), Some(true));
+    }
 
     // ── test fixtures ─────────────────────────────────────────────────────────
 

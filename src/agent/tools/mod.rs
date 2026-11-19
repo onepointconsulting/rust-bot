@@ -14,6 +14,7 @@ pub mod registry;
 pub mod sandbox;
 pub mod search;
 pub mod shell;
+pub mod skill_manage;
 pub mod spawn;
 #[cfg(test)]
 pub(crate) mod test_support;

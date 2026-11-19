@@ -422,31 +422,43 @@ impl SkillsLoader {
     /// # Returns
     /// Metadata object or `None`.
     fn get_skill_metadata(&self, name: &str) -> Option<serde_json::Value> {
-        let content = self.load_skill(name);
-        if let Some(content) = content {
-            if !content.starts_with("---") {
-                return None;
-            }
-            let matched_option = STRIP_SKILL_FRONTMATTER.captures(content.as_str());
-            {
-                let captures = matched_option?;
-                let group1 = captures.get(1).map(|m| m.as_str());
-                let mut metadata: HashMap<String, String> = HashMap::new();
-                if let Some(group1) = group1 {
-                    for line in group1.lines() {
-                        if !line.contains(":") {
-                            continue;
-                        }
-                        let (key, value) = line.split_once(':').unwrap();
-                        metadata.insert(key.trim().to_string(), strip_surrounding_quotes(value));
-                    }
-                }
-                Some(serde_json::json!(metadata))
-            }
-        } else {
-            None
-        }
+        let content = self.load_skill(name)?;
+        let frontmatter = parse_skill_frontmatter(&content)?;
+        Some(serde_json::json!(frontmatter.fields))
     }
+}
+
+/// The frontmatter of a `SKILL.md`, split from its body.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct SkillFrontmatter<'a> {
+    /// `key: value` lines of the frontmatter block, keys trimmed and values
+    /// stripped of surrounding quotes. Lines without `:` are ignored.
+    pub fields: HashMap<String, String>,
+    /// Everything after the closing `---` line.
+    pub body: &'a str,
+}
+
+/// Split a `SKILL.md` text into its frontmatter fields and body.
+///
+/// Returns `None` when the text does not start with a `---` block closed by a
+/// `---` line. This is the same line-based reading the loader uses for the
+/// skill index (no YAML parser), so what validates here is what the index shows.
+pub(crate) fn parse_skill_frontmatter(content: &str) -> Option<SkillFrontmatter<'_>> {
+    if !content.starts_with("---") {
+        return None;
+    }
+    let captures = STRIP_SKILL_FRONTMATTER.captures(content)?;
+    let block = captures.get(1).map_or("", |m| m.as_str());
+    let fields = block
+        .lines()
+        .filter_map(|line| line.split_once(':'))
+        .map(|(key, value)| (key.trim().to_string(), strip_surrounding_quotes(value)))
+        .collect();
+    let body_start = captures.get(0).map_or(content.len(), |m| m.end());
+    Some(SkillFrontmatter {
+        fields,
+        body: &content[body_start..],
+    })
 }
 
 #[cfg(test)]

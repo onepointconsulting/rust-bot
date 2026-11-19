@@ -47,6 +47,7 @@ use crate::agent::tools::mcp::{
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
+use crate::agent::tools::skill_manage::skill_learning_prompt_section;
 use crate::agent::tools::spawn::SpawnTool;
 use crate::agent::tools::tool_search::{ToolSearchTool, deferred_tools_prompt_section};
 use crate::agent::turn_journal::TurnJournal;
@@ -66,7 +67,7 @@ use crate::command::{CommandRouter, builtin::register_builtin_commands};
 use crate::config::schema::{
     ChannelsConfig, Config, DocxToolConfig, DurabilityConfig, ExecToolConfig, GmailToolConfig,
     ImageGenerationToolConfig, MCP_ALL_TOOLS, McpServerConfig, OcrToolConfig, QuestionToolConfig,
-    RESERVED_MODEL_PRESET_NAME, WebToolsConfig,
+    RESERVED_MODEL_PRESET_NAME, SkillsToolConfig, WebToolsConfig,
 };
 use crate::cron::CronService;
 use crate::providers::base::{LLMProviderDyn, LLMUsage};
@@ -92,7 +93,7 @@ use crate::utils::helpers::{image_placeholder_text, strip_think, truncate_text};
 use crate::utils::registry_helper::{
     filesystem_tool_scope, register_conversion_tools, register_filesystem_tools,
     register_gmail_tools, register_image_generation_tools, register_ocr_tools,
-    register_question_tool, register_web_tools,
+    register_question_tool, register_skill_manage_tool, register_web_tools,
 };
 use crate::utils::runtime::EMPTY_FINAL_RESPONSE_MESSAGE;
 use crate::utils::tool_hints::format_tool_hints;
@@ -651,6 +652,7 @@ impl AgentLoop {
             &docx_config,
             &image_generation_config,
             &question_config,
+            &tools_cfg.skills,
             bus.clone(),
             &cron_service,
             &timezone,
@@ -683,6 +685,16 @@ impl AgentLoop {
             let acp_tools = Arc::clone(acp_tools);
             context_builder = context_builder
                 .with_prompt_section(Arc::new(move |_mode| acp_tools.prompt_section()));
+        }
+        // Tells the model when to record a skill; absent when `skill_manage` is
+        // not callable (disabled, removed by `disabledTools`, or hidden by the mode).
+        if tools_cfg.skills.enabled {
+            let section_tools = Arc::clone(&tools);
+            let skills_dir = workspace.join("skills");
+            context_builder = context_builder.with_prompt_section(Arc::new(move |mode| {
+                let registry = section_tools.lock().unwrap_or_else(|e| e.into_inner());
+                skill_learning_prompt_section(&registry, mode, &skills_dir)
+            }));
         }
         // Names the deferred servers and tools, so the model knows `tool_search` can load
         // them. Built from the mode's view, so `no_mcp` lists no MCP server.
@@ -1050,6 +1062,7 @@ impl AgentLoop {
         docx_config: &DocxToolConfig,
         image_generation_config: &ImageGenerationToolConfig,
         question_config: &QuestionToolConfig,
+        skills_config: &SkillsToolConfig,
         bus: Arc<MessageBus>,
         cron_service: &Option<Arc<CronService>>,
         timezone: &Option<String>,
@@ -1088,6 +1101,7 @@ impl AgentLoop {
         );
         register_image_generation_tools(image_generation_config, workspace, tools);
         register_question_tool(question_config, bus.clone(), tools);
+        register_skill_manage_tool(skills_config, workspace, tools);
         tools.register(Box::new(MessageTool::new(
             Some(MessageTool::create_send_callback(bus)),
             "",
