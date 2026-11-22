@@ -60,6 +60,19 @@ pub struct ChatEntry {
     pub timestamp: Option<String>,
 }
 
+/// Text of the most recent user message with non-blank content, for the
+/// composer's Up-arrow recall. `None` in a chat with no user messages.
+///
+/// Image-only user rows (blank `content`) are skipped, so the recall lands on
+/// the last message the user actually typed.
+pub fn last_user_message_text(entries: &[ChatEntry]) -> Option<String> {
+    entries
+        .iter()
+        .rev()
+        .find(|entry| entry.role == Role::User && !entry.content.trim().is_empty())
+        .map(|entry| entry.content.clone())
+}
+
 /// Session lifetime token/cost totals, as surfaced by the gateway on
 /// `attached` and `session_updated`.
 ///
@@ -193,6 +206,10 @@ pub struct ToolSettingSummary {
     /// The settings form, when the row stands for a whole tool section (e.g. `gmail`).
     #[serde(default)]
     pub config: Option<ToolConfigSummary>,
+    /// Why the enabled tool section cannot run right now (e.g. Gmail without
+    /// credentials). `None` when it can, or on older gateways.
+    #[serde(default)]
+    pub unavailable_reason: Option<String>,
 }
 
 /// What kind of input a tool setting needs. Mirrors the backend's `FieldKind`
@@ -751,6 +768,58 @@ mod tests {
             description: String::new(),
             exposure,
         }
+    }
+
+    fn chat_entry(id: u64, role: Role, content: &str) -> ChatEntry {
+        ChatEntry {
+            id,
+            role,
+            content: content.to_string(),
+            attachments: Vec::new(),
+            streaming: false,
+            tool_events: None,
+            reasoning: None,
+            user_id: None,
+            timestamp: None,
+        }
+    }
+
+    #[test]
+    fn last_user_message_text_is_none_for_empty_chat() {
+        assert_eq!(last_user_message_text(&[]), None);
+    }
+
+    #[test]
+    fn last_user_message_text_is_none_without_user_rows() {
+        let entries = vec![chat_entry(1, Role::Assistant, "Hi, how can I help?")];
+        assert_eq!(last_user_message_text(&entries), None);
+    }
+
+    #[test]
+    fn last_user_message_text_returns_most_recent_user_row() {
+        let entries = vec![
+            chat_entry(1, Role::User, "first question"),
+            chat_entry(2, Role::Assistant, "first answer"),
+            chat_entry(3, Role::User, "second question\nwith two lines"),
+            chat_entry(4, Role::Assistant, "second answer"),
+        ];
+        assert_eq!(
+            last_user_message_text(&entries),
+            Some("second question\nwith two lines".to_string())
+        );
+    }
+
+    #[test]
+    fn last_user_message_text_skips_trailing_image_only_row() {
+        let entries = vec![
+            chat_entry(1, Role::User, "describe this"),
+            chat_entry(2, Role::Assistant, "sure"),
+            chat_entry(3, Role::User, "   "),
+        ];
+        assert_eq!(
+            last_user_message_text(&entries),
+            Some("describe this".to_string())
+        );
     }
 
     #[test]

@@ -40,6 +40,37 @@ fn sync_textarea_value_and_resize(el: &HtmlTextAreaElement, value: &str) {
     resize_textarea(el);
 }
 
+/// `true` when a composer keydown should recall the previous message:
+/// plain ArrowUp (no Shift/Ctrl/Alt/Meta), not mid IME composition,
+/// and the field is empty (so the caret is at position 0).
+///
+/// Requiring an empty field means a half-typed draft is never overwritten and
+/// Up keeps its normal caret behaviour whenever there is text to move through.
+fn should_recall_previous_message(
+    key: &str,
+    has_modifier: bool,
+    is_composing: bool,
+    current_draft: &str,
+) -> bool {
+    key == "ArrowUp" && !has_modifier && !is_composing && current_draft.is_empty()
+}
+
+/// Put `previous_message_text` into the composer and place the caret at its end.
+///
+/// The value is written onto the textarea immediately (rather than waiting
+/// for `prop:value` to flush) so the selection can be set right away; DOM
+/// selection offsets count UTF-16 code units, hence `encode_utf16`.
+fn recall_previous_message_into(
+    el: &HtmlTextAreaElement,
+    draft: RwSignal<String>,
+    previous_message_text: &str,
+) {
+    draft.set(previous_message_text.to_string());
+    sync_textarea_value_and_resize(el, previous_message_text);
+    let caret_offset = previous_message_text.encode_utf16().count() as u32;
+    let _ = el.set_selection_range(caret_offset, caret_offset);
+}
+
 /// Read a `File`'s bytes as a `data:` URL and hand the result to `on_loaded`.
 fn read_file_as_data_url(file: File, on_loaded: impl Fn(String) + 'static) {
     let Ok(reader) = web_sys::FileReader::new() else {
@@ -706,6 +737,10 @@ pub fn ChatInput(
     /// increments focus. Omitted means the composer never steals focus.
     #[prop(optional)]
     focus_request: Option<RwSignal<u32>>,
+    /// Text the Up arrow recalls into an empty composer (the user's last
+    /// message). Omitted or `None` disables the shortcut — `web-chat` never sets this.
+    #[prop(into, optional)]
+    previous_message: Option<Signal<Option<String>>>,
 ) -> impl IntoView {
     let attachments = RwSignal::new(Vec::<ImageAttachment>::new());
     let show_url_field = RwSignal::new(false);
@@ -875,6 +910,28 @@ pub fn ChatInput(
                         if ev.key() == "Enter" && !ev.shift_key() && !ev.ctrl_key() {
                             ev.prevent_default();
                             send();
+                            return;
+                        }
+                        // Up in an empty field recalls the previous message.
+                        let Some(previous_message) = previous_message else {
+                            return;
+                        };
+                        let has_modifier =
+                            ev.shift_key() || ev.ctrl_key() || ev.alt_key() || ev.meta_key();
+                        if !should_recall_previous_message(
+                            &ev.key(),
+                            has_modifier,
+                            ev.is_composing(),
+                            &draft.get_untracked(),
+                        ) {
+                            return;
+                        }
+                        let Some(previous_message_text) = previous_message.get_untracked() else {
+                            return;
+                        };
+                        if let Some(el) = textarea_ref.get_untracked() {
+                            ev.prevent_default();
+                            recall_previous_message_into(&el, draft, &previous_message_text);
                         }
                     }
                     on:paste=move |ev| {
@@ -1056,11 +1113,45 @@ pub fn ChatInput(
 
 #[cfg(test)]
 mod tests {
-    use super::agent_mode_label;
+    use super::{agent_mode_label, should_recall_previous_message};
 
     #[test]
     fn agent_mode_label_replaces_underscores_with_spaces() {
         assert_eq!(agent_mode_label("no_mcp"), "no mcp");
+    }
+
+    #[test]
+    fn plain_arrow_up_in_empty_field_recalls_previous_message() {
+        assert!(should_recall_previous_message("ArrowUp", false, false, ""));
+    }
+
+    #[test]
+    fn arrow_up_with_draft_text_keeps_normal_caret_behaviour() {
+        assert!(!should_recall_previous_message(
+            "ArrowUp", false, false, "abc"
+        ));
+    }
+
+    #[test]
+    fn arrow_up_with_modifier_does_not_recall() {
+        assert!(!should_recall_previous_message("ArrowUp", true, false, ""));
+    }
+
+    #[test]
+    fn arrow_up_during_ime_composition_does_not_recall() {
+        assert!(!should_recall_previous_message("ArrowUp", false, true, ""));
+    }
+
+    #[test]
+    fn other_keys_do_not_recall() {
+        assert!(!should_recall_previous_message(
+            "ArrowDown",
+            false,
+            false,
+            ""
+        ));
+        assert!(!should_recall_previous_message("Up", false, false, ""));
+        assert!(!should_recall_previous_message("Enter", false, false, ""));
     }
 
     #[test]

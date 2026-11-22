@@ -99,6 +99,9 @@ jobs:
         run: trunk build --release
 
       - name: Build release binaries
+        env:
+          # Built-in Gmail OAuth Desktop client (JSON); empty secret = none embedded.
+          RUST_BOT_GMAIL_CLIENT_SECRET: ${{ secrets.RUST_BOT_GMAIL_CLIENT_SECRET }}
         run: cargo build --release --bin rust-bot --bin gmail-auth --target x86_64-pc-windows-msvc
 
       - name: Assemble package

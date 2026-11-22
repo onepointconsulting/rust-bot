@@ -94,6 +94,9 @@ jobs:
         run: trunk build --release
 
       - name: Build release binaries (glibc 2.17 floor via zig)
+        env:
+          # Built-in Gmail OAuth Desktop client (JSON); empty secret = none embedded.
+          RUST_BOT_GMAIL_CLIENT_SECRET: ${{ secrets.RUST_BOT_GMAIL_CLIENT_SECRET }}
         run: cargo zigbuild --release --bin rust-bot --bin gmail-auth --target x86_64-unknown-linux-gnu.2.17
 
       - name: Verify glibc symbol ceiling (must stay <= 2.17)

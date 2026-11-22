@@ -1,17 +1,17 @@
 use chat_ui::components::{ChatHeaderActions, ChatInput, SessionsSidebar, SessionsStrip};
 use chat_ui::models::{
-    AcpAgentSummary, ChatEntry, McpCustomServerSummary, McpPresetSummary, OutgoingMessage,
-    SessionListItem, SessionSummaryPopup, SessionTokenUsage, SkillSummary, SpawnTaskSummary,
-    ToolSummary, WorkspaceDialogState,
+    last_user_message_text, AcpAgentSummary, ChatEntry, McpCustomServerSummary, McpPresetSummary,
+    OutgoingMessage, SessionListItem, SessionSummaryPopup, SessionTokenUsage, SkillSummary,
+    SpawnTaskSummary, ToolSummary, WorkspaceDialogState,
 };
 use leptos::prelude::*;
 
 use crate::components::{
     AskQuestionCard, ConfigSavedNotice, McpChangeRequest, McpPresetsPage, MessageList,
-    SettingsActions, SettingsDialog, SettingsPanel, SubagentsPage, ToolApprovalCard,
-    ToolGrantsBanner,
+    SettingsActions, SettingsDialog, SettingsPanel, StartupWarningsBanner, SubagentsPage,
+    ToolApprovalCard, ToolGrantsBanner,
 };
-use crate::protocol::ToolApprovalGrant;
+use crate::protocol::{StartupWarning, ToolApprovalGrant};
 use crate::shortcuts::{is_sidebar_toggle_shortcut, sidebar_shortcut_label};
 use crate::state::{
     background_banner, ConfigFileView, ConnectionStatus, MainView, PendingApproval,
@@ -81,6 +81,11 @@ pub fn ChatShell(
     /// The signed-in user's role from the `ready` frame, shown in the account menu.
     #[prop(into)]
     user_role: Signal<Option<String>>,
+    /// Start-up warnings still to show (dismissed ones already removed).
+    #[prop(into)]
+    startup_warnings: Signal<Vec<StartupWarning>>,
+    /// Called with the warnings shown when the user dismisses the strip.
+    on_dismiss_startup_warnings: Callback<Vec<StartupWarning>>,
     draft: RwSignal<String>,
     on_send: impl Fn(OutgoingMessage) + 'static + Copy,
     on_new_chat: impl Fn() + 'static + Send + Sync + Copy,
@@ -180,6 +185,10 @@ pub fn ChatShell(
     #[prop(default = true)] show_minimize: bool,
 ) -> impl IntoView {
     let on_use_prompt = move |prompt: String| draft.set(prompt);
+    // Up in an empty composer recalls the user's last message in this chat.
+    // `entries` follows the active session, so a new chat recalls nothing.
+    let previous_user_message =
+        Signal::derive(move || entries.with(|chat_entries| last_user_message_text(chat_entries)));
     // Starting a new chat should leave the cursor ready in the composer.
     let composer_focus_request = RwSignal::new(0_u32);
     let on_new_chat_and_focus = move || {
@@ -289,6 +298,11 @@ pub fn ChatShell(
                     </div>
                 </Show>
 
+                <StartupWarningsBanner
+                    warnings=startup_warnings
+                    on_dismiss=on_dismiss_startup_warnings
+                />
+
                 <Show when=move || error.get().is_some()>
                     <p class="border-b border-red-100 bg-red-50 px-4 py-2 text-xs text-red-600">
                         {move || error.get().unwrap_or_default()}
@@ -350,6 +364,7 @@ pub fn ChatShell(
                         tools=tools
                         on_open_tools=Callback::new(move |()| on_open_tools())
                         focus_request=composer_focus_request
+                        previous_message=previous_user_message
                     />
                 </div>
                 <Show when=move || main_view.get() == MainView::Subagents>

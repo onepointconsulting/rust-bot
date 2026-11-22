@@ -5,6 +5,7 @@ pub mod command_specifications;
 pub mod commands;
 mod confirm_tools;
 mod docker_runtime;
+pub mod gmail_auth;
 pub mod instance_layout;
 pub mod onboard;
 pub mod onboard_docker;

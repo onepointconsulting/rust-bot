@@ -11,9 +11,6 @@ pub const GENERAL_ERROR: i32 = 1;
 /// Invalid / unknown value in `agents.provider`.
 pub const INVALID_PROVIDER: i32 = 3;
 
-/// Gmail tool credentials missing (OAuth client secret or token cache path).
-pub const GMAIL_CONFIG_ERROR: i32 = 4;
-
 /// A channel has an empty `allowFrom` list (must be `["*"]` or specific user IDs).
 pub const CHANNEL_ALLOW_FROM_EMPTY: i32 = 5;
 

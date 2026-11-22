@@ -20,6 +20,7 @@ use crate::agent::tools::cron::CronTool;
 use crate::agent::tools::message::MessageTool;
 use crate::agent::tools::question::{QUESTION_TOOL_NAME, QuestionTool};
 use crate::agent::tools::registry::ToolRegistry;
+use crate::agent::tools::startup_warning::ToolStartupWarning;
 use crate::api::login::{
     AuthConfigResponse, GatewayApiDoc, LoginState, auth_config, jwt_auth_state_from_config, login,
 };
@@ -58,7 +59,7 @@ use crate::integrations::herdr::HerdrReporter;
 use crate::security::jwt::{GeneratedKeypair, JwtError, generate_jwt_keypair, generate_jwt_token};
 use crate::security::workspace_requests::WorkspaceRequestHandler;
 use crate::session::manager::{RenameSessionError, SessionManager};
-use crate::utils::cli::{is_all_interfaces_host, print_markdown, print_warning};
+use crate::utils::cli::{eprint_warning, is_all_interfaces_host, print_markdown, print_warning};
 use crate::utils::evaluator::evaluate_response;
 
 use anstyle::{AnsiColor, Color, Style};
@@ -286,6 +287,7 @@ pub async fn run(cli: Cli) -> Result<(), CliError> {
         Commands::GenerateJwtToken(args) => run_generate_token(args),
         Commands::Subagents(args) => run_subagents(args),
         Commands::CheckConfig(args) => run_check_config(args),
+        Commands::GmailAuth(args) => crate::cli::gmail_auth::run_gmail_auth(args).await,
     }
 }
 
@@ -646,6 +648,9 @@ async fn run_agent(args: AgentArgs) -> Result<(), CliError> {
              they are added to their session the next time it is used (the gateway resumes them automatically)."
         );
     }
+    for warning in agent_loop.tool_startup_warnings() {
+        eprint_warning(&warning.message);
+    }
 
     if let Some(restart_notice) = consume_restart_notice_from_env()
         && should_show_cli_restart_notice(restart_notice.clone(), session_id.as_str())
@@ -959,6 +964,7 @@ async fn run_api(args: ApiArgs) -> Result<(), CliError> {
         &timeout,
         web_root.as_deref(),
     );
+    print_tool_startup_warnings(agent_loop.tool_startup_warnings());
     if let Err(err) = create_api_server(ApiServer {
         agent_loop: Arc::new(agent_loop),
         host,
@@ -1000,6 +1006,7 @@ fn resolve_websocket_channel(
     tool_registry: Arc<StdMutex<ToolRegistry>>,
     acp_manager: Option<Arc<AcpManager>>,
     subagents: Option<Arc<SubagentManager>>,
+    tool_startup_warnings: &[ToolStartupWarning],
 ) -> Option<Arc<WebSocketChannel>> {
     let raw = config.channels.extra.get(CHANNEL_NAME)?.clone();
     let cfg: WebSocketConfig = serde_json::from_value(raw)
@@ -1025,6 +1032,7 @@ fn resolve_websocket_channel(
     );
     channel.acp_manager = acp_manager;
     channel.subagents = subagents;
+    channel.tool_startup_warnings = Arc::new(tool_startup_warnings.to_vec());
     Some(Arc::new(channel))
 }
 
@@ -1324,6 +1332,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             .acp_tools()
             .map(|acp_tools| Arc::clone(acp_tools.manager())),
         Some(Arc::clone(&agent_loop.subagents)),
+        agent_loop.tool_startup_warnings(),
     );
     // Give the WebSocket channel's `delete_chat` handler something to abort
     // in-flight work through. Must happen before `ws_channel.router()` is
@@ -1531,6 +1540,7 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
             yellow.render_reset()
         );
     }
+    print_tool_startup_warnings(agent_loop.tool_startup_warnings());
 
     // Register Dream system job (always-on, idempotent on restart)
     // Note: dream.model_override is already applied in AgentLoop::new.
@@ -1768,6 +1778,14 @@ fn render_api_startup_message(
         print_warning(
             "API is bound to all interfaces. Only do this behind a trusted network boundary, firewall, or reverse proxy.",
         );
+    }
+}
+
+/// Print one `Warning:` line per tool section left out at start-up, for the
+/// gateway and API start-up banners.
+fn print_tool_startup_warnings(warnings: &[ToolStartupWarning]) {
+    for warning in warnings {
+        print_warning(&warning.message);
     }
 }
 
@@ -2568,6 +2586,7 @@ mod tests {
             test_tool_registry(),
             None,
             None,
+            &[],
         );
 
         assert!(
@@ -2594,6 +2613,7 @@ mod tests {
             test_tool_registry(),
             None,
             None,
+            &[],
         );
 
         assert!(resolved.is_none());
@@ -2616,6 +2636,7 @@ mod tests {
             test_tool_registry(),
             None,
             None,
+            &[],
         );
 
         assert!(resolved.is_some());
@@ -2638,6 +2659,7 @@ mod tests {
             test_tool_registry(),
             None,
             None,
+            &[],
         );
 
         assert!(resolved.is_none());

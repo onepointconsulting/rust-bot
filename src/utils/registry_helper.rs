@@ -11,12 +11,14 @@ use crate::{
             docx::DocxConversionTool,
             filesystem::{EditFileTool, FsToolConfig, ListDirTool, ReadFileTool, WriteFileTool},
             gmail::{GmailEmailDownloadTool, GmailEmailSendTool, GmailEmailsTool},
+            gmail_oauth::gmail_unavailable_reason,
             image_generation::ImageGenerationTool,
             ocr::OcrTool,
             question::QuestionTool,
             registry::ToolRegistry,
             search::{GlobTool, GrepTool},
             skill_manage::SkillManageTool,
+            startup_warning::ToolStartupWarning,
             web::{WebFetchTool, WebSearchTool},
         },
     },
@@ -98,21 +100,36 @@ pub fn register_web_tools(web_config: &WebToolsConfig, tools: &mut ToolRegistry)
     }
 }
 
+/// Config section name of the Gmail tools (`tools.gmail`).
+pub const GMAIL_TOOL_SECTION: &str = "gmail";
+
+/// Register `gmail`, `gmail_email_send` and `gmail_email_download` when
+/// `tools.gmail.enable` is set and both credential files exist.
+///
+/// When Gmail is enabled but a credential file is missing, registers nothing,
+/// logs a warning and returns it so the caller can show it to the user; the
+/// process keeps running. Returns `None` when Gmail is disabled or registered.
 pub fn register_gmail_tools(
     gmail_config: &GmailToolConfig,
     workspace: &Path,
     tools: &mut ToolRegistry,
-) {
+) -> Option<ToolStartupWarning> {
     log::info!("Gmail config: {:?}", gmail_config);
-    if gmail_config.enable {
-        log::debug!("Registering gmail tool");
-        tools.register(Box::new(GmailEmailsTool::new(gmail_config.clone())));
-        tools.register(Box::new(GmailEmailSendTool::new(gmail_config.clone())));
-        tools.register(Box::new(GmailEmailDownloadTool::new(
-            gmail_config.clone(),
-            workspace.to_path_buf(),
-        )));
+    if !gmail_config.enable {
+        return None;
     }
+    if let Some(reason) = gmail_unavailable_reason(gmail_config) {
+        log::warn!("{reason}");
+        return Some(ToolStartupWarning::new(GMAIL_TOOL_SECTION, reason));
+    }
+    log::debug!("Registering gmail tool");
+    tools.register(Box::new(GmailEmailsTool::new(gmail_config.clone())));
+    tools.register(Box::new(GmailEmailSendTool::new(gmail_config.clone())));
+    tools.register(Box::new(GmailEmailDownloadTool::new(
+        gmail_config.clone(),
+        workspace.to_path_buf(),
+    )));
+    None
 }
 
 pub fn register_ocr_tools(
@@ -199,6 +216,59 @@ pub fn register_skill_manage_tool(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Gmail config pointing at `client_secret.json` / `token_cache.json` in `dir`.
+    fn gmail_config_in(dir: &Path, enable: bool) -> GmailToolConfig {
+        GmailToolConfig {
+            enable,
+            client_secret_path: dir.join("client_secret.json").to_string_lossy().to_string(),
+            token_cache_path: dir.join("token_cache.json").to_string_lossy().to_string(),
+            ..GmailToolConfig::default()
+        }
+    }
+
+    /// Whether any of the three Gmail tools is registered.
+    fn has_any_gmail_tool(tools: &ToolRegistry) -> bool {
+        ["gmail", "gmail_email_send", "gmail_email_download"]
+            .iter()
+            .any(|name| tools.has(name))
+    }
+
+    #[test]
+    fn disabled_gmail_registers_nothing_and_warns_nothing() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        let warning =
+            register_gmail_tools(&gmail_config_in(dir.path(), false), dir.path(), &mut tools);
+        assert!(warning.is_none());
+        assert!(!has_any_gmail_tool(&tools));
+    }
+
+    #[test]
+    fn enabled_gmail_without_credentials_warns_instead_of_exiting() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut tools = ToolRegistry::new();
+        let warning =
+            register_gmail_tools(&gmail_config_in(dir.path(), true), dir.path(), &mut tools)
+                .expect("a warning for the missing credentials");
+        assert_eq!(warning.section, GMAIL_TOOL_SECTION);
+        assert!(warning.message.contains("gmail-auth"));
+        assert!(!has_any_gmail_tool(&tools));
+    }
+
+    #[test]
+    fn enabled_gmail_with_both_files_registers_three_tools() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("client_secret.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("token_cache.json"), "[]").unwrap();
+        let mut tools = ToolRegistry::new();
+        let warning =
+            register_gmail_tools(&gmail_config_in(dir.path(), true), dir.path(), &mut tools);
+        assert!(warning.is_none());
+        for name in ["gmail", "gmail_email_send", "gmail_email_download"] {
+            assert!(tools.has(name), "{name} should be registered");
+        }
+    }
 
     #[test]
     fn question_tool_waits_as_long_as_the_config_says() {

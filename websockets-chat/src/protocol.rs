@@ -1345,6 +1345,9 @@ pub enum ServerEvent {
         /// [`is_admin_role`] derives the admin check from it. Only decides what the
         /// UI offers; the gateway enforces it on every request.
         role: Option<String>,
+        /// Tool sections the gateway left out at start-up. Only sent to connections
+        /// that may change settings; empty on older gateways.
+        warnings: Vec<StartupWarning>,
     },
     /// A server-side error, optionally scoped to one chat / in-flight turn.
     /// `chat_id` is omitted when the error is not attached to any chat yet
@@ -1852,6 +1855,20 @@ struct ReadyWire {
     streaming: bool,
     #[serde(default)]
     role: Option<String>,
+    #[serde(default)]
+    warnings: Vec<StartupWarning>,
+}
+
+/// A tool section the gateway left out at start-up (for example Gmail without
+/// credentials), as sent on the `ready` frame. Mirrors the backend's
+/// `ToolStartupWarning` (`src/agent/tools/startup_warning.rs`).
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
+pub struct StartupWarning {
+    /// Config section under `tools`, e.g. `gmail`.
+    #[serde(default)]
+    pub section: String,
+    /// What is wrong and how to fix it.
+    pub message: String,
 }
 
 #[derive(Deserialize)]
@@ -2448,6 +2465,7 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             client_id: w.client_id,
             streaming: w.streaming,
             role: w.role,
+            warnings: w.warnings,
         }),
         "error" => decode::<ErrorWire>(&value).map(|w| ServerEvent::Error {
             chat_id: w.chat_id,
@@ -2780,6 +2798,7 @@ mod tests {
                 client_id: "browser-abc".to_string(),
                 streaming: false,
                 role: None,
+                warnings: Vec::new(),
             }
         );
     }
@@ -2796,7 +2815,23 @@ mod tests {
                 client_id: "browser-abc".to_string(),
                 streaming: true,
                 role: None,
+                warnings: Vec::new(),
             }
+        );
+    }
+
+    #[test]
+    fn parses_ready_with_startup_warnings() {
+        let raw = r#"{"event":"ready","chat_id":"c","client_id":"b","warnings":[{"section":"gmail","message":"Gmail tools disabled"}]}"#;
+        let Ok(ServerEvent::Ready { warnings, .. }) = parse_server_event(raw) else {
+            panic!("should parse");
+        };
+        assert_eq!(
+            warnings,
+            vec![StartupWarning {
+                section: "gmail".to_string(),
+                message: "Gmail tools disabled".to_string(),
+            }]
         );
     }
 

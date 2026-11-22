@@ -143,6 +143,25 @@ pub enum Commands {
 
     /// Validate the config file (JSON, schema, unset `${VAR}` placeholders) and exit
     CheckConfig(CheckConfigArgs),
+
+    /// Install a Gmail OAuth client secret and sign in to Google for the Gmail tools
+    GmailAuth(GmailAuthArgs),
+}
+
+#[derive(Debug, Parser)]
+pub struct GmailAuthArgs {
+    /// JSON configuration file path (its `tools.gmail` paths are used)
+    #[arg(short, long, default_value_os_t = default_config_path())]
+    pub config: PathBuf,
+
+    /// Downloaded OAuth Desktop client JSON to install at `tools.gmail.clientSecretPath`
+    #[arg(long, value_name = "PATH")]
+    pub client_secret: Option<PathBuf>,
+
+    /// Replace an existing different client secret and sign in again even when a
+    /// token cache already exists
+    #[arg(long)]
+    pub force: bool,
 }
 
 #[derive(Debug, Parser)]
@@ -534,6 +553,39 @@ mod tests {
         std::fs::create_dir_all(config_path.parent().unwrap()).unwrap();
         std::fs::write(&config_path, "{}").unwrap();
         config_path
+    }
+
+    #[test]
+    fn gmail_auth_parses_its_options() {
+        let Commands::GmailAuth(args) = Cli::try_parse_from([
+            "rust-bot",
+            "gmail-auth",
+            "-c",
+            "cfg.json",
+            "--client-secret",
+            "download.json",
+            "--force",
+        ])
+        .unwrap()
+        .command
+        else {
+            panic!("expected gmail-auth");
+        };
+        assert_eq!(args.config, PathBuf::from("cfg.json"));
+        assert_eq!(args.client_secret, Some(PathBuf::from("download.json")));
+        assert!(args.force);
+    }
+
+    #[test]
+    fn gmail_auth_defaults_to_no_secret_and_no_force() {
+        let Commands::GmailAuth(args) = Cli::try_parse_from(["rust-bot", "gmail-auth"])
+            .unwrap()
+            .command
+        else {
+            panic!("expected gmail-auth");
+        };
+        assert_eq!(args.client_secret, None);
+        assert!(!args.force);
     }
 
     #[test]

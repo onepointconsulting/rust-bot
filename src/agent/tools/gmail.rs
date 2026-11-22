@@ -1,7 +1,12 @@
 use crate::{
-    agent::tools::base::Tool,
+    agent::tools::{
+        base::Tool,
+        gmail_oauth::{
+            GMAIL_API, GMAIL_AUTH_COMMAND, GMAIL_READONLY_SCOPE, GMAIL_SEND_SCOPE,
+            gmail_credential_state, missing_credentials_message,
+        },
+    },
     config::schema::GmailToolConfig,
-    utils::exit_codes::{self, GMAIL_CONFIG_ERROR},
 };
 use async_trait::async_trait;
 use base64::Engine;
@@ -11,7 +16,6 @@ use yup_oauth2::{InstalledFlowAuthenticator, InstalledFlowReturnMethod};
 const DEFAULT_LIMIT: u32 = 20;
 const DEFAULT_BODY_LIMIT: usize = 500;
 
-const GMAIL_API: &str = "https://gmail.googleapis.com/gmail/v1";
 const EMAILS_DIR: &str = "emails";
 const ATTACHMENTS_DIR: &str = "attachments";
 
@@ -367,23 +371,57 @@ struct GmailToolCommon {
 }
 
 impl GmailToolCommon {
+    /// Shared state for a Gmail tool that requests `scope`. Does not check the
+    /// credential files: `register_gmail_tools` does that at start-up and
+    /// [`Self::access_token`] reports files deleted later.
+    fn new(config: &GmailToolConfig, scope: &str) -> Self {
+        Self {
+            config: config.clone(),
+            secret_path: config.client_secret_path().to_string_lossy().to_string(),
+            token_cache_path: config.token_cache_path().to_string_lossy().to_string(),
+            scopes: vec![scope.to_string()],
+        }
+    }
+
+    /// An access token from the token cache, refreshed if needed. Fails with a
+    /// message naming the missing file and `rust-bot gmail-auth` when the
+    /// credentials are gone, instead of starting an interactive sign-in.
     async fn access_token(&self) -> Result<String, String> {
-        let secret = yup_oauth2::read_application_secret(self.secret_path.clone())
+        let secret_path = Path::new(&self.secret_path);
+        let token_cache_path = Path::new(&self.token_cache_path);
+        let state = gmail_credential_state(secret_path, token_cache_path);
+        if let Some(message) = missing_credentials_message(state, secret_path, token_cache_path) {
+            return Err(gmail_err(format!("Error: {message}")));
+        }
+        let secret = yup_oauth2::read_application_secret(secret_path)
             .await
-            .map_err(|_| "Error: failed to read client secret JSON".to_string())?;
+            .map_err(|e| {
+                gmail_err(format!(
+                    "Error: failed to read client secret JSON at {}: {e}",
+                    self.secret_path
+                ))
+            })?;
 
         log::info!("Reading token from {}", self.token_cache_path);
-        let auth =
-            InstalledFlowAuthenticator::builder(secret, InstalledFlowReturnMethod::HTTPRedirect)
-                .persist_tokens_to_disk(self.token_cache_path.clone())
-                .build()
-                .await
-                .map_err(|_| "Error: failed to read client secret JSON".to_string())?;
+        let auth = InstalledFlowAuthenticator::builder(
+            secret,
+            InstalledFlowReturnMethod::HTTPRedirect,
+        )
+        .persist_tokens_to_disk(self.token_cache_path.clone())
+        .build()
+        .await
+        .map_err(|e| {
+            gmail_err(format!(
+                "Error: failed to load the token cache at {}: {e}. Run `{GMAIL_AUTH_COMMAND}`.",
+                self.token_cache_path
+            ))
+        })?;
 
-        let token = auth
-            .token(self.scopes.as_slice())
-            .await
-            .map_err(|_| "Error: failed to get token".to_string())?;
+        let token = auth.token(self.scopes.as_slice()).await.map_err(|e| {
+            gmail_err(format!(
+                "Error: failed to get a Gmail token ({e}). Run `{GMAIL_AUTH_COMMAND} --force` to sign in again."
+            ))
+        })?;
 
         token
             .token()
@@ -398,36 +436,9 @@ pub struct GmailEmailsTool {
     common: GmailToolCommon,
 }
 
-fn show_error_and_exit(path: &Path) {
-    let error_message = format!(
-        "ERROR: {} not found. Make sure this path exists.",
-        path.display()
-    );
-    log::error!("{}", error_message);
-    eprintln!("{}", error_message);
-    exit_codes::exit(GMAIL_CONFIG_ERROR);
-}
-
-fn validate_secret_and_token_cache_paths(secret_path: &PathBuf, token_cache_path: &PathBuf) {
-    if !Path::new(&secret_path).exists() {
-        show_error_and_exit(secret_path);
-    }
-    if !Path::new(&token_cache_path).exists() {
-        show_error_and_exit(token_cache_path);
-    }
-}
-
 impl GmailEmailsTool {
     pub fn new(config: GmailToolConfig) -> Self {
-        let secret_path = config.client_secret_path();
-        let token_cache_path = config.token_cache_path();
-        validate_secret_and_token_cache_paths(&secret_path, &token_cache_path);
-        let common = GmailToolCommon {
-            config: config.clone(),
-            secret_path: secret_path.to_string_lossy().to_string(),
-            token_cache_path: token_cache_path.to_string_lossy().to_string(),
-            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
-        };
+        let common = GmailToolCommon::new(&config, GMAIL_READONLY_SCOPE);
         Self {
             name: "gmail".to_string(),
             description: "Gmail Tool. Returns the latest emails from the user's inbox.".to_string(),
@@ -801,15 +812,7 @@ pub struct GmailEmailSendTool {
 
 impl GmailEmailSendTool {
     pub fn new(config: GmailToolConfig) -> Self {
-        let secret_path = config.client_secret_path();
-        let token_cache_path = config.token_cache_path();
-        validate_secret_and_token_cache_paths(&secret_path, &token_cache_path);
-        let common = GmailToolCommon {
-            config: config.clone(),
-            secret_path: secret_path.to_string_lossy().to_string(),
-            token_cache_path: token_cache_path.to_string_lossy().to_string(),
-            scopes: vec!["https://www.googleapis.com/auth/gmail.send".to_string()],
-        };
+        let common = GmailToolCommon::new(&config, GMAIL_SEND_SCOPE);
         Self {
             name: "gmail_email_send".to_string(),
             description:
@@ -938,15 +941,7 @@ pub struct GmailEmailDownloadTool {
 
 impl GmailEmailDownloadTool {
     pub fn new(config: GmailToolConfig, workspace: PathBuf) -> Self {
-        let secret_path = config.client_secret_path();
-        let token_cache_path = config.token_cache_path();
-        validate_secret_and_token_cache_paths(&secret_path, &token_cache_path);
-        let common = GmailToolCommon {
-            config: config.clone(),
-            secret_path: secret_path.to_string_lossy().to_string(),
-            token_cache_path: token_cache_path.to_string_lossy().to_string(),
-            scopes: vec!["https://www.googleapis.com/auth/gmail.readonly".to_string()],
-        };
+        let common = GmailToolCommon::new(&config, GMAIL_READONLY_SCOPE);
         Self {
             name: "gmail_email_download".to_string(),
             description: "Gmail Email Download Tool. Downloads an email from the user's inbox with all attachments to the workspace emails folder.".to_string(),

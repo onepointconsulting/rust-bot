@@ -4,6 +4,7 @@ pub mod cron;
 pub mod docx;
 pub mod filesystem;
 pub mod gmail;
+pub mod gmail_oauth;
 pub mod goal;
 pub mod image_generation;
 pub mod mcp;
@@ -16,6 +17,7 @@ pub mod search;
 pub mod shell;
 pub mod skill_manage;
 pub mod spawn;
+pub mod startup_warning;
 #[cfg(test)]
 pub(crate) mod test_support;
 pub mod tool_ranker;

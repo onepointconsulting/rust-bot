@@ -409,6 +409,10 @@ pub struct ToolSettingRow {
     /// The configuration form, for a row that stands for a whole tool section.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub config: Option<ToolSettingsSummary>,
+    /// Why an enabled tool section cannot run right now (for example Gmail without
+    /// credentials). Shown instead of the restart hint.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub unavailable_reason: Option<String>,
 }
 
 /// What the dialog shows for one configured MCP server.
@@ -448,6 +452,7 @@ pub fn tool_setting_rows(
             active: entry.active,
             toggleable: !is_protected_tool(&entry.name),
             config: None,
+            unavailable_reason: None,
         })
         .collect();
     let known: HashSet<&str> = catalogue.iter().map(|e| e.name.as_str()).collect();
@@ -463,6 +468,7 @@ pub fn tool_setting_rows(
             active: false,
             toggleable: true,
             config: None,
+            unavailable_reason: None,
         });
     }
     rows.sort_by_key(|row| row.name.to_lowercase());
@@ -499,10 +505,24 @@ pub fn merge_section_rows(
             active,
             toggleable: true,
             config: Some(section),
+            unavailable_reason: None,
         });
     }
     merged.sort_by_key(|row| row.name.to_lowercase());
     merged
+}
+
+/// Set `unavailable_reason` on every section row (one carrying a form) for which
+/// `reason_of(section name)` returns a reason. Worked out on every listing, so the
+/// page is current right after the user fixes the cause (e.g. runs `gmail-auth`).
+pub fn with_unavailable_reasons(
+    mut rows: Vec<ToolSettingRow>,
+    reason_of: impl Fn(&str) -> Option<String>,
+) -> Vec<ToolSettingRow> {
+    for row in rows.iter_mut().filter(|row| row.config.is_some()) {
+        row.unavailable_reason = reason_of(&row.name);
+    }
+    rows
 }
 
 /// The MCP server rows: every configured server, sorted A–Z ignoring case.
@@ -632,6 +652,31 @@ mod tests {
         assert_eq!(unknown.len(), 1);
         assert!(!unknown[0].enabled && !unknown[0].active);
         assert_eq!(unknown[0].description, UNKNOWN_TOOL_DESCRIPTION);
+    }
+
+    #[test]
+    fn unavailable_reasons_are_set_on_section_rows_only() {
+        use crate::agent::tools::tool_settings_api::tool_settings_overview;
+        use crate::config::schema::ToolsConfig;
+
+        let rows = merge_section_rows(
+            tool_setting_rows(&[entry("grep", true)], &[]),
+            tool_settings_overview(&ToolsConfig::default()),
+        );
+        let rows = with_unavailable_reasons(rows, |name| {
+            (name == "gmail" || name == "grep").then(|| "needs credentials".to_string())
+        });
+
+        let gmail = rows.iter().find(|r| r.name == "gmail").unwrap();
+        assert_eq!(
+            gmail.unavailable_reason.as_deref(),
+            Some("needs credentials")
+        );
+        let grep = rows.iter().find(|r| r.name == "grep").unwrap();
+        assert!(
+            grep.unavailable_reason.is_none(),
+            "plain tool rows are left alone"
+        );
     }
 
     #[test]

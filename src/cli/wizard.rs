@@ -5,10 +5,16 @@ use anstyle::Style;
 use inquire::validator::Validation;
 use inquire::{Confirm, CustomType, Password, Select, Text};
 
+use crate::agent::tools::gmail_oauth::{
+    GmailCredentialState, gmail_credential_state, install_client_secret,
+};
 use crate::api::user_registry::{JsonUserRegistry, User, UserRegistry, hash_password};
 use crate::channels::websocket::CHANNEL_NAME as CHANNEL_WEBSOCKET;
 use crate::channels::websocket::types::WebSocketConfig;
 use crate::cli::commands::run_generate_keypair_with_config;
+use crate::cli::gmail_auth::{
+    install_built_in_client_secret, remove_token_cache, sign_in_and_verify,
+};
 use crate::cli::instance_layout::InstanceLayout;
 use crate::cli::onboard::create_env_file;
 use crate::config::schema::ProvidersConfig;
@@ -23,12 +29,12 @@ use crate::{
     },
     config::{
         channels::EmailConfig,
-        loader::{load_config, save_config, set_config_path},
+        loader::{get_config_path, load_config, save_config, set_config_path},
         schema::{
-            AgentsConfig, ChannelsConfig, Config, McpServerConfig, McpTransportType,
-            ModelPresetConfig, OcrProvider, ProviderBackend, ProviderConfig, ProviderRetryMode,
-            REASONING_EFFORT_CHOICES, REASONING_EFFORT_NONE, RESERVED_MODEL_PRESET_NAME,
-            ToolsConfig, WebSearchProvider,
+            AgentsConfig, ChannelsConfig, Config, GmailToolConfig, McpServerConfig,
+            McpTransportType, ModelPresetConfig, OcrProvider, ProviderBackend, ProviderConfig,
+            ProviderRetryMode, REASONING_EFFORT_CHOICES, REASONING_EFFORT_NONE,
+            RESERVED_MODEL_PRESET_NAME, ToolsConfig, WebSearchProvider,
         },
     },
     providers::registry::providers,
@@ -1308,6 +1314,110 @@ fn configure_email_tool(tools: &mut ToolsConfig) -> Result<(), CliError> {
         })
         .prompt()?;
 
+    offer_gmail_credentials_setup(gmail)?;
+    Ok(())
+}
+
+/// Run `future` to completion from the synchronous wizard: on the current Tokio
+/// runtime when there is one (the CLI's multi-threaded runtime), else on a
+/// temporary runtime.
+fn run_blocking<F: std::future::Future>(future: F) -> Result<F::Output, CliError> {
+    match tokio::runtime::Handle::try_current() {
+        Ok(handle) => Ok(tokio::task::block_in_place(|| handle.block_on(future))),
+        Err(_) => tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map(|runtime| runtime.block_on(future))
+            .map_err(|e| CliError::Other(format!("Cannot start an async runtime: {e}"))),
+    }
+}
+
+/// Ask for the downloaded client secret until it installs at `destination` or the
+/// user leaves the answer empty. Returns whether a client secret is now in place.
+fn prompt_install_client_secret(destination: &Path) -> Result<bool, CliError> {
+    println!(
+        "No Gmail client secret at {}. Create an OAuth client of type \"Desktop app\" in          Google Cloud Console (APIs & Services → Credentials) and download its JSON.",
+        display_path(destination)
+    );
+    loop {
+        let downloaded = Text::new("Path of the downloaded client secret JSON")
+            .with_help_message("Leave empty to skip; it is copied to the path above")
+            .prompt()?;
+        let downloaded = downloaded.trim();
+        if downloaded.is_empty() {
+            return Ok(false);
+        }
+        let downloaded = PathBuf::from(expand_tilde_path(downloaded).as_ref());
+        match install_client_secret(&downloaded, destination, false) {
+            Ok(installed) => {
+                println!("Client secret installed at {}", display_path(&installed));
+                return Ok(true);
+            }
+            Err(message) => eprint_error(message),
+        }
+    }
+}
+
+/// Run the Google sign-in (and the inbox check) for the wizard, first deleting the
+/// old token cache when `replace_existing_cache` is set. Returns whether it worked;
+/// a failure is printed, never returned, so the wizard carries on.
+fn sign_in_from_wizard(
+    client_secret_path: &Path,
+    token_cache_path: &Path,
+    replace_existing_cache: bool,
+) -> Result<bool, CliError> {
+    if replace_existing_cache {
+        remove_token_cache(token_cache_path)?;
+    }
+    match run_blocking(sign_in_and_verify(client_secret_path, token_cache_path))? {
+        Ok(()) => Ok(true),
+        Err(error) => {
+            eprint_error(error);
+            Ok(false)
+        }
+    }
+}
+
+/// After the Gmail paths are set, help the user get both credential files in place:
+/// use the built-in client or install a downloaded client secret, then offer the Google sign-in (or a fresh
+/// one when already signed in). Skipping or a failure only prints how to finish
+/// later with `rust-bot gmail-auth`; the wizard is never cancelled.
+fn offer_gmail_credentials_setup(gmail: &GmailToolConfig) -> Result<(), CliError> {
+    let client_secret_path = gmail.client_secret_path();
+    let token_cache_path = gmail.token_cache_path();
+    if let Err(error) = install_built_in_client_secret(&client_secret_path) {
+        eprint_error(error.to_string());
+    }
+    let state = gmail_credential_state(&client_secret_path, &token_cache_path);
+    let ready = match state {
+        GmailCredentialState::MissingClientSecret => {
+            prompt_install_client_secret(&client_secret_path)?
+                && Confirm::new("Sign in to Google now?")
+                    .with_default(true)
+                    .with_help_message("Opens a sign-in link and writes the token cache")
+                    .prompt()?
+                && sign_in_from_wizard(&client_secret_path, &token_cache_path, false)?
+        }
+        GmailCredentialState::NotAuthorised => {
+            Confirm::new("Sign in to Google now?")
+                .with_default(true)
+                .with_help_message("Opens a sign-in link and writes the token cache")
+                .prompt()?
+                && sign_in_from_wizard(&client_secret_path, &token_cache_path, false)?
+        }
+        GmailCredentialState::Authorised => {
+            let reauthorise = Confirm::new("Already signed in to Google. Sign in again?")
+                .with_default(false)
+                .prompt()?;
+            !reauthorise || sign_in_from_wizard(&client_secret_path, &token_cache_path, true)?
+        }
+    };
+    if !ready {
+        println!(
+            "Note: the Gmail tools stay disabled (with a start-up warning) until you run \n             `rust-bot gmail-auth -c {}`.",
+            display_path(&get_config_path())
+        );
+    }
     Ok(())
 }
 

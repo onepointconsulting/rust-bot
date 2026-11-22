@@ -131,6 +131,8 @@ pub struct SettingRow {
     pub config: Option<ToolConfigSummary>,
     /// For an MCP server: whether its tools are loaded on demand. `None` for tools.
     pub on_demand: Option<bool>,
+    /// Why the enabled tool section cannot run (e.g. Gmail without credentials).
+    pub unavailable_reason: Option<String>,
 }
 
 /// An item the Settings pages list: it has a name, a switch and a running state.
@@ -153,6 +155,7 @@ impl SettingItem for ToolSettingSummary {
             toggleable: self.toggleable,
             config: self.config.clone(),
             on_demand: None,
+            unavailable_reason: self.unavailable_reason.clone(),
         }
     }
     fn name(&self) -> &str {
@@ -173,6 +176,7 @@ impl SettingItem for McpServerSettingSummary {
             toggleable: true,
             config: self.config.clone(),
             on_demand: Some(self.deferred),
+            unavailable_reason: None,
         }
     }
     fn name(&self) -> &str {
@@ -256,8 +260,17 @@ pub fn visible_rows(rows: Vec<SettingRow>, query: &str) -> Vec<SettingRow> {
     visible
 }
 
-/// The note under a row whose switch differs from what the bot is running, or `None`.
-pub fn pending_label(row: &SettingRow) -> Option<&'static str> {
+/// The note under an enabled row that cannot run until the user supplies credentials.
+pub const NEEDS_CREDENTIALS_LABEL: &str = "Needs credentials";
+
+/// The reason to show under an enabled row that cannot run, or `None`. A switched-off
+/// row needs nothing, so its reason is not shown.
+pub fn unavailable_reason(row: &SettingRow) -> Option<&str> {
+    row.unavailable_reason.as_deref().filter(|_| row.enabled)
+}
+
+/// The restart note of a row whose switch differs from what the bot is running.
+fn restart_label(row: &SettingRow) -> Option<&'static str> {
     match (row.enabled, row.active) {
         (true, false) => Some("Will be enabled after restart"),
         (false, true) => Some("Will be disabled after restart"),
@@ -265,9 +278,20 @@ pub fn pending_label(row: &SettingRow) -> Option<&'static str> {
     }
 }
 
-/// Whether any row waits for a restart.
+/// The note under a row: "Needs credentials" when it is enabled but cannot run (a
+/// restart alone would not help), else the restart note when its switch differs from
+/// what the bot is running, else `None`.
+pub fn pending_label(row: &SettingRow) -> Option<&'static str> {
+    if unavailable_reason(row).is_some() {
+        return Some(NEEDS_CREDENTIALS_LABEL);
+    }
+    restart_label(row)
+}
+
+/// Whether any row waits for a restart. Rows that need credentials first do not count.
 pub fn any_pending(rows: &[SettingRow]) -> bool {
-    rows.iter().any(|row| pending_label(row).is_some())
+    rows.iter()
+        .any(|row| unavailable_reason(row).is_none() && restart_label(row).is_some())
 }
 
 /// The count line: "29 tools", or "3 of 29 tools" while a search hides some.
@@ -769,6 +793,7 @@ fn SettingRowView(
     let enabled = row.enabled;
     let toggleable = row.toggleable;
     let pending = pending_label(&row);
+    let reason = unavailable_reason(&row).map(str::to_string);
     let hint_row = row.clone();
     let config = row.config.clone();
     let title = row_title(&row);
@@ -792,6 +817,10 @@ fn SettingRowView(
                     {pending
                         .map(|label| {
                             view! { <p class="mt-1 text-xs font-medium text-amber-700">{label}</p> }
+                        })}
+                    {reason
+                        .map(|reason| {
+                            view! { <p class="mt-1 break-words text-xs text-amber-700">{reason}</p> }
                         })}
                     {on_demand
                         .map(|deferred| {
@@ -1095,6 +1124,7 @@ mod tests {
             toggleable: true,
             config: None,
             on_demand: None,
+            unavailable_reason: None,
         }
     }
 
@@ -1106,7 +1136,53 @@ mod tests {
             active: enabled,
             toggleable: true,
             config: None,
+            unavailable_reason: None,
         }
+    }
+
+    /// An enabled row that is not running and cannot run without credentials.
+    fn unavailable_row() -> SettingRow {
+        SettingRow {
+            unavailable_reason: Some("Gmail tools disabled: not signed in".to_string()),
+            ..row("gmail", "", true, false)
+        }
+    }
+
+    #[test]
+    fn pending_label_prefers_the_unavailable_reason_over_the_restart_hint() {
+        let row = unavailable_row();
+        assert_eq!(pending_label(&row), Some(NEEDS_CREDENTIALS_LABEL));
+        assert_eq!(
+            unavailable_reason(&row),
+            Some("Gmail tools disabled: not signed in")
+        );
+    }
+
+    #[test]
+    fn a_switched_off_row_shows_no_unavailable_reason() {
+        let row = SettingRow {
+            enabled: false,
+            ..unavailable_row()
+        };
+        assert_eq!(unavailable_reason(&row), None);
+        assert_eq!(pending_label(&row), None);
+    }
+
+    #[test]
+    fn rows_needing_credentials_do_not_ask_for_a_restart() {
+        assert!(!any_pending(&[unavailable_row()]));
+    }
+
+    #[test]
+    fn tool_rows_carry_the_unavailable_reason() {
+        let summary = ToolSettingSummary {
+            unavailable_reason: Some("no token".to_string()),
+            ..tool("gmail", true)
+        };
+        assert_eq!(
+            summary.to_row().unavailable_reason.as_deref(),
+            Some("no token")
+        );
     }
 
     fn section_row(name: &str, title: &str, enabled: Option<bool>) -> SettingRow {

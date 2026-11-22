@@ -17,6 +17,7 @@ mod reasoning_panel;
 mod segmented_toggle;
 mod settings_dialog;
 mod settings_pages;
+mod startup_warnings_banner;
 mod subagents_page;
 mod tool_activity;
 mod tool_approval;
@@ -42,6 +43,9 @@ pub use settings_dialog::{ConfigSavedNotice, SettingsDialog};
 pub use settings_pages::{
     after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand, apply_tool_config,
     insert_mcp_server, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
+};
+pub use startup_warnings_banner::{
+    dismiss_startup_warnings, visible_startup_warnings, StartupWarningsBanner,
 };
 pub use subagents_page::SubagentsPage;
 pub use tool_activity::ToolActivity;

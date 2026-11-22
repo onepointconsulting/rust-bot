@@ -113,6 +113,18 @@ rust-bot onboard --mode local
 rust-bot onboard --mode docker --port 18791 --name bot-two --dir ./bot-two
 ```
 
+## `gmail-auth` subcommand
+
+Installs a downloaded Gmail OAuth client secret and signs in to Google, writing the token cache to the paths under `tools.gmail` in the config.
+
+| Flag | Default | Description |
+| ---- | ------- | ----------- |
+| `-c`, `--config` | `~/.rust-bot/config.json` | Config file path |
+| `--client-secret <PATH>` | *(none)* | Downloaded OAuth Desktop client JSON to install at `tools.gmail.clientSecretPath`. Not needed when the binary has a [built-in client](GMAIL_SUPPORT.md#built-in-google-client) |
+| `--force` | `false` | Replace a different existing client secret and sign in again even when a token cache exists |
+
+See [GMAIL_SUPPORT.md](GMAIL_SUPPORT.md#signing-in) for details.
+
 ## JWT keypair and tokens
 
 JWT auth for the REST API and WebSocket gateway is configured through two
@@ -171,7 +183,6 @@ cargo run -- generate-jwt-token --help
 | `0`  | `SUCCESS`                  | Success (also used after spawning a restarted process on Windows)        |
 | `1`  | `GENERAL_ERROR`            | Config or general CLI error                                              |
 | `3`  | `INVALID_PROVIDER`         | Invalid provider (unknown value in `agents.provider`)                    |
-| `4`  | `GMAIL_CONFIG_ERROR`       | Gmail tool credentials missing (OAuth client secret or token cache)      |
 | `5`  | `CHANNEL_ALLOW_FROM_EMPTY` | Channel has an empty `allowFrom` list (set `["*"]` or specific user IDs) |
 
 

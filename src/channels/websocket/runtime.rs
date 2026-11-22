@@ -39,6 +39,7 @@ use crate::agent::tools::mcp::mcp_presets_api::{
     self, McpPreset, McpPresetError, McpPresetSummary, McpPresetsOverview,
 };
 use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
+use crate::agent::tools::startup_warning::ToolStartupWarning;
 use crate::agent::tools::tool_search::tool_summaries_for_view;
 use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
 use crate::bus::outbound_events::TurnEndEvent;
@@ -409,19 +410,40 @@ async fn ws_upgrade_handler(
 
 /// Build the `ready` control frame. `role` tells the web UI whether to offer the
 /// settings (admins only); the gateway enforces the same rule on every request.
+/// `warnings` (tool sections left out at start-up) is added only when non-empty,
+/// so older clients see the same frame as before.
 fn ready_event(
     chat_id: &str,
     client_id: &str,
     streaming: bool,
     role: UserRole,
+    warnings: &[ToolStartupWarning],
 ) -> serde_json::Value {
-    serde_json::json!({
+    let mut ready = serde_json::json!({
         "event": WsOutboundEvent::Ready.as_str(),
         "chat_id": chat_id,
         "client_id": client_id,
         "streaming": streaming,
         "role": role.as_str(),
-    })
+    });
+    if !warnings.is_empty() {
+        ready["warnings"] = serde_json::json!(warnings);
+    }
+    ready
+}
+
+/// The start-up warnings `ready` may carry for this connection: all of them when it
+/// may change settings (the `can_modify` rule), none otherwise, because other users
+/// cannot act on them and they contain server file paths.
+fn startup_warnings_for_connection(
+    shared: &WsShared,
+    remote_addr: SocketAddr,
+    auth: &AuthorizeResult,
+) -> Vec<ToolStartupWarning> {
+    if mcp_write_denial(shared, remote_addr, auth, overlay_is_active()).is_some() {
+        return Vec::new();
+    }
+    shared.tool_startup_warnings.as_ref().clone()
 }
 
 /// Server-initiated WebSocket ping policy for one connection.
@@ -466,6 +488,127 @@ impl PingLiveness {
     }
 }
 
+/// Ping liveness state shared between a connection's reader (which records
+/// inbound traffic) and its writer (which sends pings and checks the timeout).
+type SharedPingLiveness = Arc<StdMutex<PingLiveness>>;
+
+/// Upper bound on the best-effort `Close` frame sent after a ping timeout. The
+/// peer is presumed unreachable at that point, so the writer must not wait on
+/// a stalled socket before exiting.
+const PING_TIMEOUT_CLOSE_GRACE: Duration = Duration::from_secs(1);
+
+/// Outbound half of one connection: forward queued frames from `outbound_frames`
+/// to `sink` and, when `liveness` is set, send periodic server pings.
+///
+/// Returns when the outbound queue closes, a write fails, or a ping goes
+/// unanswered for longer than the configured timeout. On a ping timeout a
+/// best-effort `Close` frame is sent first so a peer that is still reachable
+/// learns the connection is over. The reader watches this task (see
+/// [`next_inbound_message`]) and tears the whole connection down once it
+/// returns, so a dead writer never leaves a socket that accepts input but can
+/// no longer reply.
+async fn run_connection_writer<S>(
+    mut sink: S,
+    mut outbound_frames: mpsc::UnboundedReceiver<Message>,
+    liveness: Option<SharedPingLiveness>,
+    connection_id: String,
+) where
+    S: futures::Sink<Message> + Unpin,
+{
+    let Some(liveness) = liveness else {
+        while let Some(frame) = outbound_frames.recv().await {
+            if sink.send(frame).await.is_err() {
+                break;
+            }
+        }
+        return;
+    };
+
+    let interval = liveness
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .interval();
+    let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            frame = outbound_frames.recv() => {
+                let Some(frame) = frame else {
+                    break;
+                };
+                if sink.send(frame).await.is_err() {
+                    log::warn!(
+                        "WebSocket channel: connection '{connection_id}' closed while writing"
+                    );
+                    break;
+                }
+            }
+            _ = ticker.tick() => {
+                let timed_out = liveness
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .is_timed_out(Instant::now());
+                if timed_out {
+                    log::warn!("WebSocket channel: connection '{connection_id}' ping timeout");
+                    let _ = tokio::time::timeout(
+                        PING_TIMEOUT_CLOSE_GRACE,
+                        sink.send(Message::Close(None)),
+                    )
+                    .await;
+                    break;
+                }
+                if sink.send(Message::Ping(Default::default())).await.is_err() {
+                    log::warn!(
+                        "WebSocket channel: connection '{connection_id}' closed while pinging"
+                    );
+                    break;
+                }
+                liveness
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .on_ping_sent(Instant::now());
+            }
+        }
+    }
+}
+
+/// Wait for the next inbound frame of one connection while watching its writer.
+///
+/// Returns `None` — meaning "close this connection" — when the stream ends,
+/// yields an error, yields a `Close` frame, or when `writer` finishes (ping
+/// timeout or failed write). The last case is what prevents a half-dead
+/// connection: without it the reader would keep accepting the browser's
+/// messages after the writer had gone, so the browser would believe it was
+/// still connected while no reply could ever reach it. Once this returns
+/// `None` the caller drops both halves, which closes the socket and lets the
+/// client reconnect and re-attach.
+///
+/// `writer` must not be polled again after this has returned `None` because
+/// of it; callers stop looping at the first `None`.
+async fn next_inbound_message<S>(
+    stream: &mut S,
+    writer: &mut tokio::task::JoinHandle<()>,
+    connection_id: &str,
+) -> Option<Message>
+where
+    S: futures::Stream<Item = Result<Message, axum::Error>> + Unpin,
+{
+    tokio::select! {
+        frame = stream.next() => match frame {
+            Some(Ok(Message::Close(_))) | None => None,
+            Some(Ok(msg)) => Some(msg),
+            Some(Err(e)) => {
+                log::warn!("WebSocket channel: connection '{connection_id}' error: {e}");
+                None
+            }
+        },
+        _ = &mut *writer => {
+            log::info!("WebSocket channel: connection '{connection_id}' writer stopped; closing");
+            None
+        }
+    }
+}
+
 /// Drive one connection for its lifetime: mint a fresh `chat_id` for it,
 /// announce it via a `ready` frame, register an outbound sender, forward
 /// inbound text frames to the bus, and clean up the registry entry on close.
@@ -481,6 +624,10 @@ impl PingLiveness {
 /// when that value is 0) so idle reverse proxies do not drop the socket.
 /// `ping_timeout_s` closes the connection if nothing inbound arrives after
 /// a ping; 0 means send pings but never kill for a missing pong.
+///
+/// The outbound half runs in [`run_connection_writer`]; the inbound loop here
+/// ends as soon as that writer stops (see [`next_inbound_message`]), so both
+/// halves are always torn down together and the client sees a real close.
 async fn handle_socket(
     socket: WebSocket,
     shared: WsShared,
@@ -491,13 +638,20 @@ async fn handle_socket(
     let connection_id = Uuid::new_v4().to_string();
     let chat_id = Uuid::new_v4().to_string();
     let (mut sink, mut stream) = socket.split();
-    let (tx, mut rx) = mpsc::unbounded_channel::<Message>();
+    let (tx, rx) = mpsc::unbounded_channel::<Message>();
 
     // Send `ready` before registering, so a reply can never race ahead of
     // the client learning its own chat_id (mirrors nanobot's ordering
     // comment at runtime.py:578). `streaming` tells the WebUI whether this
     // channel will emit `delta` frames or a single final `message`.
-    let ready = ready_event(&chat_id, &client_id, shared.supports_streaming, auth.role);
+    let startup_warnings = startup_warnings_for_connection(&shared, remote_addr, &auth);
+    let ready = ready_event(
+        &chat_id,
+        &client_id,
+        shared.supports_streaming,
+        auth.role,
+        &startup_warnings,
+    );
     if sink.send(Message::text(ready.to_string())).await.is_err() {
         return;
     }
@@ -509,118 +663,54 @@ async fn handle_socket(
 
     let liveness = PingLiveness::new(shared.ping_interval_s, shared.ping_timeout_s)
         .map(|liveness| Arc::new(StdMutex::new(liveness)));
-    let writer_liveness = liveness.clone();
-    let writer_connection_id = connection_id.clone();
-    let writer = tokio::spawn(async move {
-        let Some(liveness) = writer_liveness else {
-            while let Some(msg) = rx.recv().await {
-                if sink.send(msg).await.is_err() {
-                    break;
-                }
-            }
-            return;
-        };
+    let mut writer = tokio::spawn(run_connection_writer(
+        sink,
+        rx,
+        liveness.clone(),
+        connection_id.clone(),
+    ));
 
-        let interval = liveness
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .interval();
-        let mut ticker = tokio::time::interval_at(tokio::time::Instant::now() + interval, interval);
-        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        loop {
-            tokio::select! {
-                msg = rx.recv() => {
-                    match msg {
-                        Some(msg) => {
-                            if sink.send(msg).await.is_err() {
-                                log::warn!(
-                                    "WebSocket channel: connection '{writer_connection_id}' closed while writing"
-                                );
-                                break;
-                            }
-                        }
-                        None => break,
-                    }
-                }
-                _ = ticker.tick() => {
-                    let timed_out = liveness
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .is_timed_out(Instant::now());
-                    if timed_out {
-                        log::warn!(
-                            "WebSocket channel: connection '{writer_connection_id}' ping timeout"
-                        );
-                        break;
-                    }
-                    if sink.send(Message::Ping(Default::default())).await.is_err() {
-                        log::warn!(
-                            "WebSocket channel: connection '{writer_connection_id}' closed while pinging"
-                        );
-                        break;
-                    }
-                    liveness
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .on_ping_sent(Instant::now());
-                }
-            }
-        }
-    });
-
-    while let Some(frame) = stream.next().await {
-        let msg = match frame {
-            Ok(msg) => msg,
-            Err(e) => {
-                log::warn!("WebSocket channel: connection '{connection_id}' error: {e}");
-                break;
-            }
-        };
+    while let Some(msg) = next_inbound_message(&mut stream, &mut writer, &connection_id).await {
         if let Some(liveness) = &liveness {
             liveness
                 .lock()
                 .unwrap_or_else(|e| e.into_inner())
                 .on_inbound();
         }
-        match msg {
-            Message::Text(text) => {
-                let raw = text.as_str();
-                if let Some(envelope) = parse_envelope(raw) {
-                    let envelope_dispatch_context = EnvelopeDispatchContext {
-                        envelope: &envelope,
-                        connection_id: &connection_id,
-                        client_id: &client_id,
-                        shared: &shared,
-                        remote_addr,
-                        auth: &auth,
-                    };
-                    dispatch_envelope(envelope_dispatch_context).await;
-                    continue;
-                };
-                let Some(content) = parse_inbound_payload(raw) else {
-                    continue;
-                };
-                if let Err(e) = handle_message(
-                    &client_id,
-                    &chat_id,
-                    &content,
-                    None,
-                    None,
-                    None,
-                    sender_allowed(&shared.channels_config, &client_id),
-                    shared.supports_streaming,
-                    shared.name,
-                    &shared.bus,
-                )
-                .await
-                {
-                    log::warn!(
-                        "WebSocket channel: failed to publish message for chat '{chat_id}': {e}"
-                    );
-                }
-            }
-            Message::Close(_) => break,
-            _ => {}
+        let Message::Text(text) = msg else {
+            continue;
+        };
+        let raw = text.as_str();
+        if let Some(envelope) = parse_envelope(raw) {
+            let envelope_dispatch_context = EnvelopeDispatchContext {
+                envelope: &envelope,
+                connection_id: &connection_id,
+                client_id: &client_id,
+                shared: &shared,
+                remote_addr,
+                auth: &auth,
+            };
+            dispatch_envelope(envelope_dispatch_context).await;
+            continue;
+        };
+        let Some(content) = parse_inbound_payload(raw) else {
+            continue;
+        };
+        if let Err(e) = handle_message(
+            &client_id,
+            &chat_id,
+            &content,
+            None,
+            None,
+            None,
+            sender_allowed(&shared.channels_config, &client_id),
+            shared.supports_streaming,
+            shared.name,
+            &shared.bus,
+        )
+        .await
+        {
+            log::warn!("WebSocket channel: failed to publish message for chat '{chat_id}': {e}");
         }
     }
 
@@ -3632,9 +3722,13 @@ async fn handle_list_tool_settings<'a>(envelope_dispatch_context: EnvelopeDispat
         .and_then(|text| config_toggles::disabled_tool_names(&text).map_err(|e| e.message()));
     match disabled_names {
         Ok(disabled_names) => {
-            let rows = config_toggles::merge_section_rows(
-                config_toggles::tool_setting_rows(&catalogue, &disabled_names),
-                tool_settings_api::tool_settings_overview(&load_config(None).tools),
+            let tools_config = load_config(None).tools;
+            let rows = config_toggles::with_unavailable_reasons(
+                config_toggles::merge_section_rows(
+                    config_toggles::tool_setting_rows(&catalogue, &disabled_names),
+                    tool_settings_api::tool_settings_overview(&tools_config),
+                ),
+                |section| tool_settings_api::section_unavailable_reason(&tools_config, section),
             );
             send_event(
                 shared,
@@ -6499,6 +6593,9 @@ pub struct WebSocketChannel {
     /// Names of the MCP servers the process was started with switched on, cloned into
     /// every [`WsShared`] snapshot. Empty until set by the gateway.
     pub(crate) running_mcp_servers: Arc<HashSet<String>>,
+    /// Tool sections left out at start-up, cloned into every [`WsShared`]
+    /// snapshot. Empty until set by the gateway.
+    pub(crate) tool_startup_warnings: Arc<Vec<ToolStartupWarning>>,
     /// Filesystem root [`serve_media`] confines keys to. Captured at
     /// construction (`get_media_dir(None)`) so tests can point it at a
     /// tempdir the same way they override `gateway_services`.
@@ -6545,6 +6642,7 @@ impl WebSocketChannel {
             acp_manager: None,
             subagents: None,
             running_mcp_servers: Arc::new(HashSet::new()),
+            tool_startup_warnings: Arc::new(Vec::new()),
             media_root: get_media_dir(None),
         }
     }
@@ -6669,6 +6767,7 @@ impl WebSocketChannel {
             acp_manager: self.acp_manager.clone(),
             subagents: self.subagents.clone(),
             running_mcp_servers: Arc::clone(&self.running_mcp_servers),
+            tool_startup_warnings: Arc::clone(&self.tool_startup_warnings),
         }
     }
 
@@ -6820,6 +6919,15 @@ impl BaseChannel for WebSocketChannel {
         self.shutdown.notify_waiters();
     }
 
+    /// Persist one outbound message to the WebUI transcript (when the message
+    /// carries WebUI metadata) and fan it out to every live connection
+    /// subscribed to its chat.
+    ///
+    /// Each call writes exactly one transcript row and confines its media
+    /// exactly once, so this method deliberately never asks the manager to
+    /// retry: it returns `Ok` even when no connection is currently subscribed,
+    /// because the stored row is replayed when a client next attaches, and a
+    /// retry could only duplicate that row and its media copies.
     async fn send(&self, msg: OutboundMessage) -> Result<(), String> {
         // Mirrors nanobot's `send()` (`channels/websocket/runtime.py:946-1084`)
         // for the subset of event kinds actually reachable here:
@@ -6938,14 +7046,19 @@ impl BaseChannel for WebSocketChannel {
 
         let raw = payload.to_string();
         let delivered = self.fan_out_to_chat(&msg.chat_id, &raw).await;
-        // Only fail when nobody received it — a partial failure must not
-        // trigger a retry that would re-deliver duplicate content to
-        // recipients that already succeeded.
+        // Never report "nobody listening" as an error. The WebUI transcript
+        // written above is the durable record and is replayed on the next
+        // `attach`, so the message is not lost. Returning `Err` would make
+        // `ChannelManager::send_with_retry` re-run this whole method, and each
+        // re-run appends another transcript row (and copies the media again),
+        // which is how a chat without subscribers ended up showing every
+        // message three times.
         if delivered == 0 {
-            return Err(format!(
-                "No open WebSocket connection for chat_id '{}'",
+            log::debug!(
+                "WebSocket channel: no open connection for chat_id '{}'; \
+                 message stored for replay on next attach",
                 msg.chat_id
-            ));
+            );
         }
         Ok(())
     }
@@ -7472,16 +7585,38 @@ mod tests {
 
     #[test]
     fn ready_event_advertises_streaming() {
-        let body = ready_event("chat-1", "client-1", true, UserRole::Admin);
+        let body = ready_event("chat-1", "client-1", true, UserRole::Admin, &[]);
         assert_eq!(body["event"], "ready");
         assert_eq!(body["chat_id"], "chat-1");
         assert_eq!(body["client_id"], "client-1");
         assert_eq!(body["streaming"], true);
         assert_eq!(body["role"], "admin");
+        assert!(body.get("warnings").is_none());
 
-        let body = ready_event("chat-1", "client-1", false, UserRole::User);
+        let body = ready_event("chat-1", "client-1", false, UserRole::User, &[]);
         assert_eq!(body["streaming"], false);
         assert_eq!(body["role"], "user");
+    }
+
+    #[test]
+    fn ready_event_lists_startup_warnings() {
+        let warnings = [ToolStartupWarning::new("gmail", "Gmail tools disabled")];
+        let body = ready_event("chat-1", "client-1", true, UserRole::Admin, &warnings);
+        assert_eq!(body["warnings"][0]["section"], "gmail");
+        assert_eq!(body["warnings"][0]["message"], "Gmail tools disabled");
+    }
+
+    #[test]
+    fn startup_warnings_reach_admins_on_the_gateway_machine_only() {
+        let mut shared = test_shared("browser");
+        shared.tool_startup_warnings = Arc::new(vec![ToolStartupWarning::new(
+            "gmail",
+            "Gmail tools disabled",
+        )]);
+        let admin = startup_warnings_for_connection(&shared, addr("127.0.0.1"), &authenticated());
+        assert_eq!(admin.len(), 1);
+        let user = startup_warnings_for_connection(&shared, addr("127.0.0.1"), &plain_user());
+        assert!(user.is_empty());
     }
 
     // --- PingLiveness ---
@@ -7555,6 +7690,7 @@ mod tests {
             acp_manager: None,
             subagents: None,
             running_mcp_servers: Arc::new(HashSet::new()),
+            tool_startup_warnings: Arc::new(Vec::new()),
         }
     }
 
@@ -15333,10 +15469,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn send_no_recipients_is_an_error() {
+    async fn send_no_recipients_is_not_an_error() {
         let channel = test_channel();
         let result = BaseChannel::send(&channel, outbound("chat-1", "hi", None)).await;
-        assert!(result.is_err());
+        assert!(
+            result.is_ok(),
+            "an Err would make the manager retry and duplicate the message: {result:?}"
+        );
+        assert!(
+            transcript_rows(&channel, "chat-1").is_empty(),
+            "a message without WebUI metadata is not persisted"
+        );
     }
 
     #[tokio::test]
@@ -15526,6 +15669,156 @@ mod tests {
             .lock()
             .unwrap()
             .read_transcript_lines(&get_session_id(chat_id))
+    }
+
+    /// Write one small file into a fresh temp directory and return both, so the
+    /// directory outlives the `send` that copies the file.
+    fn temp_attachment(file_name: &str) -> (tempfile::TempDir, String) {
+        let source_dir = tempfile::tempdir().unwrap();
+        let source_path = source_dir.path().join(file_name);
+        std::fs::write(&source_path, b"attachment-bytes").unwrap();
+        (source_dir, source_path.to_str().unwrap().to_string())
+    }
+
+    /// Number of files the WebSocket channel has copied under `media_root`.
+    fn confined_media_file_count(channel: &WebSocketChannel) -> usize {
+        let websocket_media_dir = channel.media_root.join(CHANNEL_NAME);
+        std::fs::read_dir(websocket_media_dir)
+            .map(|entries| entries.count())
+            .unwrap_or(0)
+    }
+
+    #[tokio::test]
+    async fn send_without_subscribers_persists_one_row_and_returns_ok() {
+        let channel = test_channel();
+        let mut msg = outbound("chat-1", "background result", None);
+        msg.metadata = webui_meta("system-turn-1");
+
+        let result = BaseChannel::send(&channel, msg).await;
+
+        assert!(
+            result.is_ok(),
+            "no subscriber must not ask the manager to retry: {result:?}"
+        );
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0]["text"], "background result");
+    }
+
+    #[tokio::test]
+    async fn send_to_a_dead_subscriber_persists_one_row_and_returns_ok() {
+        let channel = test_channel();
+        let (tx, rx) = mpsc::unbounded_channel::<Message>();
+        channel
+            .connections
+            .lock()
+            .await
+            .register("conn-1", "chat-1", tx);
+        drop(rx);
+        let mut msg = outbound("chat-1", "reply after the writer died", None);
+        msg.metadata = webui_meta("turn-1");
+
+        let result = BaseChannel::send(&channel, msg).await;
+
+        assert!(result.is_ok(), "{result:?}");
+        assert_eq!(transcript_rows(&channel, "chat-1").len(), 1);
+    }
+
+    #[tokio::test]
+    async fn send_with_media_without_subscribers_copies_media_once() {
+        let channel = test_channel();
+        let (_source_dir, attachment_path) = temp_attachment("report.docx");
+        let mut msg = outbound("chat-1", "here is the document", None);
+        msg.media = vec![attachment_path];
+        msg.metadata = webui_meta("system-turn-1");
+
+        BaseChannel::send(&channel, msg).await.unwrap();
+
+        let rows = transcript_rows(&channel, "chat-1");
+        assert_eq!(rows.len(), 1);
+        let media_paths = rows[0]["media_paths"].as_array().expect("media_paths");
+        assert_eq!(media_paths.len(), 1);
+        assert_eq!(confined_media_file_count(&channel), 1);
+    }
+
+    #[tokio::test]
+    async fn next_inbound_message_returns_none_when_writer_finishes() {
+        let mut stream = futures::stream::pending::<Result<Message, axum::Error>>();
+        let mut writer = tokio::spawn(async {});
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            next_inbound_message(&mut stream, &mut writer, "conn-1"),
+        )
+        .await
+        .expect("reader must stop once the writer has finished");
+
+        assert!(next.is_none());
+    }
+
+    #[tokio::test]
+    async fn next_inbound_message_returns_none_on_close_frame() {
+        let mut stream = futures::stream::iter(vec![Ok::<_, axum::Error>(Message::Close(None))]);
+        let mut writer = tokio::spawn(futures::future::pending::<()>());
+
+        let next = tokio::time::timeout(
+            Duration::from_secs(2),
+            next_inbound_message(&mut stream, &mut writer, "conn-1"),
+        )
+        .await
+        .expect("reader must stop on a Close frame");
+
+        assert!(next.is_none());
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn next_inbound_message_forwards_text_frames_while_writer_runs() {
+        let mut stream = futures::stream::iter(vec![Ok::<_, axum::Error>(Message::text("hello"))]);
+        let mut writer = tokio::spawn(futures::future::pending::<()>());
+
+        let next = next_inbound_message(&mut stream, &mut writer, "conn-1").await;
+
+        assert_eq!(next, Some(Message::text("hello")));
+        writer.abort();
+    }
+
+    #[tokio::test]
+    async fn connection_writer_stops_when_outbound_queue_closes() {
+        let (sink, _sink_frames) = futures::channel::mpsc::unbounded::<Message>();
+        let (outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
+        drop(outbound_tx);
+
+        tokio::time::timeout(
+            Duration::from_secs(2),
+            run_connection_writer(sink, outbound_rx, None, "conn-1".to_string()),
+        )
+        .await
+        .expect("writer must stop once its outbound queue is closed");
+    }
+
+    #[tokio::test]
+    async fn connection_writer_sends_close_frame_on_ping_timeout() {
+        let (sink, mut sink_frames) = futures::channel::mpsc::unbounded::<Message>();
+        let (_outbound_tx, outbound_rx) = mpsc::unbounded_channel::<Message>();
+        let liveness = PingLiveness::new(1, 1).map(|liveness| Arc::new(StdMutex::new(liveness)));
+
+        tokio::time::timeout(
+            Duration::from_secs(6),
+            run_connection_writer(sink, outbound_rx, liveness, "conn-1".to_string()),
+        )
+        .await
+        .expect("writer must stop after an unanswered ping");
+
+        let mut written_frames = Vec::new();
+        while let Ok(frame) = sink_frames.try_recv() {
+            written_frames.push(frame);
+        }
+        assert!(
+            matches!(written_frames.first(), Some(Message::Ping(_))),
+            "{written_frames:?}"
+        );
+        assert_eq!(written_frames.last(), Some(&Message::Close(None)));
     }
 
     #[tokio::test]

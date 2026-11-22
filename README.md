@@ -161,7 +161,7 @@ cargo build -r
 
 This produces `target/release/rust-bot` (or `.\target\release\rust-bot.exe` on Windows).
 
-A separate helper binary for Gmail OAuth is built alongside the main CLI:
+A separate legacy helper binary for Gmail OAuth is built alongside the main CLI (prefer the built-in `rust-bot gmail-auth`):
 
 ```
 cargo build -r --bin gmail-auth
@@ -204,7 +204,7 @@ Rust Bot ships with a REPL-style interactive console (Emacs-style keybindings, h
 
 ## Gmail support
 
-The agent can read and send email through Gmail. Google Cloud setup, the `gmail-auth` OAuth helper, enabling the Gmail tools, and the tool parameters are documented in [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md).
+The agent can read and send email through Gmail. Install the downloaded OAuth client and sign in with `rust-bot gmail-auth --client-secret <file>` (or the config wizard), then enable `tools.gmail`. When credentials are missing the agent starts without the Gmail tools and shows a warning instead of exiting. Google Cloud setup, sign-in, and the tool parameters are documented in [docs/GMAIL_SUPPORT.md](docs/GMAIL_SUPPORT.md).
 
 ---
 

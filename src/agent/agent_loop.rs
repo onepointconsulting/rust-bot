@@ -49,6 +49,7 @@ use crate::agent::tools::registry::ToolRegistry;
 use crate::agent::tools::shell::ShellTool;
 use crate::agent::tools::skill_manage::skill_learning_prompt_section;
 use crate::agent::tools::spawn::SpawnTool;
+use crate::agent::tools::startup_warning::ToolStartupWarning;
 use crate::agent::tools::tool_search::{ToolSearchTool, deferred_tools_prompt_section};
 use crate::agent::turn_journal::TurnJournal;
 use crate::agent::workspace_context::{
@@ -541,6 +542,9 @@ pub struct AgentLoop {
     /// nanobot's `_idle_compact_check_interval_s` (`loop.py:1099-1104`).
     idle_compact_check_interval: Duration,
     commands: CommandRouter,
+    /// Enabled tool sections left out at start-up, shown by the CLI, gateway
+    /// and websockets-chat (see [`Self::tool_startup_warnings`]).
+    tool_startup_warnings: Vec<ToolStartupWarning>,
 }
 
 /// Counts of what one startup resume pass did.
@@ -642,7 +646,7 @@ impl AgentLoop {
             .with_disabled_tools(tools_cfg.disabled_tools.clone()),
         );
         let mut tools = ToolRegistry::new();
-        AgentLoop::register_default_tools(
+        let tool_startup_warnings = AgentLoop::register_default_tools(
             &mut tools,
             restrict_to_workspace,
             &exec_config,
@@ -774,6 +778,7 @@ impl AgentLoop {
             )),
             auto_compact,
             idle_compact_check_interval,
+            tool_startup_warnings,
             commands: {
                 let mut router = CommandRouter::new();
                 register_builtin_commands(&mut router);
@@ -1050,7 +1055,8 @@ impl AgentLoop {
         )
     }
 
-    /// Register the default set of tools.
+    /// Register the default set of tools. Returns a warning for every enabled
+    /// tool section that had to be left out (for example Gmail without credentials).
     #[allow(clippy::too_many_arguments)]
     fn register_default_tools(
         tools: &mut ToolRegistry,
@@ -1068,8 +1074,9 @@ impl AgentLoop {
         timezone: &Option<String>,
         workspace: &Path,
         session_manager: Arc<Mutex<SessionManager>>,
-    ) {
+    ) -> Vec<ToolStartupWarning> {
         log::info!("Registering default tools");
+        let mut startup_warnings = Vec::new();
         let (allowed_dir, extra_read) =
             filesystem_tool_scope(workspace, restrict_to_workspace, &exec_config.sandbox);
         register_filesystem_tools(tools, workspace, allowed_dir.clone(), extra_read.clone());
@@ -1086,7 +1093,7 @@ impl AgentLoop {
             )));
         }
         register_web_tools(web_config, tools);
-        register_gmail_tools(gmail_config, workspace, tools);
+        startup_warnings.extend(register_gmail_tools(gmail_config, workspace, tools));
         register_ocr_tools(
             ocr_config,
             workspace,
@@ -1115,6 +1122,7 @@ impl AgentLoop {
             )));
         }
         tools.register(Box::new(UpdateGoalTool::new(session_manager)));
+        startup_warnings
     }
 
     /// Connect to configured MCP servers (lazy, on the first message).
@@ -1273,6 +1281,12 @@ impl AgentLoop {
             .iter()
             .map(|(name, error)| (name.clone(), error.clone()))
             .collect()
+    }
+
+    /// Enabled tool sections that were left out at start-up (for example Gmail
+    /// without credentials), in registration order.
+    pub fn tool_startup_warnings(&self) -> &[ToolStartupWarning] {
+        &self.tool_startup_warnings
     }
 
     /// Shared message bus handle for publishing outbound messages.

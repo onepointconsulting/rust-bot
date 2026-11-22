@@ -654,7 +654,8 @@ impl SubagentManager {
             )));
         }
         register_web_tools(&self.web_config, &mut tools);
-        register_gmail_tools(&self.gmail_config, &self.workspace, &mut tools);
+        // The parent loop already reported missing Gmail credentials at start-up.
+        let _ = register_gmail_tools(&self.gmail_config, &self.workspace, &mut tools);
         register_ocr_tools(
             &self.ocr_config,
             &self.workspace,

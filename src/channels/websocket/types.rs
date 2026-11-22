@@ -18,6 +18,7 @@ use crate::agent::acp::manager::AcpManager;
 use crate::agent::model_runtime::ModelRuntimeResolver;
 use crate::agent::subagent::SubagentManager;
 use crate::agent::tools::registry::ToolRegistry;
+use crate::agent::tools::startup_warning::ToolStartupWarning;
 use crate::security::jwt::UserRole;
 use crate::{
     bus::queue::MessageBus,
@@ -704,6 +705,10 @@ pub struct WsShared {
     /// Settings dialog compares it with `config.json` to tell which toggles still wait
     /// for a restart.
     pub running_mcp_servers: Arc<HashSet<String>>,
+    /// Enabled tool sections the agent loop left out at start-up (for example
+    /// Gmail without credentials). Sent in the `ready` frame to connections
+    /// that may change settings.
+    pub tool_startup_warnings: Arc<Vec<ToolStartupWarning>>,
 }
 
 /// Upgrade-time JWT outcome for one WebSocket connection. Produced by

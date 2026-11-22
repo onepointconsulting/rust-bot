@@ -32,10 +32,11 @@ use chat_ui::models::{
 use crate::api::{self, WsSender};
 use crate::components::{
     add_server_success_message, after_reconnect, apply_enabled, apply_mcp_server, apply_on_demand,
-    apply_tool_config, insert_mcp_server, model_preset_notice, model_preset_picker_names,
-    provider_notice, ChatShell, McpChangeRequest, ProviderAddRequest, ProviderExtras,
-    ProviderModelsState, SettingsActions, SettingsPage, SettingsPanel, ToggleRequest,
-    ToolConfigChange, ADD_BUSY_KEY, MODEL_PRESET_ADD_BUSY_KEY, PROVIDER_ADD_BUSY_KEY,
+    apply_tool_config, dismiss_startup_warnings, insert_mcp_server, model_preset_notice,
+    model_preset_picker_names, provider_notice, visible_startup_warnings, ChatShell,
+    McpChangeRequest, ProviderAddRequest, ProviderExtras, ProviderModelsState, SettingsActions,
+    SettingsPage, SettingsPanel, ToggleRequest, ToolConfigChange, ADD_BUSY_KEY,
+    MODEL_PRESET_ADD_BUSY_KEY, PROVIDER_ADD_BUSY_KEY,
 };
 use crate::protocol::{self, ServerEvent};
 use crate::state::{self, startup_view, ConfigFileView, ConnectionStatus, MainView, StartupView};
@@ -416,6 +417,9 @@ struct WsContext {
     /// it arrives, or on older gateways). Shown in the account menu; through
     /// [`protocol::is_admin_role`] it also decides whether the Settings button shows.
     user_role: RwSignal<Option<String>>,
+    /// Tool sections the gateway left out at start-up, from the latest `ready` frame
+    /// (sent to administrators only). Shown in the start-up warnings strip.
+    startup_warnings: RwSignal<Vec<protocol::StartupWarning>>,
     /// Whether the Settings dialog is open.
     settings_open: RwSignal<bool>,
     /// What the dialog's configuration file editor shows. Only filled while the
@@ -793,12 +797,14 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             client_id,
             streaming,
             role,
+            warnings,
         } => {
             log::info!(
                 "gateway ready: chat_id={chat_id} client_id={client_id} streaming={streaming} role={role:?}"
             );
             ctx.connection_status.set(ConnectionStatus::Connected);
             ctx.user_role.set(role);
+            ctx.startup_warnings.set(warnings);
             settings_after_reconnect(ctx);
             ctx.token_streaming.set(streaming);
             // A fresh connection starts on the chat, never on a list page.
@@ -2941,6 +2947,10 @@ pub fn App() -> impl IntoView {
     let mcp_row_error = RwSignal::new(None::<(String, String)>);
     let mcp_changed = RwSignal::new(Vec::<String>::new());
     let user_role = RwSignal::new(None::<String>);
+    let startup_warnings = RwSignal::new(Vec::<protocol::StartupWarning>::new());
+    // Messages of start-up warnings the user dismissed. Kept for the page's lifetime,
+    // so a reconnect does not bring them back.
+    let dismissed_startup_warnings = RwSignal::new(Vec::<String>::new());
     let settings_open = RwSignal::new(false);
     let config_file = RwSignal::new(ConfigFileView::Closed);
     let config_saving = RwSignal::new(false);
@@ -2988,6 +2998,7 @@ pub fn App() -> impl IntoView {
         mcp_row_error,
         mcp_changed,
         user_role,
+        startup_warnings,
         settings_open,
         config_file,
         config_saving,
@@ -3127,6 +3138,7 @@ pub fn App() -> impl IntoView {
         mcp_changed.set(Vec::new());
         close_settings(&ws_context);
         user_role.set(None);
+        startup_warnings.set(Vec::new());
         config_saved_notice.set(false);
         summary_popup.set(None);
         workspace_popup.set(None);
@@ -3370,6 +3382,16 @@ pub fn App() -> impl IntoView {
                     user_email=Signal::derive(move || user_email.get())
                     bot_version=Signal::derive(move || bot_version.get())
                     user_role=Signal::derive(move || user_role.get())
+                    startup_warnings=Signal::derive(move || {
+                        visible_startup_warnings(
+                            &startup_warnings.get(),
+                            &dismissed_startup_warnings.get(),
+                        )
+                    })
+                    on_dismiss_startup_warnings=Callback::new(move |shown: Vec<protocol::StartupWarning>| {
+                        dismissed_startup_warnings
+                            .update(|dismissed| *dismissed = dismiss_startup_warnings(dismissed, &shown));
+                    })
                     draft=composer_draft
                     on_send=do_send
                     on_new_chat=do_new_chat

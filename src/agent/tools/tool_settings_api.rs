@@ -23,6 +23,7 @@ use schemars::{JsonSchema, schema_for};
 use serde::Serialize;
 use serde_json::{Map, Value};
 
+use crate::agent::tools::gmail_oauth::gmail_unavailable_reason;
 use crate::config::schema::{
     AcpConfig, Config, DocxToolConfig, ExecToolConfig, GmailToolConfig, ImageGenerationToolConfig,
     OcrToolConfig, QuestionToolConfig, SkillsToolConfig, ToolsConfig, WebToolsConfig,
@@ -377,6 +378,16 @@ pub fn tool_settings_overview(tools: &ToolsConfig) -> Vec<ToolSettingsSummary> {
         .collect()
 }
 
+/// Why the enabled tool section `section` cannot run with the current files, or
+/// `None` when it can (or is switched off). Only Gmail has such a check today:
+/// its credential files must exist (see [`gmail_unavailable_reason`]).
+pub fn section_unavailable_reason(tools: &ToolsConfig, section: &str) -> Option<String> {
+    match section {
+        "gmail" if tools.gmail.enable => gmail_unavailable_reason(&tools.gmail),
+        _ => None,
+    }
+}
+
 /// Check `value` fits `kind` and return it normalized (strings trimmed), or why not.
 pub(crate) fn check_value(kind: &FieldKind, value: &Value) -> Result<Value, String> {
     match (kind, value) {
@@ -563,6 +574,40 @@ fn set_property(section_json: &mut Map<String, Value>, name: &str, value: Value)
 mod tests {
     use super::*;
     use serde_json::json;
+
+    /// Tools config with Gmail switched `enable`d and its files in `dir`.
+    fn tools_with_gmail_in(dir: &std::path::Path, enable: bool) -> ToolsConfig {
+        let mut tools = ToolsConfig::default();
+        tools.gmail.enable = enable;
+        tools.gmail.client_secret_path =
+            dir.join("client_secret.json").to_string_lossy().to_string();
+        tools.gmail.token_cache_path = dir.join("token_cache.json").to_string_lossy().to_string();
+        tools
+    }
+
+    #[test]
+    fn enabled_gmail_without_files_is_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let reason = section_unavailable_reason(&tools_with_gmail_in(dir.path(), true), "gmail");
+        assert!(reason.unwrap().contains("gmail-auth"));
+    }
+
+    #[test]
+    fn enabled_gmail_with_both_files_is_available() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("client_secret.json"), "{}").unwrap();
+        std::fs::write(dir.path().join("token_cache.json"), "[]").unwrap();
+        let tools = tools_with_gmail_in(dir.path(), true);
+        assert!(section_unavailable_reason(&tools, "gmail").is_none());
+    }
+
+    #[test]
+    fn disabled_gmail_and_other_sections_are_never_unavailable() {
+        let dir = tempfile::tempdir().unwrap();
+        let tools = tools_with_gmail_in(dir.path(), false);
+        assert!(section_unavailable_reason(&tools, "gmail").is_none());
+        assert!(section_unavailable_reason(&tools, "ocr").is_none());
+    }
 
     fn image_summary(tools: &ToolsConfig) -> ToolSettingsSummary {
         tool_settings_overview(tools)

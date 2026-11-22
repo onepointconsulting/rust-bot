@@ -60,3 +60,41 @@ async fn test_gmail_send_tool() {
     let result = gmail_tool.execute(&params).await;
     println!("{}", result);
 }
+
+/// Gmail config whose credential files would live in `dir` (none are created).
+fn gmail_config_without_credentials(
+    dir: &std::path::Path,
+) -> rust_bot::config::schema::GmailToolConfig {
+    rust_bot::config::schema::GmailToolConfig {
+        enable: true,
+        client_secret_path: dir.join("client_secret.json").to_string_lossy().to_string(),
+        token_cache_path: dir.join("token_cache.json").to_string_lossy().to_string(),
+        ..Default::default()
+    }
+}
+
+#[tokio::test]
+async fn gmail_tool_without_credentials_reports_the_missing_file_instead_of_exiting() {
+    let dir = tempfile::tempdir().unwrap();
+    let gmail_tool = GmailEmailsTool::new(gmail_config_without_credentials(dir.path()));
+    let result = gmail_tool.execute(&current_month_gmail_params(1)).await;
+    // Builds with a built-in client only ask to sign in; others name the missing file.
+    let expected = if rust_bot::agent::tools::gmail_oauth::built_in_client_secret().is_some() {
+        "not signed in"
+    } else {
+        "client_secret.json"
+    };
+    assert!(result.contains(expected), "{result}");
+    assert!(result.contains("gmail-auth"), "{result}");
+}
+
+#[tokio::test]
+async fn gmail_send_tool_without_token_cache_asks_to_sign_in() {
+    let dir = tempfile::tempdir().unwrap();
+    std::fs::write(dir.path().join("client_secret.json"), "{}").unwrap();
+    let gmail_tool = GmailEmailSendTool::new(gmail_config_without_credentials(dir.path()));
+    let params = serde_json::json!({"to": "a@example.com", "subject": "s", "body": "b"});
+    let result = gmail_tool.execute(&params).await;
+    assert!(result.contains("not signed in"), "{result}");
+    assert!(result.contains("gmail-auth"), "{result}");
+}

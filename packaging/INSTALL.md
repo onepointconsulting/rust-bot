@@ -287,44 +287,44 @@ them.
 
 The package also includes an optional Gmail OAuth utility.
 
-### Gmail OAuth (`gmail-auth`)
+### Gmail OAuth (`rust-bot gmail-auth`)
 
-Use this once per machine to authorize Gmail read/send access for the agent.
+Use this once per machine to authorise Gmail read/send access for the agent.
+
+If this package was built with a built-in Google client, just run
+`rust-bot gmail-auth` (no `--client-secret`) and sign in: steps 1 and 2 are
+done for you. Otherwise:
 
 1. Create a Google Cloud OAuth **Desktop app** client, enable the Gmail API,
-   and allow the redirect URI `http://localhost:8080`.
-2. Save the downloaded client secret as `credentials/client_secret.json`
-   relative to your current working directory (create the `credentials/`
-   folder if needed).
-3. Run the helper:
+   and download the client secret JSON.
+2. Install it and sign in. The command copies the file to
+   `tools.gmail.clientSecretPath` and writes the token cache to
+   `tools.gmail.tokenCachePath` from your config, so nothing needs copying:
 
 ```bash
 # Windows
-.\gmail-auth.exe
+.\rust-bot.exe gmail-auth --client-secret C:\path\to\client_secret.json
 
 # Linux / macOS
-./gmail-auth
+./rust-bot gmail-auth --client-secret /path/to/client_secret.json
 ```
 
-4. Complete the Google login in the browser. Tokens are written to
-   `token_cache.json` in the current directory.
-5. Copy both credential files into the paths configured under
-   `tools.gmail` (sample defaults shown below):
+3. Complete the Google login in the browser (the sign-in link is printed).
+4. Set `tools.gmail.enable` to `true` in your config (the command reminds you
+   if it is off) and restart the agent or gateway.
 
-```bash
-# Linux / macOS
-mkdir -p ~/.rust-bot/workspace/credentials
-cp credentials/client_secret.json ~/.rust-bot/workspace/credentials/
-cp token_cache.json ~/.rust-bot/workspace/credentials/
+The config wizard (`rust-bot onboard --wizard` → Tools → gmail) offers the
+same steps. Run `rust-bot gmail-auth --force` to sign in again if tokens are
+revoked or scopes change.
 
-# Windows (PowerShell)
-New-Item -ItemType Directory -Force -Path "$HOME\.rust-bot\workspace\credentials"
-Copy-Item .\credentials\client_secret.json "$HOME\.rust-bot\workspace\credentials\"
-Copy-Item .\token_cache.json "$HOME\.rust-bot\workspace\credentials\"
-```
+If Gmail is enabled but a credential file is missing, rust-bot no longer
+exits: it starts without the Gmail tools and shows a warning (CLI, gateway
+banner, the chat UI for administrators, and "Needs credentials" on the
+Settings → Tools page).
 
-Then set `tools.gmail.enable` to `true` in your config. Re-run `gmail-auth`
-if tokens are revoked or scopes change.
+The standalone `gmail-auth` binary is still included for compatibility. It
+writes `token_cache.json` next to the client secret you pass, so you then have
+to copy both files to the paths under `tools.gmail` yourself.
 
 ## 6. Web chat UIs
 
