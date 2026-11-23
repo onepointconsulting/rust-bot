@@ -792,7 +792,7 @@ dependencies = [
 
 [[package]]
 name = "chat-ui"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "ammonia",
  "chrono",
@@ -5567,7 +5567,7 @@ dependencies = [
 
 [[package]]
 name = "rust-bot"
-version = "0.5.0"
+version = "0.5.1"
 dependencies = [
  "adk-anthropic",
  "agent-client-protocol",
@@ -7786,7 +7786,7 @@ dependencies = [
 
 [[package]]
 name = "web-chat"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "chat-ui",
  "console_error_panic_hook",
@@ -7847,7 +7847,7 @@ dependencies = [
 
 [[package]]
 name = "websockets-chat"
-version = "0.1.0"
+version = "0.5.1"
 dependencies = [
  "chat-ui",
  "console_error_panic_hook",
