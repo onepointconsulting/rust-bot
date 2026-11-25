@@ -189,11 +189,12 @@ pub fn ChatShell(
     // `entries` follows the active session, so a new chat recalls nothing.
     let previous_user_message =
         Signal::derive(move || entries.with(|chat_entries| last_user_message_text(chat_entries)));
-    // Starting a new chat should leave the cursor ready in the composer.
-    let composer_focus_request = RwSignal::new(0_u32);
+    // Bumped each time a new chat starts: the composer takes keyboard focus and
+    // the sidebar closes its search so the new session isn't filtered out.
+    let new_chat_request = RwSignal::new(0_u32);
     let on_new_chat_and_focus = move || {
         on_new_chat();
-        composer_focus_request.update(|count| *count += 1);
+        new_chat_request.update(|count| *count += 1);
     };
     // Ctrl/Cmd+B toggles the sidebar from anywhere (including the composer).
     // Registered once for the component's lifetime; Leptos removes it on
@@ -252,6 +253,7 @@ pub fn ChatShell(
                 on_clear=Callback::new(move |id| on_clear_session(id))
                 on_delete=Callback::new(move |id| on_delete_session(id))
                 on_new_chat=on_new_chat_callback
+                search_reset_request=new_chat_request
                 on_mcps=show_mcps.then_some(Callback::new(move |()| on_open_mcps()))
                 mcps_active=Signal::derive(move || main_view.get() == MainView::Mcps)
                 on_subagents=show_subagents
@@ -363,7 +365,7 @@ pub fn ChatShell(
                         skills=skills
                         tools=tools
                         on_open_tools=Callback::new(move |()| on_open_tools())
-                        focus_request=composer_focus_request
+                        focus_request=new_chat_request
                         previous_message=previous_user_message
                     />
                 </div>

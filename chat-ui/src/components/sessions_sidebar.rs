@@ -122,6 +122,13 @@ fn dragged_sidebar_width(start_width: f64, start_pointer_x: f64, current_pointer
         .clamp(SIDEBAR_MIN_WIDTH_PX, SIDEBAR_MAX_WIDTH_PX)
 }
 
+/// Whether the host's `search_reset_request` counter asks for the search to
+/// be reset. The initial value (`0`) is ignored, so mounting the sidebar never
+/// closes a search; every later increment does.
+fn is_reset_requested(request_count: u32) -> bool {
+    request_count != 0
+}
+
 /// Tailwind classes for a sidebar page button ("MCPs", "Sub-agents"), highlighted while
 /// its page is showing.
 fn nav_button_class(active: bool) -> &'static str {
@@ -1071,6 +1078,11 @@ pub fn SessionsSidebar(
     /// floating-widget window.
     #[prop(into, default = Signal::stored(false))]
     compact: Signal<bool>,
+    /// Bumped by the host whenever a new chat starts; each increment closes the
+    /// search field and clears its query so the new session is not filtered out.
+    /// The initial value is ignored. Omitted (web-chat) means search is never reset externally.
+    #[prop(optional)]
+    search_reset_request: Option<RwSignal<u32>>,
 ) -> impl IntoView {
     // Which groups' "··· More" disclosure has been opened. Hoisted above
     // `body` (rather than living inside `SessionGroupSection`, as it used
@@ -1082,14 +1094,28 @@ pub fn SessionsSidebar(
     // closing it clears the query so the full list returns.
     let search_open = RwSignal::new(false);
     let search_query = RwSignal::new(String::new());
+    let close_search = move || {
+        search_open.set(false);
+        search_query.set(String::new());
+    };
     let toggle_search = move || {
         if search_open.get_untracked() {
-            search_open.set(false);
-            search_query.set(String::new());
+            close_search();
         } else {
             search_open.set(true);
         }
     };
+    // A new chat started by the host closes the search so the new session
+    // isn't hidden by a stale query. Lives here (not in `body`, which is
+    // instantiated twice for docked/mobile) so it runs once per bump.
+    Effect::new(move |_| {
+        let Some(request) = search_reset_request else {
+            return;
+        };
+        if is_reset_requested(request.get()) {
+            close_search();
+        }
+    });
     // Drag-to-resize: `None` keeps the default (compact/regular) width class
     // until the user first drags; `resize_drag` holds the pointer x and the
     // sidebar width at the moment the current drag started.
@@ -2000,9 +2026,20 @@ mod collapse_tooltip_tests {
 #[cfg(test)]
 mod tests {
     use super::{
-        dragged_sidebar_width, estimated_menu_height, menu_placement_style, nav_button_class,
-        pin_menu_label,
+        dragged_sidebar_width, estimated_menu_height, is_reset_requested, menu_placement_style,
+        nav_button_class, pin_menu_label,
     };
+
+    #[test]
+    fn reset_is_not_requested_for_initial_value() {
+        assert!(!is_reset_requested(0));
+    }
+
+    #[test]
+    fn reset_is_requested_after_any_increment() {
+        assert!(is_reset_requested(1));
+        assert!(is_reset_requested(5));
+    }
 
     #[test]
     fn dragging_right_widens_and_left_narrows_the_sidebar() {
