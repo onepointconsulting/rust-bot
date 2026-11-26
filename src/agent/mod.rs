@@ -15,6 +15,8 @@ pub mod question_broker;
 pub mod recovery;
 pub mod resume;
 pub mod runner;
+pub mod skill_operation;
+pub mod skill_proposals;
 pub mod skill_store;
 pub mod skills;
 pub mod subagent;

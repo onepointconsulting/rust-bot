@@ -3,7 +3,8 @@ Extract key facts from this conversation. Only output items matching these categ
 - Decisions: choices made, conclusions reached
 - Solutions: working approaches discovered through trial and error, especially non-obvious methods that succeeded after failed attempts
 - Events: plans, deadlines, notable occurrences
-- Preferences: communication style, tool preferences
+- Preferences: communication style, tool preferences{% if learn_skills %}
+- Procedures: reusable steps, commands, and the pitfall avoided, as "PROCEDURE: <task> — <steps> — <pitfall>"{% endif %}
 
 Priority: user corrections and preferences > solutions > decisions > events > environment facts. The most valuable memory prevents the user from having to repeat themselves.
 

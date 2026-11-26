@@ -14,6 +14,7 @@ use std::fs;
 use std::path::{Component, Path, PathBuf};
 use std::sync::Mutex;
 
+use crate::agent::skill_operation::SkillOperation;
 use crate::agent::skills::{BUILTIN_SKILLS_DIR, parse_skill_frontmatter};
 use crate::agent::tools::filesystem::{find_and_replace, is_path_under};
 use crate::config::schema::SkillsToolConfig;
@@ -80,6 +81,45 @@ struct LocatedSkill {
     source: SkillSource,
 }
 
+/// A validated change, worked out by [`SkillStore::plan`] but not yet written.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum PlannedChange {
+    /// Write `content` to `relative_target` in the skill's workspace folder.
+    /// `located` is `None` for a new skill.
+    Write {
+        name: String,
+        located: Option<LocatedSkill>,
+        relative_target: PathBuf,
+        content: String,
+        message: String,
+    },
+    /// Remove the supporting file `relative_target` (given as `file_path`).
+    RemoveFile {
+        name: String,
+        located: LocatedSkill,
+        relative_target: PathBuf,
+        file_path: String,
+        message: String,
+    },
+    /// Remove the whole workspace skill folder.
+    Delete {
+        name: String,
+        located: LocatedSkill,
+        message: String,
+    },
+}
+
+impl PlannedChange {
+    /// The sentence describing the change once made.
+    fn message(&self) -> &str {
+        match self {
+            PlannedChange::Write { message, .. }
+            | PlannedChange::RemoveFile { message, .. }
+            | PlannedChange::Delete { message, .. } => message,
+        }
+    }
+}
+
 /// Creates, changes and deletes skills under the workspace's `skills` folder.
 pub struct SkillStore {
     workspace_skills: PathBuf,
@@ -111,46 +151,17 @@ impl SkillStore {
     ///
     /// Fails when a workspace or bundled skill of that name exists already.
     pub fn create(&self, name: &str, content: &str) -> Result<SkillChange, String> {
-        validate_skill_name(name)?;
-        let content = strip_byte_order_mark(content);
-        validate_skill_document(name, content, &self.limits)?;
-        let _guard = self.lock();
-        if let Some(existing) = self.locate(name) {
-            return Err(format!(
-                "Error: a skill named '{name}' already exists at {}. \
-                 Use action='patch' to change it.",
-                existing.directory.display()
-            ));
-        }
-        let skill_dir = self.workspace_skills.join(name);
-        if directory_has_entries(&skill_dir) {
-            return Err(format!(
-                "Error: cannot create skill '{name}': {} already exists and is not an \
-                 empty skill folder. Choose another name.",
-                skill_dir.display()
-            ));
-        }
-        let skill_file = skill_dir.join(SKILL_FILE_NAME);
-        self.write_inside(&skill_dir, &skill_file, content)?;
-        Ok(SkillChange {
-            message: format!("Skill '{name}' created."),
-            path: skill_file,
+        self.apply(&SkillOperation::Create {
+            name: name.to_string(),
+            content: content.to_string(),
         })
     }
 
     /// Replace the whole `SKILL.md` of the existing skill `name` with `content`.
     pub fn rewrite(&self, name: &str, content: &str) -> Result<SkillChange, String> {
-        validate_skill_name(name)?;
-        let content = strip_byte_order_mark(content);
-        validate_skill_document(name, content, &self.limits)?;
-        let _guard = self.lock();
-        let located = self.locate_or_error(name)?;
-        let skill_dir = self.make_writable(name, &located)?;
-        let skill_file = skill_dir.join(SKILL_FILE_NAME);
-        self.write_inside(&skill_dir, &skill_file, content)?;
-        Ok(SkillChange {
-            message: format!("Skill '{name}' rewritten."),
-            path: skill_file,
+        self.apply(&SkillOperation::Rewrite {
+            name: name.to_string(),
+            content: content.to_string(),
         })
     }
 
@@ -167,7 +178,148 @@ impl SkillStore {
         file_path: Option<&str>,
         replace_all: bool,
     ) -> Result<SkillChange, String> {
-        validate_skill_name(name)?;
+        self.apply(&SkillOperation::Patch {
+            name: name.to_string(),
+            old_string: old_string.to_string(),
+            new_string: new_string.to_string(),
+            file_path: file_path.map(str::to_string),
+            replace_all,
+        })
+    }
+
+    /// Add or overwrite the supporting file `file_path` of the skill `name`.
+    pub fn write_file(
+        &self,
+        name: &str,
+        file_path: &str,
+        file_content: &str,
+    ) -> Result<SkillChange, String> {
+        self.apply(&SkillOperation::WriteFile {
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+            file_content: file_content.to_string(),
+        })
+    }
+
+    /// Remove the supporting file `file_path` from the skill `name`. A folder
+    /// left empty is removed too.
+    pub fn remove_file(&self, name: &str, file_path: &str) -> Result<SkillChange, String> {
+        self.apply(&SkillOperation::RemoveFile {
+            name: name.to_string(),
+            file_path: file_path.to_string(),
+        })
+    }
+
+    /// Delete the workspace skill `name` with all its files. Bundled skills
+    /// cannot be deleted.
+    pub fn delete(&self, name: &str) -> Result<SkillChange, String> {
+        self.apply(&SkillOperation::Delete {
+            name: name.to_string(),
+        })
+    }
+
+    /// Validate `operation` and carry it out.
+    pub fn apply(&self, operation: &SkillOperation) -> Result<SkillChange, String> {
+        let _guard = self.lock();
+        let planned = self.plan(operation)?;
+        self.execute(planned)
+    }
+
+    /// Dry run of [`Self::apply`]: validate `operation` against the skills as
+    /// they are now (for a patch, compute the patched text) without writing
+    /// anything. Returns what applying it would report.
+    pub fn check(&self, operation: &SkillOperation) -> Result<SkillChange, String> {
+        let _guard = self.lock();
+        let planned = self.plan(operation)?;
+        Ok(SkillChange {
+            message: planned.message().to_string(),
+            path: self.planned_path(&planned),
+        })
+    }
+
+    /// Validate `operation` and work out exactly what it would change.
+    /// Reads the skills but never writes. Callers hold the write lock.
+    fn plan(&self, operation: &SkillOperation) -> Result<PlannedChange, String> {
+        validate_skill_name(operation.skill_name())?;
+        match operation {
+            SkillOperation::Create { name, content } => self.plan_create(name, content),
+            SkillOperation::Rewrite { name, content } => self.plan_rewrite(name, content),
+            SkillOperation::Patch {
+                name,
+                old_string,
+                new_string,
+                file_path,
+                replace_all,
+            } => self.plan_patch(
+                name,
+                old_string,
+                new_string,
+                file_path.as_deref(),
+                *replace_all,
+            ),
+            SkillOperation::WriteFile {
+                name,
+                file_path,
+                file_content,
+            } => self.plan_write_file(name, file_path, file_content),
+            SkillOperation::RemoveFile { name, file_path } => {
+                self.plan_remove_file(name, file_path)
+            }
+            SkillOperation::Delete { name } => self.plan_delete(name),
+        }
+    }
+
+    /// Plan a `create`: a valid document for a name nobody uses yet.
+    fn plan_create(&self, name: &str, content: &str) -> Result<PlannedChange, String> {
+        let content = strip_byte_order_mark(content);
+        validate_skill_document(name, content, &self.limits)?;
+        if let Some(existing) = self.locate(name) {
+            return Err(format!(
+                "Error: a skill named '{name}' already exists at {}. \
+                 Use action='patch' to change it.",
+                existing.directory.display()
+            ));
+        }
+        let skill_dir = self.workspace_skills.join(name);
+        if directory_has_entries(&skill_dir) {
+            return Err(format!(
+                "Error: cannot create skill '{name}': {} already exists and is not an \
+                 empty skill folder. Choose another name.",
+                skill_dir.display()
+            ));
+        }
+        Ok(PlannedChange::Write {
+            name: name.to_string(),
+            located: None,
+            relative_target: PathBuf::from(SKILL_FILE_NAME),
+            content: content.to_string(),
+            message: format!("Skill '{name}' created."),
+        })
+    }
+
+    /// Plan a full `SKILL.md` rewrite of an existing skill.
+    fn plan_rewrite(&self, name: &str, content: &str) -> Result<PlannedChange, String> {
+        let content = strip_byte_order_mark(content);
+        validate_skill_document(name, content, &self.limits)?;
+        let located = self.locate_or_error(name)?;
+        Ok(PlannedChange::Write {
+            name: name.to_string(),
+            located: Some(located),
+            relative_target: PathBuf::from(SKILL_FILE_NAME),
+            content: content.to_string(),
+            message: format!("Skill '{name}' rewritten."),
+        })
+    }
+
+    /// Plan a find-and-replace, computing the patched text and checking it.
+    fn plan_patch(
+        &self,
+        name: &str,
+        old_string: &str,
+        new_string: &str,
+        file_path: Option<&str>,
+        replace_all: bool,
+    ) -> Result<PlannedChange, String> {
         if old_string.is_empty() {
             return Err("Error: old_string must not be empty.".to_string());
         }
@@ -177,7 +329,6 @@ impl SkillStore {
         };
         let target_label = relative_target.to_string_lossy().replace('\\', "/");
 
-        let _guard = self.lock();
         let located = self.locate_or_error(name)?;
         let current_path = located.directory.join(&relative_target);
         if !is_path_under(&current_path, &located.directory) {
@@ -200,47 +351,41 @@ impl SkillStore {
             validate_skill_document(name, &replacement.text, &self.limits)
                 .map_err(|error| format!("Error: the patch would break SKILL.md. {error}"))?;
         }
-
-        let skill_dir = self.make_writable(name, &located)?;
-        let target = skill_dir.join(&relative_target);
-        self.write_inside(&skill_dir, &target, &replacement.text)?;
         let plural = if replacement.count == 1 { "" } else { "s" };
-        Ok(SkillChange {
+        Ok(PlannedChange::Write {
+            name: name.to_string(),
+            located: Some(located),
+            relative_target,
+            content: replacement.text,
             message: format!(
                 "Patched {target_label} in skill '{name}' ({} replacement{plural}).",
                 replacement.count
             ),
-            path: target,
         })
     }
 
-    /// Add or overwrite the supporting file `file_path` of the skill `name`.
-    pub fn write_file(
+    /// Plan adding or overwriting a supporting file of an existing skill.
+    fn plan_write_file(
         &self,
         name: &str,
         file_path: &str,
         file_content: &str,
-    ) -> Result<SkillChange, String> {
-        validate_skill_name(name)?;
+    ) -> Result<PlannedChange, String> {
         let relative_target = validate_supporting_path(file_path)?;
         validate_size(file_content, file_path, &self.limits)?;
-        let _guard = self.lock();
         let located = self.locate_or_error(name)?;
-        let skill_dir = self.make_writable(name, &located)?;
-        let target = skill_dir.join(&relative_target);
-        self.write_inside(&skill_dir, &target, file_content)?;
-        Ok(SkillChange {
+        Ok(PlannedChange::Write {
+            name: name.to_string(),
+            located: Some(located),
+            relative_target,
+            content: file_content.to_string(),
             message: format!("File '{file_path}' written to skill '{name}'."),
-            path: target,
         })
     }
 
-    /// Remove the supporting file `file_path` from the skill `name`. A folder
-    /// left empty is removed too.
-    pub fn remove_file(&self, name: &str, file_path: &str) -> Result<SkillChange, String> {
-        validate_skill_name(name)?;
+    /// Plan removing an existing supporting file.
+    fn plan_remove_file(&self, name: &str, file_path: &str) -> Result<PlannedChange, String> {
         let relative_target = validate_supporting_path(file_path)?;
-        let _guard = self.lock();
         let located = self.locate_or_error(name)?;
         if !located.directory.join(&relative_target).is_file() {
             let available = list_supporting_files(&located.directory);
@@ -253,39 +398,105 @@ impl SkillStore {
                 "Error: file '{file_path}' not found in skill '{name}'. {hint}"
             ));
         }
-        let skill_dir = self.make_writable(name, &located)?;
-        let target = skill_dir.join(&relative_target);
-        if !is_path_under(&target, &skill_dir) {
-            return Err(format!("Error: '{file_path}' is outside skill '{name}'."));
-        }
-        fs::remove_file(&target)
-            .map_err(|error| format!("Error: could not remove '{file_path}': {error}"))?;
-        if let Some(parent) = target.parent() {
-            remove_empty_folders_up_to(parent, &skill_dir);
-        }
-        Ok(SkillChange {
+        Ok(PlannedChange::RemoveFile {
+            name: name.to_string(),
+            located,
+            relative_target,
+            file_path: file_path.to_string(),
             message: format!("File '{file_path}' removed from skill '{name}'."),
-            path: target,
         })
     }
 
-    /// Delete the workspace skill `name` with all its files. Bundled skills
-    /// cannot be deleted.
-    pub fn delete(&self, name: &str) -> Result<SkillChange, String> {
-        validate_skill_name(name)?;
-        let _guard = self.lock();
+    /// Plan deleting a workspace skill; bundled skills cannot be deleted.
+    fn plan_delete(&self, name: &str) -> Result<PlannedChange, String> {
         let located = self.locate_or_error(name)?;
         if located.source == SkillSource::Builtin {
             return Err(format!(
                 "Error: '{name}' is a bundled skill and cannot be deleted."
             ));
         }
-        fs::remove_dir_all(&located.directory)
-            .map_err(|error| format!("Error: could not delete skill '{name}': {error}"))?;
-        Ok(SkillChange {
+        Ok(PlannedChange::Delete {
+            name: name.to_string(),
+            located,
             message: format!("Skill '{name}' deleted."),
-            path: located.directory,
         })
+    }
+
+    /// Carry out a planned change. Callers hold the write lock.
+    fn execute(&self, planned: PlannedChange) -> Result<SkillChange, String> {
+        match planned {
+            PlannedChange::Write {
+                name,
+                located,
+                relative_target,
+                content,
+                message,
+            } => {
+                let skill_dir = match &located {
+                    Some(located) => self.make_writable(&name, located)?,
+                    None => self.workspace_skills.join(&name),
+                };
+                let target = skill_dir.join(&relative_target);
+                self.write_inside(&skill_dir, &target, &content)?;
+                Ok(SkillChange {
+                    message,
+                    path: target,
+                })
+            }
+            PlannedChange::RemoveFile {
+                name,
+                located,
+                relative_target,
+                file_path,
+                message,
+            } => {
+                let skill_dir = self.make_writable(&name, &located)?;
+                let target = skill_dir.join(&relative_target);
+                if !is_path_under(&target, &skill_dir) {
+                    return Err(format!("Error: '{file_path}' is outside skill '{name}'."));
+                }
+                fs::remove_file(&target)
+                    .map_err(|error| format!("Error: could not remove '{file_path}': {error}"))?;
+                if let Some(parent) = target.parent() {
+                    remove_empty_folders_up_to(parent, &skill_dir);
+                }
+                Ok(SkillChange {
+                    message,
+                    path: target,
+                })
+            }
+            PlannedChange::Delete {
+                name,
+                located,
+                message,
+            } => {
+                fs::remove_dir_all(&located.directory).map_err(|error| {
+                    format!("Error: could not delete skill '{name}': {error}")
+                })?;
+                Ok(SkillChange {
+                    message,
+                    path: located.directory,
+                })
+            }
+        }
+    }
+
+    /// The path a planned change touches. Writes always land in the
+    /// workspace, even for a bundled skill (which is copied there first).
+    fn planned_path(&self, planned: &PlannedChange) -> PathBuf {
+        match planned {
+            PlannedChange::Write {
+                name,
+                relative_target,
+                ..
+            }
+            | PlannedChange::RemoveFile {
+                name,
+                relative_target,
+                ..
+            } => self.workspace_skills.join(name).join(relative_target),
+            PlannedChange::Delete { located, .. } => located.directory.clone(),
+        }
     }
 
     /// Take the write lock; a poisoned lock is still usable (it guards no data).
@@ -1168,5 +1379,109 @@ mod tests {
     fn delete_of_a_missing_skill_is_an_error() {
         let fixture = Fixture::new();
         assert!(fixture.store().delete("ghost").is_err());
+    }
+
+    // ── check / apply ─────────────────────────────────────────────────────
+
+    /// Every file below `folder`, relative and sorted, with its content.
+    fn snapshot(folder: &Path) -> Vec<(String, String)> {
+        let mut files = Vec::new();
+        collect_files(folder, folder, &mut files);
+        files.sort();
+        files
+            .into_iter()
+            .map(|relative| {
+                let content = fs::read_to_string(folder.join(&relative)).unwrap_or_default();
+                (relative, content)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn check_validates_every_operation_without_touching_the_disk() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        store.create("deploy-app", &deploy_skill()).unwrap();
+        store
+            .write_file("deploy-app", "references/notes.md", "old notes")
+            .unwrap();
+        fixture.add_builtin_skill("weather", "Use wttr.in.");
+        let skills_root = fixture.workspace.path().join("skills");
+        let before = snapshot(&skills_root);
+
+        let operations = [
+            SkillOperation::Create {
+                name: "fresh".into(),
+                content: skill_document("fresh", "Use when testing.", "Step."),
+            },
+            SkillOperation::Rewrite {
+                name: "deploy-app".into(),
+                content: deploy_skill().replace("Copy the binary", "Upload"),
+            },
+            SkillOperation::Patch {
+                name: "weather".into(),
+                old_string: "wttr.in".into(),
+                new_string: "open-meteo".into(),
+                file_path: None,
+                replace_all: false,
+            },
+            SkillOperation::WriteFile {
+                name: "deploy-app".into(),
+                file_path: "references/more.md".into(),
+                file_content: "more".into(),
+            },
+            SkillOperation::RemoveFile {
+                name: "deploy-app".into(),
+                file_path: "references/notes.md".into(),
+            },
+            SkillOperation::Delete {
+                name: "deploy-app".into(),
+            },
+        ];
+        for operation in &operations {
+            let change = store.check(operation).unwrap_or_else(|e| panic!("{operation:?}: {e}"));
+            assert!(!change.message.is_empty());
+        }
+        assert_eq!(snapshot(&skills_root), before);
+        // The bundled skill was not copied into the workspace by the dry run.
+        assert!(!fixture.workspace_skill("weather").exists());
+    }
+
+    #[test]
+    fn check_reports_the_same_errors_as_apply() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        store.create("deploy-app", &deploy_skill()).unwrap();
+        let missing_text = SkillOperation::Patch {
+            name: "deploy-app".into(),
+            old_string: "not in the skill".into(),
+            new_string: "x".into(),
+            file_path: None,
+            replace_all: false,
+        };
+        let duplicate = SkillOperation::Create {
+            name: "deploy-app".into(),
+            content: deploy_skill(),
+        };
+        for operation in [missing_text, duplicate] {
+            assert_eq!(
+                store.check(&operation).unwrap_err(),
+                store.apply(&operation).unwrap_err()
+            );
+        }
+    }
+
+    #[test]
+    fn check_names_the_path_apply_writes() {
+        let fixture = Fixture::new();
+        let store = fixture.store();
+        let operation = SkillOperation::Create {
+            name: "deploy-app".into(),
+            content: deploy_skill(),
+        };
+        let checked = store.check(&operation).unwrap();
+        let applied = store.apply(&operation).unwrap();
+        assert_eq!(checked, applied);
+        assert!(applied.path.is_file());
     }
 }

@@ -17,6 +17,7 @@ pub mod session_picker;
 pub mod stream;
 pub mod terminal_draw;
 pub mod wizard;
+mod wizard_memory;
 
 pub use cancel::{pause_for_prompt, wait_for_escape_cancel};
 pub use command_specifications::{AgentArgs, Cli, Commands};

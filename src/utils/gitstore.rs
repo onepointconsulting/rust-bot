@@ -1,9 +1,31 @@
-/// Git-backed version control for memory files, using git2 (libgit2).
+//! Git-backed version control for memory files, using git2 (libgit2).
+//!
+//! A tracked path is either a file (`memory/MEMORY.md`) or a directory entry
+//! ending in `/` (`skills/`), which tracks every file below it, including new
+//! and deleted ones.
 use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 use chrono::TimeZone;
-use git2::{DiffFormat, Repository, Signature};
+use git2::{DiffFormat, IndexAddOption, Repository, Signature, build::CheckoutBuilder};
+
+/// Workspace paths versioned by the memory store: the files Dream edits and
+/// the `skills/` folder Dream and `skill_manage` write to. Entries ending in
+/// `/` are directories.
+pub const MEMORY_TRACKED_PATHS: &[&str] = &["SOUL.md", "USER.md", "memory/MEMORY.md", "skills/"];
+
+/// [`MEMORY_TRACKED_PATHS`] as owned strings, ready for [`GitStore::new`].
+pub fn memory_tracked_paths() -> Vec<String> {
+    MEMORY_TRACKED_PATHS
+        .iter()
+        .map(|path| path.to_string())
+        .collect()
+}
+
+/// Whether the tracked `path` names a directory (it ends in `/`).
+fn is_directory_entry(path: &str) -> bool {
+    path.ends_with('/')
+}
 
 // ── CommitInfo ────────────────────────────────────────────────────────────────
 
@@ -71,9 +93,14 @@ impl GitStore {
             return false;
         }
 
-        // Touch tracked files so the initial commit has something to track
+        // Touch tracked files (and create tracked directories) so the initial
+        // commit has something to track
         for rel in &self.tracked_files {
             let p = self.workspace.join(rel);
+            if is_directory_entry(rel) {
+                let _ = std::fs::create_dir_all(&p);
+                continue;
+            }
             if let Some(parent) = p.parent() {
                 let _ = std::fs::create_dir_all(parent);
             }
@@ -92,9 +119,7 @@ impl GitStore {
         };
 
         let _ = index.add_path(Path::new(".gitignore"));
-        for rel in &self.tracked_files {
-            let _ = index.add_path(Path::new(rel));
-        }
+        self.stage_tracked(&mut index);
         let _ = index.write();
 
         let tree_oid = match index.write_tree() {
@@ -136,6 +161,8 @@ impl GitStore {
 
     /// Stage tracked memory files and commit if there are changes.
     ///
+    /// Only tracked paths count: the commit is skipped when the staged tree
+    /// equals `HEAD`'s, whatever else changed in the workspace.
     /// Returns the short commit SHA, or `None` if nothing to commit.
     pub fn auto_commit(&self, message: &str) -> Option<String> {
         if !self.is_initialized() {
@@ -146,25 +173,12 @@ impl GitStore {
             .map_err(|e| log::warn!("Git auto-commit: open failed: {}", e))
             .ok()?;
 
-        // Check for any changes among tracked files
-        let statuses = repo
-            .statuses(None)
-            .map_err(|e| log::warn!("Git auto-commit: status failed: {}", e))
-            .ok()?;
-
-        let has_changes = statuses.iter().any(|s| s.status() != git2::Status::CURRENT);
-        if !has_changes {
-            return None;
-        }
-
         let mut index = repo
             .index()
             .map_err(|e| log::warn!("Git auto-commit: index error: {}", e))
             .ok()?;
 
-        for rel in &self.tracked_files {
-            let _ = index.add_path(Path::new(rel));
-        }
+        self.stage_tracked(&mut index);
         index
             .write()
             .map_err(|e| log::warn!("Git auto-commit: index write error: {}", e))
@@ -174,6 +188,9 @@ impl GitStore {
             .write_tree()
             .map_err(|e| log::warn!("Git auto-commit: write_tree error: {}", e))
             .ok()?;
+        if Self::head_tree_id(&repo) == Some(tree_oid) {
+            return None;
+        }
         let tree = repo
             .find_tree(tree_oid)
             .map_err(|e| log::warn!("Git auto-commit: find_tree error: {}", e))
@@ -336,9 +353,10 @@ impl GitStore {
 
     /// Revert (undo) the changes introduced by the given commit.
     ///
-    /// Restores all tracked memory files to the state at the commit's parent,
-    /// then creates a new commit recording the revert.
-    /// Returns the new commit SHA, or `None` on failure.
+    /// Restores all tracked memory files (and every file in tracked
+    /// directories) to the state at the commit's parent, then creates a new
+    /// commit recording the revert. Returns the new commit SHA, or `None` on
+    /// failure or when the restore changed nothing.
     pub fn revert(&self, commit: &str) -> Option<String> {
         if !self.is_initialized() {
             return None;
@@ -381,27 +399,16 @@ impl GitStore {
             .map_err(|e| log::warn!("Git revert: parent tree error: {}", e))
             .ok()?;
 
-        // Restore tracked files from the parent's tree
-        let mut restored = false;
-        for rel in &self.tracked_files {
-            let entry = match parent_tree.get_path(Path::new(rel)) {
-                Ok(e) => e,
-                Err(_) => continue,
-            };
-            let blob = match repo.find_blob(entry.id()) {
-                Ok(b) => b,
-                Err(_) => continue,
-            };
-            let content = String::from_utf8_lossy(blob.content()).into_owned();
-            let dest = self.workspace.join(rel);
-            if std::fs::write(&dest, content).is_ok() {
-                restored = true;
-            }
+        // Make every tracked path match the parent's tree: changed files are
+        // restored and tracked files the parent did not have are removed.
+        let mut checkout = CheckoutBuilder::new();
+        checkout.force();
+        for pathspec in self.tracked_pathspecs() {
+            checkout.path(pathspec);
         }
-
-        if !restored {
-            return None;
-        }
+        repo.checkout_tree(parent_tree.as_object(), Some(&mut checkout))
+            .map_err(|e| log::warn!("Git revert: checkout error: {}", e))
+            .ok()?;
 
         self.auto_commit(&format!("revert: undo {}", commit))
     }
@@ -412,9 +419,68 @@ impl GitStore {
         Signature::now("rust-bot", "rust-bot@dream").expect("valid hardcoded signature")
     }
 
+    /// Add any `.gitignore` line the tracked paths need but the file lacks.
+    ///
+    /// Workspaces initialised before a path was tracked (e.g. `skills/`) keep
+    /// ignoring it otherwise. Existing lines are left untouched, so running
+    /// this again is a no-op. Does nothing when the repo is not initialised.
+    pub fn ensure_gitignore(&self) {
+        if !self.is_initialized() {
+            return;
+        }
+        let gitignore_path = self.workspace.join(".gitignore");
+        let existing = std::fs::read_to_string(&gitignore_path).unwrap_or_default();
+        let merged = merge_gitignore(&existing, &self.build_gitignore());
+        if merged != existing
+            && let Err(e) = std::fs::write(&gitignore_path, merged)
+        {
+            log::warn!("Git store: failed to update .gitignore: {}", e);
+        }
+    }
+
+    /// Stage every tracked path in `index`: files are added, or removed from
+    /// the index once deleted; directories have their new, changed and
+    /// deleted files staged.
+    fn stage_tracked(&self, index: &mut git2::Index) {
+        for rel in &self.tracked_files {
+            if is_directory_entry(rel) {
+                let pathspec = [rel.trim_end_matches('/')];
+                if let Err(e) = index.add_all(pathspec, IndexAddOption::DEFAULT, None) {
+                    log::warn!("Git store: staging {} failed: {}", rel, e);
+                }
+                if let Err(e) = index.update_all(pathspec, None) {
+                    log::warn!("Git store: staging deletions in {} failed: {}", rel, e);
+                }
+            } else if self.workspace.join(rel).is_file() {
+                let _ = index.add_path(Path::new(rel));
+            } else {
+                let _ = index.remove_path(Path::new(rel));
+            }
+        }
+    }
+
+    /// The tracked paths as git pathspecs (directories without the trailing `/`).
+    fn tracked_pathspecs(&self) -> Vec<&str> {
+        self.tracked_files
+            .iter()
+            .map(|rel| rel.trim_end_matches('/'))
+            .collect()
+    }
+
+    /// The tree id of `HEAD`, or `None` before the first commit.
+    fn head_tree_id(repo: &Repository) -> Option<git2::Oid> {
+        repo.head()
+            .ok()?
+            .peel_to_commit()
+            .ok()
+            .map(|commit| commit.tree_id())
+    }
+
+    /// The `.gitignore` that ignores the whole workspace except the tracked
+    /// paths (and the folders holding tracked files).
     fn build_gitignore(&self) -> String {
         let mut dirs: BTreeSet<String> = BTreeSet::new();
-        for f in &self.tracked_files {
+        for f in self.tracked_files.iter().filter(|f| !is_directory_entry(f)) {
             let p = Path::new(f);
             if let Some(parent) = p.parent() {
                 let s = parent.to_string_lossy();
@@ -429,10 +495,36 @@ impl GitStore {
         }
         for f in &self.tracked_files {
             lines.push(format!("!{}", f));
+            if is_directory_entry(f) {
+                lines.push(format!("!{}**", f));
+            }
         }
         lines.push("!.gitignore".to_string());
         lines.join("\n") + "\n"
     }
+}
+
+/// `existing` `.gitignore` text with every line of `wanted` it lacks appended,
+/// in `wanted`'s order. Returns `existing` unchanged when nothing is missing.
+fn merge_gitignore(existing: &str, wanted: &str) -> String {
+    let present: BTreeSet<&str> = existing.lines().map(str::trim).collect();
+    let missing: Vec<&str> = wanted
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !present.contains(line))
+        .collect();
+    if missing.is_empty() {
+        return existing.to_string();
+    }
+    let mut merged = existing.to_string();
+    if !merged.is_empty() && !merged.ends_with('\n') {
+        merged.push('\n');
+    }
+    for line in missing {
+        merged.push_str(line);
+        merged.push('\n');
+    }
+    merged
 }
 
 // ── tests ─────────────────────────────────────────────────────────────────────
@@ -522,5 +614,172 @@ mod tests {
 
         let content = std::fs::read_to_string(tmp.path().join("memory/MEMORY.md")).unwrap();
         assert_eq!(content, "v1");
+    }
+
+    // ── directory tracking (skills/) ──────────────────────────────────────────
+
+    fn make_memory_store(dir: &Path) -> GitStore {
+        GitStore::new(dir.to_path_buf(), memory_tracked_paths())
+    }
+
+    fn write(dir: &Path, rel: &str, content: &str) {
+        let path = dir.join(rel);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, content).unwrap();
+    }
+
+    fn files_in_diff(diff_text: &str) -> Vec<String> {
+        diff_text
+            .lines()
+            .filter_map(|line| line.strip_prefix("diff --git a/"))
+            .map(|rest| rest.split(' ').next().unwrap_or("").to_string())
+            .collect()
+    }
+
+    #[test]
+    fn memory_tracked_paths_include_the_skills_folder() {
+        assert!(MEMORY_TRACKED_PATHS.contains(&"skills/"));
+        assert!(MEMORY_TRACKED_PATHS.contains(&"memory/MEMORY.md"));
+        assert_eq!(memory_tracked_paths().len(), MEMORY_TRACKED_PATHS.len());
+    }
+
+    #[test]
+    fn gitignore_unignores_tracked_directories_and_their_contents() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let gitignore = make_memory_store(tmp.path()).build_gitignore();
+        assert!(gitignore.lines().any(|l| l == "!skills/"));
+        assert!(gitignore.lines().any(|l| l == "!skills/**"));
+        assert!(gitignore.lines().any(|l| l == "!memory/"));
+        assert!(gitignore.starts_with("/*\n"));
+    }
+
+    #[test]
+    fn a_store_without_tracked_paths_never_commits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = GitStore::new(tmp.path().to_path_buf(), vec![]);
+        store.init();
+        write(tmp.path(), "memory/MEMORY.md", "# changed");
+        assert!(store.auto_commit("nothing tracked").is_none());
+    }
+
+    #[test]
+    fn untracked_workspace_files_do_not_cause_empty_commits() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_memory_store(tmp.path());
+        store.init();
+        write(tmp.path(), "notes.txt", "scratch");
+        write(tmp.path(), "memory/history.jsonl", "{}");
+        assert!(store.auto_commit("should be nothing").is_none());
+    }
+
+    #[test]
+    fn memory_file_changes_are_committed_with_a_diff() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_memory_store(tmp.path());
+        store.init();
+        write(tmp.path(), "memory/MEMORY.md", "- fact\n");
+        let sha = store.auto_commit("dream: memory").expect("commit");
+        let (_, diff) = store.show_commit_diff(&sha).expect("diff");
+        assert_eq!(files_in_diff(&diff), vec!["memory/MEMORY.md".to_string()]);
+    }
+
+    #[test]
+    fn new_and_deleted_skill_files_are_committed() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_memory_store(tmp.path());
+        store.init();
+
+        write(tmp.path(), "skills/deploy/SKILL.md", "v1");
+        write(tmp.path(), "skills/deploy/references/api.md", "ref");
+        let added = store.auto_commit("add skill").expect("commit");
+        let (_, diff) = store.show_commit_diff(&added).unwrap();
+        let mut files = files_in_diff(&diff);
+        files.sort();
+        assert_eq!(
+            files,
+            vec![
+                "skills/deploy/SKILL.md".to_string(),
+                "skills/deploy/references/api.md".to_string()
+            ]
+        );
+
+        std::fs::remove_file(tmp.path().join("skills/deploy/references/api.md")).unwrap();
+        let removed = store.auto_commit("remove reference").expect("commit");
+        let (_, diff) = store.show_commit_diff(&removed).unwrap();
+        assert_eq!(
+            files_in_diff(&diff),
+            vec!["skills/deploy/references/api.md".to_string()]
+        );
+    }
+
+    #[test]
+    fn revert_restores_a_deleted_skill_and_removes_an_added_one() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let store = make_memory_store(tmp.path());
+        store.init();
+        write(tmp.path(), "skills/keep/SKILL.md", "keep me");
+        store.auto_commit("add keep").unwrap();
+
+        std::fs::remove_dir_all(tmp.path().join("skills/keep")).unwrap();
+        write(tmp.path(), "skills/fresh/SKILL.md", "new skill");
+        let change = store.auto_commit("swap skills").unwrap();
+
+        assert!(store.revert(&change).is_some());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("skills/keep/SKILL.md")).unwrap(),
+            "keep me"
+        );
+        assert!(!tmp.path().join("skills/fresh/SKILL.md").exists());
+        // The revert is itself committed: nothing is left to commit.
+        assert!(store.auto_commit("after revert").is_none());
+    }
+
+    #[test]
+    fn ensure_gitignore_adds_missing_lines_once_and_keeps_existing_ones() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // A workspace initialised before skills/ was tracked.
+        let old_store = GitStore::new(
+            tmp.path().to_path_buf(),
+            vec![
+                "SOUL.md".to_string(),
+                "USER.md".to_string(),
+                "memory/MEMORY.md".to_string(),
+            ],
+        );
+        old_store.init();
+        let gitignore_path = tmp.path().join(".gitignore");
+        let mut old_text = std::fs::read_to_string(&gitignore_path).unwrap();
+        old_text.push_str("# user line\n");
+        std::fs::write(&gitignore_path, &old_text).unwrap();
+
+        let store = make_memory_store(tmp.path());
+        store.ensure_gitignore();
+        let updated = std::fs::read_to_string(&gitignore_path).unwrap();
+        assert!(updated.starts_with(&old_text));
+        assert!(updated.lines().any(|l| l == "!skills/"));
+        assert!(updated.lines().any(|l| l == "!skills/**"));
+
+        store.ensure_gitignore();
+        assert_eq!(std::fs::read_to_string(&gitignore_path).unwrap(), updated);
+
+        // The old workspace now versions its skills.
+        write(tmp.path(), "skills/demo/SKILL.md", "demo");
+        let sha = store.auto_commit("skill").expect("commit");
+        let (_, diff) = store.show_commit_diff(&sha).unwrap();
+        assert!(files_in_diff(&diff).contains(&"skills/demo/SKILL.md".to_string()));
+    }
+
+    #[test]
+    fn ensure_gitignore_is_a_no_op_without_a_repo() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        make_memory_store(tmp.path()).ensure_gitignore();
+        assert!(!tmp.path().join(".gitignore").exists());
+    }
+
+    #[test]
+    fn merge_gitignore_appends_only_missing_lines() {
+        assert_eq!(merge_gitignore("/*\n!a\n", "/*\n!a\n"), "/*\n!a\n");
+        assert_eq!(merge_gitignore("/*\n!a", "/*\n!a\n!b\n"), "/*\n!a\n!b\n");
+        assert_eq!(merge_gitignore("", "/*\n"), "/*\n");
     }
 }

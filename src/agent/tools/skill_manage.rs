@@ -1,6 +1,12 @@
 //! The `skill_manage` tool: lets the agent record what it learnt as a skill
 //! (procedural memory) and refine it later. The filesystem work lives in
-//! [`SkillStore`]; this module parses the call and phrases the answer.
+//! [`SkillStore`]; the parameter checks in [`SkillOperation::from_params`];
+//! this module decides what to do with a call and phrases the answer.
+//!
+//! The foreground agent uses the default tool: every action, applied at once.
+//! Dream uses a restricted one ([`SkillManageTool::with_allowed_actions`]) and,
+//! when `tools.skills.requireApproval` is on, one that stages proposals
+//! ([`SkillWriteMode::Propose`]) instead of writing skills.
 
 use std::path::Path;
 use std::sync::Arc;
@@ -9,6 +15,8 @@ use async_trait::async_trait;
 use serde_json::Value;
 
 use crate::agent::modes::AgentMode;
+use crate::agent::skill_operation::{SkillAction, SkillOperation, optional_text};
+use crate::agent::skill_proposals::{SkillProposal, SkillProposalStore};
 use crate::agent::skill_store::{MAX_SKILL_NAME_CHARS, SkillChange, SkillStore};
 use crate::agent::tools::base::{Tool, ToolResult};
 use crate::agent::tools::registry::ToolRegistry;
@@ -19,6 +27,9 @@ pub const SKILL_MANAGE_TOOL_NAME: &str = "skill_manage";
 
 /// Template telling the model when and how to learn skills.
 const SKILL_LEARNING_TEMPLATE: &str = "agent/skill_learning.md";
+
+/// Origin recorded on proposals staged by this tool.
+const PROPOSAL_ORIGIN: &str = "dream";
 
 /// The "Learning Skills" system-prompt section, telling the model when to call
 /// `skill_manage`.
@@ -47,102 +58,139 @@ pub fn skill_learning_prompt_section(
     }
 }
 
+/// What the tool does with a valid call.
+#[derive(Clone)]
+pub enum SkillWriteMode {
+    /// Write the change to the skills folder at once (the default).
+    Apply,
+    /// Stage the change as a proposal the user accepts or rejects later.
+    Propose(Arc<SkillProposalStore>),
+}
+
 /// Creates, patches and deletes the agent's own skills.
 pub struct SkillManageTool {
     store: Arc<SkillStore>,
+    mode: SkillWriteMode,
+    /// Actions this instance accepts, in [`SkillAction::ALL`] order.
+    allowed_actions: Vec<SkillAction>,
 }
 
 impl SkillManageTool {
+    /// A tool applying every action directly.
     pub fn new(store: Arc<SkillStore>) -> Self {
-        Self { store }
-    }
-
-    /// Run one call: check its fields for the action, then hand it to the store.
-    fn run(&self, params: &Value) -> Result<SkillChange, String> {
-        let action = required_text(params, "action")?;
-        let name = required_text(params, "name")?;
-        match action {
-            "create" => self.store.create(name, required_text(params, "content")?),
-            "patch" => self.patch(name, params),
-            "write_file" => self.store.write_file(
-                name,
-                required_text(params, "file_path")?,
-                required_text_allow_empty(params, "file_content")?,
-            ),
-            "remove_file" => self
-                .store
-                .remove_file(name, required_text(params, "file_path")?),
-            "delete" => self.store.delete(name),
-            other => Err(format!(
-                "Error: unknown action '{other}'. Use create, patch, write_file, \
-                 remove_file or delete."
-            )),
+        Self {
+            store,
+            mode: SkillWriteMode::Apply,
+            allowed_actions: SkillAction::ALL.to_vec(),
         }
     }
 
-    /// `patch` has two shapes: `old_string` + `new_string` for a targeted
-    /// replacement, or `content` alone for a full `SKILL.md` rewrite.
-    fn patch(&self, name: &str, params: &Value) -> Result<SkillChange, String> {
-        let content = optional_text(params, "content");
-        let has_replacement_fields =
-            params.get("old_string").is_some() || params.get("new_string").is_some();
-        if let Some(content) = content {
-            if has_replacement_fields {
-                return Err(
-                    "Error: patch takes either old_string/new_string or content \
-                            (full rewrite), not both."
-                        .to_string(),
-                );
+    /// Use `mode` for valid calls.
+    pub fn with_mode(mut self, mode: SkillWriteMode) -> Self {
+        self.mode = mode;
+        self
+    }
+
+    /// Accept only `actions`; the schema and the description list only these.
+    pub fn with_allowed_actions(mut self, actions: &[SkillAction]) -> Self {
+        self.allowed_actions = SkillAction::ALL
+            .into_iter()
+            .filter(|action| actions.contains(action))
+            .collect();
+        self
+    }
+
+    /// Whether valid calls are staged rather than applied.
+    fn proposes(&self) -> bool {
+        matches!(self.mode, SkillWriteMode::Propose(_))
+    }
+
+    /// Run one call: parse it, check the action is allowed, then apply or
+    /// stage it. Returns the answer for the model.
+    fn run(&self, params: &Value) -> Result<String, String> {
+        let operation = SkillOperation::from_params(params)?;
+        self.ensure_allowed(operation.action())?;
+        match &self.mode {
+            SkillWriteMode::Apply => {
+                let change = self.store.apply(&operation)?;
+                Ok(describe_change(&change, operation.action()))
             }
-            return self.store.rewrite(name, content);
+            SkillWriteMode::Propose(proposals) => {
+                let reason = optional_text(params, "reason").map(str::to_string);
+                let proposal = proposals.propose(operation, PROPOSAL_ORIGIN, reason)?;
+                Ok(describe_proposal(&proposal))
+            }
         }
-        let replace_all = params
-            .get("replace_all")
-            .and_then(Value::as_bool)
-            .unwrap_or(false);
-        self.store.patch(
-            name,
-            required_text(params, "old_string")?,
-            required_text_allow_empty(params, "new_string")?,
-            optional_text(params, "file_path"),
-            replace_all,
-        )
     }
-}
 
-/// The non-empty string field `key`, or an error naming it.
-fn required_text<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
-    optional_text(params, key).ok_or_else(|| format!("Error: missing required parameter '{key}'."))
-}
+    /// An error unless this instance accepts `action`.
+    fn ensure_allowed(&self, action: SkillAction) -> Result<(), String> {
+        if self.allowed_actions.contains(&action) {
+            return Ok(());
+        }
+        Err(format!(
+            "Error: action '{}' is not allowed here. Use {}.",
+            action.as_str(),
+            self.allowed_action_names().join(", ")
+        ))
+    }
 
-/// The string field `key`, which may be empty (e.g. a `new_string` that
-/// deletes the match), or an error when it is absent.
-fn required_text_allow_empty<'a>(params: &'a Value, key: &str) -> Result<&'a str, String> {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .ok_or_else(|| format!("Error: missing required parameter '{key}'."))
-}
+    /// The allowed action names, in schema order.
+    fn allowed_action_names(&self) -> Vec<&'static str> {
+        self.allowed_actions
+            .iter()
+            .map(|action| action.as_str())
+            .collect()
+    }
 
-/// The string field `key` when present and not empty.
-fn optional_text<'a>(params: &'a Value, key: &str) -> Option<&'a str> {
-    params
-        .get(key)
-        .and_then(Value::as_str)
-        .filter(|text| !text.is_empty())
+    /// The description's "Actions: …" list, for the allowed actions only.
+    fn actions_description(&self) -> String {
+        let parts: Vec<&str> = self
+            .allowed_actions
+            .iter()
+            .map(|action| match action {
+                SkillAction::Create => {
+                    "create (full SKILL.md: frontmatter with name and description, then \
+                     the instructions)"
+                }
+                SkillAction::Patch => {
+                    "patch (old_string/new_string targeted fix, preferred; or content alone \
+                     to rewrite SKILL.md)"
+                }
+                SkillAction::WriteFile => {
+                    "write_file (a supporting file under references/, templates/, scripts/ \
+                     or assets/)"
+                }
+                SkillAction::RemoveFile => "remove_file (a supporting file)",
+                SkillAction::Delete => "delete (a whole skill)",
+            })
+            .collect();
+        parts.join(", ")
+    }
 }
 
 /// The answer to the model for a successful change. Except after a delete it
 /// says how to use the skill before the skill index lists it next turn.
-fn describe_change(change: &SkillChange, action: &str) -> String {
+fn describe_change(change: &SkillChange, action: SkillAction) -> String {
     let path = change.path.display();
-    if action == "delete" {
+    if action == SkillAction::Delete {
         return format!("{}\nRemoved: {path}", change.message);
     }
     format!(
         "{}\nPath: {path}\nThe skill index lists it from the next turn; read_file this \
          path to use the new version now.",
         change.message
+    )
+}
+
+/// The answer to the model for a staged change.
+fn describe_proposal(proposal: &SkillProposal) -> String {
+    format!(
+        "Proposal {} staged: {} skill '{}'. The user reviews it with /skills-review; \
+         it takes effect only once accepted.",
+        proposal.id,
+        proposal.operation.label(),
+        proposal.operation.skill_name()
     )
 }
 
@@ -153,17 +201,29 @@ impl Tool for SkillManageTool {
     }
 
     fn description(&self) -> String {
-        "Create, update or delete skills: your procedural memory for recurring tasks. \
-         Record a skill after you work out a non-trivial reusable workflow, find the \
-         working approach after errors or dead ends, or are corrected by the user. \
-         Actions: create (full SKILL.md: frontmatter with name and description, then \
-         the instructions), patch (old_string/new_string targeted fix, preferred; or \
-         content alone to rewrite SKILL.md), write_file/remove_file (supporting files \
-         under references/, templates/, scripts/ or assets/), delete. Prefer patching an \
-         existing skill over creating a near-duplicate. Description: one sentence, \
-         'Use when <trigger>. <behaviour>.' Write lessons, not logs: imperative rules \
-         and why, no dates, ticket numbers or incident narration."
-            .to_string()
+        let verbs = if self.allowed_actions.contains(&SkillAction::Delete) {
+            "Create, update or delete"
+        } else {
+            "Create or update"
+        };
+        let mut description = format!(
+            "{verbs} skills: your procedural memory for recurring tasks. \
+             Record a skill after you work out a non-trivial reusable workflow, find the \
+             working approach after errors or dead ends, or are corrected by the user. \
+             Actions: {}. Prefer patching an existing skill over creating a \
+             near-duplicate. Description: one sentence, 'Use when <trigger>. \
+             <behaviour>.' Write lessons, not logs: imperative rules and why, no dates, \
+             ticket numbers or incident narration.",
+            self.actions_description()
+        );
+        if self.proposes() {
+            description.push_str(
+                " Changes are staged as proposals for the user to review, not written: \
+                 each call must be valid on its own against the skills as they are now, \
+                 so put a new skill's complete text into one create.",
+            );
+        }
+        description
     }
 
     fn read_only(&self) -> bool {
@@ -171,12 +231,12 @@ impl Tool for SkillManageTool {
     }
 
     fn parameters(&self) -> Value {
-        serde_json::json!({
+        let mut schema = serde_json::json!({
             "type": "object",
             "properties": {
                 "action": {
                     "type": "string",
-                    "enum": ["create", "patch", "write_file", "remove_file", "delete"],
+                    "enum": self.allowed_action_names(),
                     "description": "What to do."
                 },
                 "name": {
@@ -216,7 +276,15 @@ impl Tool for SkillManageTool {
                 }
             },
             "required": ["action", "name"]
-        })
+        });
+        if self.proposes() {
+            schema["properties"]["reason"] = serde_json::json!({
+                "type": "string",
+                "description": "The lesson this change records, shown to the user \
+                    reviewing the proposal."
+            });
+        }
+        schema
     }
 
     async fn execute(&self, params: &Value) -> String {
@@ -224,9 +292,8 @@ impl Tool for SkillManageTool {
     }
 
     async fn execute_result(&self, params: &Value) -> ToolResult {
-        let action = params.get("action").and_then(Value::as_str).unwrap_or("");
         match self.run(params) {
-            Ok(change) => ToolResult::ok(describe_change(&change, action)),
+            Ok(answer) => ToolResult::ok(answer),
             Err(message) => ToolResult::error(message),
         }
     }
@@ -289,43 +356,14 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_fields_are_errors_naming_the_field() {
+    async fn a_missing_field_is_an_error_naming_it() {
+        // The per-action field checks live in `SkillOperation::from_params`.
         let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        let tool = tool_in(&workspace, &builtin);
-        let cases = [
-            (json!({"name": "demo"}), "'action'"),
-            (json!({"action": "create"}), "'name'"),
-            (json!({"action": "create", "name": "demo"}), "'content'"),
-            (
-                json!({"action": "write_file", "name": "demo", "file_content": "x"}),
-                "'file_path'",
-            ),
-            (
-                json!({"action": "write_file", "name": "demo", "file_path": "references/a.md"}),
-                "'file_content'",
-            ),
-            (
-                json!({"action": "remove_file", "name": "demo"}),
-                "'file_path'",
-            ),
-            (
-                json!({"action": "patch", "name": "demo", "new_string": "x"}),
-                "'old_string'",
-            ),
-            (
-                json!({"action": "patch", "name": "demo", "old_string": "x"}),
-                "'new_string'",
-            ),
-        ];
-        for (params, field) in cases {
-            let result = tool.execute_result(&params).await;
-            assert!(result.is_error, "{params}");
-            assert!(
-                result.content.contains(field),
-                "{params}: {}",
-                result.content
-            );
-        }
+        let result = tool_in(&workspace, &builtin)
+            .execute_result(&json!({"action": "create", "name": "demo"}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("'content'"), "{}", result.content);
     }
 
     #[tokio::test]
@@ -453,5 +491,106 @@ mod tests {
         assert!(!result.is_error, "{}", result.content);
         assert!(result.content.contains("Removed:"));
         assert!(!result.content.contains("read_file"));
+    }
+
+    // ── allowed actions and write modes ───────────────────────────────────
+
+    fn store_in(workspace: &TempDir, builtin: &TempDir) -> Arc<SkillStore> {
+        Arc::new(SkillStore::new(
+            workspace.path(),
+            Some(builtin.path().to_path_buf()),
+            SkillLimits::default(),
+        ))
+    }
+
+    #[test]
+    fn a_restricted_tool_lists_only_its_actions() {
+        let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let tool = SkillManageTool::new(store_in(&workspace, &builtin))
+            .with_allowed_actions(&SkillAction::NON_DESTRUCTIVE);
+        assert_eq!(
+            tool.parameters()["properties"]["action"]["enum"],
+            json!(["create", "patch", "write_file"])
+        );
+        let description = tool.description();
+        assert!(!description.contains("delete"), "{description}");
+        assert!(!description.contains("remove_file"), "{description}");
+        assert!(description.starts_with("Create or update skills"));
+        assert!(
+            tool_in(&workspace, &builtin)
+                .description()
+                .starts_with("Create, update or delete")
+        );
+    }
+
+    #[tokio::test]
+    async fn a_restricted_tool_refuses_other_actions_and_keeps_the_skill() {
+        let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store = store_in(&workspace, &builtin);
+        store.create("demo", &document("demo")).unwrap();
+        let tool =
+            SkillManageTool::new(store).with_allowed_actions(&SkillAction::NON_DESTRUCTIVE);
+        let result = tool
+            .execute_result(&json!({"action": "delete", "name": "demo"}))
+            .await;
+        assert!(result.is_error);
+        assert!(result.content.contains("not allowed"), "{}", result.content);
+        assert!(result.content.contains("create, patch, write_file"));
+        assert!(workspace.path().join("skills/demo/SKILL.md").is_file());
+    }
+
+    #[tokio::test]
+    async fn propose_mode_stages_the_change_instead_of_writing_it() {
+        let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store = store_in(&workspace, &builtin);
+        let proposals = Arc::new(SkillProposalStore::new(
+            workspace.path(),
+            Arc::clone(&store),
+        ));
+        let tool = SkillManageTool::new(store)
+            .with_mode(SkillWriteMode::Propose(Arc::clone(&proposals)));
+        assert!(tool.parameters()["properties"]["reason"].is_object());
+        assert!(tool.description().contains("staged as proposals"));
+
+        let result = tool
+            .execute_result(&json!({"action": "create", "name": "demo",
+                                    "content": document("demo"), "reason": "a lesson"}))
+            .await;
+        assert!(!result.is_error, "{}", result.content);
+        assert!(
+            result.content.contains("Proposal 1 staged"),
+            "{}",
+            result.content
+        );
+        assert!(!workspace.path().join("skills/demo").exists());
+        let pending = proposals.list();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].reason.as_deref(), Some("a lesson"));
+    }
+
+    #[tokio::test]
+    async fn propose_mode_refuses_an_invalid_change() {
+        let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let store = store_in(&workspace, &builtin);
+        let proposals = Arc::new(SkillProposalStore::new(
+            workspace.path(),
+            Arc::clone(&store),
+        ));
+        let tool = SkillManageTool::new(store)
+            .with_mode(SkillWriteMode::Propose(Arc::clone(&proposals)));
+        let result = tool
+            .execute_result(&json!({"action": "patch", "name": "ghost",
+                                    "old_string": "a", "new_string": "b"}))
+            .await;
+        assert!(result.is_error);
+        assert!(proposals.list().is_empty());
+    }
+
+    #[test]
+    fn the_default_tool_has_no_reason_parameter() {
+        let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        assert!(
+            tool_in(&workspace, &builtin).parameters()["properties"]["reason"].is_null()
+        );
     }
 }

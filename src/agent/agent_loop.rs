@@ -716,7 +716,8 @@ impl AgentLoop {
             context_window_tokens,
             Box::new(Arc::clone(&context)),
             max_tool_result_chars as usize,
-        ));
+        )
+        .with_learn_skills(agents_cfg.dream.learn_skills));
         let auto_compact = Arc::new(Autocompact::new(
             session_manager.clone(),
             Arc::clone(&consolidator),
@@ -775,7 +776,8 @@ impl AgentLoop {
                 dream_cfg.max_batch_size as usize,
                 dream_cfg.max_iterations as usize,
                 max_tool_result_chars as usize,
-            )),
+            )
+            .with_skill_learning(dream_cfg.learn_skills, &tools_cfg.skills)),
             auto_compact,
             idle_compact_check_interval,
             tool_startup_warnings,

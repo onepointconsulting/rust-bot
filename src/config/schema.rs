@@ -212,44 +212,67 @@ fn default_dream_max_iterations() -> u32 {
     10
 }
 
-/// Dream memory consolidation configuration.
-#[derive(Debug, Deserialize, Serialize, Validate, Clone)]
+/// Dream: background consolidation of the conversation history into the memory files
+/// and, optionally, into skills.
+///
+/// The field doc comments are the help texts of the WebUI's Dream settings page
+/// (generated from this struct's JSON Schema).
+#[derive(Debug, Deserialize, Serialize, Validate, Clone, JsonSchema)]
 #[serde(rename_all = "camelCase", default)]
+#[schemars(extend("x-title" = "Dream settings"))]
 pub struct DreamConfig {
-    /// Consolidation interval in whole hours. Must be ≥ 1. Default: 2.
+    /// How often Dream runs on its own, in whole hours; `/dream` runs it at once.
+    /// Must be ≥ 1. Default: 2.
     #[serde(alias = "interval_h", default = "default_dream_interval_h")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1), extend("x-label" = "Interval (hours)"))]
     pub interval_h: u32,
 
     /// Legacy cron expression override. When present, takes priority over
     /// `interval_h`. Excluded from serialised output.
     #[serde(alias = "cron", skip_serializing)]
     #[garde(skip)]
+    #[schemars(skip)]
     pub cron: Option<String>,
 
-    /// Optional Dream-specific model override. Accepts `modelOverride`,
-    /// `model`, or `model_override` as JSON keys. A raw model string, applied
-    /// directly — unrelated to named presets. See `dream_model_preset` for
-    /// selecting a named `model_presets` entry instead.
+    /// A model name for Dream, used when no Dream model preset is chosen. Empty: the
+    /// main agent model. Accepts `modelOverride`, `model`, or `model_override` as JSON
+    /// keys.
     #[serde(alias = "model", alias = "model_override")]
     #[garde(skip)]
+    #[schemars(extend("x-label" = "Model override"))]
     pub model_override: Option<String>,
 
-    /// Name of a `model_presets` entry Dream should use instead of the
-    /// process-wide default. Takes precedence over `model_override` when set.
+    /// The model preset Dream uses instead of the default model. Takes precedence over
+    /// the model override when set.
     #[serde(alias = "dream_model_preset")]
     #[garde(skip)]
+    #[schemars(extend("x-label" = "Model preset"))]
     pub dream_model_preset: Option<String>,
 
-    /// Maximum history entries processed per consolidation run. Must be ≥ 1.
+    /// Maximum history entries processed per run; a larger backlog is spread over
+    /// several runs. Must be ≥ 1.
     #[serde(alias = "max_batch_size", default = "default_dream_max_batch_size")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1), extend("x-label" = "Max batch size"))]
     pub max_batch_size: u32,
 
-    /// Maximum tool calls allowed per Phase 2 run. Must be ≥ 1.
+    /// Maximum tool calls per Dream agent phase: the memory edits, and the skill writes
+    /// when learning skills. Must be ≥ 1.
     #[serde(alias = "max_iterations", default = "default_dream_max_iterations")]
     #[garde(range(min = 1))]
+    #[schemars(range(min = 1), extend("x-label" = "Max iterations"))]
     pub max_iterations: u32,
+
+    /// Let Dream also learn skills from the history: the Consolidator keeps reusable
+    /// procedures in its summaries and Dream turns them into workspace skills. They are
+    /// written directly, or staged for `/skills-review` when the skills' "Require
+    /// approval" (`tools.skills.requireApproval`) is on. Size limits come from
+    /// `tools.skills`; its `enabled` switch is not needed. Default: `false`.
+    #[serde(alias = "learn_skills")]
+    #[garde(skip)]
+    #[schemars(extend("x-label" = "Learn skills"))]
+    pub learn_skills: bool,
 }
 
 impl Default for DreamConfig {
@@ -261,6 +284,7 @@ impl Default for DreamConfig {
             dream_model_preset: None,
             max_batch_size: default_dream_max_batch_size(),
             max_iterations: default_dream_max_iterations(),
+            learn_skills: false,
         }
     }
 }
@@ -1400,7 +1424,8 @@ pub struct SkillsToolConfig {
 
     /// Ask the user before every `skill_manage` call, even when
     /// `confirmBeforeExecute` is off. A call nobody can be asked about (e.g. a
-    /// turn from email) is denied. Default: `false`.
+    /// turn from email) is denied. Skills Dream learns are staged for
+    /// `/skills-review` instead of written. Default: `false`.
     #[serde(alias = "require_approval")]
     #[garde(skip)]
     pub require_approval: bool,
@@ -2748,6 +2773,23 @@ mod tests {
         assert_eq!(cfg.model_override, None);
         assert_eq!(cfg.cron, None);
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_dream_learn_skills_defaults_to_false() {
+        assert!(!DreamConfig::default().learn_skills);
+        let cfg: DreamConfig = serde_json::from_str("{}").unwrap();
+        assert!(!cfg.learn_skills);
+    }
+
+    #[test]
+    fn test_dream_learn_skills_accepts_camel_and_snake_case() {
+        let camel: DreamConfig = serde_json::from_str(r#"{"learnSkills": true}"#).unwrap();
+        assert!(camel.learn_skills);
+        let snake: DreamConfig = serde_json::from_str(r#"{"learn_skills": true}"#).unwrap();
+        assert!(snake.learn_skills);
+        let serialised = serde_json::to_value(&camel).unwrap();
+        assert_eq!(serialised["learnSkills"], true);
     }
 
     #[test]

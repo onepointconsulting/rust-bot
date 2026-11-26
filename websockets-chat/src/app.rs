@@ -1378,6 +1378,26 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
             panel.channels.set(channels);
             panel.channels_loaded.set(true);
         }
+        ServerEvent::MemorySettings {
+            sections,
+            can_modify,
+            changed,
+            restart_required,
+        } => {
+            // A reply that lands after the dialog closed must not leave data behind.
+            if !ctx.settings_open.get_untracked() {
+                return;
+            }
+            let panel = ctx.settings_panel;
+            if changed.is_some() {
+                finish_setting_change(ctx, restart_required);
+            } else {
+                panel.busy.set(None);
+            }
+            panel.can_modify.set(can_modify);
+            panel.memory_settings.set(sections);
+            panel.memory_settings_loaded.set(true);
+        }
         ServerEvent::SettingError {
             kind,
             name,
@@ -1414,6 +1434,8 @@ fn dispatch_server_event(ctx: &WsContext, event: ServerEvent) {
                     panel.providers_loaded.set(true);
                 } else if kind.starts_with(CHANNEL_SETTING_KIND_PREFIX) {
                     panel.channels_loaded.set(true);
+                } else if kind == MEMORY_SETTINGS_KIND {
+                    panel.memory_settings_loaded.set(true);
                 } else {
                     panel.mcp_servers_loaded.set(true);
                 }
@@ -1867,6 +1889,9 @@ fn request_settings_list(ctx: &WsContext, page: SettingsPage) {
             protocol::ClientEnvelope::list_tool_settings()
         }
         SettingsPage::McpServers => protocol::ClientEnvelope::list_mcp_servers(),
+        SettingsPage::Dream | SettingsPage::Skills | SettingsPage::Consolidator => {
+            protocol::ClientEnvelope::list_memory_settings()
+        }
     };
     send_client_envelope(
         *ctx,
@@ -1895,6 +1920,9 @@ fn select_settings_page(ctx: &WsContext, page: SettingsPage) {
         SettingsPage::Channels => panel.channels_loaded.set(false),
         SettingsPage::Tools | SettingsPage::ToolSafety => panel.tools_loaded.set(false),
         SettingsPage::McpServers => panel.mcp_servers_loaded.set(false),
+        SettingsPage::Dream | SettingsPage::Skills | SettingsPage::Consolidator => {
+            panel.memory_settings_loaded.set(false)
+        }
     }
     request_settings_list(ctx, page);
 }
@@ -1912,7 +1940,12 @@ fn request_toggle_setting(ctx: &WsContext, (page, name, enabled): ToggleRequest)
     let envelope = match page {
         // The Models, Providers and Channels pages have no switches; nothing sends one
         // for them.
-        SettingsPage::Models | SettingsPage::Providers | SettingsPage::Channels => return,
+        SettingsPage::Models
+        | SettingsPage::Providers
+        | SettingsPage::Channels
+        | SettingsPage::Dream
+        | SettingsPage::Skills
+        | SettingsPage::Consolidator => return,
         SettingsPage::Tools | SettingsPage::ToolSafety => {
             protocol::ClientEnvelope::set_tool_enabled(name, enabled)
         }
@@ -2078,6 +2111,23 @@ fn request_delete_provider(ctx: &WsContext, name: String) {
         *ctx,
         protocol::ClientEnvelope::delete_provider(name),
         "Failed to encode the delete provider request.",
+    );
+}
+
+/// The `kind` of a `setting_error` about the Dream, Skills or Consolidator page.
+const MEMORY_SETTINGS_KIND: &str = "memory_settings";
+
+/// Ask the gateway to save changed settings of the Dream, Skills or Consolidator page:
+/// `(section, settings)`. The reply is a `memory_settings` event naming the section, or
+/// a `setting_error` of kind `memory_settings` (shown under the form).
+fn request_save_memory_settings(ctx: &WsContext, (section, values): ToolConfigChange) {
+    let panel = ctx.settings_panel;
+    panel.error.set(None);
+    panel.busy.set(Some(section.clone()));
+    send_client_envelope(
+        *ctx,
+        protocol::ClientEnvelope::set_memory_settings(section, values),
+        "Failed to encode the settings request.",
     );
 }
 
@@ -3324,6 +3374,9 @@ pub fn App() -> impl IntoView {
         on_save_channel: Callback::new(move |change| request_save_channel(&ws_context, change)),
         on_delete_channel: Callback::new(move |channel_type| {
             request_delete_channel(&ws_context, channel_type)
+        }),
+        on_save_memory_settings: Callback::new(move |change| {
+            request_save_memory_settings(&ws_context, change)
         }),
         on_restart: Callback::new(move |()| request_restart(&ws_context)),
     };

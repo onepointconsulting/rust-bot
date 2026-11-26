@@ -80,6 +80,10 @@ To serve a freshly built bundle without recompiling `rust-bot`:
 ./rust-bot gateway --config ./.rust-bot/config.json --web-root ./websockets-chat/dist
 ```
 
+### Slash commands
+
+The chat box accepts the same slash commands as the console (see [Interactive console](INTERACTIVE_CONSOLE.md)). They are answered by the gateway without starting an agent turn. When Dream learns skills (`agents.dream.learnSkills`) and `tools.skills.requireApproval` is on, type `/skills-review` to list the skill changes Dream proposed, `/skills-review <id>` to read one, and `/skills-review accept <id>|all` or `/skills-review reject <id>|all` to decide; see [Dream skill learning](INTERACTIVE_CONSOLE.md#dream-skill-learning).
+
 ### Development with live reload
 
 Run the gateway in one terminal, and the Trunk dev server in another:
@@ -247,3 +251,33 @@ Changes **apply after a restart**: channels are built once when the gateway star
 ```
 
 A type that is not set up has `configured: false` and a blank `new_form` instead of `form`. `form` and `new_form` only go to connections that may change the configuration. `changed` (`action`: `added`, `updated` or `deleted`) and `restart_required` (whether the file changed) are absent on a plain list. A refused write is a `setting_error` with `kind` `channel_add`, `channel_config` or `channel_delete`, `name` the channel type and `detail` such as `invalid_value`, `channel_exists`, `channel_not_configured` or `unknown_channel_type`.
+
+## Settings → Dream, Skills and Consolidator
+
+Three pages after MCP Servers edit the background memory machinery. Each shows one form, laid out like Tool Safety: a row per setting, saved as soon as it changes (switch flipped, option picked, number or text committed with Enter or by leaving the field). Changes **apply after a restart** and show the amber "Restart now" banner.
+
+| Page | Object in `config.json` | Settings |
+|---|---|---|
+| **Dream** | `agents.dream` | Interval (hours), Model override, Model preset (empty or one of the configured presets), Max batch size, Max iterations, Learn skills |
+| **Skills** | `tools.skills` | Enabled (learning during chats), Require approval (also makes Dream stage proposals for `/skills-review`), Max skill characters, Max description characters |
+| **Consolidator** | `agents` | Context window tokens, Idle compaction after (minutes; 0 = off), Idle check interval (seconds) |
+
+The forms show what the bot runs with: the stored value, else the default. A setting keeps the spelling the file already uses (`interval_h` stays snake_case), unknown keys and `${VAR}` placeholders elsewhere are kept, and emptying a text or choice (e.g. the model preset) removes the key so the default applies again. The legacy Dream `cron` schedule is not on the form; edit it in the configuration file. Values below a setting's minimum, an unknown preset and a `${VAR}` naming an unset variable are refused.
+
+### Protocol
+
+| Client envelope | Fields | Effect |
+|---|---|---|
+| `list_memory_settings` | – | Reply with `memory_settings`. |
+| `set_memory_settings` | `name`, `values` | Change the submitted settings of the section `name` (`dream`, `skills` or `consolidator`). |
+
+```json
+{"event": "memory_settings",
+ "sections": [{"name": "dream", "title": "Dream settings", "fields": [{"name": "intervalH", "label": "Interval (hours)", "kind": "integer", "min": 1, "value": 2, "…": "…"}]},
+              {"name": "skills", "…": "…"}, {"name": "consolidator", "…": "…"}],
+ "can_modify": true,
+ "changed": "dream",
+ "restart_required": true}
+```
+
+`changed` and `restart_required` are absent on a plain list. A refused write is a `setting_error` with `kind` `memory_settings`, `name` the section and `detail` such as `invalid_value`, `unknown_field` or `unknown_section`.

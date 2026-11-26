@@ -29,6 +29,7 @@ use super::add_mcp_server_panel::{ADD_BUSY_KEY, ADD_BUTTON_LABEL, ADD_PANEL_TITL
 use super::channels_page::ChannelsSection;
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
+use super::memory_settings_page::MemorySettingsSection;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
 use super::model_picker::ProviderModelsState;
 use super::model_presets_page::ModelPresetsSection;
@@ -61,18 +62,39 @@ pub enum SettingsPage {
     /// whitelist), kept apart from the long tool list.
     ToolSafety,
     McpServers,
+    /// Dream: background consolidation of the history into memory and skills
+    /// (`agents.dream`).
+    Dream,
+    /// The skills the agent and Dream write (`tools.skills`).
+    Skills,
+    /// When sessions are summarised into the history Dream reads (`agents`).
+    Consolidator,
 }
 
 impl SettingsPage {
     /// All pages, in menu order.
-    pub const ALL: [SettingsPage; 6] = [
+    pub const ALL: [SettingsPage; 9] = [
         SettingsPage::Models,
         SettingsPage::Providers,
         SettingsPage::Channels,
         SettingsPage::Tools,
         SettingsPage::ToolSafety,
         SettingsPage::McpServers,
+        SettingsPage::Dream,
+        SettingsPage::Skills,
+        SettingsPage::Consolidator,
     ];
+
+    /// The gateway's name of the settings section a memory page edits (see
+    /// [`super::memory_settings_page`]); `None` for the other pages.
+    pub fn memory_section(self) -> Option<&'static str> {
+        match self {
+            Self::Dream => Some("dream"),
+            Self::Skills => Some("skills"),
+            Self::Consolidator => Some("consolidator"),
+            _ => None,
+        }
+    }
 
     /// Menu entry and page heading.
     pub fn title(self) -> &'static str {
@@ -83,6 +105,9 @@ impl SettingsPage {
             Self::Tools => "Tools",
             Self::ToolSafety => "Tool Safety",
             Self::McpServers => "MCP Servers",
+            Self::Dream => "Dream",
+            Self::Skills => "Skills",
+            Self::Consolidator => "Consolidator",
         }
     }
 
@@ -95,6 +120,9 @@ impl SettingsPage {
             Self::Tools => "Switch the agent's built-in tools on or off. MCP tools are managed under MCP Servers.",
             Self::ToolSafety => "Limits that apply to all tools: file access, confirmation before running and network access.",
             Self::McpServers => "Switch the configured MCP servers on or off, or change how they are started under Settings. A server that is off is not started. Servers with many tools can load them on demand, which keeps requests small.",
+            Self::Dream => "Dream works the conversation history into the memory files in the background and, with Learn skills on, into skills. Changes apply after a restart.",
+            Self::Skills => "How skills are written, by the agent during a chat and by Dream. Changes apply after a restart.",
+            Self::Consolidator => "When chats are summarised into the history Dream learns from. Changes apply after a restart.",
         }
     }
 
@@ -107,6 +135,7 @@ impl SettingsPage {
             Self::Tools => "tools",
             Self::ToolSafety => "settings",
             Self::McpServers => "MCP servers",
+            Self::Dream | Self::Skills | Self::Consolidator => "settings",
         }
     }
 }
@@ -472,6 +501,9 @@ pub struct SettingsPanel {
     pub confirm_delete_channel: RwSignal<Option<String>>,
     /// The channel types whose section is collapsed; every section starts expanded.
     pub collapsed_channel_sections: RwSignal<HashSet<String>>,
+    /// The settings forms of the Dream, Skills and Consolidator pages, one per section.
+    pub memory_settings: RwSignal<Vec<ToolConfigSummary>>,
+    pub memory_settings_loaded: RwSignal<bool>,
     /// The unsaved drafts of each row's settings form. Kept here, not in the form, since
     /// the list rebuilds its rows on every change (switch, save, search); reference
     /// counted signals so a rebuilt row keeps editing the same drafts.
@@ -518,6 +550,8 @@ impl SettingsPanel {
             adding_channel: RwSignal::new(None),
             confirm_delete_channel: RwSignal::new(None),
             collapsed_channel_sections: RwSignal::new(HashSet::new()),
+            memory_settings: RwSignal::new(Vec::new()),
+            memory_settings_loaded: RwSignal::new(false),
             form_drafts: StoredValue::new(HashMap::new()),
         }
     }
@@ -578,7 +612,12 @@ impl SettingsPanel {
     fn open_rows(&self) -> Vec<SettingRow> {
         match self.page.get() {
             // The model presets have their own rows.
-            SettingsPage::Models | SettingsPage::Providers | SettingsPage::Channels => Vec::new(),
+            SettingsPage::Models
+            | SettingsPage::Providers
+            | SettingsPage::Channels
+            | SettingsPage::Dream
+            | SettingsPage::Skills
+            | SettingsPage::Consolidator => Vec::new(),
             // The general settings have their own page.
             SettingsPage::Tools => self
                 .tools
@@ -605,6 +644,9 @@ impl SettingsPanel {
             SettingsPage::Channels => self.channels_loaded.get(),
             SettingsPage::Tools | SettingsPage::ToolSafety => self.tools_loaded.get(),
             SettingsPage::McpServers => self.mcp_servers_loaded.get(),
+            SettingsPage::Dream | SettingsPage::Skills | SettingsPage::Consolidator => {
+                self.memory_settings_loaded.get()
+            }
         }
     }
 
@@ -639,6 +681,8 @@ impl SettingsPanel {
         self.channels.set(Vec::new());
         self.channels_loaded.set(false);
         self.close_channel_panels();
+        self.memory_settings.set(Vec::new());
+        self.memory_settings_loaded.set(false);
         self.form_drafts.update_value(HashMap::clear);
     }
 }
@@ -690,6 +734,9 @@ pub struct SettingsActions {
     pub on_save_channel: Callback<ToolConfigChange>,
     /// Delete one channel (by channel type).
     pub on_delete_channel: Callback<String>,
+    /// Save changed settings of the Dream, Skills or Consolidator page: `(section,
+    /// settings)`.
+    pub on_save_memory_settings: Callback<ToolConfigChange>,
     /// Restart the whole bot process so the saved changes take effect.
     pub on_restart: Callback<()>,
 }
@@ -712,6 +759,9 @@ fn save_callback_for(page: SettingsPage, actions: SettingsActions) -> Callback<T
         SettingsPage::Channels => actions.on_save_channel,
         SettingsPage::McpServers => actions.on_save_mcp_config,
         SettingsPage::Tools | SettingsPage::ToolSafety => actions.on_save_config,
+        SettingsPage::Dream | SettingsPage::Skills | SettingsPage::Consolidator => {
+            actions.on_save_memory_settings
+        }
     }
 }
 
@@ -1039,6 +1089,9 @@ pub fn SettingsPageView(
             <Show when=move || page() == SettingsPage::Channels>
                 <ChannelsSection panel=panel actions=actions />
             </Show>
+            <Show when=move || page().memory_section().is_some()>
+                <MemorySettingsSection panel=panel actions=actions />
+            </Show>
             <Show when=move || {
                 !matches!(
                     page(),
@@ -1046,7 +1099,7 @@ pub fn SettingsPageView(
                         | SettingsPage::Models
                         | SettingsPage::Providers
                         | SettingsPage::Channels
-                )
+                ) && page().memory_section().is_none()
             }>
             <input
                 type="search"
@@ -1704,13 +1757,35 @@ mod tests {
                 "Channels",
                 "Tools",
                 "Tool Safety",
-                "MCP Servers"
+                "MCP Servers",
+                "Dream",
+                "Skills",
+                "Consolidator"
             ]
         );
         assert_eq!(SettingsPage::Channels.noun(), "channels");
         assert!(SettingsPage::Channels.subtitle().contains("restart"));
         assert_eq!(SettingsPage::default(), SettingsPage::Models);
         assert!(SettingsPage::Models.subtitle().contains("API keys"));
+    }
+
+    #[test]
+    fn only_the_memory_pages_name_a_gateway_settings_section() {
+        let sections: Vec<(SettingsPage, &str)> = SettingsPage::ALL
+            .into_iter()
+            .filter_map(|page| page.memory_section().map(|section| (page, section)))
+            .collect();
+        assert_eq!(
+            sections,
+            vec![
+                (SettingsPage::Dream, "dream"),
+                (SettingsPage::Skills, "skills"),
+                (SettingsPage::Consolidator, "consolidator"),
+            ]
+        );
+        for page in [SettingsPage::Dream, SettingsPage::Skills, SettingsPage::Consolidator] {
+            assert!(page.subtitle().contains("restart"));
+        }
     }
 
     #[test]

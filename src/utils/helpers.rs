@@ -14,7 +14,7 @@ use uuid::Uuid;
 use crate::agent::context::BOOTSTRAP_FILES;
 use crate::providers::base::LLMUsage;
 use crate::utils::embedded_templates;
-use crate::utils::gitstore::GitStore;
+use crate::utils::gitstore::{GitStore, memory_tracked_paths};
 use crate::utils::logo::LOGO;
 use tiktoken_rs::{CoreBPE, cl100k_base};
 
@@ -877,14 +877,7 @@ fn sync_workspace_templates_with_root(
         }
     }
 
-    let git = GitStore::new(
-        workspace.to_path_buf(),
-        vec![
-            "SOUL.md".to_string(),
-            "USER.md".to_string(),
-            "memory/MEMORY.md".to_string(),
-        ],
-    );
+    let git = GitStore::new(workspace.to_path_buf(), memory_tracked_paths());
     let _ = git.init();
 
     added

@@ -151,8 +151,9 @@ launchers documented under [Command line](COMMAND_LINE.md).
 | `/model-preset`    | Show the current preset's model and provider, or switch: `/model-preset <name>` |
 | `/model-presets`   | List available model presets                                                    |
 | `/dream`           | Manually trigger Dream consolidation                                            |
-| `/dream-log`       | Show what the last Dream changed                                                |
-| `/dream-restore`   | Revert memory to a previous state                                               |
+| `/dream-log`       | Show what the last Dream changed: `/dream-log [sha]`                            |
+| `/dream-restore`   | Revert memory and skills to a previous state: `/dream-restore [sha]`            |
+| `/skills-review`   | Review skill changes Dream proposed — see [below](#dream-skill-learning)        |
 | `/help`            | Show available commands                                                         |
 | `/mcp-list`        | List connected MCP servers                                                      |
 | `/mcp-preset`      | Manage built-in MCP server presets — see [below](#mcp-preset)                   |
@@ -166,6 +167,37 @@ launchers documented under [Command line](COMMAND_LINE.md).
 | `/subagents`       | List spawn tasks and ACP child agents: `/subagents [spawn\|acp\|all]`            |
 
 
+### Dream skill learning
+
+Dream normally only edits the memory files (`SOUL.md`, `USER.md`, `memory/MEMORY.md`). With
+`agents.dream.learnSkills` set to `true` it also turns reusable procedures found in the history —
+a working approach after a dead end, a correction about how to do a kind of task — into workspace
+skills under `<workspace>/skills/`. It only creates and patches skills; it never deletes them.
+Skill size limits come from `tools.skills`; `tools.skills.enabled` does not need to be on.
+
+```json
+{
+  "agents": { "dream": { "learnSkills": true } },
+  "tools": { "skills": { "requireApproval": false } }
+}
+```
+
+- With `tools.skills.requireApproval` off, Dream writes the skills directly. Every change to the
+  memory and skill files is committed to the workspace's git store, so `/dream-log` shows the diff
+  and `/dream-restore <sha>` undoes it.
+- With `tools.skills.requireApproval` on, Dream only stages proposals in
+  `<workspace>/memory/skill_proposals/`, which the skill index never loads. Review them with
+  `/skills-review`:
+
+| Command                              | Effect                                                    |
+| ------------------------------------ | --------------------------------------------------------- |
+| `/skills-review`                     | List pending proposals: id, change, skill and a preview   |
+| `/skills-review <id>`                | Show one proposal in full (the skill text or a diff)      |
+| `/skills-review accept <id>\|all`    | Apply the proposals and commit them (`skills: accept …`)  |
+| `/skills-review reject <id>\|all`    | Drop the proposals without applying them                  |
+
+A proposal whose skill was changed after Dream proposed it is refused with "no longer applies" and
+stays pending; reject it, or let Dream propose again.
 
 
 ### Model presets

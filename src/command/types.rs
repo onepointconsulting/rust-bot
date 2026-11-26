@@ -41,6 +41,8 @@ pub enum ChatCommand {
     Dream,
     DreamLog,
     DreamRestore,
+    #[serde(rename = "skills-review", alias = "skillsreview")]
+    SkillsReview,
     McpList,
     McpPreset,
     Tools,
@@ -72,6 +74,7 @@ impl std::str::FromStr for ChatCommand {
             DREAM_JOB_NAME => Ok(ChatCommand::Dream),
             "dream-log" => Ok(ChatCommand::DreamLog),
             "dream-restore" => Ok(ChatCommand::DreamRestore),
+            "skills-review" => Ok(ChatCommand::SkillsReview),
             "mcp-list" => Ok(ChatCommand::McpList),
             "mcp-preset" => Ok(ChatCommand::McpPreset),
             "tools" => Ok(ChatCommand::Tools),
@@ -100,6 +103,7 @@ impl std::fmt::Display for ChatCommand {
             ChatCommand::Dream => write!(f, "/dream"),
             ChatCommand::DreamLog => write!(f, "/dream-log"),
             ChatCommand::DreamRestore => write!(f, "/dream-restore"),
+            ChatCommand::SkillsReview => write!(f, "/skills-review"),
             ChatCommand::McpList => write!(f, "/mcp-list"),
             ChatCommand::McpPreset => write!(f, "/mcp-preset"),
             ChatCommand::Tools => write!(f, "/tools"),
@@ -133,6 +137,7 @@ impl ChatCommand {
                 | ChatCommand::ModelPreset
                 | ChatCommand::DreamLog
                 | ChatCommand::DreamRestore
+                | ChatCommand::SkillsReview
                 | ChatCommand::McpPreset
                 | ChatCommand::Workspace
                 | ChatCommand::Mode
@@ -165,6 +170,57 @@ impl SubagentsFilter {
             "" | "all" => Ok(SubagentsFilter::All),
             "spawn" => Ok(SubagentsFilter::Spawn),
             "acp" => Ok(SubagentsFilter::Acp),
+            _ => Err(Self::USAGE),
+        }
+    }
+}
+
+/// Which proposals a `/skills-review accept|reject` applies to.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProposalTarget {
+    /// The proposal with this id.
+    One(String),
+    /// Every pending proposal.
+    All,
+}
+
+/// What `/skills-review` was asked to do.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SkillsReviewRequest {
+    /// List the pending proposals.
+    List,
+    /// Show one proposal in full.
+    Show(String),
+    /// Apply proposals.
+    Accept(ProposalTarget),
+    /// Drop proposals.
+    Reject(ProposalTarget),
+}
+
+impl SkillsReviewRequest {
+    /// The usage line shown for malformed arguments.
+    pub const USAGE: &'static str =
+        "Usage: /skills-review [<id> | accept <id>|all | reject <id>|all]";
+
+    /// Parse the text after `/skills-review`: empty lists the proposals, a
+    /// lone id shows one, `accept`/`reject` take an id or `all`. Keywords are
+    /// case-insensitive. Anything else is an error carrying [`Self::USAGE`].
+    pub fn parse(args: &str) -> Result<Self, &'static str> {
+        let tokens: Vec<String> = args.split_whitespace().map(str::to_lowercase).collect();
+        let target = |token: &str| {
+            if token == "all" {
+                ProposalTarget::All
+            } else {
+                ProposalTarget::One(token.to_string())
+            }
+        };
+        match tokens.as_slice() {
+            [] => Ok(SkillsReviewRequest::List),
+            [verb, id] if verb == "accept" => Ok(SkillsReviewRequest::Accept(target(id))),
+            [verb, id] if verb == "reject" => Ok(SkillsReviewRequest::Reject(target(id))),
+            [id] if id != "accept" && id != "reject" && id != "all" => {
+                Ok(SkillsReviewRequest::Show(id.clone()))
+            }
             _ => Err(Self::USAGE),
         }
     }
@@ -228,5 +284,59 @@ mod tests {
             SubagentsFilter::parse("acp spawn"),
             Err(SubagentsFilter::USAGE)
         );
+    }
+
+    #[test]
+    fn skills_review_parses_displays_and_accepts_args() {
+        assert_eq!(
+            ChatCommand::from_str("skills-review"),
+            Ok(ChatCommand::SkillsReview)
+        );
+        assert_eq!(ChatCommand::SkillsReview.to_string(), "/skills-review");
+        assert!(ChatCommand::SkillsReview.accepts_args());
+        assert_eq!(ChatCommand::SkillsReview.lifecycle(), None);
+        assert_eq!(
+            serde_json::to_string(&ChatCommand::SkillsReview).unwrap(),
+            "\"skills-review\""
+        );
+    }
+
+    #[test]
+    fn skills_review_request_parses_every_form() {
+        assert_eq!(
+            SkillsReviewRequest::parse("  "),
+            Ok(SkillsReviewRequest::List)
+        );
+        assert_eq!(
+            SkillsReviewRequest::parse("3"),
+            Ok(SkillsReviewRequest::Show("3".into()))
+        );
+        assert_eq!(
+            SkillsReviewRequest::parse("ACCEPT 3"),
+            Ok(SkillsReviewRequest::Accept(ProposalTarget::One("3".into())))
+        );
+        assert_eq!(
+            SkillsReviewRequest::parse("accept all"),
+            Ok(SkillsReviewRequest::Accept(ProposalTarget::All))
+        );
+        assert_eq!(
+            SkillsReviewRequest::parse("reject  2 "),
+            Ok(SkillsReviewRequest::Reject(ProposalTarget::One("2".into())))
+        );
+        assert_eq!(
+            SkillsReviewRequest::parse("reject All"),
+            Ok(SkillsReviewRequest::Reject(ProposalTarget::All))
+        );
+    }
+
+    #[test]
+    fn skills_review_request_rejects_malformed_arguments() {
+        for args in ["accept", "reject", "all", "accept 1 2", "delete 1"] {
+            assert_eq!(
+                SkillsReviewRequest::parse(args),
+                Err(SkillsReviewRequest::USAGE),
+                "{args}"
+            );
+        }
     }
 }

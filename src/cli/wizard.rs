@@ -17,6 +17,9 @@ use crate::cli::gmail_auth::{
 };
 use crate::cli::instance_layout::InstanceLayout;
 use crate::cli::onboard::create_env_file;
+use crate::cli::wizard_memory::{
+    configure_consolidator, configure_dream, configure_skills, prompt_context_window_tokens,
+};
 use crate::config::schema::ProvidersConfig;
 use crate::providers::anthropic_provider::AnthropicProvider;
 use crate::providers::openai_compat_provider::OpenAICompatProvider;
@@ -47,6 +50,9 @@ use crate::{
 const LLM_PROVIDER: &str = "LLM Provider";
 const CHAT_CHANNELS: &str = "Chat Channels";
 const AGENT_SETTINGS: &str = "Agent Settings";
+const DREAM: &str = "Dream";
+const SKILLS: &str = "Skills";
+const CONSOLIDATOR: &str = "Consolidator";
 const MODEL_PRESETS: &str = "Model Presets";
 const API: &str = "API";
 const GATEWAY: &str = "Gateway";
@@ -66,10 +72,13 @@ const PROVIDER_XIAOMI_SUBSCRIPTION: &str = "xiaomi_subscription";
 const PROVIDER_TOGETHER: &str = "together";
 const PROVIDER_OPENAI: &str = "openai";
 
-const WIZARD_OPTIONS: [&str; 11] = [
+const WIZARD_OPTIONS: [&str; 14] = [
     LLM_PROVIDER,
     CHAT_CHANNELS,
     AGENT_SETTINGS,
+    DREAM,
+    SKILLS,
+    CONSOLIDATOR,
     MODEL_PRESETS,
     API,
     GATEWAY,
@@ -143,6 +152,15 @@ pub fn wizard(args: OnboardArgs) -> Result<(), CliError> {
             }
             AGENT_SETTINGS => {
                 configure_agent_settings(&mut config)?;
+            }
+            DREAM => {
+                configure_dream(&mut config)?;
+            }
+            SKILLS => {
+                configure_skills(&mut config.tools.skills)?;
+            }
+            CONSOLIDATOR => {
+                configure_consolidator(&mut config.agents)?;
             }
             MODEL_PRESETS => {
                 configure_model_presets_menu(&mut config)?;
@@ -833,11 +851,7 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         .with_error_message("Please enter a positive integer")
         .prompt()?;
 
-    agents.context_window_tokens = CustomType::<u64>::new("Context window tokens")
-        .with_default(agents.context_window_tokens)
-        .with_help_message("Total context window size for the model")
-        .with_error_message("Please enter a positive integer")
-        .prompt()?;
+    prompt_context_window_tokens(agents)?;
 
     agents.temperature = CustomType::<f32>::new("Temperature")
         .with_default(agents.temperature)
@@ -906,8 +920,6 @@ fn configure_agent_settings(config: &mut Config) -> Result<Config, CliError> {
         .with_help_message("IANA timezone, e.g. UTC or Europe/London")
         .prompt()?;
 
-    configure_dream_settings(agents)?;
-
     Ok(config.clone())
 }
 
@@ -958,51 +970,6 @@ pub fn config_model(
         .with_default(default_model)
         .with_help_message(help_message)
         .prompt()?;
-    Ok(())
-}
-
-fn configure_dream_settings(agents: &mut AgentsConfig) -> Result<(), CliError> {
-    let configure_dream = Confirm::new("Configure Dream memory consolidation?")
-        .with_default(true)
-        .prompt()?;
-    if !configure_dream {
-        return Ok(());
-    }
-
-    let dream = &mut agents.dream;
-
-    dream.interval_h = CustomType::<u32>::new("Dream interval (hours)")
-        .with_default(dream.interval_h)
-        .with_help_message("How often Dream consolidates memory (≥ 1)")
-        .with_error_message("Please enter an integer ≥ 1")
-        .prompt()?;
-
-    let current_override = dream.model_override.clone().unwrap_or_default();
-    let model_override = Text::new("Dream model override")
-        .with_default(current_override.as_str())
-        .with_help_message("Leave empty to use the main agent model")
-        .prompt()?;
-    dream.model_override = {
-        let trimmed = model_override.trim();
-        if trimmed.is_empty() {
-            None
-        } else {
-            Some(trimmed.to_string())
-        }
-    };
-
-    dream.max_batch_size = CustomType::<u32>::new("Dream max batch size")
-        .with_default(dream.max_batch_size)
-        .with_help_message("Max history entries per consolidation run")
-        .with_error_message("Please enter a positive integer")
-        .prompt()?;
-
-    dream.max_iterations = CustomType::<u32>::new("Dream max iterations")
-        .with_default(dream.max_iterations)
-        .with_help_message("Max tool calls allowed during Dream Phase 2")
-        .with_error_message("Please enter a positive integer")
-        .prompt()?;
-
     Ok(())
 }
 
@@ -1965,6 +1932,18 @@ fn configure_subagent(config: &mut Config) -> Result<(), CliError> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn main_menu_offers_dream_skills_and_consolidator_after_agent_settings() {
+        let agent_settings_index = WIZARD_OPTIONS
+            .iter()
+            .position(|option| *option == AGENT_SETTINGS)
+            .unwrap();
+        assert_eq!(
+            WIZARD_OPTIONS[agent_settings_index + 1..agent_settings_index + 4],
+            [DREAM, SKILLS, CONSOLIDATOR]
+        );
+    }
 
     #[test]
     fn every_offered_role_choice_parses() {

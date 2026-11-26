@@ -3,6 +3,9 @@ use crate::{
     agent::{
         acp::listing::{format_acp_agents, list_acp_rows},
         agent_loop::AgentLoop,
+        skill_operation::SkillOperation,
+        skill_proposals::{SkillProposal, SkillProposalStore},
+        skill_store::SkillChange,
         context::BOOTSTRAP_FILES,
         subagent::format_subagents_list,
         tools::{
@@ -14,7 +17,7 @@ use crate::{
     bus::events::OutboundMessage,
     command::{
         CommandContext, CommandHandler, CommandRouter,
-        types::{ChatCommand, SubagentsFilter},
+        types::{ChatCommand, ProposalTarget, SkillsReviewRequest, SubagentsFilter},
     },
     config::{
         loader::{load_config, resolve_config_env_vars, save_config},
@@ -727,7 +730,7 @@ impl CmdDreamLog {
     fn format_changed_files(diff: &str) -> String {
         let files = Self::extract_changed_files(diff);
         if files.is_empty() {
-            "No tracked memory files changed.".to_string()
+            "No tracked memory or skill files changed.".to_string()
         } else {
             files
                 .iter()
@@ -744,9 +747,9 @@ impl CmdDreamLog {
     ) -> String {
         let files_line = Self::format_changed_files(diff);
         let intro = if requested_sha.is_none() {
-            "Here is the latest Dream memory change."
+            "Here is the latest change to the memory and skill files."
         } else {
-            "Here is the selected Dream memory change."
+            "Here is the selected change to the memory and skill files."
         };
 
         let mut lines = vec![
@@ -829,7 +832,7 @@ impl CmdDreamRestore {
         let mut lines = vec![
             "## Dream Restore".to_string(),
             String::new(),
-            "Choose a Dream memory version to restore. Latest first:".to_string(),
+            "Choose a version of the memory and skill files to restore. Latest first:".to_string(),
             String::new(),
         ];
         for commit in commits {
@@ -852,12 +855,12 @@ impl CmdDreamRestore {
         let changed_files = if let Some((_, diff)) = &result {
             CmdDreamLog::format_changed_files(diff)
         } else {
-            "the tracked memory files".to_string()
+            "the tracked memory and skill files".to_string()
         };
 
         match git.revert(sha) {
             Some(new_sha) => format!(
-                "Restored Dream memory to the state before `{sha}`.\n\n\
+                "Restored the memory and skill files to the state before `{sha}`.\n\n\
                  - New safety commit: `{new_sha}`\n\
                  - Restored files: {changed_files}\n\n\
                  Use `/dream-log {new_sha}` to inspect the restore diff."
@@ -899,6 +902,245 @@ impl CommandHandler for CmdDreamRestore {
             Self::restore_content(git, sha)
         };
 
+        reply_as_text(ctx, content)
+    }
+}
+
+struct CmdSkillsReview;
+
+/// Longest preview of a proposal in the `/skills-review` list, in characters.
+const PROPOSAL_PREVIEW_CHARS: usize = 80;
+
+impl CmdSkillsReview {
+    /// The pending proposals, one line each with a short preview.
+    fn format_proposal_list(proposals: &[SkillProposal]) -> String {
+        if proposals.is_empty() {
+            return "No skill proposals are waiting for review.".to_string();
+        }
+        let mut lines = vec![
+            "## Skill Proposals".to_string(),
+            String::new(),
+            "Dream proposed these skill changes. Oldest first:".to_string(),
+            String::new(),
+        ];
+        for proposal in proposals {
+            lines.push(format!(
+                "- `{}` {} `{}` - {}",
+                proposal.id,
+                proposal.operation.label(),
+                proposal.operation.skill_name(),
+                Self::proposal_preview(proposal)
+            ));
+        }
+        lines.extend([
+            String::new(),
+            "Show one with `/skills-review <id>`.".to_string(),
+            "Accept with `/skills-review accept <id>|all`, reject with \
+             `/skills-review reject <id>|all`."
+                .to_string(),
+        ]);
+        lines.join("\n")
+    }
+
+    /// One line summing up a proposal: its reason, else the start of the
+    /// change, shortened to [`PROPOSAL_PREVIEW_CHARS`].
+    fn proposal_preview(proposal: &SkillProposal) -> String {
+        let text = match (&proposal.reason, &proposal.operation) {
+            (Some(reason), _) => reason.clone(),
+            (None, SkillOperation::Create { content, .. })
+            | (None, SkillOperation::Rewrite { content, .. }) => content.clone(),
+            (None, SkillOperation::Patch { new_string, .. }) => new_string.clone(),
+            (None, SkillOperation::WriteFile { file_content, .. }) => file_content.clone(),
+            (None, SkillOperation::RemoveFile { file_path, .. }) => file_path.clone(),
+            (None, SkillOperation::Delete { name }) => name.clone(),
+        };
+        let one_line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+        if one_line.chars().count() <= PROPOSAL_PREVIEW_CHARS {
+            return one_line;
+        }
+        let shortened: String = one_line.chars().take(PROPOSAL_PREVIEW_CHARS).collect();
+        format!("{shortened}…")
+    }
+
+    /// A proposal in full: where it came from and the exact change.
+    fn format_proposal_detail(proposal: &SkillProposal) -> String {
+        let mut lines = vec![
+            format!("## Skill Proposal `{}`", proposal.id),
+            String::new(),
+            format!(
+                "- Change: {} `{}`",
+                proposal.operation.label(),
+                proposal.operation.skill_name()
+            ),
+            format!("- Proposed by: {} at {}", proposal.origin, proposal.created_at),
+        ];
+        if let Some(reason) = &proposal.reason {
+            lines.push(format!("- Reason: {reason}"));
+        }
+        lines.push(String::new());
+        lines.push(Self::format_operation_body(&proposal.operation));
+        lines.extend([
+            String::new(),
+            format!(
+                "Accept with `/skills-review accept {id}`, reject with \
+                 `/skills-review reject {id}`.",
+                id = proposal.id
+            ),
+        ]);
+        lines.join("\n")
+    }
+
+    /// The change an operation makes: the new text, or a diff for a patch.
+    fn format_operation_body(operation: &SkillOperation) -> String {
+        match operation {
+            SkillOperation::Create { content, .. } | SkillOperation::Rewrite { content, .. } => {
+                format!("```markdown\n{}\n```", content.trim_end())
+            }
+            SkillOperation::Patch {
+                old_string,
+                new_string,
+                replace_all,
+                ..
+            } => {
+                let mut diff: Vec<String> =
+                    old_string.lines().map(|line| format!("-{line}")).collect();
+                diff.extend(new_string.lines().map(|line| format!("+{line}")));
+                let scope = if *replace_all {
+                    "every occurrence"
+                } else {
+                    "one occurrence"
+                };
+                format!("Replaces {scope}:\n```diff\n{}\n```", diff.join("\n"))
+            }
+            SkillOperation::WriteFile {
+                file_path,
+                file_content,
+                ..
+            } => format!(
+                "Writes `{file_path}`:\n```\n{}\n```",
+                file_content.trim_end()
+            ),
+            SkillOperation::RemoveFile { file_path, .. } => format!("Removes `{file_path}`."),
+            SkillOperation::Delete { name } => format!("Deletes the skill `{name}`."),
+        }
+    }
+
+    /// The outcome of accepting proposals, with the commit recording them.
+    fn format_accept_results(
+        results: &[(String, Result<SkillChange, String>)],
+        commit_sha: Option<&str>,
+    ) -> String {
+        let mut lines = vec!["## Skill Proposals Accepted".to_string(), String::new()];
+        for (id, result) in results {
+            lines.push(match result {
+                Ok(change) => format!("- `{id}`: {}", change.message),
+                Err(error) => format!("- `{id}`: not applied. {error}"),
+            });
+        }
+        if let Some(sha) = commit_sha {
+            lines.extend([
+                String::new(),
+                format!("Committed as `{sha}`; undo with `/dream-restore {sha}`."),
+            ]);
+        }
+        lines.join("\n")
+    }
+
+    /// The outcome of rejecting proposals.
+    fn format_reject_results(results: &[(String, Result<SkillProposal, String>)]) -> String {
+        let mut lines = vec!["## Skill Proposals Rejected".to_string(), String::new()];
+        for (id, result) in results {
+            lines.push(match result {
+                Ok(proposal) => format!(
+                    "- `{id}`: dropped {} `{}`.",
+                    proposal.operation.label(),
+                    proposal.operation.skill_name()
+                ),
+                Err(error) => format!("- `{id}`: {error}"),
+            });
+        }
+        lines.join("\n")
+    }
+
+    /// The ids `target` names: one, or every pending proposal.
+    fn target_ids(proposals: &SkillProposalStore, target: &ProposalTarget) -> Vec<String> {
+        match target {
+            ProposalTarget::One(id) => vec![id.clone()],
+            ProposalTarget::All => proposals
+                .list()
+                .into_iter()
+                .map(|proposal| proposal.id)
+                .collect(),
+        }
+    }
+
+    /// Accept the targeted proposals and commit the skills they changed.
+    fn accept(proposals: &SkillProposalStore, git: &GitStore, target: &ProposalTarget) -> String {
+        let ids = Self::target_ids(proposals, target);
+        if ids.is_empty() {
+            return "No skill proposals are waiting for review.".to_string();
+        }
+        let results: Vec<(String, Result<SkillChange, String>)> = ids
+            .into_iter()
+            .map(|id| {
+                let result = proposals.accept(&id);
+                (id, result)
+            })
+            .collect();
+        let accepted_ids: Vec<&str> = results
+            .iter()
+            .filter(|(_, result)| result.is_ok())
+            .map(|(id, _)| id.as_str())
+            .collect();
+        let commit_sha = if accepted_ids.is_empty() {
+            None
+        } else {
+            git.auto_commit(&format!("skills: accept {}", accepted_ids.join(", ")))
+        };
+        Self::format_accept_results(&results, commit_sha.as_deref())
+    }
+
+    /// Reject the targeted proposals.
+    fn reject(proposals: &SkillProposalStore, target: &ProposalTarget) -> String {
+        let ids = Self::target_ids(proposals, target);
+        if ids.is_empty() {
+            return "No skill proposals are waiting for review.".to_string();
+        }
+        let results: Vec<(String, Result<SkillProposal, String>)> = ids
+            .into_iter()
+            .map(|id| {
+                let result = proposals.reject(&id);
+                (id, result)
+            })
+            .collect();
+        Self::format_reject_results(&results)
+    }
+}
+
+/// Review the skill changes Dream staged (`tools.skills.requireApproval`).
+///
+/// `/skills-review` lists them, `/skills-review <id>` shows one,
+/// `/skills-review accept|reject <id>|all` applies or drops them. Accepting
+/// commits the changed skills to the memory git store.
+#[async_trait]
+impl CommandHandler for CmdSkillsReview {
+    async fn handle(&self, ctx: &CommandContext) -> OutboundMessage {
+        let Some(agent_loop) = &ctx.agent_loop else {
+            return reply_no_loop(ctx, "/skills-review");
+        };
+        let proposals = agent_loop.dream.skill_proposals();
+        let content = match SkillsReviewRequest::parse(&ctx.args) {
+            Err(usage) => usage.to_string(),
+            Ok(SkillsReviewRequest::List) => Self::format_proposal_list(&proposals.list()),
+            Ok(SkillsReviewRequest::Show(id)) => match proposals.get(&id) {
+                Ok(proposal) => Self::format_proposal_detail(&proposal),
+                Err(error) => error,
+            },
+            Ok(SkillsReviewRequest::Accept(target)) => {
+                Self::accept(proposals, &agent_loop.consolidator.store.git, &target)
+            }
+            Ok(SkillsReviewRequest::Reject(target)) => Self::reject(proposals, &target),
+        };
         reply_as_text(ctx, content)
     }
 }
@@ -1353,7 +1595,8 @@ fn build_help_text() -> String {
         "/mode — Show this session's agent mode, or switch it: /mode standard|minimal|no_mcp, /mode default to clear",
         "/dream — Manually trigger Dream consolidation",
         "/dream-log — Show what the last Dream changed",
-        "/dream-restore — Revert memory to a previous state",
+        "/dream-restore — Revert memory and skills to a previous state",
+        "/skills-review — Review skill changes Dream proposed: /skills-review <id>, /skills-review accept|reject <id>|all",
         "/help — Show available commands",
         "/mcp-list — List available MCP servers",
         "/mcp-preset <list|info|enable|disable|test> [name] [key=value ...] — Manage MCP server presets (e.g. github, playwright); info shows the fields a preset needs; enable/disable require a restart to take effect",
@@ -1379,6 +1622,21 @@ pub fn register_builtin_commands(router: &mut CommandRouter) {
     router.exact(
         ChatCommand::DreamRestore.to_string(),
         Arc::new(CmdDreamRestore),
+    );
+    // `exact` only matches the bare command; the trailing-space `prefix`
+    // carries the sha argument.
+    router.prefix(format!("{} ", ChatCommand::DreamLog), Arc::new(CmdDreamLog));
+    router.prefix(
+        format!("{} ", ChatCommand::DreamRestore),
+        Arc::new(CmdDreamRestore),
+    );
+    router.exact(
+        ChatCommand::SkillsReview.to_string(),
+        Arc::new(CmdSkillsReview),
+    );
+    router.prefix(
+        format!("{} ", ChatCommand::SkillsReview),
+        Arc::new(CmdSkillsReview),
     );
     router.exact(ChatCommand::Help.to_string(), Arc::new(CmdHelp));
     router.prefix(ChatCommand::Model.to_string(), Arc::new(CmdModel));
@@ -1420,6 +1678,7 @@ mod tests {
     use std::collections::HashMap;
 
     use super::*;
+    use crate::agent::skill_store::{SkillLimits, SkillStore};
     use crate::bus::events::InboundMessage;
     use chrono::Utc;
 
@@ -2326,7 +2585,7 @@ mod tests {
         let content = CmdDreamLog::format_dream_log_content(&commit, diff, None);
 
         assert!(content.contains("## Dream Update"));
-        assert!(content.contains("Here is the latest Dream memory change."));
+        assert!(content.contains("Here is the latest change to the memory and skill files."));
         assert!(content.contains("- Commit: `abcd1234`"));
         assert!(content.contains("- Changed files: `SOUL.md`"));
         assert!(content.contains("Use `/dream-restore abcd1234` to undo this change."));
@@ -2343,8 +2602,8 @@ mod tests {
         };
         let content = CmdDreamLog::format_dream_log_content(&commit, "", Some("abcd1234"));
 
-        assert!(content.contains("Here is the selected Dream memory change."));
-        assert!(content.contains("No tracked memory files changed."));
+        assert!(content.contains("Here is the selected change to the memory and skill files."));
+        assert!(content.contains("No tracked memory or skill files changed."));
         assert!(
             content.contains("Dream recorded this version, but there is no file diff to display.")
         );
@@ -2858,5 +3117,195 @@ mod tests {
         assert_eq!("revoke".parse::<ChatCommand>(), Ok(ChatCommand::Revoke));
         assert_eq!(ChatCommand::Revoke.to_string(), "/revoke");
         assert!(build_help_text().contains("/revoke"));
+    }
+
+    // ── /skills-review ────────────────────────────────────────────────────────
+
+    fn sample_proposal(id: &str, reason: Option<&str>, operation: SkillOperation) -> SkillProposal {
+        SkillProposal {
+            id: id.to_string(),
+            created_at: "2026-11-25T10:00:00+00:00".to_string(),
+            origin: "dream".to_string(),
+            reason: reason.map(str::to_string),
+            operation,
+        }
+    }
+
+    fn create_operation(name: &str) -> SkillOperation {
+        SkillOperation::Create {
+            name: name.to_string(),
+            content: format!(
+                "---\nname: {name}\ndescription: Use when testing.\n---\n\nStep one.\n"
+            ),
+        }
+    }
+
+    #[test]
+    fn skills_review_list_shows_ids_actions_and_previews() {
+        let long_reason = "x".repeat(200);
+        let proposals = vec![
+            sample_proposal("1", Some("Clear the cache first"), create_operation("deploy")),
+            sample_proposal(
+                "2",
+                None,
+                SkillOperation::Patch {
+                    name: "weather".into(),
+                    old_string: "wttr.in".into(),
+                    new_string: "open-meteo\nwith  spaces".into(),
+                    file_path: None,
+                    replace_all: false,
+                },
+            ),
+            sample_proposal("3", Some(&long_reason), create_operation("long")),
+        ];
+        let content = CmdSkillsReview::format_proposal_list(&proposals);
+        assert!(content.contains("## Skill Proposals"));
+        assert!(content.contains("- `1` create `deploy` - Clear the cache first"));
+        assert!(content.contains("- `2` patch SKILL.md `weather` - open-meteo with spaces"));
+        assert!(content.contains(&format!("- `3` create `long` - {}…", "x".repeat(80))));
+        assert!(content.contains("/skills-review accept <id>|all"));
+    }
+
+    #[test]
+    fn skills_review_list_without_proposals_says_so() {
+        assert_eq!(
+            CmdSkillsReview::format_proposal_list(&[]),
+            "No skill proposals are waiting for review."
+        );
+    }
+
+    #[test]
+    fn skills_review_detail_shows_the_full_change() {
+        let create = sample_proposal("4", Some("A lesson"), create_operation("deploy"));
+        let content = CmdSkillsReview::format_proposal_detail(&create);
+        assert!(content.contains("## Skill Proposal `4`"));
+        assert!(content.contains("- Change: create `deploy`"));
+        assert!(content.contains("- Reason: A lesson"));
+        assert!(content.contains("```markdown\n---\nname: deploy"));
+        assert!(content.contains("/skills-review accept 4"));
+
+        let patch = sample_proposal(
+            "5",
+            None,
+            SkillOperation::Patch {
+                name: "weather".into(),
+                old_string: "old line".into(),
+                new_string: "new line".into(),
+                file_path: Some("references/api.md".into()),
+                replace_all: true,
+            },
+        );
+        let content = CmdSkillsReview::format_proposal_detail(&patch);
+        assert!(content.contains("- Change: patch references/api.md `weather`"));
+        assert!(content.contains("Replaces every occurrence:\n```diff\n-old line\n+new line\n```"));
+        assert!(!content.contains("- Reason:"));
+    }
+
+    #[test]
+    fn skills_review_accept_and_reject_results_are_listed_per_id() {
+        let accepted = CmdSkillsReview::format_accept_results(
+            &[
+                (
+                    "1".to_string(),
+                    Ok(SkillChange {
+                        message: "Skill 'deploy' created.".into(),
+                        path: PathBuf::from("skills/deploy/SKILL.md"),
+                    }),
+                ),
+                ("2".to_string(), Err("Proposal `2` no longer applies.".into())),
+            ],
+            Some("abcd1234"),
+        );
+        assert!(accepted.contains("- `1`: Skill 'deploy' created."));
+        assert!(accepted.contains("- `2`: not applied. Proposal `2` no longer applies."));
+        assert!(accepted.contains("undo with `/dream-restore abcd1234`"));
+
+        let rejected = CmdSkillsReview::format_reject_results(&[
+            (
+                "3".to_string(),
+                Ok(sample_proposal("3", None, create_operation("deploy"))),
+            ),
+            ("9".to_string(), Err("No pending skill proposal `9`.".into())),
+        ]);
+        assert!(rejected.contains("- `3`: dropped create `deploy`."));
+        assert!(rejected.contains("- `9`: No pending skill proposal `9`."));
+    }
+
+    #[test]
+    fn skills_review_accept_all_applies_and_commits_the_skills() {
+        let workspace = tempfile::tempdir().unwrap();
+        let builtin = tempfile::tempdir().unwrap();
+        let git = GitStore::new(
+            workspace.path().to_path_buf(),
+            crate::utils::gitstore::memory_tracked_paths(),
+        );
+        git.init();
+        let skills = Arc::new(SkillStore::new(
+            workspace.path(),
+            Some(builtin.path().to_path_buf()),
+            SkillLimits::default(),
+        ));
+        let proposals = SkillProposalStore::new(workspace.path(), skills);
+        proposals.propose(create_operation("one"), "dream", None).unwrap();
+        proposals.propose(create_operation("two"), "dream", None).unwrap();
+
+        let content = CmdSkillsReview::accept(&proposals, &git, &ProposalTarget::All);
+
+        assert!(content.contains("- `1`: Skill 'one' created."), "{content}");
+        assert!(content.contains("- `2`: Skill 'two' created."), "{content}");
+        assert!(proposals.list().is_empty());
+        let head = &git.log(1)[0];
+        assert_eq!(head.message, "skills: accept 1, 2");
+        assert!(content.contains(&head.sha));
+        assert!(workspace.path().join("skills/one/SKILL.md").is_file());
+    }
+
+    #[test]
+    fn skills_review_reject_all_drops_every_proposal() {
+        let workspace = tempfile::tempdir().unwrap();
+        let builtin = tempfile::tempdir().unwrap();
+        let skills = Arc::new(SkillStore::new(
+            workspace.path(),
+            Some(builtin.path().to_path_buf()),
+            SkillLimits::default(),
+        ));
+        let proposals = SkillProposalStore::new(workspace.path(), skills);
+        assert_eq!(
+            CmdSkillsReview::reject(&proposals, &ProposalTarget::All),
+            "No skill proposals are waiting for review."
+        );
+        proposals.propose(create_operation("one"), "dream", None).unwrap();
+        let content = CmdSkillsReview::reject(&proposals, &ProposalTarget::All);
+        assert!(content.contains("- `1`: dropped create `one`."));
+        assert!(proposals.list().is_empty());
+        assert!(!workspace.path().join("skills/one").exists());
+    }
+
+    #[tokio::test]
+    async fn dream_log_and_restore_receive_their_sha_argument() {
+        let mut router = CommandRouter::new();
+        register_builtin_commands(&mut router);
+        for command in ["/dream-log abcd1234", "/dream-restore abcd1234"] {
+            let name = command.split_whitespace().next().unwrap().trim_start_matches('/');
+            let mut ctx = CommandContext::new(
+                InboundMessage {
+                    channel: "cli".into(),
+                    sender_id: "user".into(),
+                    chat_id: "direct".into(),
+                    content: command.into(),
+                    timestamp: Utc::now(),
+                    media: vec![],
+                    metadata: Default::default(),
+                    session_key_override: None,
+                    request_id: None,
+                },
+                None,
+                name,
+                command,
+            );
+            let reply = router.dispatch(&mut ctx).await.expect("routed");
+            assert_eq!(ctx.args.trim(), "abcd1234", "{command}");
+            assert!(reply.content.contains("No agent available"), "{command}");
+        }
     }
 }

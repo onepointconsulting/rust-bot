@@ -41,11 +41,12 @@ use crate::agent::tools::mcp::mcp_presets_api::{
 use crate::agent::tools::registry::{ToolRegistry, ToolSummary};
 use crate::agent::tools::startup_warning::ToolStartupWarning;
 use crate::agent::tools::tool_search::tool_summaries_for_view;
-use crate::agent::tools::tool_settings_api::{self, ToolSettingsError};
+use crate::agent::tools::tool_settings_api::{self, ToolSettingsError, ToolSettingsSummary};
 use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::channel_form;
+use crate::channels::websocket::memory_settings_form;
 use crate::channels::websocket::config_file;
 use crate::channels::websocket::config_toggles;
 use crate::channels::websocket::mcp_server_form;
@@ -852,6 +853,12 @@ async fn dispatch_envelope<'a>(envelope_dispatch_context: EnvelopeDispatchContex
         }
         EnvelopeType::DeleteChannel => {
             handle_delete_channel(envelope_dispatch_context).await;
+        }
+        EnvelopeType::ListMemorySettings => {
+            handle_list_memory_settings(envelope_dispatch_context).await;
+        }
+        EnvelopeType::SetMemorySettings => {
+            handle_set_memory_settings(envelope_dispatch_context).await;
         }
         EnvelopeType::ListSubagents => {
             handle_list_subagents(envelope_dispatch_context).await;
@@ -3514,6 +3521,8 @@ enum SettingKind {
     ChannelConfig,
     /// Removing a channel.
     ChannelDelete,
+    /// The Dream, Skills and Consolidator pages.
+    MemorySettings,
 }
 
 impl SettingKind {
@@ -3535,6 +3544,7 @@ impl SettingKind {
             Self::ChannelAdd => "channel_add",
             Self::ChannelConfig => "channel_config",
             Self::ChannelDelete => "channel_delete",
+            Self::MemorySettings => "memory_settings",
         }
     }
 
@@ -3568,6 +3578,7 @@ impl SettingKind {
             Self::ChannelAdd | Self::ChannelConfig | Self::ChannelDelete => {
                 WsOutboundEvent::Channels
             }
+            Self::MemorySettings => WsOutboundEvent::MemorySettings,
         }
     }
 
@@ -3597,7 +3608,8 @@ impl SettingKind {
             | Self::ProviderDelete
             | Self::ChannelAdd
             | Self::ChannelConfig
-            | Self::ChannelDelete => Err(config_toggles::ToggleError::UnknownField(
+            | Self::ChannelDelete
+            | Self::MemorySettings => Err(config_toggles::ToggleError::UnknownField(
                 "enabled".to_string(),
             )),
         }
@@ -5079,6 +5091,137 @@ async fn handle_delete_channel<'a>(envelope_dispatch_context: EnvelopeDispatchCo
         },
     )
     .await;
+}
+
+/// The fields of a `memory_settings` event: one settings form per page (Dream, Skills,
+/// Consolidator), whether the connection may change them and, after a write, the
+/// section written (`changed`) and whether a restart is needed to apply it.
+fn memory_settings_event_body(
+    sections: &[ToolSettingsSummary],
+    can_modify: bool,
+    written: Option<(&str, bool)>,
+) -> serde_json::Value {
+    let mut body = serde_json::json!({
+        "sections": sections,
+        "can_modify": can_modify,
+    });
+    if let Some((section, restart_required)) = written {
+        body["changed"] = serde_json::json!(section);
+        body["restart_required"] = serde_json::json!(restart_required);
+    }
+    body
+}
+
+/// Read `config.json` and send the requester a `memory_settings` event, or a
+/// `setting_error` naming `section` when the file cannot be read. `written` is the
+/// section just saved and whether that needs a restart.
+async fn send_memory_settings(
+    shared: &WsShared,
+    connection_id: &str,
+    can_modify: bool,
+    section: &str,
+    written: Option<(&str, bool)>,
+) {
+    let sections = read_config_for_settings().and_then(|text| {
+        memory_settings_form::memory_settings_overview(&text).map_err(|e| e.message())
+    });
+    match sections {
+        Ok(sections) => {
+            send_event(
+                shared,
+                connection_id,
+                WsOutboundEvent::MemorySettings,
+                None,
+                memory_settings_event_body(&sections, can_modify, written),
+            )
+            .await;
+        }
+        Err(message) => {
+            send_setting_error(
+                shared,
+                connection_id,
+                SettingKind::MemorySettings,
+                section,
+                "config_error",
+                &message,
+            )
+            .await;
+        }
+    }
+}
+
+/// Handle a `list_memory_settings` envelope: reply with a `memory_settings` event holding
+/// the forms of the Dream, Skills and Consolidator pages. Authenticated connections only.
+/// Rust-side addition with no nanobot precedent.
+async fn handle_list_memory_settings<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, _client_id) = envelope_dispatch_context.connection_fields();
+    if !connection_is_authenticated(envelope_dispatch_context.auth) {
+        send_event(
+            shared,
+            connection_id,
+            WsOutboundEvent::Error,
+            None,
+            serde_json::json!({"detail": "access_denied"}),
+        )
+        .await;
+        return;
+    }
+    let can_modify = setting_write_denial(shared, &envelope_dispatch_context).is_none();
+    send_memory_settings(shared, connection_id, can_modify, "", None).await;
+}
+
+/// Handle a `set_memory_settings` envelope `{name, values}`: apply the submitted settings
+/// to the section `name` (`dream`, `skills` or `consolidator`) of `config.json` under the
+/// config write lock (validated, previous file backed up) and reply with the fresh
+/// `memory_settings` naming the section. Dream, the skills and the Consolidator are set
+/// up at startup, so the reply says a restart is required when the file changed.
+/// Failures become a `setting_error` of kind `memory_settings`. Rust-side addition with
+/// no nanobot precedent.
+async fn handle_set_memory_settings<'a>(envelope_dispatch_context: EnvelopeDispatchContext<'a>) {
+    let (shared, connection_id, client_id) = envelope_dispatch_context.connection_fields();
+    let kind = SettingKind::MemorySettings;
+    let section = envelope_dispatch_context
+        .envelope
+        .get("name")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    if let Some((detail, message)) = setting_write_denial(shared, &envelope_dispatch_context) {
+        send_setting_error(shared, connection_id, kind, &section, detail, message).await;
+        return;
+    }
+    let Some(values) = parse_tool_config_values(envelope_dispatch_context.envelope) else {
+        let message = "The request was malformed.";
+        send_setting_error(shared, connection_id, kind, &section, "invalid_request", message)
+            .await;
+        return;
+    };
+
+    let result = {
+        // Shares the lock with the other writers: each one rewrites the whole file.
+        let _write_guard = CONFIG_WRITE_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        config_toggles::apply_edit(&get_config_path(), |text| {
+            let parsed = memory_settings_form::MemorySettingsSection::parse(&section)?;
+            memory_settings_form::with_memory_settings(text, parsed, &values)
+        })
+    };
+
+    match result {
+        Ok(outcome) => {
+            if outcome.changed {
+                log::info!(
+                    "Settings '{section}' updated from the WebUI (client '{client_id}'); previous config kept as {:?}",
+                    outcome.backup,
+                );
+            }
+            let written = Some((section.as_str(), outcome.changed));
+            send_memory_settings(shared, connection_id, true, &section, written).await;
+        }
+        Err(error) => {
+            send_apply_error(shared, connection_id, kind, &section, error).await;
+        }
+    }
 }
 
 /// Read the `values` object of a `set_tool_config` envelope (`property -> value`). A

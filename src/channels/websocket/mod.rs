@@ -2,6 +2,7 @@ pub mod channel_form;
 pub mod config_file;
 pub mod config_toggles;
 pub mod mcp_server_form;
+pub mod memory_settings_form;
 pub mod model_preset_form;
 pub mod provider_form;
 pub mod registry;

@@ -70,6 +70,8 @@ pub enum ToggleError {
     ChannelExists,
     /// No channel of that type is configured.
     ChannelNotConfigured,
+    /// The section is not one of the Dream, Skills or Consolidator pages.
+    UnknownSettingsSection,
 }
 
 impl ToggleError {
@@ -93,6 +95,7 @@ impl ToggleError {
             Self::UnknownChannelType => "unknown_channel_type",
             Self::ChannelExists => "channel_exists",
             Self::ChannelNotConfigured => "channel_not_configured",
+            Self::UnknownSettingsSection => "unknown_section",
         }
     }
 
@@ -118,6 +121,7 @@ impl ToggleError {
             Self::UnknownChannelType => "Unknown channel type.".to_string(),
             Self::ChannelExists => "A channel of this type is already set up.".to_string(),
             Self::ChannelNotConfigured => "No channel of this type is set up.".to_string(),
+            Self::UnknownSettingsSection => "Unknown settings section.".to_string(),
         }
     }
 }

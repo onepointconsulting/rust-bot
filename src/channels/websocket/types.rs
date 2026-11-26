@@ -175,6 +175,14 @@ pub enum EnvelopeType {
     /// Remove one channel (`{channelType}`) with all its settings. Applies after a
     /// restart. Same access rules as [`Self::AddModelPreset`].
     DeleteChannel,
+    /// List the settings forms of the Settings dialog's Dream, Skills and Consolidator
+    /// pages (`agents.dream`, `tools.skills`, the compaction settings of `agents`).
+    /// Rust-side addition with no nanobot precedent. Authenticated connections only.
+    ListMemorySettings,
+    /// Change settings of one of those pages (`{name, values}`, `name` being `dream`,
+    /// `skills` or `consolidator`). Applies after a restart. Same access rules as
+    /// [`Self::AddModelPreset`].
+    SetMemorySettings,
     /// List the durable ACP child agents and the spawn tasks of this process, as
     /// `/subagents` does. Rust-side addition with no nanobot precedent. Authenticated
     /// connections only; spawn tasks are limited to the chats the connection may see.
@@ -286,6 +294,8 @@ impl From<&str> for EnvelopeType {
             "add_channel" => Self::AddChannel,
             "set_channel_config" => Self::SetChannelConfig,
             "delete_channel" => Self::DeleteChannel,
+            "list_memory_settings" => Self::ListMemorySettings,
+            "set_memory_settings" => Self::SetMemorySettings,
             "list_subagents" => Self::ListSubagents,
             "set_model_preset" => Self::SetModelPreset,
             "set_mode" => Self::SetMode,
@@ -390,6 +400,11 @@ pub enum WsOutboundEvent {
     /// `{action, channelType}` (`action`: `added`, `updated` or `deleted`) and absent on
     /// a plain list. Never carries passwords.
     Channels,
+    /// Reply to [`EnvelopeType::ListMemorySettings`] and to every successful
+    /// [`EnvelopeType::SetMemorySettings`] — `{sections, can_modify, changed?,
+    /// restart_required?}`, `sections` being one settings form per page and `changed`
+    /// the name of the section written (absent on a plain list).
+    MemorySettings,
     /// Reply to a refused or failed tool or MCP server toggle — `{kind, name, detail,
     /// message}`. Never carries any of the file's content.
     SettingError,
@@ -482,6 +497,7 @@ impl WsOutboundEvent {
             Self::ProviderModels => "provider_models",
             Self::Providers => "providers",
             Self::Channels => "channels",
+            Self::MemorySettings => "memory_settings",
             Self::SettingError => "setting_error",
             Self::Subagents => "subagents",
             Self::ChatRenamed => "chat_renamed",
@@ -1093,10 +1109,13 @@ mod tests {
             ("add_channel", EnvelopeType::AddChannel),
             ("set_channel_config", EnvelopeType::SetChannelConfig),
             ("delete_channel", EnvelopeType::DeleteChannel),
+            ("list_memory_settings", EnvelopeType::ListMemorySettings),
+            ("set_memory_settings", EnvelopeType::SetMemorySettings),
         ] {
             assert_eq!(EnvelopeType::from(wire_name), envelope_type, "{wire_name}");
         }
         assert_eq!(WsOutboundEvent::Channels.as_str(), "channels");
+        assert_eq!(WsOutboundEvent::MemorySettings.as_str(), "memory_settings");
         // The per-chat switch keeps its own name and meaning.
         assert_eq!(
             EnvelopeType::from("set_model_preset"),

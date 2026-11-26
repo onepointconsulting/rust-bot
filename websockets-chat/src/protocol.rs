@@ -697,6 +697,32 @@ impl ClientEnvelope {
         }
     }
 
+    /// Ask the gateway for the settings forms of the Dream, Skills and Consolidator pages.
+    /// Authenticated connections only. The reply is a `memory_settings` event (see
+    /// [`ServerEvent::MemorySettings`]).
+    pub fn list_memory_settings() -> Self {
+        Self {
+            type_: "list_memory_settings",
+            ..Self::list_skills()
+        }
+    }
+
+    /// Ask the gateway to change settings of the section `name` (`dream`, `skills` or
+    /// `consolidator`): setting name to value. Applies after a restart. Same access rules
+    /// as [`Self::add_model_preset`]. The reply is a `memory_settings` event naming the
+    /// section, or a `setting_error` event of kind `memory_settings`.
+    pub fn set_memory_settings(
+        name: impl Into<String>,
+        values: HashMap<String, serde_json::Value>,
+    ) -> Self {
+        Self {
+            type_: "set_memory_settings",
+            name: Some(name.into()),
+            values: Some(values),
+            ..Self::list_skills()
+        }
+    }
+
     /// Ask the gateway which models `provider` offers (`auto`: the provider it would pick),
     /// using the credentials in its `config.json`. Same access rules as
     /// [`Self::add_model_preset`]. The reply is a `provider_models` event (see
@@ -1576,6 +1602,16 @@ pub enum ServerEvent {
         changed: Option<ChannelChange>,
         restart_required: bool,
     },
+    /// Reply to [`ClientEnvelope::list_memory_settings`] and to every successful
+    /// [`ClientEnvelope::set_memory_settings`]: one settings form per section (Dream,
+    /// Skills, Consolidator) and, after a write, the section written (`changed`) and
+    /// whether a restart is needed to apply it. Not scoped to any one `chat_id`.
+    MemorySettings {
+        sections: Vec<ToolConfigSummary>,
+        can_modify: bool,
+        changed: Option<String>,
+        restart_required: bool,
+    },
     /// Reply to [`ClientEnvelope::list_provider_models`]: the provider's models sorted by
     /// id, or — when refused or failed — an empty list with `detail` (a stable code:
     /// `access_denied`, `admin_required`, `missing_provider`, `config_error`,
@@ -1798,6 +1834,7 @@ impl ServerEvent {
             | ServerEvent::ModelPresets { .. }
             | ServerEvent::Providers { .. }
             | ServerEvent::Channels { .. }
+            | ServerEvent::MemorySettings { .. }
             | ServerEvent::ProviderModels { .. }
             | ServerEvent::SettingError { .. }
             | ServerEvent::ConfigFile { .. }
@@ -2265,6 +2302,18 @@ struct ChannelsWire {
 }
 
 #[derive(Deserialize)]
+struct MemorySettingsWire {
+    #[serde(default)]
+    sections: Vec<ToolConfigSummary>,
+    #[serde(default)]
+    can_modify: bool,
+    #[serde(default)]
+    changed: Option<String>,
+    #[serde(default)]
+    restart_required: bool,
+}
+
+#[derive(Deserialize)]
 struct ProviderModelsWire {
     #[serde(default)]
     provider: String,
@@ -2646,6 +2695,14 @@ pub fn parse_server_event(raw: &str) -> Result<ServerEvent, ProtocolError> {
             changed: w.changed,
             restart_required: w.restart_required,
         }),
+        "memory_settings" => {
+            decode::<MemorySettingsWire>(&value).map(|w| ServerEvent::MemorySettings {
+                sections: w.sections,
+                can_modify: w.can_modify,
+                changed: w.changed,
+                restart_required: w.restart_required,
+            })
+        }
         "provider_models" => {
             decode::<ProviderModelsWire>(&value).map(|w| ServerEvent::ProviderModels {
                 provider: w.provider,
@@ -4274,6 +4331,58 @@ mod tests {
             panic!("expected Channels");
         };
         assert!(channels.is_empty() && changed.is_none() && !can_modify && !restart_required);
+    }
+
+    #[test]
+    fn memory_settings_envelopes_carry_the_section_name_and_values() {
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::list_memory_settings()).unwrap(),
+            serde_json::json!({"type": "list_memory_settings", "webui": true})
+        );
+        let values = HashMap::from([("intervalH".to_string(), serde_json::json!(4))]);
+        assert_eq!(
+            serde_json::to_value(ClientEnvelope::set_memory_settings("dream", values)).unwrap(),
+            serde_json::json!({
+                "type": "set_memory_settings",
+                "name": "dream",
+                "values": {"intervalH": 4},
+                "webui": true,
+            })
+        );
+    }
+
+    #[test]
+    fn memory_settings_decodes_the_forms_and_the_change() {
+        let event = parse_server_event(
+            r#"{"event":"memory_settings","can_modify":true,"restart_required":true,
+                "changed":"dream",
+                "sections":[{"name":"dream","title":"Dream settings","fields":[
+                  {"name":"intervalH","label":"Interval (hours)","kind":"integer",
+                   "min":1,"secret":false,"value":2}]}]}"#,
+        )
+        .unwrap();
+        assert_eq!(event.chat_id(), None);
+        let ServerEvent::MemorySettings {
+            sections,
+            can_modify,
+            changed,
+            restart_required,
+        } = event
+        else {
+            panic!("expected MemorySettings");
+        };
+        assert!(can_modify && restart_required);
+        assert_eq!(changed.as_deref(), Some("dream"));
+        assert_eq!(sections[0].fields[0].name, "intervalH");
+
+        let plain = parse_server_event(r#"{"event":"memory_settings"}"#).unwrap();
+        let ServerEvent::MemorySettings {
+            sections, changed, ..
+        } = plain
+        else {
+            panic!("expected MemorySettings");
+        };
+        assert!(sections.is_empty() && changed.is_none());
     }
 
     #[test]

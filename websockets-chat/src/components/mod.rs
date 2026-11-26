@@ -9,6 +9,7 @@ mod json_editor;
 mod key_value_rows;
 mod list_page;
 mod mcp_presets_page;
+mod memory_settings_page;
 mod message_list;
 mod model_picker;
 mod model_presets_page;

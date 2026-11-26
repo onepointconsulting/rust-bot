@@ -8,12 +8,18 @@ use std::time::SystemTime;
 use crate::agent::context::{SOUL_FILE, USER_FILE};
 use crate::agent::model_runtime::{ModelRuntime, ModelRuntimeResolver};
 use crate::agent::runner::{AgentRunSpec, AgentRunner};
+use crate::agent::skill_operation::SkillAction;
+use crate::agent::skill_proposals::SkillProposalStore;
+use crate::agent::skill_store::{SkillLimits, SkillStore};
+use crate::agent::skills::{BUILTIN_SKILLS_DIR, SkillsLoader};
+use crate::agent::tools::skill_manage::{SKILL_MANAGE_TOOL_NAME, SkillManageTool, SkillWriteMode};
 use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
 use crate::agent::tools::registry::ToolRegistry;
+use crate::config::schema::SkillsToolConfig;
 use crate::providers::base::LLMResponse;
 use crate::session::manager::{Session, SessionManager};
 use crate::utils::fs::write_atomic;
-use crate::utils::gitstore::GitStore;
+use crate::utils::gitstore::{GitStore, memory_tracked_paths};
 use crate::utils::helpers::{
     empty_or_default, ensure_dir, estimate_message_tokens, estimate_prompt_tokens_chain,
     strip_think,
@@ -76,7 +82,9 @@ impl MemoryStore {
         let user_file = workspace.join(USER_FILE);
         let cursor_file = memory_dir.join(CURSOR_FILE);
         let dream_cursor_file = memory_dir.join(DREAM_CURSOR_FILE);
-        let git = GitStore::new(workspace, vec![]);
+        let git = GitStore::new(workspace, memory_tracked_paths());
+        // Workspaces initialised before `skills/` was tracked still ignore it.
+        git.ensure_gitignore();
         let store = Self {
             workspace: cloned_workspace,
             max_history_entries: max_history_entries.unwrap_or(DEFAULT_MAX_HISTORY),
@@ -692,6 +700,9 @@ pub struct Consolidator {
     message_builder: Box<dyn MessageBuilder>,
     max_completion_tokens: usize,
     locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Keep reusable procedures in summaries (`agents.dream.learnSkills`), so
+    /// Dream can turn them into skills.
+    learn_skills: bool,
 }
 
 impl Consolidator {
@@ -714,6 +725,28 @@ impl Consolidator {
             message_builder,
             max_completion_tokens,
             locks: Arc::new(Mutex::new(HashMap::new())),
+            learn_skills: false,
+        }
+    }
+
+    /// Ask summaries to keep reusable procedures ("PROCEDURE: …" lines) for
+    /// Dream's skill learning (`agents.dream.learnSkills`).
+    pub fn with_learn_skills(mut self, learn_skills: bool) -> Self {
+        self.learn_skills = learn_skills;
+        self
+    }
+
+    /// The summarisation system prompt; it adds the Procedures category when
+    /// `learn_skills` is on.
+    fn archive_system_prompt(&self) -> String {
+        let mut context = Context::new();
+        context.insert("learn_skills", &self.learn_skills);
+        match render_template("agent/consolidator_archive.md", &context, true) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Failed to render consolidator_archive template: {}", e);
+                String::new()
+            }
         }
     }
 
@@ -796,14 +829,7 @@ impl Consolidator {
         if messages.is_empty() {
             return None;
         }
-        let system_prompt =
-            match render_template("agent/consolidator_archive.md", &Context::new(), true) {
-                Ok(s) => s,
-                Err(e) => {
-                    log::error!("Failed to render consolidator_archive template: {}", e);
-                    String::new()
-                }
-            };
+        let system_prompt = self.archive_system_prompt();
         let formatted = MemoryStore::format_messages(summary_messages.unwrap_or(messages));
 
         let resolved_runtime;
@@ -1101,10 +1127,188 @@ impl Consolidator {
     }
 }
 
-/// Two-phase memory processor: analyze history.jsonl, then edit files via AgentRunner.
+/// Marker opening a Phase 1 line that describes a skill (procedural) lesson.
+const SKILL_FINDING_MARKER: &str = "[SKILL]";
+
+/// Analysis handed to Phase 2 when Phase 1 found only skill lessons.
+const SKIP_MARKER: &str = "[SKIP]";
+
+/// Write tools whose successful calls count as Dream changes.
+const MEMORY_WRITE_TOOL: &str = "edit_file";
+
+/// Phase 1's analysis, split by destination.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct DreamFindings {
+    /// Lines for the memory files (`[FILE]`, `[FILE-REMOVE]`, `[SKIP]`, …),
+    /// handed to Phase 2 unchanged.
+    pub memory: String,
+    /// `[SKILL] …` lines for Phase 3, trimmed, without list bullets.
+    pub skills: Vec<String>,
+}
+
+/// Split Phase 1's `analysis` into memory findings and `[SKILL]` lines.
+///
+/// A skill line is one whose trimmed text, after an optional `-`/`*` list
+/// bullet, starts with `[SKILL]` (any case). Every other line stays in
+/// `memory`, in order; the memory text is trimmed.
+pub fn partition_findings(analysis: &str) -> DreamFindings {
+    let mut memory_lines = Vec::new();
+    let mut skills = Vec::new();
+    for line in analysis.lines() {
+        match skill_finding(line) {
+            Some(finding) => skills.push(finding),
+            None => memory_lines.push(line),
+        }
+    }
+    DreamFindings {
+        memory: memory_lines.join("\n").trim().to_string(),
+        skills,
+    }
+}
+
+/// The normalised `[SKILL] …` finding on `line`, if it is one.
+fn skill_finding(line: &str) -> Option<String> {
+    let text = line.trim();
+    let text = text
+        .strip_prefix("- ")
+        .or_else(|| text.strip_prefix("* "))
+        .unwrap_or(text)
+        .trim_start();
+    let marker_len = SKILL_FINDING_MARKER.len();
+    let marker = text.get(..marker_len)?;
+    if !marker.eq_ignore_ascii_case(SKILL_FINDING_MARKER) {
+        return None;
+    }
+    let lesson = text[marker_len..].trim();
+    if lesson.is_empty() {
+        return None;
+    }
+    Some(format!("{SKILL_FINDING_MARKER} {lesson}"))
+}
+
+/// One skill as Dream shows it to the model.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillIndexEntry {
+    pub name: String,
+    pub description: String,
+    /// Where its `SKILL.md` is, when the prompt should say so.
+    pub path: Option<String>,
+}
+
+/// The skill index as prompt lines (`- name: description [— path]`), or
+/// `(none)` when there are no skills.
+pub fn format_skill_index(entries: &[SkillIndexEntry]) -> String {
+    if entries.is_empty() {
+        return "(none)".to_string();
+    }
+    entries
+        .iter()
+        .map(|entry| match &entry.path {
+            Some(path) => format!("- {}: {} — {}", entry.name, entry.description, path),
+            None => format!("- {}: {}", entry.name, entry.description),
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// The Dream commit message for the changes of one run.
+///
+/// Skill changes are only mentioned when skill learning is on; staged
+/// proposals are counted as proposals, since they are not written yet.
+pub fn format_dream_commit_message(
+    timestamp: &str,
+    memory_changes: usize,
+    skill_changes: usize,
+    learn_skills: bool,
+    skills_staged: bool,
+) -> String {
+    let mut message = format!("dream: {timestamp}, {memory_changes} memory change(s)");
+    if learn_skills {
+        let kind = if skills_staged {
+            "skill proposal(s)"
+        } else {
+            "skill change(s)"
+        };
+        message.push_str(&format!(", {skill_changes} {kind}"));
+    }
+    message
+}
+
+/// What one AgentRunner phase achieved.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+struct PhaseOutcome {
+    /// Whether the run stopped normally (`stop_reason == "completed"`).
+    completed: bool,
+    /// One `name: detail` line per successful write.
+    changes: Vec<String>,
+}
+
+/// Dream's background skill learning: whether it is on, and the tools Phase 3
+/// runs with.
+struct SkillLearning {
+    enabled: bool,
+    /// Whether `skill_manage` stages proposals rather than writing.
+    staged: bool,
+    /// `read_file` plus a restricted `skill_manage`.
+    tools: ToolRegistry,
+    /// Bundled skills, listed after the workspace ones.
+    builtin_skills_dir: PathBuf,
+    /// Pending proposals, also read by `/skills-review`.
+    proposals: Arc<SkillProposalStore>,
+}
+
+impl SkillLearning {
+    /// Skill learning for `workspace`: on when `enabled`; writes directly or,
+    /// when `skills_config.require_approval`, stages proposals. Size limits
+    /// come from `skills_config`.
+    fn new(
+        workspace: &Path,
+        enabled: bool,
+        skills_config: &SkillsToolConfig,
+        builtin_skills_dir: Option<PathBuf>,
+    ) -> Self {
+        let builtin_skills_dir = builtin_skills_dir.unwrap_or_else(|| BUILTIN_SKILLS_DIR.clone());
+        let store = Arc::new(SkillStore::new(
+            workspace,
+            Some(builtin_skills_dir.clone()),
+            SkillLimits::from(skills_config),
+        ));
+        let proposals = Arc::new(SkillProposalStore::new(workspace, Arc::clone(&store)));
+        let staged = skills_config.require_approval;
+        let mode = if staged {
+            SkillWriteMode::Propose(Arc::clone(&proposals))
+        } else {
+            SkillWriteMode::Apply
+        };
+        let mut tools = ToolRegistry::new();
+        tools.register(Box::new(ReadFileTool::new(
+            Some(workspace.to_path_buf()),
+            None,
+            None,
+        )));
+        tools.register(Box::new(
+            SkillManageTool::new(store)
+                .with_mode(mode)
+                .with_allowed_actions(&SkillAction::NON_DESTRUCTIVE),
+        ));
+        Self {
+            enabled,
+            staged,
+            tools,
+            builtin_skills_dir,
+            proposals,
+        }
+    }
+}
+
+/// Memory processor: analyse history.jsonl, then edit files via AgentRunner.
+///
 /// Phase 1 produces an analysis summary (plain LLM call).
 /// Phase 2 delegates to AgentRunner with read_file / edit_file tools so the
 /// LLM can make targeted, incremental edits instead of replacing entire files.
+/// Phase 3 (only with `agents.dream.learnSkills` and when Phase 1 found
+/// `[SKILL]` lessons) runs AgentRunner with read_file / skill_manage to turn
+/// those lessons into workspace skills, or skill proposals.
 pub struct Dream {
     pub store: Arc<MemoryStore>,
     /// Resolves each Dream cycle's provider/model — no fixed provider/model
@@ -1118,9 +1322,12 @@ pub struct Dream {
     pub max_iterations: usize,
     pub max_tool_result_chars: usize,
     tools: ToolRegistry,
+    skill_learning: SkillLearning,
 }
 
 impl Dream {
+    /// A Dream over `store` with skill learning off; see
+    /// [`Self::with_skill_learning`].
     pub fn new(
         store: Arc<MemoryStore>,
         runtime_resolver: Arc<ModelRuntimeResolver>,
@@ -1137,7 +1344,13 @@ impl Dream {
             None,
             None,
         )));
-        tools.register(Box::new(EditFileTool::new(Some(workspace), None, None)));
+        tools.register(Box::new(EditFileTool::new(
+            Some(workspace.clone()),
+            None,
+            None,
+        )));
+        let skill_learning =
+            SkillLearning::new(&workspace, false, &SkillsToolConfig::default(), None);
         Dream {
             store,
             runtime_resolver,
@@ -1147,7 +1360,39 @@ impl Dream {
             max_iterations,
             max_tool_result_chars,
             tools,
+            skill_learning,
         }
+    }
+
+    /// Turn background skill learning on or off (`agents.dream.learnSkills`).
+    ///
+    /// Size limits and the write policy come from `tools.skills`: with
+    /// `requireApproval` Dream stages proposals for `/skills-review`,
+    /// otherwise it writes skills directly (versioned by the memory git store).
+    pub fn with_skill_learning(self, learn_skills: bool, skills_config: &SkillsToolConfig) -> Self {
+        self.with_skill_learning_from(learn_skills, skills_config, None)
+    }
+
+    /// [`Self::with_skill_learning`] reading bundled skills from
+    /// `builtin_skills_dir` (the loader's default when `None`).
+    fn with_skill_learning_from(
+        mut self,
+        learn_skills: bool,
+        skills_config: &SkillsToolConfig,
+        builtin_skills_dir: Option<PathBuf>,
+    ) -> Self {
+        self.skill_learning = SkillLearning::new(
+            &self.store.workspace,
+            learn_skills,
+            skills_config,
+            builtin_skills_dir,
+        );
+        self
+    }
+
+    /// The pending skill proposals (also those left from earlier runs).
+    pub fn skill_proposals(&self) -> &Arc<SkillProposalStore> {
+        &self.skill_learning.proposals
     }
 
     /// Resolve this Dream cycle's runtime: `dream_model_preset` (a named
@@ -1176,7 +1421,11 @@ impl Dream {
         phase1_response.finish_reason == "error" || phase1_response.content.is_none()
     }
 
-    /// Process unprocessed history entries. Returns True if work was done.
+    /// Process unprocessed history entries. Returns true if work was done.
+    ///
+    /// The cursor advances whatever the phases achieve, so a batch is never
+    /// analysed twice. A Phase 3 failure is logged and does not undo Phase 2.
+    /// Any change made is committed; the result reports Phase 2's success.
     pub async fn run(&self) -> bool {
         log::info!("Dream: running");
         let runtime = self.resolve_runtime();
@@ -1201,8 +1450,52 @@ impl Dream {
             batch.len(),
         );
 
-        // Build history text for LLM
-        let history_text = batch
+        let history_text = Self::build_history_text(&batch);
+        let file_context = self.build_file_context();
+
+        let Some(analysis) = self
+            .run_analysis(&runtime, &history_text, &file_context)
+            .await
+        else {
+            return false;
+        };
+        let findings = if self.skill_learning.enabled {
+            partition_findings(&analysis)
+        } else {
+            DreamFindings {
+                memory: analysis,
+                skills: Vec::new(),
+            }
+        };
+
+        let memory_outcome = self
+            .run_memory_phase(&runtime, &findings, &file_context)
+            .await;
+        let skill_outcome = self.run_skill_phase(&runtime, &findings.skills).await;
+
+        // Advance cursor — always, to avoid re-processing Phase 1
+        let new_cursor = batch[batch.len() - 1]["cursor"].as_u64().unwrap_or(0);
+        self.store.set_last_dream_cursor(new_cursor);
+        self.store.compact_history();
+
+        if memory_outcome.completed {
+            log::info!(
+                "Dream done: {} memory change(s), {} skill change(s), cursor advanced to {}",
+                memory_outcome.changes.len(),
+                skill_outcome.changes.len(),
+                new_cursor,
+            );
+        } else {
+            log::warn!("Dream Phase 2 failed; cursor advanced to {}", new_cursor);
+        }
+
+        self.commit_changes(&batch, &memory_outcome, &skill_outcome);
+        memory_outcome.completed
+    }
+
+    /// The batch as `[timestamp] content` lines for the prompts.
+    fn build_history_text(batch: &[serde_json::Value]) -> String {
+        batch
             .iter()
             .map(|e| {
                 format!(
@@ -1212,14 +1505,17 @@ impl Dream {
                 )
             })
             .collect::<Vec<String>>()
-            .join("\n");
+            .join("\n")
+    }
 
-        // Current file contents
+    /// Today's date and the current MEMORY.md, SOUL.md and USER.md, for the
+    /// Phase 1 and Phase 2 prompts.
+    fn build_file_context(&self) -> String {
         let current_date = Local::now().format("%Y-%m-%d").to_string();
         let current_memory = empty_or_default(self.store.read_memory());
         let current_soul = empty_or_default(self.store.read_soul());
         let current_user = empty_or_default(self.store.read_user());
-        let file_context = format!(
+        format!(
             "## Current Date\n{}\n\n\
              ## Current MEMORY.md ({} chars)\n{}\n\n\
              ## Current SOUL.md ({} chars)\n{}\n\n\
@@ -1231,16 +1527,60 @@ impl Dream {
             current_soul,
             current_user.chars().count(),
             current_user,
-        );
+        )
+    }
 
-        // Phase 1: Analyze
+    /// Every skill the loader sees, workspace first; with `with_paths`, each
+    /// entry says where its `SKILL.md` is.
+    fn skill_index(&self, with_paths: bool) -> Vec<SkillIndexEntry> {
+        let workspace_skills = self.store.workspace.join("skills");
+        let builtin_skills = &self.skill_learning.builtin_skills_dir;
+        SkillsLoader::new(&self.store.workspace, Some(builtin_skills.clone()))
+            .list_skill_summaries()
+            .into_iter()
+            .map(|summary| {
+                let path = with_paths.then(|| {
+                    let workspace_file = workspace_skills.join(&summary.name).join("SKILL.md");
+                    let file = if workspace_file.is_file() {
+                        workspace_file
+                    } else {
+                        builtin_skills.join(&summary.name).join("SKILL.md")
+                    };
+                    file.display().to_string()
+                });
+                SkillIndexEntry {
+                    name: summary.name,
+                    description: summary.description,
+                    path,
+                }
+            })
+            .collect()
+    }
+
+    /// The Phase 1 system prompt; asks for `[SKILL]` lines when learning skills.
+    fn phase1_system_prompt(&self) -> Result<String, String> {
+        let mut context = Context::new();
+        context.insert("learn_skills", &self.skill_learning.enabled);
+        if self.skill_learning.enabled {
+            context.insert("skill_index", &format_skill_index(&self.skill_index(false)));
+        }
+        render_template("agent/dream_phase1.md", &context, true)
+    }
+
+    /// Phase 1: one LLM call comparing history with the memory files.
+    /// Returns the analysis, or `None` when the call failed.
+    async fn run_analysis(
+        &self,
+        runtime: &ModelRuntime,
+        history_text: &str,
+        file_context: &str,
+    ) -> Option<String> {
         let phase1_prompt = format!("## Conversation History\n{history_text}\n\n{file_context}");
-
-        let phase1_system = match render_template("agent/dream_phase1.md", &Context::new(), true) {
+        let phase1_system = match self.phase1_system_prompt() {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Dream Phase 1: failed to render template: {}", e);
-                return false;
+                return None;
             }
         };
         let phase1_response = runtime
@@ -1270,7 +1610,7 @@ impl Dream {
                 phase1_response.finish_reason,
                 phase1_response.content.is_some(),
             );
-            return false;
+            return None;
         }
         let analysis = empty_or_default(phase1_response.content);
         log::info!(
@@ -1278,31 +1618,124 @@ impl Dream {
             analysis.chars().count(),
             analysis.chars().take(500).collect::<String>()
         );
+        Some(analysis)
+    }
 
-        // Phase 2: Delegate to AgentRunner with read_file / edit_file
+    /// Phase 2: edit SOUL.md, USER.md and MEMORY.md from the memory findings.
+    ///
+    /// When Phase 1 found only skill lessons, there is nothing for the memory
+    /// files and the phase is skipped (it counts as completed).
+    async fn run_memory_phase(
+        &self,
+        runtime: &ModelRuntime,
+        findings: &DreamFindings,
+        file_context: &str,
+    ) -> PhaseOutcome {
+        let analysis = findings.memory.as_str();
+        if analysis.is_empty() && !findings.skills.is_empty() {
+            log::info!("Dream Phase 2 skipped: only skill findings");
+            return PhaseOutcome {
+                completed: true,
+                changes: Vec::new(),
+            };
+        }
+        let analysis = if analysis.is_empty() {
+            SKIP_MARKER
+        } else {
+            analysis
+        };
         let phase2_prompt = format!("## Analysis Result\n{analysis}\n\n{file_context}");
         let phase2_system = match render_template("agent/dream_phase2.md", &Context::new(), true) {
             Ok(s) => s,
             Err(e) => {
                 log::error!("Dream Phase 2: failed to render template: {}", e);
-                return false;
+                return PhaseOutcome::default();
             }
         };
+        self.run_agent_phase(
+            "Phase 2",
+            runtime,
+            phase2_system,
+            phase2_prompt,
+            &self.tools,
+            MEMORY_WRITE_TOOL,
+        )
+        .await
+    }
+
+    /// Phase 3: turn `[SKILL]` findings into skills (or skill proposals).
+    ///
+    /// Runs only when skill learning is on and there are findings, so it costs
+    /// nothing otherwise. A failure is logged; it never undoes Phase 2.
+    async fn run_skill_phase(&self, runtime: &ModelRuntime, skills: &[String]) -> PhaseOutcome {
+        if !self.skill_learning.enabled || skills.is_empty() {
+            return PhaseOutcome {
+                completed: true,
+                changes: Vec::new(),
+            };
+        }
+        let skills_dir = self.store.workspace.join("skills");
+        let mut context = Context::new();
+        context.insert("skills_dir", &skills_dir.display().to_string());
+        context.insert("staged", &self.skill_learning.staged);
+        let phase3_system = match render_template("agent/dream_phase3.md", &context, true) {
+            Ok(s) => s,
+            Err(e) => {
+                log::error!("Dream Phase 3: failed to render template: {}", e);
+                return PhaseOutcome::default();
+            }
+        };
+        let phase3_prompt = format!(
+            "## Skill Findings\n{}\n\n## Existing Skills\n{}\n\n## Skills Directory\n{}",
+            skills.join("\n"),
+            format_skill_index(&self.skill_index(true)),
+            skills_dir.display(),
+        );
+        let outcome = self
+            .run_agent_phase(
+                "Phase 3",
+                runtime,
+                phase3_system,
+                phase3_prompt,
+                &self.skill_learning.tools,
+                SKILL_MANAGE_TOOL_NAME,
+            )
+            .await;
+        if !outcome.completed {
+            log::warn!(
+                "Dream Phase 3 did not complete; {} skill change(s) kept",
+                outcome.changes.len()
+            );
+        }
+        outcome
+    }
+
+    /// Run an AgentRunner phase with `tools`; successful `write_tool` calls are
+    /// the phase's changes.
+    async fn run_agent_phase(
+        &self,
+        phase: &str,
+        runtime: &ModelRuntime,
+        system_prompt: String,
+        user_prompt: String,
+        tools: &ToolRegistry,
+        write_tool: &str,
+    ) -> PhaseOutcome {
         let messages = vec![
             serde_json::json!({
                 "role": "system",
-                "content": phase2_system,
+                "content": system_prompt,
             }),
             serde_json::json!({
                 "role": "user",
-                "content": phase2_prompt,
+                "content": user_prompt,
             }),
         ];
         let runner = AgentRunner::new(runtime.provider.clone());
-        let phase2_response = runner
+        let response = runner
             .run(AgentRunSpec {
                 initial_messages: messages,
-                tools: self.tools.clone(),
+                tools: tools.clone(),
                 model: runtime.model.clone(),
                 max_iterations: self.max_iterations,
                 max_tool_result_chars: self.max_tool_result_chars,
@@ -1311,70 +1744,77 @@ impl Dream {
             })
             .await;
         log::debug!(
-            "Dream Phase 2 complete: stop_reason={}, tool_events={}",
-            phase2_response.stop_reason,
-            phase2_response.tool_events.len(),
+            "Dream {phase} complete: stop_reason={}, tool_events={}",
+            response.stop_reason,
+            response.tool_events.len(),
         );
-        let default_value = "".to_string();
-        let mut changelog: Vec<String> = Vec::new();
-        for event in &phase2_response.tool_events {
-            let msg = format!(
-                "Dream tool_event: name={}, status={}, detail={}",
-                event.get("name").unwrap_or(&default_value),
-                event.get("status").unwrap_or(&default_value),
-                event.get("detail").unwrap_or(&default_value),
-            );
-            log::info!("{}", msg.chars().take(200).collect::<String>());
-            if event.get("status").unwrap_or(&default_value) == "ok" {
-                changelog.push(format!(
-                    "{}: {}",
-                    event.get("name").unwrap_or(&default_value),
-                    event.get("detail").unwrap_or(&default_value),
-                ));
-            }
-        }
-
-        // Advance cursor — always, to avoid re-processing Phase 1
-        let new_cursor = batch[batch.len() - 1]["cursor"].as_u64().unwrap_or(0);
-        self.store.set_last_dream_cursor(new_cursor);
-        self.store.compact_history();
-
-        if phase2_response.stop_reason == "completed" {
-            log::info!(
-                "Dream done: {} change(s), cursor advanced to {}",
-                changelog.len(),
-                new_cursor,
-            );
-        } else {
+        if response.stop_reason != "completed" {
             log::warn!(
-                "Dream Phase 2 failed: stop_reason={}, has_content={}; cursor advanced to {}",
-                phase2_response.stop_reason,
-                phase2_response.final_content.is_some(),
-                new_cursor
+                "Dream {phase} stopped: stop_reason={}, has_content={}",
+                response.stop_reason,
+                response.final_content.is_some(),
             );
-            return false;
         }
-
-        // Git auto-commit (only when there are actual changes)
-        if !changelog.is_empty() && self.store.git.is_initialized() {
-            let ts_raw = &batch[batch.len() - 1]["timestamp"];
-            let ts = ts_raw.as_str().unwrap_or("");
-            let commit_ts = if ts.is_empty() {
-                Local::now().format("%Y-%m-%d %H:%M").to_string()
-            } else {
-                ts.to_string()
-            };
-            if let Some(sha) = self.store.git.auto_commit(&format!(
-                "dream: {}, {} change(s)",
-                commit_ts,
-                changelog.len()
-            )) {
-                log::info!("Dream git commit: {}", sha);
-            }
+        PhaseOutcome {
+            completed: response.stop_reason == "completed",
+            changes: successful_writes(&response.tool_events, write_tool),
         }
-
-        true
     }
+
+    /// Commit the run's changes to the memory git store, when there are any.
+    fn commit_changes(
+        &self,
+        batch: &[serde_json::Value],
+        memory_outcome: &PhaseOutcome,
+        skill_outcome: &PhaseOutcome,
+    ) {
+        let total_changes = memory_outcome.changes.len() + skill_outcome.changes.len();
+        if total_changes == 0 || !self.store.git.is_initialized() {
+            return;
+        }
+        let ts = batch
+            .last()
+            .and_then(|entry| entry["timestamp"].as_str())
+            .unwrap_or("");
+        let commit_ts = if ts.is_empty() {
+            Local::now().format("%Y-%m-%d %H:%M").to_string()
+        } else {
+            ts.to_string()
+        };
+        let message = format_dream_commit_message(
+            &commit_ts,
+            memory_outcome.changes.len(),
+            skill_outcome.changes.len(),
+            self.skill_learning.enabled,
+            self.skill_learning.staged,
+        );
+        if let Some(sha) = self.store.git.auto_commit(&message) {
+            log::info!("Dream git commit: {}", sha);
+        }
+    }
+}
+
+/// Log every tool event and return `name: detail` for each successful call
+/// of `write_tool` (reads are not changes).
+fn successful_writes(
+    tool_events: &[HashMap<String, String>],
+    write_tool: &str,
+) -> Vec<String> {
+    let mut changes = Vec::new();
+    for event in tool_events {
+        let field = |key: &str| event.get(key).map(String::as_str).unwrap_or("");
+        let msg = format!(
+            "Dream tool_event: name={}, status={}, detail={}",
+            field("name"),
+            field("status"),
+            field("detail"),
+        );
+        log::info!("{}", msg.chars().take(200).collect::<String>());
+        if field("status") == "ok" && field("name") == write_tool {
+            changes.push(format!("{}: {}", field("name"), field("detail")));
+        }
+    }
+    changes
 }
 
 #[cfg(test)]
@@ -1429,10 +1869,14 @@ mod tests {
         }
     }
 
-    /// `LLMProviderDyn` stub: [`chat_with_retry`](LLMProviderDyn::chat_with_retry) returns a fixed response.
+    /// `LLMProviderDyn` stub: [`chat_with_retry`](LLMProviderDyn::chat_with_retry)
+    /// replays `script` in order, then returns a fixed response. Every
+    /// request's messages are recorded.
     struct ArchiveTestProvider {
         settings: GenerationSettings,
         chat_with_retry_response: LLMResponse,
+        script: Mutex<std::collections::VecDeque<LLMResponse>>,
+        requests: Mutex<Vec<Vec<serde_json::Value>>>,
     }
 
     impl ArchiveTestProvider {
@@ -1440,8 +1884,53 @@ mod tests {
             Arc::new(Self {
                 settings: GenerationSettings::new(),
                 chat_with_retry_response,
+                script: Mutex::new(Default::default()),
+                requests: Mutex::new(Vec::new()),
             })
         }
+
+        /// A provider answering with `script`, then with a plain "done".
+        fn scripted(script: Vec<LLMResponse>) -> Arc<Self> {
+            Arc::new(Self {
+                settings: GenerationSettings::new(),
+                chat_with_retry_response: text_response("done"),
+                script: Mutex::new(script.into()),
+                requests: Mutex::new(Vec::new()),
+            })
+        }
+
+        /// The messages of every request so far.
+        fn requests(&self) -> Vec<Vec<serde_json::Value>> {
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    /// A final text answer.
+    fn text_response(content: &str) -> LLMResponse {
+        let mut response = LLMResponse::new();
+        response.content = Some(content.to_string());
+        response.finish_reason = "stop".to_string();
+        response
+    }
+
+    /// An answer calling the tool `name` with `arguments`.
+    fn tool_call_response(name: &str, arguments: serde_json::Value) -> LLMResponse {
+        let mut response = LLMResponse::new();
+        response.finish_reason = "tool_calls".to_string();
+        response.tool_calls = vec![crate::providers::base::ToolCallRequest {
+            id: "call_1".to_string(),
+            name: name.to_string(),
+            arguments: arguments
+                .as_object()
+                .unwrap()
+                .iter()
+                .map(|(k, v)| (k.clone(), v.clone()))
+                .collect(),
+            extra_content: None,
+            provider_specific_fields: None,
+            function_provider_specific_fields: None,
+        }];
+        response
     }
 
     #[async_trait::async_trait]
@@ -1493,7 +1982,7 @@ mod tests {
         }
         async fn chat_with_retry(
             &self,
-            _: Vec<serde_json::Value>,
+            messages: Vec<serde_json::Value>,
             _: Option<Vec<serde_json::Value>>,
             _: Option<String>,
             _: Option<usize>,
@@ -1501,7 +1990,12 @@ mod tests {
             _: Option<String>,
             _: Option<serde_json::Value>,
         ) -> LLMResponse {
-            self.chat_with_retry_response.clone()
+            self.requests.lock().unwrap().push(messages);
+            self.script
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or_else(|| self.chat_with_retry_response.clone())
         }
         async fn chat_stream_with_retry_boxed(
             &self,
@@ -3221,5 +3715,306 @@ mod tests {
         let runtime = dream.resolve_runtime();
         assert_eq!(runtime.model, resolver.current_default().model);
         assert_eq!(runtime.preset_name, "default");
+    }
+
+    // ── partition_findings ────────────────────────────────────────────────────
+
+    #[test]
+    fn partition_findings_splits_skill_lines_from_memory_lines() {
+        let analysis = "[USER] lives in Lisbon\n\
+                        [SKILL] NEW:deploy-app build then upload — pitfall: stale cache\n\
+                        [MEMORY-REMOVE] old meeting\n\
+                        [SKILL] weather use open-meteo";
+        let findings = partition_findings(analysis);
+        assert_eq!(
+            findings.memory,
+            "[USER] lives in Lisbon\n[MEMORY-REMOVE] old meeting"
+        );
+        assert_eq!(
+            findings.skills,
+            vec![
+                "[SKILL] NEW:deploy-app build then upload — pitfall: stale cache".to_string(),
+                "[SKILL] weather use open-meteo".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn partition_findings_with_only_skill_lines_leaves_memory_empty() {
+        let findings = partition_findings("[SKILL] a lesson\n\n[SKILL] another\n");
+        assert_eq!(findings.memory, "");
+        assert_eq!(findings.skills.len(), 2);
+    }
+
+    #[test]
+    fn partition_findings_without_skill_lines_keeps_the_analysis() {
+        let findings = partition_findings("[USER] fact\n[SOUL] tone");
+        assert_eq!(findings.memory, "[USER] fact\n[SOUL] tone");
+        assert!(findings.skills.is_empty());
+        assert_eq!(partition_findings("").memory, "");
+    }
+
+    #[test]
+    fn partition_findings_leaves_skip_for_phase_two() {
+        let findings = partition_findings("[SKIP]");
+        assert_eq!(findings.memory, "[SKIP]");
+        assert!(findings.skills.is_empty());
+    }
+
+    #[test]
+    fn partition_findings_accepts_bullets_whitespace_and_any_case() {
+        let findings = partition_findings(
+            "  - [skill] lower case lesson  \n* [Skill]   bulleted\n\t[SKILL]\n[SKILLS] not a marker",
+        );
+        assert_eq!(
+            findings.skills,
+            vec![
+                "[SKILL] lower case lesson".to_string(),
+                "[SKILL] bulleted".to_string(),
+            ]
+        );
+        // An empty [SKILL] line and a different marker stay with memory.
+        assert_eq!(findings.memory, "[SKILL]\n[SKILLS] not a marker");
+    }
+
+    #[test]
+    fn format_skill_index_lists_names_descriptions_and_optional_paths() {
+        assert_eq!(format_skill_index(&[]), "(none)");
+        let entries = vec![
+            SkillIndexEntry {
+                name: "a".into(),
+                description: "Use when A.".into(),
+                path: None,
+            },
+            SkillIndexEntry {
+                name: "b".into(),
+                description: "Use when B.".into(),
+                path: Some("/skills/b/SKILL.md".into()),
+            },
+        ];
+        assert_eq!(
+            format_skill_index(&entries),
+            "- a: Use when A.\n- b: Use when B. — /skills/b/SKILL.md"
+        );
+    }
+
+    #[test]
+    fn dream_commit_message_counts_memory_and_skill_changes() {
+        assert_eq!(
+            format_dream_commit_message("2026-11-25 10:00", 2, 0, false, false),
+            "dream: 2026-11-25 10:00, 2 memory change(s)"
+        );
+        assert_eq!(
+            format_dream_commit_message("ts", 1, 3, true, false),
+            "dream: ts, 1 memory change(s), 3 skill change(s)"
+        );
+        assert_eq!(
+            format_dream_commit_message("ts", 0, 1, true, true),
+            "dream: ts, 0 memory change(s), 1 skill proposal(s)"
+        );
+    }
+
+    // ── Consolidator procedure category ───────────────────────────────────────
+
+    #[test]
+    fn archive_prompt_asks_for_procedures_only_when_learning_skills() {
+        let tmp = TempDir::new().unwrap();
+        let provider = ArchiveTestProvider::arc(LLMResponse::new());
+        let plain = test_consolidator(&tmp, Arc::clone(&provider)).archive_system_prompt();
+        assert!(!plain.contains("PROCEDURE"));
+        assert!(plain.contains("- Preferences: communication style, tool preferences\n\nPriority"));
+
+        let learning = test_consolidator(&tmp, provider)
+            .with_learn_skills(true)
+            .archive_system_prompt();
+        assert!(learning.contains("PROCEDURE: <task> — <steps> — <pitfall>"));
+    }
+
+    // ── Dream phases with a scripted provider ─────────────────────────────────
+
+    /// A workspace whose memory store is versioned, with one history entry,
+    /// and an empty bundled-skills folder.
+    struct DreamFixture {
+        workspace: TempDir,
+        builtin: TempDir,
+        store: Arc<MemoryStore>,
+    }
+
+    impl DreamFixture {
+        fn new() -> Self {
+            let workspace = TempDir::new().unwrap();
+            let store = Arc::new(make_store(&workspace));
+            assert!(store.git.init());
+            store.append_history("deploy failed until the cache was cleared");
+            Self {
+                workspace,
+                builtin: TempDir::new().unwrap(),
+                store,
+            }
+        }
+
+        /// A Dream answering from `provider`, learning skills when
+        /// `learn_skills`, staging them when `require_approval`.
+        fn dream(
+            &self,
+            provider: Arc<ArchiveTestProvider>,
+            learn_skills: bool,
+            require_approval: bool,
+        ) -> Dream {
+            let skills_config = SkillsToolConfig {
+                require_approval,
+                ..SkillsToolConfig::default()
+            };
+            Dream::new(
+                Arc::clone(&self.store),
+                test_runtime_resolver(provider),
+                None,
+                None,
+                20,
+                10,
+                8192,
+            )
+            .with_skill_learning_from(
+                learn_skills,
+                &skills_config,
+                Some(self.builtin.path().to_path_buf()),
+            )
+        }
+
+        fn skill_file(&self, name: &str) -> PathBuf {
+            self.workspace
+                .path()
+                .join("skills")
+                .join(name)
+                .join("SKILL.md")
+        }
+    }
+
+    const SKILL_FINDING: &str = "[SKILL] NEW:deploy-cache clear the build cache before deploying";
+
+    fn deploy_cache_skill() -> String {
+        "---\nname: deploy-cache\ndescription: Use when deploying. Clears the cache first.\n---\n\n\
+         1. Clear the build cache.\n2. Deploy.\n"
+            .to_string()
+    }
+
+    /// Phase 1 finds one skill lesson; Phase 3 creates it, then stops.
+    fn skill_script() -> Vec<LLMResponse> {
+        vec![
+            text_response(SKILL_FINDING),
+            tool_call_response(
+                "skill_manage",
+                json!({"action": "create", "name": "deploy-cache",
+                       "content": deploy_cache_skill(), "reason": "cache pitfall"}),
+            ),
+            text_response("done"),
+        ]
+    }
+
+    fn system_prompt_of(request: &[serde_json::Value]) -> String {
+        request[0]["content"].as_str().unwrap_or("").to_string()
+    }
+
+    #[tokio::test]
+    async fn dream_without_skill_findings_does_not_run_phase_three() {
+        let fixture = DreamFixture::new();
+        let provider =
+            ArchiveTestProvider::scripted(vec![text_response("[SKIP]"), text_response("ok")]);
+        let dream = fixture.dream(Arc::clone(&provider), true, false);
+
+        assert!(dream.run().await);
+
+        let requests = provider.requests();
+        assert_eq!(requests.len(), 2, "Phase 1 and Phase 2 only");
+        assert!(system_prompt_of(&requests[1]).contains("Update memory files"));
+        assert!(fs::read_dir(fixture.workspace.path().join("skills")).unwrap().next().is_none());
+    }
+
+    #[tokio::test]
+    async fn dream_writes_a_skill_and_commits_it_when_approval_is_off() {
+        let fixture = DreamFixture::new();
+        let provider = ArchiveTestProvider::scripted(skill_script());
+        let dream = fixture.dream(Arc::clone(&provider), true, false);
+
+        assert!(dream.run().await);
+
+        assert!(fixture.skill_file("deploy-cache").is_file());
+        let requests = provider.requests();
+        // Phase 2 was skipped (only skill findings); Phase 3 took two turns.
+        assert_eq!(requests.len(), 3);
+        assert!(system_prompt_of(&requests[1]).contains("skill_manage"));
+        let phase3_prompt = requests[1][1]["content"].as_str().unwrap();
+        assert!(phase3_prompt.contains(SKILL_FINDING));
+
+        let head = &fixture.store.git.log(1)[0];
+        assert!(
+            head.message.contains("0 memory change(s), 1 skill change(s)"),
+            "{}",
+            head.message
+        );
+        let (_, diff) = fixture.store.git.show_commit_diff(&head.sha).unwrap();
+        assert!(diff.contains("skills/deploy-cache/SKILL.md"), "{diff}");
+        assert!(dream.skill_proposals().list().is_empty());
+        assert!(fixture.store.get_last_dream_cursor() > 0);
+    }
+
+    #[tokio::test]
+    async fn dream_stages_a_proposal_when_approval_is_required() {
+        let fixture = DreamFixture::new();
+        let provider = ArchiveTestProvider::scripted(skill_script());
+        let dream = fixture.dream(Arc::clone(&provider), true, true);
+
+        assert!(dream.run().await);
+
+        assert!(!fixture.skill_file("deploy-cache").exists());
+        let proposals = dream.skill_proposals().list();
+        assert_eq!(proposals.len(), 1);
+        assert_eq!(proposals[0].operation.skill_name(), "deploy-cache");
+        assert_eq!(proposals[0].reason.as_deref(), Some("cache pitfall"));
+        assert!(system_prompt_of(&provider.requests()[1]).contains("Review mode"));
+        // Nothing tracked changed, so nothing was committed after init.
+        assert_eq!(fixture.store.git.log(10).len(), 1);
+    }
+
+    #[tokio::test]
+    async fn dream_phase_one_has_no_skill_block_when_learning_is_off() {
+        let fixture = DreamFixture::new();
+        let provider = ArchiveTestProvider::scripted(vec![
+            text_response(SKILL_FINDING),
+            text_response("nothing to edit"),
+        ]);
+        let dream = fixture.dream(Arc::clone(&provider), false, false);
+
+        assert!(dream.run().await);
+
+        let requests = provider.requests();
+        let phase1_system = system_prompt_of(&requests[0]);
+        assert!(!phase1_system.contains("[SKILL]"));
+        assert!(!phase1_system.contains("Existing skills"));
+        // The analysis goes to Phase 2 untouched and Phase 3 never runs.
+        assert_eq!(requests.len(), 2);
+        assert!(requests[1][1]["content"].as_str().unwrap().contains(SKILL_FINDING));
+        assert!(!fixture.skill_file("deploy-cache").exists());
+    }
+
+    #[tokio::test]
+    async fn dream_phase_one_lists_existing_skills_when_learning() {
+        let fixture = DreamFixture::new();
+        let existing = fixture.builtin.path().join("weather");
+        fs::create_dir_all(&existing).unwrap();
+        fs::write(
+            existing.join("SKILL.md"),
+            "---\nname: weather\ndescription: Use when asked about weather.\n---\n\nUse wttr.in.\n",
+        )
+        .unwrap();
+        let provider =
+            ArchiveTestProvider::scripted(vec![text_response("[SKIP]"), text_response("ok")]);
+        let dream = fixture.dream(Arc::clone(&provider), true, false);
+
+        dream.run().await;
+
+        let phase1_system = system_prompt_of(&provider.requests()[0]);
+        assert!(phase1_system.contains("[SKILL] <existing-skill-name | NEW:proposed-name>"));
+        assert!(phase1_system.contains("- weather: Use when asked about weather."));
     }
 }
