@@ -461,6 +461,20 @@ impl AgentHook for LoopHook {
     }
 }
 
+/// How often [`AgentLoop::shutdown`] re-checks for in-flight turns.
+const SHUTDOWN_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Outcome of [`AgentLoop::shutdown`], for logging.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ShutdownReport {
+    /// Turns that completed on their own within the grace period.
+    pub finished_turns: u32,
+    /// Turns aborted without `turn_end`; they resume on the next start.
+    pub aborted_turns: u32,
+    /// Subagents cancelled.
+    pub aborted_subagents: u32,
+}
+
 ///
 /// The agent loop is the core processing engine.
 /// 1. Receives messages from the bus
@@ -709,15 +723,17 @@ impl AgentLoop {
             deferred_tools_prompt_section(&mode.restrict_tools(&registry), &server_descriptions)
         }));
         let context = Arc::new(context_builder);
-        let consolidator = Arc::new(Consolidator::new(
-            Arc::clone(&context.memory),
-            runtime_resolver.clone(),
-            session_manager.clone(),
-            context_window_tokens,
-            Box::new(Arc::clone(&context)),
-            max_tool_result_chars as usize,
-        )
-        .with_learn_skills(agents_cfg.dream.learn_skills));
+        let consolidator = Arc::new(
+            Consolidator::new(
+                Arc::clone(&context.memory),
+                runtime_resolver.clone(),
+                session_manager.clone(),
+                context_window_tokens,
+                Box::new(Arc::clone(&context)),
+                max_tool_result_chars as usize,
+            )
+            .with_learn_skills(agents_cfg.dream.learn_skills),
+        );
         let auto_compact = Arc::new(Autocompact::new(
             session_manager.clone(),
             Arc::clone(&consolidator),
@@ -768,16 +784,18 @@ impl AgentLoop {
             _max: max,
             concurrency_gate,
             consolidator,
-            dream: Arc::new(Dream::new(
-                Arc::clone(&context.memory),
-                runtime_resolver.clone(),
-                dream_cfg.dream_model_preset.clone(),
-                dream_cfg.model_override.clone(),
-                dream_cfg.max_batch_size as usize,
-                dream_cfg.max_iterations as usize,
-                max_tool_result_chars as usize,
-            )
-            .with_skill_learning(dream_cfg.learn_skills, &tools_cfg.skills)),
+            dream: Arc::new(
+                Dream::new(
+                    Arc::clone(&context.memory),
+                    runtime_resolver.clone(),
+                    dream_cfg.dream_model_preset.clone(),
+                    dream_cfg.model_override.clone(),
+                    dream_cfg.max_batch_size as usize,
+                    dream_cfg.max_iterations as usize,
+                    max_tool_result_chars as usize,
+                )
+                .with_skill_learning(dream_cfg.learn_skills, &tools_cfg.skills),
+            ),
             auto_compact,
             idle_compact_check_interval,
             tool_startup_warnings,
@@ -1323,6 +1341,58 @@ impl AgentLoop {
         }
     }
 
+    /// Abort every task handle and return how many were aborted.
+    fn abort_task_handles(tasks: TaskJoinHandles) -> u32 {
+        let mut aborted: u32 = 0;
+        for handle in tasks.into_values() {
+            handle.abort();
+            aborted += 1;
+        }
+        aborted
+    }
+
+    /// Gracefully drain the loop for process shutdown (SIGTERM / Ctrl-C).
+    ///
+    /// Stops the loop consuming new inbound messages, waits up to `grace` for
+    /// in-flight turns to finish on their own, then aborts the remainder and
+    /// all subagents. Aborted turns deliberately get **no** `turn_end` and
+    /// their inbox ledger entries stay pending, so crash recovery resumes
+    /// them on the next start (unlike `/stop`, see [`Self::abort_session`]).
+    pub async fn shutdown(&self, grace: Duration) -> ShutdownReport {
+        self.stop();
+        let initial_turns = self.count_active_turns().await;
+        let deadline = tokio::time::Instant::now() + grace;
+        while self.count_active_turns().await > 0 && tokio::time::Instant::now() < deadline {
+            tokio::time::sleep(SHUTDOWN_POLL_INTERVAL).await;
+        }
+        let remaining = std::mem::take(&mut *self.active_tasks.lock().await);
+        let mut aborted_turns: u32 = 0;
+        for session_tasks in remaining.into_values() {
+            aborted_turns += session_tasks
+                .values()
+                .filter(|handle| !handle.is_finished())
+                .count() as u32;
+            Self::abort_task_handles(session_tasks);
+        }
+        let aborted_subagents = self.subagents.cancel_all().await;
+        ShutdownReport {
+            finished_turns: initial_turns.saturating_sub(aborted_turns),
+            aborted_turns,
+            aborted_subagents,
+        }
+    }
+
+    /// Number of in-flight turns (tasks that have not finished yet).
+    async fn count_active_turns(&self) -> u32 {
+        self.active_tasks
+            .lock()
+            .await
+            .values()
+            .flat_map(|session_tasks| session_tasks.values())
+            .filter(|handle| !handle.is_finished())
+            .count() as u32
+    }
+
     /// Cancel all active tasks and subagents for `msg`'s session, then
     /// publish a `TurnEnd` so channels/the UI don't stay stuck "running" —
     /// aborting drops `dispatch` before its own post-`process_message`
@@ -1342,11 +1412,7 @@ impl AgentLoop {
             .await
             .remove(&session_key)
             .unwrap_or_default();
-        let mut cancelled: u32 = 0;
-        for handle in tasks.into_values() {
-            handle.abort();
-            cancelled += 1;
-        }
+        let cancelled = Self::abort_task_handles(tasks);
         let sub_cancelled = self.subagents.cancel_by_session(&session_key).await;
         // A stopped request must not be re-driven after a restart.
         let ledger = InboxLedger::for_session(&self.journal_store(), &session_key);
@@ -4170,6 +4236,107 @@ mod tests {
 
         assert_eq!(next_reply(&fixture.loop_).await.content, "the answer");
         assert!(fixture.requests.lock().unwrap().is_empty());
+    }
+
+    // ── graceful shutdown ─────────────────────────────────────────────────────
+
+    /// Register a fake in-flight turn that sleeps `duration`, as `run()` would.
+    async fn register_fake_turn(
+        loop_: &AgentLoop,
+        session_key: &str,
+        task_id: u64,
+        duration: Duration,
+    ) -> Arc<std::sync::atomic::AtomicBool> {
+        let completed = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let completed_flag = Arc::clone(&completed);
+        let active_tasks = Arc::clone(&loop_.active_tasks);
+        let key = session_key.to_string();
+        let handle = tokio::spawn(async move {
+            tokio::time::sleep(duration).await;
+            completed_flag.store(true, Ordering::SeqCst);
+            active_tasks.lock().await.remove(&key);
+        });
+        loop_
+            .active_tasks
+            .lock()
+            .await
+            .entry(session_key.to_string())
+            .or_default()
+            .insert(task_id, handle);
+        completed
+    }
+
+    #[tokio::test]
+    async fn shutdown_of_an_idle_loop_reports_nothing_and_stops_it() {
+        let fixture = resume_fixture(Config::default());
+        let report = fixture.loop_.shutdown(Duration::from_secs(1)).await;
+        assert_eq!(
+            report,
+            ShutdownReport {
+                finished_turns: 0,
+                aborted_turns: 0,
+                aborted_subagents: 0
+            }
+        );
+        assert!(!fixture.loop_.running.load(Ordering::Relaxed));
+    }
+
+    #[tokio::test]
+    async fn shutdown_lets_a_turn_finish_inside_the_grace_period() {
+        let fixture = resume_fixture(Config::default());
+        let completed =
+            register_fake_turn(&fixture.loop_, "chan:a", 1, Duration::from_millis(200)).await;
+        let report = fixture.loop_.shutdown(Duration::from_secs(5)).await;
+        assert!(completed.load(Ordering::SeqCst));
+        assert_eq!(report.finished_turns, 1);
+        assert_eq!(report.aborted_turns, 0);
+    }
+
+    #[tokio::test]
+    async fn shutdown_aborts_a_turn_exceeding_grace_without_ending_its_journal_turn() {
+        use crate::session::journal::JournalRecord;
+        let fixture = resume_fixture(Config::default());
+        let journal = RunJournal::new(Arc::clone(&fixture.journals), "chan:a");
+        journal
+            .append(JournalRecord::TurnStart {
+                turn_id: "t".into(),
+                session_key: "chan:a".into(),
+                request_id: None,
+                user_message: Some(json!({"role": "user", "content": "hi"})),
+                attempt: 0,
+                channel: Some("chan".into()),
+                chat_id: Some("a".into()),
+            })
+            .unwrap();
+        let completed =
+            register_fake_turn(&fixture.loop_, "chan:a", 1, Duration::from_secs(60)).await;
+
+        let report = fixture.loop_.shutdown(Duration::from_millis(150)).await;
+
+        assert_eq!(report.aborted_turns, 1);
+        assert_eq!(report.finished_turns, 0);
+        assert!(!completed.load(Ordering::SeqCst));
+        assert!(fixture.loop_.active_tasks.lock().await.is_empty());
+        let scan = fixture.journals.scan("chan:a");
+        assert!(
+            !scan
+                .entries
+                .iter()
+                .any(|entry| matches!(entry.record, JournalRecord::TurnEnd { .. })),
+            "shutdown must not write turn_end, or the turn would not resume"
+        );
+    }
+
+    #[tokio::test]
+    async fn shutdown_with_zero_grace_aborts_immediately() {
+        let fixture = resume_fixture(Config::default());
+        let completed =
+            register_fake_turn(&fixture.loop_, "chan:a", 1, Duration::from_millis(500)).await;
+        let started = tokio::time::Instant::now();
+        let report = fixture.loop_.shutdown(Duration::ZERO).await;
+        assert!(started.elapsed() < Duration::from_millis(400));
+        assert_eq!(report.aborted_turns, 1);
+        assert!(!completed.load(Ordering::SeqCst));
     }
 
     // ── inbox ledger through the running loop ─────────────────────────────────

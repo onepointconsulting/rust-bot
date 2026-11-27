@@ -1014,6 +1014,9 @@ fn default_gateway_host() -> String {
 fn default_gateway_port() -> u16 {
     18790
 }
+fn default_shutdown_grace_secs() -> u64 {
+    8
+}
 
 /// Gateway/server configuration.
 #[derive(Debug, Deserialize, Serialize, Validate, Clone)]
@@ -1050,6 +1053,13 @@ pub struct GatewayConfig {
     #[serde(alias = "strapi_sso", default)]
     #[garde(dive)]
     pub strapi_sso: StrapiSsoConfig,
+
+    /// Seconds the gateway waits for in-flight turns to finish after SIGTERM /
+    /// Ctrl-C before aborting them (aborted turns resume on the next start).
+    /// `0` aborts immediately. Default: 8 (under Docker's 10 s `stop` timeout).
+    #[serde(alias = "shutdown_grace_secs", default = "default_shutdown_grace_secs")]
+    #[garde(skip)]
+    pub shutdown_grace_secs: u64,
 }
 
 /// Config for exchanging a Strapi admin JWT for a rust-bot WebUI JWT.
@@ -1071,6 +1081,7 @@ impl Default for GatewayConfig {
             heartbeat: HeartbeatConfig::default(),
             web_root: None,
             strapi_sso: StrapiSsoConfig::default(),
+            shutdown_grace_secs: default_shutdown_grace_secs(),
         }
     }
 }
@@ -3339,6 +3350,15 @@ mod tests {
         assert_eq!(cfg.web_root, None);
         assert!(cfg.strapi_sso.strapi_url.is_empty());
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn test_gateway_shutdown_grace_default_and_deserialize() {
+        assert_eq!(GatewayConfig::default().shutdown_grace_secs, 8);
+        let cfg: GatewayConfig = serde_json::from_str(r#"{"shutdownGraceSecs": 0}"#).unwrap();
+        assert_eq!(cfg.shutdown_grace_secs, 0);
+        let cfg: GatewayConfig = serde_json::from_str("{}").unwrap();
+        assert_eq!(cfg.shutdown_grace_secs, 8);
     }
 
     #[test]

@@ -23,8 +23,8 @@ use serde_json::{Map, Value, json};
 use super::config_toggles::{ToggleError, child_object_mut, parse_root};
 use super::model_preset_form::{rendered_and_checked, typed_config};
 use super::settings_form::{
-    SettingSpellings, UNSET_VARIABLE_EXPLANATION, check_placeholders, is_blank,
-    process_env_is_set, remove_value, schema_properties, store_value, stored_value,
+    SettingSpellings, UNSET_VARIABLE_EXPLANATION, check_placeholders, is_blank, process_env_is_set,
+    remove_value, schema_properties, store_value, stored_value,
 };
 use crate::agent::tools::tool_settings_api::{
     FieldKind, ToolSettingsSummary, check_value, field_kind, summarize_field,
@@ -181,7 +181,10 @@ impl MemorySettingsSection {
 
 /// `properties` with the Dream model preset turned into a choice of `preset_names`,
 /// preceded by `""` (no preset).
-fn with_preset_choices(mut properties: Map<String, Value>, preset_names: &[String]) -> Map<String, Value> {
+fn with_preset_choices(
+    mut properties: Map<String, Value>,
+    preset_names: &[String],
+) -> Map<String, Value> {
     if let Some(Value::Object(preset)) = properties.get_mut(DREAM_MODEL_PRESET) {
         let choices: Vec<&str> = std::iter::once("")
             .chain(preset_names.iter().map(String::as_str))
@@ -199,7 +202,10 @@ fn preset_names(text: &str) -> Result<Vec<String>, ToggleError> {
 }
 
 /// The child of `object` under the first of `keys` it has, if that child is an object.
-fn child_object<'a>(object: &'a Map<String, Value>, keys: &[&str]) -> Option<&'a Map<String, Value>> {
+fn child_object<'a>(
+    object: &'a Map<String, Value>,
+    keys: &[&str],
+) -> Option<&'a Map<String, Value>> {
     keys.iter().find_map(|key| object.get(*key))?.as_object()
 }
 
@@ -297,7 +303,10 @@ fn with_memory_settings_in(
     env_is_set: &dyn Fn(&str) -> bool,
 ) -> Result<Option<String>, ToggleError> {
     let properties = section.form_properties(&preset_names(text)?);
-    if let Some(unknown) = changes.keys().find(|setting| !properties.contains_key(*setting)) {
+    if let Some(unknown) = changes
+        .keys()
+        .find(|setting| !properties.contains_key(*setting))
+    {
         return Err(ToggleError::UnknownField(unknown.clone()));
     }
     let table = section.spellings();
@@ -347,7 +356,10 @@ mod tests {
     }
 
     fn change(pairs: &[(&str, Value)]) -> HashMap<String, Value> {
-        pairs.iter().map(|(name, value)| (name.to_string(), value.clone())).collect()
+        pairs
+            .iter()
+            .map(|(name, value)| (name.to_string(), value.clone()))
+            .collect()
     }
 
     fn all_set(_: &str) -> bool {
@@ -408,7 +420,10 @@ mod tests {
         assert_eq!(field(&dream, "intervalH").label, "Interval (hours)");
 
         let consolidator = form(MemorySettingsSection::Consolidator);
-        assert_eq!(field(&consolidator, "sessionTtlMinutes").value, Some(json!(30)));
+        assert_eq!(
+            field(&consolidator, "sessionTtlMinutes").value,
+            Some(json!(30))
+        );
         assert_eq!(
             field(&consolidator, "idleCompactCheckIntervalSeconds").value,
             Some(json!(60))
@@ -463,7 +478,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(json_of(&updated)["tools"]["skills"], json!({"requireApproval": true}));
+        assert_eq!(
+            json_of(&updated)["tools"]["skills"],
+            json!({"requireApproval": true})
+        );
     }
 
     #[test]
@@ -471,7 +489,10 @@ mod tests {
         let updated = edited(
             &config_text(),
             MemorySettingsSection::Consolidator,
-            &change(&[("sessionTtlMinutes", json!(0)), ("contextWindowTokens", json!(64_000))]),
+            &change(&[
+                ("sessionTtlMinutes", json!(0)),
+                ("contextWindowTokens", json!(64_000)),
+            ]),
         )
         .unwrap()
         .unwrap();
@@ -489,7 +510,10 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert_eq!(json_of(&with_preset)["agents"]["dream"][DREAM_MODEL_PRESET], "cheap");
+        assert_eq!(
+            json_of(&with_preset)["agents"]["dream"][DREAM_MODEL_PRESET],
+            "cheap"
+        );
 
         let without = edited(
             &with_preset,
@@ -498,7 +522,11 @@ mod tests {
         )
         .unwrap()
         .unwrap();
-        assert!(json_of(&without)["agents"]["dream"].get(DREAM_MODEL_PRESET).is_none());
+        assert!(
+            json_of(&without)["agents"]["dream"]
+                .get(DREAM_MODEL_PRESET)
+                .is_none()
+        );
     }
 
     #[test]
@@ -532,7 +560,11 @@ mod tests {
             Err(ToggleError::UnknownField(_))
         ));
         assert!(matches!(
-            edited(&text, dream, &change(&[(DREAM_MODEL_PRESET, json!("missing"))])),
+            edited(
+                &text,
+                dream,
+                &change(&[(DREAM_MODEL_PRESET, json!("missing"))])
+            ),
             Err(ToggleError::InvalidValue(..))
         ));
     }

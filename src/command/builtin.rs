@@ -3,10 +3,10 @@ use crate::{
     agent::{
         acp::listing::{format_acp_agents, list_acp_rows},
         agent_loop::AgentLoop,
+        context::BOOTSTRAP_FILES,
         skill_operation::SkillOperation,
         skill_proposals::{SkillProposal, SkillProposalStore},
         skill_store::SkillChange,
-        context::BOOTSTRAP_FILES,
         subagent::format_subagents_list,
         tools::{
             mcp::{load_mcp_tools_from_config, mcp_presets_api},
@@ -972,7 +972,10 @@ impl CmdSkillsReview {
                 proposal.operation.label(),
                 proposal.operation.skill_name()
             ),
-            format!("- Proposed by: {} at {}", proposal.origin, proposal.created_at),
+            format!(
+                "- Proposed by: {} at {}",
+                proposal.origin, proposal.created_at
+            ),
         ];
         if let Some(reason) = &proposal.reason {
             lines.push(format!("- Reason: {reason}"));
@@ -3144,7 +3147,11 @@ mod tests {
     fn skills_review_list_shows_ids_actions_and_previews() {
         let long_reason = "x".repeat(200);
         let proposals = vec![
-            sample_proposal("1", Some("Clear the cache first"), create_operation("deploy")),
+            sample_proposal(
+                "1",
+                Some("Clear the cache first"),
+                create_operation("deploy"),
+            ),
             sample_proposal(
                 "2",
                 None,
@@ -3212,7 +3219,10 @@ mod tests {
                         path: PathBuf::from("skills/deploy/SKILL.md"),
                     }),
                 ),
-                ("2".to_string(), Err("Proposal `2` no longer applies.".into())),
+                (
+                    "2".to_string(),
+                    Err("Proposal `2` no longer applies.".into()),
+                ),
             ],
             Some("abcd1234"),
         );
@@ -3225,7 +3235,10 @@ mod tests {
                 "3".to_string(),
                 Ok(sample_proposal("3", None, create_operation("deploy"))),
             ),
-            ("9".to_string(), Err("No pending skill proposal `9`.".into())),
+            (
+                "9".to_string(),
+                Err("No pending skill proposal `9`.".into()),
+            ),
         ]);
         assert!(rejected.contains("- `3`: dropped create `deploy`."));
         assert!(rejected.contains("- `9`: No pending skill proposal `9`."));
@@ -3246,8 +3259,12 @@ mod tests {
             SkillLimits::default(),
         ));
         let proposals = SkillProposalStore::new(workspace.path(), skills);
-        proposals.propose(create_operation("one"), "dream", None).unwrap();
-        proposals.propose(create_operation("two"), "dream", None).unwrap();
+        proposals
+            .propose(create_operation("one"), "dream", None)
+            .unwrap();
+        proposals
+            .propose(create_operation("two"), "dream", None)
+            .unwrap();
 
         let content = CmdSkillsReview::accept(&proposals, &git, &ProposalTarget::All);
 
@@ -3274,7 +3291,9 @@ mod tests {
             CmdSkillsReview::reject(&proposals, &ProposalTarget::All),
             "No skill proposals are waiting for review."
         );
-        proposals.propose(create_operation("one"), "dream", None).unwrap();
+        proposals
+            .propose(create_operation("one"), "dream", None)
+            .unwrap();
         let content = CmdSkillsReview::reject(&proposals, &ProposalTarget::All);
         assert!(content.contains("- `1`: dropped create `one`."));
         assert!(proposals.list().is_empty());
@@ -3286,7 +3305,11 @@ mod tests {
         let mut router = CommandRouter::new();
         register_builtin_commands(&mut router);
         for command in ["/dream-log abcd1234", "/dream-restore abcd1234"] {
-            let name = command.split_whitespace().next().unwrap().trim_start_matches('/');
+            let name = command
+                .split_whitespace()
+                .next()
+                .unwrap()
+                .trim_start_matches('/');
             let mut ctx = CommandContext::new(
                 InboundMessage {
                     channel: "cli".into(),

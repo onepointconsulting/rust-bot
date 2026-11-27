@@ -14,6 +14,7 @@ pub mod progress;
 pub mod question_prompt;
 pub mod session_listing;
 pub mod session_picker;
+pub mod shutdown;
 pub mod stream;
 pub mod terminal_draw;
 pub mod wizard;

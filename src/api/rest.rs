@@ -501,9 +501,8 @@ async fn example_prompts(State(state): State<Arc<AppState>>) -> Json<ExampleProm
 }
 
 async fn shutdown_signal() {
-    if tokio::signal::ctrl_c().await.is_ok() {
-        log::info!("Shutdown signal received, stopping API server...");
-    }
+    let signal_name = crate::cli::shutdown::wait_for_shutdown_signal().await;
+    log::info!("{signal_name} received, stopping API server...");
 }
 
 /// Build a CORS layer from config.

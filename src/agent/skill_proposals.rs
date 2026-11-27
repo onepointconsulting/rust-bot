@@ -101,7 +101,10 @@ impl SkillProposalStore {
         let mut proposals: Vec<SkillProposal> = entries
             .flatten()
             .map(|entry| entry.path())
-            .filter(|path| path.extension().is_some_and(|ext| ext == PROPOSAL_EXTENSION))
+            .filter(|path| {
+                path.extension()
+                    .is_some_and(|ext| ext == PROPOSAL_EXTENSION)
+            })
             .filter_map(|path| read_proposal(&path))
             .collect();
         proposals.sort_by_key(|proposal| numeric_id(&proposal.id).unwrap_or(u64::MAX));
@@ -223,7 +226,11 @@ mod tests {
         }
 
         fn skill_file(&self, name: &str) -> PathBuf {
-            self.workspace.path().join("skills").join(name).join("SKILL.md")
+            self.workspace
+                .path()
+                .join("skills")
+                .join(name)
+                .join("SKILL.md")
         }
     }
 

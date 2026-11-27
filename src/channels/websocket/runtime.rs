@@ -46,10 +46,10 @@ use crate::bus::outbound_events::TurnEndEvent;
 use crate::channels::base::handle_message;
 use crate::channels::gateway_services::GatewayServices;
 use crate::channels::websocket::channel_form;
-use crate::channels::websocket::memory_settings_form;
 use crate::channels::websocket::config_file;
 use crate::channels::websocket::config_toggles;
 use crate::channels::websocket::mcp_server_form;
+use crate::channels::websocket::memory_settings_form;
 use crate::channels::websocket::model_preset_form;
 use crate::channels::websocket::provider_form;
 use crate::channels::websocket::registry::ConnectionRegistry;
@@ -5193,8 +5193,15 @@ async fn handle_set_memory_settings<'a>(envelope_dispatch_context: EnvelopeDispa
     }
     let Some(values) = parse_tool_config_values(envelope_dispatch_context.envelope) else {
         let message = "The request was malformed.";
-        send_setting_error(shared, connection_id, kind, &section, "invalid_request", message)
-            .await;
+        send_setting_error(
+            shared,
+            connection_id,
+            kind,
+            &section,
+            "invalid_request",
+            message,
+        )
+        .await;
         return;
     };
 

@@ -1715,19 +1715,42 @@ async fn run_gateway(args: GatewayArgs) -> Result<(), CliError> {
                 println!("{join_err}");
             }
         }
-        _ = tokio::signal::ctrl_c() => {
-            println!("\nShutting down...");
+        signal_name = crate::cli::shutdown::wait_for_shutdown_signal() => {
+            let grace = crate::cli::shutdown::grace_duration(config.gateway.shutdown_grace_secs);
+            println!(
+                "\n{signal_name} received, shutting down (waiting up to {}s for in-flight turns; press again to force)...",
+                grace.as_secs()
+            );
+            // Drain in-flight turns first, with channels and MCP still alive so
+            // nearly finished turns can deliver their replies. A second signal
+            // skips the wait.
+            let report = tokio::select! {
+                report = agent_loop.shutdown(grace) => Some(report),
+                _ = crate::cli::shutdown::wait_for_shutdown_signal() => None,
+            };
             gather.abort();
             let _ = gather.await;
+            match report {
+                Some(report) => log::info!(
+                    "Shutdown: {} turn(s) finished, {} turn(s) saved for resume on next start, {} subagent(s) cancelled",
+                    report.finished_turns,
+                    report.aborted_turns,
+                    report.aborted_subagents
+                ),
+                None => {
+                    println!("Second signal received, forcing exit.");
+                    std::process::exit(130);
+                }
+            }
         }
     }
 
-    agent_loop.close_mcp().await;
     heartbeat.stop().await;
     if let Some(cron) = &cron_option {
         cron.stop().await;
     }
     agent_loop.stop();
+    agent_loop.close_mcp().await;
     channels.stop_all().await;
 
     Ok(())

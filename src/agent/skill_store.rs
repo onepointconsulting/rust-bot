@@ -470,9 +470,8 @@ impl SkillStore {
                 located,
                 message,
             } => {
-                fs::remove_dir_all(&located.directory).map_err(|error| {
-                    format!("Error: could not delete skill '{name}': {error}")
-                })?;
+                fs::remove_dir_all(&located.directory)
+                    .map_err(|error| format!("Error: could not delete skill '{name}': {error}"))?;
                 Ok(SkillChange {
                     message,
                     path: located.directory,
@@ -1439,7 +1438,9 @@ mod tests {
             },
         ];
         for operation in &operations {
-            let change = store.check(operation).unwrap_or_else(|e| panic!("{operation:?}: {e}"));
+            let change = store
+                .check(operation)
+                .unwrap_or_else(|e| panic!("{operation:?}: {e}"));
             assert!(!change.message.is_empty());
         }
         assert_eq!(snapshot(&skills_root), before);

@@ -29,8 +29,8 @@ use super::add_mcp_server_panel::{ADD_BUSY_KEY, ADD_BUTTON_LABEL, ADD_PANEL_TITL
 use super::channels_page::ChannelsSection;
 use super::general_settings::GeneralSettings;
 use super::list_page::Tile;
-use super::memory_settings_page::MemorySettingsSection;
 use super::mcp_presets_page::{is_busy, row_error_for, switch_hint, ToggleSwitch};
+use super::memory_settings_page::MemorySettingsSection;
 use super::model_picker::ProviderModelsState;
 use super::model_presets_page::ModelPresetsSection;
 use super::providers_page::{ProviderAddRequest, ProviderExtras, ProvidersSection};
@@ -1783,7 +1783,11 @@ mod tests {
                 (SettingsPage::Consolidator, "consolidator"),
             ]
         );
-        for page in [SettingsPage::Dream, SettingsPage::Skills, SettingsPage::Consolidator] {
+        for page in [
+            SettingsPage::Dream,
+            SettingsPage::Skills,
+            SettingsPage::Consolidator,
+        ] {
             assert!(page.subtitle().contains("restart"));
         }
     }

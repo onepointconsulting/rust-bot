@@ -528,8 +528,7 @@ mod tests {
         let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
         let store = store_in(&workspace, &builtin);
         store.create("demo", &document("demo")).unwrap();
-        let tool =
-            SkillManageTool::new(store).with_allowed_actions(&SkillAction::NON_DESTRUCTIVE);
+        let tool = SkillManageTool::new(store).with_allowed_actions(&SkillAction::NON_DESTRUCTIVE);
         let result = tool
             .execute_result(&json!({"action": "delete", "name": "demo"}))
             .await;
@@ -547,8 +546,8 @@ mod tests {
             workspace.path(),
             Arc::clone(&store),
         ));
-        let tool = SkillManageTool::new(store)
-            .with_mode(SkillWriteMode::Propose(Arc::clone(&proposals)));
+        let tool =
+            SkillManageTool::new(store).with_mode(SkillWriteMode::Propose(Arc::clone(&proposals)));
         assert!(tool.parameters()["properties"]["reason"].is_object());
         assert!(tool.description().contains("staged as proposals"));
 
@@ -576,8 +575,8 @@ mod tests {
             workspace.path(),
             Arc::clone(&store),
         ));
-        let tool = SkillManageTool::new(store)
-            .with_mode(SkillWriteMode::Propose(Arc::clone(&proposals)));
+        let tool =
+            SkillManageTool::new(store).with_mode(SkillWriteMode::Propose(Arc::clone(&proposals)));
         let result = tool
             .execute_result(&json!({"action": "patch", "name": "ghost",
                                     "old_string": "a", "new_string": "b"}))
@@ -589,8 +588,6 @@ mod tests {
     #[test]
     fn the_default_tool_has_no_reason_parameter() {
         let (workspace, builtin) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
-        assert!(
-            tool_in(&workspace, &builtin).parameters()["properties"]["reason"].is_null()
-        );
+        assert!(tool_in(&workspace, &builtin).parameters()["properties"]["reason"].is_null());
     }
 }

@@ -12,9 +12,9 @@ use crate::agent::skill_operation::SkillAction;
 use crate::agent::skill_proposals::SkillProposalStore;
 use crate::agent::skill_store::{SkillLimits, SkillStore};
 use crate::agent::skills::{BUILTIN_SKILLS_DIR, SkillsLoader};
-use crate::agent::tools::skill_manage::{SKILL_MANAGE_TOOL_NAME, SkillManageTool, SkillWriteMode};
 use crate::agent::tools::filesystem::{EditFileTool, ReadFileTool};
 use crate::agent::tools::registry::ToolRegistry;
+use crate::agent::tools::skill_manage::{SKILL_MANAGE_TOOL_NAME, SkillManageTool, SkillWriteMode};
 use crate::config::schema::SkillsToolConfig;
 use crate::providers::base::LLMResponse;
 use crate::session::manager::{Session, SessionManager};
@@ -1796,10 +1796,7 @@ impl Dream {
 
 /// Log every tool event and return `name: detail` for each successful call
 /// of `write_tool` (reads are not changes).
-fn successful_writes(
-    tool_events: &[HashMap<String, String>],
-    write_tool: &str,
-) -> Vec<String> {
+fn successful_writes(tool_events: &[HashMap<String, String>], write_tool: &str) -> Vec<String> {
     let mut changes = Vec::new();
     for event in tool_events {
         let field = |key: &str| event.get(key).map(String::as_str).unwrap_or("");
@@ -3927,7 +3924,12 @@ mod tests {
         let requests = provider.requests();
         assert_eq!(requests.len(), 2, "Phase 1 and Phase 2 only");
         assert!(system_prompt_of(&requests[1]).contains("Update memory files"));
-        assert!(fs::read_dir(fixture.workspace.path().join("skills")).unwrap().next().is_none());
+        assert!(
+            fs::read_dir(fixture.workspace.path().join("skills"))
+                .unwrap()
+                .next()
+                .is_none()
+        );
     }
 
     #[tokio::test]
@@ -3948,7 +3950,8 @@ mod tests {
 
         let head = &fixture.store.git.log(1)[0];
         assert!(
-            head.message.contains("0 memory change(s), 1 skill change(s)"),
+            head.message
+                .contains("0 memory change(s), 1 skill change(s)"),
             "{}",
             head.message
         );
@@ -3993,7 +3996,12 @@ mod tests {
         assert!(!phase1_system.contains("Existing skills"));
         // The analysis goes to Phase 2 untouched and Phase 3 never runs.
         assert_eq!(requests.len(), 2);
-        assert!(requests[1][1]["content"].as_str().unwrap().contains(SKILL_FINDING));
+        assert!(
+            requests[1][1]["content"]
+                .as_str()
+                .unwrap()
+                .contains(SKILL_FINDING)
+        );
         assert!(!fixture.skill_file("deploy-cache").exists());
     }
 

@@ -111,6 +111,28 @@ All keys live under `durability` in the config file and have defaults.
 | `ledgerTtlDays` | `14` | how long an answered request id is remembered |
 | `ledgerMaxEntries` | `1000` | answered request ids kept per session |
 
+## Shutdown
+
+The gateway handles SIGINT and SIGTERM on Unix (`docker stop`, systemd,
+Kubernetes) and Ctrl-C / Ctrl-Break / console close / system shutdown on
+Windows. On the first signal it:
+
+1. stops the agent loop taking new inbound messages;
+2. waits up to `gateway.shutdownGraceSecs` (default `8`, `0` = no wait) for
+   in-flight turns to finish and deliver their replies, with channels and MCP
+   still running;
+3. aborts the turns and subagents still running, **without** writing
+   `turn_end` and leaving their inbox ledger entries pending, so they resume
+   on the next start like a crash would (`/stop` differs: it ends the turn
+   and marks the request done);
+4. stops heartbeat, cron, MCP and the channels, and logs
+   `N turn(s) saved for resume on next start`.
+
+A second signal during the wait exits immediately (status 130). Work done
+since a turn's last checkpoint (a model stream in progress, a running tool) is
+redone on resume. Keep `shutdownGraceSecs` below the orchestrator's kill
+timeout (Docker's `stop` default is 10 s).
+
 ## Limits
 
 * One rust-bot process per workspace (as before). Two processes appending to the

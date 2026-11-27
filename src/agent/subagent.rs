@@ -948,7 +948,25 @@ impl SubagentManager {
             .get(session_key)
             .map(|ids| ids.iter().cloned().collect())
             .unwrap_or_default();
+        self.cancel_tasks(task_ids).await
+    }
 
+    /// Cancel every running subagent across all sessions (gateway shutdown).
+    /// Returns count cancelled.
+    pub async fn cancel_all(&self) -> u32 {
+        let task_ids: Vec<String> = self
+            .session_tasks
+            .lock()
+            .unwrap()
+            .values()
+            .flat_map(|ids| ids.iter().cloned())
+            .collect();
+        self.cancel_tasks(task_ids).await
+    }
+
+    /// Cancel the given subagent tasks (skipping finished ones) and wait for
+    /// their threads to end. Returns count cancelled.
+    async fn cancel_tasks(&self, task_ids: Vec<String>) -> u32 {
         let mut handles = Vec::new();
         let mut cancelled_ids = Vec::new();
         {
